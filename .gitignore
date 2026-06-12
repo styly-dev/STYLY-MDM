@@ -1,0 +1,44 @@
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === IDE ===
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+
+# === Android / Gradle ===
+mdm-client/.gradle/
+mdm-client/build/
+mdm-client/app/build/
+mdm-client/local.properties
+mdm-client/gradle/
+mdm-client/gradlew
+mdm-client/gradlew.bat
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# === Logs ===
+*.log
+
+# === Server runtime data ===
+mdm-server/device_registry.json
+mdm-server/device_registry.json.tmp
+
+# === Misc ===
+nanobanana-output/*.png
+.claude/settings.local.json

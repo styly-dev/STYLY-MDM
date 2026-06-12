@@ -1,0 +1,24 @@
+{
+  "name": "STYLY-MDM Android Client",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "lts"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "fwcd.kotlin",
+        "vscjava.vscode-gradle"
+      ]
+    }
+  },
+  "mounts": [
+    "source=stylymdm-gradle-cache,target=/home/vscode/.gradle,type=volume",
+    "source=stylymdm-npm-cache,target=/home/vscode/.npm,type=volume"
+  ],
+  "postCreateCommand": "sudo mkdir -p /home/vscode/.npm && sudo chown -R vscode:vscode /home/vscode/.npm && echo 'sdk.dir=/opt/android-sdk' > mdm-client/local.properties"
+}

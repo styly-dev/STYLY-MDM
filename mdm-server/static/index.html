@@ -1,0 +1,1497 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>STYLY-MDM - Device Management</title>
+  <style>
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0
+    }
+
+    :root {
+      --bg-primary: #0f1117;
+      --bg-secondary: #1a1d27;
+      --bg-tertiary: #242836;
+      --border: #2e3346;
+      --text-primary: #e4e6f0;
+      --text-secondary: #9499b3;
+      --accent: #4f8ff7;
+      --accent-hover: #3a7be0;
+      --success: #34d399;
+      --danger: #f87171;
+      --warning: #fbbf24;
+      --info: #60a5fa;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    /* Header */
+    .header {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .header-title {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }
+
+    .header-title span {
+      color: var(--accent)
+    }
+
+    .conn-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .conn-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--danger);
+      transition: background 0.3s;
+    }
+
+    .conn-dot.connected {
+      background: var(--success)
+    }
+
+    .conn-dot.reconnecting {
+      background: var(--warning);
+      animation: pulse 1s infinite
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        opacity: 1
+      }
+
+      50% {
+        opacity: 0.4
+      }
+    }
+
+    /* Main layout */
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    /* Section cards */
+    .card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .card-header {
+      padding: 14px 20px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .device-count {
+      font-size: 12px;
+      background: var(--bg-tertiary);
+      padding: 2px 10px;
+      border-radius: 12px;
+      color: var(--text-secondary);
+      font-weight: 400;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+
+    /* Collapsible sections (accordion) */
+    .collapsible-header {
+      cursor: pointer;
+      user-select: none;
+      transition: color 0.2s
+    }
+
+    .collapsible-header:hover {
+      color: var(--text-primary)
+    }
+
+    .caret {
+      width: 0;
+      height: 0;
+      border-left: 5px solid currentColor;
+      border-top: 4px solid transparent;
+      border-bottom: 4px solid transparent;
+      flex-shrink: 0;
+      opacity: 0.7;
+      transition: transform 0.2s;
+    }
+
+    .card:not(.collapsed) .caret {
+      transform: rotate(90deg)
+    }
+
+    .card.collapsed .command-section {
+      display: none
+    }
+
+    .card.collapsed .card-header {
+      border-bottom-color: transparent
+    }
+
+    /* Device table */
+    .table-wrap {
+      overflow-x: auto
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse
+    }
+
+    thead {
+      background: var(--bg-tertiary)
+    }
+
+    th {
+      padding: 10px 16px;
+      text-align: left;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      white-space: nowrap;
+    }
+
+    td {
+      padding: 12px 16px;
+      font-size: 14px;
+      border-top: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    tbody tr:hover {
+      background: var(--bg-tertiary)
+    }
+
+    .status-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--success);
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+
+    .status-dot.offline {
+      background: var(--text-secondary)
+    }
+
+    tr.offline {
+      opacity: 0.5
+    }
+
+    tr.offline:hover {
+      opacity: 0.72
+    }
+
+    .last-seen {
+      color: var(--text-secondary);
+      font-size: 12px;
+      margin-left: 6px
+    }
+
+    .forget-btn {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: var(--text-secondary);
+      font-size: 13px;
+      line-height: 1;
+      padding: 3px 5px;
+      border-radius: 4px;
+      margin-left: 8px;
+      transition: color 0.2s, background 0.2s;
+    }
+
+    .forget-btn:hover {
+      color: var(--danger);
+      background: var(--bg-tertiary)
+    }
+
+    /* Per-device install status cell */
+    .install-cell {
+      font-size: 13px;
+      white-space: nowrap
+    }
+
+    .install-cell .install-none {
+      color: var(--text-secondary)
+    }
+
+    .install-cell .install-installing {
+      color: var(--warning)
+    }
+
+    .install-cell .install-success {
+      color: var(--success)
+    }
+
+    .install-cell .install-fail {
+      color: var(--danger)
+    }
+
+    .install-cell .install-file {
+      color: var(--text-secondary);
+      margin-left: 6px;
+      font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+      font-size: 12px;
+      display: inline-block;
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      vertical-align: bottom;
+    }
+
+    .install-spinner {
+      display: inline-block;
+      animation: spin 1s linear infinite
+    }
+
+    @keyframes spin {
+      from {
+        transform: rotate(0)
+      }
+
+      to {
+        transform: rotate(360deg)
+      }
+    }
+
+    .empty-state {
+      padding: 48px 20px;
+      text-align: center;
+      color: var(--text-secondary);
+      font-size: 14px;
+    }
+
+    /* Device label / serial cell */
+    .device-label-row {
+      display: flex;
+      align-items: center;
+      gap: 8px
+    }
+
+    .device-label {
+      font-weight: 600
+    }
+
+    .device-label.unlabeled {
+      color: var(--text-secondary);
+      font-weight: 400
+    }
+
+    .device-serial {
+      font-size: 12px;
+      color: var(--text-secondary);
+      font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+      margin-top: 2px;
+    }
+
+    .label-edit-btn {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: var(--text-secondary);
+      font-size: 13px;
+      line-height: 1;
+      padding: 3px 5px;
+      border-radius: 4px;
+      transition: color 0.2s, background 0.2s;
+    }
+
+    .label-edit-btn:hover {
+      color: var(--accent);
+      background: var(--bg-tertiary)
+    }
+
+    .device-edit {
+      display: flex;
+      align-items: center;
+      gap: 6px
+    }
+
+    .label-input {
+      padding: 6px 10px;
+      background: var(--bg-primary);
+      border: 1px solid var(--accent);
+      border-radius: 6px;
+      color: var(--text-primary);
+      font-size: 14px;
+      font-family: inherit;
+      width: 150px;
+    }
+
+    .label-input:focus {
+      outline: none
+    }
+
+    .btn-mini {
+      padding: 5px 12px;
+      border: none;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    .btn-save {
+      background: var(--accent);
+      color: #fff
+    }
+
+    .btn-cancel {
+      background: var(--bg-tertiary);
+      color: var(--text-secondary)
+    }
+
+    /* Checkbox styling */
+    input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+
+    /* Command section */
+    .command-section {
+      padding: 20px
+    }
+
+    .input-row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+
+    .input-group {
+      flex: 1;
+      min-width: 200px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .input-group label {
+      font-size: 12px;
+      color: var(--text-secondary);
+      font-weight: 500;
+    }
+
+    .input-group input {
+      padding: 10px 14px;
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-primary);
+      font-size: 14px;
+      font-family: inherit;
+      transition: border-color 0.2s;
+    }
+
+    .input-group input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .input-group input[type="file"] {
+      padding: 8px 10px;
+      cursor: pointer;
+    }
+
+    .input-group input::placeholder {
+      color: var(--text-secondary);
+      opacity: 0.5
+    }
+
+    .upload-summary {
+      min-height: 20px;
+      margin-bottom: 14px;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .upload-summary strong {
+      color: var(--text-primary);
+      font-weight: 600
+    }
+
+    .btn-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap
+    }
+
+    .btn {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s, opacity 0.2s;
+      font-family: inherit;
+    }
+
+    .btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: var(--accent-hover)
+    }
+
+    .btn-success {
+      background: var(--success);
+      color: #0f1117
+    }
+
+    .btn-success:hover:not(:disabled) {
+      background: #2bbf89
+    }
+
+    .btn-warning {
+      background: var(--warning);
+      color: #1a1d27
+    }
+
+    .btn-warning:hover:not(:disabled) {
+      background: #e5ab1c
+    }
+
+    /* Log section */
+    .log-container {
+      max-height: 300px;
+      overflow-y: auto;
+      padding: 12px 16px;
+      font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+      font-size: 13px;
+      line-height: 1.8;
+    }
+
+    .log-entry {
+      display: flex;
+      gap: 10px
+    }
+
+    .log-time {
+      color: var(--text-secondary);
+      flex-shrink: 0
+    }
+
+    .log-msg {}
+
+    .log-msg.success {
+      color: var(--success)
+    }
+
+    .log-msg.fail {
+      color: var(--danger)
+    }
+
+    .log-msg.warn {
+      color: var(--warning)
+    }
+
+    .log-msg.info {
+      color: var(--info)
+    }
+
+    .log-empty {
+      padding: 32px 20px;
+      text-align: center;
+      color: var(--text-secondary);
+      font-size: 13px;
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px
+    }
+
+    ::-webkit-scrollbar-track {
+      background: var(--bg-primary)
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--border);
+      border-radius: 3px
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: var(--text-secondary)
+    }
+
+    /* Responsive */
+    @media(max-width:640px) {
+      .header {
+        padding: 12px 16px
+      }
+
+      .container {
+        padding: 16px
+      }
+
+      .command-section {
+        padding: 16px
+      }
+
+      .input-row {
+        flex-direction: column
+      }
+
+      .input-group {
+        min-width: unset
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+  <div class="header">
+    <div class="header-title">STYLY-MDM</div>
+    <div class="conn-status">
+      <div class="conn-dot" id="connDot"></div>
+      <span id="connText">Disconnected</span>
+    </div>
+  </div>
+
+  <div class="container">
+    <!-- Device List -->
+    <div class="card">
+      <div class="card-header">
+        <span>Devices</span>
+        <span class="device-count" id="deviceCount">0 online</span>
+      </div>
+      <div class="table-wrap">
+        <table id="deviceTable">
+          <thead>
+            <tr>
+              <th style="width:40px"><input type="checkbox" id="selectAll" title="Select All"></th>
+              <th>Device</th>
+              <th>Model</th>
+              <th>IP Address</th>
+              <th>Startup App</th>
+              <th>Status</th>
+              <th>Install</th>
+            </tr>
+          </thead>
+          <tbody id="deviceBody"></tbody>
+        </table>
+        <div class="empty-state" id="emptyState">No devices yet</div>
+      </div>
+    </div>
+
+    <!-- Quick Install Section -->
+    <div class="card collapsible">
+      <div class="card-header collapsible-header">
+        <span>Quick Install</span>
+        <span class="caret"></span>
+      </div>
+      <div class="command-section">
+        <div class="input-row">
+          <div class="input-group">
+            <label for="apkFile">APK File</label>
+            <input type="file" id="apkFile" accept=".apk,application/vnd.android.package-archive">
+          </div>
+        </div>
+        <div class="upload-summary" id="apkSummary">No APK selected</div>
+        <div class="btn-row">
+          <button class="btn btn-success" id="btnInstallSelected" disabled>Install to Selected</button>
+          <button class="btn btn-warning" id="btnInstallAll" disabled>Install to All</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Command Section -->
+    <div class="card collapsible collapsed">
+      <div class="card-header collapsible-header">
+        <span>Launch Command</span>
+        <span class="caret"></span>
+      </div>
+      <div class="command-section">
+        <div class="input-row">
+          <div class="input-group">
+            <label for="packageName">Package Name</label>
+            <input type="text" id="packageName" placeholder="com.example.app">
+          </div>
+          <div class="input-group">
+            <label for="extraData">Extra Data (optional)</label>
+            <input type="text" id="extraData" placeholder='{"scene": "main"}'>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="btnSelected" disabled>Launch to Selected</button>
+          <button class="btn btn-warning" id="btnAll" disabled>Launch to All</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Startup App Configuration -->
+    <div class="card collapsible collapsed">
+      <div class="card-header collapsible-header">
+        <span>Startup App Configuration</span>
+        <span class="caret"></span>
+      </div>
+      <div class="command-section">
+        <div class="input-row">
+          <div class="input-group">
+            <label for="startupPackageName">Package Name</label>
+            <input type="text" id="startupPackageName" placeholder="com.example.app">
+          </div>
+          <div class="input-group">
+            <label for="startupExtraData">Extra Data (optional)</label>
+            <input type="text" id="startupExtraData" placeholder='{"scene": "main"}'>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="btnSetStartupSelected" disabled>Set for Selected</button>
+          <button class="btn btn-warning" id="btnSetStartupAll" disabled>Set for All</button>
+          <button class="btn btn-danger-outline" id="btnClearStartupSelected" disabled
+            style="background:transparent;border:1px solid var(--danger);color:var(--danger)">Clear for
+            Selected</button>
+          <button class="btn btn-danger-outline" id="btnClearStartupAll" disabled
+            style="background:transparent;border:1px solid var(--danger);color:var(--danger)">Clear for All</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Activity Log -->
+    <div class="card">
+      <div class="card-header">
+        <span>Activity Log</span>
+        <button class="btn"
+          style="padding:4px 12px;font-size:11px;background:var(--bg-tertiary);color:var(--text-secondary)"
+          id="btnClearLog">Clear</button>
+      </div>
+      <div class="log-container" id="logContainer">
+        <div class="log-empty" id="logEmpty">No activity yet</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      // State
+      let ws = null;
+      let devices = [];
+      let selectedIds = new Set();
+      // Per-device install status (session-only): id -> { status, filename, detail }
+      // status: 'installing' | 'success' | 'fail'
+      let installState = {};
+      let editingId = null;
+      let uploadedApk = null;
+      let uploadInProgress = false;
+      let reconnectTimer = null;
+      const RECONNECT_DELAY = 3000;
+
+      // DOM refs
+      const connDot = document.getElementById('connDot');
+      const connText = document.getElementById('connText');
+      const deviceBody = document.getElementById('deviceBody');
+      const deviceCount = document.getElementById('deviceCount');
+      const emptyState = document.getElementById('emptyState');
+      const selectAll = document.getElementById('selectAll');
+      const packageName = document.getElementById('packageName');
+      const extraData = document.getElementById('extraData');
+      const btnSelected = document.getElementById('btnSelected');
+      const btnAll = document.getElementById('btnAll');
+      const apkFile = document.getElementById('apkFile');
+      const apkSummary = document.getElementById('apkSummary');
+      const btnInstallSelected = document.getElementById('btnInstallSelected');
+      const btnInstallAll = document.getElementById('btnInstallAll');
+      const startupPackageName = document.getElementById('startupPackageName');
+      const startupExtraData = document.getElementById('startupExtraData');
+      const btnSetStartupSelected = document.getElementById('btnSetStartupSelected');
+      const btnSetStartupAll = document.getElementById('btnSetStartupAll');
+      const btnClearStartupSelected = document.getElementById('btnClearStartupSelected');
+      const btnClearStartupAll = document.getElementById('btnClearStartupAll');
+      const logContainer = document.getElementById('logContainer');
+      const logEmpty = document.getElementById('logEmpty');
+      const btnClearLog = document.getElementById('btnClearLog');
+
+      function getDeviceId(device) {
+        return device.device_id || device.serial_number || '';
+      }
+
+      // A device is online unless the server explicitly marks it offline.
+      function isOnline(device) {
+        return device.status !== 'offline';
+      }
+
+      // IDs of currently online devices (the only valid command targets).
+      function getOnlineIds() {
+        return devices.filter(isOnline).map(getDeviceId).filter(Boolean);
+      }
+
+      // Friendly identifier for logs: prefer the label, fall back to the serial.
+      function labelFor(id) {
+        if (!id) return '-';
+        var d = devices.find(function (x) { return getDeviceId(x) === id; });
+        return (d && d.label) ? d.label : id;
+      }
+
+      // Connection status
+      function setConnStatus(state) {
+        connDot.className = 'conn-dot';
+        if (state === 'connected') {
+          connDot.classList.add('connected');
+          connText.textContent = 'Connected';
+        } else if (state === 'reconnecting') {
+          connDot.classList.add('reconnecting');
+          connText.textContent = 'Reconnecting...';
+        } else {
+          connText.textContent = 'Disconnected';
+        }
+      }
+
+      // WebSocket
+      function connect() {
+        if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const url = proto + '//' + location.host + '/ws/admin';
+        ws = new WebSocket(url);
+
+        ws.onopen = function () {
+          setConnStatus('connected');
+          addLog('Connected to server', 'info');
+          if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+          }
+        };
+
+        ws.onclose = function () {
+          setConnStatus('reconnecting');
+          addLog('Disconnected from server', 'fail');
+          scheduleReconnect();
+        };
+
+        ws.onerror = function () {
+          // onclose will fire after this
+        };
+
+        ws.onmessage = function (e) {
+          try {
+            const msg = JSON.parse(e.data);
+            handleMessage(msg);
+          } catch (err) {
+            addLog('Failed to parse message: ' + err.message, 'fail');
+          }
+        };
+      }
+
+      function scheduleReconnect() {
+        if (reconnectTimer) return;
+        reconnectTimer = setTimeout(function () {
+          reconnectTimer = null;
+          addLog('Attempting to reconnect...', 'info');
+          connect();
+        }, RECONNECT_DELAY);
+      }
+
+      function handleMessage(msg) {
+        switch (msg.type) {
+          case 'DEVICE_LIST':
+            devices = msg.devices || [];
+            // Prune selected IDs that are no longer in the device list. Offline
+            // devices remain in the list, so a selection survives for labeling.
+            const currentIds = new Set(devices.map(getDeviceId).filter(Boolean));
+            selectedIds.forEach(function (id) {
+              if (!currentIds.has(id)) selectedIds.delete(id);
+            });
+            // Drop install status for any device that is not currently online: keeps
+            // the online-only install model honest and avoids a stuck "Installing…"
+            // spinner on a device that dropped mid-install.
+            const onlineNow = new Set(getOnlineIds());
+            Object.keys(installState).forEach(function (id) {
+              if (!onlineNow.has(id)) delete installState[id];
+            });
+            renderDevices();
+            break;
+
+          case 'LAUNCH_RESULT':
+            var status = msg.status === 'success' ? 'success' : 'fail';
+            var label = msg.status === 'success' ? 'OK' : 'FAIL';
+            var launchDetail = msg.error || msg.message || '';
+            addLog('[' + label + '] ' + msg.package_name + ' on ' + labelFor(msg.device_id) + (launchDetail ? ' - ' + launchDetail : ''), status);
+            break;
+
+          case 'LAUNCH_SENT':
+            addLog('Launch command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info');
+            break;
+
+          case 'INSTALL_SENT':
+            addLog('Install command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info');
+            break;
+
+          case 'INSTALL_RESULT':
+            var installStatus = msg.status === 'success' ? 'success' : 'fail';
+            var installLabel = msg.status === 'success' ? 'OK' : 'FAIL';
+            var installDetail = msg.error || msg.message || '';
+            if (msg.device_id) {
+              installState[msg.device_id] = {
+                status: installStatus,
+                filename: msg.apk_filename || '',
+                detail: installDetail
+              };
+              updateInstallCell(msg.device_id);
+            }
+            addLog('[' + installLabel + '] install ' + (msg.apk_filename || '-') + ' on ' + labelFor(msg.device_id) + (installDetail ? ' - ' + installDetail : ''), installStatus);
+            break;
+
+          case 'DEVICE_LABEL_SET':
+            addLog('Label set: ' + (msg.device_id || '-') + ' -> ' + (msg.label || '(cleared)'), 'success');
+            break;
+
+          case 'DEVICE_FORGOTTEN':
+            addLog('Device forgotten: ' + (msg.device_id || '-'), 'success');
+            break;
+
+          case 'ERROR':
+            addLog('[ERROR] ' + (msg.message || 'Unknown error'), 'fail');
+            break;
+
+          case 'SET_STARTUP_APP_SENT':
+            addLog('Startup app set: ' + msg.package_name + ' (' + msg.sent_count + '/' + msg.target_count + ' devices)', 'success');
+            break;
+
+          case 'CLEAR_STARTUP_APP_SENT':
+            addLog('Startup app cleared (' + msg.sent_count + '/' + msg.target_count + ' devices)', 'success');
+            break;
+
+          case 'STARTUP_APP_RESULT':
+            var saStatus = msg.status === 'success' ? 'success' : 'fail';
+            var saLabel = msg.status === 'success' ? 'OK' : 'FAIL';
+            addLog('[Startup ' + saLabel + '] ' + (msg.package_name || '') + (msg.device_id ? ' on ' + msg.device_id : '') + (msg.error ? ' - ' + msg.error : ''), saStatus);
+            break;
+
+          default:
+            addLog('Received: ' + msg.type, 'info');
+        }
+      }
+
+      // Render device table
+      function renderDevices() {
+        var onlineCount = devices.filter(isOnline).length;
+        deviceCount.textContent = onlineCount + ' online / ' + devices.length + ' total';
+        emptyState.style.display = devices.length ? 'none' : 'block';
+
+        deviceBody.innerHTML = '';
+        devices.forEach(function (dev) {
+          var tr = document.createElement('tr');
+          var id = getDeviceId(dev);
+          var offline = !isOnline(dev);
+          tr.dataset.deviceId = id;
+          if (offline) tr.classList.add('offline');
+
+          // Checkbox
+          var tdCb = document.createElement('td');
+          var cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.checked = selectedIds.has(id);
+          cb.addEventListener('change', function () {
+            if (cb.checked) {
+              selectedIds.add(id);
+            } else {
+              selectedIds.delete(id);
+            }
+            updateSelectAll();
+            updateButtons();
+          });
+          tdCb.appendChild(cb);
+          tr.appendChild(tdCb);
+
+          // Device: label (primary) + serial (sub), with inline edit
+          var tdDevice = document.createElement('td');
+          tdDevice.appendChild(buildDeviceCell(dev, id));
+          tr.appendChild(tdDevice);
+
+          // Model
+          var tdModel = document.createElement('td');
+          tdModel.textContent = dev.model || '-';
+          tr.appendChild(tdModel);
+
+          // IP Address
+          var tdIp = document.createElement('td');
+          tdIp.textContent = dev.ip || '-';
+          tr.appendChild(tdIp);
+
+          // Startup App
+          var tdStartup = document.createElement('td');
+          tdStartup.textContent = (dev.startup_app && dev.startup_app.package_name) ? dev.startup_app.package_name : '-';
+          tdStartup.style.fontSize = '13px';
+          tdStartup.style.color = (dev.startup_app && dev.startup_app.package_name) ? 'var(--success)' : 'var(--text-secondary)';
+          tr.appendChild(tdStartup);
+
+          // Status (online/offline; offline rows show last-seen + a Forget action)
+          var tdStatus = document.createElement('td');
+          var dot = document.createElement('span');
+          dot.className = 'status-dot' + (offline ? ' offline' : '');
+          tdStatus.appendChild(dot);
+          tdStatus.appendChild(document.createTextNode(offline ? 'Offline' : 'Online'));
+          if (offline && dev.last_seen) {
+            var seen = document.createElement('span');
+            seen.className = 'last-seen';
+            seen.textContent = formatRelativeTime(dev.last_seen);
+            seen.title = 'Last seen ' + new Date(dev.last_seen * 1000).toLocaleString();
+            tdStatus.appendChild(seen);
+          }
+          if (offline) {
+            var forget = document.createElement('button');
+            forget.className = 'forget-btn';
+            forget.title = 'Forget this device';
+            forget.textContent = '🗑';
+            forget.addEventListener('click', function () {
+              var name = dev.label || id;
+              if (confirm('Forget "' + name + '"?\nIt will be removed from the list until it connects again.')) {
+                sendForget(id);
+              }
+            });
+            tdStatus.appendChild(forget);
+          }
+          tr.appendChild(tdStatus);
+
+          // Install status
+          var tdInstall = document.createElement('td');
+          tdInstall.className = 'install-cell';
+          renderInstallCell(tdInstall, id);
+          tr.appendChild(tdInstall);
+
+          deviceBody.appendChild(tr);
+        });
+
+        updateSelectAll();
+        updateButtons();
+      }
+
+      // Fill an install-status cell from installState[id].
+      function renderInstallCell(td, id) {
+        td.innerHTML = '';
+        var st = installState[id];
+        if (!st) {
+          var none = document.createElement('span');
+          none.className = 'install-none';
+          none.textContent = '—';
+          td.appendChild(none);
+          return;
+        }
+
+        var badge = document.createElement('span');
+        badge.className = 'install-' + st.status;
+
+        if (st.status === 'installing') {
+          var spin = document.createElement('span');
+          spin.className = 'install-spinner';
+          spin.textContent = '⟳';
+          badge.appendChild(spin);
+          badge.appendChild(document.createTextNode(' Installing…'));
+        } else if (st.status === 'success') {
+          badge.textContent = '✓ installed';
+        } else {
+          badge.textContent = '✗ failed';
+          if (st.detail) badge.title = st.detail;
+        }
+        td.appendChild(badge);
+
+        if (st.filename) {
+          var file = document.createElement('span');
+          file.className = 'install-file';
+          file.textContent = st.filename;
+          file.title = st.filename + (st.detail && st.status === 'fail' ? ' — ' + st.detail : '');
+          td.appendChild(file);
+        }
+      }
+
+      // Update only the install cell for one device, leaving the rest of the row
+      // (and any in-progress inline label edit) untouched.
+      function updateInstallCell(id) {
+        var rows = deviceBody.children;
+        for (var i = 0; i < rows.length; i++) {
+          if (rows[i].dataset.deviceId === id) {
+            var td = rows[i].querySelector('.install-cell');
+            if (td) renderInstallCell(td, id);
+            return;
+          }
+        }
+      }
+
+      // Build the "Device" cell: label (primary) + serial (sub), with inline edit
+      function buildDeviceCell(dev, id) {
+        var wrap = document.createElement('div');
+        var label = dev.label || '';
+
+        if (editingId === id) {
+          var editRow = document.createElement('div');
+          editRow.className = 'device-edit';
+
+          var input = document.createElement('input');
+          input.type = 'text';
+          input.className = 'label-input';
+          input.value = label;
+          input.placeholder = 'DEV-001';
+          input.maxLength = 64;
+
+          var commit = function () {
+            editingId = null;
+            sendSetLabel(id, input.value.trim());
+            renderDevices();
+          };
+          var cancel = function () {
+            editingId = null;
+            renderDevices();
+          };
+
+          var save = document.createElement('button');
+          save.className = 'btn-mini btn-save';
+          save.textContent = 'Save';
+          save.addEventListener('click', commit);
+
+          var cancelBtn = document.createElement('button');
+          cancelBtn.className = 'btn-mini btn-cancel';
+          cancelBtn.textContent = 'Cancel';
+          cancelBtn.addEventListener('click', cancel);
+
+          input.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') { e.preventDefault(); commit(); }
+            else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+          });
+
+          editRow.appendChild(input);
+          editRow.appendChild(save);
+          editRow.appendChild(cancelBtn);
+          wrap.appendChild(editRow);
+
+          // Focus once the cell is attached to the DOM
+          setTimeout(function () { input.focus(); input.select(); }, 0);
+        } else {
+          var labelRow = document.createElement('div');
+          labelRow.className = 'device-label-row';
+
+          var labelSpan = document.createElement('span');
+          labelSpan.className = 'device-label' + (label ? '' : ' unlabeled');
+          labelSpan.textContent = label || '—';
+          labelRow.appendChild(labelSpan);
+
+          var edit = document.createElement('button');
+          edit.className = 'label-edit-btn';
+          edit.title = label ? 'Edit label' : 'Assign label';
+          edit.textContent = '✏';
+          edit.addEventListener('click', function () {
+            editingId = id;
+            renderDevices();
+          });
+          labelRow.appendChild(edit);
+
+          wrap.appendChild(labelRow);
+        }
+
+        var serial = document.createElement('div');
+        serial.className = 'device-serial';
+        serial.textContent = id;
+        wrap.appendChild(serial);
+
+        return wrap;
+      }
+
+      function sendSetLabel(serial, label) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          addLog('Cannot set label: not connected to server', 'fail');
+          return;
+        }
+        ws.send(JSON.stringify({ type: 'SET_DEVICE_LABEL', device_id: serial, label: label }));
+      }
+
+      function sendForget(serial) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          addLog('Cannot forget device: not connected to server', 'fail');
+          return;
+        }
+        ws.send(JSON.stringify({ type: 'FORGET_DEVICE', device_id: serial }));
+      }
+
+      // Select All
+      selectAll.addEventListener('change', function () {
+        if (selectAll.checked) {
+          devices.forEach(function (d) {
+            var id = getDeviceId(d);
+            if (id) selectedIds.add(id);
+          });
+        } else {
+          selectedIds.clear();
+        }
+        renderDevices();
+      });
+
+      function updateSelectAll() {
+        if (devices.length === 0) {
+          selectAll.checked = false;
+          selectAll.indeterminate = false;
+        } else if (selectedIds.size === devices.length) {
+          selectAll.checked = true;
+          selectAll.indeterminate = false;
+        } else if (selectedIds.size > 0) {
+          selectAll.checked = false;
+          selectAll.indeterminate = true;
+        } else {
+          selectAll.checked = false;
+          selectAll.indeterminate = false;
+        }
+      }
+
+      // Button states
+      function updateButtons() {
+        // Commands target online devices only, so the "All" actions are gated on the
+        // online count, not the total (which now includes offline devices).
+        var onlineCount = getOnlineIds().length;
+        var hasPkg = packageName.value.trim() !== '';
+        var hasApkFile = apkFile.files.length > 0;
+        btnAll.disabled = !hasPkg || onlineCount === 0;
+        btnSelected.disabled = !hasPkg || selectedIds.size === 0;
+        btnInstallAll.disabled = uploadInProgress || !hasApkFile || onlineCount === 0;
+        btnInstallSelected.disabled = uploadInProgress || !hasApkFile || selectedIds.size === 0;
+
+        var hasStartupPkg = startupPackageName.value.trim() !== '';
+        btnSetStartupAll.disabled = !hasStartupPkg || onlineCount === 0;
+        btnSetStartupSelected.disabled = !hasStartupPkg || selectedIds.size === 0;
+        btnClearStartupAll.disabled = onlineCount === 0;
+        btnClearStartupSelected.disabled = selectedIds.size === 0;
+      }
+
+      packageName.addEventListener('input', updateButtons);
+      apkFile.addEventListener('change', function () {
+        uploadedApk = null;
+        var file = apkFile.files[0];
+        if (file) {
+          apkSummary.textContent = 'Selected: ' + file.name + ' (' + formatBytes(file.size) + ')';
+        } else {
+          apkSummary.textContent = 'No APK selected';
+        }
+        updateButtons();
+      });
+      startupPackageName.addEventListener('input', updateButtons);
+
+      // Launch commands
+      btnSelected.addEventListener('click', function () {
+        sendLaunch(Array.from(selectedIds));
+      });
+
+      btnAll.addEventListener('click', function () {
+        sendLaunch(getOnlineIds());
+      });
+
+      function sendLaunch(targetDevices) {
+        var pkg = packageName.value.trim();
+        if (!pkg) return;
+
+        var msg = {
+          type: 'LAUNCH_APP',
+          target_devices: targetDevices,
+          package_name: pkg
+        };
+
+        var extra = extraData.value.trim();
+        if (extra) {
+          msg.extra_data = extra;
+        }
+
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          addLog('Cannot send: not connected to server', 'fail');
+          return;
+        }
+
+        ws.send(JSON.stringify(msg));
+        addLog('Launching ' + pkg + ' on ' + targetDevices.length + ' device(s)', 'info');
+      }
+
+      // APK install commands (upload happens automatically on first install)
+      btnInstallSelected.addEventListener('click', function () {
+        sendInstall(Array.from(selectedIds));
+      });
+
+      btnInstallAll.addEventListener('click', function () {
+        sendInstall(getOnlineIds());
+      });
+
+      // Upload the selected APK if it has not been uploaded yet, then resolve with
+      // its metadata. Reuses the previous upload when installing to multiple targets.
+      function ensureUploaded() {
+        if (uploadedApk) return Promise.resolve(uploadedApk);
+
+        var file = apkFile.files[0];
+        if (!file) return Promise.reject(new Error('No APK selected'));
+        if (!file.name.toLowerCase().endsWith('.apk')) {
+          return Promise.reject(new Error('Select an .apk file'));
+        }
+
+        var formData = new FormData();
+        formData.append('apk', file);
+        uploadInProgress = true;
+        apkSummary.textContent = 'Uploading ' + file.name + '...';
+        updateButtons();
+
+        return fetch('/api/apks', {
+          method: 'POST',
+          body: formData
+        })
+          .then(function (response) {
+            return response.json().catch(function () {
+              return {};
+            }).then(function (payload) {
+              if (!response.ok) {
+                throw new Error(payload.error || response.statusText);
+              }
+              return payload;
+            });
+          })
+          .then(function (payload) {
+            uploadedApk = payload;
+            apkSummary.innerHTML = 'Uploaded: <strong>' + escapeHtml(payload.apk_filename) + '</strong> (' + formatBytes(payload.size || file.size) + ')';
+            addLog('Uploaded APK: ' + payload.apk_filename, 'success');
+            return payload;
+          })
+          .finally(function () {
+            uploadInProgress = false;
+            updateButtons();
+          });
+      }
+
+      function sendInstall(targetDevices) {
+        if (targetDevices.length === 0 || uploadInProgress) return;
+
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          addLog('Cannot send: not connected to server', 'fail');
+          return;
+        }
+
+        // Quick Install targets online devices only. Any target that is offline or no
+        // longer in the device list (e.g. it disconnected after selection) is skipped
+        // with a warning — there is no queueing for later.
+        var onlineSet = new Set(getOnlineIds());
+        var online = targetDevices.filter(function (id) { return onlineSet.has(id); });
+        var offline = targetDevices.filter(function (id) { return !onlineSet.has(id); });
+
+        if (offline.length > 0) {
+          addLog('Skipping ' + offline.length + ' offline device(s): ' +
+            offline.map(labelFor).join(', '), 'warn');
+        }
+        if (online.length === 0) {
+          addLog('No online devices selected to install', 'warn');
+          return;
+        }
+
+        ensureUploaded()
+          .then(function (apk) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+              addLog('Cannot send: not connected to server', 'fail');
+              return;
+            }
+            var msg = {
+              type: 'INSTALL_APK',
+              target_devices: online,
+              apk_url: apk.apk_url,
+              apk_filename: apk.apk_filename
+            };
+            ws.send(JSON.stringify(msg));
+            // Mark each target as installing now (INSTALL_SENT carries only counts,
+            // not ids, so send time is the only place we know the targets).
+            online.forEach(function (id) {
+              installState[id] = { status: 'installing', filename: apk.apk_filename, detail: '' };
+              updateInstallCell(id);
+            });
+            addLog('Installing ' + apk.apk_filename + ' on ' + online.length + ' device(s)', 'info');
+          })
+          .catch(function (err) {
+            apkSummary.textContent = 'Upload failed';
+            addLog('APK install failed: ' + err.message, 'fail');
+          });
+      }
+
+      // Compact "time since" for an epoch-seconds timestamp (used for last-seen).
+      function formatRelativeTime(epochSeconds) {
+        if (!epochSeconds) return '';
+        var diff = Date.now() / 1000 - epochSeconds;
+        if (diff < 0) diff = 0;
+        if (diff < 60) return 'just now';
+        var mins = Math.floor(diff / 60);
+        if (mins < 60) return mins + 'm ago';
+        var hours = Math.floor(mins / 60);
+        if (hours < 24) return hours + 'h ago';
+        var days = Math.floor(hours / 24);
+        return days + 'd ago';
+      }
+
+      function formatBytes(bytes) {
+        if (!bytes) return '0 B';
+        var units = ['B', 'KB', 'MB', 'GB'];
+        var value = bytes;
+        var index = 0;
+        while (value >= 1024 && index < units.length - 1) {
+          value = value / 1024;
+          index += 1;
+        }
+        return value.toFixed(index === 0 ? 0 : 1) + ' ' + units[index];
+      }
+
+      function escapeHtml(text) {
+        var span = document.createElement('span');
+        span.textContent = text || '';
+        return span.innerHTML;
+      }
+
+      // Startup app commands
+      btnSetStartupSelected.addEventListener('click', function () {
+        sendSetStartupApp(Array.from(selectedIds));
+      });
+
+      btnSetStartupAll.addEventListener('click', function () {
+        sendSetStartupApp(getOnlineIds());
+      });
+
+      btnClearStartupSelected.addEventListener('click', function () {
+        sendClearStartupApp(Array.from(selectedIds));
+      });
+
+      btnClearStartupAll.addEventListener('click', function () {
+        sendClearStartupApp(getOnlineIds());
+      });
+
+      function sendSetStartupApp(targetDevices) {
+        var pkg = startupPackageName.value.trim();
+        if (!pkg) return;
+
+        var msg = {
+          type: 'SET_STARTUP_APP',
+          target_devices: targetDevices,
+          package_name: pkg
+        };
+
+        var extra = startupExtraData.value.trim();
+        if (extra) {
+          msg.extra_data = extra;
+        }
+
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          addLog('Cannot send: not connected to server', 'fail');
+          return;
+        }
+
+        ws.send(JSON.stringify(msg));
+        addLog('Setting startup app ' + pkg + ' on ' + targetDevices.length + ' device(s)', 'info');
+      }
+
+      function sendClearStartupApp(targetDevices) {
+        var msg = {
+          type: 'CLEAR_STARTUP_APP',
+          target_devices: targetDevices
+        };
+
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          addLog('Cannot send: not connected to server', 'fail');
+          return;
+        }
+
+        ws.send(JSON.stringify(msg));
+        addLog('Clearing startup app on ' + targetDevices.length + ' device(s)', 'info');
+      }
+
+      // Activity log
+      function addLog(message, type) {
+        logEmpty.style.display = 'none';
+
+        var entry = document.createElement('div');
+        entry.className = 'log-entry';
+
+        var time = document.createElement('span');
+        time.className = 'log-time';
+        var now = new Date();
+        time.textContent = now.toLocaleTimeString();
+
+        var msg = document.createElement('span');
+        msg.className = 'log-msg ' + (type || 'info');
+        msg.textContent = message;
+
+        entry.appendChild(time);
+        entry.appendChild(msg);
+        logContainer.appendChild(entry);
+        logContainer.scrollTop = logContainer.scrollHeight;
+      }
+
+      btnClearLog.addEventListener('click', function () {
+        logContainer.innerHTML = '';
+        logContainer.appendChild(logEmpty);
+        logEmpty.style.display = 'block';
+      });
+
+      // Collapsible command sections (accordion: only one open at a time)
+      var accordionCards = Array.prototype.slice.call(document.querySelectorAll('.card.collapsible'));
+      accordionCards.forEach(function (card) {
+        var header = card.querySelector('.collapsible-header');
+        header.addEventListener('click', function () {
+          var willOpen = card.classList.contains('collapsed');
+          accordionCards.forEach(function (c) { c.classList.add('collapsed'); });
+          if (willOpen) card.classList.remove('collapsed');
+        });
+      });
+
+      // Initialize
+      connect();
+    })();
+  </script>
+</body>
+
+</html>
