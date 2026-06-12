@@ -45,13 +45,24 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      - name: Build debug APK
+      - name: Decode release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: echo "$KEYSTORE_BASE64" | base64 -d > mdm-client/release.keystore
+
+      - name: Build release APK
         working-directory: mdm-client
-        run: gradle assembleDebug
+        env:
+          KEYSTORE_FILE: ${{ github.workspace }}/mdm-client/release.keystore
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: gradle assembleRelease
 
       - name: Upload APK to release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          APK=$(find mdm-client/app/build/outputs/apk/debug -name "*.apk" | head -1)
-          gh release upload "${{ github.event.release.tag_name }}" "$APK" --clobber
+          APK=$(find mdm-client/app/build/outputs/apk/release -name "*.apk" | head -1)
+          gh release upload "$RELEASE_TAG" "$APK" --clobber
