@@ -20,13 +20,12 @@ venv/
 .env
 
 # === Android / Gradle ===
+# NOTE: The Gradle wrapper (gradlew, gradlew.bat, gradle/wrapper/) is intentionally
+# committed so build.sh and CI can pin the required Gradle version. Do not ignore it.
 mdm-client/.gradle/
 mdm-client/build/
 mdm-client/app/build/
 mdm-client/local.properties
-mdm-client/gradle/
-mdm-client/gradlew
-mdm-client/gradlew.bat
 *.apk
 *.aab
 *.ap_
