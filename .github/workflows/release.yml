@@ -43,7 +43,7 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.2"
+          gradle-version: "8.9"
 
       - name: Build debug APK
         working-directory: mdm-client
