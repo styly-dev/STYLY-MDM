@@ -1,6 +1,6 @@
-# STYLY-MDM
+# STYLY-MDM for LBE
 
-A lightweight remote device management system for standalone VR headsets. STYLY-MDM lets you launch applications on one or more HMDs simultaneously from a web browser — no physical access to each headset required.
+A lightweight Mobile Device Management (MDM) system purpose-built for Location Based Experience (LBE) — managing standalone VR headsets deployed at venues, events, and attractions. STYLY-MDM lets you launch applications on one or more HMDs simultaneously from a web browser — no physical access to each headset required.
 
 STYLY-MDM currently supports PICO devices (PICO OS with Business Mode). Support for other device platforms is planned for the future.
 
