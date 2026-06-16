@@ -6,7 +6,7 @@ STYLY-MDM currently supports PICO devices (PICO OS with Business Mode). Support 
 
 > **Note:** STYLY-MDM is designed for use within a local area network (LAN). It does not include any authentication mechanism. Do not expose the server to the public internet.
 
-<img width="898" height="913" alt="STYLY-MDM" src="https://github.com/user-attachments/assets/d72e973a-9e37-4a8d-99bf-8cc0e9b69bb3" />
+<img width="898" height="913" alt="STYLY-MDM" src="docs/images/screenshot.png" />
 
 ## Features
 
