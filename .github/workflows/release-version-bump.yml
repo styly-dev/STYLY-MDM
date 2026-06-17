@@ -1,0 +1,138 @@
+name: 'Release: bump version & draft'
+
+# Manually triggered. Given a versionName, this workflow:
+#   1. Bumps versionName in mdm-client/app/build.gradle and auto-increments versionCode.
+#   2. Commits the bump to develop.
+#   3. Creates a DRAFT GitHub Release tagged vX.Y.Z targeting develop.
+#
+# It intentionally stops at a draft. Publishing the draft is a MANUAL step, and that human
+# publish is what triggers release.yml to build and attach the signed APK. This is required:
+# a workflow using the default GITHUB_TOKEN cannot trigger another workflow, so auto-publishing
+# here would silently suppress the `release: published` event and the APK would never build.
+# (If auto-publish is ever wanted, release.yml would have to be triggered via a PAT instead.)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'versionName (semver, e.g. 0.2.0). versionCode is auto-incremented.'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  bump-and-draft:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout develop
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0 # Full history so the bump commit pushes cleanly.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate version format
+        env:
+          # Pass via env (never interpolate untrusted ${{ ... }} directly into the shell).
+          VERSION_INPUT: ${{ github.event.inputs.version }}
+        run: |
+          # Strip a leading v/V if present.
+          VERSION="${VERSION_INPUT#[vV]}"
+          if ! echo "$VERSION" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$' > /dev/null; then
+            echo "::error::Invalid version format: '$VERSION' (expected semver, e.g. 0.2.0 or 0.2.0-beta.1)"
+            exit 1
+          fi
+          # Safe to export now: the regex above guarantees VERSION is semver-only.
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "✅ Version format valid: $VERSION"
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Ensure develop is up to date
+        run: |
+          git fetch origin develop
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/develop)" ]; then
+            echo "::error::Local develop is not in sync with origin/develop. Re-run after the workflow checks out the latest develop."
+            exit 1
+          fi
+          echo "✅ develop is up to date"
+
+      - name: Bump versionName and versionCode
+        run: |
+          BUILD_GRADLE="mdm-client/app/build.gradle"
+          [ -f "$BUILD_GRADLE" ] || { echo "::error::$BUILD_GRADLE not found"; exit 1; }
+
+          CURRENT_NAME=$(grep -E '^[[:space:]]*versionName[[:space:]]+"' "$BUILD_GRADLE" | head -1 | sed -E 's/.*versionName[[:space:]]+"([^"]*)".*/\1/')
+          CURRENT_CODE=$(grep -E '^[[:space:]]*versionCode[[:space:]]+[0-9]+' "$BUILD_GRADLE" | head -1 | grep -oE '[0-9]+')
+          [ -n "$CURRENT_CODE" ] || { echo "::error::Could not read current versionCode from $BUILD_GRADLE"; exit 1; }
+          NEW_CODE=$((CURRENT_CODE + 1))
+
+          echo "versionName: $CURRENT_NAME -> $VERSION"
+          echo "versionCode: $CURRENT_CODE -> $NEW_CODE"
+
+          sed -i -E "s/^([[:space:]]*)versionName[[:space:]]+\".*\"/\1versionName \"$VERSION\"/" "$BUILD_GRADLE"
+          sed -i -E "s/^([[:space:]]*)versionCode[[:space:]]+[0-9]+/\1versionCode $NEW_CODE/" "$BUILD_GRADLE"
+
+          # Re-read and verify the edit landed exactly as intended.
+          AFTER_NAME=$(grep -E '^[[:space:]]*versionName[[:space:]]+"' "$BUILD_GRADLE" | head -1 | sed -E 's/.*versionName[[:space:]]+"([^"]*)".*/\1/')
+          AFTER_CODE=$(grep -E '^[[:space:]]*versionCode[[:space:]]+[0-9]+' "$BUILD_GRADLE" | head -1 | grep -oE '[0-9]+')
+          if [ "$AFTER_NAME" != "$VERSION" ] || [ "$AFTER_CODE" != "$NEW_CODE" ]; then
+            echo "::error::build.gradle verification failed (versionName=$AFTER_NAME versionCode=$AFTER_CODE)"
+            exit 1
+          fi
+
+          echo "NEW_CODE=$NEW_CODE" >> "$GITHUB_ENV"
+          echo "CURRENT_NAME=$CURRENT_NAME" >> "$GITHUB_ENV"
+
+      - name: Commit and push to develop
+        run: |
+          git add mdm-client/app/build.gradle
+          if git diff --staged --quiet; then
+            echo "::error::No changes to commit — version may already be $VERSION."
+            exit 1
+          fi
+          git commit -m "chore: bump version to $VERSION (versionCode $NEW_CODE)"
+          git push origin develop
+          echo "✅ Pushed version bump to develop"
+
+      - name: Create draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v$VERSION"
+          gh release create "$TAG" \
+            --draft \
+            --target develop \
+            --title "$TAG" \
+            --generate-notes
+          echo "✅ Draft release created: $TAG (targeting develop)"
+          echo "👉 Review the notes and click **Publish release** to build & attach the signed APK."
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "# 📦 Release version bump"
+            echo ""
+            if [ "${{ job.status }}" == "success" ]; then
+              echo "| Field | From | To |"
+              echo "|-------|------|----|"
+              echo "| versionName | \`${CURRENT_NAME}\` | \`${VERSION}\` |"
+              echo "| versionCode | (prev) | \`${NEW_CODE}\` |"
+              echo ""
+              echo "Draft release **\`v${VERSION}\`** created (target: \`develop\`)."
+              echo ""
+              echo "### Next step"
+              echo "Edit the notes and **Publish** the draft. That fires \`release.yml\`, which builds and attaches the signed APK."
+              echo ""
+              echo "[Open releases](https://github.com/${{ github.repository }}/releases)"
+            else
+              echo "## ❌ Failed"
+              echo "Check the logs above. Common causes: invalid version, develop branch protection blocking the push, or version already set."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -2,7 +2,10 @@ name: Build and Release APK
 
 on:
   release:
-    types: [created]
+    # Fires when a release is published (including publishing a draft created by
+    # release-version-bump.yml). Draft creation does not trigger any release event,
+    # so the version-bump workflow stops at a draft and a human publish starts this build.
+    types: [published]
 
 jobs:
   build:
