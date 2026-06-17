@@ -84,7 +84,7 @@ Uploaded APKs are stored under `mdm-server/apks/` and served to devices over the
 > adb shell appops set com.styly.mdmclient MANAGE_EXTERNAL_STORAGE allow
 > ```
 >
-> (or toggle **All files access** for the app in the headset's app settings). Without it, installs fail with `pbsControlAPPManger returned 102: APK does not exist`.
+> (or toggle **All files access** for the app in the headset's app settings). The client's own settings screen also shows the current grant status and a **Grant All Files Access** button that opens this settings page. Without it, installs fail with `pbsControlAPPManger returned 102: APK does not exist`.
 
 ## Documentation
 
