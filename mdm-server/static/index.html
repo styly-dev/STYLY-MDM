@@ -1354,6 +1354,14 @@
               updateInstallCell(id);
             });
             addLog('Installing ' + apk.apk_filename + ' on ' + online.length + ' device(s)', 'info');
+            // Clear the selection after each install. Over a LAN (non-secure context) the
+            // browser only holds a one-time File snapshot and cannot detect a local rebuild,
+            // so we force a fresh pick next time — this prevents silently re-installing a
+            // stale APK after the .apk has been rebuilt.
+            apkFile.value = '';
+            uploadedApk = null;
+            apkSummary.textContent = 'No APK selected';
+            updateButtons();
           })
           .catch(function (err) {
             apkSummary.textContent = 'Upload failed';
