@@ -51,3 +51,29 @@
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
 - **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
 - **English Only**: All code comments, log messages, and user-facing strings must be written in English.
+
+## External Documentation (Context7)
+
+When implementing, modifying, reviewing, or debugging anything related to PICO
+enterprise devices — device management, enterprise deployment, the PICO
+Enterprise SDK (TobService), silent app install/uninstall, device owner
+settings, permissions, or Android manifest settings for PICO devices — use
+Context7 before writing code.
+
+Primary reference:
+
+- **PICO Business documentation**
+- Context7 URL: https://context7.com/websites/business_picoxr_us_doc
+- Preferred Context7 library ID: `/websites/business_picoxr_us_doc`
+
+Query the exact library ID `/websites/business_picoxr_us_doc` directly instead
+of doing a generic library search.
+
+Do not rely only on memory for PICO Enterprise SDK APIs, permissions, Android
+manifest settings, enterprise deployment behavior, device management behavior,
+or version-specific behavior. Check the current Context7 documentation first.
+
+Claude Code picks up the Context7 MCP server automatically from the
+project-scoped `.mcp.json`. For Codex, register it once with
+`codex mcp add context7 --url https://mcp.context7.com/mcp` (Codex does not
+read a project-local `.codex/config.toml`).
