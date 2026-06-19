@@ -74,6 +74,11 @@ manifest settings, enterprise deployment behavior, device management behavior,
 or version-specific behavior. Check the current Context7 documentation first.
 
 Claude Code picks up the Context7 MCP server automatically from the
-project-scoped `.mcp.json`. For Codex, register it once with
-`codex mcp add context7 --url https://mcp.context7.com/mcp` (Codex does not
-read a project-local `.codex/config.toml`).
+project-scoped `.mcp.json`. Codex CLI 0.141.0 and later can read the
+project-scoped `.codex/config.toml` when the project is trusted. If Context7 is
+not listed by `codex mcp list`, trust this project or register the server in
+the user-level config with:
+
+```bash
+codex mcp add context7 --url https://mcp.context7.com/mcp
+```
