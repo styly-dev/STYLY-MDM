@@ -86,6 +86,23 @@ Uploaded APKs are stored under `mdm-server/apks/` and served to devices over the
 >
 > (or toggle **All files access** for the app in the headset's app settings). The client's own settings screen also shows the current grant status and a **Grant All Files Access** button that opens this settings page. Without it, installs fail with `pbsControlAPPManger returned 102: APK does not exist`.
 
+## For Maintainers
+
+### Cutting a Release
+
+Releases are driven by the **`Release: bump version & draft`** workflow (`.github/workflows/release-version-bump.yml`). This is the only workflow a maintainer starts manually — do not run the build workflow directly.
+
+1. Go to **Actions → Release: bump version & draft → Run workflow**.
+2. Enter the new `versionName` (semver, e.g. `0.2.0`) and run it. The workflow:
+   - bumps `versionName` and auto-increments `versionCode` in `mdm-client/app/build.gradle`,
+   - commits the bump to `develop`, and
+   - creates a **draft** GitHub Release tagged `vX.Y.Z`.
+3. Open the draft release on GitHub, review the auto-generated notes, and click **Publish release**.
+4. Publishing the draft automatically triggers **`Build and Release APK`** (`.github/workflows/release.yml`), which builds, signs, and attaches the APK to the release.
+
+> **Why two workflows, and why the manual publish step?**
+> A workflow using the default `GITHUB_TOKEN` cannot trigger another workflow. If the bump workflow auto-published the release, the `release: published` event would be suppressed and the APK would never build. Stopping at a draft and letting a human click **Publish** is what fires the build. So the only workflow you launch is `release-version-bump.yml`; the publish click is the single manual step in between.
+
 ## Documentation
 
 - **[Developer Guide](docs/DEVELOPMENT.md)** — architecture, build instructions, project structure, WebSocket / discovery protocol references, client permissions, and version requirements.
