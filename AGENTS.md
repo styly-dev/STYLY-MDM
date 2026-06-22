@@ -23,6 +23,7 @@
 - Diff behavior between main and your changes when relevant
 - Ask yourself: "Would a staff engineer approve this?"
 - Run tests, check logs, demonstrate correctness
+- When a change adds a new feature or alters the architecture, update `docs/DEVELOPMENT.md` (and its diagrams) in the same change
 
 ### 5. Demand Elegance (Balanced)
 - For non-trivial changes: pause and ask "is there a more elegant way?"
@@ -51,6 +52,7 @@
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
 - **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
 - **English Only**: All code comments, log messages, and user-facing strings must be written in English.
+- **Docs in Sync**: Keep `docs/DEVELOPMENT.md` up to date. Any new feature or architectural change must be reflected there (including the `architecture.drawio.svg` / `message-flow.drawio.svg` diagrams when relevant) as part of the same change.
 
 ## External Documentation (Context7)
 
