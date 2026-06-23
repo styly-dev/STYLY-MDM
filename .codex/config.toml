@@ -1,0 +1,14 @@
+# Codex configuration for the STYLY-MDM repository.
+#
+# Context7 MCP server: provides the latest PICO Business / Enterprise SDK
+# (TobService) documentation. Prefer querying the library ID
+# /websites/business_picoxr_us_doc for PICO-related work.
+#
+# Codex CLI 0.141.0 loads project-local .codex/config.toml files for trusted
+# projects. If Context7 is not listed by `codex mcp list`, trust this project
+# or register the server in the user-level config with:
+#   codex mcp add context7 --url https://mcp.context7.com/mcp
+
+[mcp_servers.context7]
+url = "https://mcp.context7.com/mcp"
+enabled = true
