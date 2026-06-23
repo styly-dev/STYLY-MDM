@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Overrides the launcher label for the dev flavor so it's distinguishable
+         from the production build when both are installed on the same device. -->
+    <string name="app_name">STYLY-MDM Dev</string>
+    <!-- Dev uses the dev ws port (7080) so the placeholder doesn't point at prod. -->
+    <string name="server_url_hint">ws://192.168.1.100:7080/ws/device</string>
+</resources>

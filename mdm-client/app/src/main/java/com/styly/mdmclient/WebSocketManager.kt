@@ -31,7 +31,11 @@ class WebSocketManager(
         private const val TAG = "WebSocketManager"
         const val PREF_NAME = "stylymdm_prefs"
         private const val PREF_SERVER_URL = "server_url"
-        private const val DEFAULT_SERVER_URL = "ws://192.168.1.100:7070/ws/device"
+        // Last-resort fallback used only when discovery fails and no URL is saved.
+        // The port is flavor-aware (BuildConfig.DEFAULT_WS_PORT) so the dev build
+        // never falls back to the production port and accidentally connects to a
+        // production server. The IP is just a placeholder; discovery is the real path.
+        val DEFAULT_SERVER_URL = "ws://192.168.1.100:${BuildConfig.DEFAULT_WS_PORT}/ws/device"
         private const val INITIAL_RECONNECT_DELAY_MS = 1000L
         private const val MAX_RECONNECT_DELAY_MS = 30000L
         private const val DISCOVERY_INTERVAL_MS = 15000L

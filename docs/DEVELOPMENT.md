@@ -24,11 +24,16 @@ For end-user setup and usage, see the [README](../README.md).
 
 ```bash
 cd mdm-client
-./build.sh          # debug build
-./build.sh release  # release build
+./build.sh                # prod debug (default)
+./build.sh release        # prod release
+./build.sh debug dev      # dev debug   — separate discovery port (see below)
+./build.sh release dev    # dev release
 ```
 
-The generated APK is output to `mdm-client/app/build/outputs/apk/debug/` (or `release/`).
+Usage: `./build.sh [debug|release] [prod|dev]` (defaults: `debug prod`).
+
+The generated APK is output to `mdm-client/app/build/outputs/apk/<flavor>/<type>/`,
+e.g. `apk/prod/debug/app-prod-debug.apk` or `apk/dev/debug/app-dev-debug.apk`.
 
 ### Build from Android Studio
 
@@ -38,10 +43,56 @@ The generated APK is output to `mdm-client/app/build/outputs/apk/debug/` (or `re
 ### Install the APK
 
 ```bash
-adb install mdm-client/app/build/outputs/apk/debug/app-debug.apk
+adb install mdm-client/app/build/outputs/apk/prod/debug/app-prod-debug.apk
 ```
 
 > **Dev Container:** A ready-to-use build environment is provided via [Dev Containers](https://containers.dev/). Open this repository in VS Code with the Dev Containers extension (or GitHub Codespaces) and all prerequisites (JDK 17, Android SDK 33, build-tools, Gradle) are set up automatically — no local installation needed.
+
+## Running a Dev Environment Alongside Production
+
+Only one production server may exist per LAN (clients connect to the first server
+that answers discovery). During development you often want a separate dev server and
+dev client on the **same** network without disturbing production. The `dev` build
+flavor and a pair of server environment variables isolate the two by using different
+ports, so neither environment discovers the other.
+
+| Environment | Discovery port | WebSocket port | Client applicationId |
+|---|---|---|---|
+| Production (default) | 7071 | 7070 | `com.styly.mdmclient` |
+| Development (`dev` flavor) | 7081 | 7080 | `com.styly.mdmclient.dev` |
+
+**Dev server** — start with the `dev` argument, which sets the dev ports for you:
+
+```bash
+cd mdm-server
+./run.sh dev      # dev ports (7081 / 7080); ./run.sh (or "prod") uses production ports
+```
+
+`run.sh dev` simply exports `MDM_DISCOVERY_PORT=7081` / `MDM_WS_PORT=7080` before
+launching `server.py`. You can still set those variables yourself if you prefer.
+When unset, `server.py` falls back to the production ports, so production startup is
+unchanged.
+
+**Dev client** — build the `dev` flavor:
+
+```bash
+cd mdm-client
+./build.sh debug dev      # or: ./build.sh release dev
+adb install app/build/outputs/apk/dev/debug/app-dev-debug.apk
+```
+
+The dev APK uses applicationId `com.styly.mdmclient.dev` and label **STYLY-MDM Dev**,
+so it installs side-by-side with the production build on the same headset. It only
+broadcasts/listens on the dev discovery port (7081), so it never discovers the
+production server. Its fallback URL also targets the dev WebSocket port (7080), so
+even if discovery times out it cannot accidentally connect to a production server.
+
+The ports come from `BuildConfig` fields defined per flavor in
+`mdm-client/app/build.gradle` (`DISCOVERY_PORT`, `DEFAULT_WS_PORT`).
+
+> **Device owner:** Android allows only one device owner per device. If you provision
+> the dev build as device owner for testing, the production build cannot hold
+> device-owner powers at the same time.
 
 ## Project Structure
 
@@ -117,6 +168,10 @@ STYLY-MDM supports automatic server discovery via UDP broadcast on the LAN.
 | 2 | Server → Client | Respond with JSON: `{"service": "stylymdm", "ws_url": "ws://<ip>:7070/ws/device", "version": "1.0"}` |
 
 The client waits up to 3 seconds for a response. If no server replies, discovery fails silently and the client falls back to the default or saved URL.
+
+> The ports above are the production defaults. A development server/client uses
+> port 7081 (discovery) and 7080 (WebSocket) instead — see
+> [Running a Dev Environment Alongside Production](#running-a-dev-environment-alongside-production).
 
 ## MDM Client Permissions
 

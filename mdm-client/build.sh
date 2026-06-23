@@ -17,22 +17,34 @@ if [ -z "${ANDROID_HOME:-}" ] && [ -z "${ANDROID_SDK_ROOT:-}" ]; then
 fi
 
 # --- build -------------------------------------------------------------------
+# Usage: ./build.sh [debug|release] [prod|dev]
+# Flavors: prod = production (discovery port 7071), dev = development (port 7081,
+# applicationId ".dev" so it installs alongside prod for side-by-side testing).
 BUILD_TYPE="${1:-debug}"
+FLAVOR="${2:-prod}"
 
 case "$BUILD_TYPE" in
-    debug)   TASK="assembleDebug"   ;;
-    release) TASK="assembleRelease" ;;
+    debug)   TYPE_CAP="Debug"   ;;
+    release) TYPE_CAP="Release" ;;
     *)       error "Unknown build type: $BUILD_TYPE (specify debug or release)" ;;
 esac
 
-info "Building MDM Client APK (${BUILD_TYPE}) ..."
+case "$FLAVOR" in
+    prod) FLAVOR_CAP="Prod" ;;
+    dev)  FLAVOR_CAP="Dev"  ;;
+    *)    error "Unknown flavor: $FLAVOR (specify prod or dev)" ;;
+esac
+
+TASK="assemble${FLAVOR_CAP}${TYPE_CAP}"
+
+info "Building MDM Client APK (${FLAVOR} ${BUILD_TYPE}) ..."
 # Use the Gradle wrapper, not a system-wide `gradle`. The wrapper pins the Gradle
 # version (gradle/wrapper/gradle-wrapper.properties) that the configured AGP requires;
 # a mismatched system Gradle fails the AGP version check.
 ./gradlew "$TASK"
 
 # --- output ------------------------------------------------------------------
-APK=$(find app/build/outputs/apk/"$BUILD_TYPE" -name "*.apk" 2>/dev/null | head -1)
+APK=$(find app/build/outputs/apk/"$FLAVOR"/"$BUILD_TYPE" -name "*.apk" 2>/dev/null | head -1)
 
 if [ -z "$APK" ]; then
     error "APK not found."

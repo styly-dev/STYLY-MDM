@@ -37,6 +37,31 @@ android {
         }
     }
 
+    buildFeatures {
+        // Required on AGP 8+ to generate BuildConfig with our custom fields.
+        buildConfig true
+    }
+
+    flavorDimensions += "environment"
+    productFlavors {
+        // Production: ships to real devices on the production server's discovery port.
+        prod {
+            dimension "environment"
+            buildConfigField "int", "DISCOVERY_PORT", "7071"
+            buildConfigField "int", "DEFAULT_WS_PORT", "7070"
+        }
+        // Development: separate discovery port so a dev server/APK can coexist with
+        // production on the same LAN. The ".dev" applicationId lets the dev build be
+        // installed side-by-side with the production build on the same headset.
+        dev {
+            dimension "environment"
+            applicationIdSuffix ".dev"
+            versionNameSuffix "-dev"
+            buildConfigField "int", "DISCOVERY_PORT", "7081"
+            buildConfigField "int", "DEFAULT_WS_PORT", "7080"
+        }
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
