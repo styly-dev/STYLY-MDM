@@ -8,13 +8,14 @@ import java.net.InetAddress
 
 /**
  * Discovers STYLY-MDM servers on the local network using UDP broadcast.
- * Sends a discovery request to the broadcast address on port 7071
- * and waits for a JSON response containing the server's WebSocket URL.
+ * Sends a discovery request to the broadcast address on the build flavor's
+ * discovery port (prod/dev differ so they don't find each other's server) and
+ * waits for a JSON response containing the server's WebSocket URL.
  */
 object ServerDiscovery {
 
     private const val TAG = "ServerDiscovery"
-    private const val DISCOVERY_PORT = 7071
+    private val DISCOVERY_PORT = BuildConfig.DISCOVERY_PORT
     private const val DISCOVERY_MESSAGE = "STYLYMDM_DISCOVER"
     private const val TIMEOUT_MS = 3000
 

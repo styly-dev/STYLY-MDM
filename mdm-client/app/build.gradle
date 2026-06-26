@@ -37,6 +37,33 @@ android {
         }
     }
 
+    buildFeatures {
+        // Required on AGP 8+ to generate BuildConfig with our custom fields.
+        buildConfig true
+    }
+
+    flavorDimensions += "environment"
+    productFlavors {
+        // Production: ships to real devices on the production server's discovery port.
+        prod {
+            dimension "environment"
+            buildConfigField "int", "DISCOVERY_PORT", "7071"
+            buildConfigField "int", "DEFAULT_WS_PORT", "7070"
+        }
+        // Development: separate discovery/WebSocket ports so a dev server/client can run
+        // on the same LAN as production without the two discovering each other. The
+        // applicationId is intentionally identical to prod (no suffix), so the dev build
+        // is NOT installed side-by-side — installing it replaces the production build on a
+        // device. Use a dedicated test device (or accept the replacement while testing).
+        // The "-dev" versionName and "STYLY-MDM Dev" label show which build is installed.
+        dev {
+            dimension "environment"
+            versionNameSuffix "-dev"
+            buildConfigField "int", "DISCOVERY_PORT", "7081"
+            buildConfigField "int", "DEFAULT_WS_PORT", "7080"
+        }
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8

@@ -24,11 +24,16 @@ For end-user setup and usage, see the [README](../README.md).
 
 ```bash
 cd mdm-client
-./build.sh          # debug build
-./build.sh release  # release build
+./build.sh                # prod debug (default)
+./build.sh release        # prod release
+./build.sh debug dev      # dev debug   — separate discovery port (see below)
+./build.sh release dev    # dev release
 ```
 
-The generated APK is output to `mdm-client/app/build/outputs/apk/debug/` (or `release/`).
+Usage: `./build.sh [debug|release] [prod|dev]` (defaults: `debug prod`).
+
+The generated APK is output to `mdm-client/app/build/outputs/apk/<flavor>/<type>/`,
+e.g. `apk/prod/debug/app-prod-debug.apk` or `apk/dev/debug/app-dev-debug.apk`.
 
 ### Build from Android Studio
 
@@ -38,10 +43,66 @@ The generated APK is output to `mdm-client/app/build/outputs/apk/debug/` (or `re
 ### Install the APK
 
 ```bash
-adb install mdm-client/app/build/outputs/apk/debug/app-debug.apk
+adb install mdm-client/app/build/outputs/apk/prod/debug/app-prod-debug.apk
 ```
 
 > **Dev Container:** A ready-to-use build environment is provided via [Dev Containers](https://containers.dev/). Open this repository in VS Code with the Dev Containers extension (or GitHub Codespaces) and all prerequisites (JDK 17, Android SDK 33, build-tools, Gradle) are set up automatically — no local installation needed.
+
+## Running a Dev Environment Alongside Production
+
+Only one production server may exist per LAN (clients connect to the first server
+that answers discovery). During development you often want a separate dev server and
+dev client on the **same** network without disturbing production. The `dev` build
+flavor and a pair of server environment variables isolate the two by using different
+ports, so neither environment discovers the other.
+
+| Environment | Discovery port | WebSocket port | Client build (label) |
+|---|---|---|---|
+| Production (default) | 7071 | 7070 | `prod` flavor — "STYLY-MDM Client" |
+| Development (`dev` flavor) | 7081 | 7080 | `dev` flavor — "STYLY-MDM Dev" |
+
+Both flavors share the applicationId `com.styly.mdmclient`, so they **cannot be
+installed at the same time** — installing the dev build replaces the production build
+on a device. Run the dev client on a dedicated test device, or accept that it replaces
+production while you test. Isolation between the two environments is purely by port, so
+a dev client/server never discovers a production one even on the same LAN.
+
+**Dev server** — start with the `dev` argument, which sets the dev ports for you:
+
+```bash
+cd mdm-server
+./run.sh dev      # dev ports (7081 / 7080); ./run.sh (or "prod") uses production ports
+```
+
+`run.sh dev` simply exports `MDM_DISCOVERY_PORT=7081` / `MDM_WS_PORT=7080` before
+launching `server.py`. You can still set those variables yourself if you prefer.
+When unset, `server.py` falls back to the production ports, so production startup is
+unchanged.
+
+**Dev client** — build the `dev` flavor:
+
+```bash
+cd mdm-client
+./build.sh debug dev      # or: ./build.sh release dev
+adb install app/build/outputs/apk/dev/debug/app-dev-debug.apk
+```
+
+The dev APK keeps the production applicationId `com.styly.mdmclient` and only changes
+its label to **STYLY-MDM Dev**, so installing it replaces the production build on a
+device (they share a package name and cannot coexist). It only broadcasts/listens on
+the dev discovery port (7081), so it never discovers the production server. Its
+fallback URL also targets the dev WebSocket port (7080), so even if discovery times
+out it cannot accidentally connect to a production server.
+
+The ports come from `BuildConfig` fields defined per flavor in
+`mdm-client/app/build.gradle` (`DISCOVERY_PORT`, `DEFAULT_WS_PORT`).
+
+> **Device owner:** because dev and prod share an applicationId, a device only ever has
+> one STYLY-MDM install, so there is never a dev-vs-prod device-owner conflict on a
+> single device. Updating a device-owner production install in place with a dev build
+> of the **same signing key** preserves device-owner status; a differently signed dev
+> build (e.g. debug over a release install) must be uninstalled first, which clears
+> device-owner status, so you would need to re-provision.
 
 ## Project Structure
 
@@ -117,6 +178,10 @@ STYLY-MDM supports automatic server discovery via UDP broadcast on the LAN.
 | 2 | Server → Client | Respond with JSON: `{"service": "stylymdm", "ws_url": "ws://<ip>:7070/ws/device", "version": "1.0"}` |
 
 The client waits up to 3 seconds for a response. If no server replies, discovery fails silently and the client falls back to the default or saved URL.
+
+> The ports above are the production defaults. A development server/client uses
+> port 7081 (discovery) and 7080 (WebSocket) instead — see
+> [Running a Dev Environment Alongside Production](#running-a-dev-environment-alongside-production).
 
 ## MDM Client Permissions
 

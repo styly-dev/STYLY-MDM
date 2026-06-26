@@ -51,7 +51,7 @@ class SettingsActivity : AppCompatActivity() {
 
         // Load current server URL
         val prefs = getSharedPreferences("stylymdm_prefs", MODE_PRIVATE)
-        val currentUrl = prefs.getString("server_url", "ws://192.168.1.100:7070/ws/device") ?: ""
+        val currentUrl = prefs.getString("server_url", WebSocketManager.DEFAULT_SERVER_URL) ?: ""
         serverUrlInput.setText(currentUrl)
 
         saveButton.setOnClickListener {

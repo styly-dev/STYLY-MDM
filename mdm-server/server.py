@@ -8,6 +8,7 @@ Static files for the web console are served from ./static/.
 import asyncio
 import json
 import logging
+import os
 import re
 import socket
 import time
@@ -686,7 +687,10 @@ async def handle_clear_startup_app(admin_ws: web.WebSocketResponse, data: dict):
 # UDP Discovery Responder
 # ---------------------------------------------------------------------------
 
-DISCOVERY_PORT = 7071
+# Discovery port can be overridden so a development server can run on the same
+# LAN as production without the two stealing each other's clients. Defaults to
+# the production port when MDM_DISCOVERY_PORT is unset.
+DISCOVERY_PORT = int(os.environ.get("MDM_DISCOVERY_PORT", "7071"))
 DISCOVERY_REQUEST = b"STYLYMDM_DISCOVER"
 
 
@@ -771,7 +775,10 @@ def get_local_ip_addresses() -> list[str]:
 
 
 async def run_server():
-    port = 7070
+    # WebSocket port is overridable (MDM_WS_PORT) so a development server can run
+    # alongside production on the same machine; the discovery response advertises
+    # this port, so clients follow it automatically.
+    port = int(os.environ.get("MDM_WS_PORT", "7070"))
     app = create_app()
     ip_addresses = get_local_ip_addresses()
 
