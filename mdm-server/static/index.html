@@ -651,7 +651,6 @@
         <div class="upload-summary" id="apkSummary">No APK selected</div>
         <div class="btn-row">
           <button class="btn btn-success" id="btnInstallSelected" disabled>Install to Selected</button>
-          <button class="btn btn-warning" id="btnInstallAll" disabled>Install to All</button>
         </div>
       </div>
     </div>
@@ -675,7 +674,6 @@
         </div>
         <div class="btn-row">
           <button class="btn btn-primary" id="btnSelected" disabled>Launch to Selected</button>
-          <button class="btn btn-warning" id="btnAll" disabled>Launch to All</button>
         </div>
       </div>
     </div>
@@ -699,12 +697,9 @@
         </div>
         <div class="btn-row">
           <button class="btn btn-primary" id="btnSetStartupSelected" disabled>Set for Selected</button>
-          <button class="btn btn-warning" id="btnSetStartupAll" disabled>Set for All</button>
           <button class="btn btn-danger-outline" id="btnClearStartupSelected" disabled
             style="background:transparent;border:1px solid var(--danger);color:var(--danger)">Clear for
             Selected</button>
-          <button class="btn btn-danger-outline" id="btnClearStartupAll" disabled
-            style="background:transparent;border:1px solid var(--danger);color:var(--danger)">Clear for All</button>
         </div>
       </div>
     </div>
@@ -748,17 +743,13 @@
       const packageName = document.getElementById('packageName');
       const extraData = document.getElementById('extraData');
       const btnSelected = document.getElementById('btnSelected');
-      const btnAll = document.getElementById('btnAll');
       const apkFile = document.getElementById('apkFile');
       const apkSummary = document.getElementById('apkSummary');
       const btnInstallSelected = document.getElementById('btnInstallSelected');
-      const btnInstallAll = document.getElementById('btnInstallAll');
       const startupPackageName = document.getElementById('startupPackageName');
       const startupExtraData = document.getElementById('startupExtraData');
       const btnSetStartupSelected = document.getElementById('btnSetStartupSelected');
-      const btnSetStartupAll = document.getElementById('btnSetStartupAll');
       const btnClearStartupSelected = document.getElementById('btnClearStartupSelected');
-      const btnClearStartupAll = document.getElementById('btnClearStartupAll');
       const logContainer = document.getElementById('logContainer');
       const logEmpty = document.getElementById('logEmpty');
       const btnClearLog = document.getElementById('btnClearLog');
@@ -1195,20 +1186,15 @@
 
       // Button states
       function updateButtons() {
-        // Commands target online devices only, so the "All" actions are gated on the
-        // online count, not the total (which now includes offline devices).
-        var onlineCount = getOnlineIds().length;
+        // Every action targets the checkbox selection; offline targets are filtered
+        // out at send time, so the buttons only gate on whether anything is selected.
         var hasPkg = packageName.value.trim() !== '';
         var hasApkFile = apkFile.files.length > 0;
-        btnAll.disabled = !hasPkg || onlineCount === 0;
         btnSelected.disabled = !hasPkg || selectedIds.size === 0;
-        btnInstallAll.disabled = uploadInProgress || !hasApkFile || onlineCount === 0;
         btnInstallSelected.disabled = uploadInProgress || !hasApkFile || selectedIds.size === 0;
 
         var hasStartupPkg = startupPackageName.value.trim() !== '';
-        btnSetStartupAll.disabled = !hasStartupPkg || onlineCount === 0;
         btnSetStartupSelected.disabled = !hasStartupPkg || selectedIds.size === 0;
-        btnClearStartupAll.disabled = onlineCount === 0;
         btnClearStartupSelected.disabled = selectedIds.size === 0;
       }
 
@@ -1225,22 +1211,42 @@
       });
       startupPackageName.addEventListener('input', updateButtons);
 
+      // Split targets into online/offline, warn about any offline devices that are
+      // skipped (commands never queue for later), and return the reachable subset.
+      function onlineTargets(targetDevices) {
+        var onlineSet = new Set(getOnlineIds());
+        var online = targetDevices.filter(function (id) { return onlineSet.has(id); });
+        var offline = targetDevices.filter(function (id) { return !onlineSet.has(id); });
+        if (offline.length > 0) {
+          addLog('Skipping ' + offline.length + ' offline device(s): ' +
+            offline.map(labelFor).join(', '), 'warn');
+        }
+        return online;
+      }
+
       // Launch commands
       btnSelected.addEventListener('click', function () {
         sendLaunch(Array.from(selectedIds));
-      });
-
-      btnAll.addEventListener('click', function () {
-        sendLaunch(getOnlineIds());
       });
 
       function sendLaunch(targetDevices) {
         var pkg = packageName.value.trim();
         if (!pkg) return;
 
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          addLog('Cannot send: not connected to server', 'fail');
+          return;
+        }
+
+        var online = onlineTargets(targetDevices);
+        if (online.length === 0) {
+          addLog('No online devices selected to launch', 'warn');
+          return;
+        }
+
         var msg = {
           type: 'LAUNCH_APP',
-          target_devices: targetDevices,
+          target_devices: online,
           package_name: pkg
         };
 
@@ -1249,22 +1255,13 @@
           msg.extra_data = extra;
         }
 
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          addLog('Cannot send: not connected to server', 'fail');
-          return;
-        }
-
         ws.send(JSON.stringify(msg));
-        addLog('Launching ' + pkg + ' on ' + targetDevices.length + ' device(s)', 'info');
+        addLog('Launching ' + pkg + ' on ' + online.length + ' device(s)', 'info');
       }
 
       // APK install commands (upload happens automatically on first install)
       btnInstallSelected.addEventListener('click', function () {
         sendInstall(Array.from(selectedIds));
-      });
-
-      btnInstallAll.addEventListener('click', function () {
-        sendInstall(getOnlineIds());
       });
 
       // Upload the selected APK if it has not been uploaded yet, then resolve with
@@ -1321,14 +1318,7 @@
         // Quick Install targets online devices only. Any target that is offline or no
         // longer in the device list (e.g. it disconnected after selection) is skipped
         // with a warning — there is no queueing for later.
-        var onlineSet = new Set(getOnlineIds());
-        var online = targetDevices.filter(function (id) { return onlineSet.has(id); });
-        var offline = targetDevices.filter(function (id) { return !onlineSet.has(id); });
-
-        if (offline.length > 0) {
-          addLog('Skipping ' + offline.length + ' offline device(s): ' +
-            offline.map(labelFor).join(', '), 'warn');
-        }
+        var online = onlineTargets(targetDevices);
         if (online.length === 0) {
           addLog('No online devices selected to install', 'warn');
           return;
@@ -1406,25 +1396,28 @@
         sendSetStartupApp(Array.from(selectedIds));
       });
 
-      btnSetStartupAll.addEventListener('click', function () {
-        sendSetStartupApp(getOnlineIds());
-      });
-
       btnClearStartupSelected.addEventListener('click', function () {
         sendClearStartupApp(Array.from(selectedIds));
-      });
-
-      btnClearStartupAll.addEventListener('click', function () {
-        sendClearStartupApp(getOnlineIds());
       });
 
       function sendSetStartupApp(targetDevices) {
         var pkg = startupPackageName.value.trim();
         if (!pkg) return;
 
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          addLog('Cannot send: not connected to server', 'fail');
+          return;
+        }
+
+        var online = onlineTargets(targetDevices);
+        if (online.length === 0) {
+          addLog('No online devices selected to set startup app', 'warn');
+          return;
+        }
+
         var msg = {
           type: 'SET_STARTUP_APP',
-          target_devices: targetDevices,
+          target_devices: online,
           package_name: pkg
         };
 
@@ -1433,28 +1426,29 @@
           msg.extra_data = extra;
         }
 
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          addLog('Cannot send: not connected to server', 'fail');
-          return;
-        }
-
         ws.send(JSON.stringify(msg));
-        addLog('Setting startup app ' + pkg + ' on ' + targetDevices.length + ' device(s)', 'info');
+        addLog('Setting startup app ' + pkg + ' on ' + online.length + ' device(s)', 'info');
       }
 
       function sendClearStartupApp(targetDevices) {
-        var msg = {
-          type: 'CLEAR_STARTUP_APP',
-          target_devices: targetDevices
-        };
-
         if (!ws || ws.readyState !== WebSocket.OPEN) {
           addLog('Cannot send: not connected to server', 'fail');
           return;
         }
 
+        var online = onlineTargets(targetDevices);
+        if (online.length === 0) {
+          addLog('No online devices selected to clear startup app', 'warn');
+          return;
+        }
+
+        var msg = {
+          type: 'CLEAR_STARTUP_APP',
+          target_devices: online
+        };
+
         ws.send(JSON.stringify(msg));
-        addLog('Clearing startup app on ' + targetDevices.length + ' device(s)', 'info');
+        addLog('Clearing startup app on ' + online.length + ' device(s)', 'info');
       }
 
       // Activity log

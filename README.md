@@ -10,7 +10,7 @@ STYLY-MDM currently supports PICO devices (PICO OS with Business Mode). Support 
 
 ## Features
 
-- **Multi-device launch** — send an app launch command to selected devices or all connected devices at once
+- **Multi-device launch** — select devices with the checkboxes (use the header checkbox to select all) and send an app launch command to them at once; offline devices are skipped automatically
 - **Persistent device list** — once an HMD has connected it stays in the list with an `online`/`offline` status instead of vanishing on disconnect; offline devices keep their last-known details, can be pre-labeled, and can be forgotten when decommissioned
 - **Auto-reconnect** — both the MDM client and the web console reconnect automatically with exponential backoff
 - **Boot persistence** — the MDM client starts automatically on HMD boot via `BOOT_COMPLETED` and PICO auto-boot intents
@@ -64,17 +64,17 @@ The MDM client connects to the server, registers the device (serial number, mode
 
 1. Open `http://<server-ip>:7070` in a browser.
 2. Connected HMDs appear in the **Devices** table.
-3. Select target devices using the checkboxes (or use **Launch to All**).
+3. Select target devices using the checkboxes (use the header checkbox to select all).
 4. Enter the app's **Package Name** (e.g. `com.example.vrapp`) and optional **Extra Data** (JSON string passed to the activity).
-5. Click **Launch to Selected** or **Launch to All**.
+5. Click **Launch to Selected**. Offline devices in the selection are skipped automatically.
 
 ### 4. Install APKs from the Web Console
 
 1. Open the web console using the server's LAN address, for example `http://192.168.1.5:7070`.
 2. Connected HMDs appear in the **Devices** table.
-3. Select target devices using the checkboxes, or use **Install to All**.
+3. Select target devices using the checkboxes (use the header checkbox to select all).
 4. In **Install APK**, choose an `.apk` file and click **Upload APK**.
-5. After upload completes, click **Install to Selected** or **Install to All**.
+5. After upload completes, click **Install to Selected**. Offline devices in the selection are skipped automatically.
 
 Uploaded APKs are stored under `mdm-server/apks/` and served to devices over the LAN. The MDM client downloads the APK and calls PICO Business SDK's silent install API, so Business Mode and the high-risk API manifest tag are required.
 
