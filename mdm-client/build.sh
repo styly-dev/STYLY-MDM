@@ -18,8 +18,8 @@ fi
 
 # --- build -------------------------------------------------------------------
 # Usage: ./build.sh [debug|release] [prod|dev]
-# Flavors: prod = production (discovery port 7071), dev = development (port 7081,
-# applicationId ".dev" so it installs alongside prod for side-by-side testing).
+# Flavors: prod = production (discovery port 7071), dev = development (port 7081).
+# dev shares prod's applicationId, so installing it replaces a prod install on a device.
 BUILD_TYPE="${1:-debug}"
 FLAVOR="${2:-prod}"
 

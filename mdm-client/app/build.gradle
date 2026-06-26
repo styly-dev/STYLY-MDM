@@ -50,12 +50,14 @@ android {
             buildConfigField "int", "DISCOVERY_PORT", "7071"
             buildConfigField "int", "DEFAULT_WS_PORT", "7070"
         }
-        // Development: separate discovery port so a dev server/APK can coexist with
-        // production on the same LAN. The ".dev" applicationId lets the dev build be
-        // installed side-by-side with the production build on the same headset.
+        // Development: separate discovery/WebSocket ports so a dev server/client can run
+        // on the same LAN as production without the two discovering each other. The
+        // applicationId is intentionally identical to prod (no suffix), so the dev build
+        // is NOT installed side-by-side — installing it replaces the production build on a
+        // device. Use a dedicated test device (or accept the replacement while testing).
+        // The "-dev" versionName and "STYLY-MDM Dev" label show which build is installed.
         dev {
             dimension "environment"
-            applicationIdSuffix ".dev"
             versionNameSuffix "-dev"
             buildConfigField "int", "DISCOVERY_PORT", "7081"
             buildConfigField "int", "DEFAULT_WS_PORT", "7080"

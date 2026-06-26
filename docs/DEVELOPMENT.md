@@ -56,10 +56,16 @@ dev client on the **same** network without disturbing production. The `dev` buil
 flavor and a pair of server environment variables isolate the two by using different
 ports, so neither environment discovers the other.
 
-| Environment | Discovery port | WebSocket port | Client applicationId |
+| Environment | Discovery port | WebSocket port | Client build (label) |
 |---|---|---|---|
-| Production (default) | 7071 | 7070 | `com.styly.mdmclient` |
-| Development (`dev` flavor) | 7081 | 7080 | `com.styly.mdmclient.dev` |
+| Production (default) | 7071 | 7070 | `prod` flavor — "STYLY-MDM Client" |
+| Development (`dev` flavor) | 7081 | 7080 | `dev` flavor — "STYLY-MDM Dev" |
+
+Both flavors share the applicationId `com.styly.mdmclient`, so they **cannot be
+installed at the same time** — installing the dev build replaces the production build
+on a device. Run the dev client on a dedicated test device, or accept that it replaces
+production while you test. Isolation between the two environments is purely by port, so
+a dev client/server never discovers a production one even on the same LAN.
 
 **Dev server** — start with the `dev` argument, which sets the dev ports for you:
 
@@ -81,18 +87,22 @@ cd mdm-client
 adb install app/build/outputs/apk/dev/debug/app-dev-debug.apk
 ```
 
-The dev APK uses applicationId `com.styly.mdmclient.dev` and label **STYLY-MDM Dev**,
-so it installs side-by-side with the production build on the same headset. It only
-broadcasts/listens on the dev discovery port (7081), so it never discovers the
-production server. Its fallback URL also targets the dev WebSocket port (7080), so
-even if discovery times out it cannot accidentally connect to a production server.
+The dev APK keeps the production applicationId `com.styly.mdmclient` and only changes
+its label to **STYLY-MDM Dev**, so installing it replaces the production build on a
+device (they share a package name and cannot coexist). It only broadcasts/listens on
+the dev discovery port (7081), so it never discovers the production server. Its
+fallback URL also targets the dev WebSocket port (7080), so even if discovery times
+out it cannot accidentally connect to a production server.
 
 The ports come from `BuildConfig` fields defined per flavor in
 `mdm-client/app/build.gradle` (`DISCOVERY_PORT`, `DEFAULT_WS_PORT`).
 
-> **Device owner:** Android allows only one device owner per device. If you provision
-> the dev build as device owner for testing, the production build cannot hold
-> device-owner powers at the same time.
+> **Device owner:** because dev and prod share an applicationId, a device only ever has
+> one STYLY-MDM install, so there is never a dev-vs-prod device-owner conflict on a
+> single device. Updating a device-owner production install in place with a dev build
+> of the **same signing key** preserves device-owner status; a differently signed dev
+> build (e.g. debug over a release install) must be uninstalled first, which clears
+> device-owner status, so you would need to re-provision.
 
 ## Project Structure
 
