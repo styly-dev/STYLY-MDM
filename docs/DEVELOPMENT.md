@@ -149,6 +149,11 @@ STYLY-MDM/
 | `LAUNCH_APP` | Launch an app on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `package_name`, `extra_data` |
 | `INSTALL_APK` | Install an uploaded APK on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `apk_url`, `apk_filename` |
 | `GET_DEVICE_LIST` | Request the current device list |
+| `CREATE_GROUP` | Create a new, empty device group. Fields: `name` |
+| `RENAME_GROUP` | Rename a group, preserving its members. Fields: `name`, `new_name` |
+| `DELETE_GROUP` | Delete a group (member devices are not affected). Fields: `name` |
+| `SET_DEVICE_GROUPS` | Set the exact set of groups a device belongs to. Fields: `device_id`, `groups` (list of existing group names) |
+| `SET_GROUP_MEMBERS` | Set the exact member list of an existing group (group-centric). Fields: `name`, `members` (list of serials; offline/unknown serials allowed) |
 
 ### Admin HTTP API
 
@@ -166,7 +171,18 @@ STYLY-MDM/
 | `INSTALL_SENT` | Confirmation that install commands were dispatched. Fields: `apk_filename`, `apk_url`, `sent_count`, `target_count` |
 | `LAUNCH_RESULT` | Forwarded result from a device |
 | `INSTALL_RESULT` | Forwarded install result from a device |
+| `GROUP_LIST` | Current device groups. Fields: `groups` (object mapping group name → array of member serials). The console derives each device's group membership from this; sent on connect and after any group change. |
+| `GROUP_CREATED` / `GROUP_RENAMED` / `GROUP_DELETED` | Acknowledgements for group create / rename / delete. |
+| `DEVICE_GROUPS_SET` | Acknowledgement of a device's group membership change. Fields: `device_id`, `groups` |
+| `GROUP_MEMBERS_SET` | Acknowledgement of a group's member list change. Fields: `name`, `members` |
 | `ERROR` | Error message. Fields: `message` |
+
+> **Device groups** are a many-to-many grouping keyed by device serial, persisted
+> server-side in `device_registry.json` (under a `groups` key). Selecting a group
+> in the console is a client-side convenience: it sets the device selection to that
+> group's members (devices not in the group are deselected), so commands still
+> dispatch via the normal `target_devices` path (online members only). Group
+> membership can include offline devices.
 
 ## Server Discovery Protocol
 
