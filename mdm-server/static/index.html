@@ -473,7 +473,7 @@
             break;
           case 'GROUP_DELETED': addLog('Group deleted: ' + (msg.name || '-'), 'success'); if (activeGroup === msg.name) activeGroup = null; break;
           case 'DEVICE_GROUPS_SET': addLog('Groups set for ' + labelFor(msg.device_id) + ': ' + ((msg.groups && msg.groups.length) ? msg.groups.join(', ') : '(none)'), 'success'); break;
-          case 'GROUP_MEMBERS_SET': addLog('Members saved for "' + (msg.name || '-') + '": ' + ((msg.members && msg.members.length) || 0) + ' device(s)', 'success'); break;
+          case 'GROUP_MEMBERS_SET': addLog('Group "' + (msg.name || '-') + '" saved: ' + ((msg.members && msg.members.length) || 0) + ' device(s)', 'success'); break;
           case 'SET_STARTUP_APP_SENT': addLog('Startup app set: ' + msg.package_name + ' (' + msg.sent_count + '/' + msg.target_count + ' devices)', 'success'); break;
           case 'CLEAR_STARTUP_APP_SENT': addLog('Startup app cleared (' + msg.sent_count + '/' + msg.target_count + ' devices)', 'success'); break;
           case 'STARTUP_APP_RESULT': {
@@ -773,22 +773,24 @@
           return;
         }
         const name = manageSelectedGroup;
-        const offCount = Array.from(manageMembers).filter(function (s) { const d = deviceById(s); return d && !isOnline(d); }).length;
+        const memArr = Array.from(manageMembers);
+        const offCount = memArr.filter(function (s) { const d = deviceById(s); return !d || !isOnline(d); }).length;
+        const onCount = memArr.length - offCount;
         const head = renamingManageGroup
           ? '<div class="dev-edit"><input class="label-input" data-mg-rename maxlength="64" value="' + esc(name) + '">' +
             '<button class="btn-mini btn-save" data-act="saveRename">Save</button>' +
             '<button class="btn-mini btn-cancel" data-act="cancelRename">Cancel</button></div>'
-          : '<div><div class="mg-title">' + esc(name) + '</div><div class="mg-sub">' + manageMembers.size + (manageMembers.size === 1 ? ' member' : ' members') + (offCount ? ' · ' + offCount + ' offline included' : '') + '</div></div>' +
+          : '<div><div class="mg-title">' + esc(name) + '</div><div class="mg-sub">' + onCount + ' online, ' + offCount + ' offline</div></div>' +
             '<div class="mg-head-actions"><button class="btn-outline" data-act="renameGroup">Rename</button>' +
             '<button class="btn-danger-outline" data-act="deleteGroup" data-group="' + esc(name) + '">Delete</button></div>';
         mgDetail.innerHTML =
           '<div class="mg-detail-head">' + head + '</div>' +
           '<div class="mg-search"><input class="mg-search-input" data-mg-search placeholder="⌕ Search devices to add…" value="' + esc(manageSearch) + '"></div>' +
           '<div class="mg-dev-list" id="mgDevList">' + renderMgDevListHtml() + '</div>' +
-          '<div class="mg-footer"><span class="mg-foot-count">' + manageMembers.size + (manageMembers.size === 1 ? ' member' : ' members') + ' selected</span>' +
+          '<div class="mg-footer"><span class="mg-foot-count">' + manageMembers.size + ' selected</span>' +
           '<div class="spacer"></div>' +
           '<button class="btn-text" data-act="cancelMembers">Cancel</button>' +
-          '<button class="btn-primary" data-act="saveMembers">Save members</button></div>';
+          '<button class="btn-primary" data-act="saveMembers">Save</button></div>';
       }
 
       function renderMgDevListHtml() {
