@@ -45,7 +45,11 @@
     ::-webkit-scrollbar-track { background: transparent }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px }
 
-    .shell { max-width: 1240px; margin: 0 auto; }
+    .shell { width: 100%; }
+
+    /* Console fills the viewport (minus body margin); zones grow, log is a fixed
+       panel whose top edge is draggable. Each column scrolls internally. */
+    #consoleView { display: flex; flex-direction: column; height: calc(100vh - 72px); }
 
     .card {
       background: var(--bg-card);
@@ -81,9 +85,22 @@
     .manage-btn:hover { color: var(--text-primary); border-color: #394056; }
 
     /* Console zones */
-    .zones { display: grid; grid-template-columns: 1.5fr 1fr; }
-    .targets { border-right: 1px solid var(--border); min-width: 0; }
-    .actions { background: var(--bg-actions); min-width: 0; }
+    .topbar { flex: 0 0 auto; }
+    .zones {
+      flex: 1 1 0; min-height: 0; overflow: hidden;
+      display: grid;
+      grid-template-columns: minmax(260px, var(--targets-w, 58%)) 6px minmax(260px, 1fr);
+    }
+    .targets { border-right: 1px solid var(--border); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+    .actions { background: var(--bg-actions); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+    .targets-head, .subtabs { flex: 0 0 auto; }
+    .actions > .zone-label, .sel-card { flex: 0 0 auto; }
+
+    /* Drag handles */
+    .v-gutter { cursor: col-resize; background: transparent; transition: background .15s; }
+    .v-gutter:hover, .v-gutter.dragging { background: var(--accent); opacity: .5; }
+    .h-gutter { flex: 0 0 6px; cursor: row-resize; background: transparent; transition: background .15s; }
+    .h-gutter:hover, .h-gutter.dragging { background: var(--accent); opacity: .5; }
 
     /* Sub-tabs */
     .subtabs { display: flex; align-items: center; padding: 8px 20px 0; }
@@ -97,7 +114,7 @@
     .subtab.active .cnt { color: var(--text-secondary); }
     .subtabs-fill { flex: 1; border-bottom: 1px solid var(--border); align-self: stretch; }
 
-    .targets-body { padding: 0; }
+    .targets-body { padding: 0; flex: 1 1 0; min-height: 0; overflow-y: auto; }
 
     /* Group rows */
     .group-list { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
@@ -169,7 +186,7 @@
     .sel-clear:hover { color: var(--text-primary); }
     .sel-ctx { font-size: 12px; color: #9bb0d6; margin-top: 7px; }
 
-    .commands { padding: 0 18px 18px; display: flex; flex-direction: column; gap: 14px; }
+    .commands { padding: 0 18px 18px; display: flex; flex-direction: column; gap: 14px; flex: 1 1 0; min-height: 0; overflow-y: auto; }
     .cmd-divider { height: 1px; background: var(--border); }
     .cmd-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 8px; cursor: default; }
     .cmd-chevron { display: none; }
@@ -193,12 +210,12 @@
     .btn-row { display: flex; gap: 8px; margin-top: 8px; }
     .btn-row .btn { margin-top: 0; }
 
-    /* Log */
-    .logzone { border-top: 1px solid var(--border); background: var(--bg-actions); }
-    .log-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 22px; border-bottom: 1px solid var(--border-soft); }
+    /* Log (fixed-height panel; top edge draggable via .h-gutter) */
+    .logzone { border-top: 1px solid var(--border); background: var(--bg-actions); flex: 0 0 auto; height: 170px; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+    .log-head { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; padding: 10px 22px; border-bottom: 1px solid var(--border-soft); }
     .log-head .zl { font-size: 11px; font-weight: 700; letter-spacing: 1px; color: var(--accent); text-transform: uppercase; }
     .log-clear { font-size: 11px; color: var(--text-secondary); background: var(--bg-tertiary); border: none; border-radius: 5px; padding: 3px 11px; cursor: pointer; font-family: inherit; }
-    .log-body { padding: 10px 22px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.9; max-height: 160px; overflow-y: auto; }
+    .log-body { padding: 10px 22px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.9; flex: 1 1 0; min-height: 0; overflow-y: auto; }
     .log-entry { display: flex; gap: 10px; }
     .log-time { color: var(--text-muted); flex-shrink: 0; }
     .log-msg.success { color: var(--success); }
@@ -249,8 +266,15 @@
     /* Responsive */
     @media (max-width: 640px) {
       body { padding: 16px 12px; }
-      .zones { grid-template-columns: 1fr; }
+      /* Drop the viewport-locked layout on small screens: block flow, page scrolls. */
+      #consoleView { display: block; height: auto; }
+      .zones { grid-template-columns: 1fr; overflow: visible; }
+      .targets, .actions { overflow: visible; }
+      .targets-body, .commands { overflow-y: visible; flex: 0 0 auto; }
       .targets { border-right: none; border-bottom: 1px solid var(--border); }
+      .v-gutter, .h-gutter { display: none; }
+      .logzone { height: auto; }
+      .log-body { flex: 0 0 auto; max-height: 220px; }
       .manage-grid { grid-template-columns: 1fr; }
       .mg-sidebar { border-right: none; border-bottom: 1px solid var(--border); }
       .cmd-chevron { display: inline-block; }
@@ -283,6 +307,9 @@
           </div>
           <div class="targets-body" id="targetsBody"></div>
         </div>
+
+        <!-- Draggable boundary: Targets | Actions -->
+        <div class="v-gutter" id="vGutter" title="Drag to resize"></div>
 
         <!-- (2) Actions -->
         <div class="actions">
@@ -324,6 +351,9 @@
           </div>
         </div>
       </div>
+
+      <!-- Draggable boundary: zones | Activity Log -->
+      <div class="h-gutter" id="hGutter" title="Drag to resize"></div>
 
       <!-- (3) Log -->
       <div class="logzone">
@@ -956,8 +986,79 @@
         }
       });
 
+      // ---------------- Resizable layout (drag handles + persistence) ----------------
+      const vGutter = document.getElementById('vGutter');
+      const hGutter = document.getElementById('hGutter');
+      const zonesEl = consoleView.querySelector('.zones');
+      const targetsEl = consoleView.querySelector('.targets');
+      const logzoneEl = consoleView.querySelector('.logzone');
+      const MIN_COL = 260, MIN_ZONES = 160, MIN_LOG = 80;
+
+      function saveLayout() {
+        try {
+          const zw = zonesEl.getBoundingClientRect().width;
+          const tw = targetsEl.getBoundingClientRect().width;
+          if (zw > 0) localStorage.setItem('mdm.targetsFrac', String(tw / zw));
+          localStorage.setItem('mdm.logH', String(Math.round(logzoneEl.getBoundingClientRect().height)));
+        } catch (e) { /* localStorage may be unavailable */ }
+      }
+
+      function restoreLayout() {
+        try {
+          const frac = parseFloat(localStorage.getItem('mdm.targetsFrac'));
+          if (frac > 0.1 && frac < 0.9) {
+            const zw = zonesEl.getBoundingClientRect().width;
+            if (zw > 0) zonesEl.style.setProperty('--targets-w', Math.round(frac * zw) + 'px');
+          }
+          const lh = parseFloat(localStorage.getItem('mdm.logH'));
+          if (lh >= MIN_LOG) logzoneEl.style.height = lh + 'px';
+        } catch (e) { /* ignore */ }
+      }
+
+      function makeDraggable(gutter, onMove) {
+        gutter.addEventListener('pointerdown', function (e) {
+          if (getComputedStyle(gutter).display === 'none') return; // disabled on narrow
+          e.preventDefault();
+          gutter.classList.add('dragging');
+          gutter.setPointerCapture(e.pointerId);
+          document.body.style.userSelect = 'none';
+          const ctx = onMove.start(e);
+          const move = function (ev) { onMove.move(ev, ctx); };
+          const up = function () {
+            gutter.classList.remove('dragging');
+            document.body.style.userSelect = '';
+            gutter.removeEventListener('pointermove', move);
+            gutter.removeEventListener('pointerup', up);
+            saveLayout();
+          };
+          gutter.addEventListener('pointermove', move);
+          gutter.addEventListener('pointerup', up);
+        });
+      }
+
+      makeDraggable(vGutter, {
+        start: function (e) { return { x: e.clientX, w: targetsEl.getBoundingClientRect().width }; },
+        move: function (ev, c) {
+          const zw = zonesEl.getBoundingClientRect().width;
+          let w = c.w + (ev.clientX - c.x);
+          w = Math.max(MIN_COL, Math.min(w, zw - MIN_COL - 6));
+          zonesEl.style.setProperty('--targets-w', w + 'px');
+        },
+      });
+
+      makeDraggable(hGutter, {
+        start: function (e) { return { y: e.clientY, h: logzoneEl.getBoundingClientRect().height }; },
+        move: function (ev, c) {
+          const cardH = consoleView.getBoundingClientRect().height;
+          let h = c.h + (c.y - ev.clientY); // drag up grows the log
+          h = Math.max(MIN_LOG, Math.min(h, cardH - MIN_ZONES));
+          logzoneEl.style.height = h + 'px';
+        },
+      });
+
       // ---------------- Init ----------------
       render();
+      restoreLayout();
       connect();
     })();
   </script>
