@@ -188,9 +188,13 @@
 
     .commands { padding: 0 18px 18px; display: flex; flex-direction: column; gap: 14px; flex: 1 1 0; min-height: 0; overflow-y: auto; }
     .cmd-divider { height: 1px; background: var(--border); }
-    .cmd-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 8px; cursor: default; }
-    .cmd-chevron { display: none; }
+    .cmd-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 8px; cursor: pointer; user-select: none; }
+    .cmd-head:hover { color: var(--text-primary); }
+    .cmd-chevron { display: inline-block; opacity: .7; transition: transform .15s; }
     .cmd-body { display: block; }
+    .cmd-section.collapsed .cmd-body { display: none; }
+    .cmd-section.collapsed .cmd-head { margin-bottom: 0; }
+    .cmd-section.collapsed .cmd-chevron { transform: rotate(-90deg); }
     .field { padding: 9px 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; color: var(--text-primary); font-size: 13px; font-family: inherit; width: 100%; }
     .field:focus { outline: none; border-color: var(--accent); }
     .field::placeholder { color: var(--text-dim); }
@@ -277,9 +281,6 @@
       .log-body { flex: 0 0 auto; max-height: 220px; }
       .manage-grid { grid-template-columns: 1fr; }
       .mg-sidebar { border-right: none; border-bottom: 1px solid var(--border); }
-      .cmd-chevron { display: inline-block; }
-      .cmd-section.collapsed .cmd-body { display: none; }
-      .cmd-head { cursor: pointer; }
     }
   </style>
 </head>
@@ -316,7 +317,7 @@
           <div class="zone-label">② Actions</div>
           <div class="sel-card" id="selCard"></div>
           <div class="commands">
-            <div class="cmd-section" data-cmd="install">
+            <div class="cmd-section collapsed" data-cmd="install">
               <div class="cmd-head" data-act="toggleCmd"><span>Quick Install</span><span class="cmd-chevron">▾</span></div>
               <div class="cmd-body">
                 <div class="file-row">
@@ -328,7 +329,7 @@
               </div>
             </div>
             <div class="cmd-divider"></div>
-            <div class="cmd-section" data-cmd="launch">
+            <div class="cmd-section collapsed" data-cmd="launch">
               <div class="cmd-head" data-act="toggleCmd"><span>Launch Command</span><span class="cmd-chevron">▾</span></div>
               <div class="cmd-body">
                 <input type="text" class="field" id="launchPkg" placeholder="com.example.app">
@@ -337,7 +338,7 @@
               </div>
             </div>
             <div class="cmd-divider"></div>
-            <div class="cmd-section" data-cmd="startup">
+            <div class="cmd-section collapsed" data-cmd="startup">
               <div class="cmd-head" data-act="toggleCmd"><span>Startup App</span><span class="cmd-chevron">▾</span></div>
               <div class="cmd-body">
                 <input type="text" class="field" id="startupPkg" placeholder="com.example.app">
@@ -939,9 +940,16 @@
       btnStartupClear.addEventListener('click', sendClearStartup);
       btnClearLog.addEventListener('click', function () { logContainer.innerHTML = ''; logContainer.appendChild(logEmpty); logEmpty.style.display = 'block'; });
 
-      // Command sections collapsible (only effective ≤640 via CSS)
-      document.querySelectorAll('.cmd-head[data-act="toggleCmd"]').forEach(function (h) {
-        h.addEventListener('click', function () { h.closest('.cmd-section').classList.toggle('collapsed'); });
+      // Command sections accordion: only one open at a time (matches the original
+      // layout). Clicking an open section's header collapses it (all closed).
+      var cmdSections = Array.prototype.slice.call(document.querySelectorAll('.cmd-section'));
+      cmdSections.forEach(function (sec) {
+        var head = sec.querySelector('.cmd-head');
+        head.addEventListener('click', function () {
+          var willOpen = sec.classList.contains('collapsed');
+          cmdSections.forEach(function (s) { s.classList.add('collapsed'); });
+          if (willOpen) sec.classList.remove('collapsed');
+        });
       });
 
       // Manage view delegation (click)
