@@ -75,6 +75,10 @@
       padding: 13px 20px 0; font-size: 11px; font-weight: 700; letter-spacing: 1px;
       color: var(--accent); text-transform: uppercase;
     }
+    .targets-head { display: flex; align-items: center; justify-content: space-between; padding: 13px 20px 0; }
+    .targets-head .zone-label { padding: 0; }
+    .manage-btn { font-size: 12px; color: var(--text-secondary); border: 1px solid var(--border); border-radius: 6px; padding: 5px 11px; background: none; cursor: pointer; font-family: inherit; }
+    .manage-btn:hover { color: var(--text-primary); border-color: #394056; }
 
     /* Console zones */
     .zones { display: grid; grid-template-columns: 1.5fr 1fr; }
@@ -268,7 +272,10 @@
       <div class="zones">
         <!-- (1) Targets -->
         <div class="targets">
-          <div class="zone-label">① Targets</div>
+          <div class="targets-head">
+            <span class="zone-label">① Targets</span>
+            <button class="manage-btn" id="btnManageGroups">Manage Groups</button>
+          </div>
           <div class="subtabs">
             <button class="subtab active" id="tabGroups" data-tab="groups">Groups <span class="cnt" id="cntGroups">0</span></button>
             <button class="subtab" id="tabDevices" data-tab="devices">Devices <span class="cnt" id="cntDevices">0</span></button>
@@ -351,6 +358,7 @@
       let selectedIds = new Set();
       let activeGroup = null;          // group name driving the selection, or null
       let targetTab = 'groups';        // 'groups' | 'devices'
+      let userPickedTab = false;       // true once the user clicks a sub-tab (stops auto-default)
       let view = 'console';            // 'console' | 'manage'
       let installState = {};           // id -> { status, filename, detail }
       let editingLabelId = null;
@@ -372,6 +380,7 @@
       const connText = document.getElementById('connText');
       const tabGroups = document.getElementById('tabGroups');
       const tabDevices = document.getElementById('tabDevices');
+      const btnManageGroups = document.getElementById('btnManageGroups');
       const cntGroups = document.getElementById('cntGroups');
       const cntDevices = document.getElementById('cntDevices');
       const targetsBody = document.getElementById('targetsBody');
@@ -496,6 +505,9 @@
         } else {
           consoleView.style.display = '';
           manageView.style.display = 'none';
+          // Default tab: Groups when groups exist, else Devices — until the user
+          // explicitly picks a tab, after which their choice sticks.
+          if (!userPickedTab) targetTab = groupNames().length ? 'groups' : 'devices';
           renderTabs();
           renderTargets();
           renderActions();
@@ -519,7 +531,7 @@
 
       function renderGroupsHtml() {
         const names = groupNames();
-        if (!names.length) return '<div class="empty">No groups — create one in Manage Groups</div>';
+        if (!names.length) return '<div class="empty">No groups yet — use "Manage Groups" (top right) to create one.</div>';
         return '<div class="group-list">' + names.map(function (name) {
           const members = groups[name] || [];
           const count = members.length;
@@ -848,8 +860,13 @@
 
       // ---------------- Event wiring ----------------
       // Sub-tabs
-      tabGroups.addEventListener('click', function () { targetTab = 'groups'; render(); });
-      tabDevices.addEventListener('click', function () { targetTab = 'devices'; render(); });
+      tabGroups.addEventListener('click', function () { targetTab = 'groups'; userPickedTab = true; render(); });
+      tabDevices.addEventListener('click', function () { targetTab = 'devices'; userPickedTab = true; render(); });
+      btnManageGroups.addEventListener('click', function () {
+        openManage(null);
+        const inp = mgSidebar.querySelector('[data-mg-new]');
+        if (inp) setTimeout(function () { inp.focus(); }, 0);
+      });
 
       // Targets delegation (click)
       targetsBody.addEventListener('click', function (e) {
