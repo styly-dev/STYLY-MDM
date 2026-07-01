@@ -485,6 +485,7 @@
             selectedIds.forEach(function (id) { if (!cur.has(id)) selectedIds.delete(id); });
             const onlineNow = new Set(getOnlineIds());
             Object.keys(installState).forEach(function (id) { if (!onlineNow.has(id)) delete installState[id]; });
+            syncActiveGroupSelection();
             render();
             break;
           }
@@ -492,6 +493,9 @@
             groups = msg.groups || {};
             if (pendingSelectGroup && (pendingSelectGroup in groups)) { selectManageGroup(pendingSelectGroup); pendingSelectGroup = null; }
             else if (manageSelectedGroup && !(manageSelectedGroup in groups)) { manageSelectedGroup = null; manageMembers = new Set(); }
+            // Keep the active-group selection current: a group whose membership was
+            // just edited must not dispatch to the old member set (PR #29 P1).
+            syncActiveGroupSelection();
             render();
             break;
           }
@@ -715,6 +719,16 @@
         activeGroup = name;
         addLog('Selected group "' + name + '": ' + selectedIds.size + ' device(s) selected', 'info');
         render();
+      }
+
+      // Re-sync the selection with the active group's current membership. Called after
+      // GROUP_LIST / DEVICE_LIST so editing the selected group can't leave commands
+      // pointing at a stale member set. If the group is gone, clear the selection.
+      function syncActiveGroupSelection() {
+        if (!activeGroup) return;
+        if (!(activeGroup in groups)) { activeGroup = null; selectedIds.clear(); return; }
+        const known = knownIds();
+        selectedIds = new Set((groups[activeGroup] || []).filter(function (s) { return known.has(s); }));
       }
       function toggleDevice(id) {
         if (selectedIds.has(id)) selectedIds.delete(id); else selectedIds.add(id);
