@@ -118,11 +118,17 @@
 
     /* Group rows */
     .group-list { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
-    .group-row {
-      display: flex; align-items: center; gap: 12px; padding: 12px 14px;
-      background: var(--bg-bar); border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
-    }
-    .group-row:hover { border-color: #394056; }
+    .group-item { background: var(--bg-bar); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .group-row { display: flex; align-items: center; gap: 12px; padding: 12px 14px; cursor: pointer; }
+    .group-row:hover { background: rgba(255, 255, 255, 0.02); }
+    .group-expand { background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 14px; line-height: 1; padding: 3px 7px; border-radius: 4px; flex-shrink: 0; }
+    .group-expand:hover { color: var(--text-primary); background: var(--bg-tertiary); }
+    .group-devs { border-top: 1px solid var(--border); padding: 2px 14px 6px 44px; }
+    .group-dev { display: flex; align-items: center; gap: 10px; padding: 7px 0; font-size: 13px; }
+    .group-dev + .group-dev { border-top: 1px solid var(--border-soft); }
+    .group-dev-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .group-dev-status { color: var(--text-secondary); font-size: 12px; white-space: nowrap; width: 66px; }
+    .group-dev-install { font-size: 12px; white-space: nowrap; text-align: right; min-width: 92px; }
     .radio { width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid #41475f; flex-shrink: 0; }
     .radio.on { border: 5px solid var(--accent); background: var(--bg-card); }
     .group-main { min-width: 0; flex: 1; }
@@ -390,6 +396,7 @@
       let activeGroup = null;          // group name driving the selection, or null
       let targetTab = 'groups';        // 'groups' | 'devices'
       let userPickedTab = false;       // true once the user clicks a sub-tab (stops auto-default)
+      let expandedGroups = new Set();  // group names expanded to show per-device status
       let view = 'console';            // 'console' | 'manage'
       let installState = {};           // id -> { status, filename, detail }
       let editingLabelId = null;
@@ -568,19 +575,42 @@
           const count = members.length;
           const off = offlineMembers(name);
           const on = activeGroup === name;
-          const membersHtml = count
+          const expanded = expandedGroups.has(name);
+          // Collapsed rows show a one-line member preview; expanded rows show the
+          // per-device status list below instead (so the preview is redundant).
+          const preview = expanded ? '' : (count
             ? '<div class="group-members">' + esc(members.map(labelFor).join(', ')) + '</div>'
-            : '<div class="group-empty">No members yet</div>';
-          return '<div class="group-row" data-act="selectGroup" data-group="' + esc(name) + '">' +
+            : '<div class="group-empty">No members yet</div>');
+          const row = '<div class="group-row" data-act="selectGroup" data-group="' + esc(name) + '">' +
             '<div class="radio ' + (on ? 'on' : '') + '"></div>' +
             '<div class="group-main"><div class="group-line">' +
             '<span class="group-name">' + esc(name) + '</span>' +
             '<span class="group-count">' + (count === 1 ? '1 device' : count + ' devices') + '</span>' +
+            '<button class="group-expand" data-act="toggleExpand" data-group="' + esc(name) + '" title="' + (expanded ? 'Collapse' : 'Show devices') + '">' + (expanded ? '▾' : '▸') + '</button>' +
             (off ? '<span class="badge-offline">' + off + ' offline</span>' : '') +
-            '</div>' + membersHtml + '</div>' +
+            '</div>' + preview + '</div>' +
             '<button class="btn-edit" data-act="editGroup" data-group="' + esc(name) + '">✏ Edit</button>' +
             '</div>';
+          const body = expanded ? '<div class="group-devs">' + renderGroupDevsHtml(members) + '</div>' : '';
+          return '<div class="group-item">' + row + body + '</div>';
         }).join('') + '</div>';
+      }
+
+      // Per-device rows shown when a group is expanded: online/offline + install progress.
+      function renderGroupDevsHtml(members) {
+        if (!members.length) return '<div class="group-empty">No members yet</div>';
+        return members.map(function (serial) {
+          const d = deviceById(serial);
+          const label = (d && d.label) ? d.label : serial;
+          const status = !d ? 'Unknown' : (isOnline(d) ? 'Online' : 'Offline');
+          const off = !d || !isOnline(d);
+          return '<div class="group-dev">' +
+            '<span class="dot ' + (off ? 'off' : '') + '"></span>' +
+            '<span class="group-dev-name">' + esc(label) + '</span>' +
+            '<span class="group-dev-status">' + status + '</span>' +
+            '<span class="group-dev-install" data-install-id="' + esc(serial) + '">' + installCellHtml(serial) + '</span>' +
+            '</div>';
+        }).join('');
       }
 
       function renderDevicesHtml() {
@@ -644,9 +674,11 @@
       }
 
       function updateInstallCell(id) {
-        if (view !== 'console' || targetTab !== 'devices') return;
-        const cell = targetsBody.querySelector('[data-install-id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]');
-        if (cell) cell.innerHTML = installCellHtml(id);
+        // Refresh every matching install cell currently rendered: the Devices-tab
+        // row and/or the expanded-group per-device rows on the Groups tab.
+        if (view !== 'console') return;
+        const sel = '[data-install-id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]';
+        targetsBody.querySelectorAll(sel).forEach(function (cell) { cell.innerHTML = installCellHtml(id); });
       }
 
       function renderActions() {
@@ -905,6 +937,11 @@
         if (!t) return;
         const act = t.dataset.act;
         if (act === 'selectGroup') selectGroupAsTarget(t.dataset.group);
+        else if (act === 'toggleExpand') {
+          const g = t.dataset.group;
+          if (expandedGroups.has(g)) expandedGroups.delete(g); else expandedGroups.add(g);
+          renderTargets();
+        }
         else if (act === 'editGroup') openManage(t.dataset.group);
         else if (act === 'toggleDevice') toggleDevice(t.dataset.id);
         else if (act === 'selectAll') toggleSelectAll();
