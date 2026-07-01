@@ -27,6 +27,7 @@ MAX_APK_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB
 # Persistent per-device registry: serial -> {label, model, ip, last_seen, startup_app}
 REGISTRY_PATH = Path(__file__).parent / "device_registry.json"
 MAX_LABEL_LEN = 64
+MAX_GROUP_NAME_LEN = 64
 
 # Connected devices: device_id -> {ws, device_id, model, ip, status, startup_app}
 devices: dict[str, dict] = {}
@@ -35,6 +36,12 @@ devices: dict[str, dict] = {}
 # every device that has connected at least once so it stays listed while offline.
 # Survives restarts (persisted to REGISTRY_PATH).
 device_registry: dict[str, dict] = {}
+
+# Named device groups (many-to-many): group name -> list of member serials. A
+# device can belong to zero or more groups; membership is keyed by serial so an
+# offline (or not-yet-registered) device can still be grouped. Persisted to
+# REGISTRY_PATH alongside the device registry.
+device_groups: dict[str, list[str]] = {}
 
 # Connected admin WebSocket sessions
 admin_connections: set[web.WebSocketResponse] = set()
@@ -68,13 +75,45 @@ def _coerce_record(value) -> dict | None:
     return None
 
 
-def load_registry() -> None:
-    """Load the per-device registry from disk, tolerating a missing/corrupt file.
+def _coerce_groups(value) -> dict[str, list[str]]:
+    """Normalize the persisted groups mapping into {name: [serial, ...]}.
 
-    Accepts both the legacy flat shape (serial -> label string) and the current
-    record shape (serial -> {label, model, ip, last_seen, startup_app}).
+    Drops non-string names/serials, strips and length-caps names, and dedupes
+    members while preserving order. Returns an empty mapping for anything else.
+    """
+    result: dict[str, list[str]] = {}
+    if not isinstance(value, dict):
+        return result
+    for name, members in value.items():
+        if not isinstance(name, str):
+            continue
+        clean_name = name.strip()[:MAX_GROUP_NAME_LEN]
+        if not clean_name:
+            continue
+        serials: list[str] = []
+        if isinstance(members, list):
+            for s in members:
+                if isinstance(s, str) and s and s not in serials:
+                    serials.append(s)
+        result[clean_name] = serials
+    return result
+
+
+def load_registry() -> None:
+    """Load the per-device registry and groups from disk, tolerating a missing/corrupt file.
+
+    Accepts two on-disk shapes:
+    - Legacy flat: serial -> label string, or serial -> record dict (no groups).
+    - Current wrapped: {"devices": {serial -> record}, "groups": {name -> [serial]}}.
+
+    The wrapped shape is detected by a dict-valued "devices" key. Device serials
+    are formatted like "PA94U0...", so a real serial never collides with the
+    "devices"/"groups" keys. The server always writes the wrapped shape, so this
+    is a one-way auto-migration; an older server reading a new file would mistake
+    "devices"/"groups" for phantom devices (downgrade-only, acceptable).
     """
     device_registry.clear()
+    device_groups.clear()
     try:
         raw = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -85,20 +124,29 @@ def load_registry() -> None:
     if not isinstance(raw, dict):
         log.warning("Device registry is not an object; ignoring")
         return
-    for serial, value in raw.items():
+
+    if isinstance(raw.get("devices"), dict):
+        devices_raw = raw["devices"]
+        device_groups.update(_coerce_groups(raw.get("groups")))
+    else:
+        devices_raw = raw  # legacy flat shape: the whole object is serial -> value
+
+    for serial, value in devices_raw.items():
         if not isinstance(serial, str):
             continue
         record = _coerce_record(value)
         if record is not None:
             device_registry[serial] = record
-    log.info("Loaded %d device(s) from registry", len(device_registry))
+    log.info("Loaded %d device(s) and %d group(s) from registry",
+             len(device_registry), len(device_groups))
 
 
 def save_registry() -> None:
-    """Persist the per-device registry atomically (temp file + replace)."""
+    """Persist the per-device registry and groups atomically (temp file + replace)."""
     tmp = REGISTRY_PATH.with_suffix(".json.tmp")
+    payload = {"devices": device_registry, "groups": device_groups}
     try:
-        tmp.write_text(json.dumps(device_registry, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(REGISTRY_PATH)
     except OSError as e:
         log.error("Failed to persist device registry: %s", e)
@@ -152,6 +200,31 @@ def build_device_list_msg() -> str:
 async def broadcast_device_list():
     """Send the current device list to every connected admin."""
     msg = build_device_list_msg()
+    stale: list[web.WebSocketResponse] = []
+    for ws in admin_connections:
+        try:
+            await ws.send_str(msg)
+        except ConnectionResetError:
+            stale.append(ws)
+    for ws in stale:
+        admin_connections.discard(ws)
+
+
+def build_group_list_msg() -> str:
+    """Build a GROUP_LIST payload: every group with its member serials.
+
+    This is the single source of truth for group membership; the admin console
+    derives the per-device "which groups" view from it. Groups are sorted by name
+    for a stable display, and members are emitted as plain serial lists (a serial
+    may reference an offline or not-yet-registered device).
+    """
+    groups = {name: list(members) for name, members in sorted(device_groups.items())}
+    return json.dumps({"type": "GROUP_LIST", "groups": groups})
+
+
+async def broadcast_group_list():
+    """Send the current group list to every connected admin."""
+    msg = build_group_list_msg()
     stale: list[web.WebSocketResponse] = []
     for ws in admin_connections:
         try:
@@ -304,9 +377,10 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
     admin_connections.add(ws)
     log.info("Admin console connected from %s", request.remote)
 
-    # Send current device list immediately on connect
+    # Send current device list and group list immediately on connect
     try:
         await ws.send_str(build_device_list_msg())
+        await ws.send_str(build_group_list_msg())
     except ConnectionResetError:
         admin_connections.discard(ws)
         return ws
@@ -342,6 +416,21 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 elif msg_type == "FORGET_DEVICE":
                     await handle_forget_device(ws, data)
+
+                elif msg_type == "CREATE_GROUP":
+                    await handle_create_group(ws, data)
+
+                elif msg_type == "RENAME_GROUP":
+                    await handle_rename_group(ws, data)
+
+                elif msg_type == "DELETE_GROUP":
+                    await handle_delete_group(ws, data)
+
+                elif msg_type == "SET_DEVICE_GROUPS":
+                    await handle_set_device_groups(ws, data)
+
+                elif msg_type == "SET_GROUP_MEMBERS":
+                    await handle_set_group_members(ws, data)
 
                 else:
                     log.warning("Unknown message type from admin: %s", msg_type)
@@ -422,8 +511,18 @@ async def handle_forget_device(admin_ws: web.WebSocketResponse, data: dict):
         }))
         return
 
-    if device_registry.pop(serial, None) is not None:
+    removed = device_registry.pop(serial, None) is not None
+    # Decommission cleanly: drop the serial from every group so no group keeps a
+    # dangling reference to a device that is no longer known.
+    groups_changed = False
+    for members in device_groups.values():
+        if serial in members:
+            members.remove(serial)
+            groups_changed = True
+
+    if removed or groups_changed:
         save_registry()
+    if removed:
         log.info("Device forgotten: %s", serial)
 
     await admin_ws.send_str(json.dumps({
@@ -431,6 +530,207 @@ async def handle_forget_device(admin_ws: web.WebSocketResponse, data: dict):
         "device_id": serial,
     }))
     await broadcast_device_list()
+    if groups_changed:
+        await broadcast_group_list()
+
+
+async def handle_create_group(admin_ws: web.WebSocketResponse, data: dict):
+    """Create a new, empty named group and persist it."""
+    name: str = (data.get("name") or "").strip()[:MAX_GROUP_NAME_LEN]
+
+    if not name:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "Group name is required",
+        }))
+        return
+
+    if name in device_groups:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": f"Group '{name}' already exists",
+        }))
+        return
+
+    device_groups[name] = []
+    save_registry()
+    log.info("Group created: %r", name)
+
+    await admin_ws.send_str(json.dumps({
+        "type": "GROUP_CREATED",
+        "name": name,
+    }))
+    await broadcast_group_list()
+
+
+async def handle_rename_group(admin_ws: web.WebSocketResponse, data: dict):
+    """Rename an existing group, preserving its membership."""
+    name: str = (data.get("name") or "").strip()[:MAX_GROUP_NAME_LEN]
+    new_name: str = (data.get("new_name") or "").strip()[:MAX_GROUP_NAME_LEN]
+
+    if not name or not new_name:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "Both name and new_name are required",
+        }))
+        return
+
+    if name not in device_groups:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": f"Group '{name}' does not exist",
+        }))
+        return
+
+    if new_name != name and new_name in device_groups:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": f"Group '{new_name}' already exists",
+        }))
+        return
+
+    # Rebuild to preserve insertion order while swapping the key.
+    device_groups[new_name] = device_groups.pop(name)
+    save_registry()
+    log.info("Group renamed: %r -> %r", name, new_name)
+
+    await admin_ws.send_str(json.dumps({
+        "type": "GROUP_RENAMED",
+        "name": name,
+        "new_name": new_name,
+    }))
+    await broadcast_group_list()
+
+
+async def handle_delete_group(admin_ws: web.WebSocketResponse, data: dict):
+    """Delete a group. Devices are never affected, only the grouping is removed."""
+    name: str = (data.get("name") or "").strip()[:MAX_GROUP_NAME_LEN]
+
+    if not name:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "Group name is required",
+        }))
+        return
+
+    if device_groups.pop(name, None) is not None:
+        save_registry()
+        log.info("Group deleted: %r", name)
+
+    await admin_ws.send_str(json.dumps({
+        "type": "GROUP_DELETED",
+        "name": name,
+    }))
+    await broadcast_group_list()
+
+
+async def handle_set_device_groups(admin_ws: web.WebSocketResponse, data: dict):
+    """Set the exact set of groups a device belongs to.
+
+    Every named group must already exist (created via CREATE_GROUP); unknown names
+    are rejected so typos never spawn phantom groups. Membership is keyed by serial
+    so an offline device can be (re)assigned.
+    """
+    serial: str = data.get("device_id", "")
+    requested = data.get("groups", [])
+
+    if not serial:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "device_id is required",
+        }))
+        return
+
+    if not isinstance(requested, list):
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "groups must be a list of group names",
+        }))
+        return
+
+    # Normalize and validate: dedupe, and require every name to exist already.
+    target_names: list[str] = []
+    for raw_name in requested:
+        if not isinstance(raw_name, str):
+            continue
+        clean = raw_name.strip()[:MAX_GROUP_NAME_LEN]
+        if clean and clean not in target_names:
+            target_names.append(clean)
+
+    unknown = [n for n in target_names if n not in device_groups]
+    if unknown:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": f"Unknown group(s): {', '.join(unknown)}",
+        }))
+        return
+
+    # Rebuild membership so the device is in exactly the requested groups.
+    target_set = set(target_names)
+    for name, members in device_groups.items():
+        in_group = serial in members
+        if name in target_set and not in_group:
+            members.append(serial)
+        elif name not in target_set and in_group:
+            members.remove(serial)
+
+    save_registry()
+    log.info("Device groups set: %s -> %s", serial, target_names)
+
+    await admin_ws.send_str(json.dumps({
+        "type": "DEVICE_GROUPS_SET",
+        "device_id": serial,
+        "groups": target_names,
+    }))
+    await broadcast_group_list()
+
+
+async def handle_set_group_members(admin_ws: web.WebSocketResponse, data: dict):
+    """Set the exact member list of a group (group-centric assignment).
+
+    The group must already exist. Members are stored as serials; offline or
+    not-yet-registered serials are allowed (a device can be grouped while offline),
+    so members are NOT filtered against the live device list.
+    """
+    name: str = (data.get("name") or "").strip()[:MAX_GROUP_NAME_LEN]
+    requested = data.get("members", [])
+
+    if not name:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "Group name is required",
+        }))
+        return
+
+    if name not in device_groups:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": f"Group '{name}' does not exist",
+        }))
+        return
+
+    if not isinstance(requested, list):
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "members must be a list of serials",
+        }))
+        return
+
+    members: list[str] = []
+    for serial in requested:
+        if isinstance(serial, str) and serial and serial not in members:
+            members.append(serial)
+
+    device_groups[name] = members
+    save_registry()
+    log.info("Group members set: %r -> %d member(s)", name, len(members))
+
+    await admin_ws.send_str(json.dumps({
+        "type": "GROUP_MEMBERS_SET",
+        "name": name,
+        "members": members,
+    }))
+    await broadcast_group_list()
 
 
 async def handle_launch_app(admin_ws: web.WebSocketResponse, data: dict):

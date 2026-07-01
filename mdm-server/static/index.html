@@ -6,21 +6,20 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>STYLY-MDM - Device Management</title>
   <style>
-    *,
-    *::before,
-    *::after {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0
-    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --bg-primary: #0f1117;
-      --bg-secondary: #1a1d27;
+      --bg-page: #0b0d12;
+      --bg-card: #0f1117;
+      --bg-bar: #1a1d27;
+      --bg-actions: #13161e;
       --bg-tertiary: #242836;
       --border: #2e3346;
+      --border-soft: #20242f;
       --text-primary: #e4e6f0;
       --text-secondary: #9499b3;
+      --text-muted: #6b7280;
+      --text-dim: #4b5161;
       --accent: #4f8ff7;
       --accent-hover: #3a7be0;
       --success: #34d399;
@@ -31,1466 +30,1094 @@
 
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
-      background: var(--bg-primary);
+      -webkit-font-smoothing: antialiased;
+      background: var(--bg-page);
       color: var(--text-primary);
-      line-height: 1.6;
+      line-height: 1.5;
       min-height: 100vh;
+      padding: 36px 24px;
     }
 
-    /* Header */
-    .header {
-      background: var(--bg-secondary);
-      border-bottom: 1px solid var(--border);
-      padding: 16px 24px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
+    @keyframes spin { from { transform: rotate(0) } to { transform: rotate(360deg) } }
+    @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .35 } }
 
-    .header-title {
-      font-size: 20px;
-      font-weight: 700;
-      letter-spacing: 0.5px;
-    }
+    ::-webkit-scrollbar { width: 8px; height: 8px }
+    ::-webkit-scrollbar-track { background: transparent }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px }
 
-    .header-title span {
-      color: var(--accent)
-    }
+    .shell { width: 100%; }
 
-    .conn-status {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 13px;
-      color: var(--text-secondary);
-    }
+    /* Console fills the viewport (minus body margin); zones grow, log is a fixed
+       panel whose top edge is draggable. Each column scrolls internally. */
+    #consoleView { display: flex; flex-direction: column; height: calc(100vh - 72px); }
 
-    .conn-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: var(--danger);
-      transition: background 0.3s;
-    }
-
-    .conn-dot.connected {
-      background: var(--success)
-    }
-
-    .conn-dot.reconnecting {
-      background: var(--warning);
-      animation: pulse 1s infinite
-    }
-
-    @keyframes pulse {
-
-      0%,
-      100% {
-        opacity: 1
-      }
-
-      50% {
-        opacity: 0.4
-      }
-    }
-
-    /* Main layout */
-    .container {
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 24px;
-      display: flex;
-      flex-direction: column;
-      gap: 20px;
-    }
-
-    /* Section cards */
     .card {
-      background: var(--bg-secondary);
-      border: 1px solid var(--border);
-      border-radius: 8px;
+      background: var(--bg-card);
+      border-radius: 12px;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 12px 48px rgba(0, 0, 0, .28);
       overflow: hidden;
     }
 
-    .card-header {
-      padding: 14px 20px;
-      font-size: 14px;
-      font-weight: 600;
-      color: var(--text-secondary);
-      text-transform: uppercase;
-      letter-spacing: 0.8px;
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
+    /* Top bar */
+    .topbar {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 22px; background: var(--bg-bar); border-bottom: 1px solid var(--border);
     }
+    .brand { font: 700 19px/1 -apple-system, sans-serif; letter-spacing: .5px; }
+    .brand span { color: var(--accent); }
+    .conn { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); }
+    .conn-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); transition: background .3s; }
+    .conn-dot.connected { background: var(--success); }
+    .conn-dot.reconnecting { background: var(--warning); animation: pulse 1s infinite; }
+    .topbar-link { display: flex; align-items: center; gap: 14px; }
+    .back-link { font-size: 13px; color: var(--text-secondary); font-weight: 600; cursor: pointer; background: none; border: none; font-family: inherit; }
+    .back-link:hover { color: var(--text-primary); }
+    .bar-sep { width: 1px; height: 18px; background: var(--border); }
+    .bar-title { font: 700 17px/1 -apple-system, sans-serif; }
 
-    .device-count {
-      font-size: 12px;
-      background: var(--bg-tertiary);
-      padding: 2px 10px;
-      border-radius: 12px;
-      color: var(--text-secondary);
-      font-weight: 400;
-      text-transform: none;
-      letter-spacing: 0;
+    .zone-label {
+      padding: 13px 20px 0; font-size: 11px; font-weight: 700; letter-spacing: 1px;
+      color: var(--accent); text-transform: uppercase;
     }
+    .targets-head { display: flex; align-items: center; justify-content: space-between; padding: 13px 20px 0; }
+    .targets-head .zone-label { padding: 0; }
+    .manage-btn { font-size: 12px; color: var(--text-secondary); border: 1px solid var(--border); border-radius: 6px; padding: 5px 11px; background: none; cursor: pointer; font-family: inherit; }
+    .manage-btn:hover { color: var(--text-primary); border-color: #394056; }
 
-    /* Collapsible sections (accordion) */
-    .collapsible-header {
-      cursor: pointer;
-      user-select: none;
-      transition: color 0.2s
+    /* Console zones */
+    .topbar { flex: 0 0 auto; }
+    .zones {
+      flex: 1 1 0; min-height: 0; overflow: hidden;
+      display: grid;
+      grid-template-columns: minmax(260px, var(--targets-w, 58%)) 6px minmax(260px, 1fr);
     }
+    .targets { border-right: 1px solid var(--border); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+    .actions { background: var(--bg-actions); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+    .targets-head, .subtabs { flex: 0 0 auto; }
+    .actions > .zone-label, .sel-card { flex: 0 0 auto; }
 
-    .collapsible-header:hover {
-      color: var(--text-primary)
-    }
+    /* Drag handles */
+    .v-gutter { cursor: col-resize; background: transparent; transition: background .15s; }
+    .v-gutter:hover, .v-gutter.dragging { background: var(--accent); opacity: .5; }
+    .h-gutter { flex: 0 0 6px; cursor: row-resize; background: transparent; transition: background .15s; }
+    .h-gutter:hover, .h-gutter.dragging { background: var(--accent); opacity: .5; }
 
-    .caret {
-      width: 0;
-      height: 0;
-      border-left: 5px solid currentColor;
-      border-top: 4px solid transparent;
-      border-bottom: 4px solid transparent;
-      flex-shrink: 0;
-      opacity: 0.7;
-      transition: transform 0.2s;
+    /* Sub-tabs */
+    .subtabs { display: flex; align-items: center; padding: 8px 20px 0; }
+    .subtab {
+      padding: 11px 16px; font-size: 14px; font-weight: 600; color: var(--text-secondary);
+      border: none; background: none; font-family: inherit; cursor: pointer;
+      border-bottom: 2px solid transparent;
     }
+    .subtab .cnt { color: var(--text-secondary); font-weight: 400; }
+    .subtab.active { color: var(--text-primary); border-bottom-color: var(--accent); }
+    .subtab.active .cnt { color: var(--text-secondary); }
+    .subtabs-fill { flex: 1; border-bottom: 1px solid var(--border); align-self: stretch; }
 
-    .card:not(.collapsed) .caret {
-      transform: rotate(90deg)
-    }
+    .targets-body { padding: 0; flex: 1 1 0; min-height: 0; overflow-y: auto; }
 
-    .card.collapsed .command-section {
-      display: none
-    }
-
-    .card.collapsed .card-header {
-      border-bottom-color: transparent
-    }
+    /* Group rows */
+    .group-list { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
+    .group-item { background: var(--bg-bar); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .group-row { display: flex; align-items: center; gap: 12px; padding: 12px 14px; cursor: pointer; }
+    .group-row:hover { background: rgba(255, 255, 255, 0.02); }
+    .group-expand { background: none; border: none; color: var(--text-secondary); cursor: pointer; font-size: 14px; line-height: 1; padding: 3px 7px; border-radius: 4px; flex-shrink: 0; }
+    .group-expand:hover { color: var(--text-primary); background: var(--bg-tertiary); }
+    .group-devs { border-top: 1px solid var(--border); padding: 2px 14px 6px 44px; }
+    .group-dev { display: flex; align-items: center; gap: 10px; padding: 7px 0; font-size: 13px; }
+    .group-dev + .group-dev { border-top: 1px solid var(--border-soft); }
+    .group-dev-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .group-dev-status { color: var(--text-secondary); font-size: 12px; white-space: nowrap; width: 66px; }
+    .group-dev-install { font-size: 12px; white-space: nowrap; text-align: right; min-width: 92px; }
+    .radio { width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid #41475f; flex-shrink: 0; }
+    .radio.on { border: 5px solid var(--accent); background: var(--bg-card); }
+    .group-main { min-width: 0; flex: 1; }
+    .group-line { display: flex; align-items: center; gap: 9px; }
+    .group-name { font-weight: 600; font-size: 15px; }
+    .group-count { font-size: 12px; color: var(--text-secondary); }
+    .group-members { font-size: 12px; color: var(--text-secondary); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .group-empty { font-size: 12px; color: var(--text-muted); margin-top: 3px; font-style: italic; }
+    .badge-offline { font-size: 10px; color: var(--warning); border: 1px solid #5a4a1c; border-radius: 4px; padding: 0 6px; }
+    .badge-startup { font-size: 10px; color: var(--success); border: 1px solid #2c5a48; border-radius: 4px; padding: 0 5px; }
+    .btn-edit { font-size: 13px; color: var(--text-secondary); border: 1px solid var(--border); border-radius: 6px; padding: 6px 11px; white-space: nowrap; background: none; cursor: pointer; font-family: inherit; }
+    .btn-edit:hover { color: var(--text-primary); border-color: #394056; }
 
     /* Device table */
-    .table-wrap {
-      overflow-x: auto
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse
-    }
-
-    thead {
-      background: var(--bg-tertiary)
-    }
-
-    th {
-      padding: 10px 16px;
-      text-align: left;
-      font-size: 12px;
-      font-weight: 600;
-      color: var(--text-secondary);
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      white-space: nowrap;
-    }
-
-    td {
-      padding: 12px 16px;
-      font-size: 14px;
-      border-top: 1px solid var(--border);
-      white-space: nowrap;
-    }
-
-    tbody tr:hover {
-      background: var(--bg-tertiary)
-    }
-
-    .status-dot {
-      display: inline-block;
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--success);
-      margin-right: 6px;
-      vertical-align: middle;
-    }
-
-    .status-dot.offline {
-      background: var(--text-secondary)
-    }
-
-    tr.offline {
-      opacity: 0.5
-    }
-
-    tr.offline:hover {
-      opacity: 0.72
-    }
-
-    .last-seen {
-      color: var(--text-secondary);
-      font-size: 12px;
-      margin-left: 6px
-    }
-
-    .forget-btn {
-      background: none;
-      border: none;
-      cursor: pointer;
-      color: var(--text-secondary);
-      font-size: 13px;
-      line-height: 1;
-      padding: 3px 5px;
-      border-radius: 4px;
-      margin-left: 8px;
-      transition: color 0.2s, background 0.2s;
-    }
-
-    .forget-btn:hover {
-      color: var(--danger);
-      background: var(--bg-tertiary)
-    }
-
-    /* Per-device install status cell */
-    .install-cell {
-      font-size: 13px;
-      white-space: nowrap
-    }
-
-    .install-cell .install-none {
-      color: var(--text-secondary)
-    }
-
-    .install-cell .install-installing {
-      color: var(--warning)
-    }
-
-    .install-cell .install-success {
-      color: var(--success)
-    }
-
-    .install-cell .install-fail {
-      color: var(--danger)
-    }
-
-    .install-cell .install-file {
-      color: var(--text-secondary);
-      margin-left: 6px;
-      font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
-      font-size: 12px;
-      display: inline-block;
-      max-width: 220px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      vertical-align: bottom;
-    }
-
-    .install-spinner {
-      display: inline-block;
-      animation: spin 1s linear infinite
-    }
-
-    @keyframes spin {
-      from {
-        transform: rotate(0)
-      }
-
-      to {
-        transform: rotate(360deg)
-      }
-    }
-
-    .empty-state {
-      padding: 48px 20px;
-      text-align: center;
-      color: var(--text-secondary);
-      font-size: 14px;
-    }
-
-    /* Device label / serial cell */
-    .device-label-row {
-      display: flex;
-      align-items: center;
-      gap: 8px
-    }
-
-    .device-label {
-      font-weight: 600
-    }
-
-    .device-label.unlabeled {
-      color: var(--text-secondary);
-      font-weight: 400
-    }
-
-    .device-serial {
-      font-size: 12px;
-      color: var(--text-secondary);
-      font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
-      margin-top: 2px;
-    }
-
-    .label-edit-btn {
-      background: none;
-      border: none;
-      cursor: pointer;
-      color: var(--text-secondary);
-      font-size: 13px;
-      line-height: 1;
-      padding: 3px 5px;
-      border-radius: 4px;
-      transition: color 0.2s, background 0.2s;
-    }
-
-    .label-edit-btn:hover {
-      color: var(--accent);
-      background: var(--bg-tertiary)
-    }
-
-    .device-edit {
-      display: flex;
-      align-items: center;
-      gap: 6px
-    }
-
-    .label-input {
-      padding: 6px 10px;
-      background: var(--bg-primary);
-      border: 1px solid var(--accent);
-      border-radius: 6px;
-      color: var(--text-primary);
-      font-size: 14px;
-      font-family: inherit;
-      width: 150px;
-    }
-
-    .label-input:focus {
-      outline: none
-    }
-
-    .btn-mini {
-      padding: 5px 12px;
-      border: none;
-      border-radius: 6px;
-      font-size: 12px;
-      font-weight: 600;
-      cursor: pointer;
-      font-family: inherit;
-    }
-
-    .btn-save {
-      background: var(--accent);
-      color: #fff
-    }
-
-    .btn-cancel {
-      background: var(--bg-tertiary);
-      color: var(--text-secondary)
-    }
-
-    /* Checkbox styling */
-    input[type="checkbox"] {
-      width: 16px;
-      height: 16px;
-      accent-color: var(--accent);
-      cursor: pointer;
-    }
-
-    /* Command section */
-    .command-section {
-      padding: 20px
-    }
-
-    .input-row {
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
-      margin-bottom: 16px;
-    }
-
-    .input-group {
-      flex: 1;
-      min-width: 200px;
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-
-    .input-group label {
-      font-size: 12px;
-      color: var(--text-secondary);
-      font-weight: 500;
-    }
-
-    .input-group input {
-      padding: 10px 14px;
-      background: var(--bg-primary);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      color: var(--text-primary);
-      font-size: 14px;
-      font-family: inherit;
-      transition: border-color 0.2s;
-    }
-
-    .input-group input:focus {
-      outline: none;
-      border-color: var(--accent);
-    }
-
-    .input-group input[type="file"] {
-      padding: 8px 10px;
-      cursor: pointer;
-    }
-
-    .input-group input::placeholder {
-      color: var(--text-secondary);
-      opacity: 0.5
-    }
-
-    .upload-summary {
-      min-height: 20px;
-      margin-bottom: 14px;
-      font-size: 13px;
-      color: var(--text-secondary);
-    }
-
-    .upload-summary strong {
-      color: var(--text-primary);
-      font-weight: 600
-    }
-
-    .btn-row {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap
-    }
-
-    .btn {
-      padding: 10px 20px;
-      border: none;
-      border-radius: 6px;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: background 0.2s, opacity 0.2s;
-      font-family: inherit;
-    }
-
-    .btn:disabled {
-      opacity: 0.4;
-      cursor: not-allowed
-    }
-
-    .btn-primary {
-      background: var(--accent);
-      color: #fff
-    }
-
-    .btn-primary:hover:not(:disabled) {
-      background: var(--accent-hover)
-    }
-
-    .btn-success {
-      background: var(--success);
-      color: #0f1117
-    }
-
-    .btn-success:hover:not(:disabled) {
-      background: #2bbf89
-    }
-
-    .btn-warning {
-      background: var(--warning);
-      color: #1a1d27
-    }
-
-    .btn-warning:hover:not(:disabled) {
-      background: #e5ab1c
-    }
-
-    /* Log section */
-    .log-container {
-      max-height: 300px;
-      overflow-y: auto;
-      padding: 12px 16px;
-      font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
-      font-size: 13px;
-      line-height: 1.8;
-    }
-
-    .log-entry {
-      display: flex;
-      gap: 10px
-    }
-
-    .log-time {
-      color: var(--text-secondary);
-      flex-shrink: 0
-    }
-
-    .log-msg {}
-
-    .log-msg.success {
-      color: var(--success)
-    }
-
-    .log-msg.fail {
-      color: var(--danger)
-    }
-
-    .log-msg.warn {
-      color: var(--warning)
-    }
-
-    .log-msg.info {
-      color: var(--info)
-    }
-
-    .log-empty {
-      padding: 32px 20px;
-      text-align: center;
-      color: var(--text-secondary);
-      font-size: 13px;
-    }
-
-    /* Scrollbar */
-    ::-webkit-scrollbar {
-      width: 6px;
-      height: 6px
-    }
-
-    ::-webkit-scrollbar-track {
-      background: var(--bg-primary)
-    }
-
-    ::-webkit-scrollbar-thumb {
-      background: var(--border);
-      border-radius: 3px
-    }
-
-    ::-webkit-scrollbar-thumb:hover {
-      background: var(--text-secondary)
-    }
+    .dev-table { width: 100%; }
+    .dev-row { display: grid; grid-template-columns: 42px 2fr 1fr 1fr; align-items: center; padding: 10px 0; padding-left: 18px; border-top: 1px solid var(--border-soft); font-size: 13px; }
+    .dev-head { padding-top: 9px; padding-bottom: 9px; border-top: none; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .5px; }
+    .dev-row.offline { opacity: .55; }
+    .dev-row.offline:hover { opacity: .75; }
+    .dev-cell { min-width: 0; padding-right: 10px; }
+    .dev-label-row { display: flex; align-items: center; gap: 6px; }
+    .dev-label { font-weight: 600; font-size: 14px; }
+    .dev-label.unlabeled { color: var(--text-secondary); font-weight: 400; }
+    .dev-sub { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .dev-status { font-size: 13px; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 6px; vertical-align: middle; }
+    .dot.off { background: var(--text-muted); }
+    .last-seen { color: var(--text-muted); font-size: 11px; margin-left: 4px; }
+    .dev-install { font-size: 12px; padding-right: 14px; }
+    .ins-installing { color: var(--warning); }
+    .ins-success { color: var(--success); }
+    .ins-fail { color: var(--danger); }
+    .ins-none { color: var(--text-dim); }
+    .spinner { display: inline-block; animation: spin 1s linear infinite; }
+
+    /* Select boxes */
+    .selbox { width: 16px; height: 16px; border-radius: 4px; border: 1.5px solid #41475f; display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; color: #fff; font-size: 11px; font-weight: 800; }
+    .selbox.on, .selbox.mixed { background: var(--accent); border-color: var(--accent); }
+
+    .ic-btn { background: none; border: none; cursor: pointer; color: var(--text-secondary); font-size: 12px; line-height: 1; padding: 2px 4px; border-radius: 4px; }
+    .ic-btn:hover { color: var(--accent); background: var(--bg-tertiary); }
+    .forget-btn { background: none; border: none; cursor: pointer; color: var(--text-muted); font-size: 13px; padding: 2px 4px; border-radius: 4px; margin-left: 6px; }
+    .forget-btn:hover { color: var(--danger); background: var(--bg-tertiary); }
+    .assign-btn { color: var(--accent); }
+
+    /* Inline edit */
+    .dev-edit { display: flex; align-items: center; gap: 6px; }
+    .label-input { padding: 6px 10px; background: var(--bg-card); border: 1px solid var(--accent); border-radius: 6px; color: var(--text-primary); font-size: 14px; font-family: inherit; width: 150px; }
+    .label-input:focus { outline: none; }
+    .btn-mini { padding: 5px 11px; border: none; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; font-family: inherit; }
+    .btn-save { background: var(--accent); color: #fff; }
+    .btn-cancel { background: var(--bg-tertiary); color: var(--text-secondary); }
+
+    /* Actions */
+    .sel-card { margin: 12px 18px; padding: 13px 15px; background: #162033; border: 1px solid #25324a; border-radius: 8px; }
+    .sel-head { display: flex; align-items: center; gap: 10px; }
+    .sel-badge { width: 20px; height: 20px; border-radius: 5px; background: var(--accent); display: flex; align-items: center; justify-content: center; color: #fff; font-size: 12px; font-weight: 800; }
+    .sel-badge.zero { background: var(--bg-tertiary); color: var(--text-secondary); }
+    .sel-count { font-size: 15px; font-weight: 700; }
+    .sel-clear { font-size: 12px; color: #9bb0d6; cursor: pointer; background: none; border: none; font-family: inherit; }
+    .sel-clear:hover { color: var(--text-primary); }
+    .sel-ctx { font-size: 12px; color: #9bb0d6; margin-top: 7px; }
+
+    .commands { padding: 0 18px 18px; display: flex; flex-direction: column; gap: 14px; flex: 1 1 0; min-height: 0; overflow-y: auto; }
+    .cmd-divider { height: 1px; background: var(--border); }
+    .cmd-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 8px; cursor: pointer; user-select: none; }
+    .cmd-head:hover { color: var(--text-primary); }
+    .cmd-chevron { display: inline-block; opacity: .7; transition: transform .15s; }
+    .cmd-body { display: block; }
+    .cmd-section.collapsed .cmd-body { display: none; }
+    .cmd-section.collapsed .cmd-head { margin-bottom: 0; }
+    .cmd-section.collapsed .cmd-chevron { transform: rotate(-90deg); }
+    .field { padding: 9px 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; color: var(--text-primary); font-size: 13px; font-family: inherit; width: 100%; }
+    .field:focus { outline: none; border-color: var(--accent); }
+    .field::placeholder { color: var(--text-dim); }
+    .field + .field { margin-top: 7px; }
+    .file-row { display: flex; align-items: center; gap: 9px; padding: 8px 10px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; }
+    .file-pick { background: var(--bg-tertiary); border-radius: 5px; padding: 5px 11px; font-size: 12px; color: #cfd3e3; cursor: pointer; white-space: nowrap; }
+    .file-name { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .file-name strong { color: var(--text-primary); font-weight: 600; }
+
+    .btn { padding: 10px; border: none; border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; width: 100%; text-align: center; margin-top: 8px; transition: opacity .2s, background .2s; }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+    .btn-success { background: var(--success); color: #0f1117; }
+    .btn-success:hover:not(:disabled) { background: #2bbf89; }
+    .btn-danger-outline { background: transparent; border: 1px solid var(--danger); color: var(--danger); }
+    .btn-row { display: flex; gap: 8px; margin-top: 8px; }
+    .btn-row .btn { margin-top: 0; }
+
+    /* Log (fixed-height panel; top edge draggable via .h-gutter) */
+    .logzone { border-top: 1px solid var(--border); background: var(--bg-actions); flex: 0 0 auto; height: 170px; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+    .log-head { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; padding: 10px 22px; border-bottom: 1px solid var(--border-soft); }
+    .log-head .zl { font-size: 11px; font-weight: 700; letter-spacing: 1px; color: var(--accent); text-transform: uppercase; }
+    .log-clear { font-size: 11px; color: var(--text-secondary); background: var(--bg-tertiary); border: none; border-radius: 5px; padding: 3px 11px; cursor: pointer; font-family: inherit; }
+    .log-body { padding: 10px 22px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.9; flex: 1 1 0; min-height: 0; overflow-y: auto; }
+    .log-entry { display: flex; gap: 10px; }
+    .log-time { color: var(--text-muted); flex-shrink: 0; }
+    .log-msg.success { color: var(--success); }
+    .log-msg.fail { color: var(--danger); }
+    .log-msg.warn { color: var(--warning); }
+    .log-msg.info { color: var(--info); }
+    .log-empty { color: var(--text-muted); padding: 8px 0; }
+
+    .empty { padding: 40px 20px; text-align: center; color: var(--text-muted); font-size: 14px; }
+    .empty.small { padding: 18px 10px; font-size: 13px; }
+
+    /* Manage Groups */
+    .manage-grid { display: grid; grid-template-columns: 280px 1fr; }
+    .mg-sidebar { background: var(--bg-actions); border-right: 1px solid var(--border); padding: 14px 12px; }
+    .mg-create { display: flex; gap: 8px; margin-bottom: 12px; }
+    .mg-new { flex: 1; padding: 9px 11px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; color: var(--text-primary); font-size: 13px; font-family: inherit; min-width: 0; }
+    .mg-new:focus { outline: none; border-color: var(--accent); }
+    .mg-list { display: flex; flex-direction: column; gap: 3px; }
+    .mg-item { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-radius: 7px; cursor: pointer; font-size: 14px; }
+    .mg-item:hover { background: #1d2230; }
+    .mg-item.active { background: #1d2230; }
+    .mg-item-name { flex: 1; font-weight: 600; }
+    .mg-item-count { font-size: 11px; color: #8b91a8; background: var(--bg-card); border-radius: 9px; padding: 1px 8px; }
+    .mg-detail-empty { padding: 48px 24px; text-align: center; color: var(--text-muted); }
+    .mg-detail-head { display: flex; align-items: center; justify-content: space-between; padding: 15px 20px; border-bottom: 1px solid var(--border); gap: 12px; }
+    .mg-title { font-size: 18px; font-weight: 700; }
+    .mg-sub { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+    .mg-head-actions { display: flex; gap: 8px; font-size: 12px; }
+    .btn-outline { padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px; color: #cfd3e3; background: none; cursor: pointer; font-family: inherit; font-size: 12px; }
+    .btn-outline:hover { border-color: #394056; }
+    .mg-detail-head .btn-danger-outline { padding: 6px 12px; width: auto; margin: 0; font-size: 12px; font-weight: 400; }
+    .mg-search { padding: 14px 20px 8px; }
+    .mg-search-input { width: 100%; padding: 9px 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 7px; color: var(--text-primary); font-size: 13px; font-family: inherit; }
+    .mg-search-input:focus { outline: none; border-color: var(--accent); }
+    .mg-dev-list { max-height: 320px; overflow-y: auto; padding: 2px 12px 10px; }
+    .mg-dev { display: flex; align-items: center; gap: 12px; padding: 9px 10px; border-radius: 7px; cursor: pointer; }
+    .mg-dev:hover { background: var(--bg-bar); }
+    .mg-dev-main { flex: 1; min-width: 0; }
+    .mg-dev-status { font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
+    .mg-footer { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-top: 1px solid var(--border); background: #161a24; }
+    .mg-foot-count { font-size: 12px; color: var(--text-secondary); }
+    .mg-footer .spacer { flex: 1; }
+    .btn-text { background: none; border: none; color: var(--text-secondary); font-size: 13px; cursor: pointer; font-family: inherit; padding: 9px 16px; }
+    .mg-footer .btn-primary { width: auto; margin: 0; padding: 9px 20px; font-size: 13px; }
+
+    input[type="checkbox"] { accent-color: var(--accent); }
 
     /* Responsive */
-    @media(max-width:640px) {
-      .header {
-        padding: 12px 16px
-      }
-
-      .container {
-        padding: 16px
-      }
-
-      .command-section {
-        padding: 16px
-      }
-
-      .input-row {
-        flex-direction: column
-      }
-
-      .input-group {
-        min-width: unset
-      }
+    @media (max-width: 640px) {
+      body { padding: 16px 12px; }
+      /* Drop the viewport-locked layout on small screens: block flow, page scrolls. */
+      #consoleView { display: block; height: auto; }
+      .zones { grid-template-columns: 1fr; overflow: visible; }
+      .targets, .actions { overflow: visible; }
+      .targets-body, .commands { overflow-y: visible; flex: 0 0 auto; }
+      .targets { border-right: none; border-bottom: 1px solid var(--border); }
+      .v-gutter, .h-gutter { display: none; }
+      .logzone { height: auto; }
+      .log-body { flex: 0 0 auto; max-height: 220px; }
+      .manage-grid { grid-template-columns: 1fr; }
+      .mg-sidebar { border-right: none; border-bottom: 1px solid var(--border); }
     }
   </style>
 </head>
 
 <body>
-
-  <div class="header">
-    <div class="header-title">STYLY-MDM</div>
-    <div class="conn-status">
-      <div class="conn-dot" id="connDot"></div>
-      <span id="connText">Disconnected</span>
-    </div>
-  </div>
-
-  <div class="container">
-    <!-- Device List -->
-    <div class="card">
-      <div class="card-header">
-        <span>Devices</span>
-        <span class="device-count" id="deviceCount">0 online</span>
+  <div class="shell">
+    <!-- ===================== CONSOLE VIEW ===================== -->
+    <div id="consoleView" class="card">
+      <div class="topbar">
+        <div class="brand">STYLY-<span>MDM</span></div>
+        <div class="conn"><span class="conn-dot" id="connDot"></span><span id="connText">Disconnected</span></div>
       </div>
-      <div class="table-wrap">
-        <table id="deviceTable">
-          <thead>
-            <tr>
-              <th style="width:40px"><input type="checkbox" id="selectAll" title="Select All"></th>
-              <th>Device</th>
-              <th>Model</th>
-              <th>IP Address</th>
-              <th>Startup App</th>
-              <th>Status</th>
-              <th>Install</th>
-            </tr>
-          </thead>
-          <tbody id="deviceBody"></tbody>
-        </table>
-        <div class="empty-state" id="emptyState">No devices yet</div>
-      </div>
-    </div>
 
-    <!-- Quick Install Section -->
-    <div class="card collapsible">
-      <div class="card-header collapsible-header">
-        <span>Quick Install</span>
-        <span class="caret"></span>
-      </div>
-      <div class="command-section">
-        <div class="input-row">
-          <div class="input-group">
-            <label for="apkFile">APK File</label>
-            <input type="file" id="apkFile" accept=".apk,application/vnd.android.package-archive">
+      <div class="zones">
+        <!-- (1) Targets -->
+        <div class="targets">
+          <div class="targets-head">
+            <span class="zone-label">① Targets</span>
+            <button class="manage-btn" id="btnManageGroups">Manage Groups</button>
+          </div>
+          <div class="subtabs">
+            <button class="subtab active" id="tabGroups" data-tab="groups">Groups <span class="cnt" id="cntGroups">0</span></button>
+            <button class="subtab" id="tabDevices" data-tab="devices">Devices <span class="cnt" id="cntDevices">0</span></button>
+            <div class="subtabs-fill"></div>
+          </div>
+          <div class="targets-body" id="targetsBody"></div>
+        </div>
+
+        <!-- Draggable boundary: Targets | Actions -->
+        <div class="v-gutter" id="vGutter" title="Drag to resize"></div>
+
+        <!-- (2) Actions -->
+        <div class="actions">
+          <div class="zone-label">② Actions</div>
+          <div class="sel-card" id="selCard"></div>
+          <div class="commands">
+            <div class="cmd-section collapsed" data-cmd="install">
+              <div class="cmd-head" data-act="toggleCmd"><span>Quick Install</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <div class="file-row">
+                  <label class="file-pick" for="apkFile">Choose File</label>
+                  <input type="file" id="apkFile" accept=".apk,application/vnd.android.package-archive" hidden>
+                  <span class="file-name" id="apkName">No APK selected</span>
+                </div>
+                <button class="btn btn-success" id="btnInstall" disabled>Install to Selected</button>
+              </div>
+            </div>
+            <div class="cmd-divider"></div>
+            <div class="cmd-section collapsed" data-cmd="launch">
+              <div class="cmd-head" data-act="toggleCmd"><span>Launch Command</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <input type="text" class="field" id="launchPkg" placeholder="com.example.app">
+                <input type="text" class="field" id="launchExtra" placeholder='{"scene":"main"} (optional)'>
+                <button class="btn btn-primary" id="btnLaunch" disabled>Launch to Selected</button>
+              </div>
+            </div>
+            <div class="cmd-divider"></div>
+            <div class="cmd-section collapsed" data-cmd="startup">
+              <div class="cmd-head" data-act="toggleCmd"><span>Startup App</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <input type="text" class="field" id="startupPkg" placeholder="com.example.app">
+                <input type="text" class="field" id="startupExtra" placeholder='{"scene":"main"} (optional)'>
+                <div class="btn-row">
+                  <button class="btn btn-primary" id="btnStartupSet" disabled>Set</button>
+                  <button class="btn btn-danger-outline" id="btnStartupClear" disabled>Clear</button>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
-        <div class="upload-summary" id="apkSummary">No APK selected</div>
-        <div class="btn-row">
-          <button class="btn btn-success" id="btnInstallSelected" disabled>Install to Selected</button>
-        </div>
       </div>
-    </div>
 
-    <!-- Command Section -->
-    <div class="card collapsible collapsed">
-      <div class="card-header collapsible-header">
-        <span>Launch Command</span>
-        <span class="caret"></span>
-      </div>
-      <div class="command-section">
-        <div class="input-row">
-          <div class="input-group">
-            <label for="packageName">Package Name</label>
-            <input type="text" id="packageName" placeholder="com.example.app">
-          </div>
-          <div class="input-group">
-            <label for="extraData">Extra Data (optional)</label>
-            <input type="text" id="extraData" placeholder='{"scene": "main"}'>
-          </div>
-        </div>
-        <div class="btn-row">
-          <button class="btn btn-primary" id="btnSelected" disabled>Launch to Selected</button>
-        </div>
-      </div>
-    </div>
+      <!-- Draggable boundary: zones | Activity Log -->
+      <div class="h-gutter" id="hGutter" title="Drag to resize"></div>
 
-    <!-- Startup App Configuration -->
-    <div class="card collapsible collapsed">
-      <div class="card-header collapsible-header">
-        <span>Startup App Configuration</span>
-        <span class="caret"></span>
-      </div>
-      <div class="command-section">
-        <div class="input-row">
-          <div class="input-group">
-            <label for="startupPackageName">Package Name</label>
-            <input type="text" id="startupPackageName" placeholder="com.example.app">
-          </div>
-          <div class="input-group">
-            <label for="startupExtraData">Extra Data (optional)</label>
-            <input type="text" id="startupExtraData" placeholder='{"scene": "main"}'>
-          </div>
+      <!-- (3) Log -->
+      <div class="logzone">
+        <div class="log-head">
+          <span class="zl">③ Activity Log</span>
+          <button class="log-clear" id="btnClearLog">Clear</button>
         </div>
-        <div class="btn-row">
-          <button class="btn btn-primary" id="btnSetStartupSelected" disabled>Set for Selected</button>
-          <button class="btn btn-danger-outline" id="btnClearStartupSelected" disabled
-            style="background:transparent;border:1px solid var(--danger);color:var(--danger)">Clear for
-            Selected</button>
-        </div>
+        <div class="log-body" id="logContainer"><div class="log-empty" id="logEmpty">No activity yet</div></div>
       </div>
     </div>
 
-    <!-- Activity Log -->
-    <div class="card">
-      <div class="card-header">
-        <span>Activity Log</span>
-        <button class="btn"
-          style="padding:4px 12px;font-size:11px;background:var(--bg-tertiary);color:var(--text-secondary)"
-          id="btnClearLog">Clear</button>
+    <!-- ===================== MANAGE GROUPS VIEW ===================== -->
+    <div id="manageView" class="card" style="display:none">
+      <div class="topbar topbar-link">
+        <button class="back-link" data-act="back">← Back to console</button>
+        <span class="bar-sep"></span>
+        <span class="bar-title">Manage Groups</span>
       </div>
-      <div class="log-container" id="logContainer">
-        <div class="log-empty" id="logEmpty">No activity yet</div>
+      <div class="manage-grid">
+        <div class="mg-sidebar" id="mgSidebar"></div>
+        <div id="mgDetail"></div>
       </div>
     </div>
   </div>
 
   <script>
     (function () {
-      // State
+      // ---------------- State ----------------
       let ws = null;
       let devices = [];
+      let groups = {};                 // name -> [serials]
       let selectedIds = new Set();
-      // Per-device install status (session-only): id -> { status, filename, detail }
-      // status: 'installing' | 'success' | 'fail'
-      let installState = {};
-      let editingId = null;
+      let activeGroup = null;          // group name driving the selection, or null
+      let targetTab = 'groups';        // 'groups' | 'devices'
+      let userPickedTab = false;       // true once the user clicks a sub-tab (stops auto-default)
+      let expandedGroups = new Set();  // group names expanded to show per-device status
+      let view = 'console';            // 'console' | 'manage'
+      let installState = {};           // id -> { status, filename, detail }
+      let editingLabelId = null;
       let uploadedApk = null;
       let uploadInProgress = false;
       let reconnectTimer = null;
       const RECONNECT_DELAY = 3000;
+      // Manage view
+      let manageSelectedGroup = null;
+      let manageMembers = new Set();
+      let manageSearch = '';
+      let renamingManageGroup = false;
+      let pendingSelectGroup = null;   // select this group in manage once GROUP_LIST confirms it
 
-      // DOM refs
+      // ---------------- DOM refs ----------------
+      const consoleView = document.getElementById('consoleView');
+      const manageView = document.getElementById('manageView');
       const connDot = document.getElementById('connDot');
       const connText = document.getElementById('connText');
-      const deviceBody = document.getElementById('deviceBody');
-      const deviceCount = document.getElementById('deviceCount');
-      const emptyState = document.getElementById('emptyState');
-      const selectAll = document.getElementById('selectAll');
-      const packageName = document.getElementById('packageName');
-      const extraData = document.getElementById('extraData');
-      const btnSelected = document.getElementById('btnSelected');
+      const tabGroups = document.getElementById('tabGroups');
+      const tabDevices = document.getElementById('tabDevices');
+      const btnManageGroups = document.getElementById('btnManageGroups');
+      const cntGroups = document.getElementById('cntGroups');
+      const cntDevices = document.getElementById('cntDevices');
+      const targetsBody = document.getElementById('targetsBody');
+      const selCard = document.getElementById('selCard');
       const apkFile = document.getElementById('apkFile');
-      const apkSummary = document.getElementById('apkSummary');
-      const btnInstallSelected = document.getElementById('btnInstallSelected');
-      const startupPackageName = document.getElementById('startupPackageName');
-      const startupExtraData = document.getElementById('startupExtraData');
-      const btnSetStartupSelected = document.getElementById('btnSetStartupSelected');
-      const btnClearStartupSelected = document.getElementById('btnClearStartupSelected');
+      const apkName = document.getElementById('apkName');
+      const btnInstall = document.getElementById('btnInstall');
+      const launchPkg = document.getElementById('launchPkg');
+      const launchExtra = document.getElementById('launchExtra');
+      const btnLaunch = document.getElementById('btnLaunch');
+      const startupPkg = document.getElementById('startupPkg');
+      const startupExtra = document.getElementById('startupExtra');
+      const btnStartupSet = document.getElementById('btnStartupSet');
+      const btnStartupClear = document.getElementById('btnStartupClear');
       const logContainer = document.getElementById('logContainer');
       const logEmpty = document.getElementById('logEmpty');
       const btnClearLog = document.getElementById('btnClearLog');
+      const mgSidebar = document.getElementById('mgSidebar');
+      const mgDetail = document.getElementById('mgDetail');
 
-      function getDeviceId(device) {
-        return device.device_id || device.serial_number || '';
-      }
+      // ---------------- Helpers ----------------
+      function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+      function getDeviceId(d) { return d.device_id || d.serial_number || ''; }
+      function isOnline(d) { return d.status !== 'offline'; }
+      function deviceById(id) { return devices.find(function (d) { return getDeviceId(d) === id; }); }
+      function getOnlineIds() { return devices.filter(isOnline).map(getDeviceId).filter(Boolean); }
+      function knownIds() { return new Set(devices.map(getDeviceId).filter(Boolean)); }
+      function labelFor(id) { if (!id) return '-'; const d = deviceById(id); return (d && d.label) ? d.label : id; }
+      function groupNames() { return Object.keys(groups).sort(); }
+      function offlineMembers(name) { return (groups[name] || []).filter(function (s) { const d = deviceById(s); return d && !isOnline(d); }).length; }
 
-      // A device is online unless the server explicitly marks it offline.
-      function isOnline(device) {
-        return device.status !== 'offline';
-      }
-
-      // IDs of currently online devices (the only valid command targets).
-      function getOnlineIds() {
-        return devices.filter(isOnline).map(getDeviceId).filter(Boolean);
-      }
-
-      // Friendly identifier for logs: prefer the label, fall back to the serial.
-      function labelFor(id) {
-        if (!id) return '-';
-        var d = devices.find(function (x) { return getDeviceId(x) === id; });
-        return (d && d.label) ? d.label : id;
-      }
-
-      // Connection status
+      // ---------------- Connection ----------------
       function setConnStatus(state) {
         connDot.className = 'conn-dot';
-        if (state === 'connected') {
-          connDot.classList.add('connected');
-          connText.textContent = 'Connected';
-        } else if (state === 'reconnecting') {
-          connDot.classList.add('reconnecting');
-          connText.textContent = 'Reconnecting...';
-        } else {
-          connText.textContent = 'Disconnected';
-        }
+        if (state === 'connected') { connDot.classList.add('connected'); connText.textContent = 'Connected'; }
+        else if (state === 'reconnecting') { connDot.classList.add('reconnecting'); connText.textContent = 'Reconnecting...'; }
+        else { connText.textContent = 'Disconnected'; }
       }
 
-      // WebSocket
       function connect() {
         if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
-
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const url = proto + '//' + location.host + '/ws/admin';
-        ws = new WebSocket(url);
-
-        ws.onopen = function () {
-          setConnStatus('connected');
-          addLog('Connected to server', 'info');
-          if (reconnectTimer) {
-            clearTimeout(reconnectTimer);
-            reconnectTimer = null;
-          }
-        };
-
-        ws.onclose = function () {
-          setConnStatus('reconnecting');
-          addLog('Disconnected from server', 'fail');
-          scheduleReconnect();
-        };
-
-        ws.onerror = function () {
-          // onclose will fire after this
-        };
-
-        ws.onmessage = function (e) {
-          try {
-            const msg = JSON.parse(e.data);
-            handleMessage(msg);
-          } catch (err) {
-            addLog('Failed to parse message: ' + err.message, 'fail');
-          }
-        };
+        ws = new WebSocket(proto + '//' + location.host + '/ws/admin');
+        ws.onopen = function () { setConnStatus('connected'); addLog('Connected to server', 'info'); if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; } };
+        ws.onclose = function () { setConnStatus('reconnecting'); addLog('Disconnected from server', 'fail'); scheduleReconnect(); };
+        ws.onerror = function () { };
+        ws.onmessage = function (e) { try { handleMessage(JSON.parse(e.data)); } catch (err) { addLog('Failed to parse message: ' + err.message, 'fail'); } };
       }
-
       function scheduleReconnect() {
         if (reconnectTimer) return;
-        reconnectTimer = setTimeout(function () {
-          reconnectTimer = null;
-          addLog('Attempting to reconnect...', 'info');
-          connect();
-        }, RECONNECT_DELAY);
+        reconnectTimer = setTimeout(function () { reconnectTimer = null; addLog('Attempting to reconnect...', 'info'); connect(); }, RECONNECT_DELAY);
+      }
+      function wsSend(obj, failCtx) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) { addLog('Cannot ' + failCtx + ': not connected to server', 'fail'); return false; }
+        ws.send(JSON.stringify(obj)); return true;
       }
 
+      // ---------------- Message handling ----------------
       function handleMessage(msg) {
         switch (msg.type) {
-          case 'DEVICE_LIST':
+          case 'DEVICE_LIST': {
             devices = msg.devices || [];
-            // Prune selected IDs that are no longer in the device list. Offline
-            // devices remain in the list, so a selection survives for labeling.
-            const currentIds = new Set(devices.map(getDeviceId).filter(Boolean));
-            selectedIds.forEach(function (id) {
-              if (!currentIds.has(id)) selectedIds.delete(id);
-            });
-            // Drop install status for any device that is not currently online: keeps
-            // the online-only install model honest and avoids a stuck "Installing…"
-            // spinner on a device that dropped mid-install.
+            const cur = knownIds();
+            selectedIds.forEach(function (id) { if (!cur.has(id)) selectedIds.delete(id); });
             const onlineNow = new Set(getOnlineIds());
-            Object.keys(installState).forEach(function (id) {
-              if (!onlineNow.has(id)) delete installState[id];
-            });
-            renderDevices();
+            Object.keys(installState).forEach(function (id) { if (!onlineNow.has(id)) delete installState[id]; });
+            syncActiveGroupSelection();
+            render();
             break;
-
-          case 'LAUNCH_RESULT':
-            var status = msg.status === 'success' ? 'success' : 'fail';
-            var label = msg.status === 'success' ? 'OK' : 'FAIL';
-            var launchDetail = msg.error || msg.message || '';
-            addLog('[' + label + '] ' + msg.package_name + ' on ' + labelFor(msg.device_id) + (launchDetail ? ' - ' + launchDetail : ''), status);
+          }
+          case 'GROUP_LIST': {
+            groups = msg.groups || {};
+            if (pendingSelectGroup && (pendingSelectGroup in groups)) { selectManageGroup(pendingSelectGroup); pendingSelectGroup = null; }
+            else if (manageSelectedGroup && !(manageSelectedGroup in groups)) { manageSelectedGroup = null; manageMembers = new Set(); }
+            // Keep the active-group selection current: a group whose membership was
+            // just edited must not dispatch to the old member set (PR #29 P1).
+            syncActiveGroupSelection();
+            render();
             break;
-
-          case 'LAUNCH_SENT':
-            addLog('Launch command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info');
+          }
+          case 'LAUNCH_RESULT': {
+            const st = msg.status === 'success' ? 'success' : 'fail';
+            const detail = msg.error || msg.message || '';
+            addLog('[' + (msg.status === 'success' ? 'OK' : 'FAIL') + '] ' + msg.package_name + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), st);
             break;
-
-          case 'INSTALL_SENT':
-            addLog('Install command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info');
+          }
+          case 'LAUNCH_SENT': addLog('Launch command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'INSTALL_SENT': addLog('Install command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'INSTALL_RESULT': {
+            const st = msg.status === 'success' ? 'success' : 'fail';
+            const detail = msg.error || msg.message || '';
+            if (msg.device_id) { installState[msg.device_id] = { status: st, filename: msg.apk_filename || '', detail: detail }; updateInstallCell(msg.device_id); }
+            addLog('[' + (msg.status === 'success' ? 'OK' : 'FAIL') + '] install ' + (msg.apk_filename || '-') + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), st);
             break;
-
-          case 'INSTALL_RESULT':
-            var installStatus = msg.status === 'success' ? 'success' : 'fail';
-            var installLabel = msg.status === 'success' ? 'OK' : 'FAIL';
-            var installDetail = msg.error || msg.message || '';
-            if (msg.device_id) {
-              installState[msg.device_id] = {
-                status: installStatus,
-                filename: msg.apk_filename || '',
-                detail: installDetail
-              };
-              updateInstallCell(msg.device_id);
-            }
-            addLog('[' + installLabel + '] install ' + (msg.apk_filename || '-') + ' on ' + labelFor(msg.device_id) + (installDetail ? ' - ' + installDetail : ''), installStatus);
+          }
+          case 'DEVICE_LABEL_SET': addLog('Label set: ' + (msg.device_id || '-') + ' -> ' + (msg.label || '(cleared)'), 'success'); break;
+          case 'DEVICE_FORGOTTEN': addLog('Device forgotten: ' + (msg.device_id || '-'), 'success'); break;
+          case 'GROUP_CREATED': addLog('Group created: ' + (msg.name || '-'), 'success'); if (view === 'manage') pendingSelectGroup = msg.name; break;
+          case 'GROUP_RENAMED':
+            addLog('Group renamed: ' + (msg.name || '-') + ' -> ' + (msg.new_name || '-'), 'success');
+            if (manageSelectedGroup === msg.name) pendingSelectGroup = msg.new_name;
+            if (activeGroup === msg.name) activeGroup = msg.new_name;
             break;
-
-          case 'DEVICE_LABEL_SET':
-            addLog('Label set: ' + (msg.device_id || '-') + ' -> ' + (msg.label || '(cleared)'), 'success');
+          case 'GROUP_DELETED': addLog('Group deleted: ' + (msg.name || '-'), 'success'); if (activeGroup === msg.name) activeGroup = null; break;
+          case 'DEVICE_GROUPS_SET': addLog('Groups set for ' + labelFor(msg.device_id) + ': ' + ((msg.groups && msg.groups.length) ? msg.groups.join(', ') : '(none)'), 'success'); break;
+          case 'GROUP_MEMBERS_SET': addLog('Group "' + (msg.name || '-') + '" saved: ' + ((msg.members && msg.members.length) || 0) + ' device(s)', 'success'); break;
+          case 'SET_STARTUP_APP_SENT': addLog('Startup app set: ' + msg.package_name + ' (' + msg.sent_count + '/' + msg.target_count + ' devices)', 'success'); break;
+          case 'CLEAR_STARTUP_APP_SENT': addLog('Startup app cleared (' + msg.sent_count + '/' + msg.target_count + ' devices)', 'success'); break;
+          case 'STARTUP_APP_RESULT': {
+            const st = msg.status === 'success' ? 'success' : 'fail';
+            addLog('[Startup ' + (msg.status === 'success' ? 'OK' : 'FAIL') + '] ' + (msg.package_name || '') + (msg.device_id ? ' on ' + labelFor(msg.device_id) : '') + (msg.error ? ' - ' + msg.error : ''), st);
             break;
-
-          case 'DEVICE_FORGOTTEN':
-            addLog('Device forgotten: ' + (msg.device_id || '-'), 'success');
-            break;
-
-          case 'ERROR':
-            addLog('[ERROR] ' + (msg.message || 'Unknown error'), 'fail');
-            break;
-
-          case 'SET_STARTUP_APP_SENT':
-            addLog('Startup app set: ' + msg.package_name + ' (' + msg.sent_count + '/' + msg.target_count + ' devices)', 'success');
-            break;
-
-          case 'CLEAR_STARTUP_APP_SENT':
-            addLog('Startup app cleared (' + msg.sent_count + '/' + msg.target_count + ' devices)', 'success');
-            break;
-
-          case 'STARTUP_APP_RESULT':
-            var saStatus = msg.status === 'success' ? 'success' : 'fail';
-            var saLabel = msg.status === 'success' ? 'OK' : 'FAIL';
-            addLog('[Startup ' + saLabel + '] ' + (msg.package_name || '') + (msg.device_id ? ' on ' + msg.device_id : '') + (msg.error ? ' - ' + msg.error : ''), saStatus);
-            break;
-
-          default:
-            addLog('Received: ' + msg.type, 'info');
+          }
+          case 'ERROR': addLog('[ERROR] ' + (msg.message || 'Unknown error'), 'fail'); break;
+          default: addLog('Received: ' + msg.type, 'info');
         }
       }
 
-      // Render device table
-      function renderDevices() {
-        var onlineCount = devices.filter(isOnline).length;
-        deviceCount.textContent = onlineCount + ' online / ' + devices.length + ' total';
-        emptyState.style.display = devices.length ? 'none' : 'block';
+      // ---------------- Render (master) ----------------
+      function render() {
+        if (view === 'manage') {
+          manageView.style.display = '';
+          consoleView.style.display = 'none';
+          renderManageSidebar();
+          renderManageDetail();
+        } else {
+          consoleView.style.display = '';
+          manageView.style.display = 'none';
+          // Default tab: Groups when groups exist, else Devices — until the user
+          // explicitly picks a tab, after which their choice sticks.
+          if (!userPickedTab) targetTab = groupNames().length ? 'groups' : 'devices';
+          renderTabs();
+          renderTargets();
+          renderActions();
+        }
+      }
 
-        deviceBody.innerHTML = '';
-        devices.forEach(function (dev) {
-          var tr = document.createElement('tr');
-          var id = getDeviceId(dev);
-          var offline = !isOnline(dev);
-          tr.dataset.deviceId = id;
-          if (offline) tr.classList.add('offline');
+      function renderTabs() {
+        cntGroups.textContent = groupNames().length;
+        cntDevices.textContent = devices.length;
+        tabGroups.classList.toggle('active', targetTab === 'groups');
+        tabDevices.classList.toggle('active', targetTab === 'devices');
+      }
 
-          // Checkbox
-          var tdCb = document.createElement('td');
-          var cb = document.createElement('input');
-          cb.type = 'checkbox';
-          cb.checked = selectedIds.has(id);
-          cb.addEventListener('change', function () {
-            if (cb.checked) {
-              selectedIds.add(id);
-            } else {
-              selectedIds.delete(id);
-            }
-            updateSelectAll();
-            updateButtons();
-          });
-          tdCb.appendChild(cb);
-          tr.appendChild(tdCb);
+      function renderTargets() {
+        targetsBody.innerHTML = targetTab === 'groups' ? renderGroupsHtml() : renderDevicesHtml();
+        if (editingLabelId !== null && targetTab === 'devices') {
+          const inp = targetsBody.querySelector('[data-label-input]');
+          if (inp) setTimeout(function () { inp.focus(); inp.select(); }, 0);
+        }
+      }
 
-          // Device: label (primary) + serial (sub), with inline edit
-          var tdDevice = document.createElement('td');
-          tdDevice.appendChild(buildDeviceCell(dev, id));
-          tr.appendChild(tdDevice);
+      function renderGroupsHtml() {
+        const names = groupNames();
+        if (!names.length) return '<div class="empty">No groups yet — use "Manage Groups" (top right) to create one.</div>';
+        return '<div class="group-list">' + names.map(function (name) {
+          const members = groups[name] || [];
+          const count = members.length;
+          const off = offlineMembers(name);
+          const on = activeGroup === name;
+          const expanded = expandedGroups.has(name);
+          // Collapsed rows show a one-line member preview; expanded rows show the
+          // per-device status list below instead (so the preview is redundant).
+          const preview = expanded ? '' : (count
+            ? '<div class="group-members">' + esc(members.map(labelFor).join(', ')) + '</div>'
+            : '<div class="group-empty">No members yet</div>');
+          const row = '<div class="group-row" data-act="selectGroup" data-group="' + esc(name) + '">' +
+            '<div class="radio ' + (on ? 'on' : '') + '"></div>' +
+            '<div class="group-main"><div class="group-line">' +
+            '<span class="group-name">' + esc(name) + '</span>' +
+            '<span class="group-count">' + (count === 1 ? '1 device' : count + ' devices') + '</span>' +
+            '<button class="group-expand" data-act="toggleExpand" data-group="' + esc(name) + '" title="' + (expanded ? 'Collapse' : 'Show devices') + '">' + (expanded ? '▾' : '▸') + '</button>' +
+            (off ? '<span class="badge-offline">' + off + ' offline</span>' : '') +
+            '</div>' + preview + '</div>' +
+            '<button class="btn-edit" data-act="editGroup" data-group="' + esc(name) + '">✏ Edit</button>' +
+            '</div>';
+          const body = expanded ? '<div class="group-devs">' + renderGroupDevsHtml(members) + '</div>' : '';
+          return '<div class="group-item">' + row + body + '</div>';
+        }).join('') + '</div>';
+      }
 
-          // Model
-          var tdModel = document.createElement('td');
-          tdModel.textContent = dev.model || '-';
-          tr.appendChild(tdModel);
+      // Per-device rows shown when a group is expanded: online/offline + install progress.
+      function renderGroupDevsHtml(members) {
+        if (!members.length) return '<div class="group-empty">No members yet</div>';
+        return members.map(function (serial) {
+          const d = deviceById(serial);
+          const label = (d && d.label) ? d.label : serial;
+          const status = !d ? 'Unknown' : (isOnline(d) ? 'Online' : 'Offline');
+          const off = !d || !isOnline(d);
+          return '<div class="group-dev">' +
+            '<span class="dot ' + (off ? 'off' : '') + '"></span>' +
+            '<span class="group-dev-name">' + esc(label) + '</span>' +
+            '<span class="group-dev-status">' + status + '</span>' +
+            '<span class="group-dev-install" data-install-id="' + esc(serial) + '">' + installCellHtml(serial) + '</span>' +
+            '</div>';
+        }).join('');
+      }
 
-          // IP Address
-          var tdIp = document.createElement('td');
-          tdIp.textContent = dev.ip || '-';
-          tr.appendChild(tdIp);
-
-          // Startup App
-          var tdStartup = document.createElement('td');
-          tdStartup.textContent = (dev.startup_app && dev.startup_app.package_name) ? dev.startup_app.package_name : '-';
-          tdStartup.style.fontSize = '13px';
-          tdStartup.style.color = (dev.startup_app && dev.startup_app.package_name) ? 'var(--success)' : 'var(--text-secondary)';
-          tr.appendChild(tdStartup);
-
-          // Status (online/offline; offline rows show last-seen + a Forget action)
-          var tdStatus = document.createElement('td');
-          var dot = document.createElement('span');
-          dot.className = 'status-dot' + (offline ? ' offline' : '');
-          tdStatus.appendChild(dot);
-          tdStatus.appendChild(document.createTextNode(offline ? 'Offline' : 'Online'));
-          if (offline && dev.last_seen) {
-            var seen = document.createElement('span');
-            seen.className = 'last-seen';
-            seen.textContent = formatRelativeTime(dev.last_seen);
-            seen.title = 'Last seen ' + new Date(dev.last_seen * 1000).toLocaleString();
-            tdStatus.appendChild(seen);
+      function renderDevicesHtml() {
+        if (!devices.length) return '<div class="empty">No devices yet</div>';
+        const total = devices.length;
+        const sel = selectedIds.size;
+        const allSel = sel > 0 && devices.every(function (d) { return selectedIds.has(getDeviceId(d)); });
+        const someSel = sel > 0 && !allSel;
+        let html = '<div class="dev-table">';
+        html += '<div class="dev-row dev-head">' +
+          '<div class="selbox ' + (allSel ? 'on' : someSel ? 'mixed' : '') + '" data-act="selectAll">' + (allSel ? '✓' : someSel ? '–' : '') + '</div>' +
+          '<div>Device</div><div>Status</div><div>Install</div></div>';
+        devices.forEach(function (d) {
+          const id = getDeviceId(d);
+          const checked = selectedIds.has(id);
+          const off = !isOnline(d);
+          const startup = d.startup_app && d.startup_app.package_name;
+          let deviceCell;
+          if (editingLabelId === id) {
+            deviceCell = '<div class="dev-edit">' +
+              '<input class="label-input" data-label-input maxlength="64" placeholder="DEV-001" value="' + esc(d.label || '') + '">' +
+              '<button class="btn-mini btn-save" data-act="saveLabel" data-id="' + esc(id) + '">Save</button>' +
+              '<button class="btn-mini btn-cancel" data-act="cancelLabel">Cancel</button></div>';
+          } else {
+            deviceCell = '<div class="dev-label-row">' +
+              (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') +
+              '<button class="ic-btn ' + (d.label ? '' : 'assign-btn') + '" data-act="editLabel" data-id="' + esc(id) + '" title="' + (d.label ? 'Edit label' : 'Assign label') + '">✏</button>' +
+              (startup ? '<span class="badge-startup" title="' + esc(startup) + '">★</span>' : '') +
+              '</div>';
           }
-          if (offline) {
-            var forget = document.createElement('button');
-            forget.className = 'forget-btn';
-            forget.title = 'Forget this device';
-            forget.textContent = '🗑';
-            forget.addEventListener('click', function () {
-              var name = dev.label || id;
-              if (confirm('Forget "' + name + '"?\nIt will be removed from the list until it connects again.')) {
-                sendForget(id);
-              }
-            });
-            tdStatus.appendChild(forget);
+          deviceCell += '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') + '</div>';
+
+          let status;
+          if (off) {
+            status = '<span class="dot off"></span>Offline' +
+              (d.last_seen ? '<span class="last-seen" title="Last seen ' + esc(new Date(d.last_seen * 1000).toLocaleString()) + '">' + esc(formatRelativeTime(d.last_seen)) + '</span>' : '') +
+              '<button class="forget-btn" data-act="forget" data-id="' + esc(id) + '" title="Forget this device">🗑</button>';
+          } else {
+            status = '<span class="dot"></span>Online';
           }
-          tr.appendChild(tdStatus);
 
-          // Install status
-          var tdInstall = document.createElement('td');
-          tdInstall.className = 'install-cell';
-          renderInstallCell(tdInstall, id);
-          tr.appendChild(tdInstall);
-
-          deviceBody.appendChild(tr);
+          html += '<div class="dev-row' + (off ? ' offline' : '') + '" data-row-id="' + esc(id) + '">' +
+            '<div class="selbox ' + (checked ? 'on' : '') + '" data-act="toggleDevice" data-id="' + esc(id) + '">' + (checked ? '✓' : '') + '</div>' +
+            '<div class="dev-cell">' + deviceCell + '</div>' +
+            '<div class="dev-status">' + status + '</div>' +
+            '<div class="dev-install" data-install-id="' + esc(id) + '">' + installCellHtml(id) + '</div>' +
+            '</div>';
         });
-
-        updateSelectAll();
-        updateButtons();
+        html += '</div>';
+        // total is shown in the tab; touch the var to keep intent explicit
+        void total;
+        return html;
       }
 
-      // Fill an install-status cell from installState[id].
-      function renderInstallCell(td, id) {
-        td.innerHTML = '';
-        var st = installState[id];
-        if (!st) {
-          var none = document.createElement('span');
-          none.className = 'install-none';
-          none.textContent = '—';
-          td.appendChild(none);
-          return;
-        }
-
-        var badge = document.createElement('span');
-        badge.className = 'install-' + st.status;
-
-        if (st.status === 'installing') {
-          var spin = document.createElement('span');
-          spin.className = 'install-spinner';
-          spin.textContent = '⟳';
-          badge.appendChild(spin);
-          badge.appendChild(document.createTextNode(' Installing…'));
-        } else if (st.status === 'success') {
-          badge.textContent = '✓ installed';
-        } else {
-          badge.textContent = '✗ failed';
-          if (st.detail) badge.title = st.detail;
-        }
-        td.appendChild(badge);
-
-        if (st.filename) {
-          var file = document.createElement('span');
-          file.className = 'install-file';
-          file.textContent = st.filename;
-          file.title = st.filename + (st.detail && st.status === 'fail' ? ' — ' + st.detail : '');
-          td.appendChild(file);
-        }
+      function installCellHtml(id) {
+        const st = installState[id];
+        if (!st) return '<span class="ins-none">—</span>';
+        if (st.status === 'installing') return '<span class="ins-installing"><span class="spinner">⟳</span> Installing…</span>';
+        if (st.status === 'success') return '<span class="ins-success">✓ installed</span>' + (st.filename ? ' <span class="ins-none">' + esc(st.filename) + '</span>' : '');
+        return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
       }
 
-      // Update only the install cell for one device, leaving the rest of the row
-      // (and any in-progress inline label edit) untouched.
       function updateInstallCell(id) {
-        var rows = deviceBody.children;
-        for (var i = 0; i < rows.length; i++) {
-          if (rows[i].dataset.deviceId === id) {
-            var td = rows[i].querySelector('.install-cell');
-            if (td) renderInstallCell(td, id);
-            return;
-          }
-        }
+        // Refresh every matching install cell currently rendered: the Devices-tab
+        // row and/or the expanded-group per-device rows on the Groups tab.
+        if (view !== 'console') return;
+        const sel = '[data-install-id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]';
+        targetsBody.querySelectorAll(sel).forEach(function (cell) { cell.innerHTML = installCellHtml(id); });
       }
 
-      // Build the "Device" cell: label (primary) + serial (sub), with inline edit
-      function buildDeviceCell(dev, id) {
-        var wrap = document.createElement('div');
-        var label = dev.label || '';
-
-        if (editingId === id) {
-          var editRow = document.createElement('div');
-          editRow.className = 'device-edit';
-
-          var input = document.createElement('input');
-          input.type = 'text';
-          input.className = 'label-input';
-          input.value = label;
-          input.placeholder = 'DEV-001';
-          input.maxLength = 64;
-
-          var commit = function () {
-            editingId = null;
-            sendSetLabel(id, input.value.trim());
-            renderDevices();
-          };
-          var cancel = function () {
-            editingId = null;
-            renderDevices();
-          };
-
-          var save = document.createElement('button');
-          save.className = 'btn-mini btn-save';
-          save.textContent = 'Save';
-          save.addEventListener('click', commit);
-
-          var cancelBtn = document.createElement('button');
-          cancelBtn.className = 'btn-mini btn-cancel';
-          cancelBtn.textContent = 'Cancel';
-          cancelBtn.addEventListener('click', cancel);
-
-          input.addEventListener('keydown', function (e) {
-            if (e.key === 'Enter') { e.preventDefault(); commit(); }
-            else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
-          });
-
-          editRow.appendChild(input);
-          editRow.appendChild(save);
-          editRow.appendChild(cancelBtn);
-          wrap.appendChild(editRow);
-
-          // Focus once the cell is attached to the DOM
-          setTimeout(function () { input.focus(); input.select(); }, 0);
-        } else {
-          var labelRow = document.createElement('div');
-          labelRow.className = 'device-label-row';
-
-          var labelSpan = document.createElement('span');
-          labelSpan.className = 'device-label' + (label ? '' : ' unlabeled');
-          labelSpan.textContent = label || '—';
-          labelRow.appendChild(labelSpan);
-
-          var edit = document.createElement('button');
-          edit.className = 'label-edit-btn';
-          edit.title = label ? 'Edit label' : 'Assign label';
-          edit.textContent = '✏';
-          edit.addEventListener('click', function () {
-            editingId = id;
-            renderDevices();
-          });
-          labelRow.appendChild(edit);
-
-          wrap.appendChild(labelRow);
-        }
-
-        var serial = document.createElement('div');
-        serial.className = 'device-serial';
-        serial.textContent = id;
-        wrap.appendChild(serial);
-
-        return wrap;
-      }
-
-      function sendSetLabel(serial, label) {
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          addLog('Cannot set label: not connected to server', 'fail');
-          return;
-        }
-        ws.send(JSON.stringify({ type: 'SET_DEVICE_LABEL', device_id: serial, label: label }));
-      }
-
-      function sendForget(serial) {
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          addLog('Cannot forget device: not connected to server', 'fail');
-          return;
-        }
-        ws.send(JSON.stringify({ type: 'FORGET_DEVICE', device_id: serial }));
-      }
-
-      // Select All
-      selectAll.addEventListener('change', function () {
-        if (selectAll.checked) {
-          devices.forEach(function (d) {
-            var id = getDeviceId(d);
-            if (id) selectedIds.add(id);
-          });
-        } else {
-          selectedIds.clear();
-        }
-        renderDevices();
-      });
-
-      function updateSelectAll() {
-        if (devices.length === 0) {
-          selectAll.checked = false;
-          selectAll.indeterminate = false;
-        } else if (selectedIds.size === devices.length) {
-          selectAll.checked = true;
-          selectAll.indeterminate = false;
-        } else if (selectedIds.size > 0) {
-          selectAll.checked = false;
-          selectAll.indeterminate = true;
-        } else {
-          selectAll.checked = false;
-          selectAll.indeterminate = false;
-        }
-      }
-
-      // Button states
-      function updateButtons() {
-        // Every action targets the checkbox selection; offline targets are filtered
-        // out at send time, so the buttons only gate on whether anything is selected.
-        var hasPkg = packageName.value.trim() !== '';
-        var hasApkFile = apkFile.files.length > 0;
-        btnSelected.disabled = !hasPkg || selectedIds.size === 0;
-        btnInstallSelected.disabled = uploadInProgress || !hasApkFile || selectedIds.size === 0;
-
-        var hasStartupPkg = startupPackageName.value.trim() !== '';
-        btnSetStartupSelected.disabled = !hasStartupPkg || selectedIds.size === 0;
-        btnClearStartupSelected.disabled = selectedIds.size === 0;
-      }
-
-      packageName.addEventListener('input', updateButtons);
-      apkFile.addEventListener('change', function () {
-        uploadedApk = null;
-        var file = apkFile.files[0];
-        if (file) {
-          apkSummary.textContent = 'Selected: ' + file.name + ' (' + formatBytes(file.size) + ')';
-        } else {
-          apkSummary.textContent = 'No APK selected';
-        }
+      function renderActions() {
+        const online = new Set(getOnlineIds());
+        let on = 0, off = 0;
+        selectedIds.forEach(function (id) { if (online.has(id)) on++; else off++; });
+        const n = selectedIds.size;
+        let ctx;
+        if (n === 0) ctx = 'Select devices or a group to act on';
+        else if (activeGroup) ctx = 'via group "' + esc(activeGroup) + '" · ' + on + ' online' + (off ? ' · ' + off + ' offline skipped' : '');
+        else ctx = on + ' online' + (off ? ' · ' + off + ' offline skipped' : '') + ' · add or remove individually';
+        selCard.innerHTML =
+          '<div class="sel-head">' +
+          '<span class="sel-badge ' + (n ? '' : 'zero') + '">' + n + '</span>' +
+          '<span class="sel-count">' + n + ' selected</span>' +
+          '<div style="flex:1"></div>' +
+          (n ? '<button class="sel-clear" data-act="clearSelection">Clear</button>' : '') +
+          '</div><div class="sel-ctx">' + ctx + '</div>';
         updateButtons();
-      });
-      startupPackageName.addEventListener('input', updateButtons);
-
-      // Split targets into online/offline, warn about any offline devices that are
-      // skipped (commands never queue for later), and return the reachable subset.
-      function onlineTargets(targetDevices) {
-        var onlineSet = new Set(getOnlineIds());
-        var online = targetDevices.filter(function (id) { return onlineSet.has(id); });
-        var offline = targetDevices.filter(function (id) { return !onlineSet.has(id); });
-        if (offline.length > 0) {
-          addLog('Skipping ' + offline.length + ' offline device(s): ' +
-            offline.map(labelFor).join(', '), 'warn');
-        }
-        return online;
       }
 
-      // Launch commands
-      btnSelected.addEventListener('click', function () {
-        sendLaunch(Array.from(selectedIds));
-      });
+      function updateButtons() {
+        const has = selectedIds.size > 0;
+        btnInstall.disabled = uploadInProgress || apkFile.files.length === 0 || !has;
+        btnLaunch.disabled = launchPkg.value.trim() === '' || !has;
+        btnStartupSet.disabled = startupPkg.value.trim() === '' || !has;
+        btnStartupClear.disabled = !has;
+      }
 
-      function sendLaunch(targetDevices) {
-        var pkg = packageName.value.trim();
+      // ---------------- Selection actions ----------------
+      function selectGroupAsTarget(name) {
+        const known = knownIds();
+        selectedIds = new Set((groups[name] || []).filter(function (s) { return known.has(s); }));
+        activeGroup = name;
+        addLog('Selected group "' + name + '": ' + selectedIds.size + ' device(s) selected', 'info');
+        render();
+      }
+
+      // Re-sync the selection with the active group's current membership. Called after
+      // GROUP_LIST / DEVICE_LIST so editing the selected group can't leave commands
+      // pointing at a stale member set. If the group is gone, clear the selection.
+      function syncActiveGroupSelection() {
+        if (!activeGroup) return;
+        if (!(activeGroup in groups)) { activeGroup = null; selectedIds.clear(); return; }
+        const known = knownIds();
+        selectedIds = new Set((groups[activeGroup] || []).filter(function (s) { return known.has(s); }));
+      }
+      function toggleDevice(id) {
+        if (selectedIds.has(id)) selectedIds.delete(id); else selectedIds.add(id);
+        activeGroup = null;
+        render();
+      }
+      function toggleSelectAll() {
+        const all = devices.length > 0 && devices.every(function (d) { return selectedIds.has(getDeviceId(d)); });
+        if (all) selectedIds.clear();
+        else devices.forEach(function (d) { const id = getDeviceId(d); if (id) selectedIds.add(id); });
+        activeGroup = null;
+        render();
+      }
+      function clearSelection() { selectedIds.clear(); activeGroup = null; render(); }
+
+      // Split into online/offline; warn about skipped offline; return reachable subset.
+      function onlineTargets(ids) {
+        const online = new Set(getOnlineIds());
+        const reach = ids.filter(function (id) { return online.has(id); });
+        const skip = ids.filter(function (id) { return !online.has(id); });
+        if (skip.length) addLog('Skipping ' + skip.length + ' offline device(s): ' + skip.map(labelFor).join(', '), 'warn');
+        return reach;
+      }
+
+      // ---------------- Commands ----------------
+      function sendLaunch() {
+        const pkg = launchPkg.value.trim();
         if (!pkg) return;
-
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          addLog('Cannot send: not connected to server', 'fail');
-          return;
-        }
-
-        var online = onlineTargets(targetDevices);
-        if (online.length === 0) {
-          addLog('No online devices selected to launch', 'warn');
-          return;
-        }
-
-        var msg = {
-          type: 'LAUNCH_APP',
-          target_devices: online,
-          package_name: pkg
-        };
-
-        var extra = extraData.value.trim();
-        if (extra) {
-          msg.extra_data = extra;
-        }
-
-        ws.send(JSON.stringify(msg));
-        addLog('Launching ' + pkg + ' on ' + online.length + ' device(s)', 'info');
+        const online = onlineTargets(Array.from(selectedIds));
+        if (!online.length) { addLog('No online devices selected to launch', 'warn'); return; }
+        const msg = { type: 'LAUNCH_APP', target_devices: online, package_name: pkg };
+        const extra = launchExtra.value.trim(); if (extra) msg.extra_data = extra;
+        if (wsSend(msg, 'launch')) addLog('Launching ' + pkg + ' on ' + online.length + ' device(s)', 'info');
       }
 
-      // APK install commands (upload happens automatically on first install)
-      btnInstallSelected.addEventListener('click', function () {
-        sendInstall(Array.from(selectedIds));
-      });
-
-      // Upload the selected APK if it has not been uploaded yet, then resolve with
-      // its metadata. Reuses the previous upload when installing to multiple targets.
       function ensureUploaded() {
         if (uploadedApk) return Promise.resolve(uploadedApk);
-
-        var file = apkFile.files[0];
+        const file = apkFile.files[0];
         if (!file) return Promise.reject(new Error('No APK selected'));
-        if (!file.name.toLowerCase().endsWith('.apk')) {
-          return Promise.reject(new Error('Select an .apk file'));
-        }
-
-        var formData = new FormData();
-        formData.append('apk', file);
-        uploadInProgress = true;
-        apkSummary.textContent = 'Uploading ' + file.name + '...';
-        updateButtons();
-
-        return fetch('/api/apks', {
-          method: 'POST',
-          body: formData
-        })
-          .then(function (response) {
-            return response.json().catch(function () {
-              return {};
-            }).then(function (payload) {
-              if (!response.ok) {
-                throw new Error(payload.error || response.statusText);
-              }
-              return payload;
-            });
-          })
-          .then(function (payload) {
-            uploadedApk = payload;
-            apkSummary.innerHTML = 'Uploaded: <strong>' + escapeHtml(payload.apk_filename) + '</strong> (' + formatBytes(payload.size || file.size) + ')';
-            addLog('Uploaded APK: ' + payload.apk_filename, 'success');
-            return payload;
-          })
-          .finally(function () {
-            uploadInProgress = false;
-            updateButtons();
-          });
+        if (!file.name.toLowerCase().endsWith('.apk')) return Promise.reject(new Error('Select an .apk file'));
+        const fd = new FormData(); fd.append('apk', file);
+        uploadInProgress = true; apkName.textContent = 'Uploading ' + file.name + '...'; updateButtons();
+        return fetch('/api/apks', { method: 'POST', body: fd })
+          .then(function (r) { return r.json().catch(function () { return {}; }).then(function (p) { if (!r.ok) throw new Error(p.error || r.statusText); return p; }); })
+          .then(function (p) { uploadedApk = p; apkName.innerHTML = 'Uploaded: <strong>' + esc(p.apk_filename) + '</strong> (' + formatBytes(p.size || file.size) + ')'; addLog('Uploaded APK: ' + p.apk_filename, 'success'); return p; })
+          .finally(function () { uploadInProgress = false; updateButtons(); });
       }
 
-      function sendInstall(targetDevices) {
-        if (targetDevices.length === 0 || uploadInProgress) return;
-
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          addLog('Cannot send: not connected to server', 'fail');
-          return;
-        }
-
-        // Quick Install targets online devices only. Any target that is offline or no
-        // longer in the device list (e.g. it disconnected after selection) is skipped
-        // with a warning — there is no queueing for later.
-        var online = onlineTargets(targetDevices);
-        if (online.length === 0) {
-          addLog('No online devices selected to install', 'warn');
-          return;
-        }
-
-        ensureUploaded()
-          .then(function (apk) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-              addLog('Cannot send: not connected to server', 'fail');
-              return;
-            }
-            var msg = {
-              type: 'INSTALL_APK',
-              target_devices: online,
-              apk_url: apk.apk_url,
-              apk_filename: apk.apk_filename
-            };
-            ws.send(JSON.stringify(msg));
-            // Mark each target as installing now (INSTALL_SENT carries only counts,
-            // not ids, so send time is the only place we know the targets).
-            online.forEach(function (id) {
-              installState[id] = { status: 'installing', filename: apk.apk_filename, detail: '' };
-              updateInstallCell(id);
-            });
-            addLog('Installing ' + apk.apk_filename + ' on ' + online.length + ' device(s)', 'info');
-            // Clear the selection after each install. Over a LAN (non-secure context) the
-            // browser only holds a one-time File snapshot and cannot detect a local rebuild,
-            // so we force a fresh pick next time — this prevents silently re-installing a
-            // stale APK after the .apk has been rebuilt.
-            apkFile.value = '';
-            uploadedApk = null;
-            apkSummary.textContent = 'No APK selected';
-            updateButtons();
-          })
-          .catch(function (err) {
-            apkSummary.textContent = 'Upload failed';
-            addLog('APK install failed: ' + err.message, 'fail');
-          });
+      function sendInstall() {
+        if (uploadInProgress) return;
+        const online = onlineTargets(Array.from(selectedIds));
+        if (!online.length) { addLog('No online devices selected to install', 'warn'); return; }
+        ensureUploaded().then(function (apk) {
+          if (!wsSend({ type: 'INSTALL_APK', target_devices: online, apk_url: apk.apk_url, apk_filename: apk.apk_filename }, 'install')) return;
+          online.forEach(function (id) { installState[id] = { status: 'installing', filename: apk.apk_filename, detail: '' }; updateInstallCell(id); });
+          addLog('Installing ' + apk.apk_filename + ' on ' + online.length + ' device(s)', 'info');
+          // Force a fresh pick next time (LAN/non-secure context cannot detect a local rebuild).
+          apkFile.value = ''; uploadedApk = null; apkName.textContent = 'No APK selected'; updateButtons();
+        }).catch(function (err) { apkName.textContent = 'Upload failed'; addLog('APK install failed: ' + err.message, 'fail'); });
       }
 
-      // Compact "time since" for an epoch-seconds timestamp (used for last-seen).
-      function formatRelativeTime(epochSeconds) {
-        if (!epochSeconds) return '';
-        var diff = Date.now() / 1000 - epochSeconds;
-        if (diff < 0) diff = 0;
-        if (diff < 60) return 'just now';
-        var mins = Math.floor(diff / 60);
-        if (mins < 60) return mins + 'm ago';
-        var hours = Math.floor(mins / 60);
-        if (hours < 24) return hours + 'h ago';
-        var days = Math.floor(hours / 24);
-        return days + 'd ago';
-      }
-
-      function formatBytes(bytes) {
-        if (!bytes) return '0 B';
-        var units = ['B', 'KB', 'MB', 'GB'];
-        var value = bytes;
-        var index = 0;
-        while (value >= 1024 && index < units.length - 1) {
-          value = value / 1024;
-          index += 1;
-        }
-        return value.toFixed(index === 0 ? 0 : 1) + ' ' + units[index];
-      }
-
-      function escapeHtml(text) {
-        var span = document.createElement('span');
-        span.textContent = text || '';
-        return span.innerHTML;
-      }
-
-      // Startup app commands
-      btnSetStartupSelected.addEventListener('click', function () {
-        sendSetStartupApp(Array.from(selectedIds));
-      });
-
-      btnClearStartupSelected.addEventListener('click', function () {
-        sendClearStartupApp(Array.from(selectedIds));
-      });
-
-      function sendSetStartupApp(targetDevices) {
-        var pkg = startupPackageName.value.trim();
+      function sendSetStartup() {
+        const pkg = startupPkg.value.trim();
         if (!pkg) return;
-
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          addLog('Cannot send: not connected to server', 'fail');
-          return;
-        }
-
-        var online = onlineTargets(targetDevices);
-        if (online.length === 0) {
-          addLog('No online devices selected to set startup app', 'warn');
-          return;
-        }
-
-        var msg = {
-          type: 'SET_STARTUP_APP',
-          target_devices: online,
-          package_name: pkg
-        };
-
-        var extra = startupExtraData.value.trim();
-        if (extra) {
-          msg.extra_data = extra;
-        }
-
-        ws.send(JSON.stringify(msg));
-        addLog('Setting startup app ' + pkg + ' on ' + online.length + ' device(s)', 'info');
+        const online = onlineTargets(Array.from(selectedIds));
+        if (!online.length) { addLog('No online devices selected to set startup app', 'warn'); return; }
+        const msg = { type: 'SET_STARTUP_APP', target_devices: online, package_name: pkg };
+        const extra = startupExtra.value.trim(); if (extra) msg.extra_data = extra;
+        if (wsSend(msg, 'set startup app')) addLog('Setting startup app ' + pkg + ' on ' + online.length + ' device(s)', 'info');
       }
 
-      function sendClearStartupApp(targetDevices) {
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          addLog('Cannot send: not connected to server', 'fail');
-          return;
-        }
-
-        var online = onlineTargets(targetDevices);
-        if (online.length === 0) {
-          addLog('No online devices selected to clear startup app', 'warn');
-          return;
-        }
-
-        var msg = {
-          type: 'CLEAR_STARTUP_APP',
-          target_devices: online
-        };
-
-        ws.send(JSON.stringify(msg));
-        addLog('Clearing startup app on ' + online.length + ' device(s)', 'info');
+      function sendClearStartup() {
+        const online = onlineTargets(Array.from(selectedIds));
+        if (!online.length) { addLog('No online devices selected to clear startup app', 'warn'); return; }
+        if (wsSend({ type: 'CLEAR_STARTUP_APP', target_devices: online }, 'clear startup app')) addLog('Clearing startup app on ' + online.length + ' device(s)', 'info');
       }
 
-      // Activity log
+      // ---------------- Label / Forget ----------------
+      function commitLabel(id) {
+        const inp = targetsBody.querySelector('[data-label-input]');
+        const val = inp ? inp.value.trim() : '';
+        editingLabelId = null;
+        wsSend({ type: 'SET_DEVICE_LABEL', device_id: id, label: val }, 'set label');
+        render();
+      }
+      function sendForget(id) {
+        const d = deviceById(id); const name = (d && d.label) || id;
+        if (confirm('Forget "' + name + '"?\nIt will be removed from the list until it connects again.')) {
+          wsSend({ type: 'FORGET_DEVICE', device_id: id }, 'forget device');
+        }
+      }
+
+      // ---------------- Group senders ----------------
+      function sendCreateGroup(name) { wsSend({ type: 'CREATE_GROUP', name: name }, 'create group'); }
+      function sendRenameGroup(name, nn) { wsSend({ type: 'RENAME_GROUP', name: name, new_name: nn }, 'rename group'); }
+      function sendDeleteGroup(name) { wsSend({ type: 'DELETE_GROUP', name: name }, 'delete group'); }
+      function sendSetGroupMembers(name, members) { wsSend({ type: 'SET_GROUP_MEMBERS', name: name, members: members }, 'save members'); }
+
+      // ---------------- Manage Groups view ----------------
+      function openManage(group) {
+        view = 'manage';
+        if (group && (group in groups)) selectManageGroup(group);
+        render();
+      }
+      function backToConsole() { view = 'console'; renamingManageGroup = false; render(); }
+      function selectManageGroup(name) {
+        manageSelectedGroup = name;
+        manageMembers = new Set(groups[name] || []);
+        manageSearch = '';
+        renamingManageGroup = false;
+      }
+
+      function renderManageSidebar() {
+        const names = groupNames();
+        const list = names.length
+          ? names.map(function (n) {
+            return '<div class="mg-item ' + (manageSelectedGroup === n ? 'active' : '') + '" data-act="selectManageGroup" data-group="' + esc(n) + '">' +
+              '<span class="mg-item-name">' + esc(n) + '</span>' +
+              '<span class="mg-item-count">' + (groups[n] || []).length + '</span></div>';
+          }).join('')
+          : '<div class="empty small">No groups — create one</div>';
+        mgSidebar.innerHTML =
+          '<div class="mg-create"><input class="mg-new" data-mg-new placeholder="New group name…" maxlength="64">' +
+          '<button class="btn-mini btn-save" data-act="addGroup">Add</button></div>' +
+          '<div class="mg-list">' + list + '</div>';
+      }
+
+      function renderManageDetail() {
+        if (!manageSelectedGroup || !(manageSelectedGroup in groups)) {
+          mgDetail.innerHTML = '<div class="mg-detail-empty">Select a group, or create one.</div>';
+          return;
+        }
+        const name = manageSelectedGroup;
+        const memArr = Array.from(manageMembers);
+        const offCount = memArr.filter(function (s) { const d = deviceById(s); return !d || !isOnline(d); }).length;
+        const onCount = memArr.length - offCount;
+        const head = renamingManageGroup
+          ? '<div class="dev-edit"><input class="label-input" data-mg-rename maxlength="64" value="' + esc(name) + '">' +
+            '<button class="btn-mini btn-save" data-act="saveRename">Save</button>' +
+            '<button class="btn-mini btn-cancel" data-act="cancelRename">Cancel</button></div>'
+          : '<div><div class="mg-title">' + esc(name) + '</div><div class="mg-sub">' + onCount + ' online, ' + offCount + ' offline</div></div>' +
+            '<div class="mg-head-actions"><button class="btn-outline" data-act="renameGroup">Rename</button>' +
+            '<button class="btn-danger-outline" data-act="deleteGroup" data-group="' + esc(name) + '">Delete</button></div>';
+        mgDetail.innerHTML =
+          '<div class="mg-detail-head">' + head + '</div>' +
+          '<div class="mg-search"><input class="mg-search-input" data-mg-search placeholder="⌕ Search devices to add…" value="' + esc(manageSearch) + '"></div>' +
+          '<div class="mg-dev-list" id="mgDevList">' + renderMgDevListHtml() + '</div>' +
+          '<div class="mg-footer"><span class="mg-foot-count">' + manageMembers.size + ' selected</span>' +
+          '<div class="spacer"></div>' +
+          '<button class="btn-text" data-act="cancelMembers">Cancel</button>' +
+          '<button class="btn-primary" data-act="saveMembers">Save</button></div>';
+      }
+
+      function renderMgDevListHtml() {
+        if (!devices.length) return '<div class="empty small">No devices yet</div>';
+        const q = manageSearch.trim().toLowerCase();
+        const list = devices.filter(function (d) {
+          if (!q) return true;
+          const id = getDeviceId(d);
+          return (d.label || '').toLowerCase().indexOf(q) !== -1 || id.toLowerCase().indexOf(q) !== -1;
+        });
+        if (!list.length) return '<div class="empty small">No matching devices</div>';
+        return list.map(function (d) {
+          const id = getDeviceId(d); const mem = manageMembers.has(id); const off = !isOnline(d);
+          return '<div class="mg-dev" data-act="toggleMember" data-id="' + esc(id) + '">' +
+            '<div class="selbox ' + (mem ? 'on' : '') + '">' + (mem ? '✓' : '') + '</div>' +
+            '<div class="mg-dev-main">' +
+            '<div>' + (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') + '</div>' +
+            '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') + '</div></div>' +
+            '<div class="mg-dev-status"><span class="dot ' + (off ? 'off' : '') + '"></span>' + (off ? 'Offline' : 'Online') + '</div>' +
+            '</div>';
+        }).join('');
+      }
+
+      function refreshMgDevList() {
+        const el = document.getElementById('mgDevList');
+        if (el) el.innerHTML = renderMgDevListHtml();
+      }
+
+      // ---------------- Log ----------------
       function addLog(message, type) {
         logEmpty.style.display = 'none';
-
-        var entry = document.createElement('div');
-        entry.className = 'log-entry';
-
-        var time = document.createElement('span');
-        time.className = 'log-time';
-        var now = new Date();
-        time.textContent = now.toLocaleTimeString();
-
-        var msg = document.createElement('span');
-        msg.className = 'log-msg ' + (type || 'info');
-        msg.textContent = message;
-
-        entry.appendChild(time);
-        entry.appendChild(msg);
+        const entry = document.createElement('div'); entry.className = 'log-entry';
+        const time = document.createElement('span'); time.className = 'log-time'; time.textContent = new Date().toLocaleTimeString();
+        const msg = document.createElement('span'); msg.className = 'log-msg ' + (type || 'info'); msg.textContent = message;
+        entry.appendChild(time); entry.appendChild(msg);
         logContainer.appendChild(entry);
         logContainer.scrollTop = logContainer.scrollHeight;
       }
 
-      btnClearLog.addEventListener('click', function () {
-        logContainer.innerHTML = '';
-        logContainer.appendChild(logEmpty);
-        logEmpty.style.display = 'block';
+      // ---------------- Formatting ----------------
+      function formatRelativeTime(sec) {
+        if (!sec) return '';
+        let diff = Date.now() / 1000 - sec; if (diff < 0) diff = 0;
+        if (diff < 60) return 'just now';
+        const m = Math.floor(diff / 60); if (m < 60) return m + 'm ago';
+        const h = Math.floor(m / 60); if (h < 24) return h + 'h ago';
+        return Math.floor(h / 24) + 'd ago';
+      }
+      function formatBytes(b) {
+        if (!b) return '0 B';
+        const u = ['B', 'KB', 'MB', 'GB']; let v = b, i = 0;
+        while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+        return v.toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
+      }
+
+      // ---------------- Event wiring ----------------
+      // Sub-tabs
+      tabGroups.addEventListener('click', function () { targetTab = 'groups'; userPickedTab = true; render(); });
+      tabDevices.addEventListener('click', function () { targetTab = 'devices'; userPickedTab = true; render(); });
+      btnManageGroups.addEventListener('click', function () {
+        openManage(null);
+        const inp = mgSidebar.querySelector('[data-mg-new]');
+        if (inp) setTimeout(function () { inp.focus(); }, 0);
       });
 
-      // Collapsible command sections (accordion: only one open at a time)
-      var accordionCards = Array.prototype.slice.call(document.querySelectorAll('.card.collapsible'));
-      accordionCards.forEach(function (card) {
-        var header = card.querySelector('.collapsible-header');
-        header.addEventListener('click', function () {
-          var willOpen = card.classList.contains('collapsed');
-          accordionCards.forEach(function (c) { c.classList.add('collapsed'); });
-          if (willOpen) card.classList.remove('collapsed');
+      // Targets delegation (click)
+      targetsBody.addEventListener('click', function (e) {
+        const t = e.target.closest('[data-act]');
+        if (!t) return;
+        const act = t.dataset.act;
+        if (act === 'selectGroup') selectGroupAsTarget(t.dataset.group);
+        else if (act === 'toggleExpand') {
+          const g = t.dataset.group;
+          if (expandedGroups.has(g)) expandedGroups.delete(g); else expandedGroups.add(g);
+          renderTargets();
+        }
+        else if (act === 'editGroup') openManage(t.dataset.group);
+        else if (act === 'toggleDevice') toggleDevice(t.dataset.id);
+        else if (act === 'selectAll') toggleSelectAll();
+        else if (act === 'editLabel') { editingLabelId = t.dataset.id; render(); }
+        else if (act === 'saveLabel') commitLabel(t.dataset.id);
+        else if (act === 'cancelLabel') { editingLabelId = null; render(); }
+        else if (act === 'forget') sendForget(t.dataset.id);
+      });
+      // Targets label-edit keyboard
+      targetsBody.addEventListener('keydown', function (e) {
+        if (!e.target.matches('[data-label-input]')) return;
+        if (e.key === 'Enter') { e.preventDefault(); commitLabel(editingLabelId); }
+        else if (e.key === 'Escape') { e.preventDefault(); editingLabelId = null; render(); }
+      });
+
+      // Selection card delegation
+      selCard.addEventListener('click', function (e) {
+        const t = e.target.closest('[data-act]'); if (t && t.dataset.act === 'clearSelection') clearSelection();
+      });
+
+      // Commands
+      apkFile.addEventListener('change', function () {
+        uploadedApk = null;
+        const f = apkFile.files[0];
+        apkName.textContent = f ? ('Selected: ' + f.name + ' (' + formatBytes(f.size) + ')') : 'No APK selected';
+        updateButtons();
+      });
+      launchPkg.addEventListener('input', updateButtons);
+      startupPkg.addEventListener('input', updateButtons);
+      btnInstall.addEventListener('click', sendInstall);
+      btnLaunch.addEventListener('click', sendLaunch);
+      btnStartupSet.addEventListener('click', sendSetStartup);
+      btnStartupClear.addEventListener('click', sendClearStartup);
+      btnClearLog.addEventListener('click', function () { logContainer.innerHTML = ''; logContainer.appendChild(logEmpty); logEmpty.style.display = 'block'; });
+
+      // Command sections accordion: only one open at a time (matches the original
+      // layout). Clicking an open section's header collapses it (all closed).
+      var cmdSections = Array.prototype.slice.call(document.querySelectorAll('.cmd-section'));
+      cmdSections.forEach(function (sec) {
+        var head = sec.querySelector('.cmd-head');
+        head.addEventListener('click', function () {
+          var willOpen = sec.classList.contains('collapsed');
+          cmdSections.forEach(function (s) { s.classList.add('collapsed'); });
+          if (willOpen) sec.classList.remove('collapsed');
         });
       });
 
-      // Initialize
+      // Manage view delegation (click)
+      manageView.addEventListener('click', function (e) {
+        const t = e.target.closest('[data-act]');
+        if (!t) return;
+        const act = t.dataset.act;
+        if (act === 'back') backToConsole();
+        else if (act === 'selectManageGroup') { selectManageGroup(t.dataset.group); renderManageSidebar(); renderManageDetail(); }
+        else if (act === 'addGroup') {
+          const inp = mgSidebar.querySelector('[data-mg-new]'); const name = inp ? inp.value.trim() : '';
+          if (name) { sendCreateGroup(name); pendingSelectGroup = name; if (inp) inp.value = ''; }
+        }
+        else if (act === 'toggleMember') {
+          const id = t.dataset.id;
+          if (manageMembers.has(id)) manageMembers.delete(id); else manageMembers.add(id);
+          renderManageDetail();
+        }
+        else if (act === 'saveMembers') sendSetGroupMembers(manageSelectedGroup, Array.from(manageMembers));
+        else if (act === 'cancelMembers') { manageMembers = new Set(groups[manageSelectedGroup] || []); renderManageDetail(); }
+        else if (act === 'renameGroup') { renamingManageGroup = true; renderManageDetail(); const r = mgDetail.querySelector('[data-mg-rename]'); if (r) setTimeout(function () { r.focus(); r.select(); }, 0); }
+        else if (act === 'saveRename') {
+          const r = mgDetail.querySelector('[data-mg-rename]'); const nn = r ? r.value.trim() : '';
+          renamingManageGroup = false;
+          if (nn && nn !== manageSelectedGroup) sendRenameGroup(manageSelectedGroup, nn);
+          renderManageDetail();
+        }
+        else if (act === 'cancelRename') { renamingManageGroup = false; renderManageDetail(); }
+        else if (act === 'deleteGroup') { const name = t.dataset.group; if (confirm('Delete group "' + name + '"?\nDevices are not removed, only the group.')) sendDeleteGroup(name); }
+      });
+      // Manage search + keyboard
+      manageView.addEventListener('input', function (e) {
+        if (e.target.matches('[data-mg-search]')) { manageSearch = e.target.value; refreshMgDevList(); }
+      });
+      manageView.addEventListener('keydown', function (e) {
+        if (e.target.matches('[data-mg-new]') && e.key === 'Enter') {
+          e.preventDefault();
+          const name = e.target.value.trim(); if (name) { sendCreateGroup(name); pendingSelectGroup = name; e.target.value = ''; }
+        } else if (e.target.matches('[data-mg-rename]')) {
+          if (e.key === 'Enter') { e.preventDefault(); const nn = e.target.value.trim(); renamingManageGroup = false; if (nn && nn !== manageSelectedGroup) sendRenameGroup(manageSelectedGroup, nn); renderManageDetail(); }
+          else if (e.key === 'Escape') { e.preventDefault(); renamingManageGroup = false; renderManageDetail(); }
+        }
+      });
+
+      // ---------------- Resizable layout (drag handles + persistence) ----------------
+      const vGutter = document.getElementById('vGutter');
+      const hGutter = document.getElementById('hGutter');
+      const zonesEl = consoleView.querySelector('.zones');
+      const targetsEl = consoleView.querySelector('.targets');
+      const logzoneEl = consoleView.querySelector('.logzone');
+      const MIN_COL = 260, MIN_ZONES = 160, MIN_LOG = 80;
+
+      function saveLayout() {
+        try {
+          const zw = zonesEl.getBoundingClientRect().width;
+          const tw = targetsEl.getBoundingClientRect().width;
+          if (zw > 0) localStorage.setItem('mdm.targetsFrac', String(tw / zw));
+          localStorage.setItem('mdm.logH', String(Math.round(logzoneEl.getBoundingClientRect().height)));
+        } catch (e) { /* localStorage may be unavailable */ }
+      }
+
+      function restoreLayout() {
+        try {
+          const frac = parseFloat(localStorage.getItem('mdm.targetsFrac'));
+          if (frac > 0.1 && frac < 0.9) {
+            const zw = zonesEl.getBoundingClientRect().width;
+            if (zw > 0) zonesEl.style.setProperty('--targets-w', Math.round(frac * zw) + 'px');
+          }
+          const lh = parseFloat(localStorage.getItem('mdm.logH'));
+          if (lh >= MIN_LOG) logzoneEl.style.height = lh + 'px';
+        } catch (e) { /* ignore */ }
+      }
+
+      function makeDraggable(gutter, onMove) {
+        gutter.addEventListener('pointerdown', function (e) {
+          if (getComputedStyle(gutter).display === 'none') return; // disabled on narrow
+          e.preventDefault();
+          gutter.classList.add('dragging');
+          gutter.setPointerCapture(e.pointerId);
+          document.body.style.userSelect = 'none';
+          const ctx = onMove.start(e);
+          const move = function (ev) { onMove.move(ev, ctx); };
+          const up = function () {
+            gutter.classList.remove('dragging');
+            document.body.style.userSelect = '';
+            gutter.removeEventListener('pointermove', move);
+            gutter.removeEventListener('pointerup', up);
+            saveLayout();
+          };
+          gutter.addEventListener('pointermove', move);
+          gutter.addEventListener('pointerup', up);
+        });
+      }
+
+      makeDraggable(vGutter, {
+        start: function (e) { return { x: e.clientX, w: targetsEl.getBoundingClientRect().width }; },
+        move: function (ev, c) {
+          const zw = zonesEl.getBoundingClientRect().width;
+          let w = c.w + (ev.clientX - c.x);
+          w = Math.max(MIN_COL, Math.min(w, zw - MIN_COL - 6));
+          zonesEl.style.setProperty('--targets-w', w + 'px');
+        },
+      });
+
+      makeDraggable(hGutter, {
+        start: function (e) { return { y: e.clientY, h: logzoneEl.getBoundingClientRect().height }; },
+        move: function (ev, c) {
+          const cardH = consoleView.getBoundingClientRect().height;
+          let h = c.h + (c.y - ev.clientY); // drag up grows the log
+          h = Math.max(MIN_LOG, Math.min(h, cardH - MIN_ZONES));
+          logzoneEl.style.height = h + 'px';
+        },
+      });
+
+      // ---------------- Init ----------------
+      render();
+      restoreLayout();
       connect();
     })();
   </script>
