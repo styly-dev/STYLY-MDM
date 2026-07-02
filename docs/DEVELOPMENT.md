@@ -10,9 +10,9 @@ For end-user setup and usage, see the [README](../README.md).
 
 | Component | Location | Technology |
 |---|---|---|
-| Control Server | `mdm-server/` | Python 3.10+, aiohttp |
+| Control Server | `mdm-server/styly_mdm/` | Python 3.10+, aiohttp |
 | MDM Client | `mdm-client/` | Kotlin, OkHttp, PICO Business SDK |
-| Web Console | `mdm-server/static/` | Vanilla HTML / CSS / JS |
+| Web Console | `mdm-server/styly_mdm/static/` | Vanilla HTML / CSS / JS |
 
 ## Message Flow
 
@@ -75,9 +75,9 @@ cd mdm-server
 ```
 
 `run.sh dev` simply exports `MDM_DISCOVERY_PORT=7081` / `MDM_WS_PORT=7080` before
-launching `server.py`. You can still set those variables yourself if you prefer.
-When unset, `server.py` falls back to the production ports, so production startup is
-unchanged.
+launching the server (`python -m styly_mdm`). You can still set those variables
+yourself if you prefer. When unset, the server falls back to the production ports,
+so production startup is unchanged.
 
 **Dev client** — build the `dev` flavor:
 
@@ -109,10 +109,16 @@ The ports come from `BuildConfig` fields defined per flavor in
 ```
 STYLY-MDM/
 ├── mdm-server/
-│   ├── server.py           # WebSocket control server (aiohttp)
-│   ├── requirements.txt    # Python dependencies
-│   └── static/
-│       └── index.html      # Web management console
+│   ├── pyproject.toml       # Packaging metadata (published to PyPI as styly-mdm)
+│   ├── run.sh               # Dev/prod launcher (python -m styly_mdm)
+│   ├── styly_mdm/           # Installable package
+│   │   ├── __init__.py      # Exports create_app / main
+│   │   ├── __main__.py      # `python -m styly_mdm` entrypoint
+│   │   ├── server.py        # WebSocket control server (aiohttp)
+│   │   └── static/
+│   │       └── index.html   # Web management console (bundled package data)
+│   └── tests/
+│       └── test_app.py      # Smoke tests
 └── mdm-client/
     └── app/src/main/
         ├── AndroidManifest.xml
@@ -221,3 +227,63 @@ The MDM client requires the following Android permissions:
 | Android (MDM client) | API 29 (Android 10) |
 | OkHttp | 4.x |
 | PICO OS | Business Mode enabled |
+
+## Server Packaging & PyPI Release
+
+The control server is packaged as the `styly-mdm` PyPI distribution (import name
+`styly_mdm`). Runtime dependencies and metadata live in `mdm-server/pyproject.toml`;
+the web console (`styly_mdm/static/`) ships as bundled package data.
+
+**Runtime data location.** Uploaded APKs (`apks/`) and the device registry
+(`device_registry.json`) are written to a data directory, not next to the code (the
+installed package lives in read-only `site-packages`). It defaults to the current
+working directory and is overridable via `MDM_DATA_DIR` / `--data-dir`. `run.sh`
+does `cd mdm-server` first, so the from-source dev workflow keeps writing under
+`mdm-server/` as before.
+
+**Not ASGI.** The server is aiohttp and starts a UDP discovery responder in the same
+asyncio loop as the HTTP server (`server.run_server`). It must be launched via its own
+process (the `styly-mdm` console script, `python -m styly_mdm`, or `uvx styly-mdm`) —
+running it under an ASGI server such as uvicorn (`module:app`) would never start LAN
+discovery.
+
+**Build & test locally:**
+
+```bash
+cd mdm-server
+pip install -e '.[dev]'
+python -m pytest        # smoke tests
+python -m build         # sdist + wheel into dist/  (pip install build first)
+```
+
+**Versioning.** The package version is derived from the `vX.Y.Z` git tag via
+`setuptools-scm` — the same tag the APK release flow uses, so server and APK share one
+version. There is no hardcoded version to bump.
+
+**Release automation.** `.github/workflows/publish-pypi.yml` runs on the same
+`release: published` event as the APK build (`release.yml`): a human publishes the
+draft created by `release-version-bump.yml`, which fires both builds. It builds,
+tests, then publishes in two stages using **Trusted Publishing (OIDC)** — no tokens:
+
+1. **Test PyPI** — automatic after build.
+2. **PyPI** — gated by the protected `pypi` GitHub environment (manual approval = the
+   "verify on Test PyPI first" step).
+
+A `workflow_dispatch` run does a Test PyPI-only dry run.
+
+**One-time maintainer setup (required before the first publish):**
+
+- On **Test PyPI** and **PyPI**, add a Trusted Publisher for this repo: workflow
+  `publish-pypi.yml`, environment `testpypi` / `pypi` respectively (use a "pending
+  publisher" since the project doesn't exist yet).
+- In the repo's **Settings → Environments**, create `testpypi` (no protection) and
+  `pypi` (required reviewers → manual approval gate).
+
+To verify a Test PyPI upload before approving the `pypi` promotion, keep PyPI as an
+extra index so runtime dependencies (aiohttp, etc.) still resolve — `--index-url`
+alone would look for them on Test PyPI and fail:
+
+```bash
+pip install --index-url https://test.pypi.org/simple/ \
+            --extra-index-url https://pypi.org/simple/ styly-mdm
+```
