@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "styly-mdm"
+dynamic = ["version"]
+description = "Lightweight MDM control server for LBE VR headsets (PICO), with a web console and LAN discovery."
+readme = "README.md"
+requires-python = ">=3.10"
+# SPDX expression (PEP 639). The full license text lives at the repo root
+# (../LICENSE); it is not bundled here because license-files cannot reference a
+# path outside the package project directory.
+license = "Apache-2.0"
+authors = [{ name = "STYLY, Inc." }]
+keywords = ["mdm", "vr", "pico", "lbe", "device-management", "aiohttp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Framework :: aiohttp",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = ["aiohttp>=3.9,<4"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/styly-dev/STYLY-MDM"
+Repository = "https://github.com/styly-dev/STYLY-MDM"
+Issues = "https://github.com/styly-dev/STYLY-MDM/issues"
+
+[project.scripts]
+styly-mdm = "styly_mdm.server:main"
+
+[tool.setuptools]
+packages = ["styly_mdm"]
+
+[tool.setuptools.package-data]
+styly_mdm = ["static/*"]
+
+# Version is derived from git tags (vX.Y.Z) — single source of truth shared with
+# the APK release flow. The git root is the repo root, one level up from this
+# pyproject.toml. In CI the version is injected via
+# SETUPTOOLS_SCM_PRETEND_VERSION_FOR_STYLY_MDM so a shallow checkout needs no tags.
+[tool.setuptools_scm]
+root = ".."
+fallback_version = "0.0.0"
+# Drop the "+g<hash>" local segment: PEP 440 local versions are rejected on
+# upload, so this keeps non-tagged (Test PyPI dry-run) builds publishable.
+local_scheme = "no-local-version"

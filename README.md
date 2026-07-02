@@ -30,10 +30,23 @@ STYLY-MDM currently supports PICO devices (PICO OS with Business Mode). Support 
 
 ### 1. Start the Control Server
 
+Run it without cloning the repository:
+
+```bash
+# One-off, no install (recommended):
+uvx styly-mdm
+
+# Or install, then run:
+pip install styly-mdm
+styly-mdm
+```
+
+Or run from a clone (for development):
+
 ```bash
 cd mdm-server
-pip install -r requirements.txt
-python server.py
+pip install -e .
+python -m styly_mdm      # or ./run.sh
 ```
 
 The server starts on port 7070 and displays its LAN IP addresses:
@@ -45,6 +58,14 @@ The server starts on port 7070 and displays its LAN IP addresses:
 ```
 
 Open `http://<server-ip>:7070` in a browser to access the web console.
+
+**Configuration** — all optional:
+
+| Setting | Env var | Flag | Default |
+|---------|---------|------|---------|
+| HTTP/WebSocket port | `MDM_WS_PORT` | `--port` | `7070` |
+| UDP discovery port | `MDM_DISCOVERY_PORT` | — | `7071` |
+| Data directory (uploaded APKs + device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
 
 ### 2. Configure the MDM Client
 
@@ -76,7 +97,7 @@ The MDM client connects to the server, registers the device (serial number, mode
 4. In **Install APK**, choose an `.apk` file and click **Upload APK**.
 5. After upload completes, click **Install to Selected**. Offline devices in the selection are skipped automatically.
 
-Uploaded APKs are stored under `mdm-server/apks/` and served to devices over the LAN. The MDM client downloads the APK and calls PICO Business SDK's silent install API, so Business Mode and the high-risk API manifest tag are required.
+Uploaded APKs are stored under `<data-dir>/apks/` (the data directory defaults to the directory the server is started from; see the configuration table above) and served to devices over the LAN. The MDM client downloads the APK and calls PICO Business SDK's silent install API, so Business Mode and the high-risk API manifest tag are required.
 
 > **All-files access is required.** The PICO ToBService runs as a separate system-user process, so it cannot read APKs from the app's scoped storage — the client must write them to shared storage (`/sdcard/Download/styly-mdm/`). The client therefore declares `MANAGE_EXTERNAL_STORAGE`, which must be granted once per device. Grant it during provisioning with:
 >

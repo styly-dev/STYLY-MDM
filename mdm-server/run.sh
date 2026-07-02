@@ -21,7 +21,7 @@ ENVIRONMENT="${1:-prod}"
 
 case "$ENVIRONMENT" in
     prod)
-        # server.py falls back to the production ports (7071 / 7070) when unset.
+        # The server falls back to the production ports (7071 / 7070) when unset.
         ;;
     dev)
         export MDM_DISCOVERY_PORT=7081
@@ -33,5 +33,7 @@ case "$ENVIRONMENT" in
 esac
 
 # --- run --------------------------------------------------------------------
+# CWD is SCRIPT_DIR (mdm-server/), so the default data directory (apks/,
+# device_registry.json) stays under mdm-server/ as before.
 info "Starting STYLY-MDM server (${ENVIRONMENT}) ..."
-exec python server.py
+exec python -m styly_mdm

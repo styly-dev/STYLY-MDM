@@ -5,6 +5,7 @@ HMDs connect via /ws/device, admin consoles via /ws/admin.
 Static files for the web console are served from ./static/.
 """
 
+import argparse
 import asyncio
 import json
 import logging
@@ -21,11 +22,19 @@ logging.basicConfig(
 )
 log = logging.getLogger("stylymdm")
 
-APK_DIR = Path(__file__).parent / "apks"
+# Writable runtime data (uploaded APKs, device registry) lives under a
+# configurable data directory rather than next to this module. When installed as
+# a package (pip/uvx) the module directory is read-only site-packages, so writes
+# must go elsewhere. Defaults to the current working directory, which keeps the
+# from-source workflow (run.sh does `cd mdm-server`) writing to mdm-server/ as
+# before. Override with MDM_DATA_DIR or the --data-dir flag.
+DATA_DIR = Path(os.environ.get("MDM_DATA_DIR", ".")).resolve()
+
+APK_DIR = DATA_DIR / "apks"
 MAX_APK_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB
 
 # Persistent per-device registry: serial -> {label, model, ip, last_seen, startup_app}
-REGISTRY_PATH = Path(__file__).parent / "device_registry.json"
+REGISTRY_PATH = DATA_DIR / "device_registry.json"
 MAX_LABEL_LEN = 64
 MAX_GROUP_NAME_LEN = 64
 
@@ -849,7 +858,7 @@ async def upload_apk_handler(request: web.Request) -> web.Response:
     if safe_name is None:
         return web.json_response({"error": "Uploaded file must have a .apk extension"}, status=400)
 
-    APK_DIR.mkdir(exist_ok=True)
+    APK_DIR.mkdir(parents=True, exist_ok=True)
     destination = unique_apk_path(safe_name)
     size = 0
 
@@ -1035,6 +1044,8 @@ async def start_discovery_responder(ws_port: int, ip_addresses: list[str]):
 # ---------------------------------------------------------------------------
 
 def create_app() -> web.Application:
+    # Ensure the writable data directory exists before loading/saving the registry.
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     load_registry()
     app = web.Application(client_max_size=MAX_APK_SIZE + 10 * 1024 * 1024)
 
@@ -1043,9 +1054,10 @@ def create_app() -> web.Application:
     app.router.add_get("/ws/admin", admin_ws_handler)
     app.router.add_post("/api/apks", upload_apk_handler)
 
-    # Static files (served from ./static/ relative to this script)
+    # Static files are shipped inside the package (styly_mdm/static/), so this
+    # resolves both from source and when installed. It is read-only package data
+    # and is never created at runtime.
     static_dir = Path(__file__).parent / "static"
-    static_dir.mkdir(exist_ok=True)
 
     # Serve index.html at the root path so "/" loads the MDM console
     async def root_handler(_request: web.Request) -> web.FileResponse:
@@ -1054,7 +1066,7 @@ def create_app() -> web.Application:
     app.router.add_get("/", root_handler)
     app.router.add_static("/static", static_dir)
 
-    APK_DIR.mkdir(exist_ok=True)
+    APK_DIR.mkdir(parents=True, exist_ok=True)
     app.router.add_static("/apks", APK_DIR)
 
     return app
@@ -1074,11 +1086,24 @@ def get_local_ip_addresses() -> list[str]:
     return list(dict.fromkeys(addresses))
 
 
-async def run_server():
-    # WebSocket port is overridable (MDM_WS_PORT) so a development server can run
-    # alongside production on the same machine; the discovery response advertises
-    # this port, so clients follow it automatically.
-    port = int(os.environ.get("MDM_WS_PORT", "7070"))
+def _apply_data_dir(path: str) -> None:
+    """Point the writable data directory (and its derived paths) at ``path``.
+
+    Called from main() when --data-dir is passed. Reassigns the module globals so
+    create_app() and the upload/registry handlers pick up the new location.
+    """
+    global DATA_DIR, APK_DIR, REGISTRY_PATH
+    DATA_DIR = Path(path).resolve()
+    APK_DIR = DATA_DIR / "apks"
+    REGISTRY_PATH = DATA_DIR / "device_registry.json"
+
+
+async def run_server(port: int | None = None):
+    # WebSocket port is overridable (MDM_WS_PORT / --port) so a development server
+    # can run alongside production on the same machine; the discovery response
+    # advertises this port, so clients follow it automatically.
+    if port is None:
+        port = int(os.environ.get("MDM_WS_PORT", "7070"))
     app = create_app()
     ip_addresses = get_local_ip_addresses()
 
@@ -1105,7 +1130,26 @@ async def run_server():
 
 
 def main():
-    asyncio.run(run_server())
+    parser = argparse.ArgumentParser(
+        prog="styly-mdm",
+        description="STYLY-MDM control server (WebSocket + web console + LAN discovery).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="HTTP/WebSocket port (default: $MDM_WS_PORT or 7070).",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Directory for uploaded APKs and the device registry "
+        "(default: $MDM_DATA_DIR or the current directory).",
+    )
+    args = parser.parse_args()
+    if args.data_dir is not None:
+        _apply_data_dir(args.data_dir)
+    asyncio.run(run_server(port=args.port))
 
 
 if __name__ == "__main__":
