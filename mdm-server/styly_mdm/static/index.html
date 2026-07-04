@@ -144,7 +144,7 @@
 
     /* Device table */
     .dev-table { width: 100%; }
-    .dev-row { display: grid; grid-template-columns: 42px 2fr 1fr 1fr; align-items: center; padding: 10px 0; padding-left: 18px; border-top: 1px solid var(--border-soft); font-size: 13px; }
+    .dev-row { display: grid; grid-template-columns: 42px minmax(0, 2fr) minmax(76px, .7fr) minmax(96px, .85fr) minmax(92px, 1fr); align-items: center; padding: 10px 0; padding-left: 18px; border-top: 1px solid var(--border-soft); font-size: 13px; }
     .dev-head { padding-top: 9px; padding-bottom: 9px; border-top: none; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .5px; }
     .dev-row.offline { opacity: .55; }
     .dev-row.offline:hover { opacity: .75; }
@@ -157,6 +157,16 @@
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 6px; vertical-align: middle; }
     .dot.off { background: var(--text-muted); }
     .last-seen { color: var(--text-muted); font-size: 11px; margin-left: 4px; }
+    .dev-battery { font-size: 12px; padding-right: 12px; }
+    .battery { display: inline-flex; align-items: center; gap: 7px; color: var(--text-secondary); white-space: nowrap; }
+    .battery.low { color: var(--danger); }
+    .battery-meter { width: 28px; height: 12px; border: 1px solid #41475f; border-radius: 3px; padding: 2px; position: relative; flex: 0 0 auto; }
+    .battery-meter::after { content: ""; position: absolute; right: -4px; top: 3px; width: 3px; height: 5px; border-radius: 0 2px 2px 0; background: #41475f; }
+    .battery-fill { display: block; height: 100%; border-radius: 2px; background: var(--success); }
+    .battery.low .battery-fill { background: var(--danger); }
+    .battery.charging .battery-fill { background: var(--warning); }
+    .battery-note { color: var(--text-muted); font-size: 11px; margin-left: 4px; }
+    .battery-muted { color: var(--text-dim); }
     .dev-install { font-size: 12px; padding-right: 14px; }
     .ins-installing { color: var(--warning); }
     .ins-success { color: var(--success); }
@@ -404,6 +414,7 @@
       let uploadInProgress = false;
       let reconnectTimer = null;
       const RECONNECT_DELAY = 3000;
+      const LOW_BATTERY_THRESHOLD = 20;
       // Manage view
       let manageSelectedGroup = null;
       let manageMembers = new Set();
@@ -449,6 +460,18 @@
       function labelFor(id) { if (!id) return '-'; const d = deviceById(id); return (d && d.label) ? d.label : id; }
       function groupNames() { return Object.keys(groups).sort(); }
       function offlineMembers(name) { return (groups[name] || []).filter(function (s) { const d = deviceById(s); return d && !isOnline(d); }).length; }
+      function batteryHtml(d) {
+        const b = d && d.battery;
+        if (!b || typeof b.level !== 'number') return '<span class="battery-muted">—</span>';
+        const level = Math.max(0, Math.min(100, Math.round(b.level)));
+        const charging = b.charging === true;
+        const low = level < LOW_BATTERY_THRESHOLD && !charging;
+        const note = charging ? '<span class="battery-note">Charging</span>' : '';
+        const title = level + '% battery' + (charging ? ', charging' : '');
+        return '<span class="battery' + (low ? ' low' : '') + (charging ? ' charging' : '') + '" title="' + esc(title) + '">' +
+          '<span class="battery-meter"><span class="battery-fill" style="width:' + level + '%"></span></span>' +
+          '<span>' + level + '%</span>' + note + '</span>';
+      }
 
       // ---------------- Connection ----------------
       function setConnStatus(state) {
@@ -626,7 +649,7 @@
         let html = '<div class="dev-table">';
         html += '<div class="dev-row dev-head">' +
           '<div class="selbox ' + (allSel ? 'on' : someSel ? 'mixed' : '') + '" data-act="selectAll">' + (allSel ? '✓' : someSel ? '–' : '') + '</div>' +
-          '<div>Device</div><div>Status</div><div>Install</div></div>';
+          '<div>Device</div><div>Status</div><div>Battery</div><div>Install</div></div>';
         devices.forEach(function (d) {
           const id = getDeviceId(d);
           const checked = selectedIds.has(id);
@@ -660,6 +683,7 @@
             '<div class="selbox ' + (checked ? 'on' : '') + '" data-act="toggleDevice" data-id="' + esc(id) + '">' + (checked ? '✓' : '') + '</div>' +
             '<div class="dev-cell">' + deviceCell + '</div>' +
             '<div class="dev-status">' + status + '</div>' +
+            '<div class="dev-battery">' + batteryHtml(d) + '</div>' +
             '<div class="dev-install" data-install-id="' + esc(id) + '">' + installCellHtml(id) + '</div>' +
             '</div>';
         });
