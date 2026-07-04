@@ -279,11 +279,31 @@ A `workflow_dispatch` run does a Test PyPI-only dry run.
 - In the repo's **Settings → Environments**, create `testpypi` (no protection) and
   `pypi` (required reviewers → manual approval gate).
 
-To verify a Test PyPI upload before approving the `pypi` promotion, keep PyPI as an
-extra index so runtime dependencies (aiohttp, etc.) still resolve — `--index-url`
-alone would look for them on Test PyPI and fail:
+**Verifying a Test PyPI release.** After a `workflow_dispatch` dry run (or the
+automatic Test PyPI step of a real release), install the package into a throwaway
+environment and actually start it before approving the `pypi` promotion:
 
 ```bash
+# Install from Test PyPI. Two flags matter:
+#   --extra-index-url : runtime deps (aiohttp, ...) live on real PyPI, not Test PyPI,
+#                       so --index-url alone fails to resolve them.
+#   --pre             : Test PyPI only ever has dev builds (e.g. 0.2.1.devN).
+python -m venv /tmp/styly-test && source /tmp/styly-test/bin/activate
 pip install --index-url https://test.pypi.org/simple/ \
-            --extra-index-url https://pypi.org/simple/ styly-mdm
+            --extra-index-url https://pypi.org/simple/ --pre styly-mdm
+
+# Start it on non-default ports with a throwaway data dir (so it never clashes with a
+# real 7070/7071 server), then smoke-test HTTP and UDP discovery:
+MDM_WS_PORT=17070 MDM_DISCOVERY_PORT=17071 styly-mdm --data-dir /tmp/styly-data &
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:17070/   # -> HTTP 200
+python - <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+s.sendto(b'STYLYMDM_DISCOVER', ('127.0.0.1', 17071))
+print('discovery:', s.recvfrom(1024)[0].decode())   # -> {"service": "stylymdm", ...}
+PY
 ```
+
+A clean run — `HTTP 200`, a discovery JSON reply advertising the WS port, and a
+freshly created `/tmp/styly-data/apks/` — confirms the published artifact installs and
+runs. Only then approve the `pypi` environment to promote the release to PyPI.
