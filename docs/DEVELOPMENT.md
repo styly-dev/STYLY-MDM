@@ -137,7 +137,8 @@ STYLY-MDM/
 
 | Message type | Description |
 |---|---|
-| `REGISTER` | Sent on connect. Fields: `device_id`, `model`, `ip` |
+| `REGISTER` | Sent on connect. Fields: `device_id`, `model`, `ip`, `startup_app` (optional) |
+| `BATTERY_UPDATE` | Battery telemetry. Fields: `device_id`, `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds) |
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
 
@@ -172,7 +173,7 @@ STYLY-MDM/
 
 | Message type | Description |
 |---|---|
-| `DEVICE_LIST` | Current list of connected devices. Fields: `devices` (array) |
+| `DEVICE_LIST` | Current list of connected devices. Fields: `devices` (array; each device may include optional `battery`: `{level, charging, last_seen}`) |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `INSTALL_SENT` | Confirmation that install commands were dispatched. Fields: `apk_filename`, `apk_url`, `sent_count`, `target_count` |
 | `LAUNCH_RESULT` | Forwarded result from a device |
@@ -189,6 +190,13 @@ STYLY-MDM/
 > group's members (devices not in the group are deselected), so commands still
 > dispatch via the normal `target_devices` path (online members only). Group
 > membership can include offline devices.
+
+> **Battery telemetry** is optional for backwards compatibility. Older clients
+> that never send `BATTERY_UPDATE` remain valid; their device rows simply omit
+> `battery`. New clients send one update immediately after WebSocket connect and
+> then every 5 minutes while the foreground service is running. The server stores
+> the latest battery state in `device_registry.json`, so offline devices retain
+> their last-known battery percentage and charging state.
 
 ## Server Discovery Protocol
 
@@ -217,6 +225,10 @@ The MDM client requires the following Android permissions:
 | `ACCESS_NETWORK_STATE` | Monitor network connectivity |
 | `ACCESS_WIFI_STATE` | Retrieve the device IP address |
 | `MANAGE_EXTERNAL_STORAGE` | Write downloaded APKs to shared storage so the PICO ToBService can read them for silent install |
+
+Battery percentage and charging state are read with Android's standard battery
+status APIs (`ACTION_BATTERY_CHANGED` / `BatteryManager`), which do not require
+an additional manifest permission.
 
 ## Requirements
 

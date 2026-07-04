@@ -1,8 +1,14 @@
 package com.styly.mdmclient
 
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.net.wifi.WifiManager
+import android.os.BatteryManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import com.pvr.tobservice.ToBServiceHelper
 import com.pvr.tobservice.enums.PBS_SystemInfoEnum
@@ -41,6 +47,7 @@ class WebSocketManager(
         private const val DISCOVERY_INTERVAL_MS = 15000L
         private const val DISCOVERY_FAILURE_THRESHOLD = 3
         private const val PING_INTERVAL_SECONDS = 15L
+        private const val BATTERY_UPDATE_INTERVAL_MS = 5 * 60 * 1000L
 
         const val PREF_STARTUP_APP_PACKAGE = "startup_app_package"
         const val PREF_STARTUP_APP_EXTRA = "startup_app_extra"
@@ -55,8 +62,9 @@ class WebSocketManager(
     private var reconnectDelay = INITIAL_RECONNECT_DELAY_MS
     private var isRunning = false
     private var consecutiveFailures = 0
-    private val reconnectHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val reconnectHandler = Handler(Looper.getMainLooper())
     private val reconnectToken = Object()
+    private val batteryTelemetryToken = Object()
 
     fun getServerUrl(): String {
         val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
@@ -120,6 +128,7 @@ class WebSocketManager(
                 }
                 onStatusChanged(true, "Connected")
                 sendRegistration()
+                startBatteryTelemetry()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -143,12 +152,14 @@ class WebSocketManager(
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.i(TAG, "WebSocket closed: $code $reason")
                 onStatusChanged(false, "Disconnected: $reason")
+                stopBatteryTelemetry()
                 scheduleReconnect()
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 Log.e(TAG, "WebSocket failure: ${t.message}")
                 onStatusChanged(false, "Connection failed: ${t.message}")
+                stopBatteryTelemetry()
                 scheduleReconnect()
             }
         })
@@ -186,7 +197,7 @@ class WebSocketManager(
                             doConnect()
                         }
                     }.start()
-                }, reconnectToken, android.os.SystemClock.uptimeMillis() + DISCOVERY_INTERVAL_MS)
+                }, reconnectToken, SystemClock.uptimeMillis() + DISCOVERY_INTERVAL_MS)
             } else {
                 // First few failures — retry saved URL with exponential backoff
                 Log.i(TAG, "Reconnecting in ${reconnectDelay}ms")
@@ -194,7 +205,7 @@ class WebSocketManager(
 
                 reconnectHandler.postAtTime({
                     doConnect()
-                }, reconnectToken, android.os.SystemClock.uptimeMillis() + reconnectDelay)
+                }, reconnectToken, SystemClock.uptimeMillis() + reconnectDelay)
 
                 reconnectDelay = (reconnectDelay * 2).coerceAtMost(MAX_RECONNECT_DELAY_MS)
             }
@@ -235,6 +246,56 @@ class WebSocketManager(
         sendMessage(registration)
     }
 
+    private fun startBatteryTelemetry() {
+        stopBatteryTelemetry()
+        sendBatteryUpdate()
+        scheduleNextBatteryUpdate()
+    }
+
+    private fun stopBatteryTelemetry() {
+        reconnectHandler.removeCallbacksAndMessages(batteryTelemetryToken)
+    }
+
+    private fun scheduleNextBatteryUpdate() {
+        reconnectHandler.postAtTime({
+            if (isRunning && webSocket != null) {
+                sendBatteryUpdate()
+                scheduleNextBatteryUpdate()
+            }
+        }, batteryTelemetryToken, SystemClock.uptimeMillis() + BATTERY_UPDATE_INTERVAL_MS)
+    }
+
+    private fun sendBatteryUpdate() {
+        val snapshot = readBatterySnapshot()
+        if (snapshot == null) {
+            Log.w(TAG, "Battery state is unavailable")
+            return
+        }
+        val update = JSONObject().apply {
+            put("type", "BATTERY_UPDATE")
+            put("device_id", getDeviceSerialNumber())
+            put("level", snapshot.level)
+            put("charging", snapshot.charging)
+            put("timestamp", System.currentTimeMillis() / 1000)
+        }
+        sendMessage(update)
+    }
+
+    private fun readBatterySnapshot(): BatterySnapshot? {
+        val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            ?: return null
+        val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+        if (level < 0 || scale <= 0) {
+            return null
+        }
+        val percent = ((level * 100f) / scale).toInt().coerceIn(0, 100)
+        val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_UNKNOWN)
+        val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == BatteryManager.BATTERY_STATUS_FULL
+        return BatterySnapshot(percent, charging)
+    }
+
     private fun getDeviceSerialNumber(): String {
         return try {
             val binder = ToBServiceHelper.getInstance().serviceBinder
@@ -273,4 +334,9 @@ class WebSocketManager(
         }
         return "0.0.0.0"
     }
+
+    private data class BatterySnapshot(
+        val level: Int,
+        val charging: Boolean
+    )
 }

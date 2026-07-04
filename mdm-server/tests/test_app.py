@@ -4,6 +4,7 @@ No network is used: these exercise the app factory, verify the web console is
 bundled with the package, and cover the pure filename helpers.
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -73,3 +74,71 @@ def test_unique_apk_path_avoids_collision(tmp_path):
     assert second != first
     assert second.name.startswith("app-")
     assert second.suffix == ".apk"
+
+
+def test_coerce_battery_accepts_valid_optional_state():
+    assert server._coerce_battery(None) is None
+    assert server._coerce_battery({"level": 51, "charging": False, "last_seen": 123}) == {
+        "level": 51,
+        "charging": False,
+        "last_seen": 123,
+    }
+    assert server._coerce_battery({"level": 100.0, "charging": True, "timestamp": 456}) == {
+        "level": 100,
+        "charging": True,
+        "last_seen": 456,
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"level": -1, "charging": False},
+        {"level": 101, "charging": False},
+        {"level": True, "charging": False},
+        {"level": 50, "charging": "yes"},
+        "50%",
+    ],
+)
+def test_coerce_battery_rejects_invalid_state(value):
+    assert server._coerce_battery(value) is None
+
+
+def test_build_device_list_includes_online_and_offline_battery(tmp_path):
+    server._apply_data_dir(str(tmp_path))
+    server.devices.clear()
+    server.device_registry.clear()
+
+    server.device_registry["online-1"] = {
+        "label": "DEV-001",
+        "model": "PICO 4E",
+        "ip": "192.168.1.11",
+        "last_seen": 100,
+        "startup_app": None,
+        "battery": {"level": 87, "charging": True, "last_seen": 101},
+    }
+    server.device_registry["offline-1"] = {
+        "label": "DEV-002",
+        "model": "PICO 4E",
+        "ip": "192.168.1.12",
+        "last_seen": 90,
+        "startup_app": None,
+        "battery": {"level": 18, "charging": False, "last_seen": 91},
+    }
+    server.devices["online-1"] = {
+        "ws": object(),
+        "device_id": "online-1",
+        "model": "PICO 4E",
+        "ip": "192.168.1.11",
+        "status": "online",
+        "startup_app": None,
+        "battery": {"level": 87, "charging": True, "last_seen": 101},
+    }
+
+    payload = json.loads(server.build_device_list_msg())
+    rows = {row["device_id"]: row for row in payload["devices"]}
+
+    assert rows["online-1"]["status"] == "online"
+    assert rows["online-1"]["battery"] == {"level": 87, "charging": True, "last_seen": 101}
+    assert rows["offline-1"]["status"] == "offline"
+    assert rows["offline-1"]["battery"] == {"level": 18, "charging": False, "last_seen": 91}

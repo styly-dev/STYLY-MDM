@@ -33,17 +33,17 @@ DATA_DIR = Path(os.environ.get("MDM_DATA_DIR", ".")).resolve()
 APK_DIR = DATA_DIR / "apks"
 MAX_APK_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB
 
-# Persistent per-device registry: serial -> {label, model, ip, last_seen, startup_app}
+# Persistent per-device registry: serial -> {label, model, ip, last_seen, startup_app, battery}
 REGISTRY_PATH = DATA_DIR / "device_registry.json"
 MAX_LABEL_LEN = 64
 MAX_GROUP_NAME_LEN = 64
 
-# Connected devices: device_id -> {ws, device_id, model, ip, status, startup_app}
+# Connected devices: device_id -> {ws, device_id, model, ip, status, startup_app, battery}
 devices: dict[str, dict] = {}
 
-# serial -> last-known record {label, model, ip, last_seen, startup_app}. Remembers
-# every device that has connected at least once so it stays listed while offline.
-# Survives restarts (persisted to REGISTRY_PATH).
+# serial -> last-known record {label, model, ip, last_seen, startup_app, battery}.
+# Remembers every device that has connected at least once so it stays listed
+# while offline. Survives restarts (persisted to REGISTRY_PATH).
 device_registry: dict[str, dict] = {}
 
 # Named device groups (many-to-many): group name -> list of member serials. A
@@ -67,21 +67,60 @@ def _coerce_record(value) -> dict | None:
     (a dict). Returns None for anything else.
     """
     if isinstance(value, str):
-        return {"label": value.strip(), "model": "", "ip": "", "last_seen": None, "startup_app": None}
+        return {
+            "label": value.strip(),
+            "model": "",
+            "ip": "",
+            "last_seen": None,
+            "startup_app": None,
+            "battery": None,
+        }
     if isinstance(value, dict):
         label = value.get("label", "")
         model = value.get("model", "")
         ip = value.get("ip", "")
         last_seen = value.get("last_seen")
         startup_app = value.get("startup_app")
+        battery = _coerce_battery(value.get("battery"))
         return {
             "label": label.strip() if isinstance(label, str) else "",
             "model": model if isinstance(model, str) else "",
             "ip": ip if isinstance(ip, str) else "",
             "last_seen": last_seen if isinstance(last_seen, (int, float)) else None,
             "startup_app": startup_app if isinstance(startup_app, dict) else None,
+            "battery": battery,
         }
     return None
+
+
+def _coerce_battery(value) -> dict | None:
+    """Normalize battery telemetry into {level, charging, last_seen}.
+
+    Battery telemetry is optional for backward compatibility with older clients.
+    """
+    if not isinstance(value, dict):
+        return None
+
+    level = value.get("level")
+    if isinstance(level, bool) or not isinstance(level, (int, float)):
+        return None
+    level = int(level)
+    if level < 0 or level > 100:
+        return None
+
+    charging = value.get("charging")
+    if not isinstance(charging, bool):
+        return None
+
+    last_seen = value.get("last_seen", value.get("timestamp"))
+    if not isinstance(last_seen, (int, float)) or isinstance(last_seen, bool):
+        last_seen = time.time()
+
+    return {
+        "level": level,
+        "charging": charging,
+        "last_seen": last_seen,
+    }
 
 
 def _coerce_groups(value) -> dict[str, list[str]]:
@@ -184,6 +223,7 @@ def build_device_list_msg() -> str:
             "ip": d["ip"],
             "status": "online",
             "startup_app": d.get("startup_app"),
+            "battery": d.get("battery"),
             "last_seen": device_registry.get(d["device_id"], {}).get("last_seen"),
         }
         for d in devices.values()
@@ -198,6 +238,7 @@ def build_device_list_msg() -> str:
             "ip": rec.get("ip", ""),
             "status": "offline",
             "startup_app": rec.get("startup_app"),
+            "battery": rec.get("battery"),
             "last_seen": rec.get("last_seen"),
         })
     device_list.sort(
@@ -324,6 +365,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     model = data.get("model", "unknown")
                     ip = data.get("ip", request.remote or "unknown")
                     startup_app = data.get("startup_app")
+                    prev = device_registry.get(device_id, {})
                     devices[device_id] = {
                         "ws": ws,
                         "device_id": device_id,
@@ -331,19 +373,48 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "ip": ip,
                         "status": "online",
                         "startup_app": startup_app,
+                        "battery": prev.get("battery"),
                     }
                     # Remember the device persistently so it stays in the list while
                     # offline; preserve any previously assigned label.
-                    prev = device_registry.get(device_id, {})
                     device_registry[device_id] = {
                         "label": prev.get("label", ""),
                         "model": model,
                         "ip": ip,
                         "last_seen": time.time(),
                         "startup_app": startup_app,
+                        "battery": prev.get("battery"),
                     }
                     save_registry()
                     log.info("Device registered: %s (%s)", device_id, model)
+                    await broadcast_device_list()
+
+                elif msg_type == "BATTERY_UPDATE":
+                    if not device_id:
+                        log.warning("BATTERY_UPDATE before REGISTER")
+                        continue
+                    battery = _coerce_battery({
+                        "level": data.get("level"),
+                        "charging": data.get("charging"),
+                        "last_seen": data.get("timestamp"),
+                    })
+                    if battery is None:
+                        log.warning("Invalid BATTERY_UPDATE from %s: %s", device_id, data)
+                        continue
+
+                    # Use server receipt time for stale-display semantics; client clocks
+                    # can drift, and the console only needs last-known freshness.
+                    battery["last_seen"] = time.time()
+                    devices[device_id]["battery"] = battery
+                    rec = device_registry.get(device_id)
+                    if rec is not None:
+                        rec["battery"] = battery
+                        rec["last_seen"] = time.time()
+                    save_registry()
+                    log.info(
+                        "Battery update from %s: %d%% charging=%s",
+                        device_id, battery["level"], battery["charging"],
+                    )
                     await broadcast_device_list()
 
                 elif msg_type in {"LAUNCH_RESULT", "INSTALL_RESULT"}:
