@@ -1110,6 +1110,56 @@ async def start_discovery_responder(ws_port: int, ip_addresses: list[str]):
     return transport
 
 
+def probe_existing_server(timeout: float = 1.0) -> str | None:
+    """Return the IP of another STYLY-MDM server already answering discovery
+    requests on ``DISCOVERY_PORT``, or ``None`` if none responds.
+
+    Broadcasts a single discovery request and waits up to ``timeout`` seconds for
+    a valid ``stylymdm`` reply. Called before this process binds its own discovery
+    responder, so any reply can only come from a *different* server (elsewhere on
+    the LAN or a second instance on this host). The returned value is the
+    responder's packet source IP (``addr[0]``) -- its real network identity,
+    which is more reliable than the advertised ``ws_url``.
+
+    A bind-and-catch check would only catch a same-host second instance; the
+    cross-machine duplicate this guards against is only observable by putting a
+    packet on the wire.
+
+    Best-effort: two servers starting at the same instant may both probe before
+    either responder is listening and miss each other. Never raises -- any socket
+    failure returns ``None`` so a probe problem cannot block startup.
+    """
+    deadline = time.monotonic() + timeout
+    sock: socket.socket | None = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(DISCOVERY_REQUEST, ("<broadcast>", DISCOVERY_PORT))
+        # Keep reading until the deadline so a stray unrelated packet on the port
+        # does not mask a real server's reply. The per-recv timeout shrinks toward
+        # the deadline, bounding total probe time to ``timeout``.
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            sock.settimeout(remaining)
+            data, addr = sock.recvfrom(1024)
+            try:
+                payload = json.loads(data.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue  # not a STYLY-MDM reply; keep listening until the deadline
+            if isinstance(payload, dict) and payload.get("service") == "stylymdm":
+                return addr[0]
+    except socket.timeout:
+        return None
+    except OSError as exc:
+        log.debug("Discovery probe skipped: %s", exc)
+        return None
+    finally:
+        if sock is not None:
+            sock.close()
+
+
 # ---------------------------------------------------------------------------
 # Application setup
 # ---------------------------------------------------------------------------
@@ -1220,6 +1270,24 @@ def main():
     args = parser.parse_args()
     if args.data_dir is not None:
         _apply_data_dir(args.data_dir)
+
+    # Refuse to start if another STYLY-MDM server is already answering discovery
+    # requests on this LAN's discovery port. Clients take the first responder, so
+    # two servers on the same port would split devices between them
+    # nondeterministically. Run a dev server alongside production by giving it a
+    # different MDM_DISCOVERY_PORT instead.
+    existing_ip = probe_existing_server()
+    if existing_ip is not None:
+        log.error(
+            "Another STYLY-MDM server is already running on this network and "
+            "responding on discovery port %d (from %s). Refusing to start so "
+            "devices cannot connect to the wrong server. Stop the other server, "
+            "or set MDM_DISCOVERY_PORT to a different value to run alongside it.",
+            DISCOVERY_PORT,
+            existing_ip,
+        )
+        raise SystemExit(1)
+
     asyncio.run(run_server(port=args.port))
 
 

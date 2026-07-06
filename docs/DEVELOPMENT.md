@@ -213,6 +213,27 @@ The client waits up to 3 seconds for a response. If no server replies, discovery
 > port 7081 (discovery) and 7080 (WebSocket) instead — see
 > [Running a Dev Environment Alongside Production](#running-a-dev-environment-alongside-production).
 
+### Startup duplicate-server guard
+
+Because the client takes the **first** discovery response it receives, two
+servers sharing a discovery port on the same LAN would split devices between
+them nondeterministically. To prevent this, the server probes for an existing
+server before it starts: on startup it broadcasts one `STYLYMDM_DISCOVER` and
+waits ~1 s. If another STYLY-MDM server answers, the server logs an error naming
+the responder's IP and the discovery port, then exits with a non-zero status:
+
+```
+[ERROR] Another STYLY-MDM server is already running on this network and
+responding on discovery port 7071 (from 192.168.1.42). Refusing to start so
+devices cannot connect to the wrong server. Stop the other server, or set
+MDM_DISCOVERY_PORT to a different value to run alongside it.
+```
+
+Running a dev server alongside production is unaffected: it probes its own
+discovery port (7081), does not see production on 7071, and starts normally. The
+probe is best-effort — two servers started at the same instant may both probe
+before either is answering and miss each other.
+
 ## MDM Client Permissions
 
 The MDM client requires the following Android permissions:
