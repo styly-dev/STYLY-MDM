@@ -169,6 +169,7 @@ STYLY-MDM/
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
 | `DOWNLOAD_COMPLETE` | Sent right after the APK download finishes (before the local install). Frees the server's transfer slot so the next queued device can start downloading. Fields: `apk_filename`. Optional — see the install-throttling note below. |
+| `PUSH_FILES_RESULT` | Result of a file/folder sync. Fields: `status` (`success`/`fail`), `dest_path`, `added`, `updated`, `deleted` (counts), `error` (optional) |
 
 ### Server → Device
 
@@ -176,6 +177,7 @@ STYLY-MDM/
 |---|---|
 | `EXECUTE_LAUNCH` | Launch an app. Fields: `package_name`, `extra` |
 | `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename` |
+| `EXECUTE_PUSH_FILES` | Download a bundle and full-mirror it into a directory. Fields: `bundle_url`, `bundle_filename`, `dest_path` |
 
 ### Admin → Server
 
@@ -183,6 +185,7 @@ STYLY-MDM/
 |---|---|
 | `LAUNCH_APP` | Launch an app on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `package_name`, `extra_data` |
 | `INSTALL_APK` | Install an uploaded APK on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `apk_url`, `apk_filename` |
+| `PUSH_FILES` | Full-mirror a bundle into a directory on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `bundle_url`, `bundle_filename`, `dest_path` |
 | `GET_DEVICE_LIST` | Request the current device list |
 | `CREATE_GROUP` | Create a new, empty device group. Fields: `name` |
 | `RENAME_GROUP` | Rename a group, preserving its members. Fields: `name`, `new_name` |
@@ -196,6 +199,8 @@ STYLY-MDM/
 |---|---|
 | `POST /api/apks` | Multipart upload with field `apk`. Returns `apk_url`, `apk_filename`, and `size`. |
 | `GET /apks/{filename}` | Serves uploaded APK files to devices on the LAN. |
+| `POST /api/bundles` | Multipart upload with repeated field `files`; each part's filename carries its folder-relative path. The server zips the reconstructed tree into a bundle. Returns `bundle_url`, `bundle_filename`, `size`, and `entry_count`. |
+| `GET /bundles/{filename}` | Serves generated file/folder bundles (zip) to devices on the LAN. |
 
 ### Server → Admin
 
@@ -206,6 +211,8 @@ STYLY-MDM/
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
 | `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |
 | `INSTALL_DEVICE_STATE` | Per-device companion to `INSTALL_PROGRESS`: names the devices that just entered a state, so the console can label each row instead of showing the whole target set as installing. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `installing` / `fail`), `apk_filename`, `detail` (failure reason, may be empty) |
+| `PUSH_FILES_SENT` | Confirmation that push-files commands were dispatched. Fields: `bundle_filename`, `dest_path`, `sent_count`, `target_count` |
+| `PUSH_FILES_RESULT` | Forwarded file/folder sync result from a device (adds `device_id`) |
 | `LAUNCH_RESULT` | Forwarded result from a device |
 | `INSTALL_RESULT` | Forwarded install result from a device |
 | `GROUP_LIST` | Current device groups. Fields: `groups` (object mapping group name → array of member serials). The console derives each device's group membership from this; sent on connect and after any group change. |
@@ -280,6 +287,28 @@ STYLY-MDM/
 > so a `DOWNLOAD_COMPLETE` arriving after a transfer already timed out cannot
 > resurrect `installing` on a device the job has written off.
 
+> **Push files (file/folder sync).** The console uploads a file or a whole folder
+> to `POST /api/bundles`; the server reconstructs the tree and zips it into a
+> single bundle served from `/bundles/`. `PUSH_FILES` carries the bundle URL and a
+> destination directory; the client downloads the bundle, unzips it (with a
+> zip-slip guard), and **full-mirrors** it into the destination — new files are
+> created, changed files overwritten, and anything at the destination *not* in the
+> bundle is deleted (including now-empty directories), so the destination ends up
+> identical to the bundle (`rsync --delete` semantics). Each device reports
+> `PUSH_FILES_RESULT` with `added`/`updated`/`deleted` counts.
+>
+> Because full-mirror sync deletes, and because the PICO ToBService exposes **no
+> privileged file-copy API**, two constraints apply and are enforced on both the
+> server (syntactic) and the client (canonical): the destination must live under
+> **shared/primary external storage** (`/sdcard` · `/storage/emulated/0`) — the
+> client can only reach shared storage with `java.io.File` I/O, so app-scoped
+> `Android/data/<pkg>/` directories are *not* targetable — and it must be neither
+> the storage root nor a protected top-level directory (`Android`, `Download(s)`,
+> `DCIM`, `Pictures`, `Movies`, `Music`, `Documents`, `Alarms`, `Notifications`,
+> `Podcasts`, `Ringtones`) so a mistyped path cannot wipe unrelated user/media
+> data. The console additionally requires an explicit "extras will be deleted"
+> confirmation before dispatch.
+
 ## Server Discovery Protocol
 
 STYLY-MDM supports automatic server discovery via UDP broadcast on the LAN.
@@ -327,7 +356,7 @@ The MDM client requires the following Android permissions:
 | `RECEIVE_BOOT_COMPLETED` | Auto-start on device boot |
 | `ACCESS_NETWORK_STATE` | Monitor network connectivity |
 | `ACCESS_WIFI_STATE` | Retrieve the device IP address |
-| `MANAGE_EXTERNAL_STORAGE` | Write downloaded APKs to shared storage so the PICO ToBService can read them for silent install |
+| `MANAGE_EXTERNAL_STORAGE` | Write downloaded APKs to shared storage so the PICO ToBService can read them for silent install, and read/write shared-storage directories for file/folder push (sync) |
 
 Battery percentage and charging state are read with Android's standard battery
 status APIs (`ACTION_BATTERY_CHANGED` / `BatteryManager`), which do not require

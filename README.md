@@ -17,6 +17,7 @@ STYLY-MDM currently supports PICO devices (PICO OS with Business Mode). Support 
 - **Boot persistence** — the MDM client starts automatically on HMD boot via `BOOT_COMPLETED` and PICO auto-boot intents
 - **Activity log** — every launch command and result is shown in the web console with timestamps
 - **APK deployment** — upload an APK from the web console and install it silently on selected online devices
+- **File/folder push (sync)** — upload a file or an entire folder and mirror it into a directory on selected devices; the destination is synced to match (new files added, changed files overwritten, extras removed). Destinations are limited to shared storage (`/sdcard`)
 - **Auto-terminate on switch** — the current foreground app is force-stopped before launching a new one, preventing resource conflicts
 - **Server discovery** — devices can automatically find the MDM server on the LAN via UDP broadcast (port 7071), eliminating manual URL entry
 - **IP address display** — the server logs its LAN IP addresses on startup so you know exactly where to connect

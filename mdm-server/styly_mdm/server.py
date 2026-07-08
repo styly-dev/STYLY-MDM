@@ -11,9 +11,13 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
+import tempfile
 import time
+import zipfile
 from pathlib import Path
+from urllib.parse import unquote
 from aiohttp import web
 
 logging.basicConfig(
@@ -48,6 +52,14 @@ MAX_CONCURRENT_TRANSFERS = max(1, int(os.environ.get("MDM_MAX_CONCURRENT_TRANSFE
 # recovers stuck slots sooner at the risk of releasing a slow-but-healthy transfer
 # early, which only relaxes throttling and never drops the install itself.
 TRANSFER_TIMEOUT = float(os.environ.get("MDM_TRANSFER_TIMEOUT", "600"))
+
+# Generated file/folder bundles (for the push-files sync feature) live alongside the APKs.
+# The console uploads a file or folder; the server zips it into BUNDLE_DIR and serves it to
+# devices, which mirror it into a destination directory. Kept separate from APK_DIR so the
+# APK workflow is untouched.
+BUNDLE_DIR = DATA_DIR / "bundles"
+MAX_BUNDLE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB (total uploaded bytes before zipping)
+MAX_BUNDLE_ENTRIES = 5000  # cap files per bundle to bound tree reconstruction
 
 # Persistent per-device registry: serial -> {label, model, ip, last_seen, startup_app, battery}
 REGISTRY_PATH = DATA_DIR / "device_registry.json"
@@ -411,6 +423,145 @@ def unique_apk_path(filename: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# File/folder bundle helpers (push-files sync)
+# ---------------------------------------------------------------------------
+
+# Primary/shared external storage mount points on Android. Push-files destinations must live
+# under one of these: the PICO ToBService exposes no privileged file-copy API, so the client
+# can only reach shared storage with plain java.io.File I/O (app-scoped Android/data/<pkg>/
+# is unreadable across UIDs — the same wall the APK download documents).
+SHARED_STORAGE_PREFIXES = ("/sdcard/", "/storage/emulated/0/")
+
+# Well-known top-level directories under shared storage that full-mirror sync must never
+# target: mirroring into them would delete unrelated user/media/app data on every selected
+# device. Matched case-insensitively against the first segment below the storage root.
+PROTECTED_TOPLEVEL_DIRS = frozenset({
+    "android", "download", "downloads", "dcim", "pictures", "movies", "music",
+    "documents", "alarms", "notifications", "podcasts", "ringtones",
+})
+
+
+def sanitize_relpath(raw: str | None) -> str | None:
+    """Return a safe forward-slash relative path for a bundle entry, or None if invalid.
+
+    Rejects absolute paths, parent traversal (``..``) and NUL; drops empty/``.`` segments and
+    normalizes backslashes. Used to reconstruct an uploaded folder tree under a temp root
+    without any entry escaping it.
+    """
+    if not raw:
+        return None
+    text = raw.replace("\\", "/")
+    if "\x00" in text:
+        return None
+    parts: list[str] = []
+    for seg in text.split("/"):
+        seg = seg.strip()
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            return None
+        parts.append(seg)
+    if not parts:
+        return None
+    return "/".join(parts)
+
+
+def validate_dest_path(dest: str | None) -> str | None:
+    """Return an error message if a device destination path is unsafe, else None.
+
+    Full-mirror sync deletes anything at the destination not in the bundle, so a wrong path
+    would wipe unrelated data on every selected device. The path must be an absolute
+    shared-storage path, contain no ``..``, and be neither the storage root nor a protected
+    top-level directory. This is a first-line syntactic guard; the client re-validates
+    against the real canonical filesystem before applying.
+    """
+    if not isinstance(dest, str) or not dest.strip():
+        return "Destination path is required"
+    text = dest.strip()
+    if "\x00" in text:
+        return "Destination path contains an invalid character"
+    if not text.startswith("/"):
+        return "Destination must be an absolute path"
+    # Reject on the raw path (matching the client) so a '..' that would normalize away here
+    # can't be accepted by the server yet rejected by the client's stricter raw check.
+    if ".." in text.split("/"):
+        return "Destination path must not contain '..'"
+    with_slash = os.path.normpath(text).rstrip("/") + "/"
+    prefix = next((p for p in SHARED_STORAGE_PREFIXES if with_slash.startswith(p)), None)
+    if prefix is None:
+        return "Destination must be under shared storage (/sdcard or /storage/emulated/0)"
+    remainder = with_slash[len(prefix):].strip("/")
+    if not remainder:
+        return "Destination must be a subdirectory, not the shared-storage root"
+    first_segment = remainder.split("/")[0]
+    if first_segment.lower() in PROTECTED_TOPLEVEL_DIRS:
+        return f"Destination must not be inside the protected '{first_segment}' directory"
+    return None
+
+
+def unique_bundle_path(filename: str) -> Path:
+    """Build a unique destination path in BUNDLE_DIR for a generated bundle zip."""
+    destination = BUNDLE_DIR / filename
+    if not destination.exists():
+        return destination
+
+    stem = destination.stem
+    suffix = destination.suffix
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    candidate = BUNDLE_DIR / f"{stem}-{timestamp}{suffix}"
+    counter = 2
+    while candidate.exists():
+        candidate = BUNDLE_DIR / f"{stem}-{timestamp}-{counter}{suffix}"
+        counter += 1
+    return candidate
+
+
+def bundle_basename(relpaths: list[str]) -> str:
+    """Derive a safe base name (no extension) for the bundle zip from its entries.
+
+    A single file → its stem; a folder tree sharing one top-level directory → that directory
+    name; otherwise → ``bundle``.
+    """
+    if not relpaths:
+        return "bundle"
+    if len(relpaths) == 1 and "/" not in relpaths[0]:
+        raw = Path(relpaths[0]).stem or "bundle"
+    else:
+        first_segments = {p.split("/")[0] for p in relpaths}
+        raw = next(iter(first_segments)) if len(first_segments) == 1 else "bundle"
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw).strip("._-")
+    return safe or "bundle"
+
+
+def strip_common_root(relpaths: list[str]) -> tuple[str | None, list[str]]:
+    """If every entry is nested under one shared top-level directory, return
+    ``(root_name, paths_without_root)``; otherwise ``(None, relpaths)``.
+
+    A folder pick (``webkitdirectory``) yields paths all prefixed with the picked
+    folder's name (``myfolder/a.txt``, ``myfolder/sub/b.txt``). The destination should
+    mirror that folder's *contents* (``a.txt``, ``sub/b.txt``) — "identical to the pushed
+    folder" — so the shared root is stripped from the archived paths and reused as the
+    bundle name. Single-file or multi-file picks (a bare filename among the entries) have
+    no shared directory root and are returned unchanged.
+    """
+    if not relpaths or any("/" not in p for p in relpaths):
+        return None, relpaths
+    roots = {p.split("/", 1)[0] for p in relpaths}
+    if len(roots) != 1:
+        return None, relpaths
+    root = next(iter(roots))
+    return root, [p.split("/", 1)[1] for p in relpaths]
+
+
+def zip_tree(root: Path, dest_zip: Path) -> None:
+    """Zip every file under ``root`` into ``dest_zip`` using forward-slash relative names."""
+    with zipfile.ZipFile(dest_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                zf.write(path, path.relative_to(root).as_posix())
+
+
+# ---------------------------------------------------------------------------
 # Device WebSocket handler  (/ws/device)
 # ---------------------------------------------------------------------------
 
@@ -516,7 +667,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     else:
                         log.warning("DOWNLOAD_COMPLETE before REGISTER")
 
-                elif msg_type in {"LAUNCH_RESULT", "INSTALL_RESULT"}:
+                elif msg_type in {"LAUNCH_RESULT", "INSTALL_RESULT", "PUSH_FILES_RESULT"}:
                     if device_id:
                         data.setdefault("device_id", device_id)
                     # Fallback transfer-slot release: an older client that never
@@ -590,6 +741,9 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 elif msg_type == "INSTALL_APK":
                     await handle_install_apk(ws, data)
+
+                elif msg_type == "PUSH_FILES":
+                    await handle_push_files(ws, data)
 
                 elif msg_type == "SET_STARTUP_APP":
                     await handle_set_startup_app(ws, data)
@@ -1137,6 +1291,71 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
     )
 
 
+async def handle_push_files(admin_ws: web.WebSocketResponse, data: dict):
+    """Process a PUSH_FILES command: validate then fan out EXECUTE_PUSH_FILES to target HMDs.
+
+    The destination is validated here as a first-line guard (full-mirror sync deletes extras,
+    so a bad path is destructive); the client re-validates against its real filesystem before
+    applying.
+    """
+    target_devices: list[str] = data.get("target_devices", [])
+    bundle_url: str = data.get("bundle_url", "")
+    bundle_filename: str = data.get("bundle_filename", "")
+    dest_path: str = (data.get("dest_path") or "").strip()
+
+    if not bundle_url:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "bundle_url is required",
+        }))
+        return
+
+    dest_error = validate_dest_path(dest_path)
+    if dest_error is not None:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": dest_error,
+        }))
+        return
+
+    target_ids = resolve_target_ids(target_devices)
+
+    if not target_ids:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "No matching online devices found",
+        }))
+        return
+
+    execute_msg = json.dumps({
+        "type": "EXECUTE_PUSH_FILES",
+        "bundle_url": bundle_url,
+        "bundle_filename": bundle_filename,
+        "dest_path": dest_path,
+    })
+
+    sent_count = 0
+    for did in target_ids:
+        entry = devices.get(did)
+        if entry:
+            try:
+                await entry["ws"].send_str(execute_msg)
+                sent_count += 1
+            except ConnectionResetError:
+                log.warning("Failed to send EXECUTE_PUSH_FILES to %s (disconnected)", did)
+
+    log.info("PUSH_FILES: sent %s -> %s to %d/%d devices",
+             bundle_filename or bundle_url, dest_path, sent_count, len(target_ids))
+
+    await admin_ws.send_str(json.dumps({
+        "type": "PUSH_FILES_SENT",
+        "bundle_filename": bundle_filename,
+        "dest_path": dest_path,
+        "sent_count": sent_count,
+        "target_count": len(target_ids),
+    }))
+
+
 # ---------------------------------------------------------------------------
 # APK upload handler
 # ---------------------------------------------------------------------------
@@ -1188,6 +1407,106 @@ async def upload_apk_handler(request: web.Request) -> web.Response:
         "apk_url": apk_url,
         "size": size,
     })
+
+
+# ---------------------------------------------------------------------------
+# File/folder bundle upload handler
+# ---------------------------------------------------------------------------
+
+async def upload_bundle_handler(request: web.Request) -> web.Response:
+    """Accept a file/folder upload, zip it into a bundle, and return its download URL.
+
+    Each multipart part is one file whose *filename* carries its (possibly nested) relative
+    path, so a whole folder tree can be uploaded with its structure preserved (the console
+    sends ``file.webkitRelativePath``). Parts are reconstructed under a temp directory with
+    per-path sanitization, then zipped; the temp tree is discarded and only the zip is kept.
+    """
+    try:
+        reader = await request.multipart()
+    except Exception as e:
+        return web.json_response({"error": f"Invalid multipart request: {e}"}, status=400)
+
+    BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="upload-", dir=BUNDLE_DIR))
+    total_size = 0
+    relpaths: list[str] = []
+
+    try:
+        while True:
+            field = await reader.next()
+            if field is None:
+                break
+            if field.name != "files":
+                continue
+
+            # Browsers send the folder-relative path as the multipart filename; some
+            # multipart encoders percent-encode the path separators, so decode before
+            # sanitizing (sanitize_relpath still rejects any traversal after decoding).
+            raw_name = field.filename
+            relpath = sanitize_relpath(unquote(raw_name) if raw_name else None)
+            if relpath is None:
+                return web.json_response(
+                    {"error": f"Invalid file path in upload: {field.filename!r}"}, status=400)
+
+            if len(relpaths) >= MAX_BUNDLE_ENTRIES:
+                return web.json_response(
+                    {"error": f"Bundle exceeds the {MAX_BUNDLE_ENTRIES}-file limit"}, status=413)
+
+            target = staging / relpath
+            # Defense in depth: a sanitized relpath cannot escape, but confirm the join stays
+            # under the staging root before writing.
+            if not _is_within(staging, target):
+                return web.json_response({"error": "Invalid file path in upload"}, status=400)
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("wb") as f:
+                while True:
+                    chunk = await field.read_chunk(size=1024 * 1024)
+                    if not chunk:
+                        break
+                    total_size += len(chunk)
+                    if total_size > MAX_BUNDLE_SIZE:
+                        return web.json_response({"error": "Bundle exceeds 2 GiB limit"}, status=413)
+                    f.write(chunk)
+            relpaths.append(relpath)
+
+        if not relpaths:
+            return web.json_response({"error": "multipart field 'files' is required"}, status=400)
+
+        # A folder pick nests every file under the picked folder; mirror that folder's
+        # *contents* into the destination, so zip from the shared root (and name the
+        # bundle after it) rather than wrapping the destination in an extra directory.
+        root, _stripped = strip_common_root(relpaths)
+        content_root = staging / root if root is not None else staging
+        base = bundle_basename([root]) if root is not None else bundle_basename(relpaths)
+        bundle_path = unique_bundle_path(f"{base}.zip")
+        zip_tree(content_root, bundle_path)
+    except Exception as e:
+        log.exception("Failed to build uploaded bundle")
+        return web.json_response({"error": f"Failed to build bundle: {e}"}, status=500)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    size = bundle_path.stat().st_size
+    bundle_url = f"{request.scheme}://{request.host}/bundles/{bundle_path.name}"
+    log.info("Built bundle: %s (%d entries, %d bytes zipped)",
+             bundle_path.name, len(relpaths), size)
+
+    return web.json_response({
+        "bundle_filename": bundle_path.name,
+        "bundle_url": bundle_url,
+        "size": size,
+        "entry_count": len(relpaths),
+    })
+
+
+def _is_within(root: Path, target: Path) -> bool:
+    """Return True if ``target`` resolves to a path inside ``root``."""
+    try:
+        target.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 async def handle_set_startup_app(admin_ws: web.WebSocketResponse, data: dict):
@@ -1395,12 +1714,14 @@ def create_app() -> web.Application:
     # Ensure the writable data directory exists before loading/saving the registry.
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     load_registry()
-    app = web.Application(client_max_size=MAX_APK_SIZE + 10 * 1024 * 1024)
+    app = web.Application(
+        client_max_size=max(MAX_APK_SIZE, MAX_BUNDLE_SIZE) + 10 * 1024 * 1024)
 
     # WebSocket endpoints
     app.router.add_get("/ws/device", device_ws_handler)
     app.router.add_get("/ws/admin", admin_ws_handler)
     app.router.add_post("/api/apks", upload_apk_handler)
+    app.router.add_post("/api/bundles", upload_bundle_handler)
 
     # Static files are shipped inside the package (styly_mdm/static/), so this
     # resolves both from source and when installed. It is read-only package data
@@ -1416,6 +1737,9 @@ def create_app() -> web.Application:
 
     APK_DIR.mkdir(parents=True, exist_ok=True)
     app.router.add_static("/apks", APK_DIR)
+
+    BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
+    app.router.add_static("/bundles", BUNDLE_DIR)
 
     return app
 
@@ -1440,9 +1764,10 @@ def _apply_data_dir(path: str) -> None:
     Called from main() when --data-dir is passed. Reassigns the module globals so
     create_app() and the upload/registry handlers pick up the new location.
     """
-    global DATA_DIR, APK_DIR, REGISTRY_PATH
+    global DATA_DIR, APK_DIR, BUNDLE_DIR, REGISTRY_PATH
     DATA_DIR = Path(path).resolve()
     APK_DIR = DATA_DIR / "apks"
+    BUNDLE_DIR = DATA_DIR / "bundles"
     REGISTRY_PATH = DATA_DIR / "device_registry.json"
 
 
