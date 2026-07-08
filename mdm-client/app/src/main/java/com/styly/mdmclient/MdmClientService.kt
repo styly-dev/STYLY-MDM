@@ -176,6 +176,10 @@ class MdmClientService : Service() {
             Log.i(TAG, "Downloading APK: $apkUrl")
             try {
                 val downloadedApk = downloadApk(apkUrl, apkFilename)
+                // Tell the server the network-heavy download is done so it can free
+                // this device's transfer slot and dispatch the next queued device,
+                // while the local (offline) install proceeds below.
+                sendDownloadComplete(apkFilename.ifEmpty { downloadedApk.name })
                 installApk(downloadedApk, apkFilename.ifEmpty { downloadedApk.name })
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to install APK from $apkUrl", e)
@@ -376,6 +380,14 @@ class MdmClientService : Service() {
             }
         }
         webSocketManager.sendMessage(result)
+    }
+
+    private fun sendDownloadComplete(apkFilename: String) {
+        val msg = JSONObject().apply {
+            put("type", "DOWNLOAD_COMPLETE")
+            put("apk_filename", apkFilename)
+        }
+        webSocketManager.sendMessage(msg)
     }
 
     private fun sendInstallResult(

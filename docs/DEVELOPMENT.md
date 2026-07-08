@@ -168,6 +168,7 @@ STYLY-MDM/
 | `BATTERY_UPDATE` | Battery telemetry. Fields: `device_id`, `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds) |
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
+| `DOWNLOAD_COMPLETE` | Sent right after the APK download finishes (before the local install). Frees the server's transfer slot so the next queued device can start downloading. Fields: `apk_filename`. Optional — see the install-throttling note below. |
 
 ### Server → Device
 
@@ -202,7 +203,8 @@ STYLY-MDM/
 |---|---|
 | `DEVICE_LIST` | Current list of connected devices. Fields: `devices` (array; each device may include optional `battery`: `{level, charging, last_seen}`) |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
-| `INSTALL_SENT` | Confirmation that install commands were dispatched. Fields: `apk_filename`, `apk_url`, `sent_count`, `target_count` |
+| `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
+| `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |
 | `LAUNCH_RESULT` | Forwarded result from a device |
 | `INSTALL_RESULT` | Forwarded install result from a device |
 | `GROUP_LIST` | Current device groups. Fields: `groups` (object mapping group name → array of member serials). The console derives each device's group membership from this; sent on connect and after any group change. |
@@ -224,6 +226,32 @@ STYLY-MDM/
 > then every 5 minutes while the foreground service is running. The server stores
 > the latest battery state in `device_registry.json`, so offline devices retain
 > their last-known battery percentage and charging state.
+
+> **Install transfer throttling.** An `INSTALL_APK` targeting a large group would
+> otherwise make every device pull the APK from the server at the same instant (an
+> APK can be up to 2 GiB), spiking LAN/server bandwidth. Instead the server gates
+> the `EXECUTE_INSTALL` fan-out so at most **N** transfers are in flight per job
+> (`MDM_MAX_CONCURRENT_TRANSFERS` env var / `--max-concurrent-transfers` flag,
+> default **5**). Remaining targets are queued; each slot frees as soon as its
+> device signals the download finished, and the next queued device is dispatched.
+> Slot-release triggers, in order of preference:
+>
+> 1. `DOWNLOAD_COMPLETE` from the client (primary — releases the moment the
+>    network-heavy download ends, so the local install proceeds off the critical
+>    path).
+> 2. `INSTALL_RESULT` (fallback — covers older clients that never emit
+>    `DOWNLOAD_COMPLETE`, and clients whose download failed outright).
+> 3. Device disconnect (frees the slot immediately).
+> 4. A per-device timeout (`MDM_TRANSFER_TIMEOUT` seconds, default **600**) so a
+>    silent/stuck device cannot block the queue. Lowering it recovers stuck slots
+>    sooner but risks releasing a slow-but-healthy transfer early, which only
+>    relaxes throttling and never drops the install itself.
+>
+> This is fully backward compatible: an older client that ignores the new signal
+> still frees its slot via `INSTALL_RESULT` or the timeout, and an older server
+> that predates the feature simply logs `DOWNLOAD_COMPLETE` as an unknown message.
+> Admins see aggregate progress via `INSTALL_PROGRESS` (queued / transferring /
+> transferred / failed counts).
 
 ## Server Discovery Protocol
 

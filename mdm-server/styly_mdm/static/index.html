@@ -529,7 +529,8 @@
             break;
           }
           case 'LAUNCH_SENT': addLog('Launch command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
-          case 'INSTALL_SENT': addLog('Install command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'INSTALL_SENT': addLog('Install job queued for ' + msg.target_count + ' device(s)' + (msg.max_concurrent ? ' (max ' + msg.max_concurrent + ' concurrent transfer(s))' : ''), 'info'); break;
+          case 'INSTALL_PROGRESS': showInstallProgress(msg); break;
           case 'INSTALL_RESULT': {
             const st = msg.status === 'success' ? 'success' : 'fail';
             const detail = msg.error || msg.message || '';
@@ -946,7 +947,7 @@
       }
 
       // ---------------- Log ----------------
-      function addLog(message, type) {
+      function makeLogEntry(message, type) {
         logEmpty.style.display = 'none';
         const entry = document.createElement('div'); entry.className = 'log-entry';
         const time = document.createElement('span'); time.className = 'log-time'; time.textContent = new Date().toLocaleTimeString();
@@ -954,6 +955,31 @@
         entry.appendChild(time); entry.appendChild(msg);
         logContainer.appendChild(entry);
         logContainer.scrollTop = logContainer.scrollHeight;
+        return { entry: entry, time: time, msg: msg };
+      }
+
+      function addLog(message, type) { makeLogEntry(message, type); }
+
+      // Throttled APK-install progress: the server broadcasts INSTALL_PROGRESS on
+      // every transfer-slot transition, so instead of one log line per event we
+      // keep a single entry per job and update it in place until it is done.
+      let installProgress = null; // { filename, nodes }
+      function showInstallProgress(msg) {
+        const label = msg.apk_filename || 'APK';
+        const body = 'Install ' + label + ': ' + (msg.transferred || 0) + ' done, ' +
+          (msg.transferring || 0) + ' transferring, ' + (msg.queued || 0) + ' queued' +
+          (msg.failed ? ', ' + msg.failed + ' failed/timed out' : '') +
+          ' (of ' + (msg.total || 0) + ')' + (msg.done ? ' — done' : '');
+        const type = msg.done ? (msg.failed ? 'warn' : 'success') : 'info';
+        if (installProgress && installProgress.filename === label && installProgress.nodes.entry.isConnected) {
+          installProgress.nodes.msg.textContent = body;
+          installProgress.nodes.msg.className = 'log-msg ' + type;
+          installProgress.nodes.time.textContent = new Date().toLocaleTimeString();
+          logContainer.scrollTop = logContainer.scrollHeight;
+        } else {
+          installProgress = { filename: label, nodes: makeLogEntry(body, type) };
+        }
+        if (msg.done) installProgress = null;
       }
 
       // ---------------- Formatting ----------------
