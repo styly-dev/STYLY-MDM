@@ -104,6 +104,31 @@ The ports come from `BuildConfig` fields defined per flavor in
 > build (e.g. debug over a release install) must be uninstalled first, which clears
 > device-owner status, so you would need to re-provision.
 
+### Seeding dummy devices for UI testing
+
+`mdm-server/scripts/seed_dummy_devices.py` populates a **running** server with fake
+devices, so you can exercise console UI that only matters at scale (e.g. the Manage
+Groups device list scrolling). It is a dev-only helper and is not shipped in the wheel.
+
+It registers through the live `/ws/device` WebSocket rather than editing
+`device_registry.json`, because a running server owns that file: any register/battery/
+group change triggers `save_registry()`, which rewrites the file from in-memory state
+and would clobber a hand-edit. Going through the socket makes the server itself persist
+the dummies.
+
+```bash
+cd mdm-server
+python scripts/seed_dummy_devices.py 20            # add 20 offline dummy devices
+python scripts/seed_dummy_devices.py 20 --online   # keep them connected (online) until Ctrl-C
+python scripts/seed_dummy_devices.py --remove      # forget every dummy this tool created
+```
+
+The port is found by UDP discovery (so it works against a `run.sh dev` server on
+7080/7081 as well as a default 7070/7071 one); pass `--port` to target it explicitly.
+Repeated runs continue numbering, so counts add up; dummies use the serial prefix
+`DUMMY-TEST-` (override with `--prefix`) and are removed by that prefix. Only offline
+devices can be forgotten, so stop an `--online` run before `--remove`.
+
 ## Project Structure
 
 ```
@@ -111,6 +136,8 @@ STYLY-MDM/
 ├── mdm-server/
 │   ├── pyproject.toml       # Packaging metadata (published to PyPI as styly-mdm)
 │   ├── run.sh               # Dev/prod launcher (python -m styly_mdm)
+│   ├── scripts/             # Dev-only helpers (not packaged)
+│   │   └── seed_dummy_devices.py  # Add/remove fake devices on a running server
 │   ├── styly_mdm/           # Installable package
 │   │   ├── __init__.py      # Exports create_app / main
 │   │   ├── __main__.py      # `python -m styly_mdm` entrypoint
