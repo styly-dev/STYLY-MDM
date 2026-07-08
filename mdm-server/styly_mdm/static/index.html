@@ -176,6 +176,16 @@
     .ins-none { color: var(--text-dim); }
     .spinner { display: inline-block; animation: spin 1s linear infinite; }
 
+    /* Verify (integrity check) — per-device results panel inside the Actions column */
+    .verify-hint { color: var(--text-muted); font-size: 11px; margin-top: 8px; line-height: 1.4; }
+    .verify-hint code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: var(--text-secondary); }
+    .verify-results { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+    .verify-row { display: flex; align-items: baseline; gap: 8px; font-size: 12px; padding: 3px 0; border-top: 1px solid #232a3d; }
+    .verify-row:first-child { border-top: none; }
+    .verify-dev { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; }
+    .verify-stat { margin-left: auto; text-align: right; }
+    .verify-detail { color: var(--text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
+
     /* Select boxes */
     .selbox { width: 16px; height: 16px; border-radius: 4px; border: 1.5px solid #41475f; display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; color: #fff; font-size: 11px; font-weight: 800; }
     .selbox.on, .selbox.mixed { background: var(--accent); border-color: var(--accent); }
@@ -404,6 +414,38 @@
                 </div>
               </div>
             </div>
+            <div class="cmd-divider"></div>
+            <div class="cmd-section collapsed" data-cmd="verifyApk">
+              <div class="cmd-head" data-act="toggleCmd"><span>Verify APK</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <div class="file-row">
+                  <label class="file-pick" for="verifyApkFile">Choose APK</label>
+                  <input type="file" id="verifyApkFile" accept=".apk,application/vnd.android.package-archive" hidden>
+                  <span class="file-name" id="verifyApkName">No reference APK</span>
+                </div>
+                <input type="text" class="field" id="verifyApkPkg" placeholder="com.example.app (package name)">
+                <button class="btn btn-primary" id="btnVerifyApk" disabled>Verify on Selected</button>
+                <div class="verify-hint">Reference is hashed locally in your browser — nothing is uploaded.</div>
+                <div class="verify-results" id="verifyApkResults"></div>
+              </div>
+            </div>
+            <div class="cmd-divider"></div>
+            <div class="cmd-section collapsed" data-cmd="verifyDir">
+              <div class="cmd-head" data-act="toggleCmd"><span>Verify Directory</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <input type="text" class="field" id="verifyDirPath" placeholder="/sdcard/content (device path)">
+                <div class="file-row">
+                  <label class="file-pick" for="verifyDirFolder">Choose Folder</label>
+                  <input type="file" id="verifyDirFolder" webkitdirectory directory hidden>
+                  <label class="file-pick" for="verifyDirJson">or Hash JSON</label>
+                  <input type="file" id="verifyDirJson" accept=".json,application/json" hidden>
+                  <span class="file-name" id="verifyDirRefName">No reference</span>
+                </div>
+                <button class="btn btn-primary" id="btnVerifyDir" disabled>Verify on Selected</button>
+                <div class="verify-hint">Large trees hash faster with <code>styly-mdm hash &lt;path&gt;</code> — load its JSON here. Shared storage only.</div>
+                <div class="verify-results" id="verifyDirResults"></div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -451,6 +493,12 @@
       let editingLabelId = null;
       let uploadedApk = null;
       let uploadInProgress = false;
+      // Integrity verification (issue #37). The reference is computed locally in the
+      // browser and never leaves it; only per-device results are compared here.
+      let verifyApkRef = null;         // { size, cd_sha256, filename }
+      let verifyApkState = {};         // id -> { status, detail }
+      let verifyDirRef = null;         // { tree_hash, file_count, total_size, manifest?, source }
+      let verifyDirState = {};         // id -> { status, detail }
       let reconnectTimer = null;
       const RECONNECT_DELAY = 3000;
       const LOW_BATTERY_THRESHOLD = 20;
@@ -483,6 +531,17 @@
       const startupExtra = document.getElementById('startupExtra');
       const btnStartupSet = document.getElementById('btnStartupSet');
       const btnStartupClear = document.getElementById('btnStartupClear');
+      const verifyApkFile = document.getElementById('verifyApkFile');
+      const verifyApkName = document.getElementById('verifyApkName');
+      const verifyApkPkg = document.getElementById('verifyApkPkg');
+      const btnVerifyApk = document.getElementById('btnVerifyApk');
+      const verifyApkResults = document.getElementById('verifyApkResults');
+      const verifyDirPath = document.getElementById('verifyDirPath');
+      const verifyDirFolder = document.getElementById('verifyDirFolder');
+      const verifyDirJson = document.getElementById('verifyDirJson');
+      const verifyDirRefName = document.getElementById('verifyDirRefName');
+      const btnVerifyDir = document.getElementById('btnVerifyDir');
+      const verifyDirResults = document.getElementById('verifyDirResults');
       const logContainer = document.getElementById('logContainer');
       const logEmpty = document.getElementById('logEmpty');
       const btnClearLog = document.getElementById('btnClearLog');
@@ -621,6 +680,22 @@
           case 'STARTUP_APP_RESULT': {
             const st = msg.status === 'success' ? 'success' : 'fail';
             addLog('[Startup ' + (msg.status === 'success' ? 'OK' : 'FAIL') + '] ' + (msg.package_name || '') + (msg.device_id ? ' on ' + labelFor(msg.device_id) : '') + (msg.error ? ' - ' + msg.error : ''), st);
+            break;
+          }
+          case 'VERIFY_SENT': addLog('Verify APK command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'VERIFY_APK_RESULT': {
+            const cls = verifyApkRef ? classifyApk(msg) : { status: 'error', detail: 'no local reference' };
+            if (msg.device_id) { verifyApkState[msg.device_id] = cls; renderVerifyResults(verifyApkResults, verifyApkState); }
+            const ok = cls.status === 'match';
+            addLog('[' + (ok ? 'MATCH' : 'DIFF') + '] verify ' + (msg.package_name || '-') + ' on ' + labelFor(msg.device_id) + (cls.detail ? ' - ' + cls.detail : ''), ok ? 'success' : 'fail');
+            break;
+          }
+          case 'VERIFY_DIR_SENT': addLog('Verify directory command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'VERIFY_DIR_RESULT': {
+            const cls = verifyDirRef ? classifyDir(msg) : { status: 'error', detail: 'no local reference' };
+            if (msg.device_id) { verifyDirState[msg.device_id] = cls; renderVerifyResults(verifyDirResults, verifyDirState); }
+            const ok = cls.status === 'match';
+            addLog('[' + (ok ? 'MATCH' : 'DIFF') + '] verify dir ' + (msg.path || '-') + ' on ' + labelFor(msg.device_id) + (cls.detail ? ' - ' + cls.detail : ''), ok ? 'success' : 'fail');
             break;
           }
           case 'ERROR': addLog('[ERROR] ' + (msg.message || 'Unknown error'), 'fail'); break;
@@ -824,6 +899,8 @@
         btnStartupClear.disabled = !has;
         pushPanel.refreshButton(has);
         syncPanel.refreshButton(has);
+        btnVerifyApk.disabled = !verifyApkRef || verifyApkPkg.value.trim() === '' || !has;
+        btnVerifyDir.disabled = !verifyDirRef || verifyDirPath.value.trim() === '' || !has;
       }
 
       // ---------------- Selection actions ----------------
@@ -1213,6 +1290,250 @@
         return v.toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
       }
 
+      // ---------------- Integrity verification (issue #37) ----------------
+      // Pure-JS SHA-256 (the console is served over plain http://<LAN-IP>, a non-secure
+      // context, so crypto.subtle is unavailable). This implementation + the ZIP/tree
+      // algorithms below are byte-for-byte identical to the Python (styly-mdm hash) and
+      // Kotlin (device) implementations — verified with a cross-language harness.
+      const SHA256_K = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+      ];
+      function Sha256() {
+        this.h = new Int32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+        this.buf = new Uint8Array(64); this.bufLen = 0; this.total = 0; this.w = new Int32Array(64);
+      }
+      Sha256.prototype._compress = function (block, offset) {
+        const w = this.w; let i;
+        for (i = 0; i < 16; i++) {
+          w[i] = (block[offset + i * 4] << 24) | (block[offset + i * 4 + 1] << 16) | (block[offset + i * 4 + 2] << 8) | (block[offset + i * 4 + 3]);
+        }
+        for (i = 16; i < 64; i++) {
+          const x = w[i - 15], s0 = ((x >>> 7) | (x << 25)) ^ ((x >>> 18) | (x << 14)) ^ (x >>> 3);
+          const y = w[i - 2], s1 = ((y >>> 17) | (y << 15)) ^ ((y >>> 19) | (y << 13)) ^ (y >>> 10);
+          w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+        }
+        let a = this.h[0], b = this.h[1], c = this.h[2], d = this.h[3], e = this.h[4], f = this.h[5], g = this.h[6], hh = this.h[7];
+        for (i = 0; i < 64; i++) {
+          const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+          const ch = (e & f) ^ (~e & g);
+          const t1 = (hh + S1 + ch + SHA256_K[i] + w[i]) | 0;
+          const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+          const maj = (a & b) ^ (a & c) ^ (b & c);
+          const t2 = (S0 + maj) | 0;
+          hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+        }
+        this.h[0] = (this.h[0] + a) | 0; this.h[1] = (this.h[1] + b) | 0; this.h[2] = (this.h[2] + c) | 0; this.h[3] = (this.h[3] + d) | 0;
+        this.h[4] = (this.h[4] + e) | 0; this.h[5] = (this.h[5] + f) | 0; this.h[6] = (this.h[6] + g) | 0; this.h[7] = (this.h[7] + hh) | 0;
+      };
+      Sha256.prototype.update = function (data) {
+        this.total += data.length; let offset = 0; const len = data.length;
+        if (this.bufLen > 0) {
+          while (offset < len && this.bufLen < 64) { this.buf[this.bufLen++] = data[offset++]; }
+          if (this.bufLen === 64) { this._compress(this.buf, 0); this.bufLen = 0; }
+        }
+        while (len - offset >= 64) { this._compress(data, offset); offset += 64; }
+        while (offset < len) { this.buf[this.bufLen++] = data[offset++]; }
+        return this;
+      };
+      Sha256.prototype.hex = function () {
+        const bitLenHi = Math.floor(this.total / 0x20000000), bitLenLo = (this.total * 8) >>> 0;
+        const pad = [0x80];
+        const restLen = (this.bufLen + 1) % 64, padZeros = (restLen <= 56) ? (56 - restLen) : (120 - restLen);
+        for (let i = 0; i < padZeros; i++) pad.push(0x00);
+        pad.push((bitLenHi >>> 24) & 0xff, (bitLenHi >>> 16) & 0xff, (bitLenHi >>> 8) & 0xff, bitLenHi & 0xff);
+        pad.push((bitLenLo >>> 24) & 0xff, (bitLenLo >>> 16) & 0xff, (bitLenLo >>> 8) & 0xff, bitLenLo & 0xff);
+        this.update(new Uint8Array(pad));
+        let out = '';
+        for (let j = 0; j < 8; j++) { out += ('00000000' + ((this.h[j]) >>> 0).toString(16)).slice(-8); }
+        return out;
+      };
+
+      const EOCD_MIN = 22, MAX_COMMENT = 0xffff, ZIP64_SENTINEL = 0xffffffff, HASH_CHUNK = 4 * 1024 * 1024;
+      function findEocd(tail, fileLen, tailStart, view) {
+        for (let i = tail.length - EOCD_MIN; i >= 0; i--) {
+          if (tail[i] === 0x50 && tail[i + 1] === 0x4b && tail[i + 2] === 0x05 && tail[i + 3] === 0x06) {
+            const commentLen = view.getUint16(i + 20, true);
+            if (tailStart + i + EOCD_MIN + commentLen === fileLen) return i;
+          }
+        }
+        throw new Error('End Of Central Directory record not found (not a valid ZIP/APK?)');
+      }
+      // size + SHA-256 of the ZIP Central-Directory region [CD_offset .. EOF]. Reads only
+      // the tail + CD region, so a 1 GB+ APK is not loaded into memory and nothing uploads.
+      async function apkCdDigest(file) {
+        const size = file.size;
+        const readLen = Math.min(size, EOCD_MIN + MAX_COMMENT);
+        const tailStart = size - readLen;
+        const tailBuf = new Uint8Array(await file.slice(tailStart, size).arrayBuffer());
+        const view = new DataView(tailBuf.buffer, tailBuf.byteOffset, tailBuf.byteLength);
+        const eocdOff = findEocd(tailBuf, size, tailStart, view);
+        const cdOffset = view.getUint32(eocdOff + 16, true);
+        if (cdOffset === ZIP64_SENTINEL) throw new Error('zip64 archives are not supported');
+        const h = new Sha256();
+        for (let pos = cdOffset; pos < size; pos += HASH_CHUNK) {
+          h.update(new Uint8Array(await file.slice(pos, Math.min(pos + HASH_CHUNK, size)).arrayBuffer()));
+        }
+        return { size: size, cd_sha256: h.hex() };
+      }
+      async function fileSha256(file) {
+        const h = new Sha256();
+        for (let pos = 0; pos < file.size; pos += HASH_CHUNK) {
+          h.update(new Uint8Array(await file.slice(pos, Math.min(pos + HASH_CHUNK, file.size)).arrayBuffer()));
+        }
+        return h.hex();
+      }
+      // A <input webkitdirectory> pick prefixes webkitRelativePath with the picked folder
+      // name; strip it so the manifest mirrors the folder's contents (matches the device).
+      function stripTopLevel(relPath) { const i = relPath.indexOf('/'); return i >= 0 ? relPath.slice(i + 1) : relPath; }
+      function utf8Bytes(s) { return new TextEncoder().encode(s); }
+      function utf8Compare(a, b) {
+        const ea = utf8Bytes(a), eb = utf8Bytes(b), n = Math.min(ea.length, eb.length);
+        for (let i = 0; i < n; i++) { if (ea[i] !== eb[i]) return ea[i] - eb[i]; }
+        return ea.length - eb.length;
+      }
+      async function dirManifest(fileList, onProgress) {
+        const files = [];
+        for (let k = 0; k < fileList.length; k++) { if (fileList[k].webkitRelativePath) files.push(fileList[k]); }
+        const entries = [];
+        for (let i = 0; i < files.length; i++) {
+          const rel = stripTopLevel(files[i].webkitRelativePath);
+          if (!rel) continue;
+          entries.push({ relative_path: rel, size: files[i].size, sha256: await fileSha256(files[i]) });
+          if (onProgress) onProgress(i + 1, files.length);
+        }
+        entries.sort(function (x, y) { return utf8Compare(x.relative_path, y.relative_path); });
+        const h = new Sha256(); let totalSize = 0; const enc = new TextEncoder();
+        for (let j = 0; j < entries.length; j++) {
+          totalSize += entries[j].size;
+          h.update(enc.encode(entries[j].relative_path + '\n' + entries[j].size + '\n' + entries[j].sha256 + '\n'));
+        }
+        return { tree_hash: h.hex(), file_count: entries.length, total_size: totalSize, manifest: entries };
+      }
+
+      // ---- comparison of a device result against the local reference ----
+      function classifyApk(msg) {
+        if (msg.error) return { status: 'error', detail: String(msg.error) };
+        if (!msg.found) return { status: 'notfound', detail: 'not installed' };
+        const sizeOk = Number(msg.size) === Number(verifyApkRef.size);
+        const cdOk = msg.cd_sha256 === verifyApkRef.cd_sha256;
+        if (sizeOk && cdOk) return { status: 'match', detail: 'v' + (msg.version_name || '?') };
+        const bits = [];
+        if (!sizeOk) bits.push('size ' + msg.size + ' vs ' + verifyApkRef.size);
+        if (!cdOk) bits.push('CD digest differs');
+        if (msg.version_name != null || msg.version_code != null) bits.push('device v' + (msg.version_name || '?') + ' (' + (msg.version_code != null ? msg.version_code : '?') + ')');
+        if (msg.signer_sha256) bits.push('signer ' + String(msg.signer_sha256).slice(0, 12) + '…');
+        return { status: 'mismatch', detail: bits.join(' · ') };
+      }
+      function diffManifests(refList, devList) {
+        const refMap = {}, devMap = {};
+        refList.forEach(function (e) { refMap[e.relative_path] = e; });
+        devList.forEach(function (e) { devMap[e.relative_path] = e; });
+        const missing = [], added = [], changed = [];
+        Object.keys(refMap).forEach(function (p) {
+          if (!(p in devMap)) missing.push(p);
+          else if (devMap[p].sha256 !== refMap[p].sha256 || Number(devMap[p].size) !== Number(refMap[p].size)) changed.push(p);
+        });
+        Object.keys(devMap).forEach(function (p) { if (!(p in refMap)) added.push(p); });
+        return { missing: missing, added: added, changed: changed };
+      }
+      function classifyDir(msg) {
+        if (msg.error) return { status: 'error', detail: String(msg.error) };
+        if (msg.found === false) return { status: 'notfound', detail: 'path not found' };
+        if (msg.tree_hash === verifyDirRef.tree_hash) return { status: 'match', detail: (msg.file_count != null ? msg.file_count + ' files' : '') };
+        let detail;
+        if (verifyDirRef.manifest && Array.isArray(msg.manifest)) {
+          const d = diffManifests(verifyDirRef.manifest, msg.manifest);
+          detail = 'missing ' + d.missing.length + ' · added ' + d.added.length + ' · changed ' + d.changed.length;
+        } else {
+          detail = 'tree differs (' + (msg.file_count != null ? msg.file_count : '?') + ' files on device vs ' + verifyDirRef.file_count + ' local)';
+        }
+        return { status: 'mismatch', detail: detail };
+      }
+
+      function verifyStatusHtml(st) {
+        switch (st.status) {
+          case 'verifying': return '<span class="verify-stat ins-installing"><span class="spinner">⟳</span> Verifying…</span>';
+          case 'match': return '<span class="verify-stat ins-success">✓ match</span>' + (st.detail ? ' <span class="verify-detail">' + esc(st.detail) + '</span>' : '');
+          case 'mismatch': return '<span class="verify-stat ins-fail" title="' + esc(st.detail || '') + '">✗ mismatch</span>' + (st.detail ? ' <span class="verify-detail">' + esc(st.detail) + '</span>' : '');
+          case 'notfound': return '<span class="verify-stat ins-fail" title="' + esc(st.detail || '') + '">✗ ' + esc(st.detail || 'not found') + '</span>';
+          case 'error': return '<span class="verify-stat ins-fail" title="' + esc(st.detail || '') + '">✗ error</span>' + (st.detail ? ' <span class="verify-detail">' + esc(st.detail) + '</span>' : '');
+          default: return '<span class="verify-stat ins-none">—</span>';
+        }
+      }
+      function renderVerifyResults(container, stateMap) {
+        const ids = Object.keys(stateMap);
+        container.innerHTML = ids.length ? ids.map(function (id) {
+          return '<div class="verify-row"><span class="verify-dev">' + esc(labelFor(id)) + '</span>' + verifyStatusHtml(stateMap[id]) + '</div>';
+        }).join('') : '';
+      }
+
+      // ---- reference selection + command dispatch ----
+      async function onVerifyApkFile() {
+        verifyApkRef = null;
+        const f = verifyApkFile.files[0];
+        if (!f) { verifyApkName.textContent = 'No reference APK'; updateButtons(); return; }
+        verifyApkName.textContent = 'Hashing ' + f.name + '…'; updateButtons();
+        try {
+          const r = await apkCdDigest(f);
+          verifyApkRef = { size: r.size, cd_sha256: r.cd_sha256, filename: f.name };
+          verifyApkName.textContent = 'Ref: ' + f.name + ' (' + formatBytes(r.size) + ')';
+        } catch (e) { verifyApkName.textContent = 'Error: ' + e.message; }
+        updateButtons();
+      }
+      function sendVerifyApk() {
+        const pkg = verifyApkPkg.value.trim();
+        if (!verifyApkRef || !pkg) return;
+        const online = onlineTargets(Array.from(selectedIds));
+        if (!online.length) { addLog('No online devices selected to verify', 'warn'); return; }
+        if (!wsSend({ type: 'VERIFY_APK', target_devices: online, package_name: pkg }, 'verify APK')) return;
+        verifyApkState = {};
+        online.forEach(function (id) { verifyApkState[id] = { status: 'verifying', detail: '' }; });
+        renderVerifyResults(verifyApkResults, verifyApkState);
+        addLog('Verifying ' + pkg + ' against ' + verifyApkRef.filename + ' on ' + online.length + ' device(s)', 'info');
+      }
+      async function onVerifyDirFolder() {
+        verifyDirRef = null; verifyDirJson.value = '';
+        const files = verifyDirFolder.files;
+        if (!files || !files.length) { verifyDirRefName.textContent = 'No reference'; updateButtons(); return; }
+        verifyDirRefName.textContent = 'Hashing…'; updateButtons();
+        try {
+          const r = await dirManifest(files, function (done, total) { verifyDirRefName.textContent = 'Hashing ' + done + '/' + total + '…'; });
+          verifyDirRef = { tree_hash: r.tree_hash, file_count: r.file_count, total_size: r.total_size, manifest: r.manifest, source: 'folder' };
+          verifyDirRefName.textContent = 'Ref: ' + r.file_count + ' files (' + formatBytes(r.total_size) + ')';
+        } catch (e) { verifyDirRefName.textContent = 'Error: ' + e.message; }
+        updateButtons();
+      }
+      async function onVerifyDirJson() {
+        verifyDirRef = null; verifyDirFolder.value = '';
+        const f = verifyDirJson.files[0];
+        if (!f) { verifyDirRefName.textContent = 'No reference'; updateButtons(); return; }
+        try {
+          const obj = JSON.parse(await f.text());
+          if (!obj || typeof obj.tree_hash !== 'string') throw new Error('missing tree_hash');
+          verifyDirRef = { tree_hash: obj.tree_hash, file_count: obj.file_count, total_size: obj.total_size, manifest: obj.manifest, source: 'json' };
+          verifyDirRefName.textContent = 'Ref (CLI): ' + f.name + (obj.file_count != null ? ' — ' + obj.file_count + ' files' : '');
+        } catch (e) { verifyDirRefName.textContent = 'Invalid hash JSON: ' + e.message; }
+        updateButtons();
+      }
+      function sendVerifyDir() {
+        const path = verifyDirPath.value.trim();
+        if (!verifyDirRef || !path) return;
+        const online = onlineTargets(Array.from(selectedIds));
+        if (!online.length) { addLog('No online devices selected to verify', 'warn'); return; }
+        if (!wsSend({ type: 'VERIFY_DIR', target_devices: online, path: path }, 'verify directory')) return;
+        verifyDirState = {};
+        online.forEach(function (id) { verifyDirState[id] = { status: 'verifying', detail: '' }; });
+        renderVerifyResults(verifyDirResults, verifyDirState);
+        addLog('Verifying ' + path + ' against local reference on ' + online.length + ' device(s)', 'info');
+      }
+
       // ---------------- Event wiring ----------------
       // Sub-tabs
       tabGroups.addEventListener('click', function () { targetTab = 'groups'; userPickedTab = true; render(); });
@@ -1268,6 +1589,13 @@
       btnLaunch.addEventListener('click', sendLaunch);
       btnStartupSet.addEventListener('click', sendSetStartup);
       btnStartupClear.addEventListener('click', sendClearStartup);
+      verifyApkFile.addEventListener('change', onVerifyApkFile);
+      verifyApkPkg.addEventListener('input', updateButtons);
+      btnVerifyApk.addEventListener('click', sendVerifyApk);
+      verifyDirFolder.addEventListener('change', onVerifyDirFolder);
+      verifyDirJson.addEventListener('change', onVerifyDirJson);
+      verifyDirPath.addEventListener('input', updateButtons);
+      btnVerifyDir.addEventListener('click', sendVerifyDir);
       btnClearLog.addEventListener('click', function () { logContainer.innerHTML = ''; logContainer.appendChild(logEmpty); logEmpty.style.display = 'block'; });
 
       // Command sections accordion: only one open at a time (matches the original

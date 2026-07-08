@@ -6,6 +6,8 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Environment
 import android.os.IBinder
@@ -14,11 +16,19 @@ import com.pvr.tobservice.ToBServiceHelper
 import com.pvr.tobservice.enums.PBS_PackageControlEnum
 import com.pvr.tobservice.interfaces.IIntCallback
 import com.pvr.tobservice.interfaces.IToBServiceProxy
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.attribute.BasicFileAttributes
+import java.security.MessageDigest
 import java.util.zip.ZipFile
 
 /**
@@ -44,6 +54,20 @@ class MdmClientService : Service() {
             "android", "download", "downloads", "dcim", "pictures", "movies", "music",
             "documents", "alarms", "notifications", "podcasts", "ringtones"
         )
+
+        // Integrity verification (issue #37). The ZIP End-Of-Central-Directory record is
+        // the fixed 22-byte trailer plus an optional comment of up to 0xFFFF bytes.
+        private const val EOCD_MIN = 22
+        private const val MAX_EOCD_COMMENT = 0xFFFF
+        // A CD offset of 0xFFFFFFFF signals ZIP64, which we do not parse (standard APKs
+        // are not ZIP64); we return a clear error instead of hashing a wrong range.
+        private const val ZIP64_SENTINEL = 0xFFFFFFFFL
+        // Bound directory verification so a huge/hostile tree cannot exhaust the device.
+        private const val MAX_VERIFY_DIR_ENTRIES = 50_000
+        // Above this many files the per-file manifest is omitted (tree_hash still returned).
+        private const val MAX_VERIFY_DIR_MANIFEST_ENTRIES = 2_000
+
+        private val HEX = "0123456789abcdef".toCharArray()
     }
 
     private lateinit var webSocketManager: WebSocketManager
@@ -84,6 +108,8 @@ class MdmClientService : Service() {
             "EXECUTE_LAUNCH" -> executeLaunch(payload)
             "EXECUTE_INSTALL" -> executeInstall(payload)
             "EXECUTE_PUSH_FILES" -> executePushFiles(payload)
+            "EXECUTE_VERIFY_APK" -> executeVerifyApk(payload)
+            "EXECUTE_VERIFY_DIR" -> executeVerifyDir(payload)
             "SET_STARTUP_APP" -> handleSetStartupApp(payload)
             "CLEAR_STARTUP_APP" -> handleClearStartupApp()
             else -> Log.w(TAG, "Unknown command type: $type")
@@ -638,6 +664,297 @@ class MdmClientService : Service() {
             108 -> "Incompatible APK"
             else -> "Unknown install error"
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Integrity verification (issue #37). Computes the same size + ZIP
+    // Central-Directory digest / directory tree hash that the console (pure JS)
+    // and the `styly-mdm hash` CLI (Python) compute, so the browser can compare
+    // a device against a local reference without any upload. Hashing runs on a
+    // worker thread (a base.apk can be 1 GB+); the reply goes back over the same
+    // WebSocket send helper the install flow uses.
+    // -----------------------------------------------------------------------
+
+    private fun executeVerifyApk(payload: JSONObject) {
+        val pkg = payload.optString("package_name", "")
+        if (pkg.isEmpty()) {
+            Log.e(TAG, "EXECUTE_VERIFY_APK missing package_name")
+            sendVerifyApkResult(pkg, found = false, error = "Missing package_name")
+            return
+        }
+        Thread {
+            try {
+                val pm = packageManager
+                val appInfo = pm.getApplicationInfo(pkg, 0)
+                val apkFile = File(appInfo.sourceDir)
+                val size = apkFile.length()
+                val cdSha256 = apkCentralDirectoryDigest(apkFile)
+                val fullSha256 = fileSha256(apkFile)
+                @Suppress("DEPRECATION")
+                val pkgInfo = pm.getPackageInfo(pkg, PackageManager.GET_SIGNING_CERTIFICATES)
+                sendVerifyApkResult(
+                    pkg,
+                    found = true,
+                    size = size,
+                    cdSha256 = cdSha256,
+                    fullSha256 = fullSha256,
+                    versionCode = pkgInfo.longVersionCode,
+                    versionName = pkgInfo.versionName ?: "",
+                    signerSha256 = signerSha256(pkgInfo)
+                )
+            } catch (e: PackageManager.NameNotFoundException) {
+                Log.i(TAG, "VERIFY_APK: package not installed: $pkg")
+                sendVerifyApkResult(pkg, found = false)
+            } catch (e: Exception) {
+                Log.e(TAG, "VERIFY_APK failed for $pkg", e)
+                sendVerifyApkResult(pkg, found = false, error = e.message ?: "Unknown error")
+            }
+        }.start()
+    }
+
+    private fun executeVerifyDir(payload: JSONObject) {
+        val path = payload.optString("path", "")
+        Thread {
+            try {
+                if (!hasExternalStorageAccess()) {
+                    sendVerifyDirResult(
+                        path, found = false,
+                        error = "All files access (MANAGE_EXTERNAL_STORAGE) is not granted on this device"
+                    )
+                    return@Thread
+                }
+                val root = resolveVerifyDir(path)
+                if (!root.exists()) {
+                    sendVerifyDirResult(path, found = false)
+                    return@Thread
+                }
+                if (!root.isDirectory) {
+                    sendVerifyDirResult(path, found = false, error = "Path is not a directory")
+                    return@Thread
+                }
+                sendVerifyDirResult(path, found = true, result = dirManifest(root))
+            } catch (e: SecurityException) {
+                Log.e(TAG, "VERIFY_DIR denied for $path", e)
+                sendVerifyDirResult(path, found = false, error = e.message ?: "Path not permitted")
+            } catch (e: Exception) {
+                Log.e(TAG, "VERIFY_DIR failed for $path", e)
+                sendVerifyDirResult(path, found = false, error = e.message ?: "Unknown error")
+            }
+        }.start()
+    }
+
+    /**
+     * Canonicalize a device directory path and enforce that it stays within shared
+     * external storage. Verification only reads, but bounding to shared storage keeps it
+     * to the scope operators distribute content into and matches what MANAGE_EXTERNAL_STORAGE
+     * actually grants. Throws for an invalid or out-of-scope path.
+     */
+    private fun resolveVerifyDir(path: String): File {
+        if (path.isEmpty() || !path.startsWith("/")) {
+            throw IllegalArgumentException("A valid absolute path is required")
+        }
+        val storageRoot = Environment.getExternalStorageDirectory()
+            ?: throw IllegalStateException("Shared external storage is unavailable")
+        val root = storageRoot.canonicalFile
+        val target = File(path).canonicalFile
+        if (target != root && !target.path.startsWith(root.path + File.separator)) {
+            throw SecurityException("Path is outside shared storage (${root.path})")
+        }
+        return target
+    }
+
+    /**
+     * SHA-256 of the ZIP Central-Directory region [CD_offset .. EOF]. Parses the EOCD to
+     * find CD_offset (little-endian uint32) — this covers every entry's CRC-32 + sizes plus
+     * the EOCD, while reading only a few hundred KB regardless of APK size.
+     */
+    private fun apkCentralDirectoryDigest(file: File): String {
+        RandomAccessFile(file, "r").use { raf ->
+            val fileLen = raf.length()
+            val readLen = minOf(fileLen, (EOCD_MIN + MAX_EOCD_COMMENT).toLong()).toInt()
+            val tailStart = fileLen - readLen
+            val tail = ByteArray(readLen)
+            raf.seek(tailStart)
+            raf.readFully(tail)
+            val eocdOff = findEocd(tail, fileLen, tailStart)
+            if (eocdOff < 0) throw IllegalStateException("End Of Central Directory record not found")
+            // ByteBuffer defaults to big-endian — ZIP fields are little-endian.
+            val bb = ByteBuffer.wrap(tail).order(ByteOrder.LITTLE_ENDIAN)
+            val cdOffset = bb.getInt(eocdOff + 16).toLong() and 0xFFFFFFFFL
+            if (cdOffset == ZIP64_SENTINEL) throw IllegalStateException("zip64 not supported")
+            val md = MessageDigest.getInstance("SHA-256")
+            raf.seek(cdOffset)
+            val buf = ByteArray(1 shl 20)
+            var remaining = fileLen - cdOffset
+            while (remaining > 0) {
+                val n = raf.read(buf, 0, minOf(buf.size.toLong(), remaining).toInt())
+                if (n <= 0) break
+                md.update(buf, 0, n)
+                remaining -= n
+            }
+            return md.digest().toHex()
+        }
+    }
+
+    private fun findEocd(tail: ByteArray, fileLen: Long, tailStart: Long): Int {
+        val bb = ByteBuffer.wrap(tail).order(ByteOrder.LITTLE_ENDIAN)
+        for (i in tail.size - EOCD_MIN downTo 0) {
+            if ((tail[i].toInt() and 0xff) == 0x50 && (tail[i + 1].toInt() and 0xff) == 0x4b &&
+                (tail[i + 2].toInt() and 0xff) == 0x05 && (tail[i + 3].toInt() and 0xff) == 0x06
+            ) {
+                val commentLen = bb.getShort(i + 20).toInt() and 0xffff
+                if (tailStart + i + EOCD_MIN + commentLen == fileLen) return i
+            }
+        }
+        return -1
+    }
+
+    private fun fileSha256(file: File): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buf = ByteArray(1 shl 20)
+            while (true) {
+                val n = input.read(buf)
+                if (n <= 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        return md.digest().toHex()
+    }
+
+    private fun signerSha256(pkgInfo: PackageInfo): String {
+        val signers = pkgInfo.signingInfo?.apkContentsSigners ?: return ""
+        if (signers.isEmpty()) return ""
+        return MessageDigest.getInstance("SHA-256").digest(signers[0].toByteArray()).toHex()
+    }
+
+    private class DirResult(
+        val treeHash: String,
+        val fileCount: Int,
+        val totalSize: Long,
+        val manifest: JSONArray?
+    )
+
+    private class DirEntry(val relativePath: String, val size: Long, val sha256: String)
+
+    /**
+     * Walk a directory into a manifest and tree hash. Policy (matches the console and CLI):
+     * symlinks are not followed and excluded; empty directories are not represented; entries
+     * are sorted by the UTF-8 byte order of their relative path.
+     */
+    private fun dirManifest(root: File): DirResult {
+        val entries = ArrayList<DirEntry>()
+        walkDir(root, "", entries)
+        entries.sortWith(Comparator { a, b -> utf8Compare(a.relativePath, b.relativePath) })
+
+        val md = MessageDigest.getInstance("SHA-256")
+        var totalSize = 0L
+        for (e in entries) {
+            totalSize += e.size
+            md.update("${e.relativePath}\n${e.size}\n${e.sha256}\n".toByteArray(Charsets.UTF_8))
+        }
+        val manifest = if (entries.size <= MAX_VERIFY_DIR_MANIFEST_ENTRIES) {
+            JSONArray().apply {
+                for (e in entries) {
+                    put(JSONObject().apply {
+                        put("relative_path", e.relativePath)
+                        put("size", e.size)
+                        put("sha256", e.sha256)
+                    })
+                }
+            }
+        } else null
+        return DirResult(md.digest().toHex(), entries.size, totalSize, manifest)
+    }
+
+    private fun walkDir(dir: File, relBase: String, out: ArrayList<DirEntry>) {
+        Files.newDirectoryStream(dir.toPath()).use { stream ->
+            for (child in stream) {
+                if (Files.isSymbolicLink(child)) continue
+                val name = child.fileName.toString()
+                val rel = if (relBase.isEmpty()) name else "$relBase/$name"
+                val attr = Files.readAttributes(
+                    child, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS
+                )
+                when {
+                    attr.isDirectory -> walkDir(child.toFile(), rel, out)
+                    attr.isRegularFile -> {
+                        if (out.size >= MAX_VERIFY_DIR_ENTRIES) {
+                            throw IllegalStateException("Directory has more than $MAX_VERIFY_DIR_ENTRIES files")
+                        }
+                        out.add(DirEntry(rel, attr.size(), fileSha256(child.toFile())))
+                    }
+                }
+            }
+        }
+    }
+
+    private fun utf8Compare(a: String, b: String): Int {
+        val ea = a.toByteArray(Charsets.UTF_8)
+        val eb = b.toByteArray(Charsets.UTF_8)
+        val n = minOf(ea.size, eb.size)
+        for (i in 0 until n) {
+            val d = (ea[i].toInt() and 0xff) - (eb[i].toInt() and 0xff)
+            if (d != 0) return d
+        }
+        return ea.size - eb.size
+    }
+
+    private fun ByteArray.toHex(): String {
+        val sb = StringBuilder(size * 2)
+        for (b in this) {
+            val v = b.toInt() and 0xff
+            sb.append(HEX[v ushr 4])
+            sb.append(HEX[v and 0x0f])
+        }
+        return sb.toString()
+    }
+
+    private fun sendVerifyApkResult(
+        packageName: String,
+        found: Boolean,
+        size: Long? = null,
+        cdSha256: String? = null,
+        fullSha256: String? = null,
+        versionCode: Long? = null,
+        versionName: String? = null,
+        signerSha256: String? = null,
+        error: String? = null
+    ) {
+        val result = JSONObject().apply {
+            put("type", "VERIFY_APK_RESULT")
+            put("package_name", packageName)
+            put("found", found)
+            if (size != null) put("size", size)
+            if (cdSha256 != null) put("cd_sha256", cdSha256)
+            if (fullSha256 != null) put("full_sha256", fullSha256)
+            if (versionCode != null) put("version_code", versionCode)
+            if (versionName != null) put("version_name", versionName)
+            if (!signerSha256.isNullOrEmpty()) put("signer_sha256", signerSha256)
+            if (!error.isNullOrEmpty()) put("error", error)
+        }
+        webSocketManager.sendMessage(result)
+    }
+
+    private fun sendVerifyDirResult(
+        path: String,
+        found: Boolean,
+        result: DirResult? = null,
+        error: String? = null
+    ) {
+        val msg = JSONObject().apply {
+            put("type", "VERIFY_DIR_RESULT")
+            put("path", path)
+            put("found", found)
+            if (result != null) {
+                put("tree_hash", result.treeHash)
+                put("file_count", result.fileCount)
+                put("total_size", result.totalSize)
+                if (result.manifest != null) put("manifest", result.manifest)
+            }
+            if (!error.isNullOrEmpty()) put("error", error)
+        }
+        webSocketManager.sendMessage(msg)
     }
 
     private fun handleStatusChanged(connected: Boolean, message: String) {

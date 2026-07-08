@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import socket
+import sys
 import tempfile
 import time
 import zipfile
@@ -668,7 +669,13 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     else:
                         log.warning("DOWNLOAD_COMPLETE before REGISTER")
 
-                elif msg_type in {"LAUNCH_RESULT", "INSTALL_RESULT", "PUSH_FILES_RESULT"}:
+                elif msg_type in {
+                    "LAUNCH_RESULT",
+                    "INSTALL_RESULT",
+                    "PUSH_FILES_RESULT",
+                    "VERIFY_APK_RESULT",
+                    "VERIFY_DIR_RESULT",
+                }:
                     if device_id:
                         data.setdefault("device_id", device_id)
                     # Fallback transfer-slot release: an older client that never
@@ -745,6 +752,12 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 elif msg_type == "PUSH_FILES":
                     await handle_push_files(ws, data)
+
+                elif msg_type == "VERIFY_APK":
+                    await handle_verify_apk(ws, data)
+
+                elif msg_type == "VERIFY_DIR":
+                    await handle_verify_dir(ws, data)
 
                 elif msg_type == "SET_STARTUP_APP":
                     await handle_set_startup_app(ws, data)
@@ -1366,6 +1379,128 @@ async def handle_push_files(admin_ws: web.WebSocketResponse, data: dict):
 
 
 # ---------------------------------------------------------------------------
+# Integrity verification (issue #37) — relay only; no hashing on the server.
+# The reference is computed client-side in the browser (or via `styly-mdm hash`)
+# and the match/mismatch comparison happens in the browser. The server just fans
+# EXECUTE_VERIFY_* out to devices, exactly like INSTALL_APK, and forwards each
+# device's VERIFY_*_RESULT back to the admins (see the device forward set above).
+# ---------------------------------------------------------------------------
+
+async def _fanout_execute(
+    admin_ws: web.WebSocketResponse,
+    target_devices: list[str],
+    execute_msg: str,
+    verb: str,
+) -> tuple[int, int] | None:
+    """Send an already-serialized EXECUTE_* message to the resolved online targets.
+
+    Returns (sent_count, target_count), or None (after sending an ERROR to the admin)
+    when no online target matched.
+    """
+    target_ids = resolve_target_ids(target_devices)
+    if not target_ids:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "No matching online devices found",
+        }))
+        return None
+
+    sent_count = 0
+    for did in target_ids:
+        entry = devices.get(did)
+        if entry:
+            try:
+                await entry["ws"].send_str(execute_msg)
+                sent_count += 1
+            except ConnectionResetError:
+                log.warning("Failed to send %s to %s (disconnected)", verb, did)
+
+    return sent_count, len(target_ids)
+
+
+async def handle_verify_apk(admin_ws: web.WebSocketResponse, data: dict):
+    """Forward a VERIFY_APK command to target HMDs (mirrors handle_install_apk).
+
+    VERIFY_APK carries only {target_devices, package_name}; the local reference
+    (size + Central-Directory digest) never leaves the browser.
+    """
+    package_name: str = data.get("package_name", "")
+    if not package_name:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "package_name is required",
+        }))
+        return
+
+    execute_msg = json.dumps({
+        "type": "EXECUTE_VERIFY_APK",
+        "package_name": package_name,
+    })
+    result = await _fanout_execute(
+        admin_ws, data.get("target_devices", []), execute_msg, "EXECUTE_VERIFY_APK"
+    )
+    if result is None:
+        return
+    sent_count, target_count = result
+    log.info("VERIFY_APK: sent %s to %d/%d devices", package_name, sent_count, target_count)
+
+    await admin_ws.send_str(json.dumps({
+        "type": "VERIFY_SENT",
+        "package_name": package_name,
+        "sent_count": sent_count,
+        "target_count": target_count,
+    }))
+
+
+def is_syntactically_safe_verify_path(path: str) -> bool:
+    """Light syntactic guard for a device directory path (VERIFY_DIR).
+
+    Verification only reads, so this is advisory; the device performs the
+    authoritative canonical check that the path stays within shared external
+    storage. Here we just reject the obviously-wrong: empty, relative, or
+    containing a `..` traversal component.
+    """
+    if not path or not path.startswith("/"):
+        return False
+    parts = [p for p in path.split("/") if p]
+    return ".." not in parts
+
+
+async def handle_verify_dir(admin_ws: web.WebSocketResponse, data: dict):
+    """Forward a VERIFY_DIR command to target HMDs.
+
+    VERIFY_DIR carries only {target_devices, path}; the local reference
+    (manifest + tree hash) never leaves the browser.
+    """
+    path: str = data.get("path", "")
+    if not is_syntactically_safe_verify_path(path):
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "A valid absolute path without '..' is required",
+        }))
+        return
+
+    execute_msg = json.dumps({
+        "type": "EXECUTE_VERIFY_DIR",
+        "path": path,
+    })
+    result = await _fanout_execute(
+        admin_ws, data.get("target_devices", []), execute_msg, "EXECUTE_VERIFY_DIR"
+    )
+    if result is None:
+        return
+    sent_count, target_count = result
+    log.info("VERIFY_DIR: sent %s to %d/%d devices", path, sent_count, target_count)
+
+    await admin_ws.send_str(json.dumps({
+        "type": "VERIFY_DIR_SENT",
+        "path": path,
+        "sent_count": sent_count,
+        "target_count": target_count,
+    }))
+
+
+# ---------------------------------------------------------------------------
 # APK upload handler
 # ---------------------------------------------------------------------------
 
@@ -1877,6 +2012,37 @@ async def run_server(port: int | None = None):
         await runner.cleanup()
 
 
+def run_hash_cli(path: str, manifest_cap: int | None) -> int:
+    """`styly-mdm hash <path>`: print a local integrity reference as JSON.
+
+    A file is treated as an APK/ZIP (size + Central-Directory digest); a directory
+    is walked into a manifest + tree hash. This is the deterministic, large-tree
+    reference the console compares device results against (issue #37), and it runs
+    on the machine that holds the tree — which may differ from the server host.
+    The tree is never uploaded.
+    """
+    from . import integrity
+
+    if os.path.isdir(path):
+        result = integrity.dir_manifest(path, manifest_entry_cap=manifest_cap)
+    elif os.path.isfile(path):
+        try:
+            size, cd_sha256 = integrity.apk_cd_digest(path)
+        except integrity.Zip64UnsupportedError:
+            print("error: zip64 archives are not supported", file=sys.stderr)
+            return 1
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        result = {"size": size, "cd_sha256": cd_sha256}
+    else:
+        print(f"error: no such file or directory: {path}", file=sys.stderr)
+        return 1
+
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="styly-mdm",
@@ -1901,7 +2067,25 @@ def main():
         help="Max simultaneous APK transfers per install job "
         "(default: $MDM_MAX_CONCURRENT_TRANSFERS or 5).",
     )
+    subparsers = parser.add_subparsers(dest="command")
+    hash_parser = subparsers.add_parser(
+        "hash",
+        help="Compute a local integrity reference (APK CD-digest or directory "
+        "tree hash) and print it as JSON. Nothing is uploaded.",
+    )
+    hash_parser.add_argument("path", help="Path to an .apk file or a directory.")
+    hash_parser.add_argument(
+        "--manifest-cap",
+        type=int,
+        default=None,
+        help="For a directory, omit the per-file manifest when it has more than "
+        "this many entries (tree_hash is always printed).",
+    )
     args = parser.parse_args()
+
+    if args.command == "hash":
+        raise SystemExit(run_hash_cli(args.path, args.manifest_cap))
+
     if args.data_dir is not None:
         _apply_data_dir(args.data_dir)
     if args.max_concurrent_transfers is not None:
