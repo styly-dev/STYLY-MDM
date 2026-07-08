@@ -932,6 +932,19 @@
         if (el) el.innerHTML = renderMgDevListHtml();
       }
 
+      // Update the member count in the header/footer in place, without rebuilding
+      // the device list (which would reset its scroll position on every toggle).
+      function updateMgCounts() {
+        const foot = mgDetail.querySelector('.mg-foot-count');
+        if (foot) foot.textContent = manageMembers.size + ' selected';
+        const sub = mgDetail.querySelector('.mg-sub');
+        if (sub) {
+          const memArr = Array.from(manageMembers);
+          const offCount = memArr.filter(function (s) { const d = deviceById(s); return !d || !isOnline(d); }).length;
+          sub.textContent = (memArr.length - offCount) + ' online, ' + offCount + ' offline';
+        }
+      }
+
       // ---------------- Log ----------------
       function addLog(message, type) {
         logEmpty.style.display = 'none';
@@ -1041,8 +1054,12 @@
         }
         else if (act === 'toggleMember') {
           const id = t.dataset.id;
-          if (manageMembers.has(id)) manageMembers.delete(id); else manageMembers.add(id);
-          renderManageDetail();
+          const nowMember = !manageMembers.has(id);
+          if (nowMember) manageMembers.add(id); else manageMembers.delete(id);
+          // Update only the clicked row + counts so the list keeps its scroll position.
+          const box = t.querySelector('.selbox');
+          if (box) { box.classList.toggle('on', nowMember); box.textContent = nowMember ? '✓' : ''; }
+          updateMgCounts();
         }
         else if (act === 'saveMembers') sendSetGroupMembers(manageSelectedGroup, Array.from(manageMembers));
         else if (act === 'cancelMembers') { manageMembers = new Set(groups[manageSelectedGroup] || []); renderManageDetail(); }
