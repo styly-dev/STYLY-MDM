@@ -991,6 +991,7 @@
       // Targets label-edit keyboard
       targetsBody.addEventListener('keydown', function (e) {
         if (!e.target.matches('[data-label-input]')) return;
+        if (e.isComposing || e.keyCode === 229) return; // ignore IME composition-confirming keys
         if (e.key === 'Enter') { e.preventDefault(); commitLabel(editingLabelId); }
         else if (e.key === 'Escape') { e.preventDefault(); editingLabelId = null; render(); }
       });
@@ -1060,6 +1061,7 @@
         if (e.target.matches('[data-mg-search]')) { manageSearch = e.target.value; refreshMgDevList(); }
       });
       manageView.addEventListener('keydown', function (e) {
+        if (e.isComposing || e.keyCode === 229) return; // ignore IME composition-confirming keys
         if (e.target.matches('[data-mg-new]') && e.key === 'Enter') {
           e.preventDefault();
           const name = e.target.value.trim(); if (name) { sendCreateGroup(name); pendingSelectGroup = name; e.target.value = ''; }
