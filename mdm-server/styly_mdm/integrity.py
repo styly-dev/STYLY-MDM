@@ -92,12 +92,69 @@ def _file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _iter_files(root: str):
-    """Yield ``(relative_path, absolute_path)`` for every regular file under ``root``.
+# OS-generated metadata that rides along with a folder pick. None of it is content the user
+# meant to ship, and a folder copied via USB can carry one `._*` sidecar per file, so these
+# are dropped when a bundle is built and, for the same reason, when an integrity reference is
+# computed: the reference must describe what `push files` actually delivers to a device.
+#
+# Deliberately limited to files the OS creates on its own. Anything a user could plausibly
+# have authored — `.git/`, Unity `.meta`, dotfiles at large — is kept as-is: a silent drop
+# of real content would be far worse than an unwanted `.DS_Store`.
+_EXCLUDED_NAMES = frozenset({
+    ".ds_store",              # macOS Finder, one per directory
+    "thumbs.db",              # Windows Explorer thumbnail cache
+    "ehthumbs.db",
+    "desktop.ini",            # Windows folder settings
+    ".directory",             # KDE folder settings
+    ".apdisk",                # macOS
+    ".volumeicon.icns",       # macOS
+})
 
-    Policy (must match the JS and Kotlin implementations): symlinks are not followed and
-    are excluded; directories (including empty ones) are not represented; ``relative_path``
-    uses forward slashes with no leading slash.
+# Directories the OS owns end-to-end; excluding the directory excludes everything under it.
+_EXCLUDED_DIRS = frozenset({
+    ".spotlight-v100",
+    ".trashes",
+    ".fseventsd",
+    ".temporaryitems",
+    ".documentrevisions-v100",
+    "__macosx",               # created when a macOS-made zip is expanded
+    "$recycle.bin",
+})
+
+
+def is_os_metadata(relpath: str) -> bool:
+    """Return True if any path segment of ``relpath`` is OS-generated metadata.
+
+    Matching is case-insensitive: the same file is ``Thumbs.db`` on one machine and
+    ``thumbs.db`` on another, and macOS/Windows filesystems do not distinguish them.
+    Matching on *any* segment means a file nested under an excluded directory is dropped
+    along with it.
+
+    The console mirrors this predicate in JavaScript; the two must agree exactly, or a
+    browser-built reference and a CLI-built reference would hash the same tree differently.
+    """
+    for seg in relpath.split("/"):
+        low = seg.lower()
+        if low in _EXCLUDED_NAMES or low in _EXCLUDED_DIRS:
+            return True
+        # AppleDouble resource forks: one `._name` sidecar per file, created whenever a
+        # macOS folder is copied onto a non-HFS filesystem such as a USB stick.
+        if low.startswith("._"):
+            return True
+        # Per-user trash directories on Linux removable media (`.Trash-1000`).
+        if low.startswith(".trash-"):
+            return True
+    return False
+
+
+def _iter_files(root: str, excluded: list[str] | None = None):
+    """Yield ``(relative_path, absolute_path)`` for every regular content file under ``root``.
+
+    Policy: symlinks are not followed and are excluded; directories (including empty ones)
+    are not represented; OS metadata (:func:`is_os_metadata`) is excluded and, when
+    ``excluded`` is given, appended to it; ``relative_path`` uses forward slashes with no
+    leading slash. The browser's reference builder applies the same policy, except that it
+    cannot recognize symlinks.
     """
     root = os.path.abspath(root)
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -110,6 +167,13 @@ def _iter_files(root: str):
             if os.path.islink(abspath):
                 continue
             rel = os.path.relpath(abspath, root).replace(os.sep, "/")
+            # Matched per file rather than by pruning dirnames, so every dropped file is
+            # counted individually — the operator sees how much was left out, as the
+            # bundle upload already reports.
+            if is_os_metadata(rel):
+                if excluded is not None:
+                    excluded.append(rel)
+                continue
             yield rel, abspath
 
 
@@ -121,9 +185,13 @@ def dir_manifest(path: str, manifest_entry_cap: int | None = None) -> dict:
     order, the UTF-8 bytes of ``f"{relative_path}\\n{size}\\n{sha256}\\n"``. When
     ``manifest_entry_cap`` is given and there are more files than the cap, the ``manifest``
     key is omitted (``tree_hash`` alone still distinguishes same/different).
+
+    ``excluded_count`` reports how many OS-metadata files were left out, so a caller can say
+    so rather than silently hashing a different set of files than the operator picked.
     """
     entries = []
-    for rel, abspath in _iter_files(path):
+    excluded: list[str] = []
+    for rel, abspath in _iter_files(path, excluded):
         entries.append({
             "relative_path": rel,
             "size": os.path.getsize(abspath),
@@ -144,6 +212,7 @@ def dir_manifest(path: str, manifest_entry_cap: int | None = None) -> dict:
         "tree_hash": h.hexdigest(),
         "file_count": len(entries),
         "total_size": total_size,
+        "excluded_count": len(excluded),
     }
     if manifest_entry_cap is None or len(entries) <= manifest_entry_cap:
         result["manifest"] = entries

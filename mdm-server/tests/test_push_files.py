@@ -14,7 +14,7 @@ from aiohttp.test_utils import TestClient, TestServer
 import pytest
 
 import styly_mdm
-from styly_mdm import server
+from styly_mdm import integrity, server
 
 
 # ---------------------------------------------------------------------------
@@ -170,8 +170,8 @@ def test_strip_common_root():
     "$RECYCLE.BIN/a",
     ".Trash-1000/files/a",                 # Linux per-user trash on removable media
 ])
-def test_is_excluded_bundle_entry_matches_os_metadata(relpath):
-    assert server.is_excluded_bundle_entry(relpath) is True
+def test_is_os_metadata_matches_os_metadata(relpath):
+    assert integrity.is_os_metadata(relpath) is True
 
 
 @pytest.mark.parametrize("relpath", [
@@ -184,8 +184,8 @@ def test_is_excluded_bundle_entry_matches_os_metadata(relpath):
     "my.DS_Store.txt",                     # substring, not the whole segment
     "desktop.ini.bak",
 ])
-def test_is_excluded_bundle_entry_keeps_real_content(relpath):
-    assert server.is_excluded_bundle_entry(relpath) is False
+def test_is_os_metadata_keeps_real_content(relpath):
+    assert integrity.is_os_metadata(relpath) is False
 
 
 def test_upload_bundle_drops_os_metadata_and_reports_the_count(tmp_path):

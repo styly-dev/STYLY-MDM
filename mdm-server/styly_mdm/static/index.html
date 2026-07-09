@@ -227,6 +227,8 @@
     .field:focus { outline: none; border-color: var(--accent); }
     .field::placeholder { color: var(--text-dim); }
     .field + .field { margin-top: 7px; }
+    .dropzone { padding: 14px 10px; margin-bottom: 8px; background: var(--bg-card); border: 1px dashed var(--border); border-radius: 6px; text-align: center; font-size: 12px; color: var(--text-muted); transition: border-color .12s, background .12s; }
+    .dropzone.over { border-color: var(--accent, #6b8afd); border-style: solid; background: var(--bg-tertiary); color: var(--text-primary); }
     .file-row { display: flex; align-items: center; gap: 9px; padding: 8px 10px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; }
     .file-pick { background: var(--bg-tertiary); border-radius: 5px; padding: 5px 11px; font-size: 12px; color: #cfd3e3; cursor: pointer; white-space: nowrap; }
     .file-name { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -434,6 +436,7 @@
               <div class="cmd-head" data-act="toggleCmd"><span>Verify Directory</span><span class="cmd-chevron">▾</span></div>
               <div class="cmd-body">
                 <input type="text" class="field" id="verifyDirPath" placeholder="/sdcard/content (device path)">
+                <div class="dropzone" id="verifyDirDrop">Drop the reference folder here</div>
                 <div class="file-row">
                   <label class="file-pick" for="verifyDirFolder">Choose Folder</label>
                   <input type="file" id="verifyDirFolder" webkitdirectory directory hidden>
@@ -442,7 +445,7 @@
                   <span class="file-name" id="verifyDirRefName">No reference</span>
                 </div>
                 <button class="btn btn-primary" id="btnVerifyDir" disabled>Verify on Selected</button>
-                <div class="verify-hint">Large trees hash faster with <code>styly-mdm hash &lt;path&gt;</code> — load its JSON here. Shared storage only.</div>
+                <div class="verify-hint">Reference is hashed locally in your browser — nothing is uploaded. Dropping a folder skips the &ldquo;Upload N files&rdquo; prompt that Chrome always shows for <em>Choose Folder</em>. Large trees hash faster with <code>styly-mdm hash &lt;path&gt;</code> — load its JSON here. Shared storage only.</div>
                 <div class="verify-results" id="verifyDirResults"></div>
               </div>
             </div>
@@ -539,6 +542,7 @@
       const verifyApkResults = document.getElementById('verifyApkResults');
       const verifyDirPath = document.getElementById('verifyDirPath');
       const verifyDirFolder = document.getElementById('verifyDirFolder');
+      const verifyDirDrop = document.getElementById('verifyDirDrop');
       const verifyDirJson = document.getElementById('verifyDirJson');
       const verifyDirRefName = document.getElementById('verifyDirRefName');
       const btnVerifyDir = document.getElementById('btnVerifyDir');
@@ -1357,6 +1361,10 @@
       };
 
       const EOCD_MIN = 22, MAX_COMMENT = 0xffff, ZIP64_SENTINEL = 0xffffffff, HASH_CHUNK = 4 * 1024 * 1024;
+      // Mirrors MAX_VERIFY_DIR_ENTRIES on the device. The depth cap has no device counterpart:
+      // it stops a symlinked directory cycle, which the device walk instead avoids by skipping
+      // symlinks outright (the Entries API gives us no way to recognize one).
+      const MAX_VERIFY_DIR_ENTRIES = 50000, MAX_VERIFY_DIR_DEPTH = 64;
       const CD_SIG = 0x02014b50, LFH_SIG = 0x04034b50, STORED = 0, DEFLATED = 8;
       function findEocd(tail, fileLen, tailStart, view) {
         for (let i = tail.length - EOCD_MIN; i >= 0; i--) {
@@ -1524,23 +1532,112 @@
         for (let i = 0; i < n; i++) { if (ea[i] !== eb[i]) return ea[i] - eb[i]; }
         return ea.length - eb.length;
       }
-      async function dirManifest(fileList, onProgress) {
-        const files = [];
-        for (let k = 0; k < fileList.length; k++) { if (fileList[k].webkitRelativePath) files.push(fileList[k]); }
+      // Mirrors integrity.is_os_metadata() in Python — the two must agree exactly, or a
+      // reference built here and one built by `styly-mdm hash` would hash the same tree
+      // differently. The list stays narrow on purpose: `.git/`, Unity `.meta` and dotfiles
+      // at large are content, and silently dropping content is far worse than keeping a
+      // stray `.DS_Store`.
+      const OS_METADATA_NAMES = ['.ds_store', 'thumbs.db', 'ehthumbs.db', 'desktop.ini', '.directory', '.apdisk', '.volumeicon.icns'];
+      const OS_METADATA_DIRS = ['.spotlight-v100', '.trashes', '.fseventsd', '.temporaryitems', '.documentrevisions-v100', '__macosx', '$recycle.bin'];
+      function isOsMetadata(relPath) {
+        const segs = relPath.split('/');
+        for (let i = 0; i < segs.length; i++) {
+          const low = segs[i].toLowerCase();
+          if (OS_METADATA_NAMES.indexOf(low) >= 0 || OS_METADATA_DIRS.indexOf(low) >= 0) return true;
+          if (low.indexOf('._') === 0) return true;       // AppleDouble resource forks
+          if (low.indexOf('.trash-') === 0) return true;   // Linux per-user trash
+        }
+        return false;
+      }
+      // Both reference sources (dropped folder, picked folder) normalize to the same
+      // [{relative_path, file}] shape, so a single fold produces the tree hash and the
+      // two paths cannot drift apart. OS metadata is dropped here, in the one place both
+      // paths pass through: `push files` strips it on the way into the bundle, so a device
+      // never has it, and a reference that kept it would report a permanent "missing N"
+      // against a device that is in fact identical.
+      async function manifestFromFiles(picked, onProgress) {
+        const content = [];
+        let excludedCount = 0;
+        for (let k = 0; k < picked.length; k++) {
+          if (!picked[k].relative_path) continue;
+          if (isOsMetadata(picked[k].relative_path)) { excludedCount++; continue; }
+          content.push(picked[k]);
+        }
+        let pendingBytes = 0;
+        for (let k = 0; k < content.length; k++) pendingBytes += content[k].file.size;
         const entries = [];
-        for (let i = 0; i < files.length; i++) {
-          const rel = stripTopLevel(files[i].webkitRelativePath);
-          if (!rel) continue;
-          entries.push({ relative_path: rel, size: files[i].size, sha256: await fileSha256(files[i]) });
-          if (onProgress) onProgress(i + 1, files.length);
+        let doneBytes = 0;
+        for (let i = 0; i < content.length; i++) {
+          entries.push({ relative_path: content[i].relative_path, size: content[i].file.size, sha256: await fileSha256(content[i].file) });
+          doneBytes += content[i].file.size;
+          if (onProgress) onProgress(i + 1, content.length, doneBytes, pendingBytes);
         }
         entries.sort(function (x, y) { return utf8Compare(x.relative_path, y.relative_path); });
-        const h = new Sha256(); let totalSize = 0; const enc = new TextEncoder();
+        const folded = foldTreeHash(entries);
+        return { tree_hash: folded.tree_hash, file_count: folded.file_count, total_size: folded.total_size, manifest: entries, excluded_count: excludedCount };
+      }
+      // The one definition of tree_hash on this side of the wire. `entries` must already be
+      // sorted by the UTF-8 byte order of relative_path — as the reference builder sorts them
+      // and as the device sends them — because the fold is order-sensitive.
+      function foldTreeHash(entries) {
+        const h = new Sha256(), enc = new TextEncoder();
+        let totalSize = 0;
         for (let j = 0; j < entries.length; j++) {
-          totalSize += entries[j].size;
+          totalSize += Number(entries[j].size);
           h.update(enc.encode(entries[j].relative_path + '\n' + entries[j].size + '\n' + entries[j].sha256 + '\n'));
         }
-        return { tree_hash: h.hex(), file_count: entries.length, total_size: totalSize, manifest: entries };
+        return { tree_hash: h.hex(), file_count: entries.length, total_size: totalSize };
+      }
+      async function dirManifest(fileList, onProgress) {
+        const picked = [];
+        for (let k = 0; k < fileList.length; k++) {
+          const rel = fileList[k].webkitRelativePath;
+          if (rel) picked.push({ relative_path: stripTopLevel(rel), file: fileList[k] });
+        }
+        return manifestFromFiles(picked, onProgress);
+      }
+
+      // ---- dropped-folder reference (Entries API) ----
+      // A folder dropped onto the page reaches us through webkitGetAsEntry(), which — unlike
+      // showDirectoryPicker() — works on this non-secure http://<LAN-IP> origin, and unlike
+      // <input webkitdirectory> does not make Chrome ask "Upload N files to this site?".
+      // Nothing is uploaded either way; the drop just avoids the misleading prompt.
+      function readAllEntries(reader) {
+        // readEntries() hands back the directory in batches (Chrome: 100 at a time) and
+        // signals the end with an empty array. Calling it once silently truncates the tree
+        // into a wrong tree_hash, so pump it until it drains.
+        return new Promise(function (resolve, reject) {
+          const all = [];
+          (function pump() {
+            reader.readEntries(function (batch) {
+              if (!batch.length) { resolve(all); return; }
+              for (let i = 0; i < batch.length; i++) all.push(batch[i]);
+              pump();
+            }, reject);
+          })();
+        });
+      }
+      function entryToFile(fileEntry) {
+        return new Promise(function (resolve, reject) { fileEntry.file(resolve, reject); });
+      }
+      // Yields the same relative paths as stripTopLevel(webkitRelativePath): '/'-separated and
+      // relative to the dropped folder itself, which the device walk also mirrors.
+      async function walkDirEntry(dirEntry, prefix, depth, out) {
+        if (depth > MAX_VERIFY_DIR_DEPTH) throw new Error('directory nested deeper than ' + MAX_VERIFY_DIR_DEPTH + ' levels');
+        const children = await readAllEntries(dirEntry.createReader());
+        for (let i = 0; i < children.length; i++) {
+          const child = children[i], rel = prefix ? prefix + '/' + child.name : child.name;
+          if (child.isFile) {
+            if (out.length >= MAX_VERIFY_DIR_ENTRIES) throw new Error('more than ' + MAX_VERIFY_DIR_ENTRIES + ' files');
+            out.push({ relative_path: rel, file: await entryToFile(child) });
+          } else if (child.isDirectory) {
+            await walkDirEntry(child, rel, depth + 1, out);
+          }
+        }
+        return out;
+      }
+      async function dirManifestFromDrop(dirEntry, onProgress) {
+        return manifestFromFiles(await walkDirEntry(dirEntry, '', 0, []), onProgress);
       }
 
       // ---- comparison of a device result against the local reference ----
@@ -1573,12 +1670,33 @@
         if (msg.error) return { status: 'error', detail: String(msg.error) };
         if (msg.found === false) return { status: 'notfound', detail: 'path not found' };
         if (msg.tree_hash === verifyDirRef.tree_hash) return { status: 'match', detail: (msg.file_count != null ? msg.file_count + ' files' : '') };
+        // The device reports what is on disk, OS metadata included — content copied over
+        // USB/MTP from a Mac carries `.DS_Store` that a push would have stripped. The
+        // reference never contains those files, so re-fold the device's manifest without
+        // them before calling this a mismatch. Its entries are already in the required sort
+        // order, and dropping some of them preserves it.
+        let deviceEntries = Array.isArray(msg.manifest) ? msg.manifest : null;
+        let ignoredOnDevice = 0;
+        if (deviceEntries) {
+          const kept = deviceEntries.filter(function (e) { return !isOsMetadata(e.relative_path); });
+          ignoredOnDevice = deviceEntries.length - kept.length;
+          if (ignoredOnDevice) {
+            deviceEntries = kept;
+            if (foldTreeHash(kept).tree_hash === verifyDirRef.tree_hash) {
+              return { status: 'match', detail: kept.length + ' files · ' + ignoredOnDevice + ' OS metadata ignored on device' };
+            }
+          }
+        }
         let detail;
-        if (verifyDirRef.manifest && Array.isArray(msg.manifest)) {
-          const d = diffManifests(verifyDirRef.manifest, msg.manifest);
+        if (verifyDirRef.manifest && deviceEntries) {
+          const d = diffManifests(verifyDirRef.manifest, deviceEntries);
           detail = 'missing ' + d.missing.length + ' · added ' + d.added.length + ' · changed ' + d.changed.length;
+          if (ignoredOnDevice) detail += ' (' + ignoredOnDevice + ' OS metadata ignored)';
         } else {
-          detail = 'tree differs (' + (msg.file_count != null ? msg.file_count : '?') + ' files on device vs ' + verifyDirRef.file_count + ' local)';
+          // No manifest (the device omits it above its entry cap), so OS metadata on the
+          // device cannot be discounted — say so rather than let the operator wonder.
+          detail = 'tree differs (' + (msg.file_count != null ? msg.file_count : '?') + ' files on device vs ' + verifyDirRef.file_count + ' local)'
+            + (Array.isArray(msg.manifest) ? '' : '; too large for a per-file diff');
         }
         return { status: 'mismatch', detail: detail };
       }
@@ -1642,17 +1760,47 @@
         renderVerifyResults(verifyApkResults, verifyApkState);
         addLog('Verifying ' + pkg + ' against ' + verifyApkRef.filename + ' on ' + online.length + ' device(s)', 'info');
       }
+      function osMetadataNote(count) { return count ? ' · ' + count + ' OS metadata excluded' : ''; }
+      // Byte-based progress, not file-based: a tree of a few large videos would otherwise sit
+      // on "Hashing 1/13…" long enough to look hung.
+      async function setDirRef(runManifest, source) {
+        verifyDirRefName.textContent = 'Hashing…'; updateButtons();
+        try {
+          const r = await runManifest(function (done, total, doneBytes, totalBytes) {
+            const pct = totalBytes ? Math.floor((doneBytes / totalBytes) * 100) : 100;
+            verifyDirRefName.textContent = 'Hashing ' + pct + '% (' + done + '/' + total + ')…';
+          });
+          verifyDirRef = { tree_hash: r.tree_hash, file_count: r.file_count, total_size: r.total_size, manifest: r.manifest, source: source };
+          verifyDirRefName.textContent = 'Ref: ' + r.file_count + ' files (' + formatBytes(r.total_size) + ')' + osMetadataNote(r.excluded_count);
+          if (r.excluded_count) addLog('Excluded ' + r.excluded_count + ' OS metadata file(s) from the reference (never pushed to devices)', 'info');
+        } catch (e) { verifyDirRefName.textContent = 'Error: ' + e.message; }
+        updateButtons();
+      }
       async function onVerifyDirFolder() {
         verifyDirRef = null; verifyDirJson.value = '';
         const files = verifyDirFolder.files;
         if (!files || !files.length) { verifyDirRefName.textContent = 'No reference'; updateButtons(); return; }
-        verifyDirRefName.textContent = 'Hashing…'; updateButtons();
-        try {
-          const r = await dirManifest(files, function (done, total) { verifyDirRefName.textContent = 'Hashing ' + done + '/' + total + '…'; });
-          verifyDirRef = { tree_hash: r.tree_hash, file_count: r.file_count, total_size: r.total_size, manifest: r.manifest, source: 'folder' };
-          verifyDirRefName.textContent = 'Ref: ' + r.file_count + ' files (' + formatBytes(r.total_size) + ')';
-        } catch (e) { verifyDirRefName.textContent = 'Error: ' + e.message; }
-        updateButtons();
+        await setDirRef(function (onProgress) { return dirManifest(files, onProgress); }, 'folder');
+      }
+      function onVerifyDirDragOver(e) {
+        e.preventDefault(); e.dataTransfer.dropEffect = 'copy';
+        verifyDirDrop.classList.add('over');
+      }
+      function onVerifyDirDragLeave() { verifyDirDrop.classList.remove('over'); }
+      async function onVerifyDirDropped(e) {
+        e.preventDefault(); verifyDirDrop.classList.remove('over');
+        // webkitGetAsEntry() has to run before the first await — DataTransferItems are
+        // emptied as soon as the drop handler yields.
+        const items = e.dataTransfer.items, roots = [];
+        for (let i = 0; i < items.length; i++) {
+          const entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
+          if (entry) roots.push(entry);
+        }
+        verifyDirRef = null; verifyDirJson.value = ''; verifyDirFolder.value = '';
+        if (roots.length !== 1 || !roots[0].isDirectory) {
+          verifyDirRefName.textContent = 'Drop exactly one folder'; updateButtons(); return;
+        }
+        await setDirRef(function (onProgress) { return dirManifestFromDrop(roots[0], onProgress); }, 'drop');
       }
       async function onVerifyDirJson() {
         verifyDirRef = null; verifyDirFolder.value = '';
@@ -1662,7 +1810,7 @@
           const obj = JSON.parse(await f.text());
           if (!obj || typeof obj.tree_hash !== 'string') throw new Error('missing tree_hash');
           verifyDirRef = { tree_hash: obj.tree_hash, file_count: obj.file_count, total_size: obj.total_size, manifest: obj.manifest, source: 'json' };
-          verifyDirRefName.textContent = 'Ref (CLI): ' + f.name + (obj.file_count != null ? ' — ' + obj.file_count + ' files' : '');
+          verifyDirRefName.textContent = 'Ref (CLI): ' + f.name + (obj.file_count != null ? ' — ' + obj.file_count + ' files' : '') + osMetadataNote(obj.excluded_count);
         } catch (e) { verifyDirRefName.textContent = 'Invalid hash JSON: ' + e.message; }
         updateButtons();
       }
@@ -1737,6 +1885,12 @@
       verifyApkPkg.addEventListener('input', updateButtons);
       btnVerifyApk.addEventListener('click', sendVerifyApk);
       verifyDirFolder.addEventListener('change', onVerifyDirFolder);
+      verifyDirDrop.addEventListener('dragover', onVerifyDirDragOver);
+      verifyDirDrop.addEventListener('dragleave', onVerifyDirDragLeave);
+      verifyDirDrop.addEventListener('drop', onVerifyDirDropped);
+      // Without this a folder dropped next to the zone would navigate the console away.
+      document.addEventListener('dragover', function (e) { e.preventDefault(); });
+      document.addEventListener('drop', function (e) { e.preventDefault(); });
       verifyDirJson.addEventListener('change', onVerifyDirJson);
       verifyDirPath.addEventListener('input', updateButtons);
       btnVerifyDir.addEventListener('click', sendVerifyDir);

@@ -412,24 +412,66 @@ records `{relative_path, size, sha256}` (paths forward-slashed, relative to the 
 directory), sorts entries by the **UTF-8 byte order** of `relative_path`, and hashes
 `relative_path + "\n" + size + "\n" + sha256 + "\n"` per entry into a single `tree_hash`.
 The console compares `tree_hash` for same/different and, when both manifests are present,
-diffs them to list missing / added / changed files. Policy (identical across all
-implementations): symlinks are not followed and are excluded, empty directories are not
-represented, and an unreadable file makes the whole result an error. Directory checks are
+diffs them to list missing / added / changed files. Policy: empty directories are not
+represented, and an unreadable file makes the whole result an error. The device and the
+`styly-mdm hash` CLI also exclude symlinks without following them; the browser cannot —
+neither `webkitdirectory` nor the Entries API exposes whether an entry is a link — so a
+reference folder containing symlinks will hash their contents and mismatch a device that
+skipped them. Directory checks are
 bounded to **shared external storage** (`/sdcard`), which is what `MANAGE_EXTERNAL_STORAGE`
 grants; the device canonicalizes the path and refuses anything outside that root. Large
 trees can omit the per-file `manifest` (a cap on entry count) and still compare by
-`tree_hash`. Note that OS-generated hidden files in a reference folder (e.g. macOS
-`.DS_Store`, `Thumbs.db`) are hashed as content and will show up as spurious "added"
-entries against a device that does not have them — prune them from the reference first.
+`tree_hash`.
 
-**Generating a reference.** In the console, pick a local `.apk` (Verify APK) or a folder
-(Verify Directory) — it is hashed in the browser, never uploaded. For large trees the
-`styly-mdm hash <path>` CLI is faster and deterministic; it prints the same JSON the
-console consumes and runs on the machine that holds the tree (which may differ from the
-server host):
+**OS metadata is not content.** `integrity.is_os_metadata()` — mirrored as `isOsMetadata()`
+in the console — matches `.DS_Store`, `Thumbs.db`, `desktop.ini`, AppleDouble `._*` sidecars,
+`__MACOSX/`, `.Spotlight-V100/` and friends on *any* path segment, case-insensitively. It is
+applied in exactly two places, and they are the same place conceptually: `POST /api/bundles`
+drops these files on the way into a push bundle, so a device never receives them; and the
+**reference builders** (browser and `styly-mdm hash`) drop them too, so a reference describes
+what push actually delivers. Without the second half a macOS reference folder reports a
+permanent `missing N` — reference-only files land in **`missing`**, not `added` — against a
+device that is byte-identical. The list is deliberately narrow: `.git/`, Unity `.meta` and
+dotfiles at large are content, and silently dropping content is worse than keeping a stray
+`.DS_Store`. The count is reported (`excluded_count`, shown in the console) rather than hidden.
+
+The **device does not apply this filter** — it reports what is actually on disk, and needs no
+client release to stay correct. So the invariant is not "all three implementations hash any
+input identically"; it is: *the reference builders agree with each other and model what push
+delivers, while the device reports ground truth.*
+
+Content can reach a device by routes other than push — copied over USB/MTP from a Mac, say —
+and then the device really does hold `.DS_Store` files. `classifyDir()` therefore re-folds the
+device's manifest with the OS-metadata entries removed before it declares a mismatch, and
+reports `N OS metadata ignored on device`. The device sends its manifest already sorted by
+UTF-8 byte order, and removing entries preserves that order, so the re-fold is exact. Genuine
+differences still surface: a missing or changed content file is reported as before. Above the
+device's manifest entry cap no manifest is sent, so OS metadata cannot be discounted — the
+console says `too large for a per-file diff` rather than blaming the operator's tree.
+
+**Generating a reference.** In the console, pick a local `.apk` (Verify APK) or supply a
+folder (Verify Directory) — it is hashed in the browser, never uploaded.
+
+A reference folder can be **dropped onto the Verify Directory drop zone** or chosen with
+*Choose Folder*. Both produce the same manifest, but the drop zone exists because Chrome
+shows a *"Upload N files to this site?"* confirmation for any `<input webkitdirectory>`
+pick — alarming, and untrue here. A drop instead arrives via `DataTransferItem.webkitGetAsEntry()`,
+which raises no such prompt and, unlike `showDirectoryPicker()`, works on the non-secure
+`http://<LAN-IP>` origin the console is served from. Two traps make the drop path subtly
+wrong if reimplemented: `DirectoryReader.readEntries()` returns the directory in batches
+(100 at a time in Chrome) and must be pumped until it yields an empty array, or the
+manifest is silently truncated into a false mismatch; and `webkitGetAsEntry()` must be
+called before the handler's first `await`, because `DataTransferItem`s are emptied as soon
+as it yields. Because the Entries API cannot identify symlinks, the walk is bounded by a
+depth cap instead of the device's symlink skip.
+
+For large trees the `styly-mdm hash <path>` CLI is faster and deterministic — the console's
+pure-JS SHA-256 runs around 80 MB/s, since `crypto.subtle` is unavailable on a non-secure
+origin. It prints the same JSON the console consumes and runs on the machine that holds the
+tree (which may differ from the server host):
 
 ```bash
-styly-mdm hash ./content            # directory -> {tree_hash, file_count, total_size, manifest}
+styly-mdm hash ./content            # directory -> {tree_hash, file_count, total_size, excluded_count, manifest}
 styly-mdm hash ./app-release.apk    # APK       -> {size, cd_sha256}
 ```
 

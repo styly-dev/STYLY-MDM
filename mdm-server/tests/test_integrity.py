@@ -161,6 +161,50 @@ def test_dir_manifest_omits_manifest_above_cap(tmp_path):
     assert capped["tree_hash"] == uncapped["tree_hash"]
 
 
+def test_dir_manifest_excludes_os_metadata(tmp_path):
+    _write(tmp_path / "Movies" / "clip.mp4", b"movie")
+    _write(tmp_path / ".DS_Store", b"junk")
+    _write(tmp_path / "Movies" / ".DS_Store", b"junk")
+    _write(tmp_path / "Movies" / "._clip.mp4", b"junk")
+    _write(tmp_path / "__MACOSX" / "._clip.mp4", b"junk")
+    result = integrity.dir_manifest(str(tmp_path))
+    assert [e["relative_path"] for e in result["manifest"]] == ["Movies/clip.mp4"]
+    assert result["excluded_count"] == 4
+
+
+def test_dir_manifest_keeps_authored_dotfiles(tmp_path):
+    # The exclusion list is deliberately narrow: anything a user could have written stays.
+    _write(tmp_path / ".gitignore", b"x")
+    _write(tmp_path / "scene.unity.meta", b"x")
+    _write(tmp_path / ".git" / "config", b"x")
+    result = integrity.dir_manifest(str(tmp_path))
+    assert [e["relative_path"] for e in result["manifest"]] == [
+        ".git/config", ".gitignore", "scene.unity.meta"]
+    assert result["excluded_count"] == 0
+
+
+def test_reference_matches_the_tree_that_push_delivers(tmp_path):
+    """A folder picked as a reference must hash to what `push files` actually ships.
+
+    `upload_bundle_handler` drops OS metadata on the way into the bundle, so a device never
+    receives it. If the reference kept those files the console would report a permanent
+    `missing N` against a device that is in fact identical.
+    """
+    source, delivered = tmp_path / "source", tmp_path / "delivered"
+    for rel in ["Movies/clip.mp4", "Textures/a.png"]:
+        _write(source / rel, rel.encode())
+        _write(delivered / rel, rel.encode())          # what survives the bundle
+    for junk in [".DS_Store", "Movies/.DS_Store", "Movies/._clip.mp4"]:
+        _write(source / junk, b"junk")                 # stripped by the bundle upload
+        assert integrity.is_os_metadata(junk) is True
+
+    reference = integrity.dir_manifest(str(source))
+    device = integrity.dir_manifest(str(delivered))
+    assert reference["tree_hash"] == device["tree_hash"]
+    assert reference["file_count"] == device["file_count"] == 2
+    assert reference["excluded_count"] == 3
+
+
 def test_dir_manifest_empty_tree(tmp_path):
     result = integrity.dir_manifest(str(tmp_path))
     assert result["file_count"] == 0

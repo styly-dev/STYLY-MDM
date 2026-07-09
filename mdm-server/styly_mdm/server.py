@@ -21,6 +21,10 @@ from pathlib import Path
 from urllib.parse import unquote
 from aiohttp import web
 
+# Bundling and integrity references must agree on what counts as content, or a reference
+# built from a folder could never match the device that folder was pushed to.
+from .integrity import is_os_metadata
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -1595,7 +1599,7 @@ async def upload_bundle_handler(request: web.Request) -> web.Response:
 
             # Drop OS metadata before it is written to staging, so it never reaches the zip
             # and never counts against the entry limit. reader.next() drains the skipped part.
-            if is_excluded_bundle_entry(relpath):
+            if is_os_metadata(relpath):
                 skipped.append(relpath)
                 continue
 
@@ -1657,57 +1661,6 @@ async def upload_bundle_handler(request: web.Request) -> web.Response:
         "entry_count": len(relpaths),
         "skipped_count": len(skipped),
     })
-
-
-# OS-generated metadata that rides along with a folder pick. None of it is content the user
-# meant to upload, and a folder copied via USB can carry one `._*` sidecar per file, so these
-# are dropped when the bundle is built rather than shipped to every device.
-#
-# Deliberately limited to files the OS creates on its own. Anything a user could plausibly
-# have authored — `.git/`, Unity `.meta`, dotfiles at large — is uploaded as-is: a silent drop
-# of real content would be far worse than an unwanted `.DS_Store`.
-_EXCLUDED_NAMES = frozenset({
-    ".ds_store",              # macOS Finder, one per directory
-    "thumbs.db",              # Windows Explorer thumbnail cache
-    "ehthumbs.db",
-    "desktop.ini",            # Windows folder settings
-    ".directory",             # KDE folder settings
-    ".apdisk",                # macOS
-    ".volumeicon.icns",       # macOS
-})
-
-# Directories the OS owns end-to-end; excluding the directory excludes everything under it.
-_EXCLUDED_DIRS = frozenset({
-    ".spotlight-v100",
-    ".trashes",
-    ".fseventsd",
-    ".temporaryitems",
-    ".documentrevisions-v100",
-    "__macosx",               # created when a macOS-made zip is expanded
-    "$recycle.bin",
-})
-
-
-def is_excluded_bundle_entry(relpath: str) -> bool:
-    """Return True if any path segment of ``relpath`` is OS-generated metadata.
-
-    Matching is case-insensitive: the same file is ``Thumbs.db`` on one machine and
-    ``thumbs.db`` on another, and macOS/Windows filesystems do not distinguish them.
-    Matching on *any* segment means a file nested under an excluded directory is dropped
-    along with it.
-    """
-    for seg in relpath.split("/"):
-        low = seg.lower()
-        if low in _EXCLUDED_NAMES or low in _EXCLUDED_DIRS:
-            return True
-        # AppleDouble resource forks: one `._name` sidecar per file, created whenever a
-        # macOS folder is copied onto a non-HFS filesystem such as a USB stick.
-        if low.startswith("._"):
-            return True
-        # Per-user trash directories on Linux removable media (`.Trash-1000`).
-        if low.startswith(".trash-"):
-            return True
-    return False
 
 
 def _is_within(root: Path, target: Path) -> bool:
