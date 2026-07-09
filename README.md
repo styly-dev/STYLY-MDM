@@ -62,13 +62,29 @@ The server starts on port 7070 and displays its LAN IP addresses:
 
 Open `http://<server-ip>:7070` in a browser to access the web console.
 
-**Configuration** — all optional:
+**Configuration** — all optional. A command-line flag overrides the corresponding environment variable.
 
 | Setting | Env var | Flag | Default |
 |---------|---------|------|---------|
 | HTTP/WebSocket port | `MDM_WS_PORT` | `--port` | `7070` |
 | UDP discovery port | `MDM_DISCOVERY_PORT` | — | `7071` |
 | Data directory (uploaded APKs + device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
+| Simultaneous APK transfers per install job | `MDM_MAX_CONCURRENT_TRANSFERS` | `--max-concurrent-transfers` | `5` |
+| Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `600` |
+
+The **data directory** holds everything the server persists: uploaded APKs (`apks/`), pushed file bundles (`bundles/`), and the device registry (`device_registry.json`). It defaults to the directory the server is started from, so `uvx styly-mdm` in a fresh directory comes up with no devices or groups. Pass `--data-dir` to pin it somewhere stable.
+
+**Transfer throttling** keeps a large install job from making every device pull the APK at the same instant (an APK can be up to 2 GiB). At most `--max-concurrent-transfers` devices download at once; the rest queue, and a slot frees as soon as its device reports the download finished. `MDM_TRANSFER_TIMEOUT` caps how long one device may hold a slot, so a stuck device cannot block the queue. The [Developer Guide](docs/DEVELOPMENT.md) documents the full slot-release rules.
+
+> **Only one server per discovery port.** Devices connect to whichever server answers discovery first, so two servers sharing a discovery port would split them nondeterministically. To prevent that, the server broadcasts a probe on startup and exits if another STYLY-MDM server answers:
+>
+> ```
+> [ERROR] Another STYLY-MDM server is already running on this network and
+> responding on discovery port 7071 (from 192.168.1.42). Refusing to start so
+> devices cannot connect to the wrong server.
+> ```
+>
+> To run a development server alongside production, give it its own ports — `mdm-server/run.sh dev` does this by setting `MDM_DISCOVERY_PORT=7081` and `MDM_WS_PORT=7080`. The probe is best-effort: two servers started at the same instant can miss each other.
 
 ### 2. Configure the MDM Client
 
@@ -114,7 +130,7 @@ Uploaded APKs are stored under `<data-dir>/apks/` (the data directory defaults t
 
 Device labels and group definitions live in a single file, `<data-dir>/device_registry.json`. Moving them to another machine is a file copy — there is no export step in the console.
 
-1. **Stop the old server, and make sure the new one is not running yet.** A running server owns the registry file: every label edit, group change, and battery report rewrites it from in-memory state, so a file dropped in underneath a live server is silently overwritten. Leaving the old server up also keeps it answering UDP discovery, and devices will bounce between the two.
+1. **Stop the old server, and make sure the new one is not running yet.** A running server owns the registry file: every label edit, group change, and battery report rewrites it from in-memory state, so a file dropped in underneath a live server is silently overwritten. The old server has to go down anyway — while it is still answering discovery on the same port, the new one refuses to start (see [Configuration](#1-start-the-control-server)).
 
 2. **Copy the registry into the new server's data directory.**
 
