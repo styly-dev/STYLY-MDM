@@ -168,6 +168,8 @@
     .battery-note { color: var(--text-muted); font-size: 11px; margin-left: 4px; }
     .battery-muted { color: var(--text-dim); }
     .dev-install { font-size: 12px; padding-right: 14px; }
+    .ins-queued { color: var(--text-muted); }
+    .ins-transferring { color: var(--info); }
     .ins-installing { color: var(--warning); }
     .ins-success { color: var(--success); }
     .ins-fail { color: var(--danger); }
@@ -529,7 +531,17 @@
             break;
           }
           case 'LAUNCH_SENT': addLog('Launch command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
-          case 'INSTALL_SENT': addLog('Install command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'INSTALL_SENT': addLog('Install job queued for ' + msg.target_count + ' device(s)' + (msg.max_concurrent ? ' (max ' + msg.max_concurrent + ' concurrent transfer(s))' : ''), 'info'); break;
+          case 'INSTALL_PROGRESS': showInstallProgress(msg); break;
+          case 'INSTALL_DEVICE_STATE': {
+            // Per-device companion to INSTALL_PROGRESS: the aggregate counts cannot
+            // be mapped back to rows, so the server names the devices it moved.
+            (msg.device_ids || []).forEach(function (id) {
+              installState[id] = { status: msg.state, filename: msg.apk_filename || '', detail: msg.detail || '' };
+              updateInstallCell(id);
+            });
+            break;
+          }
           case 'INSTALL_RESULT': {
             const st = msg.status === 'success' ? 'success' : 'fail';
             const detail = msg.error || msg.message || '';
@@ -693,9 +705,14 @@
         return html;
       }
 
+      // The four live states mirror the server's install job: a device waits for a
+      // transfer slot (queued), pulls the APK (transferring), installs it locally
+      // (installing), then reports a terminal INSTALL_RESULT (success/fail).
       function installCellHtml(id) {
         const st = installState[id];
         if (!st) return '<span class="ins-none">—</span>';
+        if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
+        if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
         if (st.status === 'installing') return '<span class="ins-installing"><span class="spinner">⟳</span> Installing…</span>';
         if (st.status === 'success') return '<span class="ins-success">✓ installed</span>' + (st.filename ? ' <span class="ins-none">' + esc(st.filename) + '</span>' : '');
         return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
@@ -807,7 +824,9 @@
         if (!online.length) { addLog('No online devices selected to install', 'warn'); return; }
         ensureUploaded().then(function (apk) {
           if (!wsSend({ type: 'INSTALL_APK', target_devices: online, apk_url: apk.apk_url, apk_filename: apk.apk_filename }, 'install')) return;
-          online.forEach(function (id) { installState[id] = { status: 'installing', filename: apk.apk_filename, detail: '' }; updateInstallCell(id); });
+          // Optimistic first paint only: every target really does start out waiting
+          // for a transfer slot. The server's INSTALL_DEVICE_STATE drives it from here.
+          online.forEach(function (id) { installState[id] = { status: 'queued', filename: apk.apk_filename, detail: '' }; updateInstallCell(id); });
           addLog('Installing ' + apk.apk_filename + ' on ' + online.length + ' device(s)', 'info');
           // Force a fresh pick next time (LAN/non-secure context cannot detect a local rebuild).
           apkFile.value = ''; uploadedApk = null; apkName.textContent = 'No APK selected'; updateButtons();
@@ -946,7 +965,7 @@
       }
 
       // ---------------- Log ----------------
-      function addLog(message, type) {
+      function makeLogEntry(message, type) {
         logEmpty.style.display = 'none';
         const entry = document.createElement('div'); entry.className = 'log-entry';
         const time = document.createElement('span'); time.className = 'log-time'; time.textContent = new Date().toLocaleTimeString();
@@ -954,6 +973,31 @@
         entry.appendChild(time); entry.appendChild(msg);
         logContainer.appendChild(entry);
         logContainer.scrollTop = logContainer.scrollHeight;
+        return { entry: entry, time: time, msg: msg };
+      }
+
+      function addLog(message, type) { makeLogEntry(message, type); }
+
+      // Throttled APK-install progress: the server broadcasts INSTALL_PROGRESS on
+      // every transfer-slot transition, so instead of one log line per event we
+      // keep a single entry per job and update it in place until it is done.
+      let installProgress = null; // { filename, nodes }
+      function showInstallProgress(msg) {
+        const label = msg.apk_filename || 'APK';
+        const body = 'Install ' + label + ': ' + (msg.transferred || 0) + ' done, ' +
+          (msg.transferring || 0) + ' transferring, ' + (msg.queued || 0) + ' queued' +
+          (msg.failed ? ', ' + msg.failed + ' failed/timed out' : '') +
+          ' (of ' + (msg.total || 0) + ')' + (msg.done ? ' — done' : '');
+        const type = msg.done ? (msg.failed ? 'warn' : 'success') : 'info';
+        if (installProgress && installProgress.filename === label && installProgress.nodes.entry.isConnected) {
+          installProgress.nodes.msg.textContent = body;
+          installProgress.nodes.msg.className = 'log-msg ' + type;
+          installProgress.nodes.time.textContent = new Date().toLocaleTimeString();
+          logContainer.scrollTop = logContainer.scrollHeight;
+        } else {
+          installProgress = { filename: label, nodes: makeLogEntry(body, type) };
+        }
+        if (msg.done) installProgress = null;
       }
 
       // ---------------- Formatting ----------------
