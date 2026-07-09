@@ -50,6 +50,7 @@ object UpdateJournal {
     const val EVENT_INSTALL_INVOKED = "INSTALL_INVOKED"
     const val EVENT_SELF_INSTALL_INVOKED = "SELF_INSTALL_INVOKED"
     const val EVENT_INSTALL_CALLBACK = "INSTALL_CALLBACK"
+    const val EVENT_SELF_UPDATE_CONFIRMED = "SELF_UPDATE_CONFIRMED"
 
     // Recorded by PackageReplacedReceiver.
     const val EVENT_PACKAGE_REPLACED = "PACKAGE_REPLACED"
@@ -102,6 +103,34 @@ object UpdateJournal {
             targetVersionCode = prefs.getLong(PREF_TARGET_VERSION_CODE, 0L),
             correlationId = prefs.getString(PREF_CORRELATION_ID, "") ?: ""
         )
+    }
+
+    /**
+     * Closes out a self-update once the process comes back running the build it targeted.
+     * The journal keeps the correlation id and the target versionCode; only the "in flight"
+     * marker is retired, so the viewer stops claiming an update is still pending.
+     *
+     * A marker left behind means the replacement never ran the new build — which is the
+     * outcome worth seeing.
+     */
+    fun confirmSelfUpdateIfLanded(context: Context) {
+        val pending = pendingSelfUpdate(context) ?: return
+        if (BuildConfig.VERSION_CODE.toLong() < pending.targetVersionCode) return
+
+        record(
+            context,
+            EVENT_SELF_UPDATE_CONFIRMED,
+            "target_version_code=${pending.targetVersionCode} " +
+                "running_version_code=${BuildConfig.VERSION_CODE} " +
+                "correlation_id=${pending.correlationId}"
+        )
+        synchronized(lock) {
+            prefs(context).edit()
+                .remove(PREF_UPDATE_IN_PROGRESS)
+                .remove(PREF_TARGET_VERSION_CODE)
+                .remove(PREF_CORRELATION_ID)
+                .commit()
+        }
     }
 
     fun clear(context: Context) {

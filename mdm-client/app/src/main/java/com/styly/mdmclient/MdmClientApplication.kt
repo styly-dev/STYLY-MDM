@@ -24,6 +24,10 @@ class MdmClientApplication : Application() {
             UpdateJournal.EVENT_APP_ONCREATE,
             "version_code=${BuildConfig.VERSION_CODE} version_name=${BuildConfig.VERSION_NAME}"
         )
+        // Running the build a pending self-update targeted proves the replacement landed.
+        // Reporting the outcome to the server is issue #39's follow-up; this only retires
+        // the marker so the journal viewer stops showing an update that already completed.
+        UpdateJournal.confirmSelfUpdateIfLanded(this)
         bindTobService()
     }
 
