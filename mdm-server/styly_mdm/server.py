@@ -1439,6 +1439,7 @@ async def upload_bundle_handler(request: web.Request) -> web.Response:
     staging = Path(tempfile.mkdtemp(prefix="upload-", dir=BUNDLE_DIR))
     total_size = 0
     relpaths: list[str] = []
+    skipped: list[str] = []
 
     try:
         while True:
@@ -1456,6 +1457,12 @@ async def upload_bundle_handler(request: web.Request) -> web.Response:
             if relpath is None:
                 return web.json_response(
                     {"error": f"Invalid file path in upload: {field.filename!r}"}, status=400)
+
+            # Drop OS metadata before it is written to staging, so it never reaches the zip
+            # and never counts against the entry limit. reader.next() drains the skipped part.
+            if is_excluded_bundle_entry(relpath):
+                skipped.append(relpath)
+                continue
 
             if len(relpaths) >= MAX_BUNDLE_ENTRIES:
                 return web.json_response(
@@ -1480,6 +1487,10 @@ async def upload_bundle_handler(request: web.Request) -> web.Response:
             relpaths.append(relpath)
 
         if not relpaths:
+            if skipped:
+                return web.json_response(
+                    {"error": "Upload contained only OS metadata files; nothing to send"},
+                    status=400)
             return web.json_response({"error": "multipart field 'files' is required"}, status=400)
 
         # A folder pick nests every file under the picked folder; mirror that folder's
@@ -1500,13 +1511,68 @@ async def upload_bundle_handler(request: web.Request) -> web.Response:
     bundle_url = f"{request.scheme}://{request.host}/bundles/{bundle_path.name}"
     log.info("Built bundle: %s (%d entries, %d bytes zipped)",
              bundle_path.name, len(relpaths), size)
+    if skipped:
+        log.info("Excluded %d OS metadata file(s) from %s: %s",
+                 len(skipped), bundle_path.name, ", ".join(skipped[:10]))
 
     return web.json_response({
         "bundle_filename": bundle_path.name,
         "bundle_url": bundle_url,
         "size": size,
         "entry_count": len(relpaths),
+        "skipped_count": len(skipped),
     })
+
+
+# OS-generated metadata that rides along with a folder pick. None of it is content the user
+# meant to upload, and a folder copied via USB can carry one `._*` sidecar per file, so these
+# are dropped when the bundle is built rather than shipped to every device.
+#
+# Deliberately limited to files the OS creates on its own. Anything a user could plausibly
+# have authored — `.git/`, Unity `.meta`, dotfiles at large — is uploaded as-is: a silent drop
+# of real content would be far worse than an unwanted `.DS_Store`.
+_EXCLUDED_NAMES = frozenset({
+    ".ds_store",              # macOS Finder, one per directory
+    "thumbs.db",              # Windows Explorer thumbnail cache
+    "ehthumbs.db",
+    "desktop.ini",            # Windows folder settings
+    ".directory",             # KDE folder settings
+    ".apdisk",                # macOS
+    ".volumeicon.icns",       # macOS
+})
+
+# Directories the OS owns end-to-end; excluding the directory excludes everything under it.
+_EXCLUDED_DIRS = frozenset({
+    ".spotlight-v100",
+    ".trashes",
+    ".fseventsd",
+    ".temporaryitems",
+    ".documentrevisions-v100",
+    "__macosx",               # created when a macOS-made zip is expanded
+    "$recycle.bin",
+})
+
+
+def is_excluded_bundle_entry(relpath: str) -> bool:
+    """Return True if any path segment of ``relpath`` is OS-generated metadata.
+
+    Matching is case-insensitive: the same file is ``Thumbs.db`` on one machine and
+    ``thumbs.db`` on another, and macOS/Windows filesystems do not distinguish them.
+    Matching on *any* segment means a file nested under an excluded directory is dropped
+    along with it.
+    """
+    for seg in relpath.split("/"):
+        low = seg.lower()
+        if low in _EXCLUDED_NAMES or low in _EXCLUDED_DIRS:
+            return True
+        # AppleDouble resource forks: one `._name` sidecar per file, created whenever a
+        # macOS folder is copied onto a non-HFS filesystem such as a USB stick.
+        if low.startswith("._"):
+            return True
+        # Per-user trash directories on Linux removable media (`.Trash-1000`).
+        if low.startswith(".trash-"):
+            return True
+    return False
 
 
 def _is_within(root: Path, target: Path) -> bool:

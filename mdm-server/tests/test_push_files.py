@@ -148,6 +148,80 @@ def test_strip_common_root():
     assert server.strip_common_root(["x/a.txt", "y/b.txt"]) == (None, ["x/a.txt", "y/b.txt"])
 
 
+@pytest.mark.parametrize("relpath", [
+    ".DS_Store",
+    "sub/.DS_Store",
+    "sub/.ds_store",                       # case-insensitive
+    "._resourcefork.txt",                  # AppleDouble sidecar
+    "sub/._a.txt",
+    "Thumbs.db",
+    "sub/thumbs.db",
+    "ehthumbs.db",
+    "desktop.ini",
+    ".directory",
+    ".apdisk",
+    ".VolumeIcon.icns",
+    ".Spotlight-V100/store.db",            # excluded via the directory segment
+    ".Trashes/501/x",
+    ".fseventsd/000",
+    ".TemporaryItems/a",
+    ".DocumentRevisions-V100/a",
+    "__MACOSX/._a.txt",
+    "$RECYCLE.BIN/a",
+    ".Trash-1000/files/a",                 # Linux per-user trash on removable media
+])
+def test_is_excluded_bundle_entry_matches_os_metadata(relpath):
+    assert server.is_excluded_bundle_entry(relpath) is True
+
+
+@pytest.mark.parametrize("relpath", [
+    "a.txt",
+    "sub/b.bin",
+    ".gitignore",                          # a dotfile the user authored stays
+    ".git/config",                         # VCS is deliberately NOT excluded
+    "scene.unity.meta",                    # Unity metadata is real content here
+    "_underscore.txt",                     # only "._" prefixes are AppleDouble
+    "my.DS_Store.txt",                     # substring, not the whole segment
+    "desktop.ini.bak",
+])
+def test_is_excluded_bundle_entry_keeps_real_content(relpath):
+    assert server.is_excluded_bundle_entry(relpath) is False
+
+
+def test_upload_bundle_drops_os_metadata_and_reports_the_count(tmp_path):
+    server._apply_data_dir(str(tmp_path))
+    app = styly_mdm.create_app()
+
+    status, body = asyncio.run(_upload(app, [
+        ("myfolder/a.txt", b"AAA"),
+        ("myfolder/.DS_Store", b"junk"),
+        ("myfolder/sub/b.txt", b"BBBBB"),
+        ("myfolder/sub/.DS_Store", b"junk"),
+        ("myfolder/sub/._b.txt", b"junk"),
+    ]))
+
+    assert status == 200
+    assert body["entry_count"] == 2
+    assert body["skipped_count"] == 3
+    with zipfile.ZipFile(server.BUNDLE_DIR / body["bundle_filename"]) as z:
+        assert set(z.namelist()) == {"a.txt", "sub/b.txt"}
+
+
+def test_upload_bundle_rejects_an_upload_that_is_only_os_metadata(tmp_path):
+    # Excluding everything must fail loudly rather than build an empty bundle that a
+    # Sync Folder would then use to wipe the destination.
+    server._apply_data_dir(str(tmp_path))
+    app = styly_mdm.create_app()
+
+    status, body = asyncio.run(_upload(app, [
+        ("myfolder/.DS_Store", b"junk"),
+        ("myfolder/sub/._a.txt", b"junk"),
+    ]))
+
+    assert status == 400
+    assert "OS metadata" in body["error"]
+
+
 def test_upload_bundle_folder_pick_mirrors_contents(tmp_path):
     # A folder pick nests files under the folder name; the bundle must contain the
     # folder's *contents* (root stripped) so it mirrors into the destination directly,

@@ -199,7 +199,7 @@ STYLY-MDM/
 |---|---|
 | `POST /api/apks` | Multipart upload with field `apk`. Returns `apk_url`, `apk_filename`, and `size`. |
 | `GET /apks/{filename}` | Serves uploaded APK files to devices on the LAN. |
-| `POST /api/bundles` | Multipart upload with repeated field `files`; each part's filename carries its folder-relative path. The server zips the reconstructed tree into a bundle. Returns `bundle_url`, `bundle_filename`, `size`, and `entry_count`. |
+| `POST /api/bundles` | Multipart upload with repeated field `files`; each part's filename carries its folder-relative path. The server zips the reconstructed tree into a bundle, excluding OS metadata (`.DS_Store`, `._*`, `Thumbs.db`, …). Returns `bundle_url`, `bundle_filename`, `size`, `entry_count` (files in the bundle), and `skipped_count` (files excluded). 400 if every uploaded file was excluded. |
 | `GET /bundles/{filename}` | Serves generated file/folder bundles (zip) to devices on the LAN. |
 
 ### Server → Admin
@@ -289,7 +289,8 @@ STYLY-MDM/
 
 > **Push files: two actions, one transport.** The console uploads a file or a whole
 > folder to `POST /api/bundles`; the server reconstructs the tree and zips it into a
-> single bundle served from `/bundles/`. `PUSH_FILES` carries the bundle URL, a
+> single bundle served from `/bundles/`, dropping OS-generated metadata on the way in
+> (see below). `PUSH_FILES` carries the bundle URL, a
 > destination directory, and `delete_extras`. The client downloads the bundle, unzips
 > it (with a zip-slip guard), and applies it to the destination — how it applies is
 > the whole distinction:
@@ -313,6 +314,23 @@ STYLY-MDM/
 > running an APK that has this change — an older client mirrors whatever it is sent.
 > `BundleSync` is deliberately Android-free so `app/src/test/.../BundleSyncTest.kt`
 > can prove both branches on the host JVM (`./gradlew :app:testProdDebugUnitTest`).
+>
+> **Excluded from every bundle.** A folder pick drags along whatever the OS left in it —
+> a `.DS_Store` per directory, an `._name` AppleDouble sidecar per file once the folder has
+> been through a USB stick, `Thumbs.db`, `desktop.ini`. `is_excluded_bundle_entry` drops
+> these in `upload_bundle_handler`, before anything is written to staging, so they never
+> reach the zip, never count against `MAX_BUNDLE_ENTRIES`, and never land on a device.
+> Matching is case-insensitive and applies to *any* path segment, so an excluded directory
+> (`.Spotlight-V100`, `__MACOSX`, `$RECYCLE.BIN`, `.Trash-1000`) takes its contents with it.
+>
+> The list is deliberately confined to files an OS creates on its own. `.git/`, Unity
+> `.meta` files, and dotfiles at large are uploaded as-is: silently dropping content a user
+> authored would be a worse failure than shipping an unwanted `.DS_Store`. An upload that is
+> *entirely* metadata is rejected with 400 rather than producing an empty bundle — a Sync
+> Folder given an empty bundle would wipe the destination. Since the console's pre-upload
+> file count comes from the browser and the post-upload count comes from the server, the
+> upload response returns `skipped_count` and the console logs what was excluded rather than
+> letting the two numbers silently disagree.
 >
 > Because a mirror deletes, and because the PICO ToBService exposes **no privileged
 > file-copy API**, two constraints apply to both actions and are enforced on the

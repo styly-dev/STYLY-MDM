@@ -962,7 +962,15 @@
           uploading = true; nameEl.textContent = 'Uploading ' + files.length + ' file(s)...'; updateButtons();
           return fetch('/api/bundles', { method: 'POST', body: fd })
             .then(function (r) { return r.json().catch(function () { return {}; }).then(function (p) { if (!r.ok) throw new Error(p.error || r.statusText); return p; }); })
-            .then(function (p) { uploaded = p; nameEl.innerHTML = 'Uploaded: <strong>' + esc(p.bundle_filename) + '</strong> (' + p.entry_count + ' file(s), ' + formatBytes(p.size) + ')'; addLog('Uploaded bundle: ' + p.bundle_filename + ' (' + p.entry_count + ' file(s))', 'success'); return p; })
+            .then(function (p) {
+              uploaded = p;
+              nameEl.innerHTML = 'Uploaded: <strong>' + esc(p.bundle_filename) + '</strong> (' + p.entry_count + ' file(s), ' + formatBytes(p.size) + ')';
+              addLog('Uploaded bundle: ' + p.bundle_filename + ' (' + p.entry_count + ' file(s))', 'success');
+              // The picked-file count above the button counts what the OS handed the browser;
+              // the server drops its own metadata. Say so, rather than let the numbers differ.
+              if (p.skipped_count) addLog('Excluded ' + p.skipped_count + ' OS metadata file(s) (e.g. .DS_Store) from the bundle', 'info');
+              return p;
+            })
             .finally(function () { uploading = false; updateButtons(); });
         }
 
