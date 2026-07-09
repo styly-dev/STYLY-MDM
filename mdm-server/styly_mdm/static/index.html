@@ -566,7 +566,7 @@
             // Per-device companion to INSTALL_PROGRESS: the aggregate counts cannot
             // be mapped back to rows, so the server names the devices it moved.
             (msg.device_ids || []).forEach(function (id) {
-              installState[id] = { status: msg.state, filename: msg.apk_filename || '', detail: msg.detail || '' };
+              installState[id] = { task: 'install', status: msg.state, filename: msg.apk_filename || '', detail: msg.detail || '' };
               updateInstallCell(id);
             });
             break;
@@ -574,18 +574,22 @@
           case 'INSTALL_RESULT': {
             const st = msg.status === 'success' ? 'success' : 'fail';
             const detail = msg.error || msg.message || '';
-            if (msg.device_id) { installState[msg.device_id] = { status: st, filename: msg.apk_filename || '', detail: detail }; updateInstallCell(msg.device_id); }
+            if (msg.device_id) { installState[msg.device_id] = { task: 'install', status: st, filename: msg.apk_filename || '', detail: detail }; updateInstallCell(msg.device_id); }
             addLog('[' + (msg.status === 'success' ? 'OK' : 'FAIL') + '] install ' + (msg.apk_filename || '-') + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), st);
             break;
           }
           case 'PUSH_FILES_SENT': addLog('Push command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s) → ' + (msg.dest_path || '-'), 'info'); break;
           case 'PUSH_FILES_RESULT': {
             const st = msg.status === 'success' ? 'success' : 'fail';
+            const summary = '+' + (msg.added || 0) + ' ~' + (msg.updated || 0) + ' -' + (msg.deleted || 0);
+            const detail = msg.error || msg.message || '';
+            if (msg.device_id) {
+              installState[msg.device_id] = { task: 'push', status: st, filename: msg.dest_path || '', note: st === 'success' ? summary : '', detail: detail };
+              updateInstallCell(msg.device_id);
+            }
             if (st === 'success') {
-              const summary = '+' + (msg.added || 0) + ' ~' + (msg.updated || 0) + ' -' + (msg.deleted || 0);
               addLog('[OK] push to ' + (msg.dest_path || '-') + ' on ' + labelFor(msg.device_id) + ' (' + summary + ')', 'success');
             } else {
-              const detail = msg.error || msg.message || '';
               addLog('[FAIL] push to ' + (msg.dest_path || '-') + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), 'fail');
             }
             break;
@@ -702,7 +706,7 @@
         let html = '<div class="dev-table">';
         html += '<div class="dev-row dev-head">' +
           '<div class="selbox ' + (allSel ? 'on' : someSel ? 'mixed' : '') + '" data-act="selectAll">' + (allSel ? '✓' : someSel ? '–' : '') + '</div>' +
-          '<div>Device</div><div>Status</div><div>Battery</div><div>Install</div></div>';
+          '<div>Device</div><div>Status</div><div>Battery</div><div>Progress</div></div>';
         devices.forEach(function (d) {
           const id = getDeviceId(d);
           const checked = selectedIds.has(id);
@@ -746,12 +750,22 @@
         return html;
       }
 
-      // The four live states mirror the server's install job: a device waits for a
-      // transfer slot (queued), pulls the APK (transferring), installs it locally
-      // (installing), then reports a terminal INSTALL_RESULT (success/fail).
+      // The cell shows whichever job last touched the device, install or push.
+      //
+      // An install's four live states mirror the server's install job: a device waits
+      // for a transfer slot (queued), pulls the APK (transferring), installs it locally
+      // (installing), then reports a terminal INSTALL_RESULT (success/fail). A push has
+      // no such phases — it is not throttled, so the server holds no per-device state
+      // for it and cannot broadcast transitions. The console paints `pushing` on
+      // dispatch and resolves it on PUSH_FILES_RESULT.
       function installCellHtml(id) {
         const st = installState[id];
         if (!st) return '<span class="ins-none">—</span>';
+        if (st.task === 'push') {
+          if (st.status === 'pushing') return '<span class="ins-installing"><span class="spinner">⟳</span> Pushing…</span>';
+          if (st.status === 'success') return '<span class="ins-success">✓ pushed</span>' + (st.note ? ' <span class="ins-none">' + esc(st.note) + '</span>' : '');
+          return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
+        }
         if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
         if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
         if (st.status === 'installing') return '<span class="ins-installing"><span class="spinner">⟳</span> Installing…</span>';
@@ -870,7 +884,7 @@
           if (!wsSend({ type: 'INSTALL_APK', target_devices: online, apk_url: apk.apk_url, apk_filename: apk.apk_filename }, 'install')) return;
           // Optimistic first paint only: every target really does start out waiting
           // for a transfer slot. The server's INSTALL_DEVICE_STATE drives it from here.
-          online.forEach(function (id) { installState[id] = { status: 'queued', filename: apk.apk_filename, detail: '' }; updateInstallCell(id); });
+          online.forEach(function (id) { installState[id] = { task: 'install', status: 'queued', filename: apk.apk_filename, detail: '' }; updateInstallCell(id); });
           addLog('Installing ' + apk.apk_filename + ' on ' + online.length + ' device(s)', 'info');
           // Force a fresh pick next time (LAN/non-secure context cannot detect a local rebuild).
           apkFile.value = ''; uploadedApk = null; apkName.textContent = 'No APK selected'; updateButtons();
@@ -912,6 +926,10 @@
         if (!online.length) { addLog('No online devices selected to push files', 'warn'); return; }
         ensureBundleUploaded().then(function (bundle) {
           if (!wsSend({ type: 'PUSH_FILES', target_devices: online, bundle_url: bundle.bundle_url, bundle_filename: bundle.bundle_filename, dest_path: dest }, 'push files')) return;
+          // Optimistic first paint: a push is dispatched to every online target at once
+          // (no throttle), so each one really is pushing from here until its
+          // PUSH_FILES_RESULT arrives, or DEVICE_LIST drops it as offline.
+          online.forEach(function (id) { installState[id] = { task: 'push', status: 'pushing', filename: dest, note: '', detail: '' }; updateInstallCell(id); });
           addLog('Pushing ' + bundle.bundle_filename + ' → ' + dest + ' on ' + online.length + ' device(s)', 'info');
           // Force a fresh pick next time (LAN/non-secure context cannot detect a local change).
           resetPushSelection();

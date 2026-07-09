@@ -263,7 +263,7 @@ STYLY-MDM/
 
 > **Per-device install state.** `INSTALL_PROGRESS` carries only aggregate counts,
 > which cannot be mapped back to rows, so the server also broadcasts
-> `INSTALL_DEVICE_STATE` as each device moves. The console's INSTALL column shows
+> `INSTALL_DEVICE_STATE` as each device moves. The console's PROGRESS column shows
 > `Waiting…` → `Transferring…` → `Installing…` → `✓ installed` / `✗ failed`, which
 > is what distinguishes a device queued behind a transfer slot from one that is
 > genuinely installing.
@@ -308,6 +308,15 @@ STYLY-MDM/
 > `Podcasts`, `Ringtones`) so a mistyped path cannot wipe unrelated user/media
 > data. The console additionally requires an explicit "extras will be deleted"
 > confirmation before dispatch.
+>
+> Push reuses the per-device PROGRESS column, showing `Pushing…` → `✓ pushed`
+> (with the `+added ~updated -deleted` summary) / `✗ failed`. Unlike install,
+> these transitions are **not** server-driven: push is not throttled, so the
+> server holds no per-device state to broadcast. The console paints `Pushing…`
+> optimistically on dispatch and resolves it on `PUSH_FILES_RESULT`; a device that
+> drops offline mid-push clears its cell on the next `DEVICE_LIST`. The column
+> holds one state per device, so a push and an install targeting the same device
+> overwrite each other's cell — the last job dispatched wins.
 
 ## Server Discovery Protocol
 
