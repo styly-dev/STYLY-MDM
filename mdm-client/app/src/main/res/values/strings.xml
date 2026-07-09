@@ -12,4 +12,7 @@
     <string name="storage_permission_granted">Granted</string>
     <string name="storage_permission_not_granted">Not granted — required to install APKs</string>
     <string name="storage_permission_settings_unavailable">Could not open the All Files Access settings on this device</string>
+    <string name="update_journal_label">Update Journal</string>
+    <string name="update_journal_refresh">Refresh</string>
+    <string name="update_journal_clear">Clear</string>
 </resources>

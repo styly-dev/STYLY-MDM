@@ -17,6 +17,13 @@ class MdmClientApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "Initializing STYLY-MDM Client")
+        // The first thing the replacement process does after a self-update. Recording it
+        // separates "the process was started" from "the service was started".
+        UpdateJournal.record(
+            this,
+            UpdateJournal.EVENT_APP_ONCREATE,
+            "version_code=${BuildConfig.VERSION_CODE} version_name=${BuildConfig.VERSION_NAME}"
+        )
         bindTobService()
     }
 
@@ -28,13 +35,24 @@ class MdmClientApplication : Application() {
                     try {
                         ToBServiceHelper.getInstance().serviceBinder?.pbsAppKeepAlive(packageName, true, 0)
                         Log.i(TAG, "Keep-alive registered")
+                        UpdateJournal.record(this, UpdateJournal.EVENT_KEEP_ALIVE, "registered")
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to set keep-alive", e)
+                        UpdateJournal.record(
+                            this,
+                            UpdateJournal.EVENT_KEEP_ALIVE,
+                            "failed ${e.javaClass.name}: ${e.message}"
+                        )
                     }
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to bind TobService", e)
+            UpdateJournal.record(
+                this,
+                UpdateJournal.EVENT_KEEP_ALIVE,
+                "bind failed ${e.javaClass.name}: ${e.message}"
+            )
         }
     }
 }

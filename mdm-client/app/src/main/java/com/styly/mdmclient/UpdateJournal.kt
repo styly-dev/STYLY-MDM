@@ -1,0 +1,162 @@
+package com.styly.mdmclient
+
+import android.content.Context
+import android.content.SharedPreferences
+import android.util.Log
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/**
+ * A small persistent event log that survives the client killing itself.
+ *
+ * When the MDM installs an APK whose package is our own, Android kills this process as part
+ * of the package replacement. Nothing held in memory survives, and the `IIntCallback` that
+ * normally reports the install result dies with the binder. The journal is therefore the
+ * only post-mortem available: it is written to disk before the installer is invoked and read
+ * back by the replacement process.
+ *
+ * Every write uses `commit()`, not `apply()`. `apply()` hands the write to a background
+ * thread, which is exactly the thread that will not survive the package replacement.
+ *
+ * Serialization lives in [UpdateJournalCodec], which is unit-tested on the host JVM.
+ */
+object UpdateJournal {
+
+    private const val TAG = "UpdateJournal"
+
+    private const val PREF_EVENTS = "update_journal"
+    private const val PREF_UPDATE_IN_PROGRESS = "update_in_progress"
+    private const val PREF_TARGET_VERSION_CODE = "update_target_version_code"
+    private const val PREF_CORRELATION_ID = "update_correlation_id"
+
+    private val lock = Any()
+
+    // Recorded by the app process on startup.
+    const val EVENT_APP_ONCREATE = "APP_ONCREATE"
+    const val EVENT_KEEP_ALIVE = "KEEP_ALIVE"
+
+    // Recorded by MdmClientService around the two calls that can independently fail.
+    const val EVENT_SERVICE_ONCREATE = "SERVICE_ONCREATE"
+    const val EVENT_SERVICE_FOREGROUND_OK = "SERVICE_FOREGROUND_OK"
+    const val EVENT_SERVICE_START_COMMAND = "SERVICE_START_COMMAND"
+    const val EVENT_SERVICE_DESTROYED = "SERVICE_DESTROYED"
+
+    // Recorded by SettingsActivity, so a keep-alive relaunch of the LAUNCHER activity is not
+    // mistaken for a user opening the app by hand.
+    const val EVENT_ACTIVITY_ONCREATE = "ACTIVITY_ONCREATE"
+
+    // Recorded around the silent install.
+    const val EVENT_INSTALL_INVOKED = "INSTALL_INVOKED"
+    const val EVENT_SELF_INSTALL_INVOKED = "SELF_INSTALL_INVOKED"
+    const val EVENT_INSTALL_CALLBACK = "INSTALL_CALLBACK"
+
+    // Recorded by PackageReplacedReceiver.
+    const val EVENT_PACKAGE_REPLACED = "PACKAGE_REPLACED"
+    const val EVENT_FGS_ATTEMPT = "FGS_ATTEMPT"
+
+    /**
+     * Appends an event. Safe to call from any thread and from a BroadcastReceiver, and returns
+     * only once the entry is on disk.
+     */
+    fun record(context: Context, event: String, detail: String = "") {
+        synchronized(lock) {
+            val prefs = prefs(context)
+            val updated = UpdateJournalCodec.append(
+                existing = prefs.getString(PREF_EVENTS, "") ?: "",
+                timestampMillis = System.currentTimeMillis(),
+                event = event,
+                detail = detail
+            )
+            prefs.edit().putString(PREF_EVENTS, updated).commit()
+        }
+        Log.i(TAG, if (detail.isEmpty()) event else "$event: $detail")
+    }
+
+    /**
+     * Persists the fact that a self-update is under way, before the installer is invoked and
+     * the process dies. The replacement process reads this back to tell "I was updated" from
+     * "I crashed and restarted".
+     */
+    fun markSelfUpdateStarted(context: Context, targetVersionCode: Long, correlationId: String) {
+        synchronized(lock) {
+            prefs(context).edit()
+                .putBoolean(PREF_UPDATE_IN_PROGRESS, true)
+                .putLong(PREF_TARGET_VERSION_CODE, targetVersionCode)
+                .putString(PREF_CORRELATION_ID, correlationId)
+                .commit()
+        }
+        record(
+            context,
+            EVENT_SELF_INSTALL_INVOKED,
+            "target_version_code=$targetVersionCode correlation_id=$correlationId " +
+                "running_version_code=${BuildConfig.VERSION_CODE}"
+        )
+    }
+
+    /** The pending self-update, or null when no update is in flight. */
+    fun pendingSelfUpdate(context: Context): PendingUpdate? {
+        val prefs = prefs(context)
+        if (!prefs.getBoolean(PREF_UPDATE_IN_PROGRESS, false)) return null
+        return PendingUpdate(
+            targetVersionCode = prefs.getLong(PREF_TARGET_VERSION_CODE, 0L),
+            correlationId = prefs.getString(PREF_CORRELATION_ID, "") ?: ""
+        )
+    }
+
+    fun clear(context: Context) {
+        synchronized(lock) {
+            prefs(context).edit()
+                .remove(PREF_EVENTS)
+                .remove(PREF_UPDATE_IN_PROGRESS)
+                .remove(PREF_TARGET_VERSION_CODE)
+                .remove(PREF_CORRELATION_ID)
+                .commit()
+        }
+    }
+
+    /** Human-readable dump for the in-headset viewer, newest last. */
+    fun format(context: Context): String {
+        val prefs = prefs(context)
+        val entries = UpdateJournalCodec.parse(prefs.getString(PREF_EVENTS, "") ?: "")
+
+        val out = StringBuilder()
+        out.append("running: versionCode=${BuildConfig.VERSION_CODE} ")
+            .append("versionName=${BuildConfig.VERSION_NAME} ")
+            .append("spikeMode=${BuildConfig.SPIKE_MODE}\n")
+        val pending = pendingSelfUpdate(context)
+        if (pending != null) {
+            out.append(
+                "pending self-update: target=${pending.targetVersionCode} " +
+                    "correlation_id=${pending.correlationId}\n"
+            )
+        }
+        out.append('\n')
+
+        if (entries.isEmpty()) {
+            return out.append("(no events recorded)").toString()
+        }
+
+        val stamp = SimpleDateFormat("MM-dd HH:mm:ss", Locale.US)
+        for (entry in entries) {
+            out.append(stamp.format(Date(entry.timestampMillis)))
+                .append("  ")
+                .append(entry.event)
+                .append('\n')
+            if (entry.detail.isNotEmpty()) {
+                out.append("    ").append(entry.detail).append('\n')
+            }
+        }
+        return out.toString()
+    }
+
+    private fun prefs(context: Context): SharedPreferences {
+        return context.applicationContext
+            .getSharedPreferences(WebSocketManager.PREF_NAME, Context.MODE_PRIVATE)
+    }
+
+    data class PendingUpdate(
+        val targetVersionCode: Long,
+        val correlationId: String
+    )
+}

@@ -35,6 +35,14 @@ Usage: `./build.sh [debug|release] [prod|dev]` (defaults: `debug prod`).
 The generated APK is output to `mdm-client/app/build/outputs/apk/<flavor>/<type>/`,
 e.g. `apk/prod/debug/app-prod-debug.apk` or `apk/dev/debug/app-dev-debug.apk`.
 
+Gradle properties, for self-update testing (see [Client Self-Update](#client-self-update)):
+
+| Property | Default | Purpose |
+|---|---|---|
+| `-PversionCodeOverride=N` | `versionCode` in `app/build.gradle` | Push a strictly-increasing `versionCode` without editing the file |
+| `-PversionNameOverride=S` | `versionName` in `app/build.gradle` | Label a one-off build |
+| `-PspikeMode=off\|observe\|act` | `off` | Restart-probe instrumentation. `off` is the shipped behavior |
+
 ### Build from Android Studio
 
 1. Open the `mdm-client/` directory in Android Studio.
@@ -154,8 +162,12 @@ STYLY-MDM/
             ├── MdmClientApplication.kt   # Application entry point
             ├── MdmClientService.kt       # Foreground service; executes launch commands
             ├── WebSocketManager.kt       # WebSocket connection with auto-reconnect
-            ├── SettingsActivity.kt       # UI to configure server URL
+            ├── SettingsActivity.kt       # UI to configure server URL; Update Journal viewer
             ├── ServerDiscovery.kt        # UDP broadcast server discovery
+            ├── BundleSync.kt             # Push/sync a file bundle into a device directory
+            ├── UpdateJournal.kt          # Persistent event log; survives a self-update kill
+            ├── UpdateJournalCodec.kt     # Journal serialization (unit-tested on the host JVM)
+            ├── PackageReplacedReceiver.kt # MY_PACKAGE_REPLACED probe (-PspikeMode)
             └── BootReceiver.kt           # Auto-start on device boot
 ```
 
@@ -165,7 +177,7 @@ STYLY-MDM/
 
 | Message type | Description |
 |---|---|
-| `REGISTER` | Sent on connect. Fields: `device_id`, `model`, `ip`, `startup_app` (optional) |
+| `REGISTER` | Sent on connect. Fields: `device_id`, `model`, `ip`, `version_code` (integer), `version_name`, `startup_app` (optional) |
 | `BATTERY_UPDATE` | Battery telemetry. Fields: `device_id`, `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds) |
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
@@ -508,6 +520,48 @@ tree (which may differ from the server host):
 styly-mdm hash ./content            # directory -> {tree_hash, file_count, total_size, excluded_count, manifest}
 styly-mdm hash ./app-release.apk    # APK       -> {size, cd_sha256}
 ```
+
+## Client Self-Update
+
+Installing an APK whose package is `com.styly.mdmclient` makes the client replace *itself*.
+Android kills the process during package replacement, so the `IIntCallback` that normally
+reports the install result dies with the binder: on success it never fires, the downloaded
+APK is never cleaned up, and the WebSocket simply drops.
+
+### The update journal
+
+`UpdateJournal` is a persistent event log in `stylymdm_prefs`, and the only post-mortem that
+survives the process being killed. It is written with `commit()` rather than `apply()`,
+because `apply()`'s background writer thread does not survive package replacement.
+`MdmClientService.installApk` records the target `versionCode` and a correlation id *before*
+invoking the silent installer, so the replacement process can tell "I was updated" apart from
+"I crashed and restarted".
+
+The journal is readable in the headset under **Settings → Update Journal**, so diagnosing a
+failed update does not require adb. Serialization lives in `UpdateJournalCodec` (one
+tab-separated event per line) and is unit-tested on the host JVM.
+
+### Restart instrumentation (`-PspikeMode`)
+
+Whether the client comes back on its own after a self-update is device behavior, not a
+documented guarantee: the PICO keep-alive (`pbsAppKeepAlive`) may or may not cover package
+replacement, and Android 12+ forbids starting a foreground service from the background —
+`BOOT_COMPLETED` is a documented exemption, `MY_PACKAGE_REPLACED` is not. `PackageReplacedReceiver`
+exists to measure both. `MY_PACKAGE_REPLACED` is delivered to the **new** APK, so the *pushed*
+build decides the behavior:
+
+| `-PspikeMode` | Receiver in manifest | On `MY_PACKAGE_REPLACED` | Answers |
+|---|---|---|---|
+| `off` (default) | `enabled="false"` | not delivered | Does keep-alive alone restart the client, with no new code at all? |
+| `observe` | `enabled="true"` | journals only | Is the broadcast delivered? Does the service still come back? |
+| `act` | `enabled="true"` | journals, then `startForegroundService()` | Does the foreground-service start throw? |
+
+`off` is the shipped default, so a normal build behaves exactly as it did before.
+
+When testing, note that a debug-signed APK cannot replace a release-signed install (silent
+install fails with `106 Package conflict`), that the `prod` and `dev` flavors share
+`applicationId` and therefore replace each other, and that `versionCode` must strictly
+increase.
 
 ## Server Discovery Protocol
 

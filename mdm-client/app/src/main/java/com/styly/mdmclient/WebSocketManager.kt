@@ -232,6 +232,9 @@ class WebSocketManager(
             put("device_id", getDeviceSerialNumber())
             put("model", Build.MODEL)
             put("ip", getDeviceIpAddress())
+            // Lets the server confirm which build re-registered after a self-update (#39).
+            put("version_code", BuildConfig.VERSION_CODE)
+            put("version_name", BuildConfig.VERSION_NAME)
 
             val startupConfig = getStartupAppConfig()
             if (startupConfig != null) {

@@ -29,6 +29,7 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
+import java.util.UUID
 import java.util.zip.ZipFile
 
 /**
@@ -46,6 +47,23 @@ class MdmClientService : Service() {
         const val ACTION_STATUS_UPDATE = "com.styly.mdmclient.STATUS_UPDATE"
         const val EXTRA_CONNECTED = "connected"
         const val EXTRA_MESSAGE = "message"
+
+        // Who asked for the service to start. Journalled so an unattended restart (keep-alive
+        // or START_STICKY, which pass no extra) is distinguishable from a user opening the
+        // launcher activity. See UpdateJournal.
+        const val EXTRA_START_REASON = "start_reason"
+        const val REASON_BOOT = "boot"
+        const val REASON_SETTINGS = "settings"
+        const val REASON_PACKAGE_REPLACED = "package_replaced"
+        private const val REASON_SYSTEM = "system"
+
+        /**
+         * Read by PackageReplacedReceiver, which runs in the same freshly-started process, to
+         * tell whether the foreground service was already up when the broadcast arrived.
+         */
+        @Volatile
+        var isRunning = false
+            private set
 
         // Top-level shared-storage directories that full-mirror push-files sync must never
         // target: mirroring into them would delete unrelated user/media/app data. Matched
@@ -75,9 +93,20 @@ class MdmClientService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "MdmClientService created")
+        UpdateJournal.record(
+            this,
+            UpdateJournal.EVENT_SERVICE_ONCREATE,
+            "version_code=${BuildConfig.VERSION_CODE}"
+        )
 
         createNotificationChannel()
+        // startForeground() is the call that throws ForegroundServiceStartNotAllowedException on
+        // Android 12+ when the start came from the background; startForegroundService() itself
+        // can return cleanly first. Journalling only after it returns pins a failure to the
+        // right call instead of leaving the two indistinguishable.
         startForeground(NOTIFICATION_ID, buildNotification("Initializing..."))
+        UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_FOREGROUND_OK)
+        isRunning = true
 
         webSocketManager = WebSocketManager(
             context = this,
@@ -90,7 +119,19 @@ class MdmClientService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.i(TAG, "MdmClientService started")
+        // A null intent is a START_STICKY redelivery; a start with no reason extra came from
+        // outside our own code — the PICO keep-alive being the case the spike is looking for.
+        val reason = when {
+            intent == null -> REASON_SYSTEM
+            intent.action == "com.pvr.tobservice.SERVICE_AUTO_BOOT" -> "tob_auto_boot"
+            else -> intent.getStringExtra(EXTRA_START_REASON) ?: REASON_SYSTEM
+        }
+        Log.i(TAG, "MdmClientService started (reason=$reason)")
+        UpdateJournal.record(
+            this,
+            UpdateJournal.EVENT_SERVICE_START_COMMAND,
+            "reason=$reason flags=$flags"
+        )
         return START_STICKY
     }
 
@@ -98,6 +139,8 @@ class MdmClientService : Service() {
 
     override fun onDestroy() {
         Log.i(TAG, "MdmClientService destroyed")
+        UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_DESTROYED)
+        isRunning = false
         webSocketManager.disconnect()
         super.onDestroy()
     }
@@ -298,7 +341,27 @@ class MdmClientService : Service() {
             return
         }
 
-        Log.i(TAG, "Installing APK: ${apkFile.absolutePath}")
+        // When the APK replaces our own package, Android kills this process: the IIntCallback
+        // below never fires on success and the APK is left behind. Commit what we know to disk
+        // first so the replacement process can tell "I was updated" from "I crashed".
+        val archive = archiveIdentity(apkFile)
+        val isSelfUpdate = archive != null && archive.packageName == packageName
+        if (isSelfUpdate) {
+            UpdateJournal.markSelfUpdateStarted(
+                this,
+                archive!!.versionCode,
+                UUID.randomUUID().toString()
+            )
+        } else {
+            UpdateJournal.record(
+                this,
+                UpdateJournal.EVENT_INSTALL_INVOKED,
+                "package=${archive?.packageName ?: "unreadable"} " +
+                    "target_version_code=${archive?.versionCode ?: -1} file=$apkFilename"
+            )
+        }
+
+        Log.i(TAG, "Installing APK: ${apkFile.absolutePath} (self_update=$isSelfUpdate)")
         try {
             binder.pbsControlAPPManger(
                 PBS_PackageControlEnum.PACKAGE_SILENCE_INSTALL,
@@ -308,6 +371,13 @@ class MdmClientService : Service() {
                     override fun callback(result: Int) {
                         val error = if (result == 0) "" else "pbsControlAPPManger returned $result: ${installResultMessage(result)}"
                         Log.i(TAG, "pbsControlAPPManger result: $result for $apkFilename")
+                        // On a self-update this only runs when the install failed, since a
+                        // successful replacement takes the process (and this binder) with it.
+                        UpdateJournal.record(
+                            this@MdmClientService,
+                            UpdateJournal.EVENT_INSTALL_CALLBACK,
+                            "result=$result (${installResultMessage(result)}) self_update=$isSelfUpdate"
+                        )
                         sendInstallResult(
                             apkFilename,
                             if (result == 0) "success" else "fail",
@@ -325,6 +395,26 @@ class MdmClientService : Service() {
             throw e
         }
     }
+
+    /**
+     * The package name and versionCode declared inside a downloaded APK, or null when the
+     * archive cannot be parsed. Used to recognise an update of our own package before the
+     * installer is invoked.
+     */
+    private fun archiveIdentity(apkFile: File): ArchiveIdentity? {
+        return try {
+            val info = packageManager.getPackageArchiveInfo(apkFile.absolutePath, 0) ?: return null
+            ArchiveIdentity(info.packageName, info.longVersionCode)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to read package info from ${apkFile.absolutePath}", e)
+            null
+        }
+    }
+
+    private data class ArchiveIdentity(
+        val packageName: String,
+        val versionCode: Long
+    )
 
     /**
      * Download a file/folder bundle and apply it to a destination directory.
