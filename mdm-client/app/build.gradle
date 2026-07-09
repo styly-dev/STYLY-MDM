@@ -79,4 +79,8 @@ dependencies {
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.squareup.okhttp3:okhttp:4.11.0'
     implementation 'com.picoxr.tobservice:tobservicelib:4.3.16'
+
+    // Host JVM tests. BundleSync deletes files on the device, so its copy-vs-mirror
+    // behaviour is proven here rather than only on real hardware.
+    testImplementation 'junit:junit:4.13.2'
 }

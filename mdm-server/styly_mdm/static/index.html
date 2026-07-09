@@ -223,6 +223,8 @@
     .file-name strong { color: var(--text-primary); font-weight: 600; }
     .push-warn { font-size: 11.5px; line-height: 1.5; color: var(--warning); background: var(--bg-card); border: 1px solid #5a4a1c; border-radius: 6px; padding: 8px 10px; margin-top: 7px; }
     .push-warn code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+    .push-note { font-size: 11.5px; line-height: 1.5; color: var(--text-secondary); background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 6px; padding: 8px 10px; margin-top: 7px; }
+    .push-note code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
     .push-confirm { display: flex; align-items: flex-start; gap: 7px; font-size: 12px; color: var(--text-secondary); margin-top: 7px; cursor: pointer; }
     .push-confirm input { margin-top: 1px; flex-shrink: 0; }
 
@@ -362,9 +364,23 @@
                   <span class="file-name" id="pushName">No file or folder selected</span>
                 </div>
                 <input type="text" class="field" id="pushDest" placeholder="/sdcard/STYLY/content">
-                <div class="push-warn">⚠ Full-mirror sync into the destination directory. A picked folder's <em>contents</em> are mirrored into it (e.g. folder <code>content</code> → files land directly in the destination). Files already under the destination that are <strong>not</strong> in this upload will be <strong>deleted</strong> on every selected device. Destinations must be under shared storage (e.g. <code>/sdcard/…</code>) — app-private folders are not reachable.</div>
-                <label class="push-confirm"><input type="checkbox" id="pushConfirm"> I understand extras at the destination will be deleted</label>
+                <div class="push-note">Copies into the destination directory, overwriting files of the same name. Nothing already at the destination is deleted. A picked folder's <em>contents</em> land directly in the destination. Destinations must be under shared storage (e.g. <code>/sdcard/…</code>) — app-private folders are not reachable.</div>
                 <button class="btn btn-success" id="btnPush" disabled>Push to Selected</button>
+              </div>
+            </div>
+            <div class="cmd-divider"></div>
+            <div class="cmd-section collapsed" data-cmd="sync">
+              <div class="cmd-head" data-act="toggleCmd"><span>Sync Folder</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <div class="file-row">
+                  <label class="file-pick" for="syncFolder">Choose Folder</label>
+                  <input type="file" id="syncFolder" webkitdirectory hidden>
+                  <span class="file-name" id="syncName">No folder selected</span>
+                </div>
+                <input type="text" class="field" id="syncDest" placeholder="/sdcard/STYLY/content">
+                <div class="push-warn">⚠ Full-mirror sync into the destination directory. The picked folder's <em>contents</em> are mirrored into it (e.g. folder <code>content</code> → files land directly in the destination). Files already under the destination that are <strong>not</strong> in this upload will be <strong>deleted</strong> on every selected device. Destinations must be under shared storage (e.g. <code>/sdcard/…</code>) — app-private folders are not reachable.</div>
+                <label class="push-confirm"><input type="checkbox" id="syncConfirm"> I understand extras at the destination will be deleted</label>
+                <button class="btn btn-success" id="btnSync" disabled>Sync to Selected</button>
               </div>
             </div>
             <div class="cmd-divider"></div>
@@ -431,12 +447,10 @@
       let userPickedTab = false;       // true once the user clicks a sub-tab (stops auto-default)
       let expandedGroups = new Set();  // group names expanded to show per-device status
       let view = 'console';            // 'console' | 'manage'
-      let installState = {};           // id -> { status, filename, detail }
+      let installState = {};           // id -> { task, status, filename, detail, note, verb }
       let editingLabelId = null;
       let uploadedApk = null;
       let uploadInProgress = false;
-      let uploadedBundle = null;
-      let bundleUploadInProgress = false;
       let reconnectTimer = null;
       const RECONNECT_DELAY = 3000;
       const LOW_BATTERY_THRESHOLD = 20;
@@ -462,12 +476,6 @@
       const apkFile = document.getElementById('apkFile');
       const apkName = document.getElementById('apkName');
       const btnInstall = document.getElementById('btnInstall');
-      const pushFile = document.getElementById('pushFile');
-      const pushFolder = document.getElementById('pushFolder');
-      const pushName = document.getElementById('pushName');
-      const pushDest = document.getElementById('pushDest');
-      const pushConfirm = document.getElementById('pushConfirm');
-      const btnPush = document.getElementById('btnPush');
       const launchPkg = document.getElementById('launchPkg');
       const launchExtra = document.getElementById('launchExtra');
       const btnLaunch = document.getElementById('btnLaunch');
@@ -578,19 +586,22 @@
             addLog('[' + (msg.status === 'success' ? 'OK' : 'FAIL') + '] install ' + (msg.apk_filename || '-') + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), st);
             break;
           }
-          case 'PUSH_FILES_SENT': addLog('Push command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s) → ' + (msg.dest_path || '-'), 'info'); break;
+          case 'PUSH_FILES_SENT': addLog((msg.delete_extras ? 'Sync' : 'Push') + ' command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s) → ' + (msg.dest_path || '-'), 'info'); break;
           case 'PUSH_FILES_RESULT': {
             const st = msg.status === 'success' ? 'success' : 'fail';
             const summary = '+' + (msg.added || 0) + ' ~' + (msg.updated || 0) + ' -' + (msg.deleted || 0);
             const detail = msg.error || msg.message || '';
+            const prev = msg.device_id ? installState[msg.device_id] : null;
+            const verb = (prev && prev.task === 'push' && prev.verb) || 'Push';
             if (msg.device_id) {
-              installState[msg.device_id] = { task: 'push', status: st, filename: msg.dest_path || '', note: st === 'success' ? summary : '', detail: detail };
+              installState[msg.device_id] = { task: 'push', status: st, verb: verb, filename: msg.dest_path || '', note: st === 'success' ? summary : '', detail: detail };
               updateInstallCell(msg.device_id);
             }
+            const what = verb.toLowerCase();
             if (st === 'success') {
-              addLog('[OK] push to ' + (msg.dest_path || '-') + ' on ' + labelFor(msg.device_id) + ' (' + summary + ')', 'success');
+              addLog('[OK] ' + what + ' to ' + (msg.dest_path || '-') + ' on ' + labelFor(msg.device_id) + ' (' + summary + ')', 'success');
             } else {
-              addLog('[FAIL] push to ' + (msg.dest_path || '-') + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), 'fail');
+              addLog('[FAIL] ' + what + ' to ' + (msg.dest_path || '-') + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), 'fail');
             }
             break;
           }
@@ -762,8 +773,12 @@
         const st = installState[id];
         if (!st) return '<span class="ins-none">—</span>';
         if (st.task === 'push') {
-          if (st.status === 'pushing') return '<span class="ins-installing"><span class="spinner">⟳</span> Pushing…</span>';
-          if (st.status === 'success') return '<span class="ins-success">✓ pushed</span>' + (st.note ? ' <span class="ins-none">' + esc(st.note) + '</span>' : '');
+          // `verb` is set when the console dispatches, and carried onto the result so a synced
+          // device does not report itself as "pushed". PUSH_FILES_RESULT does not name the
+          // mode, so a page reloaded mid-job falls back to the neutral "Push".
+          const verb = st.verb || 'Push';
+          if (st.status === 'pushing') return '<span class="ins-installing"><span class="spinner">⟳</span> ' + esc(verb) + 'ing…</span>';
+          if (st.status === 'success') return '<span class="ins-success">✓ ' + esc(verb.toLowerCase()) + 'ed</span>' + (st.note ? ' <span class="ins-none">' + esc(st.note) + '</span>' : '');
           return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
         }
         if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
@@ -800,7 +815,6 @@
         updateButtons();
       }
 
-      function hasPushSelection() { return pushFile.files.length > 0 || pushFolder.files.length > 0; }
 
       function updateButtons() {
         const has = selectedIds.size > 0;
@@ -808,7 +822,8 @@
         btnLaunch.disabled = launchPkg.value.trim() === '' || !has;
         btnStartupSet.disabled = startupPkg.value.trim() === '' || !has;
         btnStartupClear.disabled = !has;
-        btnPush.disabled = bundleUploadInProgress || !hasPushSelection() || pushDest.value.trim() === '' || !pushConfirm.checked || !has;
+        pushPanel.refreshButton(has);
+        syncPanel.refreshButton(has);
       }
 
       // ---------------- Selection actions ----------------
@@ -891,50 +906,121 @@
         }).catch(function (err) { apkName.textContent = 'Upload failed'; addLog('APK install failed: ' + err.message, 'fail'); });
       }
 
-      function pushSelectionFiles() {
-        // Either a set of individual files (pushFile) or a folder tree (pushFolder).
-        return pushFolder.files.length > 0 ? Array.from(pushFolder.files) : Array.from(pushFile.files);
+      // Push and Sync are the same transport (upload a bundle, fan out PUSH_FILES) over two
+      // very different destination semantics, so they are two panels sharing one factory
+      // rather than one panel with a delete toggle: the destructive one has to be chosen by
+      // name. `deleteExtras` rides the wire; the delete itself happens on the device.
+      //
+      // Push takes files or a folder and only ever copies/overwrites. Sync takes a folder and
+      // full-mirrors, so it alone carries the warning and the confirmation checkbox.
+      function createPushPanel(cfg) {
+        const fileInput = cfg.fileId ? document.getElementById(cfg.fileId) : null;
+        const folderInput = document.getElementById(cfg.folderId);
+        const nameEl = document.getElementById(cfg.nameId);
+        const destEl = document.getElementById(cfg.destId);
+        const confirmEl = cfg.confirmId ? document.getElementById(cfg.confirmId) : null;
+        const btn = document.getElementById(cfg.btnId);
+        let uploaded = null;
+        let uploading = false;
+
+        function selectionFiles() {
+          if (folderInput.files.length) return Array.from(folderInput.files);
+          return fileInput ? Array.from(fileInput.files) : [];
+        }
+
+        function describeSelection() {
+          const folder = Array.from(folderInput.files);
+          if (folder.length) {
+            const top = (folder[0].webkitRelativePath || '').split('/')[0] || 'folder';
+            const bytes = folder.reduce(function (sum, f) { return sum + f.size; }, 0);
+            return 'Selected folder: ' + top + ' (' + folder.length + ' files, ' + formatBytes(bytes) + ')';
+          }
+          const files = fileInput ? Array.from(fileInput.files) : [];
+          if (!files.length) return cfg.emptyLabel;
+          if (files.length === 1) return 'Selected: ' + files[0].name + ' (' + formatBytes(files[0].size) + ')';
+          const bytes = files.reduce(function (sum, f) { return sum + f.size; }, 0);
+          return 'Selected ' + files.length + ' files (' + formatBytes(bytes) + ')';
+        }
+
+        function reset() {
+          if (fileInput) fileInput.value = '';
+          folderInput.value = '';
+          uploaded = null;
+          if (confirmEl) confirmEl.checked = false;
+          nameEl.textContent = cfg.emptyLabel;
+          updateButtons();
+        }
+
+        function ensureUploaded() {
+          if (uploaded) return Promise.resolve(uploaded);
+          const files = selectionFiles();
+          if (!files.length) return Promise.reject(new Error(cfg.emptyLabel));
+          const fd = new FormData();
+          // Send each file's relative path as its multipart filename so the server can rebuild
+          // the folder tree; webkitRelativePath is set for folder picks, empty for single files.
+          files.forEach(function (f) { fd.append('files', f, f.webkitRelativePath || f.name); });
+          uploading = true; nameEl.textContent = 'Uploading ' + files.length + ' file(s)...'; updateButtons();
+          return fetch('/api/bundles', { method: 'POST', body: fd })
+            .then(function (r) { return r.json().catch(function () { return {}; }).then(function (p) { if (!r.ok) throw new Error(p.error || r.statusText); return p; }); })
+            .then(function (p) { uploaded = p; nameEl.innerHTML = 'Uploaded: <strong>' + esc(p.bundle_filename) + '</strong> (' + p.entry_count + ' file(s), ' + formatBytes(p.size) + ')'; addLog('Uploaded bundle: ' + p.bundle_filename + ' (' + p.entry_count + ' file(s))', 'success'); return p; })
+            .finally(function () { uploading = false; updateButtons(); });
+        }
+
+        function send() {
+          if (uploading) return;
+          const dest = destEl.value.trim();
+          if (!dest) { addLog('Enter a destination path to ' + cfg.verb.toLowerCase() + ' files', 'warn'); return; }
+          if (confirmEl && !confirmEl.checked) { addLog('Confirm the delete warning before syncing', 'warn'); return; }
+          const online = onlineTargets(Array.from(selectedIds));
+          if (!online.length) { addLog('No online devices selected to ' + cfg.verb.toLowerCase() + ' files', 'warn'); return; }
+          ensureUploaded().then(function (bundle) {
+            const msg = {
+              type: 'PUSH_FILES', target_devices: online, bundle_url: bundle.bundle_url,
+              bundle_filename: bundle.bundle_filename, dest_path: dest, delete_extras: cfg.deleteExtras,
+            };
+            if (!wsSend(msg, cfg.verb.toLowerCase() + ' files')) return;
+            // Optimistic first paint: the fan-out is not throttled, so every online target
+            // really is working from here until its PUSH_FILES_RESULT arrives, or DEVICE_LIST
+            // drops it as offline.
+            online.forEach(function (id) { installState[id] = { task: 'push', status: 'pushing', verb: cfg.verb, filename: dest, note: '', detail: '' }; updateInstallCell(id); });
+            addLog(cfg.verb + 'ing ' + bundle.bundle_filename + ' → ' + dest + ' on ' + online.length + ' device(s)', 'info');
+            // Force a fresh pick next time (LAN/non-secure context cannot detect a local change).
+            reset();
+          }).catch(function (err) { nameEl.textContent = 'Upload failed'; addLog(cfg.verb + ' files failed: ' + err.message, 'fail'); });
+        }
+
+        function hasSelection() { return selectionFiles().length > 0; }
+
+        function refreshButton(anySelected) {
+          btn.disabled = uploading || !hasSelection() || destEl.value.trim() === '' ||
+            (confirmEl ? !confirmEl.checked : false) || !anySelected;
+        }
+
+        function onPick(input, other) {
+          input.addEventListener('change', function () {
+            if (input.files.length && other) other.value = '';
+            uploaded = null; nameEl.textContent = describeSelection(); updateButtons();
+          });
+        }
+        if (fileInput) onPick(fileInput, folderInput);
+        onPick(folderInput, fileInput);
+        destEl.addEventListener('input', updateButtons);
+        if (confirmEl) confirmEl.addEventListener('change', updateButtons);
+        btn.addEventListener('click', send);
+
+        return { refreshButton: refreshButton };
       }
 
-      function resetPushSelection() {
-        pushFile.value = ''; pushFolder.value = ''; uploadedBundle = null;
-        pushConfirm.checked = false; pushName.textContent = 'No file or folder selected';
-        updateButtons();
-      }
-
-      function ensureBundleUploaded() {
-        if (uploadedBundle) return Promise.resolve(uploadedBundle);
-        const files = pushSelectionFiles();
-        if (!files.length) return Promise.reject(new Error('No file or folder selected'));
-        const fd = new FormData();
-        // Send each file's relative path as its multipart filename so the server can rebuild
-        // the folder tree; webkitRelativePath is set for folder picks, empty for single files.
-        files.forEach(function (f) { fd.append('files', f, f.webkitRelativePath || f.name); });
-        bundleUploadInProgress = true; pushName.textContent = 'Uploading ' + files.length + ' file(s)...'; updateButtons();
-        return fetch('/api/bundles', { method: 'POST', body: fd })
-          .then(function (r) { return r.json().catch(function () { return {}; }).then(function (p) { if (!r.ok) throw new Error(p.error || r.statusText); return p; }); })
-          .then(function (p) { uploadedBundle = p; pushName.innerHTML = 'Uploaded: <strong>' + esc(p.bundle_filename) + '</strong> (' + p.entry_count + ' file(s), ' + formatBytes(p.size) + ')'; addLog('Uploaded bundle: ' + p.bundle_filename + ' (' + p.entry_count + ' file(s))', 'success'); return p; })
-          .finally(function () { bundleUploadInProgress = false; updateButtons(); });
-      }
-
-      function sendPush() {
-        if (bundleUploadInProgress) return;
-        const dest = pushDest.value.trim();
-        if (!dest) { addLog('Enter a destination path to push files', 'warn'); return; }
-        if (!pushConfirm.checked) { addLog('Confirm the delete warning before pushing', 'warn'); return; }
-        const online = onlineTargets(Array.from(selectedIds));
-        if (!online.length) { addLog('No online devices selected to push files', 'warn'); return; }
-        ensureBundleUploaded().then(function (bundle) {
-          if (!wsSend({ type: 'PUSH_FILES', target_devices: online, bundle_url: bundle.bundle_url, bundle_filename: bundle.bundle_filename, dest_path: dest }, 'push files')) return;
-          // Optimistic first paint: a push is dispatched to every online target at once
-          // (no throttle), so each one really is pushing from here until its
-          // PUSH_FILES_RESULT arrives, or DEVICE_LIST drops it as offline.
-          online.forEach(function (id) { installState[id] = { task: 'push', status: 'pushing', filename: dest, note: '', detail: '' }; updateInstallCell(id); });
-          addLog('Pushing ' + bundle.bundle_filename + ' → ' + dest + ' on ' + online.length + ' device(s)', 'info');
-          // Force a fresh pick next time (LAN/non-secure context cannot detect a local change).
-          resetPushSelection();
-        }).catch(function (err) { pushName.textContent = 'Upload failed'; addLog('Push files failed: ' + err.message, 'fail'); });
-      }
+      const pushPanel = createPushPanel({
+        fileId: 'pushFile', folderId: 'pushFolder', nameId: 'pushName', destId: 'pushDest',
+        btnId: 'btnPush', verb: 'Push', deleteExtras: false,
+        emptyLabel: 'No file or folder selected',
+      });
+      const syncPanel = createPushPanel({
+        folderId: 'syncFolder', nameId: 'syncName', destId: 'syncDest', confirmId: 'syncConfirm',
+        btnId: 'btnSync', verb: 'Sync', deleteExtras: true,
+        emptyLabel: 'No folder selected',
+      });
 
       function sendSetStartup() {
         const pkg = startupPkg.value.trim();
@@ -1168,30 +1254,6 @@
         apkName.textContent = f ? ('Selected: ' + f.name + ' (' + formatBytes(f.size) + ')') : 'No APK selected';
         updateButtons();
       });
-      function describePushSelection() {
-        const folder = Array.from(pushFolder.files);
-        if (folder.length) {
-          const top = (folder[0].webkitRelativePath || '').split('/')[0] || 'folder';
-          const bytes = folder.reduce(function (sum, f) { return sum + f.size; }, 0);
-          return 'Selected folder: ' + top + ' (' + folder.length + ' files, ' + formatBytes(bytes) + ')';
-        }
-        const files = Array.from(pushFile.files);
-        if (!files.length) return 'No file or folder selected';
-        if (files.length === 1) return 'Selected: ' + files[0].name + ' (' + formatBytes(files[0].size) + ')';
-        const bytes = files.reduce(function (sum, f) { return sum + f.size; }, 0);
-        return 'Selected ' + files.length + ' files (' + formatBytes(bytes) + ')';
-      }
-      pushFile.addEventListener('change', function () {
-        if (pushFile.files.length) pushFolder.value = '';
-        uploadedBundle = null; pushName.textContent = describePushSelection(); updateButtons();
-      });
-      pushFolder.addEventListener('change', function () {
-        if (pushFolder.files.length) pushFile.value = '';
-        uploadedBundle = null; pushName.textContent = describePushSelection(); updateButtons();
-      });
-      pushDest.addEventListener('input', updateButtons);
-      pushConfirm.addEventListener('change', updateButtons);
-      btnPush.addEventListener('click', sendPush);
       launchPkg.addEventListener('input', updateButtons);
       startupPkg.addEventListener('input', updateButtons);
       btnInstall.addEventListener('click', sendInstall);

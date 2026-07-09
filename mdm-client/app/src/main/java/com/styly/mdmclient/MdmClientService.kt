@@ -301,15 +301,20 @@ class MdmClientService : Service() {
     }
 
     /**
-     * Download a file/folder bundle and full-mirror it into a destination directory: new
-     * files are created, changed files overwritten, and anything at the destination not in
-     * the bundle is deleted (incl. now-empty dirs), so the destination ends up identical to
-     * the bundle. Destinations are limited to shared storage — the PICO ToBService has no
-     * privileged file-copy API, so only /sdcard is reachable via java.io.File I/O.
+     * Download a file/folder bundle and apply it to a destination directory.
+     *
+     * `delete_extras` picks the semantics: absent or false means push (copy and overwrite,
+     * never delete); true means sync (full mirror, pruning anything at the destination that
+     * is not in the bundle). It is read with a false default so a payload from a server that
+     * predates the flag can only ever copy — a missing field must never delete.
+     *
+     * Destinations are limited to shared storage — the PICO ToBService has no privileged
+     * file-copy API, so only /sdcard is reachable via java.io.File I/O.
      */
     private fun executePushFiles(payload: JSONObject) {
         val bundleUrl = payload.optString("bundle_url", "")
         val destPath = payload.optString("dest_path", "").trim()
+        val deleteExtras = payload.optBoolean("delete_extras", false)
 
         if (bundleUrl.isEmpty()) {
             Log.e(TAG, "EXECUTE_PUSH_FILES missing bundle_url")
@@ -340,10 +345,11 @@ class MdmClientService : Service() {
                 Log.i(TAG, "Downloading bundle: $bundleUrl")
                 bundleFile = downloadBundle(bundleUrl)
                 staging = unzipToStaging(bundleFile)
-                val result = mirrorStagingToDest(staging, File(destPath))
+                val result = BundleSync.apply(staging, File(destPath), deleteExtras)
                 Log.i(
                     TAG,
-                    "Push-files sync to $destPath: +${result.added} ~${result.updated} -${result.deleted}"
+                    "Push-files ${if (deleteExtras) "sync" else "copy"} to $destPath: " +
+                        "+${result.added} ~${result.updated} -${result.deleted}"
                 )
                 sendPushFilesResult(
                     destPath, "success", result.added, result.updated, result.deleted, ""
@@ -433,59 +439,6 @@ class MdmClientService : Service() {
         return staging
     }
 
-    /**
-     * Full-mirror the staging tree into destDir: copy every staged file (overwrite), then
-     * delete anything under destDir not present in the bundle so destDir == bundle exactly.
-     */
-    private fun mirrorStagingToDest(staging: File, destDir: File): SyncResult {
-        val stagedFiles = HashSet<String>()
-        val stagedDirs = HashSet<String>()
-        staging.walkTopDown().forEach { f ->
-            if (f == staging) return@forEach
-            val rel = f.relativeTo(staging).path.replace(File.separatorChar, '/')
-            if (f.isDirectory) {
-                stagedDirs.add(rel)
-            } else {
-                stagedFiles.add(rel)
-                // Keep every ancestor directory of a staged file.
-                var parent = File(rel).parent
-                while (parent != null) {
-                    stagedDirs.add(parent.replace(File.separatorChar, '/'))
-                    parent = File(parent).parent
-                }
-            }
-        }
-
-        if (!destDir.exists() && !destDir.mkdirs()) {
-            throw IllegalStateException("Failed to create destination directory: ${destDir.absolutePath}")
-        }
-
-        var added = 0
-        var updated = 0
-        staging.walkTopDown().forEach { src ->
-            if (src == staging || src.isDirectory) return@forEach
-            val rel = src.relativeTo(staging).path
-            val target = File(destDir, rel)
-            val existed = target.isFile
-            target.parentFile?.mkdirs()
-            src.copyTo(target, overwrite = true)
-            if (existed) updated++ else added++
-        }
-
-        // Prune extras bottom-up: files first, then dirs (empty by the time we reach them).
-        var deleted = 0
-        destDir.walkBottomUp().forEach { entry ->
-            if (entry == destDir) return@forEach
-            val rel = entry.relativeTo(destDir).path.replace(File.separatorChar, '/')
-            if (entry.isFile) {
-                if (rel !in stagedFiles && entry.delete()) deleted++
-            } else if (rel !in stagedDirs) {
-                entry.delete()
-            }
-        }
-        return SyncResult(added, updated, deleted)
-    }
-
     private fun pushTempDir(): File {
         val downloadsRoot = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val dir = File(downloadsRoot, "styly-mdm/.push-tmp")
@@ -496,10 +449,11 @@ class MdmClientService : Service() {
     }
 
     /**
-     * Validate a device destination path for full-mirror sync. Because sync deletes extras,
-     * a bad path could wipe unrelated data — so the canonical path must live under shared
-     * storage and be neither the storage root nor a protected top-level directory. Returns an
-     * error message, or null if the path is safe.
+     * Validate a device destination path. Applied to pushes as well as syncs: a sync deletes
+     * extras, so a bad path could wipe unrelated data, and holding both to the same rule keeps
+     * a push from quietly reaching somewhere a sync may not. The canonical path must live under
+     * shared storage and be neither the storage root nor a protected top-level directory.
+     * Returns an error message, or null if the path is safe.
      */
     private fun validateDestPath(destPath: String): String? {
         if (destPath.isEmpty()) return "Destination path is required"
@@ -526,7 +480,6 @@ class MdmClientService : Service() {
         return null
     }
 
-    private data class SyncResult(val added: Int, val updated: Int, val deleted: Int)
 
     private fun sendPushFilesResult(
         destPath: String,

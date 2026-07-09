@@ -169,7 +169,7 @@ STYLY-MDM/
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
 | `DOWNLOAD_COMPLETE` | Sent right after the APK download finishes (before the local install). Frees the server's transfer slot so the next queued device can start downloading. Fields: `apk_filename`. Optional — see the install-throttling note below. |
-| `PUSH_FILES_RESULT` | Result of a file/folder sync. Fields: `status` (`success`/`fail`), `dest_path`, `added`, `updated`, `deleted` (counts), `error` (optional) |
+| `PUSH_FILES_RESULT` | Result of a push or sync. Fields: `status` (`success`/`fail`), `dest_path`, `added`, `updated`, `deleted` (counts; `deleted` is always 0 for a push), `error` (optional) |
 
 ### Server → Device
 
@@ -177,7 +177,7 @@ STYLY-MDM/
 |---|---|
 | `EXECUTE_LAUNCH` | Launch an app. Fields: `package_name`, `extra` |
 | `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename` |
-| `EXECUTE_PUSH_FILES` | Download a bundle and full-mirror it into a directory. Fields: `bundle_url`, `bundle_filename`, `dest_path` |
+| `EXECUTE_PUSH_FILES` | Download a bundle and apply it to a directory. Fields: `bundle_url`, `bundle_filename`, `dest_path`, `delete_extras` (boolean; `false` = copy/overwrite only, `true` = full mirror. Read with a `false` default — a missing field must never delete) |
 
 ### Admin → Server
 
@@ -185,7 +185,7 @@ STYLY-MDM/
 |---|---|
 | `LAUNCH_APP` | Launch an app on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `package_name`, `extra_data` |
 | `INSTALL_APK` | Install an uploaded APK on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `apk_url`, `apk_filename` |
-| `PUSH_FILES` | Full-mirror a bundle into a directory on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `bundle_url`, `bundle_filename`, `dest_path` |
+| `PUSH_FILES` | Apply a bundle to a directory on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `bundle_url`, `bundle_filename`, `dest_path`, `delete_extras` (boolean, optional; only a literal `true` requests a full mirror) |
 | `GET_DEVICE_LIST` | Request the current device list |
 | `CREATE_GROUP` | Create a new, empty device group. Fields: `name` |
 | `RENAME_GROUP` | Rename a group, preserving its members. Fields: `name`, `new_name` |
@@ -211,8 +211,8 @@ STYLY-MDM/
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
 | `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |
 | `INSTALL_DEVICE_STATE` | Per-device companion to `INSTALL_PROGRESS`: names the devices that just entered a state, so the console can label each row instead of showing the whole target set as installing. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `installing` / `fail`), `apk_filename`, `detail` (failure reason, may be empty) |
-| `PUSH_FILES_SENT` | Confirmation that push-files commands were dispatched. Fields: `bundle_filename`, `dest_path`, `sent_count`, `target_count` |
-| `PUSH_FILES_RESULT` | Forwarded file/folder sync result from a device (adds `device_id`) |
+| `PUSH_FILES_SENT` | Confirmation that push-files commands were dispatched. Fields: `bundle_filename`, `dest_path`, `delete_extras`, `sent_count`, `target_count` |
+| `PUSH_FILES_RESULT` | Forwarded file/folder result from a device (adds `device_id`) |
 | `LAUNCH_RESULT` | Forwarded result from a device |
 | `INSTALL_RESULT` | Forwarded install result from a device |
 | `GROUP_LIST` | Current device groups. Fields: `groups` (object mapping group name → array of member serials). The console derives each device's group membership from this; sent on connect and after any group change. |
@@ -287,36 +287,53 @@ STYLY-MDM/
 > so a `DOWNLOAD_COMPLETE` arriving after a transfer already timed out cannot
 > resurrect `installing` on a device the job has written off.
 
-> **Push files (file/folder sync).** The console uploads a file or a whole folder
-> to `POST /api/bundles`; the server reconstructs the tree and zips it into a
-> single bundle served from `/bundles/`. `PUSH_FILES` carries the bundle URL and a
-> destination directory; the client downloads the bundle, unzips it (with a
-> zip-slip guard), and **full-mirrors** it into the destination — new files are
-> created, changed files overwritten, and anything at the destination *not* in the
-> bundle is deleted (including now-empty directories), so the destination ends up
-> identical to the bundle (`rsync --delete` semantics). Each device reports
-> `PUSH_FILES_RESULT` with `added`/`updated`/`deleted` counts.
+> **Push files: two actions, one transport.** The console uploads a file or a whole
+> folder to `POST /api/bundles`; the server reconstructs the tree and zips it into a
+> single bundle served from `/bundles/`. `PUSH_FILES` carries the bundle URL, a
+> destination directory, and `delete_extras`. The client downloads the bundle, unzips
+> it (with a zip-slip guard), and applies it to the destination — how it applies is
+> the whole distinction:
 >
-> Because full-mirror sync deletes, and because the PICO ToBService exposes **no
-> privileged file-copy API**, two constraints apply and are enforced on both the
+> | Console action | `delete_extras` | Semantics |
+> |---|---|---|
+> | **Push Files** (file or folder) | `false` | Copy and overwrite. Nothing at the destination is removed; `deleted` is always 0. |
+> | **Sync Folder** (folder only) | `true` | Full mirror: extras at the destination — including now-empty directories — are deleted, so it ends up identical to the bundle (`rsync --delete` semantics). |
+>
+> These are two console panels rather than one panel with a delete toggle so the
+> destructive operation has to be chosen **by name**. Only Sync Folder shows the
+> warning and requires the "extras will be deleted" confirmation.
+>
+> The delete lives in exactly one place: `BundleSync.apply` in the client, gated on
+> `deleteExtras`. Everything else — the server's `handle_push_files`, the bundle
+> build — is identical for both actions and merely passes the flag through. That flag
+> is decoded defensively at both boundaries: the server treats only a literal `true`
+> as a delete request (`data.get("delete_extras") is True`), and the client reads it
+> with `optBoolean(..., false)`. **A missing or malformed field can only ever copy.**
+> Since the delete is client-side, the non-destructive Push only exists on devices
+> running an APK that has this change — an older client mirrors whatever it is sent.
+> `BundleSync` is deliberately Android-free so `app/src/test/.../BundleSyncTest.kt`
+> can prove both branches on the host JVM (`./gradlew :app:testProdDebugUnitTest`).
+>
+> Because a mirror deletes, and because the PICO ToBService exposes **no privileged
+> file-copy API**, two constraints apply to both actions and are enforced on the
 > server (syntactic) and the client (canonical): the destination must live under
 > **shared/primary external storage** (`/sdcard` · `/storage/emulated/0`) — the
 > client can only reach shared storage with `java.io.File` I/O, so app-scoped
 > `Android/data/<pkg>/` directories are *not* targetable — and it must be neither
 > the storage root nor a protected top-level directory (`Android`, `Download(s)`,
 > `DCIM`, `Pictures`, `Movies`, `Music`, `Documents`, `Alarms`, `Notifications`,
-> `Podcasts`, `Ringtones`) so a mistyped path cannot wipe unrelated user/media
-> data. The console additionally requires an explicit "extras will be deleted"
-> confirmation before dispatch.
+> `Podcasts`, `Ringtones`) so a mistyped path cannot wipe unrelated user/media data.
 >
-> Push reuses the per-device PROGRESS column, showing `Pushing…` → `✓ pushed`
-> (with the `+added ~updated -deleted` summary) / `✗ failed`. Unlike install,
-> these transitions are **not** server-driven: push is not throttled, so the
-> server holds no per-device state to broadcast. The console paints `Pushing…`
-> optimistically on dispatch and resolves it on `PUSH_FILES_RESULT`; a device that
-> drops offline mid-push clears its cell on the next `DEVICE_LIST`. The column
-> holds one state per device, so a push and an install targeting the same device
-> overwrite each other's cell — the last job dispatched wins.
+> Both actions reuse the per-device PROGRESS column, showing `Pushing…` / `Syncing…`
+> → `✓ pushed` / `✓ synced` (with the `+added ~updated -deleted` summary) / `✗ failed`.
+> Unlike install, these transitions are **not** server-driven: neither action is
+> throttled, so the server holds no per-device state to broadcast. The console paints
+> the in-flight state optimistically on dispatch and resolves it on
+> `PUSH_FILES_RESULT`; a device that drops offline mid-job clears its cell on the next
+> `DEVICE_LIST`. `PUSH_FILES_RESULT` does not name the mode, so the console carries the
+> verb over from what it dispatched (a page reloaded mid-job falls back to "pushed").
+> The column holds one state per device, so a push and an install targeting the same
+> device overwrite each other's cell — the last job dispatched wins.
 
 ## Server Discovery Protocol
 

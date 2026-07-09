@@ -257,6 +257,40 @@ def test_handle_push_files_fans_out_to_online_devices(tmp_path):
     assert sent_ack["dest_path"] == "/sdcard/STYLY/content"
 
 
+@pytest.mark.parametrize(
+    "sent_value, expected",
+    [
+        # A push (copy) and an explicit sync (mirror) round-trip their flag verbatim.
+        (False, False),
+        (True, True),
+        # Everything else must decode to "do not delete". An omitted field is the case that
+        # matters most: a console that predates the flag must never trigger a mirror.
+        (None, False),
+        ("true", False),
+        (1, False),
+    ],
+)
+def test_handle_push_files_only_a_literal_true_requests_deletion(tmp_path, sent_value, expected):
+    server._apply_data_dir(str(tmp_path))
+    server.devices.clear()
+    dev_ws = _register_online_device("dev-1")
+    admin = FakeWS()
+
+    data = {
+        "target_devices": ["*"],
+        "bundle_url": "http://host/bundles/b.zip",
+        "bundle_filename": "b.zip",
+        "dest_path": "/sdcard/STYLY/content",
+    }
+    if sent_value is not None:
+        data["delete_extras"] = sent_value
+
+    asyncio.run(server.handle_push_files(admin, data))
+
+    assert dev_ws.sent[0]["delete_extras"] is expected
+    assert admin.sent[-1]["delete_extras"] is expected
+
+
 def test_handle_push_files_rejects_unsafe_dest(tmp_path):
     server._apply_data_dir(str(tmp_path))
     server.devices.clear()

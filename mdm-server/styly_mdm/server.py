@@ -469,8 +469,9 @@ def sanitize_relpath(raw: str | None) -> str | None:
 def validate_dest_path(dest: str | None) -> str | None:
     """Return an error message if a device destination path is unsafe, else None.
 
-    Full-mirror sync deletes anything at the destination not in the bundle, so a wrong path
-    would wipe unrelated data on every selected device. The path must be an absolute
+    A full-mirror sync deletes anything at the destination not in the bundle, so a wrong path
+    would wipe unrelated data on every selected device. Pushes are held to the same rule, so a
+    copy cannot quietly reach somewhere a sync may not. The path must be an absolute
     shared-storage path, contain no ``..``, and be neither the storage root nor a protected
     top-level directory. This is a first-line syntactic guard; the client re-validates
     against the real canonical filesystem before applying.
@@ -1294,14 +1295,19 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
 async def handle_push_files(admin_ws: web.WebSocketResponse, data: dict):
     """Process a PUSH_FILES command: validate then fan out EXECUTE_PUSH_FILES to target HMDs.
 
-    The destination is validated here as a first-line guard (full-mirror sync deletes extras,
-    so a bad path is destructive); the client re-validates against its real filesystem before
-    applying.
+    ``delete_extras`` selects the semantics the client applies: false (the default) copies and
+    overwrites without deleting anything; true full-mirrors, pruning whatever at the destination
+    is not in the bundle. The server only passes the flag through — the delete itself lives in
+    the client — but it coerces the value here so a malformed field cannot decode to true.
+
+    The destination is validated here as a first-line guard (a mirror deletes extras, so a bad
+    path is destructive); the client re-validates against its real filesystem before applying.
     """
     target_devices: list[str] = data.get("target_devices", [])
     bundle_url: str = data.get("bundle_url", "")
     bundle_filename: str = data.get("bundle_filename", "")
     dest_path: str = (data.get("dest_path") or "").strip()
+    delete_extras: bool = data.get("delete_extras") is True
 
     if not bundle_url:
         await admin_ws.send_str(json.dumps({
@@ -1332,6 +1338,7 @@ async def handle_push_files(admin_ws: web.WebSocketResponse, data: dict):
         "bundle_url": bundle_url,
         "bundle_filename": bundle_filename,
         "dest_path": dest_path,
+        "delete_extras": delete_extras,
     })
 
     sent_count = 0
@@ -1344,13 +1351,15 @@ async def handle_push_files(admin_ws: web.WebSocketResponse, data: dict):
             except ConnectionResetError:
                 log.warning("Failed to send EXECUTE_PUSH_FILES to %s (disconnected)", did)
 
-    log.info("PUSH_FILES: sent %s -> %s to %d/%d devices",
+    log.info("PUSH_FILES (%s): sent %s -> %s to %d/%d devices",
+             "sync" if delete_extras else "copy",
              bundle_filename or bundle_url, dest_path, sent_count, len(target_ids))
 
     await admin_ws.send_str(json.dumps({
         "type": "PUSH_FILES_SENT",
         "bundle_filename": bundle_filename,
         "dest_path": dest_path,
+        "delete_extras": delete_extras,
         "sent_count": sent_count,
         "target_count": len(target_ids),
     }))
