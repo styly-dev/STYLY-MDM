@@ -110,6 +110,28 @@ Uploaded APKs are stored under `<data-dir>/apks/` (the data directory defaults t
 >
 > (or toggle **All files access** for the app in the headset's app settings). The client's own settings screen also shows the current grant status and a **Grant All Files Access** button that opens this settings page. Without it, installs fail with `pbsControlAPPManger returned 102: APK does not exist`.
 
+## Migrating to Another Server
+
+Device labels and group definitions live in a single file, `<data-dir>/device_registry.json`. Moving them to another machine is a file copy — there is no export step in the console.
+
+1. **Stop the old server, and make sure the new one is not running yet.** A running server owns the registry file: every label edit, group change, and battery report rewrites it from in-memory state, so a file dropped in underneath a live server is silently overwritten. Leaving the old server up also keeps it answering UDP discovery, and devices will bounce between the two.
+
+2. **Copy the registry into the new server's data directory.**
+
+   ```bash
+   scp old-host:/path/to/mdm-server/device_registry.json new-host:/srv/styly-mdm/
+   ```
+
+3. **Start the new server pointed at that directory.**
+
+   ```bash
+   styly-mdm --data-dir /srv/styly-mdm
+   ```
+
+Devices rediscover the new server over UDP and reconnect on their own. The `ip` and `last_seen` fields refresh on reconnect, and group membership is keyed by serial number, so devices that are offline during the move keep their groups.
+
+Uploaded APKs (`<data-dir>/apks/`) and pushed file bundles (`<data-dir>/bundles/`) are not part of the registry. Copy those directories separately with `rsync` or `scp` if the new server needs them — a single APK can be up to 2 GiB, so they are not worth moving through a browser.
+
 ## Documentation
 
 - **[Developer Guide](docs/DEVELOPMENT.md)** — architecture, build instructions, project structure, WebSocket / discovery protocol references, client permissions, and version requirements.
