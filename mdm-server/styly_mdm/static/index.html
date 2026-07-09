@@ -128,7 +128,7 @@
     .group-dev + .group-dev { border-top: 1px solid var(--border-soft); }
     .group-dev-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .group-dev-status { color: var(--text-secondary); font-size: 12px; white-space: nowrap; width: 66px; }
-    .group-dev-install { font-size: 12px; white-space: nowrap; text-align: right; min-width: 92px; }
+    .group-dev-task { font-size: 12px; white-space: nowrap; text-align: right; min-width: 92px; }
     .radio { width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid #41475f; flex-shrink: 0; }
     .radio.on { border: 5px solid var(--accent); background: var(--bg-card); }
     .group-main { min-width: 0; flex: 1; }
@@ -167,7 +167,7 @@
     .battery.charging .battery-fill { background: var(--warning); }
     .battery-note { color: var(--text-muted); font-size: 11px; margin-left: 4px; }
     .battery-muted { color: var(--text-dim); }
-    .dev-install { font-size: 12px; padding-right: 14px; }
+    .dev-task { font-size: 12px; padding-right: 14px; }
     .ins-queued { color: var(--text-muted); }
     .ins-transferring { color: var(--info); }
     .ins-installing { color: var(--warning); }
@@ -179,12 +179,6 @@
     /* Verify (integrity check) — per-device results panel inside the Actions column */
     .verify-hint { color: var(--text-muted); font-size: 11px; margin-top: 8px; line-height: 1.4; }
     .verify-hint code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: var(--text-secondary); }
-    .verify-results { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
-    .verify-row { display: flex; align-items: baseline; gap: 8px; font-size: 12px; padding: 3px 0; border-top: 1px solid #232a3d; }
-    .verify-row:first-child { border-top: none; }
-    .verify-dev { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; }
-    .verify-stat { margin-left: auto; text-align: right; }
-    .verify-detail { color: var(--text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
 
     /* Select boxes */
     .selbox { width: 16px; height: 16px; border-radius: 4px; border: 1.5px solid #41475f; display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; color: #fff; font-size: 11px; font-weight: 800; }
@@ -428,7 +422,6 @@
                 <input type="text" class="field" id="verifyApkPkg" placeholder="com.example.app (package name)">
                 <button class="btn btn-primary" id="btnVerifyApk" disabled>Verify on Selected</button>
                 <div class="verify-hint">Reference is hashed locally in your browser — nothing is uploaded.</div>
-                <div class="verify-results" id="verifyApkResults"></div>
               </div>
             </div>
             <div class="cmd-divider"></div>
@@ -446,7 +439,6 @@
                 </div>
                 <button class="btn btn-primary" id="btnVerifyDir" disabled>Verify on Selected</button>
                 <div class="verify-hint">Reference is hashed locally in your browser — nothing is uploaded. Dropping a folder skips the &ldquo;Upload N files&rdquo; prompt that Chrome always shows for <em>Choose Folder</em>. Large trees hash faster with <code>styly-mdm hash &lt;path&gt;</code> — load its JSON here. Shared storage only.</div>
-                <div class="verify-results" id="verifyDirResults"></div>
               </div>
             </div>
           </div>
@@ -492,7 +484,7 @@
       let userPickedTab = false;       // true once the user clicks a sub-tab (stops auto-default)
       let expandedGroups = new Set();  // group names expanded to show per-device status
       let view = 'console';            // 'console' | 'manage'
-      let installState = {};           // id -> { task, status, filename, detail, note, verb }
+      let deviceTaskState = {};           // id -> { task, status, filename, detail, note, verb }
       let editingLabelId = null;
       let uploadedApk = null;
       let uploadInProgress = false;
@@ -500,9 +492,7 @@
       // browser and never leaves it; only per-device results are compared here.
       let verifyApkRef = null;         // { size, cd_sha256, filename }
       let verifyApkAutoPkg = '';       // last package name auto-filled from an APK (vs typed)
-      let verifyApkState = {};         // id -> { status, detail }
       let verifyDirRef = null;         // { tree_hash, file_count, total_size, manifest?, source }
-      let verifyDirState = {};         // id -> { status, detail }
       let reconnectTimer = null;
       const RECONNECT_DELAY = 3000;
       const LOW_BATTERY_THRESHOLD = 20;
@@ -539,14 +529,12 @@
       const verifyApkName = document.getElementById('verifyApkName');
       const verifyApkPkg = document.getElementById('verifyApkPkg');
       const btnVerifyApk = document.getElementById('btnVerifyApk');
-      const verifyApkResults = document.getElementById('verifyApkResults');
       const verifyDirPath = document.getElementById('verifyDirPath');
       const verifyDirFolder = document.getElementById('verifyDirFolder');
       const verifyDirDrop = document.getElementById('verifyDirDrop');
       const verifyDirJson = document.getElementById('verifyDirJson');
       const verifyDirRefName = document.getElementById('verifyDirRefName');
       const btnVerifyDir = document.getElementById('btnVerifyDir');
-      const verifyDirResults = document.getElementById('verifyDirResults');
       const logContainer = document.getElementById('logContainer');
       const logEmpty = document.getElementById('logEmpty');
       const btnClearLog = document.getElementById('btnClearLog');
@@ -554,7 +542,10 @@
       const mgDetail = document.getElementById('mgDetail');
 
       // ---------------- Helpers ----------------
-      function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+      // textContent -> innerHTML escapes & < > but leaves quotes alone, and most callers
+      // interpolate into an attribute (title=", data-id="). A device- or server-supplied
+      // string carrying a double quote would otherwise escape the attribute.
+      function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML.replace(/"/g, '&quot;'); }
       function getDeviceId(d) { return d.device_id || d.serial_number || ''; }
       function isOnline(d) { return d.status !== 'offline'; }
       function deviceById(id) { return devices.find(function (d) { return getDeviceId(d) === id; }); }
@@ -610,7 +601,7 @@
             const cur = knownIds();
             selectedIds.forEach(function (id) { if (!cur.has(id)) selectedIds.delete(id); });
             const onlineNow = new Set(getOnlineIds());
-            Object.keys(installState).forEach(function (id) { if (!onlineNow.has(id)) delete installState[id]; });
+            Object.keys(deviceTaskState).forEach(function (id) { if (!onlineNow.has(id)) delete deviceTaskState[id]; });
             syncActiveGroupSelection();
             render();
             break;
@@ -638,15 +629,15 @@
             // Per-device companion to INSTALL_PROGRESS: the aggregate counts cannot
             // be mapped back to rows, so the server names the devices it moved.
             (msg.device_ids || []).forEach(function (id) {
-              installState[id] = { task: 'install', status: msg.state, filename: msg.apk_filename || '', detail: msg.detail || '' };
-              updateInstallCell(id);
+              deviceTaskState[id] = { task: 'install', status: msg.state, filename: msg.apk_filename || '', detail: msg.detail || '' };
+              updateTaskCell(id);
             });
             break;
           }
           case 'INSTALL_RESULT': {
             const st = msg.status === 'success' ? 'success' : 'fail';
             const detail = msg.error || msg.message || '';
-            if (msg.device_id) { installState[msg.device_id] = { task: 'install', status: st, filename: msg.apk_filename || '', detail: detail }; updateInstallCell(msg.device_id); }
+            if (msg.device_id) { deviceTaskState[msg.device_id] = { task: 'install', status: st, filename: msg.apk_filename || '', detail: detail }; updateTaskCell(msg.device_id); }
             addLog('[' + (msg.status === 'success' ? 'OK' : 'FAIL') + '] install ' + (msg.apk_filename || '-') + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), st);
             break;
           }
@@ -655,11 +646,11 @@
             const st = msg.status === 'success' ? 'success' : 'fail';
             const summary = '+' + (msg.added || 0) + ' ~' + (msg.updated || 0) + ' -' + (msg.deleted || 0);
             const detail = msg.error || msg.message || '';
-            const prev = msg.device_id ? installState[msg.device_id] : null;
+            const prev = msg.device_id ? deviceTaskState[msg.device_id] : null;
             const verb = (prev && prev.task === 'push' && prev.verb) || 'Push';
             if (msg.device_id) {
-              installState[msg.device_id] = { task: 'push', status: st, verb: verb, filename: msg.dest_path || '', note: st === 'success' ? summary : '', detail: detail };
-              updateInstallCell(msg.device_id);
+              deviceTaskState[msg.device_id] = { task: 'push', status: st, verb: verb, filename: msg.dest_path || '', note: st === 'success' ? summary : '', detail: detail };
+              updateTaskCell(msg.device_id);
             }
             const what = verb.toLowerCase();
             if (st === 'success') {
@@ -690,7 +681,7 @@
           case 'VERIFY_SENT': addLog('Verify APK command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
           case 'VERIFY_APK_RESULT': {
             const cls = verifyApkRef ? classifyApk(msg) : { status: 'error', detail: 'no local reference' };
-            if (msg.device_id) { verifyApkState[msg.device_id] = cls; renderVerifyResults(verifyApkResults, verifyApkState); }
+            if (msg.device_id) { deviceTaskState[msg.device_id] = { task: 'verify', kind: 'apk', status: cls.status, detail: cls.detail }; updateTaskCell(msg.device_id); }
             const ok = cls.status === 'match';
             addLog('[' + (ok ? 'MATCH' : 'DIFF') + '] verify ' + (msg.package_name || '-') + ' on ' + labelFor(msg.device_id) + (cls.detail ? ' - ' + cls.detail : ''), ok ? 'success' : 'fail');
             break;
@@ -698,7 +689,7 @@
           case 'VERIFY_DIR_SENT': addLog('Verify directory command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
           case 'VERIFY_DIR_RESULT': {
             const cls = verifyDirRef ? classifyDir(msg) : { status: 'error', detail: 'no local reference' };
-            if (msg.device_id) { verifyDirState[msg.device_id] = cls; renderVerifyResults(verifyDirResults, verifyDirState); }
+            if (msg.device_id) { deviceTaskState[msg.device_id] = { task: 'verify', kind: 'dir', status: cls.status, detail: cls.detail }; updateTaskCell(msg.device_id); }
             const ok = cls.status === 'match';
             addLog('[' + (ok ? 'MATCH' : 'DIFF') + '] verify dir ' + (msg.path || '-') + ' on ' + labelFor(msg.device_id) + (cls.detail ? ' - ' + cls.detail : ''), ok ? 'success' : 'fail');
             break;
@@ -783,7 +774,7 @@
             '<span class="dot ' + (off ? 'off' : '') + '"></span>' +
             '<span class="group-dev-name">' + esc(label) + '</span>' +
             '<span class="group-dev-status">' + status + '</span>' +
-            '<span class="group-dev-install" data-install-id="' + esc(serial) + '">' + installCellHtml(serial) + '</span>' +
+            '<span class="group-dev-task" data-task-id="' + esc(serial) + '">' + taskCellHtml(serial) + '</span>' +
             '</div>';
         }).join('');
       }
@@ -832,7 +823,7 @@
             '<div class="dev-cell">' + deviceCell + '</div>' +
             '<div class="dev-status">' + status + '</div>' +
             '<div class="dev-battery">' + batteryHtml(d) + '</div>' +
-            '<div class="dev-install" data-install-id="' + esc(id) + '">' + installCellHtml(id) + '</div>' +
+            '<div class="dev-task" data-task-id="' + esc(id) + '">' + taskCellHtml(id) + '</div>' +
             '</div>';
         });
         html += '</div>';
@@ -841,7 +832,9 @@
         return html;
       }
 
-      // The cell shows whichever job last touched the device, install or push.
+      // The cell shows whichever job last touched the device: install, push or verify.
+      // A later job overwrites an earlier one, exactly as a second install would; the log
+      // keeps the full history either way.
       //
       // An install's four live states mirror the server's install job: a device waits
       // for a transfer slot (queued), pulls the APK (transferring), installs it locally
@@ -849,9 +842,21 @@
       // no such phases — it is not throttled, so the server holds no per-device state
       // for it and cannot broadcast transitions. The console paints `pushing` on
       // dispatch and resolves it on PUSH_FILES_RESULT.
-      function installCellHtml(id) {
-        const st = installState[id];
+      function taskCellHtml(id) {
+        const st = deviceTaskState[id];
         if (!st) return '<span class="ins-none">—</span>';
+        if (st.task === 'verify') {
+          // A verify verdict is reached in the browser, not on the device: the device
+          // returns hashes and classifyApk()/classifyDir() decide. The column has room for
+          // the verdict only — `missing 3 · added 0 · changed 1` lives in the tooltip and
+          // the log, where it can be read without truncation.
+          const what = st.kind === 'dir' ? 'directory' : 'APK';
+          if (st.status === 'verifying') return '<span class="ins-installing"><span class="spinner">⟳</span> Verifying…</span>';
+          if (st.status === 'match') return '<span class="ins-success" title="' + esc(what + ': ' + (st.detail || 'match')) + '">✓ match</span>';
+          if (st.status === 'notfound') return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ not found</span>';
+          if (st.status === 'error') return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ error</span>';
+          return '<span class="ins-fail" title="' + esc(what + ': ' + (st.detail || 'mismatch')) + '">✗ mismatch</span>';
+        }
         if (st.task === 'push') {
           // `verb` is set when the console dispatches, and carried onto the result so a synced
           // device does not report itself as "pushed". PUSH_FILES_RESULT does not name the
@@ -868,12 +873,12 @@
         return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
       }
 
-      function updateInstallCell(id) {
+      function updateTaskCell(id) {
         // Refresh every matching install cell currently rendered: the Devices-tab
         // row and/or the expanded-group per-device rows on the Groups tab.
         if (view !== 'console') return;
-        const sel = '[data-install-id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]';
-        targetsBody.querySelectorAll(sel).forEach(function (cell) { cell.innerHTML = installCellHtml(id); });
+        const sel = '[data-task-id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]';
+        targetsBody.querySelectorAll(sel).forEach(function (cell) { cell.innerHTML = taskCellHtml(id); });
       }
 
       function renderActions() {
@@ -981,7 +986,7 @@
           if (!wsSend({ type: 'INSTALL_APK', target_devices: online, apk_url: apk.apk_url, apk_filename: apk.apk_filename }, 'install')) return;
           // Optimistic first paint only: every target really does start out waiting
           // for a transfer slot. The server's INSTALL_DEVICE_STATE drives it from here.
-          online.forEach(function (id) { installState[id] = { task: 'install', status: 'queued', filename: apk.apk_filename, detail: '' }; updateInstallCell(id); });
+          online.forEach(function (id) { deviceTaskState[id] = { task: 'install', status: 'queued', filename: apk.apk_filename, detail: '' }; updateTaskCell(id); });
           addLog('Installing ' + apk.apk_filename + ' on ' + online.length + ' device(s)', 'info');
           // Force a fresh pick next time (LAN/non-secure context cannot detect a local rebuild).
           apkFile.value = ''; uploadedApk = null; apkName.textContent = 'No APK selected'; updateButtons();
@@ -1072,7 +1077,7 @@
             // Optimistic first paint: the fan-out is not throttled, so every online target
             // really is working from here until its PUSH_FILES_RESULT arrives, or DEVICE_LIST
             // drops it as offline.
-            online.forEach(function (id) { installState[id] = { task: 'push', status: 'pushing', verb: cfg.verb, filename: dest, note: '', detail: '' }; updateInstallCell(id); });
+            online.forEach(function (id) { deviceTaskState[id] = { task: 'push', status: 'pushing', verb: cfg.verb, filename: dest, note: '', detail: '' }; updateTaskCell(id); });
             addLog(cfg.verb + 'ing ' + bundle.bundle_filename + ' → ' + dest + ' on ' + online.length + ' device(s)', 'info');
             // Force a fresh pick next time (LAN/non-secure context cannot detect a local change).
             reset();
@@ -1701,23 +1706,6 @@
         return { status: 'mismatch', detail: detail };
       }
 
-      function verifyStatusHtml(st) {
-        switch (st.status) {
-          case 'verifying': return '<span class="verify-stat ins-installing"><span class="spinner">⟳</span> Verifying…</span>';
-          case 'match': return '<span class="verify-stat ins-success">✓ match</span>' + (st.detail ? ' <span class="verify-detail">' + esc(st.detail) + '</span>' : '');
-          case 'mismatch': return '<span class="verify-stat ins-fail" title="' + esc(st.detail || '') + '">✗ mismatch</span>' + (st.detail ? ' <span class="verify-detail">' + esc(st.detail) + '</span>' : '');
-          case 'notfound': return '<span class="verify-stat ins-fail" title="' + esc(st.detail || '') + '">✗ ' + esc(st.detail || 'not found') + '</span>';
-          case 'error': return '<span class="verify-stat ins-fail" title="' + esc(st.detail || '') + '">✗ error</span>' + (st.detail ? ' <span class="verify-detail">' + esc(st.detail) + '</span>' : '');
-          default: return '<span class="verify-stat ins-none">—</span>';
-        }
-      }
-      function renderVerifyResults(container, stateMap) {
-        const ids = Object.keys(stateMap);
-        container.innerHTML = ids.length ? ids.map(function (id) {
-          return '<div class="verify-row"><span class="verify-dev">' + esc(labelFor(id)) + '</span>' + verifyStatusHtml(stateMap[id]) + '</div>';
-        }).join('') : '';
-      }
-
       // ---- reference selection + command dispatch ----
       // Carrying a package name over from a previously picked APK would silently verify the
       // new reference against the old package, so drop what we filled in ourselves. A name
@@ -1755,9 +1743,7 @@
         const online = onlineTargets(Array.from(selectedIds));
         if (!online.length) { addLog('No online devices selected to verify', 'warn'); return; }
         if (!wsSend({ type: 'VERIFY_APK', target_devices: online, package_name: pkg }, 'verify APK')) return;
-        verifyApkState = {};
-        online.forEach(function (id) { verifyApkState[id] = { status: 'verifying', detail: '' }; });
-        renderVerifyResults(verifyApkResults, verifyApkState);
+        online.forEach(function (id) { deviceTaskState[id] = { task: 'verify', kind: 'apk', status: 'verifying', detail: '' }; updateTaskCell(id); });
         addLog('Verifying ' + pkg + ' against ' + verifyApkRef.filename + ' on ' + online.length + ' device(s)', 'info');
       }
       function osMetadataNote(count) { return count ? ' · ' + count + ' OS metadata excluded' : ''; }
@@ -1820,9 +1806,7 @@
         const online = onlineTargets(Array.from(selectedIds));
         if (!online.length) { addLog('No online devices selected to verify', 'warn'); return; }
         if (!wsSend({ type: 'VERIFY_DIR', target_devices: online, path: path }, 'verify directory')) return;
-        verifyDirState = {};
-        online.forEach(function (id) { verifyDirState[id] = { status: 'verifying', detail: '' }; });
-        renderVerifyResults(verifyDirResults, verifyDirState);
+        online.forEach(function (id) { deviceTaskState[id] = { task: 'verify', kind: 'dir', status: 'verifying', detail: '' }; updateTaskCell(id); });
         addLog('Verifying ' + path + ' against local reference on ' + online.length + ' device(s)', 'info');
       }
 

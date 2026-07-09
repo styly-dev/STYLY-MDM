@@ -360,8 +360,10 @@ STYLY-MDM/
 > `PUSH_FILES_RESULT`; a device that drops offline mid-job clears its cell on the next
 > `DEVICE_LIST`. `PUSH_FILES_RESULT` does not name the mode, so the console carries the
 > verb over from what it dispatched (a page reloaded mid-job falls back to "pushed").
-> The column holds one state per device, so a push and an install targeting the same
-> device overwrite each other's cell — the last job dispatched wins.
+> The column holds one state per device, so a push, an install and a verify targeting the
+> same device overwrite each other's cell — the last job dispatched wins. That state lives
+> in `deviceTaskState[id] = {task, status, …}` and is painted by `taskCellHtml()`; the log
+> keeps the full history of every job regardless.
 
 ## Integrity Verification
 
@@ -372,6 +374,13 @@ client-side**; the server only relays the `VERIFY_*` messages (it never hashes).
 This keeps two hard constraints: a 1 GB+ APK is **never uploaded** just to be
 checked, and no HTTPS/secure-context is required — the browser hashing is pure JS
 (`crypto.subtle` is unavailable over plain `http://<LAN-IP>`).
+
+Verdicts appear in the same per-device **PROGRESS column** as install and push
+(`⟳ Verifying…` → `✓ match` / `✗ mismatch` / `✗ not found` / `✗ error`), so the mismatching
+headset is identified in the device row rather than in a separate list. The column is too
+narrow for `missing 3 · added 0 · changed 1`, so that detail is carried in the cell's
+`title` tooltip and written to the log, which keeps every verdict even after a later job
+overwrites the cell.
 
 The reference, browser, and device implementations must agree byte-for-byte, so
 the algorithms below are a fixed spec (the canonical Python implementation is
