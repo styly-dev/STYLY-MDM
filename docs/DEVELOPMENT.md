@@ -389,6 +389,18 @@ returns `full_sha256` (whole-file, hardware-accelerated), `version_code`,
 diagnostics shown on a mismatch. ZIP64 archives (CD offset sentinel `0xFFFFFFFF`) are
 not supported and return a clear error rather than a wrong range.
 
+Picking a reference APK also **auto-fills the package name** to verify. The console
+reads `AndroidManifest.xml` out of the picked file (Central Directory → Local File
+Header → stored as-is or inflated with `DecompressionStream('deflate-raw')`, which,
+unlike `crypto.subtle`, works on a non-secure origin) and parses the binary AXML for
+the `<manifest>` element's `package` and `versionName`. Both storage forms occur in
+practice: Unity release APKs store the manifest, Gradle debug APKs deflate it, and the
+AXML string pool may be UTF-8 or UTF-16. This is a progressive enhancement — on any
+parse failure the console logs a warning and the field falls back to manual entry.
+A name the operator typed is never overwritten by a failed parse, but one the console
+filled in from a *previous* APK is cleared, so a reference can never be verified
+against a stale package name.
+
 *Known limitation (accepted):* `size` + CD digest does not detect in-place data
 corruption that preserves the stored CRC-32 (ZIP CRCs are build-time constants). This
 is rare — Android verifies the APK signature at install. `full_sha256` is already
