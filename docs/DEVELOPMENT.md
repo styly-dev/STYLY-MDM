@@ -205,6 +205,7 @@ STYLY-MDM/
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
 | `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |
+| `INSTALL_DEVICE_STATE` | Per-device companion to `INSTALL_PROGRESS`: names the devices that just entered a state, so the console can label each row instead of showing the whole target set as installing. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `installing` / `fail`), `apk_filename`, `detail` (failure reason, may be empty) |
 | `LAUNCH_RESULT` | Forwarded result from a device |
 | `INSTALL_RESULT` | Forwarded install result from a device |
 | `GROUP_LIST` | Current device groups. Fields: `groups` (object mapping group name → array of member serials). The console derives each device's group membership from this; sent on connect and after any group change. |
@@ -252,6 +253,32 @@ STYLY-MDM/
 > that predates the feature simply logs `DOWNLOAD_COMPLETE` as an unknown message.
 > Admins see aggregate progress via `INSTALL_PROGRESS` (queued / transferring /
 > transferred / failed counts).
+
+> **Per-device install state.** `INSTALL_PROGRESS` carries only aggregate counts,
+> which cannot be mapped back to rows, so the server also broadcasts
+> `INSTALL_DEVICE_STATE` as each device moves. The console's INSTALL column shows
+> `Waiting…` → `Transferring…` → `Installing…` → `✓ installed` / `✗ failed`, which
+> is what distinguishes a device queued behind a transfer slot from one that is
+> genuinely installing.
+>
+> Which side emits which state is deliberate:
+>
+> | State | Emitted by |
+> |---|---|
+> | `queued` | the install job, once for the whole target list |
+> | `transferring` | the dispatcher, right after `EXECUTE_INSTALL` is sent |
+> | `installing` | the `DOWNLOAD_COMPLETE` **message handler** |
+> | `fail` | the dispatcher (offline before its turn, failed dispatch, timeout) |
+> | `success` / `fail` | the forwarded terminal `INSTALL_RESULT` |
+>
+> `installing` must come from the message handler rather than the dispatcher
+> coroutine resuming from its released future: the coroutine's resumption would
+> race the receive loop processing the client's subsequent `INSTALL_RESULT`, and if
+> `installing` landed last the row would spin forever. Handling it in the receive
+> loop makes the order structural, since a WebSocket preserves per-connection
+> order. `release_transfer_slot()` returns whether it actually freed a live slot,
+> so a `DOWNLOAD_COMPLETE` arriving after a transfer already timed out cannot
+> resurrect `installing` on a device the job has written off.
 
 ## Server Discovery Protocol
 

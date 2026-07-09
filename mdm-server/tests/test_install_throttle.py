@@ -77,6 +77,25 @@ def last_progress(admin: FakeWS) -> dict | None:
     return progress[-1] if progress else None
 
 
+def install_states(admin: FakeWS) -> list[tuple[tuple[str, ...], str]]:
+    """Every INSTALL_DEVICE_STATE an admin saw, as (device_ids, state), in order."""
+    out = []
+    for m in admin.sent:
+        data = json.loads(m)
+        if data.get("type") == "INSTALL_DEVICE_STATE":
+            out.append((tuple(data["device_ids"]), data["state"]))
+    return out
+
+
+def state_of(admin: FakeWS, device_id: str) -> str | None:
+    """The last state broadcast for a device — i.e. what its INSTALL cell shows."""
+    latest = None
+    for ids, state in install_states(admin):
+        if device_id in ids:
+            latest = state
+    return latest
+
+
 # ---------------------------------------------------------------------------
 # Unit tests — bounded dispatch, release, timeout, offline
 # ---------------------------------------------------------------------------
@@ -177,6 +196,88 @@ def test_offline_device_does_not_hold_a_slot():
 
         server.release_transfer_slot("online", "download_complete")
         await asyncio.wait_for(task, 1)
+
+    asyncio.run(body())
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — per-device state broadcasts (INSTALL_DEVICE_STATE)
+# ---------------------------------------------------------------------------
+
+def test_per_device_states_follow_the_transfer_queue():
+    async def body():
+        server.MAX_CONCURRENT_TRANSFERS = 1
+        server.TRANSFER_TIMEOUT = 60
+        admin = FakeWS(); server.admin_connections.add(admin)
+        add_device("a"); add_device("b")
+
+        task = asyncio.create_task(server._run_install_job("http://x/a.apk", "a.apk", ["a", "b"]))
+        await settle()
+
+        # The job opens by naming every target as queued, in one batched message.
+        assert install_states(admin)[0] == (("a", "b"), "queued")
+        # With N == 1 only the slot holder transfers; "b" must not look installing.
+        assert state_of(admin, "a") == "transferring"
+        assert state_of(admin, "b") == "queued"
+
+        server.release_transfer_slot("a", "download_complete")
+        await settle()
+        assert state_of(admin, "b") == "transferring"
+        # "installing" belongs to the DOWNLOAD_COMPLETE handler; the dispatcher must
+        # stay silent after its slot frees or it would race the terminal result.
+        assert state_of(admin, "a") == "transferring"
+
+        server.release_transfer_slot("b", "download_complete")
+        await asyncio.wait_for(task, 1)
+
+    asyncio.run(body())
+
+
+def test_timeout_marks_that_device_failed():
+    async def body():
+        server.MAX_CONCURRENT_TRANSFERS = 1
+        server.TRANSFER_TIMEOUT = 0  # a held slot times out immediately
+        admin = FakeWS(); server.admin_connections.add(admin)
+        add_device("a")
+
+        task = asyncio.create_task(server._run_install_job("http://x/a.apk", "a.apk", ["a"]))
+        await asyncio.wait_for(task, 2)
+
+        assert state_of(admin, "a") == "fail"
+
+    asyncio.run(body())
+
+
+def test_offline_target_is_reported_as_failed_not_left_queued():
+    async def body():
+        server.MAX_CONCURRENT_TRANSFERS = 1
+        server.TRANSFER_TIMEOUT = 60
+        admin = FakeWS(); server.admin_connections.add(admin)
+        add_device("online")  # "ghost" is a target that is not actually connected
+
+        task = asyncio.create_task(
+            server._run_install_job("http://x/a.apk", "a.apk", ["ghost", "online"])
+        )
+        await settle()
+        # A device that never gets an EXECUTE_INSTALL must not sit on "Waiting…".
+        assert state_of(admin, "ghost") == "fail"
+
+        server.release_transfer_slot("online", "download_complete")
+        await asyncio.wait_for(task, 1)
+
+    asyncio.run(body())
+
+
+def test_release_transfer_slot_reports_whether_it_freed_a_slot():
+    async def body():
+        assert server.release_transfer_slot("nobody", "download_complete") is False
+
+        fut = asyncio.get_running_loop().create_future()
+        server.pending_transfers["a"] = fut
+        assert server.release_transfer_slot("a", "download_complete") is True
+        # The second call is the guard that stops a DOWNLOAD_COMPLETE arriving after
+        # a timeout from resurrecting an "installing" cell for a written-off device.
+        assert server.release_transfer_slot("a", "download_complete") is False
 
     asyncio.run(body())
 
@@ -295,6 +396,61 @@ def test_e2e_download_complete_and_install_result_release(tmp_path):
 
                 await d2.send_json({"type": "DOWNLOAD_COMPLETE", "apk_filename": "x.apk"})
                 for ws in (d0, d1, d2, admin):
+                    await ws.close()
+        finally:
+            await ts.close()
+
+    asyncio.run(body())
+
+
+def test_e2e_installing_state_arrives_before_the_terminal_result(tmp_path):
+    """A device's row must reach "installing" and then stop, never the other way.
+
+    The installing state is emitted from the DOWNLOAD_COMPLETE handler precisely so
+    it cannot land after the INSTALL_RESULT that follows it on the same device
+    connection — if it did, the console would spin on "Installing…" forever.
+    """
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        server.MAX_CONCURRENT_TRANSFERS = 1
+        server.TRANSFER_TIMEOUT = 60
+        ts = TestServer(server.create_app())
+        await ts.start_server()
+        base = f"http://{ts.host}:{ts.port}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                d0 = await _register(session, base, "dev0")
+                admin = await session.ws_connect(base + "/ws/admin")
+                await _wait_online(admin, {"dev0"})
+
+                await admin.send_json({
+                    "type": "INSTALL_APK",
+                    "target_devices": ["dev0"],
+                    "apk_url": base + "/apks/x.apk",
+                    "apk_filename": "x.apk",
+                })
+                assert await _recv_execute(d0) is not None
+
+                await d0.send_json({"type": "DOWNLOAD_COMPLETE", "apk_filename": "x.apk"})
+                await d0.send_json({"type": "INSTALL_RESULT", "status": "success", "apk_filename": "x.apk"})
+
+                seen: list[str] = []
+
+                async def poll():
+                    while True:
+                        msg = await admin.receive()
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            continue
+                        data = json.loads(msg.data)
+                        if data.get("type") == "INSTALL_DEVICE_STATE":
+                            seen.append(data["state"])
+                        elif data.get("type") == "INSTALL_RESULT":
+                            return
+
+                await asyncio.wait_for(poll(), 2)
+                assert seen == ["queued", "transferring", "installing"]
+
+                for ws in (d0, admin):
                     await ws.close()
         finally:
             await ts.close()

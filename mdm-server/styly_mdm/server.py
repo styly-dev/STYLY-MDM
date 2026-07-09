@@ -326,7 +326,7 @@ async def forward_to_admins(payload: dict):
         admin_connections.discard(ws)
 
 
-def release_transfer_slot(device_id: str, reason: str) -> None:
+def release_transfer_slot(device_id: str, reason: str) -> bool:
     """Free the transfer slot a device holds during an install job, if any.
 
     Resolving the pending future wakes the dispatcher coroutine parked on it so
@@ -334,10 +334,43 @@ def release_transfer_slot(device_id: str, reason: str) -> None:
     holds no slot (an older client's INSTALL_RESULT, an idle device disconnecting)
     and safe to call more than once for the same device (e.g. DOWNLOAD_COMPLETE
     followed by INSTALL_RESULT) — the second call is a no-op.
+
+    Returns True only when this call actually released a live slot, so callers can
+    tell a real transfer→install transition from a late message for a device whose
+    transfer already timed out or finished.
     """
     fut = pending_transfers.get(device_id)
     if fut is not None and not fut.done():
         fut.set_result(reason)
+        return True
+    return False
+
+
+async def broadcast_install_state(
+    device_ids: list[str],
+    state: str,
+    apk_filename: str = "",
+    detail: str = "",
+) -> None:
+    """Tell admins where the named devices are in an install job.
+
+    INSTALL_PROGRESS carries only aggregate counts, which the console cannot map
+    back to rows; this per-device companion drives the INSTALL column so a device
+    waiting for a transfer slot is not shown as if it were already installing.
+
+    States: queued -> transferring -> installing -> (INSTALL_RESULT: success/fail),
+    with fail also emitted here for devices that never reach a client at all
+    (offline before their turn, failed dispatch, transfer timeout).
+    """
+    if not device_ids:
+        return
+    await forward_to_admins({
+        "type": "INSTALL_DEVICE_STATE",
+        "device_ids": device_ids,
+        "state": state,
+        "apk_filename": apk_filename,
+        "detail": detail,
+    })
 
 
 def resolve_target_ids(target_devices: list[str]) -> list[str]:
@@ -464,11 +497,22 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     # finished, so free this device's slot right away and let the
                     # local install proceed without holding up the queue.
                     if device_id:
-                        release_transfer_slot(device_id, "download_complete")
+                        released = release_transfer_slot(device_id, "download_complete")
                         log.info(
                             "DOWNLOAD_COMPLETE from %s: %s",
                             device_id, data.get("apk_filename", ""),
                         )
+                        # Announce the transferring -> installing transition here, in
+                        # the receive loop, so it is ordered before the INSTALL_RESULT
+                        # that follows on this same connection. Emitting it from the
+                        # dispatcher instead would race that result and could leave the
+                        # console stuck on "Installing…". Skipped when the slot was
+                        # already gone (timed out), so a late message cannot resurrect
+                        # a device the job has written off as failed.
+                        if released:
+                            await broadcast_install_state(
+                                [device_id], "installing", data.get("apk_filename", ""),
+                            )
                     else:
                         log.warning("DOWNLOAD_COMPLETE before REGISTER")
 
@@ -976,7 +1020,10 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
     freed as soon as it reports DOWNLOAD_COMPLETE (primary), sends a terminal
     INSTALL_RESULT (fallback for older clients / download-then-fail), disconnects,
     or hits the per-device timeout. Aggregate progress is broadcast to all admins
-    as INSTALL_PROGRESS so the console can show queued / in-progress / done counts.
+    as INSTALL_PROGRESS so the console can show queued / in-progress / done counts,
+    and each device's own transition is broadcast as INSTALL_DEVICE_STATE so the
+    console can label its row waiting / transferring / installing rather than
+    showing the whole target set as if it were installing at once.
     """
     max_concurrent = max(1, MAX_CONCURRENT_TRANSFERS)
     timeout = TRANSFER_TIMEOUT
@@ -1008,6 +1055,11 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
             "done": done,
         })
 
+    async def fail_one(device_id: str, detail: str):
+        counts["failed"] += 1
+        await broadcast_install_state([device_id], "fail", apk_filename, detail)
+        await broadcast_progress()
+
     async def dispatch_one(device_id: str):
         # The semaphore IS the concurrency cap: at most max_concurrent coroutines
         # hold it at once, so at most that many EXECUTE_INSTALL transfers are live.
@@ -1017,8 +1069,7 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
             if entry is None:
                 # Went offline (or never online) before its turn — do not hold a
                 # slot waiting for a device that cannot download.
-                counts["failed"] += 1
-                await broadcast_progress()
+                await fail_one(device_id, "Device went offline before its turn")
                 return
             try:
                 await entry["ws"].send_str(execute_msg)
@@ -1026,29 +1077,38 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
                 # Any send failure (disconnect mid-fan-out, closing transport) is a
                 # failed dispatch; the semaphore is freed by the async-with on exit.
                 log.warning("Failed to send EXECUTE_INSTALL to %s: %s", device_id, e)
-                counts["failed"] += 1
-                await broadcast_progress()
+                await fail_one(device_id, "Failed to send the install command")
                 return
 
             counts["transferring"] += 1
             fut: "asyncio.Future[str]" = loop.create_future()
             pending_transfers[device_id] = fut
             try:
+                await broadcast_install_state([device_id], "transferring", apk_filename)
                 await broadcast_progress()
                 reason = await asyncio.wait_for(fut, timeout)
                 counts["transferred"] += 1
                 log.info("Transfer slot released for %s (%s)", device_id, reason)
+                # The installing state is announced by the DOWNLOAD_COMPLETE handler,
+                # and success/fail by the forwarded INSTALL_RESULT, so nothing to emit
+                # here: doing so would race those messages.
             except asyncio.TimeoutError:
                 counts["failed"] += 1
                 log.warning(
                     "Transfer slot timeout for %s after %.0fs; releasing to keep the queue moving",
                     device_id, timeout,
                 )
+                await broadcast_install_state(
+                    [device_id], "fail", apk_filename, "Transfer timed out",
+                )
             except Exception:
                 # Never let one device's failure abort the whole job; keep the
                 # invariant (this device counts as failed, not lost).
                 counts["failed"] += 1
                 log.exception("Unexpected error awaiting transfer completion for %s", device_id)
+                await broadcast_install_state(
+                    [device_id], "fail", apk_filename, "Transfer failed",
+                )
             finally:
                 # Remove only our own future — a later job targeting the same
                 # device may already have replaced the entry.
@@ -1062,6 +1122,9 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
         apk_filename or apk_url, total, max_concurrent,
     )
     try:
+        # Every target starts out waiting for a slot. One batched message keeps a
+        # large group from costing one broadcast per device before work begins.
+        await broadcast_install_state(target_ids, "queued", apk_filename)
         await broadcast_progress()
         # return_exceptions=True so an unexpected failure in one dispatch never
         # prevents the siblings from finishing or the terminal progress below.
