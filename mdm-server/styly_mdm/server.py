@@ -42,21 +42,27 @@ DATA_DIR = Path(os.environ.get("MDM_DATA_DIR", ".")).resolve()
 APK_DIR = DATA_DIR / "apks"
 MAX_APK_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB
 
-# Maximum number of APK transfers allowed in flight per install job. Pushing an
-# APK to a large group otherwise makes every device pull the file from the server
-# at the same instant (an APK can be up to 2 GiB), spiking LAN/server bandwidth
-# and stalling transfers. Each install job gates its EXECUTE_INSTALL fan-out to at
-# most this many concurrent downloads; a slot frees as soon as a device reports
-# its download finished. Read at dispatch time so tests and the
-# --max-concurrent-transfers flag can override it.
+# Maximum number of device downloads allowed in flight across the whole server.
+# Fanning a file out to a large group otherwise makes every device pull it from the
+# server at the same instant (an APK can be up to 2 GiB, a push bundle likewise),
+# spiking LAN/server bandwidth and stalling transfers. Every byte-moving fan-out —
+# install, push, sync — gates its dispatch on the same pool of this many slots; a
+# slot frees as soon as its device reports the download finished. Read when the pool
+# is first created so tests and the --max-concurrent-transfers flag can override it.
 MAX_CONCURRENT_TRANSFERS = max(1, int(os.environ.get("MDM_MAX_CONCURRENT_TRANSFERS", "5")))
 
 # Seconds a single device may hold a transfer slot before it is force-released, so
 # a silent/offline/stuck device cannot block the queue indefinitely. Generous by
 # default: a large APK over a slow LAN can legitimately take minutes. Lowering it
 # recovers stuck slots sooner at the risk of releasing a slow-but-healthy transfer
-# early, which only relaxes throttling and never drops the install itself.
+# early, which only relaxes throttling and never drops the job itself.
 TRANSFER_TIMEOUT = float(os.environ.get("MDM_TRANSFER_TIMEOUT", "600"))
+
+# The two kinds of byte-moving job. A device can be in one of each at the same time
+# (an admin can push files to a group already installing an APK), so both the slot
+# registry and the release path are keyed by task, never by device alone.
+TASK_INSTALL = "install"
+TASK_PUSH = "push"
 
 # Generated file/folder bundles (for the push-files sync feature) live alongside the APKs.
 # The console uploads a file or folder; the server zips it into BUNDLE_DIR and serves it to
@@ -88,17 +94,29 @@ device_groups: dict[str, list[str]] = {}
 # Connected admin WebSocket sessions
 admin_connections: set[web.WebSocketResponse] = set()
 
-# device_id -> Future for the transfer slot a device holds during an install job.
+# (device_id, task) -> Future for the transfer slot a device holds during a job.
 # Resolving the future releases the slot so the next queued device is dispatched
-# (see release_transfer_slot / _run_install_job). Module-global so device-originated
-# messages (DOWNLOAD_COMPLETE / INSTALL_RESULT / disconnect) can route a release to
-# the dispatcher coroutine waiting on it.
-pending_transfers: dict[str, "asyncio.Future[str]"] = {}
+# (see release_transfer_slot / _run_install_job / _run_push_job). Module-global so
+# device-originated messages (DOWNLOAD_COMPLETE / INSTALL_RESULT / PUSH_FILES_RESULT /
+# disconnect) can route a release to the dispatcher coroutine waiting on it. The task
+# is part of the key so a push's terminal message cannot free the install slot the
+# same device is holding, and vice versa.
+pending_transfers: dict[tuple[str, str], "asyncio.Future[str]"] = {}
 
-# Strong references to in-flight install-job tasks. asyncio only keeps weak
+# Strong references to in-flight transfer-job tasks. asyncio only keeps weak
 # references to tasks, so without this a backgrounded job could be garbage
 # collected mid-run. Entries are discarded when the task finishes.
-_install_tasks: set["asyncio.Task"] = set()
+_transfer_tasks: set["asyncio.Task"] = set()
+
+# Server-wide pool of transfer slots, shared by every byte-moving fan-out. The
+# throttle belongs to the transfer *resource* (the LAN, the server's uplink), not to
+# any one action: a per-job semaphore would let two overlapping install jobs run 2N
+# transfers, and would leave a concurrent install and push blind to each other.
+#
+# Built lazily rather than at import because an asyncio.Semaphore binds to the first
+# event loop that awaits it, and the test suite runs each case in a fresh loop.
+_transfer_sem: "asyncio.Semaphore | None" = None
+_transfer_sem_loop: "asyncio.AbstractEventLoop | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -343,24 +361,60 @@ async def forward_to_admins(payload: dict):
         admin_connections.discard(ws)
 
 
-def release_transfer_slot(device_id: str, reason: str) -> bool:
-    """Free the transfer slot a device holds during an install job, if any.
+def transfer_slots() -> asyncio.Semaphore:
+    """The server-wide transfer-slot pool, created on first use in this event loop.
 
-    Resolving the pending future wakes the dispatcher coroutine parked on it so
-    the next queued device is sent EXECUTE_INSTALL. Safe to call for a device that
-    holds no slot (an older client's INSTALL_RESULT, an idle device disconnecting)
-    and safe to call more than once for the same device (e.g. DOWNLOAD_COMPLETE
-    followed by INSTALL_RESULT) — the second call is a no-op.
+    Sized from MAX_CONCURRENT_TRANSFERS at creation. It is deliberately never resized
+    afterwards: swapping in a larger semaphore would strand the coroutines already
+    parked on the old one and briefly allow twice the cap. The CLI flag and the env
+    var are both read before the loop starts, so the size is settled by then.
+    """
+    global _transfer_sem, _transfer_sem_loop
+    loop = asyncio.get_running_loop()
+    if _transfer_sem is None or _transfer_sem_loop is not loop:
+        _transfer_sem = asyncio.Semaphore(max(1, MAX_CONCURRENT_TRANSFERS))
+        _transfer_sem_loop = loop
+    return _transfer_sem
+
+
+def reset_transfer_slots() -> None:
+    """Drop the pool so the next transfer_slots() call rebuilds it. Tests only."""
+    global _transfer_sem, _transfer_sem_loop
+    _transfer_sem = None
+    _transfer_sem_loop = None
+
+
+def release_transfer_slot(device_id: str, reason: str, task: str | None = None) -> bool:
+    """Free the transfer slot(s) a device holds, if any.
+
+    Resolving the pending future wakes the dispatcher coroutine parked on it so the
+    next queued device is dispatched. Safe to call for a device that holds no slot
+    (an older client's INSTALL_RESULT, an idle device disconnecting) and safe to call
+    more than once for the same device and task (e.g. DOWNLOAD_COMPLETE followed by
+    INSTALL_RESULT) — the second call is a no-op.
+
+    ``task`` names which job to release: a device may be transferring for an install
+    and a push at the same time, and each job's terminal message must free only its
+    own slot. Pass None to free every slot the device holds, which is what a
+    disconnect means.
 
     Returns True only when this call actually released a live slot, so callers can
-    tell a real transfer→install transition from a late message for a device whose
+    tell a real transfer→apply transition from a late message for a device whose
     transfer already timed out or finished.
     """
-    fut = pending_transfers.get(device_id)
-    if fut is not None and not fut.done():
-        fut.set_result(reason)
-        return True
-    return False
+    if task is not None:
+        fut = pending_transfers.get((device_id, task))
+        if fut is not None and not fut.done():
+            fut.set_result(reason)
+            return True
+        return False
+
+    released = False
+    for (did, _task), fut in list(pending_transfers.items()):
+        if did == device_id and not fut.done():
+            fut.set_result(reason)
+            released = True
+    return released
 
 
 async def broadcast_install_state(
@@ -386,6 +440,35 @@ async def broadcast_install_state(
         "device_ids": device_ids,
         "state": state,
         "apk_filename": apk_filename,
+        "detail": detail,
+    })
+
+
+async def broadcast_push_state(
+    device_ids: list[str],
+    state: str,
+    dest_path: str = "",
+    delete_extras: bool = False,
+    detail: str = "",
+) -> None:
+    """The push/sync counterpart of broadcast_install_state.
+
+    States: queued -> transferring -> applying -> (PUSH_FILES_RESULT: success/fail),
+    where applying covers the client's local unzip and mirror — the phase that runs
+    after the slot is freed. As with install, fail is also emitted here for devices
+    that never reach a client (offline before their turn, failed dispatch, timeout).
+
+    ``delete_extras`` rides along so the console can name the action (Push vs Sync)
+    without having to remember what it dispatched.
+    """
+    if not device_ids:
+        return
+    await forward_to_admins({
+        "type": "PUSH_DEVICE_STATE",
+        "device_ids": device_ids,
+        "state": state,
+        "dest_path": dest_path,
+        "delete_extras": delete_extras,
         "detail": detail,
     })
 
@@ -652,21 +735,33 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                 elif msg_type == "DOWNLOAD_COMPLETE":
                     # Primary transfer-slot release: the network-heavy download has
                     # finished, so free this device's slot right away and let the
-                    # local install proceed without holding up the queue.
+                    # local install (or unzip/mirror) proceed without holding up the
+                    # queue. `task` names which job finished downloading; clients that
+                    # predate push throttling only ever send it for an install.
                     if device_id:
-                        released = release_transfer_slot(device_id, "download_complete")
-                        log.info(
-                            "DOWNLOAD_COMPLETE from %s: %s",
-                            device_id, data.get("apk_filename", ""),
+                        task = data.get("task") or TASK_INSTALL
+                        released = release_transfer_slot(
+                            device_id, "download_complete", task=task,
                         )
-                        # Announce the transferring -> installing transition here, in
-                        # the receive loop, so it is ordered before the INSTALL_RESULT
-                        # that follows on this same connection. Emitting it from the
-                        # dispatcher instead would race that result and could leave the
-                        # console stuck on "Installing…". Skipped when the slot was
-                        # already gone (timed out), so a late message cannot resurrect
-                        # a device the job has written off as failed.
-                        if released:
+                        log.info(
+                            "DOWNLOAD_COMPLETE (%s) from %s: %s",
+                            task, device_id,
+                            data.get("apk_filename") or data.get("dest_path", ""),
+                        )
+                        # Announce the transferring -> installing/applying transition
+                        # here, in the receive loop, so it is ordered before the
+                        # terminal result that follows on this same connection.
+                        # Emitting it from the dispatcher instead would race that
+                        # result and could leave the console stuck on "Installing…".
+                        # Skipped when the slot was already gone (timed out), so a
+                        # late message cannot resurrect a device the job has written
+                        # off as failed.
+                        if released and task == TASK_PUSH:
+                            await broadcast_push_state(
+                                [device_id], "applying", data.get("dest_path", ""),
+                                bool(data.get("delete_extras")),
+                            )
+                        elif released:
                             await broadcast_install_state(
                                 [device_id], "installing", data.get("apk_filename", ""),
                             )
@@ -685,9 +780,12 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     # Fallback transfer-slot release: an older client that never
                     # emits DOWNLOAD_COMPLETE, or a client whose download failed and
                     # jumped straight to a terminal result, frees its slot here. A
-                    # no-op if DOWNLOAD_COMPLETE already released it.
-                    if msg_type == "INSTALL_RESULT" and device_id:
-                        release_transfer_slot(device_id, "install_result")
+                    # no-op if DOWNLOAD_COMPLETE already released it. Each result only
+                    # ever frees its own job's slot.
+                    if device_id and msg_type == "INSTALL_RESULT":
+                        release_transfer_slot(device_id, "install_result", task=TASK_INSTALL)
+                    elif device_id and msg_type == "PUSH_FILES_RESULT":
+                        release_transfer_slot(device_id, "push_files_result", task=TASK_PUSH)
                     log.info("%s from %s: %s", msg_type, device_id, data.get("status"))
                     await forward_to_admins(data)
 
@@ -702,8 +800,9 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                 log.error("Device WS error: %s", ws.exception())
     finally:
         if device_id:
-            # Free any transfer slot this device was holding so a disconnect mid
-            # install-job does not stall the queue until the timeout fires.
+            # Free every transfer slot this device was holding — it may have been in
+            # an install and a push at once — so a disconnect mid-job does not stall
+            # the queue until the timeout fires.
             release_transfer_slot(device_id, "disconnect")
         if device_id and device_id in devices:
             del devices[device_id]
@@ -1146,11 +1245,11 @@ async def handle_install_apk(admin_ws: web.WebSocketResponse, data: dict):
     """Process an INSTALL_APK command from an admin and forward to target HMDs.
 
     The EXECUTE_INSTALL fan-out is throttled: the actual dispatch runs as a
-    background job (see _run_install_job) that keeps at most
-    MAX_CONCURRENT_TRANSFERS transfers in flight, so a large group does not make
-    every device pull the APK from the server at the same instant. This handler
-    validates the request, acknowledges it, and returns immediately so the admin
-    can keep issuing commands while the (potentially minutes-long) job proceeds.
+    background job (see _run_install_job) that acquires from the server-wide pool of
+    MAX_CONCURRENT_TRANSFERS transfer slots, so a large group does not make every
+    device pull the APK from the server at the same instant. This handler validates
+    the request, acknowledges it, and returns immediately so the admin can keep
+    issuing commands while the (potentially minutes-long) job proceeds.
     """
     target_devices: list[str] = data.get("target_devices", [])
     apk_url: str = data.get("apk_url", "")
@@ -1181,27 +1280,28 @@ async def handle_install_apk(admin_ws: web.WebSocketResponse, data: dict):
     }))
 
     task = asyncio.create_task(_run_install_job(apk_url, apk_filename, target_ids))
-    _install_tasks.add(task)
-    task.add_done_callback(_install_tasks.discard)
+    _transfer_tasks.add(task)
+    task.add_done_callback(_transfer_tasks.discard)
 
 
 async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str]):
     """Fan out EXECUTE_INSTALL to target devices with bounded concurrency.
 
-    At most MAX_CONCURRENT_TRANSFERS devices download at once. A device's slot is
-    freed as soon as it reports DOWNLOAD_COMPLETE (primary), sends a terminal
-    INSTALL_RESULT (fallback for older clients / download-then-fail), disconnects,
-    or hits the per-device timeout. Aggregate progress is broadcast to all admins
-    as INSTALL_PROGRESS so the console can show queued / in-progress / done counts,
-    and each device's own transition is broadcast as INSTALL_DEVICE_STATE so the
-    console can label its row waiting / transferring / installing rather than
-    showing the whole target set as if it were installing at once.
+    Dispatch is gated on the server-wide transfer pool, so at most
+    MAX_CONCURRENT_TRANSFERS devices are downloading at once across every install
+    and push job combined. A device's slot is freed as soon as it reports
+    DOWNLOAD_COMPLETE (primary), sends a terminal INSTALL_RESULT (fallback for older
+    clients / download-then-fail), disconnects, or hits the per-device timeout.
+    Aggregate progress is broadcast to all admins as INSTALL_PROGRESS so the console
+    can show queued / in-progress / done counts, and each device's own transition is
+    broadcast as INSTALL_DEVICE_STATE so the console can label its row waiting /
+    transferring / installing rather than showing the whole target set as if it were
+    installing at once.
     """
-    max_concurrent = max(1, MAX_CONCURRENT_TRANSFERS)
     timeout = TRANSFER_TIMEOUT
     total = len(target_ids)
     loop = asyncio.get_running_loop()
-    sem = asyncio.Semaphore(max_concurrent)
+    sem = transfer_slots()
 
     execute_msg = json.dumps({
         "type": "EXECUTE_INSTALL",
@@ -1233,8 +1333,9 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
         await broadcast_progress()
 
     async def dispatch_one(device_id: str):
-        # The semaphore IS the concurrency cap: at most max_concurrent coroutines
-        # hold it at once, so at most that many EXECUTE_INSTALL transfers are live.
+        # The semaphore IS the concurrency cap: at most MAX_CONCURRENT_TRANSFERS
+        # coroutines hold it at once — server-wide, across every transfer job — so at
+        # most that many downloads are live.
         async with sem:
             counts["queued"] -= 1
             entry = devices.get(device_id)
@@ -1253,8 +1354,9 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
                 return
 
             counts["transferring"] += 1
+            key = (device_id, TASK_INSTALL)
             fut: "asyncio.Future[str]" = loop.create_future()
-            pending_transfers[device_id] = fut
+            pending_transfers[key] = fut
             try:
                 await broadcast_install_state([device_id], "transferring", apk_filename)
                 await broadcast_progress()
@@ -1284,14 +1386,14 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
             finally:
                 # Remove only our own future — a later job targeting the same
                 # device may already have replaced the entry.
-                if pending_transfers.get(device_id) is fut:
-                    del pending_transfers[device_id]
+                if pending_transfers.get(key) is fut:
+                    del pending_transfers[key]
                 counts["transferring"] -= 1
             await broadcast_progress()
 
     log.info(
-        "INSTALL_APK: dispatching %s to %d device(s), max %d concurrent transfer(s)",
-        apk_filename or apk_url, total, max_concurrent,
+        "INSTALL_APK: dispatching %s to %d device(s), max %d concurrent transfer(s) server-wide",
+        apk_filename or apk_url, total, MAX_CONCURRENT_TRANSFERS,
     )
     try:
         # Every target starts out waiting for a slot. One batched message keeps a
@@ -1319,6 +1421,10 @@ async def handle_push_files(admin_ws: web.WebSocketResponse, data: dict):
 
     The destination is validated here as a first-line guard (a mirror deletes extras, so a bad
     path is destructive); the client re-validates against its real filesystem before applying.
+
+    Like INSTALL_APK, the fan-out is throttled against the server-wide transfer pool (a push
+    bundle can be as large as an APK), so this handler validates, acknowledges, and returns
+    while _run_push_job dispatches in the background.
     """
     target_devices: list[str] = data.get("target_devices", [])
     bundle_url: str = data.get("bundle_url", "")
@@ -1350,6 +1456,47 @@ async def handle_push_files(admin_ws: web.WebSocketResponse, data: dict):
         }))
         return
 
+    await admin_ws.send_str(json.dumps({
+        "type": "PUSH_FILES_SENT",
+        "bundle_filename": bundle_filename,
+        "dest_path": dest_path,
+        "delete_extras": delete_extras,
+        "target_count": len(target_ids),
+        "max_concurrent": MAX_CONCURRENT_TRANSFERS,
+    }))
+
+    task = asyncio.create_task(
+        _run_push_job(bundle_url, bundle_filename, dest_path, delete_extras, target_ids)
+    )
+    _transfer_tasks.add(task)
+    task.add_done_callback(_transfer_tasks.discard)
+
+
+async def _run_push_job(
+    bundle_url: str,
+    bundle_filename: str,
+    dest_path: str,
+    delete_extras: bool,
+    target_ids: list[str],
+):
+    """Fan out EXECUTE_PUSH_FILES to target devices with bounded concurrency.
+
+    The install-job twin (_run_install_job): same slot pool, same release triggers, same
+    shape of progress. They stay two functions because everything else — the message they
+    dispatch, the counters, the states they name — is theirs alone; only the pool and
+    ``pending_transfers`` are shared, and the counters here are strictly job-local.
+
+    A device's slot is freed as soon as it reports DOWNLOAD_COMPLETE for the push
+    (primary — the unzip and mirror that follow move no bytes over the network), sends a
+    terminal PUSH_FILES_RESULT (fallback for older clients, which never signal the
+    download separately), disconnects, or hits the per-device timeout.
+    """
+    timeout = TRANSFER_TIMEOUT
+    total = len(target_ids)
+    loop = asyncio.get_running_loop()
+    sem = transfer_slots()
+    verb = "sync" if delete_extras else "push"
+
     execute_msg = json.dumps({
         "type": "EXECUTE_PUSH_FILES",
         "bundle_url": bundle_url,
@@ -1358,28 +1505,95 @@ async def handle_push_files(admin_ws: web.WebSocketResponse, data: dict):
         "delete_extras": delete_extras,
     })
 
-    sent_count = 0
-    for did in target_ids:
-        entry = devices.get(did)
-        if entry:
+    # Job-local progress counters. The invariant
+    #   total == queued + transferring + transferred + failed
+    # holds after every transition below (single-threaded event loop, so no lock).
+    counts = {"queued": total, "transferring": 0, "transferred": 0, "failed": 0}
+
+    async def broadcast_progress(done: bool = False):
+        await forward_to_admins({
+            "type": "PUSH_PROGRESS",
+            "bundle_filename": bundle_filename,
+            "dest_path": dest_path,
+            "delete_extras": delete_extras,
+            "total": total,
+            "queued": counts["queued"],
+            "transferring": counts["transferring"],
+            "transferred": counts["transferred"],
+            "failed": counts["failed"],
+            "done": done,
+        })
+
+    async def fail_one(device_id: str, detail: str):
+        counts["failed"] += 1
+        await broadcast_push_state([device_id], "fail", dest_path, delete_extras, detail)
+        await broadcast_progress()
+
+    async def dispatch_one(device_id: str):
+        async with sem:
+            counts["queued"] -= 1
+            entry = devices.get(device_id)
+            if entry is None:
+                await fail_one(device_id, "Device went offline before its turn")
+                return
             try:
                 await entry["ws"].send_str(execute_msg)
-                sent_count += 1
-            except ConnectionResetError:
-                log.warning("Failed to send EXECUTE_PUSH_FILES to %s (disconnected)", did)
+            except Exception as e:
+                log.warning("Failed to send EXECUTE_PUSH_FILES to %s: %s", device_id, e)
+                await fail_one(device_id, f"Failed to send the {verb} command")
+                return
 
-    log.info("PUSH_FILES (%s): sent %s -> %s to %d/%d devices",
-             "sync" if delete_extras else "copy",
-             bundle_filename or bundle_url, dest_path, sent_count, len(target_ids))
+            counts["transferring"] += 1
+            key = (device_id, TASK_PUSH)
+            fut: "asyncio.Future[str]" = loop.create_future()
+            pending_transfers[key] = fut
+            try:
+                await broadcast_push_state(
+                    [device_id], "transferring", dest_path, delete_extras,
+                )
+                await broadcast_progress()
+                reason = await asyncio.wait_for(fut, timeout)
+                counts["transferred"] += 1
+                log.info("Transfer slot released for %s (%s)", device_id, reason)
+                # "applying" is announced by the DOWNLOAD_COMPLETE handler, and
+                # success/fail by the forwarded PUSH_FILES_RESULT, so nothing to emit
+                # here: doing so would race those messages.
+            except asyncio.TimeoutError:
+                counts["failed"] += 1
+                log.warning(
+                    "Transfer slot timeout for %s after %.0fs; releasing to keep the queue moving",
+                    device_id, timeout,
+                )
+                await broadcast_push_state(
+                    [device_id], "fail", dest_path, delete_extras, "Transfer timed out",
+                )
+            except Exception:
+                counts["failed"] += 1
+                log.exception("Unexpected error awaiting transfer completion for %s", device_id)
+                await broadcast_push_state(
+                    [device_id], "fail", dest_path, delete_extras, "Transfer failed",
+                )
+            finally:
+                if pending_transfers.get(key) is fut:
+                    del pending_transfers[key]
+                counts["transferring"] -= 1
+            await broadcast_progress()
 
-    await admin_ws.send_str(json.dumps({
-        "type": "PUSH_FILES_SENT",
-        "bundle_filename": bundle_filename,
-        "dest_path": dest_path,
-        "delete_extras": delete_extras,
-        "sent_count": sent_count,
-        "target_count": len(target_ids),
-    }))
+    log.info(
+        "PUSH_FILES (%s): dispatching %s -> %s to %d device(s), "
+        "max %d concurrent transfer(s) server-wide",
+        verb, bundle_filename or bundle_url, dest_path, total, MAX_CONCURRENT_TRANSFERS,
+    )
+    try:
+        await broadcast_push_state(target_ids, "queued", dest_path, delete_extras)
+        await broadcast_progress()
+        await asyncio.gather(*(dispatch_one(did) for did in target_ids), return_exceptions=True)
+    finally:
+        await broadcast_progress(done=True)
+    log.info(
+        "PUSH_FILES (%s): %s finished — %d transferred, %d failed/timed out of %d",
+        verb, bundle_filename or bundle_url, counts["transferred"], counts["failed"], total,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2017,8 +2231,8 @@ def main():
         "--max-concurrent-transfers",
         type=int,
         default=None,
-        help="Max simultaneous APK transfers per install job "
-        "(default: $MDM_MAX_CONCURRENT_TRANSFERS or 5).",
+        help="Max simultaneous device downloads server-wide, across all install "
+        "and push jobs (default: $MDM_MAX_CONCURRENT_TRANSFERS or 5).",
     )
     subparsers = parser.add_subparsers(dest="command")
     hash_parser = subparsers.add_parser(

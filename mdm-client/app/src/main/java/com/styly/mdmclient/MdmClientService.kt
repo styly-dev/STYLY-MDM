@@ -215,7 +215,7 @@ class MdmClientService : Service() {
                 // Tell the server the network-heavy download is done so it can free
                 // this device's transfer slot and dispatch the next queued device,
                 // while the local (offline) install proceeds below.
-                sendDownloadComplete(apkFilename.ifEmpty { downloadedApk.name })
+                sendDownloadComplete(task = "install", apkFilename = apkFilename.ifEmpty { downloadedApk.name })
                 installApk(downloadedApk, apkFilename.ifEmpty { downloadedApk.name })
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to install APK from $apkUrl", e)
@@ -370,6 +370,10 @@ class MdmClientService : Service() {
             try {
                 Log.i(TAG, "Downloading bundle: $bundleUrl")
                 bundleFile = downloadBundle(bundleUrl)
+                // Tell the server the network-heavy download is done so it can free this
+                // device's transfer slot and dispatch the next queued device, while the
+                // local (offline) unzip and mirror proceed below.
+                sendDownloadComplete(task = "push", destPath = destPath, deleteExtras = deleteExtras)
                 staging = unzipToStaging(bundleFile)
                 val result = BundleSync.apply(staging, File(destPath), deleteExtras)
                 Log.i(
@@ -621,10 +625,28 @@ class MdmClientService : Service() {
         webSocketManager.sendMessage(result)
     }
 
-    private fun sendDownloadComplete(apkFilename: String) {
+    /**
+     * Signal that a download finished, freeing the server's transfer slot before the local
+     * work (install, or unzip + mirror) begins.
+     *
+     * `task` names which job the download belonged to, since a device can be transferring for
+     * an install and a push at once and each holds its own slot. A server that predates push
+     * throttling ignores the field and reads `apk_filename` as before.
+     */
+    private fun sendDownloadComplete(
+        task: String,
+        apkFilename: String = "",
+        destPath: String = "",
+        deleteExtras: Boolean = false
+    ) {
         val msg = JSONObject().apply {
             put("type", "DOWNLOAD_COMPLETE")
+            put("task", task)
             put("apk_filename", apkFilename)
+            if (destPath.isNotEmpty()) {
+                put("dest_path", destPath)
+                put("delete_extras", deleteExtras)
+            }
         }
         webSocketManager.sendMessage(msg)
     }
