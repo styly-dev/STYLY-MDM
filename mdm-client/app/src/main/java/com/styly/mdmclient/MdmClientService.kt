@@ -19,6 +19,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.zip.ZipFile
 
 /**
  * Foreground service that maintains the WebSocket connection to the STYLY-MDM server
@@ -35,6 +36,14 @@ class MdmClientService : Service() {
         const val ACTION_STATUS_UPDATE = "com.styly.mdmclient.STATUS_UPDATE"
         const val EXTRA_CONNECTED = "connected"
         const val EXTRA_MESSAGE = "message"
+
+        // Top-level shared-storage directories that full-mirror push-files sync must never
+        // target: mirroring into them would delete unrelated user/media/app data. Matched
+        // (case-insensitively) against the first path segment below the storage root.
+        private val PROTECTED_TOPLEVEL_DIRS = setOf(
+            "android", "download", "downloads", "dcim", "pictures", "movies", "music",
+            "documents", "alarms", "notifications", "podcasts", "ringtones"
+        )
     }
 
     private lateinit var webSocketManager: WebSocketManager
@@ -74,6 +83,7 @@ class MdmClientService : Service() {
         when (type) {
             "EXECUTE_LAUNCH" -> executeLaunch(payload)
             "EXECUTE_INSTALL" -> executeInstall(payload)
+            "EXECUTE_PUSH_FILES" -> executePushFiles(payload)
             "SET_STARTUP_APP" -> handleSetStartupApp(payload)
             "CLEAR_STARTUP_APP" -> handleClearStartupApp()
             else -> Log.w(TAG, "Unknown command type: $type")
@@ -288,6 +298,209 @@ class MdmClientService : Service() {
             apkFile.delete()
             throw e
         }
+    }
+
+    /**
+     * Download a file/folder bundle and apply it to a destination directory.
+     *
+     * `delete_extras` picks the semantics: absent or false means push (copy and overwrite,
+     * never delete); true means sync (full mirror, pruning anything at the destination that
+     * is not in the bundle). It is read with a false default so a payload from a server that
+     * predates the flag can only ever copy — a missing field must never delete.
+     *
+     * Destinations are limited to shared storage — the PICO ToBService has no privileged
+     * file-copy API, so only /sdcard is reachable via java.io.File I/O.
+     */
+    private fun executePushFiles(payload: JSONObject) {
+        val bundleUrl = payload.optString("bundle_url", "")
+        val destPath = payload.optString("dest_path", "").trim()
+        val deleteExtras = payload.optBoolean("delete_extras", false)
+
+        if (bundleUrl.isEmpty()) {
+            Log.e(TAG, "EXECUTE_PUSH_FILES missing bundle_url")
+            sendPushFilesResult(destPath, "fail", 0, 0, 0, "Missing bundle_url")
+            return
+        }
+
+        val destError = validateDestPath(destPath)
+        if (destError != null) {
+            Log.e(TAG, "EXECUTE_PUSH_FILES rejected destination '$destPath': $destError")
+            sendPushFilesResult(destPath, "fail", 0, 0, 0, destError)
+            return
+        }
+
+        if (!hasExternalStorageAccess()) {
+            Log.e(TAG, "MANAGE_EXTERNAL_STORAGE not granted; cannot sync files")
+            sendPushFilesResult(
+                destPath, "fail", 0, 0, 0,
+                "All files access (MANAGE_EXTERNAL_STORAGE) is not granted on this device"
+            )
+            return
+        }
+
+        Thread {
+            var bundleFile: File? = null
+            var staging: File? = null
+            try {
+                Log.i(TAG, "Downloading bundle: $bundleUrl")
+                bundleFile = downloadBundle(bundleUrl)
+                staging = unzipToStaging(bundleFile)
+                val result = BundleSync.apply(staging, File(destPath), deleteExtras)
+                Log.i(
+                    TAG,
+                    "Push-files ${if (deleteExtras) "sync" else "copy"} to $destPath: " +
+                        "+${result.added} ~${result.updated} -${result.deleted}"
+                )
+                sendPushFilesResult(
+                    destPath, "success", result.added, result.updated, result.deleted, ""
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to push files to $destPath", e)
+                sendPushFilesResult(destPath, "fail", 0, 0, 0, e.message ?: "Unknown error")
+            } finally {
+                bundleFile?.delete()
+                staging?.deleteRecursively()
+            }
+        }.start()
+    }
+
+    private fun downloadBundle(bundleUrl: String): File {
+        val url = URL(bundleUrl)
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000
+            readTimeout = 120_000
+            requestMethod = "GET"
+            instanceFollowRedirects = true
+        }
+
+        try {
+            val responseCode = connection.responseCode
+            if (responseCode !in 200..299) {
+                throw IllegalStateException("Bundle download failed with HTTP $responseCode")
+            }
+
+            val outputFile = File(pushTempDir(), "${System.currentTimeMillis()}-bundle.zip")
+            var bytesReadTotal = 0L
+            connection.inputStream.use { input ->
+                FileOutputStream(outputFile).use { output ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read == -1) break
+                        output.write(buffer, 0, read)
+                        bytesReadTotal += read
+                    }
+                }
+            }
+
+            if (bytesReadTotal == 0L) {
+                outputFile.delete()
+                throw IllegalStateException("Downloaded bundle is empty")
+            }
+
+            Log.i(TAG, "Downloaded bundle to ${outputFile.absolutePath} ($bytesReadTotal bytes)")
+            return outputFile
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    /**
+     * Unzip a bundle into a fresh staging directory, rejecting any entry whose path would
+     * escape the staging root (zip-slip guard).
+     */
+    private fun unzipToStaging(bundleFile: File): File {
+        val staging = File(pushTempDir(), "staging-${System.currentTimeMillis()}")
+        if (!staging.mkdirs()) {
+            throw IllegalStateException("Failed to create staging directory")
+        }
+
+        val stagingRoot = staging.canonicalPath
+        val stagingPrefix = stagingRoot + File.separator
+        ZipFile(bundleFile).use { zip ->
+            val entries = zip.entries()
+            while (entries.hasMoreElements()) {
+                val entry = entries.nextElement()
+                val outFile = File(staging, entry.name)
+                val outCanonical = outFile.canonicalPath
+                if (outCanonical != stagingRoot && !outCanonical.startsWith(stagingPrefix)) {
+                    throw IllegalStateException("Zip entry escapes staging dir: ${entry.name}")
+                }
+                if (entry.isDirectory) {
+                    outFile.mkdirs()
+                } else {
+                    outFile.parentFile?.mkdirs()
+                    zip.getInputStream(entry).use { input ->
+                        FileOutputStream(outFile).use { output -> input.copyTo(output) }
+                    }
+                }
+            }
+        }
+        return staging
+    }
+
+    private fun pushTempDir(): File {
+        val downloadsRoot = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val dir = File(downloadsRoot, "styly-mdm/.push-tmp")
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw IllegalStateException("Failed to create push temp directory")
+        }
+        return dir
+    }
+
+    /**
+     * Validate a device destination path. Applied to pushes as well as syncs: a sync deletes
+     * extras, so a bad path could wipe unrelated data, and holding both to the same rule keeps
+     * a push from quietly reaching somewhere a sync may not. The canonical path must live under
+     * shared storage and be neither the storage root nor a protected top-level directory.
+     * Returns an error message, or null if the path is safe.
+     */
+    private fun validateDestPath(destPath: String): String? {
+        if (destPath.isEmpty()) return "Destination path is required"
+        if (!destPath.startsWith("/")) return "Destination must be an absolute path"
+        if (destPath.split("/").contains("..")) return "Destination path must not contain '..'"
+
+        val storageRoot = Environment.getExternalStorageDirectory().canonicalFile
+        val target: File = try {
+            File(destPath).canonicalFile
+        } catch (e: Exception) {
+            return "Invalid destination path"
+        }
+        val rootPath = storageRoot.path
+        if (target.path == rootPath) {
+            return "Destination must be a subdirectory, not the shared-storage root"
+        }
+        if (!target.path.startsWith(rootPath + File.separator)) {
+            return "Destination must be under shared storage ($rootPath)"
+        }
+        val firstSegment = target.path.substring(rootPath.length + 1).split("/")[0]
+        if (firstSegment.lowercase() in PROTECTED_TOPLEVEL_DIRS) {
+            return "Destination must not be inside the protected '$firstSegment' directory"
+        }
+        return null
+    }
+
+
+    private fun sendPushFilesResult(
+        destPath: String,
+        status: String,
+        added: Int,
+        updated: Int,
+        deleted: Int,
+        error: String
+    ) {
+        val result = JSONObject().apply {
+            put("type", "PUSH_FILES_RESULT")
+            put("status", status)
+            put("dest_path", destPath)
+            put("added", added)
+            put("updated", updated)
+            put("deleted", deleted)
+            if (error.isNotEmpty()) {
+                put("error", error)
+            }
+        }
+        webSocketManager.sendMessage(result)
     }
 
     private fun hasExternalStorageAccess(): Boolean {
