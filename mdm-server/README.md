@@ -33,8 +33,8 @@ A command-line flag overrides the corresponding environment variable.
 |--------|---------|------|---------|
 | HTTP/WebSocket port | `MDM_WS_PORT` | `--port` | `7070` |
 | UDP discovery port | `MDM_DISCOVERY_PORT` | — | `7071` |
-| Data directory (uploaded APKs + device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
-| Simultaneous APK transfers per install job | `MDM_MAX_CONCURRENT_TRANSFERS` | `--max-concurrent-transfers` | `5` |
+| Data directory (uploaded APKs, pushed bundles, device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
+| Simultaneous device downloads, server-wide | `MDM_MAX_CONCURRENT_TRANSFERS` | `--max-concurrent-transfers` | `5` |
 | Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `600` |
 
 The data directory holds everything the server persists: uploaded APKs
@@ -43,8 +43,9 @@ registry (`<data-dir>/device_registry.json`). It defaults to the directory the
 server is started from, so `uvx styly-mdm` in a fresh directory comes up with no
 devices or groups.
 
-Transfer throttling bounds how many devices download an APK at once during a
-single install job; the rest queue until a slot frees.
+Transfer throttling bounds how many devices download at once — one server-wide
+pool shared by every install and push/sync job; the rest queue until a slot
+frees.
 
 Only one server may answer discovery on a given port: the server probes on
 startup and exits if another STYLY-MDM server already responds on its discovery

@@ -68,20 +68,21 @@ Open `http://<server-ip>:7070` in a browser to access the web console.
 |---------|---------|------|---------|
 | HTTP/WebSocket port | `MDM_WS_PORT` | `--port` | `7070` |
 | UDP discovery port | `MDM_DISCOVERY_PORT` | — | `7071` |
-| Data directory (uploaded APKs + device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
-| Simultaneous APK transfers per install job | `MDM_MAX_CONCURRENT_TRANSFERS` | `--max-concurrent-transfers` | `5` |
+| Data directory (uploaded APKs, pushed bundles, device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
+| Simultaneous device downloads, server-wide | `MDM_MAX_CONCURRENT_TRANSFERS` | `--max-concurrent-transfers` | `5` |
 | Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `600` |
 
 The **data directory** holds everything the server persists: uploaded APKs (`apks/`), pushed file bundles (`bundles/`), and the device registry (`device_registry.json`). It defaults to the directory the server is started from, so `uvx styly-mdm` in a fresh directory comes up with no devices or groups. Pass `--data-dir` to pin it somewhere stable.
 
-**Transfer throttling** keeps a large install job from making every device pull the APK at the same instant (an APK can be up to 2 GiB). At most `--max-concurrent-transfers` devices download at once; the rest queue, and a slot frees as soon as its device reports the download finished. `MDM_TRANSFER_TIMEOUT` caps how long one device may hold a slot, so a stuck device cannot block the queue. The [Developer Guide](docs/DEVELOPMENT.md) documents the full slot-release rules.
+**Transfer throttling** keeps a large fan-out — an APK install, a file push, or a folder sync — from making every device download at the same instant (an APK or a pushed bundle can be up to 2 GiB). All jobs share one server-wide pool: at most `--max-concurrent-transfers` devices download at once; the rest queue, and a slot frees as soon as its device reports the download finished. `MDM_TRANSFER_TIMEOUT` caps how long one device may hold a slot, so a stuck device cannot block the queue. The [Developer Guide](docs/DEVELOPMENT.md) documents the full slot-release rules.
 
 > **Only one server per discovery port.** Devices connect to whichever server answers discovery first, so two servers sharing a discovery port would split them nondeterministically. To prevent that, the server broadcasts a probe on startup and exits if another STYLY-MDM server answers:
 >
 > ```
 > [ERROR] Another STYLY-MDM server is already running on this network and
 > responding on discovery port 7071 (from 192.168.1.42). Refusing to start so
-> devices cannot connect to the wrong server.
+> devices cannot connect to the wrong server. Stop the other server, or set
+> MDM_DISCOVERY_PORT to a different value to run alongside it.
 > ```
 >
 > To run a development server alongside production, give it its own ports — `mdm-server/run.sh dev` does this by setting `MDM_DISCOVERY_PORT=7081` and `MDM_WS_PORT=7080`. The probe is best-effort: two servers started at the same instant can miss each other.
