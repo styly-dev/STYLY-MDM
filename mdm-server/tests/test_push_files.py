@@ -307,28 +307,58 @@ def _register_online_device(did):
     return ws
 
 
+@pytest.fixture(autouse=True)
+def _reset_transfer_state():
+    """PUSH_FILES now dispatches as a background job against the shared slot pool."""
+    for coll in (server.devices, server.admin_connections,
+                 server.pending_transfers, server._transfer_tasks):
+        coll.clear()
+    server.reset_transfer_slots()
+    yield
+    for coll in (server.devices, server.admin_connections,
+                 server.pending_transfers, server._transfer_tasks):
+        coll.clear()
+    server.reset_transfer_slots()
+
+
+async def _drain_push_job(*device_ids):
+    """Let the spawned job dispatch, free each device's slot, and await the job."""
+    for _ in range(40):
+        await asyncio.sleep(0)
+    for did in device_ids:
+        server.release_transfer_slot(did, "download_complete", task=server.TASK_PUSH)
+    if server._transfer_tasks:
+        await asyncio.wait_for(asyncio.gather(*server._transfer_tasks), 1)
+
+
 def test_handle_push_files_fans_out_to_online_devices(tmp_path):
-    server._apply_data_dir(str(tmp_path))
-    server.devices.clear()
-    dev_ws = _register_online_device("dev-1")
-    admin = FakeWS()
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        dev_ws = _register_online_device("dev-1")
+        admin = FakeWS()
 
-    asyncio.run(server.handle_push_files(admin, {
-        "target_devices": ["*"],
-        "bundle_url": "http://host/bundles/b.zip",
-        "bundle_filename": "b.zip",
-        "dest_path": "/sdcard/STYLY/content",
-    }))
+        await server.handle_push_files(admin, {
+            "target_devices": ["*"],
+            "bundle_url": "http://host/bundles/b.zip",
+            "bundle_filename": "b.zip",
+            "dest_path": "/sdcard/STYLY/content",
+        })
 
-    assert dev_ws.sent[0]["type"] == "EXECUTE_PUSH_FILES"
-    assert dev_ws.sent[0]["bundle_url"] == "http://host/bundles/b.zip"
-    assert dev_ws.sent[0]["dest_path"] == "/sdcard/STYLY/content"
+        # The ack lands before any device is dispatched: the fan-out is throttled and
+        # runs in the background, so the admin is not blocked on it.
+        sent_ack = admin.sent[-1]
+        assert sent_ack["type"] == "PUSH_FILES_SENT"
+        assert sent_ack["target_count"] == 1
+        assert sent_ack["max_concurrent"] == server.MAX_CONCURRENT_TRANSFERS
+        assert sent_ack["dest_path"] == "/sdcard/STYLY/content"
 
-    sent_ack = admin.sent[-1]
-    assert sent_ack["type"] == "PUSH_FILES_SENT"
-    assert sent_ack["sent_count"] == 1
-    assert sent_ack["target_count"] == 1
-    assert sent_ack["dest_path"] == "/sdcard/STYLY/content"
+        await _drain_push_job("dev-1")
+
+        assert dev_ws.sent[0]["type"] == "EXECUTE_PUSH_FILES"
+        assert dev_ws.sent[0]["bundle_url"] == "http://host/bundles/b.zip"
+        assert dev_ws.sent[0]["dest_path"] == "/sdcard/STYLY/content"
+
+    asyncio.run(body())
 
 
 @pytest.mark.parametrize(
@@ -345,48 +375,57 @@ def test_handle_push_files_fans_out_to_online_devices(tmp_path):
     ],
 )
 def test_handle_push_files_only_a_literal_true_requests_deletion(tmp_path, sent_value, expected):
-    server._apply_data_dir(str(tmp_path))
-    server.devices.clear()
-    dev_ws = _register_online_device("dev-1")
-    admin = FakeWS()
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        dev_ws = _register_online_device("dev-1")
+        admin = FakeWS()
 
-    data = {
-        "target_devices": ["*"],
-        "bundle_url": "http://host/bundles/b.zip",
-        "bundle_filename": "b.zip",
-        "dest_path": "/sdcard/STYLY/content",
-    }
-    if sent_value is not None:
-        data["delete_extras"] = sent_value
+        data = {
+            "target_devices": ["*"],
+            "bundle_url": "http://host/bundles/b.zip",
+            "bundle_filename": "b.zip",
+            "dest_path": "/sdcard/STYLY/content",
+        }
+        if sent_value is not None:
+            data["delete_extras"] = sent_value
 
-    asyncio.run(server.handle_push_files(admin, data))
+        await server.handle_push_files(admin, data)
+        assert admin.sent[-1]["delete_extras"] is expected
 
-    assert dev_ws.sent[0]["delete_extras"] is expected
-    assert admin.sent[-1]["delete_extras"] is expected
+        await _drain_push_job("dev-1")
+        assert dev_ws.sent[0]["delete_extras"] is expected
+
+    asyncio.run(body())
 
 
 def test_handle_push_files_rejects_unsafe_dest(tmp_path):
-    server._apply_data_dir(str(tmp_path))
-    server.devices.clear()
-    dev_ws = _register_online_device("dev-1")
-    admin = FakeWS()
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        dev_ws = _register_online_device("dev-1")
+        admin = FakeWS()
 
-    asyncio.run(server.handle_push_files(admin, {
-        "target_devices": ["*"],
-        "bundle_url": "http://host/bundles/b.zip",
-        "bundle_filename": "b.zip",
-        "dest_path": "/sdcard/Download",   # protected -> must be rejected
-    }))
+        await server.handle_push_files(admin, {
+            "target_devices": ["*"],
+            "bundle_url": "http://host/bundles/b.zip",
+            "bundle_filename": "b.zip",
+            "dest_path": "/sdcard/Download",   # protected -> must be rejected
+        })
 
-    assert admin.sent[-1]["type"] == "ERROR"
-    assert dev_ws.sent == []  # nothing dispatched to the device
+        assert admin.sent[-1]["type"] == "ERROR"
+        assert not server._transfer_tasks   # no job spawned
+        assert dev_ws.sent == []            # nothing dispatched to the device
+
+    asyncio.run(body())
 
 
 def test_handle_push_files_requires_bundle_url(tmp_path):
-    server._apply_data_dir(str(tmp_path))
-    server.devices.clear()
-    admin = FakeWS()
-    asyncio.run(server.handle_push_files(admin, {
-        "target_devices": ["*"], "dest_path": "/sdcard/STYLY/content",
-    }))
-    assert admin.sent[-1]["type"] == "ERROR"
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        admin = FakeWS()
+        await server.handle_push_files(admin, {
+            "target_devices": ["*"], "dest_path": "/sdcard/STYLY/content",
+        })
+        assert admin.sent[-1]["type"] == "ERROR"
+        assert not server._transfer_tasks
+
+    asyncio.run(body())

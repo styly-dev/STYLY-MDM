@@ -169,7 +169,7 @@ STYLY-MDM/
 | `BATTERY_UPDATE` | Battery telemetry. Fields: `device_id`, `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds) |
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
-| `DOWNLOAD_COMPLETE` | Sent right after the APK download finishes (before the local install). Frees the server's transfer slot so the next queued device can start downloading. Fields: `apk_filename`. Optional — see the install-throttling note below. |
+| `DOWNLOAD_COMPLETE` | Sent right after a download finishes, before the local work it feeds (the install, or the unzip + mirror). Frees the server's transfer slot so the next queued device can start downloading. Fields: `task` (`install` / `push`; absent means `install`), `apk_filename` (install), `dest_path` + `delete_extras` (push). Optional — see the transfer-throttling note below. |
 | `PUSH_FILES_RESULT` | Result of a push or sync. Fields: `status` (`success`/`fail`), `dest_path`, `added`, `updated`, `deleted` (counts; `deleted` is always 0 for a push), `error` (optional) |
 | `VERIFY_APK_RESULT` | Result of an APK integrity check. Fields: `package_name`, `found` (boolean), `size`, `cd_sha256`, `full_sha256`, `version_code`, `version_name`, `signer_sha256`, `error` (optional). Absent hash/version fields when `found` is false. |
 | `VERIFY_DIR_RESULT` | Result of a directory integrity check. Fields: `path`, `found` (boolean), `tree_hash`, `file_count`, `total_size`, `manifest` (optional array of `{relative_path, size, sha256}`, omitted above a cap), `error` (optional) |
@@ -218,7 +218,9 @@ STYLY-MDM/
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
 | `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |
 | `INSTALL_DEVICE_STATE` | Per-device companion to `INSTALL_PROGRESS`: names the devices that just entered a state, so the console can label each row instead of showing the whole target set as installing. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `installing` / `fail`), `apk_filename`, `detail` (failure reason, may be empty) |
-| `PUSH_FILES_SENT` | Confirmation that push-files commands were dispatched. Fields: `bundle_filename`, `dest_path`, `delete_extras`, `sent_count`, `target_count` |
+| `PUSH_FILES_SENT` | Confirmation that a push/sync job was accepted (dispatch is throttled and runs in the background). Fields: `bundle_filename`, `dest_path`, `delete_extras`, `target_count`, `max_concurrent` |
+| `PUSH_PROGRESS` | The `INSTALL_PROGRESS` twin for a push/sync job. Fields: `bundle_filename`, `dest_path`, `delete_extras`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` |
+| `PUSH_DEVICE_STATE` | The `INSTALL_DEVICE_STATE` twin. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `applying` / `fail`), `dest_path`, `delete_extras` (so the console can name the action), `detail` |
 | `PUSH_FILES_RESULT` | Forwarded file/folder result from a device (adds `device_id`) |
 | `LAUNCH_RESULT` | Forwarded result from a device |
 | `INSTALL_RESULT` | Forwarded install result from a device |
@@ -245,57 +247,79 @@ STYLY-MDM/
 > the latest battery state in `device_registry.json`, so offline devices retain
 > their last-known battery percentage and charging state.
 
-> **Install transfer throttling.** An `INSTALL_APK` targeting a large group would
-> otherwise make every device pull the APK from the server at the same instant (an
-> APK can be up to 2 GiB), spiking LAN/server bandwidth. Instead the server gates
-> the `EXECUTE_INSTALL` fan-out so at most **N** transfers are in flight per job
+> **Transfer throttling.** An `INSTALL_APK` or a `PUSH_FILES` targeting a large group
+> would otherwise make every device pull the file from the server at the same instant
+> (an APK can be up to 2 GiB, a push bundle likewise), spiking LAN/server bandwidth.
+> Instead the server owns a pool of **N** transfer slots
 > (`MDM_MAX_CONCURRENT_TRANSFERS` env var / `--max-concurrent-transfers` flag,
-> default **5**). Remaining targets are queued; each slot frees as soon as its
+> default **5**) and every byte-moving fan-out — install, push, sync — must take one
+> before it dispatches. Remaining targets are queued; each slot frees as soon as its
 > device signals the download finished, and the next queued device is dispatched.
+>
+> The pool is **server-wide, not per job**. The throttle belongs to the transfer
+> *resource* (the LAN, the server's uplink), not to any one action: a per-job
+> semaphore would let two overlapping install jobs run 2N transfers, and would leave a
+> concurrent install and push blind to each other's bytes. `transfer_slots()` builds
+> the semaphore lazily on first use and never resizes it — swapping in a larger one
+> would strand the coroutines already parked on the old object and briefly allow twice
+> the cap.
+>
 > Slot-release triggers, in order of preference:
 >
 > 1. `DOWNLOAD_COMPLETE` from the client (primary — releases the moment the
->    network-heavy download ends, so the local install proceeds off the critical
->    path).
-> 2. `INSTALL_RESULT` (fallback — covers older clients that never emit
->    `DOWNLOAD_COMPLETE`, and clients whose download failed outright).
-> 3. Device disconnect (frees the slot immediately).
+>    network-heavy download ends, so the local install / unzip + mirror proceeds off
+>    the critical path).
+> 2. The terminal result — `INSTALL_RESULT` or `PUSH_FILES_RESULT` (fallback — covers
+>    older clients that never emit `DOWNLOAD_COMPLETE`, and clients whose download
+>    failed outright).
+> 3. Device disconnect (frees every slot the device held, immediately).
 > 4. A per-device timeout (`MDM_TRANSFER_TIMEOUT` seconds, default **600**) so a
 >    silent/stuck device cannot block the queue. Lowering it recovers stuck slots
 >    sooner but risks releasing a slow-but-healthy transfer early, which only
->    relaxes throttling and never drops the install itself.
+>    relaxes throttling and never drops the job itself.
 >
-> This is fully backward compatible: an older client that ignores the new signal
-> still frees its slot via `INSTALL_RESULT` or the timeout, and an older server
-> that predates the feature simply logs `DOWNLOAD_COMPLETE` as an unknown message.
-> Admins see aggregate progress via `INSTALL_PROGRESS` (queued / transferring /
-> transferred / failed counts).
+> `pending_transfers` is keyed by **`(device_id, task)`**, not by device: an admin can
+> push files to a group that is already installing an APK, so one device may hold an
+> install slot and a push slot at once. Each terminal message frees only its own task's
+> slot; only a disconnect is task-agnostic.
+>
+> This is fully backward compatible in both directions. An older client that never
+> emits `DOWNLOAD_COMPLETE` for a push still frees its slot via `PUSH_FILES_RESULT` or
+> the timeout, and one that omits the `task` field is read as `install`, exactly as
+> before. An older server simply logs the message as unknown (pre-#35) or treats it as
+> an install release (pre-#44) — at worst that frees an install slot early, which only
+> relaxes throttling.
+>
+> Admins see aggregate progress via `INSTALL_PROGRESS` / `PUSH_PROGRESS` (queued /
+> transferring / transferred / failed counts).
 
-> **Per-device install state.** `INSTALL_PROGRESS` carries only aggregate counts,
-> which cannot be mapped back to rows, so the server also broadcasts
-> `INSTALL_DEVICE_STATE` as each device moves. The console's PROGRESS column shows
-> `Waiting…` → `Transferring…` → `Installing…` → `✓ installed` / `✗ failed`, which
-> is what distinguishes a device queued behind a transfer slot from one that is
-> genuinely installing.
+> **Per-device transfer state.** `INSTALL_PROGRESS` / `PUSH_PROGRESS` carry only
+> aggregate counts, which cannot be mapped back to rows, so the server also broadcasts
+> `INSTALL_DEVICE_STATE` / `PUSH_DEVICE_STATE` as each device moves. The console's
+> PROGRESS column shows `Waiting…` → `Transferring…` → `Installing…` / `Pushing…` /
+> `Syncing…` → `✓ installed` / `✓ pushed` / `✓ synced` / `✗ failed`, which is what
+> distinguishes a device queued behind a transfer slot from one that is genuinely
+> working.
 >
 > Which side emits which state is deliberate:
 >
 > | State | Emitted by |
 > |---|---|
-> | `queued` | the install job, once for the whole target list |
-> | `transferring` | the dispatcher, right after `EXECUTE_INSTALL` is sent |
-> | `installing` | the `DOWNLOAD_COMPLETE` **message handler** |
+> | `queued` | the job, once for the whole target list |
+> | `transferring` | the dispatcher, right after `EXECUTE_INSTALL` / `EXECUTE_PUSH_FILES` is sent |
+> | `installing` / `applying` | the `DOWNLOAD_COMPLETE` **message handler** |
 > | `fail` | the dispatcher (offline before its turn, failed dispatch, timeout) |
-> | `success` / `fail` | the forwarded terminal `INSTALL_RESULT` |
+> | `success` / `fail` | the forwarded terminal `INSTALL_RESULT` / `PUSH_FILES_RESULT` |
 >
-> `installing` must come from the message handler rather than the dispatcher
-> coroutine resuming from its released future: the coroutine's resumption would
-> race the receive loop processing the client's subsequent `INSTALL_RESULT`, and if
-> `installing` landed last the row would spin forever. Handling it in the receive
-> loop makes the order structural, since a WebSocket preserves per-connection
-> order. `release_transfer_slot()` returns whether it actually freed a live slot,
-> so a `DOWNLOAD_COMPLETE` arriving after a transfer already timed out cannot
-> resurrect `installing` on a device the job has written off.
+> `installing` (and its push twin `applying`, which covers the client's local unzip and
+> mirror) must come from the message handler rather than the dispatcher coroutine
+> resuming from its released future: the coroutine's resumption would race the receive
+> loop processing the client's subsequent terminal result, and if `installing` landed
+> last the row would spin forever. Handling it in the receive loop makes the order
+> structural, since a WebSocket preserves per-connection order.
+> `release_transfer_slot()` returns whether it actually freed a live slot, so a
+> `DOWNLOAD_COMPLETE` arriving after a transfer already timed out cannot resurrect
+> `installing` on a device the job has written off.
 
 > **Push files: two actions, one transport.** The console uploads a file or a whole
 > folder to `POST /api/bundles`; the server reconstructs the tree and zips it into a
@@ -352,18 +376,19 @@ STYLY-MDM/
 > `DCIM`, `Pictures`, `Movies`, `Music`, `Documents`, `Alarms`, `Notifications`,
 > `Podcasts`, `Ringtones`) so a mistyped path cannot wipe unrelated user/media data.
 >
-> Both actions reuse the per-device PROGRESS column, showing `Pushing…` / `Syncing…`
-> → `✓ pushed` / `✓ synced` (with the `+added ~updated -deleted` summary) / `✗ failed`.
-> Unlike install, these transitions are **not** server-driven: neither action is
-> throttled, so the server holds no per-device state to broadcast. The console paints
-> the in-flight state optimistically on dispatch and resolves it on
-> `PUSH_FILES_RESULT`; a device that drops offline mid-job clears its cell on the next
-> `DEVICE_LIST`. `PUSH_FILES_RESULT` does not name the mode, so the console carries the
-> verb over from what it dispatched (a page reloaded mid-job falls back to "pushed").
-> The column holds one state per device, so a push, an install and a verify targeting the
-> same device overwrite each other's cell — the last job dispatched wins. That state lives
-> in `deviceTaskState[id] = {task, status, …}` and is painted by `taskCellHtml()`; the log
-> keeps the full history of every job regardless.
+> Both actions reuse the per-device PROGRESS column, showing `Waiting…` →
+> `Transferring…` → `Pushing…` / `Syncing…` → `✓ pushed` / `✓ synced` (with the
+> `+added ~updated -deleted` summary) / `✗ failed`. Like install, these transitions are
+> server-driven (`PUSH_DEVICE_STATE`), because the bundle transfer draws on the same
+> server-wide slot pool and the server therefore knows where each device is. A device
+> that drops offline mid-job clears its cell on the next `DEVICE_LIST`.
+> `PUSH_FILES_RESULT` does not name the mode, so the console carries the verb over from
+> the `delete_extras` that rode along on the preceding `PUSH_DEVICE_STATE` (a page
+> reloaded mid-job falls back to "pushed"). The column holds one state per device, so a
+> push, an install and a verify targeting the same device overwrite each other's cell —
+> the last transition received wins, even though a push and an install hold independent
+> transfer slots. That state lives in `deviceTaskState[id] = {task, status, …}` and is
+> painted by `taskCellHtml()`; the log keeps the full history of every job regardless.
 
 ## Integrity Verification
 

@@ -624,7 +624,7 @@
           }
           case 'LAUNCH_SENT': addLog('Launch command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
           case 'INSTALL_SENT': addLog('Install job queued for ' + msg.target_count + ' device(s)' + (msg.max_concurrent ? ' (max ' + msg.max_concurrent + ' concurrent transfer(s))' : ''), 'info'); break;
-          case 'INSTALL_PROGRESS': showInstallProgress(msg); break;
+          case 'INSTALL_PROGRESS': showTransferProgress('install', msg); break;
           case 'INSTALL_DEVICE_STATE': {
             // Per-device companion to INSTALL_PROGRESS: the aggregate counts cannot
             // be mapped back to rows, so the server names the devices it moved.
@@ -641,11 +641,23 @@
             addLog('[' + (msg.status === 'success' ? 'OK' : 'FAIL') + '] install ' + (msg.apk_filename || '-') + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), st);
             break;
           }
-          case 'PUSH_FILES_SENT': addLog((msg.delete_extras ? 'Sync' : 'Push') + ' command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s) → ' + (msg.dest_path || '-'), 'info'); break;
+          case 'PUSH_FILES_SENT': addLog((msg.delete_extras ? 'Sync' : 'Push') + ' job queued for ' + msg.target_count + ' device(s) → ' + (msg.dest_path || '-') + (msg.max_concurrent ? ' (max ' + msg.max_concurrent + ' concurrent transfer(s))' : ''), 'info'); break;
+          case 'PUSH_PROGRESS': showTransferProgress('push', msg); break;
+          case 'PUSH_DEVICE_STATE': {
+            // Per-device companion to PUSH_PROGRESS, mirroring INSTALL_DEVICE_STATE.
+            const verb = msg.delete_extras ? 'Sync' : 'Push';
+            (msg.device_ids || []).forEach(function (id) {
+              deviceTaskState[id] = { task: 'push', status: msg.state, verb: verb, filename: msg.dest_path || '', note: '', detail: msg.detail || '' };
+              updateTaskCell(id);
+            });
+            break;
+          }
           case 'PUSH_FILES_RESULT': {
             const st = msg.status === 'success' ? 'success' : 'fail';
             const summary = '+' + (msg.added || 0) + ' ~' + (msg.updated || 0) + ' -' + (msg.deleted || 0);
             const detail = msg.error || msg.message || '';
+            // PUSH_FILES_RESULT does not name the mode, so carry the verb over from the
+            // PUSH_DEVICE_STATE transitions that preceded it.
             const prev = msg.device_id ? deviceTaskState[msg.device_id] : null;
             const verb = (prev && prev.task === 'push' && prev.verb) || 'Push';
             if (msg.device_id) {
@@ -836,12 +848,12 @@
       // A later job overwrites an earlier one, exactly as a second install would; the log
       // keeps the full history either way.
       //
-      // An install's four live states mirror the server's install job: a device waits
-      // for a transfer slot (queued), pulls the APK (transferring), installs it locally
-      // (installing), then reports a terminal INSTALL_RESULT (success/fail). A push has
-      // no such phases — it is not throttled, so the server holds no per-device state
-      // for it and cannot broadcast transitions. The console paints `pushing` on
-      // dispatch and resolves it on PUSH_FILES_RESULT.
+      // Install and push are both throttled against the same server-wide pool of transfer
+      // slots, so both walk the same live states, server-broadcast as the device moves: it
+      // waits for a slot (queued), pulls the file (transferring), then does its local work
+      // off the critical path — installing the APK, or unzipping and mirroring the bundle
+      // (applying) — before reporting a terminal INSTALL_RESULT / PUSH_FILES_RESULT.
+      // A verify moves no bytes, so it takes no slot and has no such phases.
       function taskCellHtml(id) {
         const st = deviceTaskState[id];
         if (!st) return '<span class="ins-none">—</span>';
@@ -858,11 +870,12 @@
           return '<span class="ins-fail" title="' + esc(what + ': ' + (st.detail || 'mismatch')) + '">✗ mismatch</span>';
         }
         if (st.task === 'push') {
-          // `verb` is set when the console dispatches, and carried onto the result so a synced
-          // device does not report itself as "pushed". PUSH_FILES_RESULT does not name the
-          // mode, so a page reloaded mid-job falls back to the neutral "Push".
+          // `verb` comes from the server's `delete_extras`, so a synced device does not
+          // report itself as "pushed".
           const verb = st.verb || 'Push';
-          if (st.status === 'pushing') return '<span class="ins-installing"><span class="spinner">⟳</span> ' + esc(verb) + 'ing…</span>';
+          if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
+          if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
+          if (st.status === 'applying') return '<span class="ins-installing"><span class="spinner">⟳</span> ' + esc(verb) + 'ing…</span>';
           if (st.status === 'success') return '<span class="ins-success">✓ ' + esc(verb.toLowerCase()) + 'ed</span>' + (st.note ? ' <span class="ins-none">' + esc(st.note) + '</span>' : '');
           return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
         }
@@ -1074,10 +1087,9 @@
               bundle_filename: bundle.bundle_filename, dest_path: dest, delete_extras: cfg.deleteExtras,
             };
             if (!wsSend(msg, cfg.verb.toLowerCase() + ' files')) return;
-            // Optimistic first paint: the fan-out is not throttled, so every online target
-            // really is working from here until its PUSH_FILES_RESULT arrives, or DEVICE_LIST
-            // drops it as offline.
-            online.forEach(function (id) { deviceTaskState[id] = { task: 'push', status: 'pushing', verb: cfg.verb, filename: dest, note: '', detail: '' }; updateTaskCell(id); });
+            // Optimistic first paint only: every target really does start out waiting for a
+            // transfer slot. The server's PUSH_DEVICE_STATE drives it from here.
+            online.forEach(function (id) { deviceTaskState[id] = { task: 'push', status: 'queued', verb: cfg.verb, filename: dest, note: '', detail: '' }; updateTaskCell(id); });
             addLog(cfg.verb + 'ing ' + bundle.bundle_filename + ' → ' + dest + ' on ' + online.length + ' device(s)', 'info');
             // Force a fresh pick next time (LAN/non-secure context cannot detect a local change).
             reset();
@@ -1262,26 +1274,32 @@
 
       function addLog(message, type) { makeLogEntry(message, type); }
 
-      // Throttled APK-install progress: the server broadcasts INSTALL_PROGRESS on
-      // every transfer-slot transition, so instead of one log line per event we
-      // keep a single entry per job and update it in place until it is done.
-      let installProgress = null; // { filename, nodes }
-      function showInstallProgress(msg) {
-        const label = msg.apk_filename || 'APK';
-        const body = 'Install ' + label + ': ' + (msg.transferred || 0) + ' done, ' +
+      // Throttled transfer progress: the server broadcasts INSTALL_PROGRESS / PUSH_PROGRESS
+      // on every transfer-slot transition, so instead of one log line per event we keep a
+      // single entry per job and update it in place until it is done. Kept per job kind —
+      // an install and a push draw on the same server-wide slot pool and can be in flight
+      // together, so they must not overwrite each other's line.
+      const transferProgress = { install: null, push: null }; // kind -> { label, nodes }
+      function showTransferProgress(kind, msg) {
+        const label = kind === 'push'
+          ? (msg.bundle_filename || 'bundle') + ' → ' + (msg.dest_path || '-')
+          : (msg.apk_filename || 'APK');
+        const verb = kind === 'push' ? (msg.delete_extras ? 'Sync' : 'Push') : 'Install';
+        const body = verb + ' ' + label + ': ' + (msg.transferred || 0) + ' done, ' +
           (msg.transferring || 0) + ' transferring, ' + (msg.queued || 0) + ' queued' +
           (msg.failed ? ', ' + msg.failed + ' failed/timed out' : '') +
           ' (of ' + (msg.total || 0) + ')' + (msg.done ? ' — done' : '');
         const type = msg.done ? (msg.failed ? 'warn' : 'success') : 'info';
-        if (installProgress && installProgress.filename === label && installProgress.nodes.entry.isConnected) {
-          installProgress.nodes.msg.textContent = body;
-          installProgress.nodes.msg.className = 'log-msg ' + type;
-          installProgress.nodes.time.textContent = new Date().toLocaleTimeString();
+        const cur = transferProgress[kind];
+        if (cur && cur.label === label && cur.nodes.entry.isConnected) {
+          cur.nodes.msg.textContent = body;
+          cur.nodes.msg.className = 'log-msg ' + type;
+          cur.nodes.time.textContent = new Date().toLocaleTimeString();
           logContainer.scrollTop = logContainer.scrollHeight;
         } else {
-          installProgress = { filename: label, nodes: makeLogEntry(body, type) };
+          transferProgress[kind] = { label: label, nodes: makeLogEntry(body, type) };
         }
-        if (msg.done) installProgress = null;
+        if (msg.done) transferProgress[kind] = null;
       }
 
       // ---------------- Formatting ----------------
