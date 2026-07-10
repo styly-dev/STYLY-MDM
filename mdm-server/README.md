@@ -27,14 +27,30 @@ discover the server automatically via UDP broadcast (port **7071**).
 
 ## Configuration
 
+A command-line flag overrides the corresponding environment variable.
+
 | Option | Env var | Flag | Default |
 |--------|---------|------|---------|
 | HTTP/WebSocket port | `MDM_WS_PORT` | `--port` | `7070` |
 | UDP discovery port | `MDM_DISCOVERY_PORT` | — | `7071` |
-| Data directory (uploaded APKs + device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
+| Data directory (uploaded APKs, pushed bundles, device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
+| Simultaneous device downloads, server-wide | `MDM_MAX_CONCURRENT_TRANSFERS` | `--max-concurrent-transfers` | `5` |
+| Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `600` |
 
-Uploaded APKs are written to `<data-dir>/apks/` and the persistent device
-registry to `<data-dir>/device_registry.json`.
+The data directory holds everything the server persists: uploaded APKs
+(`<data-dir>/apks/`), pushed file bundles (`<data-dir>/bundles/`), and the device
+registry (`<data-dir>/device_registry.json`). It defaults to the directory the
+server is started from, so `uvx styly-mdm` in a fresh directory comes up with no
+devices or groups.
+
+Transfer throttling bounds how many devices download at once — one server-wide
+pool shared by every install and push/sync job; the rest queue until a slot
+frees.
+
+Only one server may answer discovery on a given port: the server probes on
+startup and exits if another STYLY-MDM server already responds on its discovery
+port. Run a second server alongside the first by giving it a different
+`MDM_DISCOVERY_PORT` and `MDM_WS_PORT`.
 
 You can also start it as a module: `python -m styly_mdm`.
 
