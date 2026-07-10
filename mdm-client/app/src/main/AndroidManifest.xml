@@ -13,6 +13,14 @@
     <uses-permission
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
+    <!-- Required so integrity verification (VERIFY_APK) can resolve an arbitrary installed
+         package via PackageManager. On API 30+ package visibility is filtered; an operator
+         may verify any package name, so a <queries> allowlist cannot cover it. This app is
+         a privately distributed enterprise MDM client (not on Google Play), so the Play
+         policy restriction on this permission does not apply. -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
 
     <application
         android:name=".MdmClientApplication"

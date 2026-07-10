@@ -141,7 +141,8 @@ STYLY-MDM/
 │   ├── styly_mdm/           # Installable package
 │   │   ├── __init__.py      # Exports create_app / main
 │   │   ├── __main__.py      # `python -m styly_mdm` entrypoint
-│   │   ├── server.py        # WebSocket control server (aiohttp)
+│   │   ├── server.py        # WebSocket control server (aiohttp) + `styly-mdm hash` CLI
+│   │   ├── integrity.py     # APK CD-digest + directory tree-hash (integrity reference)
 │   │   └── static/
 │   │       └── index.html   # Web management console (bundled package data)
 │   └── tests/
@@ -170,6 +171,8 @@ STYLY-MDM/
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
 | `DOWNLOAD_COMPLETE` | Sent right after the APK download finishes (before the local install). Frees the server's transfer slot so the next queued device can start downloading. Fields: `apk_filename`. Optional — see the install-throttling note below. |
 | `PUSH_FILES_RESULT` | Result of a push or sync. Fields: `status` (`success`/`fail`), `dest_path`, `added`, `updated`, `deleted` (counts; `deleted` is always 0 for a push), `error` (optional) |
+| `VERIFY_APK_RESULT` | Result of an APK integrity check. Fields: `package_name`, `found` (boolean), `size`, `cd_sha256`, `full_sha256`, `version_code`, `version_name`, `signer_sha256`, `error` (optional). Absent hash/version fields when `found` is false. |
+| `VERIFY_DIR_RESULT` | Result of a directory integrity check. Fields: `path`, `found` (boolean), `tree_hash`, `file_count`, `total_size`, `manifest` (optional array of `{relative_path, size, sha256}`, omitted above a cap), `error` (optional) |
 
 ### Server → Device
 
@@ -178,6 +181,8 @@ STYLY-MDM/
 | `EXECUTE_LAUNCH` | Launch an app. Fields: `package_name`, `extra` |
 | `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename` |
 | `EXECUTE_PUSH_FILES` | Download a bundle and apply it to a directory. Fields: `bundle_url`, `bundle_filename`, `dest_path`, `delete_extras` (boolean; `false` = copy/overwrite only, `true` = full mirror. Read with a `false` default — a missing field must never delete) |
+| `EXECUTE_VERIFY_APK` | Compute `size` + Central-Directory digest (plus diagnostics) for an installed package. Fields: `package_name` |
+| `EXECUTE_VERIFY_DIR` | Compute a manifest + tree hash for a device directory (shared storage only). Fields: `path` |
 
 ### Admin → Server
 
@@ -186,6 +191,8 @@ STYLY-MDM/
 | `LAUNCH_APP` | Launch an app on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `package_name`, `extra_data` |
 | `INSTALL_APK` | Install an uploaded APK on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `apk_url`, `apk_filename` |
 | `PUSH_FILES` | Apply a bundle to a directory on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `bundle_url`, `bundle_filename`, `dest_path`, `delete_extras` (boolean, optional; only a literal `true` requests a full mirror) |
+| `VERIFY_APK` | Verify an installed package against a local reference on target devices. Fields: `target_devices`, `package_name`. The reference (`size` + CD digest) is computed and compared in the browser and is **never** sent to the server. |
+| `VERIFY_DIR` | Verify a device directory against a local reference on target devices. Fields: `target_devices`, `path` (absolute, within shared storage). |
 | `GET_DEVICE_LIST` | Request the current device list |
 | `CREATE_GROUP` | Create a new, empty device group. Fields: `name` |
 | `RENAME_GROUP` | Rename a group, preserving its members. Fields: `name`, `new_name` |
@@ -215,6 +222,9 @@ STYLY-MDM/
 | `PUSH_FILES_RESULT` | Forwarded file/folder result from a device (adds `device_id`) |
 | `LAUNCH_RESULT` | Forwarded result from a device |
 | `INSTALL_RESULT` | Forwarded install result from a device |
+| `VERIFY_SENT` | Confirmation that verify-APK commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
+| `VERIFY_DIR_SENT` | Confirmation that verify-directory commands were dispatched. Fields: `path`, `sent_count`, `target_count` |
+| `VERIFY_APK_RESULT` / `VERIFY_DIR_RESULT` | Forwarded integrity result from a device (stamped with `device_id`). The console compares it against the local reference. |
 | `GROUP_LIST` | Current device groups. Fields: `groups` (object mapping group name → array of member serials). The console derives each device's group membership from this; sent on connect and after any group change. |
 | `GROUP_CREATED` / `GROUP_RENAMED` / `GROUP_DELETED` | Acknowledgements for group create / rename / delete. |
 | `DEVICE_GROUPS_SET` | Acknowledgement of a device's group membership change. Fields: `device_id`, `groups` |
@@ -350,8 +360,129 @@ STYLY-MDM/
 > `PUSH_FILES_RESULT`; a device that drops offline mid-job clears its cell on the next
 > `DEVICE_LIST`. `PUSH_FILES_RESULT` does not name the mode, so the console carries the
 > verb over from what it dispatched (a page reloaded mid-job falls back to "pushed").
-> The column holds one state per device, so a push and an install targeting the same
-> device overwrite each other's cell — the last job dispatched wins.
+> The column holds one state per device, so a push, an install and a verify targeting the
+> same device overwrite each other's cell — the last job dispatched wins. That state lives
+> in `deviceTaskState[id] = {task, status, …}` and is painted by `taskCellHtml()`; the log
+> keeps the full history of every job regardless.
+
+## Integrity Verification
+
+On-demand check that a package (or a directory) on a managed device matches a
+reference the operator holds locally. The **reference is computed client-side**
+(in the browser, or with the `styly-mdm hash` CLI) and the **comparison happens
+client-side**; the server only relays the `VERIFY_*` messages (it never hashes).
+This keeps two hard constraints: a 1 GB+ APK is **never uploaded** just to be
+checked, and no HTTPS/secure-context is required — the browser hashing is pure JS
+(`crypto.subtle` is unavailable over plain `http://<LAN-IP>`).
+
+Verdicts appear in the same per-device **PROGRESS column** as install and push
+(`⟳ Verifying…` → `✓ match` / `✗ mismatch` / `✗ not found` / `✗ error`), so the mismatching
+headset is identified in the device row rather than in a separate list. The column is too
+narrow for `missing 3 · added 0 · changed 1`, so that detail is carried in the cell's
+`title` tooltip and written to the log, which keeps every verdict even after a later job
+overwrites the cell.
+
+The reference, browser, and device implementations must agree byte-for-byte, so
+the algorithms below are a fixed spec (the canonical Python implementation is
+`mdm-server/styly_mdm/integrity.py`).
+
+**APK (`VERIFY_APK`) — `size` + Central-Directory digest.** An APK is a ZIP; its
+tail holds the Central Directory (every entry's CRC-32 + sizes). `cd_sha256` is the
+SHA-256 of `file[CD_offset .. EOF]`, where `CD_offset` is the little-endian uint32 at
+offset 16 of the End-Of-Central-Directory record (the last `PK\x05\x06` whose
+`position + 22 + comment_length == file_length`). This covers every entry while
+reading only a few hundred KB regardless of APK size. A device match requires
+`found && size == reference.size && cd_sha256 == reference.cd_sha256`. The device also
+returns `full_sha256` (whole-file, hardware-accelerated), `version_code`,
+`version_name`, and `signer_sha256` (SHA-256 of the current signing certificate) as
+diagnostics shown on a mismatch. ZIP64 archives (CD offset sentinel `0xFFFFFFFF`) are
+not supported and return a clear error rather than a wrong range.
+
+Picking a reference APK also **auto-fills the package name** to verify. The console
+reads `AndroidManifest.xml` out of the picked file (Central Directory → Local File
+Header → stored as-is or inflated with `DecompressionStream('deflate-raw')`, which,
+unlike `crypto.subtle`, works on a non-secure origin) and parses the binary AXML for
+the `<manifest>` element's `package` and `versionName`. Both storage forms occur in
+practice: Unity release APKs store the manifest, Gradle debug APKs deflate it, and the
+AXML string pool may be UTF-8 or UTF-16. This is a progressive enhancement — on any
+parse failure the console logs a warning and the field falls back to manual entry.
+A name the operator typed is never overwritten by a failed parse, but one the console
+filled in from a *previous* APK is cleared, so a reference can never be verified
+against a stale package name.
+
+*Known limitation (accepted):* `size` + CD digest does not detect in-place data
+corruption that preserves the stored CRC-32 (ZIP CRCs are build-time constants). This
+is rare — Android verifies the APK signature at install. `full_sha256` is already
+returned for a future byte-exact "strict" mode. Phase 1 targets the single `base.apk`
+(`sourceDir`); split-APK combination is a possible future extension.
+
+**Directory (`VERIFY_DIR`) — manifest + tree hash.** For each regular file the device
+records `{relative_path, size, sha256}` (paths forward-slashed, relative to the target
+directory), sorts entries by the **UTF-8 byte order** of `relative_path`, and hashes
+`relative_path + "\n" + size + "\n" + sha256 + "\n"` per entry into a single `tree_hash`.
+The console compares `tree_hash` for same/different and, when both manifests are present,
+diffs them to list missing / added / changed files. Policy: empty directories are not
+represented, and an unreadable file makes the whole result an error. The device and the
+`styly-mdm hash` CLI also exclude symlinks without following them; the browser cannot —
+neither `webkitdirectory` nor the Entries API exposes whether an entry is a link — so a
+reference folder containing symlinks will hash their contents and mismatch a device that
+skipped them. Directory checks are
+bounded to **shared external storage** (`/sdcard`), which is what `MANAGE_EXTERNAL_STORAGE`
+grants; the device canonicalizes the path and refuses anything outside that root. Large
+trees can omit the per-file `manifest` (a cap on entry count) and still compare by
+`tree_hash`.
+
+**OS metadata is not content.** `integrity.is_os_metadata()` — mirrored as `isOsMetadata()`
+in the console — matches `.DS_Store`, `Thumbs.db`, `desktop.ini`, AppleDouble `._*` sidecars,
+`__MACOSX/`, `.Spotlight-V100/` and friends on *any* path segment, case-insensitively. It is
+applied in exactly two places, and they are the same place conceptually: `POST /api/bundles`
+drops these files on the way into a push bundle, so a device never receives them; and the
+**reference builders** (browser and `styly-mdm hash`) drop them too, so a reference describes
+what push actually delivers. Without the second half a macOS reference folder reports a
+permanent `missing N` — reference-only files land in **`missing`**, not `added` — against a
+device that is byte-identical. The list is deliberately narrow: `.git/`, Unity `.meta` and
+dotfiles at large are content, and silently dropping content is worse than keeping a stray
+`.DS_Store`. The count is reported (`excluded_count`, shown in the console) rather than hidden.
+
+The **device does not apply this filter** — it reports what is actually on disk, and needs no
+client release to stay correct. So the invariant is not "all three implementations hash any
+input identically"; it is: *the reference builders agree with each other and model what push
+delivers, while the device reports ground truth.*
+
+Content can reach a device by routes other than push — copied over USB/MTP from a Mac, say —
+and then the device really does hold `.DS_Store` files. `classifyDir()` therefore re-folds the
+device's manifest with the OS-metadata entries removed before it declares a mismatch, and
+reports `N OS metadata ignored on device`. The device sends its manifest already sorted by
+UTF-8 byte order, and removing entries preserves that order, so the re-fold is exact. Genuine
+differences still surface: a missing or changed content file is reported as before. Above the
+device's manifest entry cap no manifest is sent, so OS metadata cannot be discounted — the
+console says `too large for a per-file diff` rather than blaming the operator's tree.
+
+**Generating a reference.** In the console, pick a local `.apk` (Verify APK) or supply a
+folder (Verify Directory) — it is hashed in the browser, never uploaded.
+
+A reference folder can be **dropped onto the Verify Directory drop zone** or chosen with
+*Choose Folder*. Both produce the same manifest, but the drop zone exists because Chrome
+shows a *"Upload N files to this site?"* confirmation for any `<input webkitdirectory>`
+pick — alarming, and untrue here. A drop instead arrives via `DataTransferItem.webkitGetAsEntry()`,
+which raises no such prompt and, unlike `showDirectoryPicker()`, works on the non-secure
+`http://<LAN-IP>` origin the console is served from. Two traps make the drop path subtly
+wrong if reimplemented: `DirectoryReader.readEntries()` returns the directory in batches
+(100 at a time in Chrome) and must be pumped until it yields an empty array, or the
+manifest is silently truncated into a false mismatch; and `webkitGetAsEntry()` must be
+called before the handler's first `await`, because `DataTransferItem`s are emptied as soon
+as it yields. Because the Entries API cannot identify symlinks, the walk is bounded by a
+depth cap instead of the device's symlink skip.
+
+For large trees the `styly-mdm hash <path>` CLI is faster and deterministic — the console's
+pure-JS SHA-256 runs around 80 MB/s, since `crypto.subtle` is unavailable on a non-secure
+origin. It prints the same JSON the console consumes and runs on the machine that holds the
+tree (which may differ from the server host):
+
+```bash
+styly-mdm hash ./content            # directory -> {tree_hash, file_count, total_size, excluded_count, manifest}
+styly-mdm hash ./app-release.apk    # APK       -> {size, cd_sha256}
+```
 
 ## Server Discovery Protocol
 
@@ -400,7 +531,8 @@ The MDM client requires the following Android permissions:
 | `RECEIVE_BOOT_COMPLETED` | Auto-start on device boot |
 | `ACCESS_NETWORK_STATE` | Monitor network connectivity |
 | `ACCESS_WIFI_STATE` | Retrieve the device IP address |
-| `MANAGE_EXTERNAL_STORAGE` | Write downloaded APKs to shared storage so the PICO ToBService can read them for silent install, and read/write shared-storage directories for file/folder push (sync) |
+| `MANAGE_EXTERNAL_STORAGE` | Write downloaded APKs to shared storage so the PICO ToBService can read them for silent install; read/write shared-storage directories for file/folder push (sync); and read shared storage for directory integrity checks (`VERIFY_DIR`) |
+| `QUERY_ALL_PACKAGES` | Resolve an arbitrary installed package via `PackageManager` for APK integrity checks (`VERIFY_APK`). On API 30+ package visibility is filtered; an operator may verify any package, so a `<queries>` allowlist cannot cover it. This client is privately distributed (not on Google Play), so the Play-policy restriction on this permission does not apply. |
 
 Battery percentage and charging state are read with Android's standard battery
 status APIs (`ACTION_BATTERY_CHANGED` / `BatteryManager`), which do not require

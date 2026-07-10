@@ -19,6 +19,7 @@ STYLY-MDM currently supports PICO devices (PICO OS with Business Mode). Support 
 - **APK deployment** — upload an APK from the web console and install it silently on selected online devices
 - **File/folder push** — upload a file or an entire folder and copy it into a directory on selected devices; existing files of the same name are overwritten, nothing else at the destination is touched
 - **Folder sync** — mirror a folder into a directory on selected devices, so the destination matches it exactly (new files added, changed files overwritten, **extras removed**). Requires an explicit confirmation, since it deletes. Both actions are limited to shared storage (`/sdcard`)
+- **Integrity verification** — on demand, check that an installed APK (or a shared-storage directory) on selected devices matches a local reference; the reference is hashed in your browser (or via the `styly-mdm hash` CLI) with no upload and no HTTPS requirement, and each device shows a ✓/✗ match
 - **Auto-terminate on switch** — the current foreground app is force-stopped before launching a new one, preventing resource conflicts
 - **Server discovery** — devices can automatically find the MDM server on the LAN via UDP broadcast (port 7071), eliminating manual URL entry
 - **IP address display** — the server logs its LAN IP addresses on startup so you know exactly where to connect

@@ -128,7 +128,7 @@
     .group-dev + .group-dev { border-top: 1px solid var(--border-soft); }
     .group-dev-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .group-dev-status { color: var(--text-secondary); font-size: 12px; white-space: nowrap; width: 66px; }
-    .group-dev-install { font-size: 12px; white-space: nowrap; text-align: right; min-width: 92px; }
+    .group-dev-task { font-size: 12px; white-space: nowrap; text-align: right; min-width: 92px; }
     .radio { width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid #41475f; flex-shrink: 0; }
     .radio.on { border: 5px solid var(--accent); background: var(--bg-card); }
     .group-main { min-width: 0; flex: 1; }
@@ -167,7 +167,7 @@
     .battery.charging .battery-fill { background: var(--warning); }
     .battery-note { color: var(--text-muted); font-size: 11px; margin-left: 4px; }
     .battery-muted { color: var(--text-dim); }
-    .dev-install { font-size: 12px; padding-right: 14px; }
+    .dev-task { font-size: 12px; padding-right: 14px; }
     .ins-queued { color: var(--text-muted); }
     .ins-transferring { color: var(--info); }
     .ins-installing { color: var(--warning); }
@@ -175,6 +175,10 @@
     .ins-fail { color: var(--danger); }
     .ins-none { color: var(--text-dim); }
     .spinner { display: inline-block; animation: spin 1s linear infinite; }
+
+    /* Verify (integrity check) — per-device results panel inside the Actions column */
+    .verify-hint { color: var(--text-muted); font-size: 11px; margin-top: 8px; line-height: 1.4; }
+    .verify-hint code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: var(--text-secondary); }
 
     /* Select boxes */
     .selbox { width: 16px; height: 16px; border-radius: 4px; border: 1.5px solid #41475f; display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; color: #fff; font-size: 11px; font-weight: 800; }
@@ -217,6 +221,8 @@
     .field:focus { outline: none; border-color: var(--accent); }
     .field::placeholder { color: var(--text-dim); }
     .field + .field { margin-top: 7px; }
+    .dropzone { padding: 14px 10px; margin-bottom: 8px; background: var(--bg-card); border: 1px dashed var(--border); border-radius: 6px; text-align: center; font-size: 12px; color: var(--text-muted); transition: border-color .12s, background .12s; }
+    .dropzone.over { border-color: var(--accent, #6b8afd); border-style: solid; background: var(--bg-tertiary); color: var(--text-primary); }
     .file-row { display: flex; align-items: center; gap: 9px; padding: 8px 10px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; }
     .file-pick { background: var(--bg-tertiary); border-radius: 5px; padding: 5px 11px; font-size: 12px; color: #cfd3e3; cursor: pointer; white-space: nowrap; }
     .file-name { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -404,6 +410,37 @@
                 </div>
               </div>
             </div>
+            <div class="cmd-divider"></div>
+            <div class="cmd-section collapsed" data-cmd="verifyApk">
+              <div class="cmd-head" data-act="toggleCmd"><span>Verify APK</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <div class="file-row">
+                  <label class="file-pick" for="verifyApkFile">Choose APK</label>
+                  <input type="file" id="verifyApkFile" accept=".apk,application/vnd.android.package-archive" hidden>
+                  <span class="file-name" id="verifyApkName">No reference APK</span>
+                </div>
+                <input type="text" class="field" id="verifyApkPkg" placeholder="com.example.app (package name)">
+                <button class="btn btn-primary" id="btnVerifyApk" disabled>Verify on Selected</button>
+                <div class="verify-hint">Reference is hashed locally in your browser — nothing is uploaded.</div>
+              </div>
+            </div>
+            <div class="cmd-divider"></div>
+            <div class="cmd-section collapsed" data-cmd="verifyDir">
+              <div class="cmd-head" data-act="toggleCmd"><span>Verify Directory</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <input type="text" class="field" id="verifyDirPath" placeholder="/sdcard/content (device path)">
+                <div class="dropzone" id="verifyDirDrop">Drop the reference folder here</div>
+                <div class="file-row">
+                  <label class="file-pick" for="verifyDirFolder">Choose Folder</label>
+                  <input type="file" id="verifyDirFolder" webkitdirectory directory hidden>
+                  <label class="file-pick" for="verifyDirJson">or Hash JSON</label>
+                  <input type="file" id="verifyDirJson" accept=".json,application/json" hidden>
+                  <span class="file-name" id="verifyDirRefName">No reference</span>
+                </div>
+                <button class="btn btn-primary" id="btnVerifyDir" disabled>Verify on Selected</button>
+                <div class="verify-hint">Reference is hashed locally in your browser — nothing is uploaded. Dropping a folder skips the &ldquo;Upload N files&rdquo; prompt that Chrome always shows for <em>Choose Folder</em>. Large trees hash faster with <code>styly-mdm hash &lt;path&gt;</code> — load its JSON here. Shared storage only.</div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -447,10 +484,15 @@
       let userPickedTab = false;       // true once the user clicks a sub-tab (stops auto-default)
       let expandedGroups = new Set();  // group names expanded to show per-device status
       let view = 'console';            // 'console' | 'manage'
-      let installState = {};           // id -> { task, status, filename, detail, note, verb }
+      let deviceTaskState = {};           // id -> { task, status, filename, detail, note, verb }
       let editingLabelId = null;
       let uploadedApk = null;
       let uploadInProgress = false;
+      // Integrity verification (issue #37). The reference is computed locally in the
+      // browser and never leaves it; only per-device results are compared here.
+      let verifyApkRef = null;         // { size, cd_sha256, filename }
+      let verifyApkAutoPkg = '';       // last package name auto-filled from an APK (vs typed)
+      let verifyDirRef = null;         // { tree_hash, file_count, total_size, manifest?, source }
       let reconnectTimer = null;
       const RECONNECT_DELAY = 3000;
       const LOW_BATTERY_THRESHOLD = 20;
@@ -483,6 +525,16 @@
       const startupExtra = document.getElementById('startupExtra');
       const btnStartupSet = document.getElementById('btnStartupSet');
       const btnStartupClear = document.getElementById('btnStartupClear');
+      const verifyApkFile = document.getElementById('verifyApkFile');
+      const verifyApkName = document.getElementById('verifyApkName');
+      const verifyApkPkg = document.getElementById('verifyApkPkg');
+      const btnVerifyApk = document.getElementById('btnVerifyApk');
+      const verifyDirPath = document.getElementById('verifyDirPath');
+      const verifyDirFolder = document.getElementById('verifyDirFolder');
+      const verifyDirDrop = document.getElementById('verifyDirDrop');
+      const verifyDirJson = document.getElementById('verifyDirJson');
+      const verifyDirRefName = document.getElementById('verifyDirRefName');
+      const btnVerifyDir = document.getElementById('btnVerifyDir');
       const logContainer = document.getElementById('logContainer');
       const logEmpty = document.getElementById('logEmpty');
       const btnClearLog = document.getElementById('btnClearLog');
@@ -490,7 +542,10 @@
       const mgDetail = document.getElementById('mgDetail');
 
       // ---------------- Helpers ----------------
-      function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+      // textContent -> innerHTML escapes & < > but leaves quotes alone, and most callers
+      // interpolate into an attribute (title=", data-id="). A device- or server-supplied
+      // string carrying a double quote would otherwise escape the attribute.
+      function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML.replace(/"/g, '&quot;'); }
       function getDeviceId(d) { return d.device_id || d.serial_number || ''; }
       function isOnline(d) { return d.status !== 'offline'; }
       function deviceById(id) { return devices.find(function (d) { return getDeviceId(d) === id; }); }
@@ -546,7 +601,7 @@
             const cur = knownIds();
             selectedIds.forEach(function (id) { if (!cur.has(id)) selectedIds.delete(id); });
             const onlineNow = new Set(getOnlineIds());
-            Object.keys(installState).forEach(function (id) { if (!onlineNow.has(id)) delete installState[id]; });
+            Object.keys(deviceTaskState).forEach(function (id) { if (!onlineNow.has(id)) delete deviceTaskState[id]; });
             syncActiveGroupSelection();
             render();
             break;
@@ -574,15 +629,15 @@
             // Per-device companion to INSTALL_PROGRESS: the aggregate counts cannot
             // be mapped back to rows, so the server names the devices it moved.
             (msg.device_ids || []).forEach(function (id) {
-              installState[id] = { task: 'install', status: msg.state, filename: msg.apk_filename || '', detail: msg.detail || '' };
-              updateInstallCell(id);
+              deviceTaskState[id] = { task: 'install', status: msg.state, filename: msg.apk_filename || '', detail: msg.detail || '' };
+              updateTaskCell(id);
             });
             break;
           }
           case 'INSTALL_RESULT': {
             const st = msg.status === 'success' ? 'success' : 'fail';
             const detail = msg.error || msg.message || '';
-            if (msg.device_id) { installState[msg.device_id] = { task: 'install', status: st, filename: msg.apk_filename || '', detail: detail }; updateInstallCell(msg.device_id); }
+            if (msg.device_id) { deviceTaskState[msg.device_id] = { task: 'install', status: st, filename: msg.apk_filename || '', detail: detail }; updateTaskCell(msg.device_id); }
             addLog('[' + (msg.status === 'success' ? 'OK' : 'FAIL') + '] install ' + (msg.apk_filename || '-') + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), st);
             break;
           }
@@ -591,11 +646,11 @@
             const st = msg.status === 'success' ? 'success' : 'fail';
             const summary = '+' + (msg.added || 0) + ' ~' + (msg.updated || 0) + ' -' + (msg.deleted || 0);
             const detail = msg.error || msg.message || '';
-            const prev = msg.device_id ? installState[msg.device_id] : null;
+            const prev = msg.device_id ? deviceTaskState[msg.device_id] : null;
             const verb = (prev && prev.task === 'push' && prev.verb) || 'Push';
             if (msg.device_id) {
-              installState[msg.device_id] = { task: 'push', status: st, verb: verb, filename: msg.dest_path || '', note: st === 'success' ? summary : '', detail: detail };
-              updateInstallCell(msg.device_id);
+              deviceTaskState[msg.device_id] = { task: 'push', status: st, verb: verb, filename: msg.dest_path || '', note: st === 'success' ? summary : '', detail: detail };
+              updateTaskCell(msg.device_id);
             }
             const what = verb.toLowerCase();
             if (st === 'success') {
@@ -621,6 +676,22 @@
           case 'STARTUP_APP_RESULT': {
             const st = msg.status === 'success' ? 'success' : 'fail';
             addLog('[Startup ' + (msg.status === 'success' ? 'OK' : 'FAIL') + '] ' + (msg.package_name || '') + (msg.device_id ? ' on ' + labelFor(msg.device_id) : '') + (msg.error ? ' - ' + msg.error : ''), st);
+            break;
+          }
+          case 'VERIFY_SENT': addLog('Verify APK command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'VERIFY_APK_RESULT': {
+            const cls = verifyApkRef ? classifyApk(msg) : { status: 'error', detail: 'no local reference' };
+            if (msg.device_id) { deviceTaskState[msg.device_id] = { task: 'verify', kind: 'apk', status: cls.status, detail: cls.detail }; updateTaskCell(msg.device_id); }
+            const ok = cls.status === 'match';
+            addLog('[' + (ok ? 'MATCH' : 'DIFF') + '] verify ' + (msg.package_name || '-') + ' on ' + labelFor(msg.device_id) + (cls.detail ? ' - ' + cls.detail : ''), ok ? 'success' : 'fail');
+            break;
+          }
+          case 'VERIFY_DIR_SENT': addLog('Verify directory command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'VERIFY_DIR_RESULT': {
+            const cls = verifyDirRef ? classifyDir(msg) : { status: 'error', detail: 'no local reference' };
+            if (msg.device_id) { deviceTaskState[msg.device_id] = { task: 'verify', kind: 'dir', status: cls.status, detail: cls.detail }; updateTaskCell(msg.device_id); }
+            const ok = cls.status === 'match';
+            addLog('[' + (ok ? 'MATCH' : 'DIFF') + '] verify dir ' + (msg.path || '-') + ' on ' + labelFor(msg.device_id) + (cls.detail ? ' - ' + cls.detail : ''), ok ? 'success' : 'fail');
             break;
           }
           case 'ERROR': addLog('[ERROR] ' + (msg.message || 'Unknown error'), 'fail'); break;
@@ -703,7 +774,7 @@
             '<span class="dot ' + (off ? 'off' : '') + '"></span>' +
             '<span class="group-dev-name">' + esc(label) + '</span>' +
             '<span class="group-dev-status">' + status + '</span>' +
-            '<span class="group-dev-install" data-install-id="' + esc(serial) + '">' + installCellHtml(serial) + '</span>' +
+            '<span class="group-dev-task" data-task-id="' + esc(serial) + '">' + taskCellHtml(serial) + '</span>' +
             '</div>';
         }).join('');
       }
@@ -752,7 +823,7 @@
             '<div class="dev-cell">' + deviceCell + '</div>' +
             '<div class="dev-status">' + status + '</div>' +
             '<div class="dev-battery">' + batteryHtml(d) + '</div>' +
-            '<div class="dev-install" data-install-id="' + esc(id) + '">' + installCellHtml(id) + '</div>' +
+            '<div class="dev-task" data-task-id="' + esc(id) + '">' + taskCellHtml(id) + '</div>' +
             '</div>';
         });
         html += '</div>';
@@ -761,7 +832,9 @@
         return html;
       }
 
-      // The cell shows whichever job last touched the device, install or push.
+      // The cell shows whichever job last touched the device: install, push or verify.
+      // A later job overwrites an earlier one, exactly as a second install would; the log
+      // keeps the full history either way.
       //
       // An install's four live states mirror the server's install job: a device waits
       // for a transfer slot (queued), pulls the APK (transferring), installs it locally
@@ -769,9 +842,21 @@
       // no such phases — it is not throttled, so the server holds no per-device state
       // for it and cannot broadcast transitions. The console paints `pushing` on
       // dispatch and resolves it on PUSH_FILES_RESULT.
-      function installCellHtml(id) {
-        const st = installState[id];
+      function taskCellHtml(id) {
+        const st = deviceTaskState[id];
         if (!st) return '<span class="ins-none">—</span>';
+        if (st.task === 'verify') {
+          // A verify verdict is reached in the browser, not on the device: the device
+          // returns hashes and classifyApk()/classifyDir() decide. The column has room for
+          // the verdict only — `missing 3 · added 0 · changed 1` lives in the tooltip and
+          // the log, where it can be read without truncation.
+          const what = st.kind === 'dir' ? 'directory' : 'APK';
+          if (st.status === 'verifying') return '<span class="ins-installing"><span class="spinner">⟳</span> Verifying…</span>';
+          if (st.status === 'match') return '<span class="ins-success" title="' + esc(what + ': ' + (st.detail || 'match')) + '">✓ match</span>';
+          if (st.status === 'notfound') return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ not found</span>';
+          if (st.status === 'error') return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ error</span>';
+          return '<span class="ins-fail" title="' + esc(what + ': ' + (st.detail || 'mismatch')) + '">✗ mismatch</span>';
+        }
         if (st.task === 'push') {
           // `verb` is set when the console dispatches, and carried onto the result so a synced
           // device does not report itself as "pushed". PUSH_FILES_RESULT does not name the
@@ -788,12 +873,12 @@
         return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
       }
 
-      function updateInstallCell(id) {
+      function updateTaskCell(id) {
         // Refresh every matching install cell currently rendered: the Devices-tab
         // row and/or the expanded-group per-device rows on the Groups tab.
         if (view !== 'console') return;
-        const sel = '[data-install-id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]';
-        targetsBody.querySelectorAll(sel).forEach(function (cell) { cell.innerHTML = installCellHtml(id); });
+        const sel = '[data-task-id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]';
+        targetsBody.querySelectorAll(sel).forEach(function (cell) { cell.innerHTML = taskCellHtml(id); });
       }
 
       function renderActions() {
@@ -824,6 +909,8 @@
         btnStartupClear.disabled = !has;
         pushPanel.refreshButton(has);
         syncPanel.refreshButton(has);
+        btnVerifyApk.disabled = !verifyApkRef || verifyApkPkg.value.trim() === '' || !has;
+        btnVerifyDir.disabled = !verifyDirRef || verifyDirPath.value.trim() === '' || !has;
       }
 
       // ---------------- Selection actions ----------------
@@ -899,7 +986,7 @@
           if (!wsSend({ type: 'INSTALL_APK', target_devices: online, apk_url: apk.apk_url, apk_filename: apk.apk_filename }, 'install')) return;
           // Optimistic first paint only: every target really does start out waiting
           // for a transfer slot. The server's INSTALL_DEVICE_STATE drives it from here.
-          online.forEach(function (id) { installState[id] = { task: 'install', status: 'queued', filename: apk.apk_filename, detail: '' }; updateInstallCell(id); });
+          online.forEach(function (id) { deviceTaskState[id] = { task: 'install', status: 'queued', filename: apk.apk_filename, detail: '' }; updateTaskCell(id); });
           addLog('Installing ' + apk.apk_filename + ' on ' + online.length + ' device(s)', 'info');
           // Force a fresh pick next time (LAN/non-secure context cannot detect a local rebuild).
           apkFile.value = ''; uploadedApk = null; apkName.textContent = 'No APK selected'; updateButtons();
@@ -990,7 +1077,7 @@
             // Optimistic first paint: the fan-out is not throttled, so every online target
             // really is working from here until its PUSH_FILES_RESULT arrives, or DEVICE_LIST
             // drops it as offline.
-            online.forEach(function (id) { installState[id] = { task: 'push', status: 'pushing', verb: cfg.verb, filename: dest, note: '', detail: '' }; updateInstallCell(id); });
+            online.forEach(function (id) { deviceTaskState[id] = { task: 'push', status: 'pushing', verb: cfg.verb, filename: dest, note: '', detail: '' }; updateTaskCell(id); });
             addLog(cfg.verb + 'ing ' + bundle.bundle_filename + ' → ' + dest + ' on ' + online.length + ' device(s)', 'info');
             // Force a fresh pick next time (LAN/non-secure context cannot detect a local change).
             reset();
@@ -1213,6 +1300,516 @@
         return v.toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
       }
 
+      // ---------------- Integrity verification (issue #37) ----------------
+      // Pure-JS SHA-256 (the console is served over plain http://<LAN-IP>, a non-secure
+      // context, so crypto.subtle is unavailable). This implementation + the ZIP/tree
+      // algorithms below are byte-for-byte identical to the Python (styly-mdm hash) and
+      // Kotlin (device) implementations — verified with a cross-language harness.
+      const SHA256_K = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+      ];
+      function Sha256() {
+        this.h = new Int32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+        this.buf = new Uint8Array(64); this.bufLen = 0; this.total = 0; this.w = new Int32Array(64);
+      }
+      Sha256.prototype._compress = function (block, offset) {
+        const w = this.w; let i;
+        for (i = 0; i < 16; i++) {
+          w[i] = (block[offset + i * 4] << 24) | (block[offset + i * 4 + 1] << 16) | (block[offset + i * 4 + 2] << 8) | (block[offset + i * 4 + 3]);
+        }
+        for (i = 16; i < 64; i++) {
+          const x = w[i - 15], s0 = ((x >>> 7) | (x << 25)) ^ ((x >>> 18) | (x << 14)) ^ (x >>> 3);
+          const y = w[i - 2], s1 = ((y >>> 17) | (y << 15)) ^ ((y >>> 19) | (y << 13)) ^ (y >>> 10);
+          w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+        }
+        let a = this.h[0], b = this.h[1], c = this.h[2], d = this.h[3], e = this.h[4], f = this.h[5], g = this.h[6], hh = this.h[7];
+        for (i = 0; i < 64; i++) {
+          const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+          const ch = (e & f) ^ (~e & g);
+          const t1 = (hh + S1 + ch + SHA256_K[i] + w[i]) | 0;
+          const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+          const maj = (a & b) ^ (a & c) ^ (b & c);
+          const t2 = (S0 + maj) | 0;
+          hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+        }
+        this.h[0] = (this.h[0] + a) | 0; this.h[1] = (this.h[1] + b) | 0; this.h[2] = (this.h[2] + c) | 0; this.h[3] = (this.h[3] + d) | 0;
+        this.h[4] = (this.h[4] + e) | 0; this.h[5] = (this.h[5] + f) | 0; this.h[6] = (this.h[6] + g) | 0; this.h[7] = (this.h[7] + hh) | 0;
+      };
+      Sha256.prototype.update = function (data) {
+        this.total += data.length; let offset = 0; const len = data.length;
+        if (this.bufLen > 0) {
+          while (offset < len && this.bufLen < 64) { this.buf[this.bufLen++] = data[offset++]; }
+          if (this.bufLen === 64) { this._compress(this.buf, 0); this.bufLen = 0; }
+        }
+        while (len - offset >= 64) { this._compress(data, offset); offset += 64; }
+        while (offset < len) { this.buf[this.bufLen++] = data[offset++]; }
+        return this;
+      };
+      Sha256.prototype.hex = function () {
+        const bitLenHi = Math.floor(this.total / 0x20000000), bitLenLo = (this.total * 8) >>> 0;
+        const pad = [0x80];
+        const restLen = (this.bufLen + 1) % 64, padZeros = (restLen <= 56) ? (56 - restLen) : (120 - restLen);
+        for (let i = 0; i < padZeros; i++) pad.push(0x00);
+        pad.push((bitLenHi >>> 24) & 0xff, (bitLenHi >>> 16) & 0xff, (bitLenHi >>> 8) & 0xff, bitLenHi & 0xff);
+        pad.push((bitLenLo >>> 24) & 0xff, (bitLenLo >>> 16) & 0xff, (bitLenLo >>> 8) & 0xff, bitLenLo & 0xff);
+        this.update(new Uint8Array(pad));
+        let out = '';
+        for (let j = 0; j < 8; j++) { out += ('00000000' + ((this.h[j]) >>> 0).toString(16)).slice(-8); }
+        return out;
+      };
+
+      const EOCD_MIN = 22, MAX_COMMENT = 0xffff, ZIP64_SENTINEL = 0xffffffff, HASH_CHUNK = 4 * 1024 * 1024;
+      // Mirrors MAX_VERIFY_DIR_ENTRIES on the device. The depth cap has no device counterpart:
+      // it stops a symlinked directory cycle, which the device walk instead avoids by skipping
+      // symlinks outright (the Entries API gives us no way to recognize one).
+      const MAX_VERIFY_DIR_ENTRIES = 50000, MAX_VERIFY_DIR_DEPTH = 64;
+      const CD_SIG = 0x02014b50, LFH_SIG = 0x04034b50, STORED = 0, DEFLATED = 8;
+      function findEocd(tail, fileLen, tailStart, view) {
+        for (let i = tail.length - EOCD_MIN; i >= 0; i--) {
+          if (tail[i] === 0x50 && tail[i + 1] === 0x4b && tail[i + 2] === 0x05 && tail[i + 3] === 0x06) {
+            const commentLen = view.getUint16(i + 20, true);
+            if (tailStart + i + EOCD_MIN + commentLen === fileLen) return i;
+          }
+        }
+        throw new Error('End Of Central Directory record not found (not a valid ZIP/APK?)');
+      }
+      async function zipCentralDirectory(file) {
+        const size = file.size;
+        const readLen = Math.min(size, EOCD_MIN + MAX_COMMENT);
+        const tailStart = size - readLen;
+        const tailBuf = new Uint8Array(await file.slice(tailStart, size).arrayBuffer());
+        const view = new DataView(tailBuf.buffer, tailBuf.byteOffset, tailBuf.byteLength);
+        const eocdOff = findEocd(tailBuf, size, tailStart, view);
+        const cdSize = view.getUint32(eocdOff + 12, true);
+        const cdOffset = view.getUint32(eocdOff + 16, true);
+        if (cdOffset === ZIP64_SENTINEL || cdSize === ZIP64_SENTINEL) throw new Error('zip64 archives are not supported');
+        return { size: size, cdOffset: cdOffset, cdSize: cdSize };
+      }
+      // size + SHA-256 of the ZIP Central-Directory region [CD_offset .. EOF]. Reads only
+      // the tail + CD region, so a 1 GB+ APK is not loaded into memory and nothing uploads.
+      async function apkCdDigest(file) {
+        const cd = await zipCentralDirectory(file);
+        const h = new Sha256();
+        for (let pos = cd.cdOffset; pos < cd.size; pos += HASH_CHUNK) {
+          h.update(new Uint8Array(await file.slice(pos, Math.min(pos + HASH_CHUNK, cd.size)).arrayBuffer()));
+        }
+        return { size: cd.size, cd_sha256: h.hex() };
+      }
+
+      // ---- APK -> package name, read in the browser (nothing is uploaded) ----
+      // Reads AndroidManifest.xml out of the picked APK and parses the binary XML, so the
+      // operator does not have to retype a package name that is already in the file.
+      const MANIFEST_NAME = 'AndroidManifest.xml', MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
+      function bytesEqual(buf, off, want) {
+        for (let i = 0; i < want.length; i++) { if (buf[off + i] !== want[i]) return false; }
+        return true;
+      }
+      async function inflateRaw(bytes) {
+        if (typeof DecompressionStream !== 'function') throw new Error('this browser cannot inflate deflate-raw');
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+        return new Uint8Array(await new Response(stream).arrayBuffer());
+      }
+      // Walk the Central Directory for one entry and return its uncompressed bytes.
+      async function zipEntryBytes(file, wantName) {
+        const cd = await zipCentralDirectory(file);
+        const cdBuf = new Uint8Array(await file.slice(cd.cdOffset, cd.cdOffset + cd.cdSize).arrayBuffer());
+        const cv = new DataView(cdBuf.buffer, cdBuf.byteOffset, cdBuf.byteLength);
+        const want = utf8Bytes(wantName);
+        let p = 0;
+        while (p + 46 <= cdBuf.length && cv.getUint32(p, true) === CD_SIG) {
+          const method = cv.getUint16(p + 10, true);
+          const compSize = cv.getUint32(p + 20, true);
+          const nameLen = cv.getUint16(p + 28, true);
+          const extraLen = cv.getUint16(p + 30, true);
+          const commentLen = cv.getUint16(p + 32, true);
+          const lfhOffset = cv.getUint32(p + 42, true);
+          if (nameLen === want.length && bytesEqual(cdBuf, p + 46, want)) {
+            if (compSize === ZIP64_SENTINEL || lfhOffset === ZIP64_SENTINEL) throw new Error('zip64 archives are not supported');
+            if (compSize > MAX_MANIFEST_BYTES) throw new Error(wantName + ' is implausibly large');
+            const lfh = new DataView(await file.slice(lfhOffset, lfhOffset + 30).arrayBuffer());
+            if (lfh.byteLength < 30 || lfh.getUint32(0, true) !== LFH_SIG) throw new Error('bad local file header for ' + wantName);
+            // The local header carries its own extra field (zipalign padding), unrelated in
+            // length to the Central Directory's, so the data offset must come from here.
+            const dataStart = lfhOffset + 30 + lfh.getUint16(26, true) + lfh.getUint16(28, true);
+            const raw = new Uint8Array(await file.slice(dataStart, dataStart + compSize).arrayBuffer());
+            if (method === STORED) return raw;
+            if (method === DEFLATED) return inflateRaw(raw);
+            throw new Error('unsupported compression method ' + method + ' for ' + wantName);
+          }
+          p += 46 + nameLen + extraLen + commentLen;
+        }
+        return null;
+      }
+
+      const AXML_MAGIC = 0x0003, RES_STRING_POOL = 0x0001, RES_XML_START_ELEMENT = 0x0102;
+      const UTF8_FLAG = 1 << 8, TYPE_STRING = 0x03;
+      // Strings are UTF-8 or UTF-16LE depending on UTF8_FLAG; both occur in real APKs.
+      function axmlStringPool(bytes, view, off) {
+        const headerSize = view.getUint16(off + 2, true);
+        const stringCount = view.getUint32(off + 8, true);
+        const flags = view.getUint32(off + 16, true);
+        const stringsStart = view.getUint32(off + 20, true);
+        const utf8 = (flags & UTF8_FLAG) !== 0;
+        const dec = new TextDecoder(utf8 ? 'utf-8' : 'utf-16le');
+        const base = off + stringsStart;
+        return function (idx) {
+          if (idx < 0 || idx >= stringCount) return null;
+          let p = base + view.getUint32(off + headerSize + idx * 4, true);
+          if (utf8) {
+            // Two varint-ish lengths (character count, then byte count); a set high bit
+            // means the length spills into a second byte.
+            if (bytes[p++] & 0x80) p++;
+            let nbytes = bytes[p++];
+            if (nbytes & 0x80) nbytes = ((nbytes & 0x7f) << 8) | bytes[p++];
+            return dec.decode(bytes.subarray(p, p + nbytes));
+          }
+          let nchars = view.getUint16(p, true); p += 2;
+          if (nchars & 0x8000) { nchars = ((nchars & 0x7fff) << 16) | view.getUint16(p, true); p += 2; }
+          return dec.decode(bytes.subarray(p, p + nchars * 2));
+        };
+      }
+      // Returns the attributes of the root <manifest> element that identify the build.
+      function parseAndroidManifest(bytes) {
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        if (bytes.length < 8 || view.getUint16(0, true) !== AXML_MAGIC) throw new Error('not a binary AndroidManifest.xml');
+        const end = Math.min(view.getUint32(4, true), bytes.length);
+        let str = null;
+        let off = view.getUint16(2, true);
+        while (off + 8 <= end) {
+          const type = view.getUint16(off, true);
+          const chunkSize = view.getUint32(off + 4, true);
+          if (chunkSize < 8 || off + chunkSize > end) break;
+          if (type === RES_STRING_POOL) {
+            str = axmlStringPool(bytes, view, off);
+          } else if (type === RES_XML_START_ELEMENT) {
+            if (!str) throw new Error('AndroidManifest.xml has no string pool');
+            // ResXMLTree_node is 16 bytes; the attribute extension follows it.
+            const ext = off + 16;
+            if (str(view.getUint32(ext + 4, true)) === 'manifest') {
+              const attrStart = view.getUint16(ext + 8, true);
+              const attrSize = view.getUint16(ext + 10, true);
+              const attrCount = view.getUint16(ext + 12, true);
+              const out = {};
+              for (let i = 0; i < attrCount; i++) {
+                const a = ext + attrStart + i * attrSize;
+                if (a + 20 > end) break;
+                const name = str(view.getUint32(a + 4, true));
+                const rawValue = view.getInt32(a + 8, true);
+                const dataType = view.getUint8(a + 15);
+                const data = view.getUint32(a + 16, true);
+                const asString = rawValue >= 0 ? str(rawValue) : (dataType === TYPE_STRING ? str(data) : null);
+                if (name === 'package') out.package = asString;
+                else if (name === 'versionName') out.versionName = asString;
+              }
+              return out;
+            }
+          }
+          off += chunkSize;
+        }
+        throw new Error('<manifest> element not found');
+      }
+      async function apkManifestInfo(file) {
+        const bytes = await zipEntryBytes(file, MANIFEST_NAME);
+        if (!bytes) throw new Error(MANIFEST_NAME + ' not found (not an APK?)');
+        return parseAndroidManifest(bytes);
+      }
+
+      async function fileSha256(file) {
+        const h = new Sha256();
+        for (let pos = 0; pos < file.size; pos += HASH_CHUNK) {
+          h.update(new Uint8Array(await file.slice(pos, Math.min(pos + HASH_CHUNK, file.size)).arrayBuffer()));
+        }
+        return h.hex();
+      }
+      // A <input webkitdirectory> pick prefixes webkitRelativePath with the picked folder
+      // name; strip it so the manifest mirrors the folder's contents (matches the device).
+      function stripTopLevel(relPath) { const i = relPath.indexOf('/'); return i >= 0 ? relPath.slice(i + 1) : relPath; }
+      function utf8Bytes(s) { return new TextEncoder().encode(s); }
+      function utf8Compare(a, b) {
+        const ea = utf8Bytes(a), eb = utf8Bytes(b), n = Math.min(ea.length, eb.length);
+        for (let i = 0; i < n; i++) { if (ea[i] !== eb[i]) return ea[i] - eb[i]; }
+        return ea.length - eb.length;
+      }
+      // Mirrors integrity.is_os_metadata() in Python — the two must agree exactly, or a
+      // reference built here and one built by `styly-mdm hash` would hash the same tree
+      // differently. The list stays narrow on purpose: `.git/`, Unity `.meta` and dotfiles
+      // at large are content, and silently dropping content is far worse than keeping a
+      // stray `.DS_Store`.
+      const OS_METADATA_NAMES = ['.ds_store', 'thumbs.db', 'ehthumbs.db', 'desktop.ini', '.directory', '.apdisk', '.volumeicon.icns'];
+      const OS_METADATA_DIRS = ['.spotlight-v100', '.trashes', '.fseventsd', '.temporaryitems', '.documentrevisions-v100', '__macosx', '$recycle.bin'];
+      function isOsMetadata(relPath) {
+        const segs = relPath.split('/');
+        for (let i = 0; i < segs.length; i++) {
+          const low = segs[i].toLowerCase();
+          if (OS_METADATA_NAMES.indexOf(low) >= 0 || OS_METADATA_DIRS.indexOf(low) >= 0) return true;
+          if (low.indexOf('._') === 0) return true;       // AppleDouble resource forks
+          if (low.indexOf('.trash-') === 0) return true;   // Linux per-user trash
+        }
+        return false;
+      }
+      // Both reference sources (dropped folder, picked folder) normalize to the same
+      // [{relative_path, file}] shape, so a single fold produces the tree hash and the
+      // two paths cannot drift apart. OS metadata is dropped here, in the one place both
+      // paths pass through: `push files` strips it on the way into the bundle, so a device
+      // never has it, and a reference that kept it would report a permanent "missing N"
+      // against a device that is in fact identical.
+      async function manifestFromFiles(picked, onProgress) {
+        const content = [];
+        let excludedCount = 0;
+        for (let k = 0; k < picked.length; k++) {
+          if (!picked[k].relative_path) continue;
+          if (isOsMetadata(picked[k].relative_path)) { excludedCount++; continue; }
+          content.push(picked[k]);
+        }
+        let pendingBytes = 0;
+        for (let k = 0; k < content.length; k++) pendingBytes += content[k].file.size;
+        const entries = [];
+        let doneBytes = 0;
+        for (let i = 0; i < content.length; i++) {
+          entries.push({ relative_path: content[i].relative_path, size: content[i].file.size, sha256: await fileSha256(content[i].file) });
+          doneBytes += content[i].file.size;
+          if (onProgress) onProgress(i + 1, content.length, doneBytes, pendingBytes);
+        }
+        entries.sort(function (x, y) { return utf8Compare(x.relative_path, y.relative_path); });
+        const folded = foldTreeHash(entries);
+        return { tree_hash: folded.tree_hash, file_count: folded.file_count, total_size: folded.total_size, manifest: entries, excluded_count: excludedCount };
+      }
+      // The one definition of tree_hash on this side of the wire. `entries` must already be
+      // sorted by the UTF-8 byte order of relative_path — as the reference builder sorts them
+      // and as the device sends them — because the fold is order-sensitive.
+      function foldTreeHash(entries) {
+        const h = new Sha256(), enc = new TextEncoder();
+        let totalSize = 0;
+        for (let j = 0; j < entries.length; j++) {
+          totalSize += Number(entries[j].size);
+          h.update(enc.encode(entries[j].relative_path + '\n' + entries[j].size + '\n' + entries[j].sha256 + '\n'));
+        }
+        return { tree_hash: h.hex(), file_count: entries.length, total_size: totalSize };
+      }
+      async function dirManifest(fileList, onProgress) {
+        const picked = [];
+        for (let k = 0; k < fileList.length; k++) {
+          const rel = fileList[k].webkitRelativePath;
+          if (rel) picked.push({ relative_path: stripTopLevel(rel), file: fileList[k] });
+        }
+        return manifestFromFiles(picked, onProgress);
+      }
+
+      // ---- dropped-folder reference (Entries API) ----
+      // A folder dropped onto the page reaches us through webkitGetAsEntry(), which — unlike
+      // showDirectoryPicker() — works on this non-secure http://<LAN-IP> origin, and unlike
+      // <input webkitdirectory> does not make Chrome ask "Upload N files to this site?".
+      // Nothing is uploaded either way; the drop just avoids the misleading prompt.
+      function readAllEntries(reader) {
+        // readEntries() hands back the directory in batches (Chrome: 100 at a time) and
+        // signals the end with an empty array. Calling it once silently truncates the tree
+        // into a wrong tree_hash, so pump it until it drains.
+        return new Promise(function (resolve, reject) {
+          const all = [];
+          (function pump() {
+            reader.readEntries(function (batch) {
+              if (!batch.length) { resolve(all); return; }
+              for (let i = 0; i < batch.length; i++) all.push(batch[i]);
+              pump();
+            }, reject);
+          })();
+        });
+      }
+      function entryToFile(fileEntry) {
+        return new Promise(function (resolve, reject) { fileEntry.file(resolve, reject); });
+      }
+      // Yields the same relative paths as stripTopLevel(webkitRelativePath): '/'-separated and
+      // relative to the dropped folder itself, which the device walk also mirrors.
+      async function walkDirEntry(dirEntry, prefix, depth, out) {
+        if (depth > MAX_VERIFY_DIR_DEPTH) throw new Error('directory nested deeper than ' + MAX_VERIFY_DIR_DEPTH + ' levels');
+        const children = await readAllEntries(dirEntry.createReader());
+        for (let i = 0; i < children.length; i++) {
+          const child = children[i], rel = prefix ? prefix + '/' + child.name : child.name;
+          if (child.isFile) {
+            if (out.length >= MAX_VERIFY_DIR_ENTRIES) throw new Error('more than ' + MAX_VERIFY_DIR_ENTRIES + ' files');
+            out.push({ relative_path: rel, file: await entryToFile(child) });
+          } else if (child.isDirectory) {
+            await walkDirEntry(child, rel, depth + 1, out);
+          }
+        }
+        return out;
+      }
+      async function dirManifestFromDrop(dirEntry, onProgress) {
+        return manifestFromFiles(await walkDirEntry(dirEntry, '', 0, []), onProgress);
+      }
+
+      // ---- comparison of a device result against the local reference ----
+      function classifyApk(msg) {
+        if (msg.error) return { status: 'error', detail: String(msg.error) };
+        if (!msg.found) return { status: 'notfound', detail: 'not installed' };
+        const sizeOk = Number(msg.size) === Number(verifyApkRef.size);
+        const cdOk = msg.cd_sha256 === verifyApkRef.cd_sha256;
+        if (sizeOk && cdOk) return { status: 'match', detail: 'v' + (msg.version_name || '?') };
+        const bits = [];
+        if (!sizeOk) bits.push('size ' + msg.size + ' vs ' + verifyApkRef.size);
+        if (!cdOk) bits.push('CD digest differs');
+        if (msg.version_name != null || msg.version_code != null) bits.push('device v' + (msg.version_name || '?') + ' (' + (msg.version_code != null ? msg.version_code : '?') + ')');
+        if (msg.signer_sha256) bits.push('signer ' + String(msg.signer_sha256).slice(0, 12) + '…');
+        return { status: 'mismatch', detail: bits.join(' · ') };
+      }
+      function diffManifests(refList, devList) {
+        const refMap = {}, devMap = {};
+        refList.forEach(function (e) { refMap[e.relative_path] = e; });
+        devList.forEach(function (e) { devMap[e.relative_path] = e; });
+        const missing = [], added = [], changed = [];
+        Object.keys(refMap).forEach(function (p) {
+          if (!(p in devMap)) missing.push(p);
+          else if (devMap[p].sha256 !== refMap[p].sha256 || Number(devMap[p].size) !== Number(refMap[p].size)) changed.push(p);
+        });
+        Object.keys(devMap).forEach(function (p) { if (!(p in refMap)) added.push(p); });
+        return { missing: missing, added: added, changed: changed };
+      }
+      function classifyDir(msg) {
+        if (msg.error) return { status: 'error', detail: String(msg.error) };
+        if (msg.found === false) return { status: 'notfound', detail: 'path not found' };
+        if (msg.tree_hash === verifyDirRef.tree_hash) return { status: 'match', detail: (msg.file_count != null ? msg.file_count + ' files' : '') };
+        // The device reports what is on disk, OS metadata included — content copied over
+        // USB/MTP from a Mac carries `.DS_Store` that a push would have stripped. The
+        // reference never contains those files, so re-fold the device's manifest without
+        // them before calling this a mismatch. Its entries are already in the required sort
+        // order, and dropping some of them preserves it.
+        let deviceEntries = Array.isArray(msg.manifest) ? msg.manifest : null;
+        let ignoredOnDevice = 0;
+        if (deviceEntries) {
+          const kept = deviceEntries.filter(function (e) { return !isOsMetadata(e.relative_path); });
+          ignoredOnDevice = deviceEntries.length - kept.length;
+          if (ignoredOnDevice) {
+            deviceEntries = kept;
+            if (foldTreeHash(kept).tree_hash === verifyDirRef.tree_hash) {
+              return { status: 'match', detail: kept.length + ' files · ' + ignoredOnDevice + ' OS metadata ignored on device' };
+            }
+          }
+        }
+        let detail;
+        if (verifyDirRef.manifest && deviceEntries) {
+          const d = diffManifests(verifyDirRef.manifest, deviceEntries);
+          detail = 'missing ' + d.missing.length + ' · added ' + d.added.length + ' · changed ' + d.changed.length;
+          if (ignoredOnDevice) detail += ' (' + ignoredOnDevice + ' OS metadata ignored)';
+        } else {
+          // No manifest (the device omits it above its entry cap), so OS metadata on the
+          // device cannot be discounted — say so rather than let the operator wonder.
+          detail = 'tree differs (' + (msg.file_count != null ? msg.file_count : '?') + ' files on device vs ' + verifyDirRef.file_count + ' local)'
+            + (Array.isArray(msg.manifest) ? '' : '; too large for a per-file diff');
+        }
+        return { status: 'mismatch', detail: detail };
+      }
+
+      // ---- reference selection + command dispatch ----
+      // Carrying a package name over from a previously picked APK would silently verify the
+      // new reference against the old package, so drop what we filled in ourselves. A name
+      // the operator typed is theirs and survives.
+      function setAutoPkg(pkg) {
+        if (pkg || verifyApkPkg.value === verifyApkAutoPkg) verifyApkPkg.value = pkg;
+        verifyApkAutoPkg = pkg;
+      }
+      async function onVerifyApkFile() {
+        verifyApkRef = null;
+        const f = verifyApkFile.files[0];
+        if (!f) { verifyApkName.textContent = 'No reference APK'; setAutoPkg(''); updateButtons(); return; }
+        verifyApkName.textContent = 'Hashing ' + f.name + '…'; updateButtons();
+        try {
+          const r = await apkCdDigest(f);
+          verifyApkRef = { size: r.size, cd_sha256: r.cd_sha256, filename: f.name };
+          verifyApkName.textContent = 'Ref: ' + f.name + ' (' + formatBytes(r.size) + ')';
+        } catch (e) { verifyApkName.textContent = 'Error: ' + e.message; setAutoPkg(''); updateButtons(); return; }
+        // Best effort: fill in the package name from the APK itself. The field stays
+        // editable, and any failure leaves the operator with plain manual entry.
+        try {
+          const info = await apkManifestInfo(f);
+          if (!info.package) throw new Error('no package attribute on <manifest>');
+          setAutoPkg(info.package);
+          verifyApkName.textContent += info.versionName ? ' · v' + info.versionName : '';
+        } catch (e) {
+          setAutoPkg('');
+          addLog('Could not read the package name from ' + f.name + ', enter it manually (' + e.message + ')', 'warn');
+        }
+        updateButtons();
+      }
+      function sendVerifyApk() {
+        const pkg = verifyApkPkg.value.trim();
+        if (!verifyApkRef || !pkg) return;
+        const online = onlineTargets(Array.from(selectedIds));
+        if (!online.length) { addLog('No online devices selected to verify', 'warn'); return; }
+        if (!wsSend({ type: 'VERIFY_APK', target_devices: online, package_name: pkg }, 'verify APK')) return;
+        online.forEach(function (id) { deviceTaskState[id] = { task: 'verify', kind: 'apk', status: 'verifying', detail: '' }; updateTaskCell(id); });
+        addLog('Verifying ' + pkg + ' against ' + verifyApkRef.filename + ' on ' + online.length + ' device(s)', 'info');
+      }
+      function osMetadataNote(count) { return count ? ' · ' + count + ' OS metadata excluded' : ''; }
+      // Byte-based progress, not file-based: a tree of a few large videos would otherwise sit
+      // on "Hashing 1/13…" long enough to look hung.
+      async function setDirRef(runManifest, source) {
+        verifyDirRefName.textContent = 'Hashing…'; updateButtons();
+        try {
+          const r = await runManifest(function (done, total, doneBytes, totalBytes) {
+            const pct = totalBytes ? Math.floor((doneBytes / totalBytes) * 100) : 100;
+            verifyDirRefName.textContent = 'Hashing ' + pct + '% (' + done + '/' + total + ')…';
+          });
+          verifyDirRef = { tree_hash: r.tree_hash, file_count: r.file_count, total_size: r.total_size, manifest: r.manifest, source: source };
+          verifyDirRefName.textContent = 'Ref: ' + r.file_count + ' files (' + formatBytes(r.total_size) + ')' + osMetadataNote(r.excluded_count);
+          if (r.excluded_count) addLog('Excluded ' + r.excluded_count + ' OS metadata file(s) from the reference (never pushed to devices)', 'info');
+        } catch (e) { verifyDirRefName.textContent = 'Error: ' + e.message; }
+        updateButtons();
+      }
+      async function onVerifyDirFolder() {
+        verifyDirRef = null; verifyDirJson.value = '';
+        const files = verifyDirFolder.files;
+        if (!files || !files.length) { verifyDirRefName.textContent = 'No reference'; updateButtons(); return; }
+        await setDirRef(function (onProgress) { return dirManifest(files, onProgress); }, 'folder');
+      }
+      function onVerifyDirDragOver(e) {
+        e.preventDefault(); e.dataTransfer.dropEffect = 'copy';
+        verifyDirDrop.classList.add('over');
+      }
+      function onVerifyDirDragLeave() { verifyDirDrop.classList.remove('over'); }
+      async function onVerifyDirDropped(e) {
+        e.preventDefault(); verifyDirDrop.classList.remove('over');
+        // webkitGetAsEntry() has to run before the first await — DataTransferItems are
+        // emptied as soon as the drop handler yields.
+        const items = e.dataTransfer.items, roots = [];
+        for (let i = 0; i < items.length; i++) {
+          const entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
+          if (entry) roots.push(entry);
+        }
+        verifyDirRef = null; verifyDirJson.value = ''; verifyDirFolder.value = '';
+        if (roots.length !== 1 || !roots[0].isDirectory) {
+          verifyDirRefName.textContent = 'Drop exactly one folder'; updateButtons(); return;
+        }
+        await setDirRef(function (onProgress) { return dirManifestFromDrop(roots[0], onProgress); }, 'drop');
+      }
+      async function onVerifyDirJson() {
+        verifyDirRef = null; verifyDirFolder.value = '';
+        const f = verifyDirJson.files[0];
+        if (!f) { verifyDirRefName.textContent = 'No reference'; updateButtons(); return; }
+        try {
+          const obj = JSON.parse(await f.text());
+          if (!obj || typeof obj.tree_hash !== 'string') throw new Error('missing tree_hash');
+          verifyDirRef = { tree_hash: obj.tree_hash, file_count: obj.file_count, total_size: obj.total_size, manifest: obj.manifest, source: 'json' };
+          verifyDirRefName.textContent = 'Ref (CLI): ' + f.name + (obj.file_count != null ? ' — ' + obj.file_count + ' files' : '') + osMetadataNote(obj.excluded_count);
+        } catch (e) { verifyDirRefName.textContent = 'Invalid hash JSON: ' + e.message; }
+        updateButtons();
+      }
+      function sendVerifyDir() {
+        const path = verifyDirPath.value.trim();
+        if (!verifyDirRef || !path) return;
+        const online = onlineTargets(Array.from(selectedIds));
+        if (!online.length) { addLog('No online devices selected to verify', 'warn'); return; }
+        if (!wsSend({ type: 'VERIFY_DIR', target_devices: online, path: path }, 'verify directory')) return;
+        online.forEach(function (id) { deviceTaskState[id] = { task: 'verify', kind: 'dir', status: 'verifying', detail: '' }; updateTaskCell(id); });
+        addLog('Verifying ' + path + ' against local reference on ' + online.length + ' device(s)', 'info');
+      }
+
       // ---------------- Event wiring ----------------
       // Sub-tabs
       tabGroups.addEventListener('click', function () { targetTab = 'groups'; userPickedTab = true; render(); });
@@ -1268,6 +1865,19 @@
       btnLaunch.addEventListener('click', sendLaunch);
       btnStartupSet.addEventListener('click', sendSetStartup);
       btnStartupClear.addEventListener('click', sendClearStartup);
+      verifyApkFile.addEventListener('change', onVerifyApkFile);
+      verifyApkPkg.addEventListener('input', updateButtons);
+      btnVerifyApk.addEventListener('click', sendVerifyApk);
+      verifyDirFolder.addEventListener('change', onVerifyDirFolder);
+      verifyDirDrop.addEventListener('dragover', onVerifyDirDragOver);
+      verifyDirDrop.addEventListener('dragleave', onVerifyDirDragLeave);
+      verifyDirDrop.addEventListener('drop', onVerifyDirDropped);
+      // Without this a folder dropped next to the zone would navigate the console away.
+      document.addEventListener('dragover', function (e) { e.preventDefault(); });
+      document.addEventListener('drop', function (e) { e.preventDefault(); });
+      verifyDirJson.addEventListener('change', onVerifyDirJson);
+      verifyDirPath.addEventListener('input', updateButtons);
+      btnVerifyDir.addEventListener('click', sendVerifyDir);
       btnClearLog.addEventListener('click', function () { logContainer.innerHTML = ''; logContainer.appendChild(logEmpty); logEmpty.style.display = 'block'; });
 
       // Command sections accordion: only one open at a time (matches the original
