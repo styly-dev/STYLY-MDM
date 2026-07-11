@@ -11,10 +11,18 @@ android {
         applicationId "com.styly.mdmclient"
         minSdk 29
         targetSdk 33
-        // Overridable so a self-update test run can push a strictly-increasing versionCode
-        // without editing this file. CI passes neither property and gets the committed values.
-        versionCode ((project.findProperty("versionCodeOverride") ?: 6) as Integer)
-        versionName ((project.findProperty("versionNameOverride") ?: "0.2.3").toString())
+        // Keep versionCode/versionName on plain literal lines: the release-version-bump
+        // workflow greps and seds them. Overrides are applied by assignment below so a
+        // self-update test run can push a strictly-increasing versionCode without editing
+        // this file. CI passes neither property and gets the committed values.
+        versionCode 6
+        versionName "0.2.3"
+        if (project.hasProperty("versionCodeOverride")) {
+            versionCode = project.property("versionCodeOverride") as Integer
+        }
+        if (project.hasProperty("versionNameOverride")) {
+            versionName = project.property("versionNameOverride").toString()
+        }
     }
 
     signingConfigs {
