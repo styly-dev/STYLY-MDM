@@ -64,6 +64,11 @@ object UpdateJournal {
     // has to start it (first deployment, the guard's own update, or a crash).
     const val EVENT_GUARD_STARTED = "GUARD_STARTED"
 
+    // Recorded when the tick installs the embedded guard APK (missing or outdated),
+    // and once more if that install reports failure. Gated to once per absence
+    // episode so a persistently failing install cannot churn the journal.
+    const val EVENT_GUARD_INSTALLED = "GUARD_INSTALLED"
+
     /**
      * Appends an event. Safe to call from any thread and from a BroadcastReceiver, and returns
      * only once the entry is on disk.

@@ -13,6 +13,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.SystemClock
 import android.util.Log
 import com.pvr.tobservice.ToBServiceHelper
 import com.pvr.tobservice.enums.PBS_PackageControlEnum
@@ -69,10 +70,13 @@ class MdmClientService : Service() {
 
         // Mutual watch with the guard app. The self-update gate blocks up to
         // GUARD_START_WAIT_MS for the guard's process to be confirmed before relying
-        // on it for recovery; the periodic tick restarts a guard that is installed
-        // but down (first deployment, its own update, or a crash).
+        // on it for recovery; the periodic tick provisions the guard (installs the
+        // embedded APK when missing or outdated) and restarts one that is installed
+        // but down. The install cooldown keeps a failing install (e.g. a signature
+        // conflict) from being retried every tick.
         private const val GUARD_START_WAIT_MS = 5_000L
         private const val GUARD_ENSURE_INTERVAL_MS = 60_000L
+        private const val GUARD_INSTALL_COOLDOWN_MS = 300_000L
 
         // Integrity verification (issue #37). The ZIP End-Of-Central-Directory record is
         // the fixed 22-byte trailer plus an optional comment of up to 0xFFFF bytes.
@@ -97,6 +101,13 @@ class MdmClientService : Service() {
     private lateinit var guardEnsureThread: HandlerThread
     private lateinit var guardEnsure: Handler
     private var guardSeenDown = false
+    // Guard provisioning state (all touched only on the guard-ensure thread).
+    // The upgrade comparison runs once per process: a new embedded guard can only
+    // arrive with a new client build, i.e. a new process.
+    private var embeddedGuardChecked = false
+    private var guardInstallInFlight = false
+    private var lastGuardInstallAt = 0L
+    private var guardInstallJournaled = false
 
     override fun onCreate() {
         super.onCreate()
@@ -157,12 +168,14 @@ class MdmClientService : Service() {
     }
 
     /**
-     * The client's half of the mutual watch: restart the guard when it is installed
-     * but not running. Fire-and-forget — the next tick is the confirmation. See
-     * GuardLink for why the guard cannot rely on anything else to start it.
+     * The client's half of the mutual watch: install the embedded guard when it is
+     * missing or outdated, and restart one that is installed but not running.
+     * Fire-and-forget — the next tick is the confirmation. See GuardLink for why the
+     * guard cannot rely on anything else to provision or start it.
      */
     private fun guardEnsureTick() {
         try {
+            ensureGuardProvisioned()
             val proxy = ToBServiceHelper.getInstance().serviceBinder as? IToBServiceProxy
             if (proxy != null && GuardLink.isInstalled(this)) {
                 if (GuardLink.isRunning(proxy) == false) {
@@ -183,6 +196,75 @@ class MdmClientService : Service() {
             Log.e(TAG, "Guard ensure tick failed", e)
         } finally {
             guardEnsure.postDelayed(::guardEnsureTick, GUARD_ENSURE_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * Installs the guard APK bundled into this build (assets/guard.apk) when the
+     * installed guard is missing or older than the embedded copy. The upgrade
+     * comparison runs once per process; the missing case retries on a cooldown so a
+     * persistently failing install (signature conflict and the like) is neither
+     * hammered every tick nor allowed to churn the journal — the attempt and its
+     * failure are journalled once per absence episode.
+     */
+    private fun ensureGuardProvisioned() {
+        if (guardInstallInFlight) return
+        val installedVc = GuardLink.installedVersionCode(this)
+        if (installedVc != null) {
+            guardInstallJournaled = false
+            if (embeddedGuardChecked) return
+        } else if (SystemClock.elapsedRealtime() - lastGuardInstallAt < GUARD_INSTALL_COOLDOWN_MS) {
+            return
+        }
+        val binder = ToBServiceHelper.getInstance().serviceBinder ?: return
+        val embedded = GuardLink.extractEmbedded(this) ?: return
+        embeddedGuardChecked = true
+        val reason = when {
+            installedVc == null -> "missing"
+            embedded.versionCode > installedVc ->
+                "upgrade from=$installedVc to=${embedded.versionCode}"
+            else -> {
+                embedded.file.delete()
+                return
+            }
+        }
+        lastGuardInstallAt = SystemClock.elapsedRealtime()
+        guardInstallInFlight = true
+        Log.i(TAG, "Installing embedded guard (${embedded.versionCode}): $reason")
+        if (!guardInstallJournaled) {
+            guardInstallJournaled = true
+            UpdateJournal.record(
+                this,
+                UpdateJournal.EVENT_GUARD_INSTALLED,
+                "reason=$reason version_code=${embedded.versionCode}"
+            )
+        }
+        try {
+            binder.pbsControlAPPManger(
+                PBS_PackageControlEnum.PACKAGE_SILENCE_INSTALL,
+                embedded.file.absolutePath,
+                0,
+                object : IIntCallback.Stub() {
+                    override fun callback(result: Int) {
+                        guardInstallInFlight = false
+                        embedded.file.delete()
+                        if (result == 0) {
+                            Log.i(TAG, "Embedded guard installed")
+                        } else {
+                            Log.e(TAG, "Embedded guard install failed: $result (${installResultMessage(result)})")
+                            UpdateJournal.record(
+                                this@MdmClientService,
+                                UpdateJournal.EVENT_GUARD_INSTALLED,
+                                "failed result=$result (${installResultMessage(result)})"
+                            )
+                        }
+                    }
+                }
+            )
+        } catch (e: Throwable) {
+            guardInstallInFlight = false
+            embedded.file.delete()
+            Log.e(TAG, "Embedded guard install threw", e)
         }
     }
 

@@ -29,9 +29,25 @@ android {
             "${project.findProperty("guardSelfDestructGraceMsOverride") ?: 600_000}L"
     }
 
+    signingConfigs {
+        release {
+            // Same env-driven credentials as :app — the guard ships embedded in the
+            // client APK, so a signed client release must carry a signed guard.
+            if (System.getenv("KEYSTORE_FILE") != null) {
+                storeFile file(System.getenv("KEYSTORE_FILE"))
+                storePassword System.getenv("KEYSTORE_PASSWORD")
+                keyAlias System.getenv("KEY_ALIAS")
+                keyPassword System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
+            if (System.getenv("KEYSTORE_FILE") != null) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 

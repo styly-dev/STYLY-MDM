@@ -74,6 +74,31 @@ android {
     kotlinOptions {
         jvmTarget = '1.8'
     }
+
+    // The guard APK ships inside the client as assets/guard.apk: the client
+    // silent-installs it whenever it is missing or older (GuardLink), so deploying
+    // the client is the whole deployment story — no separate guard rollout, and a
+    // deleted guard comes back on the next mutual-watch tick. Debug clients embed
+    // the debug guard, release clients the release guard.
+    sourceSets {
+        debug.assets.srcDirs += "${buildDir}/generated/guardApk/debug"
+        release.assets.srcDirs += "${buildDir}/generated/guardApk/release"
+    }
+}
+
+["debug", "release"].each { buildType ->
+    def cap = buildType.capitalize()
+    tasks.register("copyGuardApk${cap}", Copy) {
+        dependsOn ":guard:assemble${cap}"
+        from project(":guard").layout.buildDirectory.file("outputs/apk/${buildType}/guard-${buildType}.apk")
+        into layout.buildDirectory.dir("generated/guardApk/${buildType}")
+        rename { "guard.apk" }
+    }
+}
+
+android.applicationVariants.all { variant ->
+    def cap = variant.buildType.name.capitalize()
+    variant.mergeAssetsProvider.configure { dependsOn(tasks.named("copyGuardApk${cap}")) }
 }
 
 dependencies {

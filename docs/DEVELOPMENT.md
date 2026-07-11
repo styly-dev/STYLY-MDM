@@ -560,10 +560,14 @@ registers its own keep-alive, and every 10 s checks the client's process
 deliberate uninstall is not fought), it starts it back up with TobService's privileged
 `startForegroundService`, which is exempt from background-start restrictions and punches
 through the stopped state (verified on device: revival lands in seconds, even after
-`am force-stop`). The watch is mutual — `GuardLink` in the client starts the guard when it
-is installed but not running (`MdmClientService` checks every 60 s, journalling
-`GUARD_STARTED` on the transition) — which is also how the guard first comes up after
-being deployed over MDM, and how it comes back after an update of its own package. The
+`am force-stop`). The watch is mutual — the client *provisions* the guard: the guard APK
+ships embedded in the client build (`assets/guard.apk`, packed by `:app`'s
+`copyGuardApk*` tasks from `:guard`), and `MdmClientService`'s 60 s tick silent-installs
+it whenever it is missing or older than the embedded copy (journalling
+`GUARD_INSTALLED`), then starts it when it is installed but not running (journalling
+`GUARD_STARTED` on the transition). Deploying the client therefore deploys the guard, a
+directly-deleted guard comes back within a tick, and guard upgrades ride client updates
+(the replaced guard's process dies and the next tick restarts the new build). The
 guard's lifecycle is coupled to the client's: it has no launcher entry (no activity at
 all), so when the client's package goes *missing* — a true uninstall; a replace never
 reads as missing — the guard stands down and, after 10 minutes of continued absence,
@@ -649,16 +653,16 @@ installed, a dead client is started back up within one watchdog tick.
 
 - **Deploy the server before pushing a new client.** A client refuses to self-update
   without server-supplied hashes, so an old server cannot push the new client onto devices.
-- **Deploy the guard like any app, after the client.** The guard APK goes out over the
-  normal Quick Install path (it is not a self-update — different package). A freshly
-  installed guard is in the stopped state and receives no boot broadcast until a reboot;
-  the client's mutual-watch tick starts it within a minute, and from then on boot
-  (`BootReceiver`), keep-alive, and the mutual watch keep it up. Order matters: a guard
-  deployed to a device with no client self-destructs after its 10-minute grace, and
-  uninstalling the client later releases its guard the same way — no separate cleanup
-  step. Without a running guard, a self-update falls back to the power-cycle timers and —
-  on firmware where those are refused — the update itself is refused with an
-  `INSTALL_RESULT` fail naming both.
+- **The guard needs no deployment of its own.** It ships inside the client APK and the
+  client's tick installs/starts/upgrades it (a release client embeds the release-signed
+  guard — `:guard` uses the same env-driven signing as `:app`, so `assembleProdRelease`
+  covers both). A freshly installed guard is in the stopped state and receives no boot
+  broadcast until a reboot; the tick starts it within a minute, and from then on boot
+  (`BootReceiver`), keep-alive, and the mutual watch keep it up. Uninstalling the client
+  releases its guard via the self-destruct grace — no separate cleanup step. Without a
+  running guard, a self-update falls back to the power-cycle timers and — on firmware
+  where those are refused — the update itself is refused with an `INSTALL_RESULT` fail
+  naming both.
 - **The first rollout is manual.** Clients older than this feature (≤ v6) have no recovery
   path: self-updating them still strands the device until a manual reboot. The same holds
   for any client whose *running* build predates a fix in this area — the running build is
@@ -688,8 +692,10 @@ self-update: `INSTALL_REFUSED` (hash gate), `SELF_INSTALL_INVOKED` (whose detail
 revival. On the power-cycle path, `POWER_CYCLE_SCHEDULED` (with the PICO timing API
 read-back strings) precedes the install and `POWER_CYCLE_CLOSED reason=recovery` follows
 the reboot; `POWER_CYCLE_CLOSED reason=install_failed|schedule_failed` mark its failure
-paths. `GUARD_STARTED` records the client's half of the mutual watch: the tick found the
-guard installed but down and started it.
+paths. `GUARD_STARTED` and `GUARD_INSTALLED` record the client's half of the mutual
+watch: the tick started a guard that was installed but down, or silent-installed the
+embedded guard because it was missing or older (with a `failed result=` entry when that
+install reports an error; both are gated to once per absence episode).
 
 When testing, note that a debug-signed APK cannot replace a release-signed install (silent
 install fails with `106 Package conflict`), that the `prod` and `dev` flavors share
