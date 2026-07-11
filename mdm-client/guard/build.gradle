@@ -19,12 +19,24 @@ android {
         targetSdk 33
         versionCode ((project.findProperty("guardVersionCodeOverride") ?: 1) as Integer)
         versionName ((project.findProperty("guardVersionNameOverride") ?: "0.1.0").toString())
+
+        // Overridable so the self-destruct path is testable on a device without
+        // uninstalling the real client: a test build watches a package that does
+        // not exist and uses a short grace. Production builds pass neither.
+        buildConfigField "String", "CLIENT_PACKAGE",
+            "\"${project.findProperty("guardClientPackageOverride") ?: "com.styly.mdmclient"}\""
+        buildConfigField "long", "SELF_DESTRUCT_GRACE_MS",
+            "${project.findProperty("guardSelfDestructGraceMsOverride") ?: 600_000}L"
     }
 
     buildTypes {
         release {
             minifyEnabled false
         }
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     compileOptions {

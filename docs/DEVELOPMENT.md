@@ -43,6 +43,8 @@ Gradle properties, for self-update testing (see [Client Self-Update](#client-sel
 | `-PversionNameOverride=S` | `versionName` in `app/build.gradle` | Label a one-off build |
 | `-PguardVersionCodeOverride=N` | `versionCode` in `guard/build.gradle` | Same, for the guard app (`./gradlew :guard:assembleDebug`) |
 | `-PguardVersionNameOverride=S` | `versionName` in `guard/build.gradle` | Same, for the guard app |
+| `-PguardClientPackageOverride=P` | `com.styly.mdmclient` | Point the guard at a package that does not exist, to exercise stand-down/self-destruct without uninstalling the real client |
+| `-PguardSelfDestructGraceMsOverride=N` | `600000` (10 min) | Shorten the self-destruct grace for that test |
 
 ### Build from Android Studio
 
@@ -562,7 +564,13 @@ through the stopped state (verified on device: revival lands in seconds, even af
 is installed but not running (`MdmClientService` checks every 60 s, journalling
 `GUARD_STARTED` on the transition) — which is also how the guard first comes up after
 being deployed over MDM, and how it comes back after an update of its own package. The
-power-cycle timers are kept only as the fallback for devices whose firmware allows them.
+guard's lifecycle is coupled to the client's: it has no launcher entry (no activity at
+all), so when the client's package goes *missing* — a true uninstall; a replace never
+reads as missing — the guard stands down and, after 10 minutes of continued absence,
+silently uninstalls itself through TobService rather than squatting invisibly on the
+device (verified on device, including that TobService accepts an uninstall of the
+calling package). The power-cycle timers are kept only as the fallback for devices
+whose firmware allows them.
 
 The self-update flow:
 
@@ -641,13 +649,16 @@ installed, a dead client is started back up within one watchdog tick.
 
 - **Deploy the server before pushing a new client.** A client refuses to self-update
   without server-supplied hashes, so an old server cannot push the new client onto devices.
-- **Deploy the guard like any app.** The guard APK goes out over the normal Quick Install
-  path (it is not a self-update — different package). A freshly installed guard is in the
-  stopped state and receives no boot broadcast until a reboot; the client's mutual-watch
-  tick starts it within a minute, and from then on boot (`BootReceiver`), keep-alive, and
-  the mutual watch keep it up. Without a running guard, a self-update falls back to the
-  power-cycle timers and — on firmware where those are refused — the update itself is
-  refused with an `INSTALL_RESULT` fail naming both.
+- **Deploy the guard like any app, after the client.** The guard APK goes out over the
+  normal Quick Install path (it is not a self-update — different package). A freshly
+  installed guard is in the stopped state and receives no boot broadcast until a reboot;
+  the client's mutual-watch tick starts it within a minute, and from then on boot
+  (`BootReceiver`), keep-alive, and the mutual watch keep it up. Order matters: a guard
+  deployed to a device with no client self-destructs after its 10-minute grace, and
+  uninstalling the client later releases its guard the same way — no separate cleanup
+  step. Without a running guard, a self-update falls back to the power-cycle timers and —
+  on firmware where those are refused — the update itself is refused with an
+  `INSTALL_RESULT` fail naming both.
 - **The first rollout is manual.** Clients older than this feature (≤ v6) have no recovery
   path: self-updating them still strands the device until a manual reboot. The same holds
   for any client whose *running* build predates a fix in this area — the running build is

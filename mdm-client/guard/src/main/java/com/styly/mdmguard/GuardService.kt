@@ -11,6 +11,8 @@ import android.os.IBinder
 import android.os.SystemClock
 import android.util.Log
 import com.pvr.tobservice.ToBServiceHelper
+import com.pvr.tobservice.enums.PBS_PackageControlEnum
+import com.pvr.tobservice.interfaces.IIntCallback
 import com.pvr.tobservice.interfaces.IToBServiceProxy
 
 /**
@@ -25,6 +27,12 @@ import com.pvr.tobservice.interfaces.IToBServiceProxy
  * privileged TobService launch APIs, which are exempt from the background-start
  * restrictions that apply to a plain startForegroundService() from here.
  *
+ * The guard's lifecycle is coupled to the client's: it has no launcher entry, so when
+ * the client is *uninstalled* (package missing — a replace never reads as missing) the
+ * guard first stands down and then, once SELF_DESTRUCT_GRACE_MS passes without the
+ * client coming back, silently uninstalls itself rather than squatting invisibly on
+ * the device.
+ *
  * Diagnostics: every state change and revival attempt is logged under the
  * GuardService tag, and specific revival methods can be forced over adb:
  *   adb shell am start-foreground-service -n com.styly.mdmguard/.GuardService -e cmd revive_fgs
@@ -37,8 +45,9 @@ class GuardService : Service() {
 
     companion object {
         private const val TAG = "GuardService"
-        private const val CLIENT_PACKAGE = "com.styly.mdmclient"
-        private const val CLIENT_SERVICE = "com.styly.mdmclient.MdmClientService"
+        // Overridable at build time so the self-destruct path is testable (see build.gradle).
+        private val CLIENT_PACKAGE = BuildConfig.CLIENT_PACKAGE
+        private val CLIENT_SERVICE = "${BuildConfig.CLIENT_PACKAGE}.MdmClientService"
         // Key the client's onStartCommand reads; shows up in its journal/log as reason=guard.
         private const val CLIENT_EXTRA_START_REASON = "start_reason"
         private const val START_REASON_GUARD = "guard"
@@ -57,9 +66,13 @@ class GuardService : Service() {
 
     @Volatile private var watching = true
     private var lastReviveAt = 0L
-    // Logged-once flag so a deliberately uninstalled client does not spam the log
-    // with a skipped revival every tick.
-    private var loggedClientMissing = false
+    // When the client's package went missing (elapsedRealtime), or null while it is
+    // installed. A missing package is a deliberate uninstall, not a crash: the guard
+    // stands down, and once the grace period passes it uninstalls itself — the guard
+    // has no launcher entry, so nothing else would ever clean up an orphaned one.
+    // The grace absorbs a dev's uninstall/reinstall gap; a package being *replaced*
+    // (self-update) never reads as missing.
+    private var clientMissingSince: Long? = null
 
     private val proxy: IToBServiceProxy?
         get() = ToBServiceHelper.getInstance().serviceBinder as? IToBServiceProxy
@@ -117,18 +130,24 @@ class GuardService : Service() {
     private fun watchdogTick() {
         try {
             if (watching) {
-                val alive = isClientAlive()
-                if (alive == false) {
-                    if (!isClientInstalled()) {
-                        // A missing package is a deliberate uninstall, not a crash:
-                        // reviving would fight the operator, so stand down until it
-                        // is installed again.
-                        if (!loggedClientMissing) {
-                            Log.w(TAG, "Client package not installed; standing down")
-                            loggedClientMissing = true
-                        }
-                    } else {
-                        loggedClientMissing = false
+                if (!isClientInstalled()) {
+                    val now = SystemClock.elapsedRealtime()
+                    val since = clientMissingSince
+                    if (since == null) {
+                        clientMissingSince = now
+                        Log.w(
+                            TAG,
+                            "Client package not installed; standing down " +
+                                "(self-destruct in ${BuildConfig.SELF_DESTRUCT_GRACE_MS / 1000}s " +
+                                "unless it comes back)"
+                        )
+                    } else if (now - since >= BuildConfig.SELF_DESTRUCT_GRACE_MS) {
+                        selfDestruct()
+                    }
+                } else {
+                    clientMissingSince = null
+                    val alive = isClientAlive()
+                    if (alive == false) {
                         val now = SystemClock.elapsedRealtime()
                         if (now - lastReviveAt >= REVIVE_COOLDOWN_MS) {
                             Log.w(TAG, "Client is DOWN; attempting revival")
@@ -138,8 +157,6 @@ class GuardService : Service() {
                             Log.i(TAG, "Client is DOWN; within revive cooldown, waiting")
                         }
                     }
-                } else {
-                    loggedClientMissing = false
                 }
             }
         } catch (e: Throwable) {
@@ -179,6 +196,40 @@ class GuardService : Service() {
         true
     } catch (e: android.content.pm.PackageManager.NameNotFoundException) {
         false
+    }
+
+    /**
+     * Uninstalls this guard through TobService's silent uninstall. The guard exists
+     * only to serve the client: with the client gone past the grace period, an
+     * invisible package with no launcher entry would otherwise squat on the device
+     * forever. The uninstall kills this process, so a callback only ever reports
+     * failure; on failure the grace clock restarts rather than hammering every tick.
+     */
+    private fun selfDestruct() {
+        Log.w(TAG, "Client gone for ${BuildConfig.SELF_DESTRUCT_GRACE_MS / 1000}s; uninstalling self")
+        val p = proxy
+        if (p == null) {
+            Log.e(TAG, "Cannot self-destruct: TobService proxy not bound; will retry")
+            clientMissingSince = SystemClock.elapsedRealtime()
+            return
+        }
+        try {
+            p.pbsControlAPPManger(
+                PBS_PackageControlEnum.PACKAGE_SILENCE_UNINSTALL,
+                packageName,
+                0,
+                object : IIntCallback.Stub() {
+                    override fun callback(result: Int) {
+                        Log.e(TAG, "Self-uninstall did not remove the process; result=$result")
+                    }
+                }
+            )
+        } catch (e: Throwable) {
+            Log.e(TAG, "Self-uninstall threw; will retry after another grace period", e)
+        }
+        // Reached only if the uninstall did not (yet) kill us: restart the clock so a
+        // rejected uninstall retries once per grace period instead of every tick.
+        clientMissingSince = SystemClock.elapsedRealtime()
     }
 
     private fun clientServiceIntent(): Intent = Intent()
