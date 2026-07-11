@@ -81,7 +81,7 @@ def apk_cd_digest(path: str) -> tuple[int, str]:
     return file_len, h.hexdigest()
 
 
-def _file_sha256(path: str) -> str:
+def file_sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
         while True:
@@ -195,7 +195,7 @@ def dir_manifest(path: str, manifest_entry_cap: int | None = None) -> dict:
         entries.append({
             "relative_path": rel,
             "size": os.path.getsize(abspath),
-            "sha256": _file_sha256(abspath),
+            "sha256": file_sha256(abspath),
         })
     # Sort by the UTF-8 byte sequence, not Python's default str ordering, so JS
     # (UTF-16 code units) and Kotlin can reproduce the exact same order for non-ASCII.

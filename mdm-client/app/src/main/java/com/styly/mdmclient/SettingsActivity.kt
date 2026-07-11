@@ -29,6 +29,9 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var discoverButton: Button
     private lateinit var storagePermissionStatus: TextView
     private lateinit var grantStorageButton: Button
+    private lateinit var journalText: TextView
+    private lateinit var journalRefreshButton: Button
+    private lateinit var journalClearButton: Button
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -42,12 +45,20 @@ class SettingsActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
 
+        // This is the LAUNCHER activity, so the PICO keep-alive may relaunch the app *through
+        // it* rather than starting the service directly. Recorded before the service is
+        // started below, so the journal shows which route brought the client back.
+        UpdateJournal.record(this, UpdateJournal.EVENT_ACTIVITY_ONCREATE)
+
         serverUrlInput = findViewById(R.id.server_url_input)
         statusText = findViewById(R.id.status_text)
         saveButton = findViewById(R.id.save_button)
         discoverButton = findViewById(R.id.discover_button)
         storagePermissionStatus = findViewById(R.id.storage_permission_status)
         grantStorageButton = findViewById(R.id.grant_storage_button)
+        journalText = findViewById(R.id.journal_text)
+        journalRefreshButton = findViewById(R.id.journal_refresh_button)
+        journalClearButton = findViewById(R.id.journal_clear_button)
 
         // Load current server URL
         val prefs = getSharedPreferences("stylymdm_prefs", MODE_PRIVATE)
@@ -66,8 +77,20 @@ class SettingsActivity : AppCompatActivity() {
             requestAllFilesAccess()
         }
 
+        journalRefreshButton.setOnClickListener {
+            refreshJournal()
+        }
+
+        journalClearButton.setOnClickListener {
+            UpdateJournal.clear(this)
+            refreshJournal()
+        }
+
         // Start the service if not already running
-        startForegroundService(Intent(this, MdmClientService::class.java))
+        startForegroundService(
+            Intent(this, MdmClientService::class.java)
+                .putExtra(MdmClientService.EXTRA_START_REASON, MdmClientService.REASON_SETTINGS)
+        )
     }
 
     override fun onResume() {
@@ -76,6 +99,11 @@ class SettingsActivity : AppCompatActivity() {
         registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         // Re-check here so returning from the system settings screen refreshes the UI.
         updateStoragePermissionUi()
+        refreshJournal()
+    }
+
+    private fun refreshJournal() {
+        journalText.text = UpdateJournal.format(this)
     }
 
     override fun onPause() {
@@ -111,7 +139,10 @@ class SettingsActivity : AppCompatActivity() {
 
         // Restart the service to apply new URL
         stopService(Intent(this, MdmClientService::class.java))
-        startForegroundService(Intent(this, MdmClientService::class.java))
+        startForegroundService(
+            Intent(this, MdmClientService::class.java)
+                .putExtra(MdmClientService.EXTRA_START_REASON, MdmClientService.REASON_SETTINGS)
+        )
 
         statusText.text = "Reconnecting..."
     }

@@ -24,6 +24,7 @@ class BootReceiver : BroadcastReceiver() {
         ) {
             Log.i(TAG, "Starting MdmClientService")
             val serviceIntent = Intent(context, MdmClientService::class.java)
+                .putExtra(MdmClientService.EXTRA_START_REASON, MdmClientService.REASON_BOOT)
             context.startForegroundService(serviceIntent)
         }
     }

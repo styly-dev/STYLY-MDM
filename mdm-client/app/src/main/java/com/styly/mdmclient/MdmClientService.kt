@@ -29,6 +29,8 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
+import java.util.Calendar
+import java.util.UUID
 import java.util.zip.ZipFile
 
 /**
@@ -46,6 +48,14 @@ class MdmClientService : Service() {
         const val ACTION_STATUS_UPDATE = "com.styly.mdmclient.STATUS_UPDATE"
         const val EXTRA_CONNECTED = "connected"
         const val EXTRA_MESSAGE = "message"
+
+        // Who asked for the service to start. Journalled so an unattended restart (keep-alive
+        // or START_STICKY, which pass no extra) is distinguishable from a user opening the
+        // launcher activity. See UpdateJournal.
+        const val EXTRA_START_REASON = "start_reason"
+        const val REASON_BOOT = "boot"
+        const val REASON_SETTINGS = "settings"
+        private const val REASON_SYSTEM = "system"
 
         // Top-level shared-storage directories that full-mirror push-files sync must never
         // target: mirroring into them would delete unrelated user/media/app data. Matched
@@ -75,9 +85,19 @@ class MdmClientService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "MdmClientService created")
+        UpdateJournal.record(
+            this,
+            UpdateJournal.EVENT_SERVICE_ONCREATE,
+            "version_code=${BuildConfig.VERSION_CODE}"
+        )
 
         createNotificationChannel()
+        // startForeground() is the call that throws ForegroundServiceStartNotAllowedException on
+        // Android 12+ when the start came from the background; startForegroundService() itself
+        // can return cleanly first. Journalling only after it returns pins a failure to the
+        // right call instead of leaving the two indistinguishable.
         startForeground(NOTIFICATION_ID, buildNotification("Initializing..."))
+        UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_FOREGROUND_OK)
 
         webSocketManager = WebSocketManager(
             context = this,
@@ -90,7 +110,19 @@ class MdmClientService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.i(TAG, "MdmClientService started")
+        // A null intent is a START_STICKY redelivery; a start with no reason extra came from
+        // outside our own code — the PICO keep-alive being the case the spike is looking for.
+        val reason = when {
+            intent == null -> REASON_SYSTEM
+            intent.action == "com.pvr.tobservice.SERVICE_AUTO_BOOT" -> "tob_auto_boot"
+            else -> intent.getStringExtra(EXTRA_START_REASON) ?: REASON_SYSTEM
+        }
+        Log.i(TAG, "MdmClientService started (reason=$reason)")
+        UpdateJournal.record(
+            this,
+            UpdateJournal.EVENT_SERVICE_START_COMMAND,
+            "reason=$reason flags=$flags"
+        )
         return START_STICKY
     }
 
@@ -98,6 +130,7 @@ class MdmClientService : Service() {
 
     override fun onDestroy() {
         Log.i(TAG, "MdmClientService destroyed")
+        UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_DESTROYED)
         webSocketManager.disconnect()
         super.onDestroy()
     }
@@ -191,6 +224,7 @@ class MdmClientService : Service() {
     private fun executeInstall(payload: JSONObject) {
         val apkUrl = payload.optString("apk_url", "")
         val apkFilename = sanitizeApkFilename(payload.optString("apk_filename", ""))
+        val expectedFullSha256 = payload.optString("full_sha256", "")
 
         if (apkUrl.isEmpty()) {
             Log.e(TAG, "EXECUTE_INSTALL missing apk_url")
@@ -212,11 +246,33 @@ class MdmClientService : Service() {
             Log.i(TAG, "Downloading APK: $apkUrl")
             try {
                 val downloadedApk = downloadApk(apkUrl, apkFilename)
+                val resultName = apkFilename.ifEmpty { downloadedApk.name }
                 // Tell the server the network-heavy download is done so it can free
                 // this device's transfer slot and dispatch the next queued device,
-                // while the local (offline) install proceeds below.
-                sendDownloadComplete(task = "install", apkFilename = apkFilename.ifEmpty { downloadedApk.name })
-                installApk(downloadedApk, apkFilename.ifEmpty { downloadedApk.name })
+                // while the local (offline) hashing and install proceed below.
+                sendDownloadComplete(task = "install", apkFilename = resultName)
+
+                val archive = archiveIdentity(downloadedApk)
+                val isSelfUpdate = archive != null && archive.packageName == packageName
+                // The download travelled over plain LAN HTTP; this comparison against
+                // the server-computed reference is its only integrity check.
+                val actualSha256 =
+                    if (expectedFullSha256.isNotEmpty()) fileSha256(downloadedApk) else null
+                val refusal =
+                    InstallPolicy.hashGateError(expectedFullSha256, actualSha256, isSelfUpdate)
+                if (refusal != null) {
+                    Log.e(TAG, "Refusing to install $resultName: $refusal")
+                    UpdateJournal.record(
+                        this,
+                        UpdateJournal.EVENT_INSTALL_REFUSED,
+                        "self_update=$isSelfUpdate file=$resultName reason=$refusal"
+                    )
+                    downloadedApk.delete()
+                    sendInstallResult(resultName, "fail", refusal)
+                    return@Thread
+                }
+
+                installApk(downloadedApk, resultName, archive, isSelfUpdate)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to install APK from $apkUrl", e)
                 sendInstallResult(apkFilename.ifEmpty { apkUrl }, "fail", e.message ?: "Unknown error")
@@ -289,7 +345,12 @@ class MdmClientService : Service() {
         }
     }
 
-    private fun installApk(apkFile: File, apkFilename: String) {
+    private fun installApk(
+        apkFile: File,
+        apkFilename: String,
+        archive: ArchiveIdentity?,
+        isSelfUpdate: Boolean,
+    ) {
         val binder = ToBServiceHelper.getInstance().serviceBinder
         if (binder == null) {
             apkFile.delete()
@@ -298,7 +359,61 @@ class MdmClientService : Service() {
             return
         }
 
-        Log.i(TAG, "Installing APK: ${apkFile.absolutePath}")
+        // When the APK replaces our own package, Android kills this process and nothing
+        // restarts it (measured: keep-alive does not survive, MY_PACKAGE_REPLACED is not
+        // delivered on PICO). Recovery is a one-shot power cycle armed *before* the
+        // installer runs: shutdown at +2 min (the install commits within ~30 s), startup
+        // at +3 min, then the boot path brings the new build back. Everything the
+        // replacement process needs is committed to disk before the installer is invoked,
+        // and the server is told last — ordering matters: if any earlier step fails,
+        // no state has leaked and the install is simply refused.
+        if (isSelfUpdate) {
+            val proxy = binder as? IToBServiceProxy
+            if (proxy == null) {
+                apkFile.delete()
+                Log.e(TAG, "ToBService proxy unavailable; cannot arm the power cycle")
+                sendInstallResult(
+                    apkFilename, "fail",
+                    "ToBService proxy unavailable; self-update needs the power-cycle timers"
+                )
+                return
+            }
+            when (PowerCycleTimers.arm(this, proxy)) {
+                PowerCycleTimers.ArmOutcome.ARMED -> Unit // proceed with the self-update
+                PowerCycleTimers.ArmOutcome.REFUSED_SAFE -> {
+                    apkFile.delete()
+                    sendInstallResult(
+                        apkFilename, "fail",
+                        "Power-cycle scheduling failed; refusing a self-update with no way back"
+                    )
+                    return
+                }
+                PowerCycleTimers.ArmOutcome.REFUSED_UNSAFE -> {
+                    apkFile.delete()
+                    sendInstallResult(
+                        apkFilename, "fail",
+                        "UNSAFE: power-cycle scheduling failed and a shutdown timer may still be armed " +
+                            "without a paired startup timer; the device may power off until it is manually restarted"
+                    )
+                    return
+                }
+            }
+            val correlationId = UUID.randomUUID().toString()
+            UpdateJournal.markSelfUpdateStarted(this, archive!!.versionCode, correlationId)
+            sendSelfUpdateStarting(correlationId, archive.versionCode, apkFilename)
+            // send() only enqueues; the installer is about to kill this process, so
+            // give the announcement a bounded chance to reach the wire.
+            webSocketManager.awaitOutboundFlush(2_000)
+        } else {
+            UpdateJournal.record(
+                this,
+                UpdateJournal.EVENT_INSTALL_INVOKED,
+                "package=${archive?.packageName ?: "unreadable"} " +
+                    "target_version_code=${archive?.versionCode ?: -1} file=$apkFilename"
+            )
+        }
+
+        Log.i(TAG, "Installing APK: ${apkFile.absolutePath} (self_update=$isSelfUpdate)")
         try {
             binder.pbsControlAPPManger(
                 PBS_PackageControlEnum.PACKAGE_SILENCE_INSTALL,
@@ -308,6 +423,25 @@ class MdmClientService : Service() {
                     override fun callback(result: Int) {
                         val error = if (result == 0) "" else "pbsControlAPPManger returned $result: ${installResultMessage(result)}"
                         Log.i(TAG, "pbsControlAPPManger result: $result for $apkFilename")
+                        // On a self-update this only runs when the install failed, since a
+                        // successful replacement takes the process (and this binder) with it.
+                        UpdateJournal.record(
+                            this@MdmClientService,
+                            UpdateJournal.EVENT_INSTALL_CALLBACK,
+                            "result=$result (${installResultMessage(result)}) self_update=$isSelfUpdate"
+                        )
+                        if (isSelfUpdate) {
+                            // The callback fired at all, which means the installer did NOT
+                            // replace this process — a successful self-replace takes the
+                            // process (and this binder) with it before any callback can run.
+                            // So the process survived and the device must not power-cycle,
+                            // regardless of the result code: disarm unconditionally rather
+                            // than trusting result != 0.
+                            PowerCycleTimers.disarm(
+                                this@MdmClientService,
+                                if (result == 0) "install_callback_survived" else "install_failed"
+                            )
+                        }
                         sendInstallResult(
                             apkFilename,
                             if (result == 0) "success" else "fail",
@@ -322,9 +456,52 @@ class MdmClientService : Service() {
             )
         } catch (e: Exception) {
             apkFile.delete()
+            if (isSelfUpdate) {
+                PowerCycleTimers.disarm(this, "install_failed")
+            }
             throw e
         }
     }
+
+    /**
+     * The client's last words before the installer kills it: tells the server to
+     * treat the coming disconnect as an update in progress, not an outage, and
+     * hands over the correlation id the re-registration will be matched against.
+     */
+    private fun sendSelfUpdateStarting(
+        correlationId: String,
+        targetVersionCode: Long,
+        apkFilename: String,
+    ) {
+        webSocketManager.sendMessage(JSONObject().apply {
+            put("type", "SELF_UPDATE_STARTING")
+            put("correlation_id", correlationId)
+            put("target_version_code", targetVersionCode)
+            put("current_version_code", BuildConfig.VERSION_CODE)
+            put("package_name", packageName)
+            put("apk_filename", apkFilename)
+        })
+    }
+
+    /**
+     * The package name and versionCode declared inside a downloaded APK, or null when the
+     * archive cannot be parsed. Used to recognise an update of our own package before the
+     * installer is invoked.
+     */
+    private fun archiveIdentity(apkFile: File): ArchiveIdentity? {
+        return try {
+            val info = packageManager.getPackageArchiveInfo(apkFile.absolutePath, 0) ?: return null
+            ArchiveIdentity(info.packageName, info.longVersionCode)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to read package info from ${apkFile.absolutePath}", e)
+            null
+        }
+    }
+
+    private data class ArchiveIdentity(
+        val packageName: String,
+        val versionCode: Long
+    )
 
     /**
      * Download a file/folder bundle and apply it to a destination directory.

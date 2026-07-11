@@ -23,7 +23,9 @@ from aiohttp import web
 
 # Bundling and integrity references must agree on what counts as content, or a reference
 # built from a folder could never match the device that folder was pushed to.
-from .integrity import is_os_metadata
+# The hash helpers compute the reference a client checks a downloaded APK against
+# before installing it (#39) — same algorithms as the #37 verify feature.
+from .integrity import apk_cd_digest, file_sha256, is_os_metadata
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,6 +65,44 @@ TRANSFER_TIMEOUT = float(os.environ.get("MDM_TRANSFER_TIMEOUT", "600"))
 # registry and the release path are keyed by task, never by device alone.
 TASK_INSTALL = "install"
 TASK_PUSH = "push"
+
+# Seconds a self-updating client may stay away before the update is declared lost.
+# The client schedules a device power cycle (shutdown at +2 min, startup at +3 min)
+# before killing itself with the install, then boots and re-registers; the window
+# must cover that whole cycle plus boot and reconnect backoff with margin.
+SELF_UPDATE_TIMEOUT = float(os.environ.get("MDM_SELF_UPDATE_TIMEOUT", "480"))
+
+# A device that has re-registered is online and responsive, so the post-update
+# auto-verify should answer within seconds. Bound it anyway: a client that never
+# returns VERIFY_APK_RESULT while staying connected would otherwise pin its entry
+# (and the "verifying" phase) in memory until the next disconnect or update.
+SELF_UPDATE_VERIFY_TIMEOUT = float(os.environ.get("MDM_SELF_UPDATE_VERIFY_TIMEOUT", "120"))
+
+# device_id -> in-flight client self-update, created when the device announces
+# SELF_UPDATE_STARTING right before killing itself with the install:
+#   {phase: "updating"|"verifying", correlation_id, target_version_code,
+#    apk_filename, package_name, expected_full_sha256, expected_cd_sha256,
+#    started_at, timeout_task}
+# Deliberately in-memory: if the server restarts mid-update the device still
+# recovers on its own (the power cycle is device-side) and simply re-registers
+# through the no-pending path; only the "updating" label and the result report
+# are lost.
+pending_self_updates: dict[str, dict] = {}
+
+# device_id -> {apk_filename, full_sha256, cd_sha256} captured when EXECUTE_INSTALL
+# is dispatched to that device. A self-update announced later (SELF_UPDATE_STARTING)
+# verifies against these dispatched bytes rather than re-hashing whatever the
+# client-echoed filename now points at: a same-name re-upload between dispatch and
+# announcement — or an empty/wrong echo — would otherwise shift the verify
+# reference off the file we actually told the device to install. Overwritten on the
+# next dispatch to the device and evicted on disconnect, so it holds at most one
+# entry per device. Hashes are None when the dispatched APK was not a local upload.
+last_install_dispatch: dict[str, dict] = {}
+
+# (path, size, mtime_ns) -> {"full_sha256", "cd_sha256"} for uploaded APKs, so a
+# fan-out to N devices hashes the file once, not N times. Keyed on stat identity:
+# replacing the file invalidates naturally.
+_apk_hash_cache: dict[tuple[str, int, int], dict] = {}
 
 # Generated file/folder bundles (for the push-files sync feature) live alongside the APKs.
 # The console uploads a file or folder; the server zips it into BUNDLE_DIR and serves it to
@@ -137,6 +177,8 @@ def _coerce_record(value) -> dict | None:
             "last_seen": None,
             "startup_app": None,
             "battery": None,
+            "version_code": None,
+            "version_name": "",
         }
     if isinstance(value, dict):
         label = value.get("label", "")
@@ -145,6 +187,10 @@ def _coerce_record(value) -> dict | None:
         last_seen = value.get("last_seen")
         startup_app = value.get("startup_app")
         battery = _coerce_battery(value.get("battery"))
+        version_code = value.get("version_code")
+        if isinstance(version_code, bool) or not isinstance(version_code, int):
+            version_code = None
+        version_name = value.get("version_name")
         return {
             "label": label.strip() if isinstance(label, str) else "",
             "model": model if isinstance(model, str) else "",
@@ -152,6 +198,8 @@ def _coerce_record(value) -> dict | None:
             "last_seen": last_seen if isinstance(last_seen, (int, float)) else None,
             "startup_app": startup_app if isinstance(startup_app, dict) else None,
             "battery": battery,
+            "version_code": version_code,
+            "version_name": version_name if isinstance(version_name, str) else "",
         }
     return None
 
@@ -288,21 +336,34 @@ def build_device_list_msg() -> str:
             "startup_app": d.get("startup_app"),
             "battery": d.get("battery"),
             "last_seen": device_registry.get(d["device_id"], {}).get("last_seen"),
+            "version_code": d.get("version_code"),
+            "version_name": d.get("version_name", ""),
         }
         for d in devices.values()
     ]
     for serial, rec in device_registry.items():
         if serial in devices:
             continue
+        # A device that killed itself for a self-update is expected back within
+        # minutes; label it "updating" rather than "offline" until it re-registers
+        # or the update times out.
+        pend = pending_self_updates.get(serial)
+        status = (
+            "updating"
+            if pend is not None and pend.get("phase") == "updating"
+            else "offline"
+        )
         device_list.append({
             "device_id": serial,
             "label": rec.get("label", ""),
             "model": rec.get("model", ""),
             "ip": rec.get("ip", ""),
-            "status": "offline",
+            "status": status,
             "startup_app": rec.get("startup_app"),
             "battery": rec.get("battery"),
             "last_seen": rec.get("last_seen"),
+            "version_code": rec.get("version_code"),
+            "version_name": rec.get("version_name", ""),
         })
     device_list.sort(
         key=lambda e: (e["label"] == "", (e["label"] or e["device_id"]).lower())
@@ -431,7 +492,10 @@ async def broadcast_install_state(
 
     States: queued -> transferring -> installing -> (INSTALL_RESULT: success/fail),
     with fail also emitted here for devices that never reach a client at all
-    (offline before their turn, failed dispatch, transfer timeout).
+    (offline before their turn, failed dispatch, transfer timeout). A client
+    *self*-update adds updating (announced by SELF_UPDATE_STARTING, spanning the
+    device's kill-and-power-cycle window) with success/fail emitted here when the
+    device re-registers or the update times out.
     """
     if not device_ids:
         return
@@ -473,6 +537,208 @@ async def broadcast_push_state(
     })
 
 
+async def _self_update_timeout(device_id: str, correlation_id: str) -> None:
+    """Give up on a self-update whose device never re-registered.
+
+    The client schedules a device power cycle before killing itself, so in every
+    survivable outcome the device comes back with *some* version within a few
+    minutes. A device still away after SELF_UPDATE_TIMEOUT is genuinely lost
+    (powered off, boot loop, network gone): report a terminal result and let the
+    row fall back to offline rather than showing "updating" forever.
+    """
+    # Cancellation (the device re-registered or the install failed) propagates:
+    # swallowing it would make the task look "finished" instead of cancelled.
+    await asyncio.sleep(SELF_UPDATE_TIMEOUT)
+    entry = pending_self_updates.get(device_id)
+    if (
+        entry is None
+        or entry.get("correlation_id") != correlation_id
+        or entry.get("phase") != "updating"
+    ):
+        return
+    del pending_self_updates[device_id]
+    log.warning("Self-update timed out for %s (%s)", device_id, correlation_id)
+    await forward_to_admins({
+        "type": "SELF_UPDATE_RESULT",
+        "device_id": device_id,
+        "correlation_id": correlation_id,
+        "status": "timeout",
+        "version_code": None,
+        "target_version_code": entry["target_version_code"],
+        "detail": f"device did not re-register within {int(SELF_UPDATE_TIMEOUT)}s",
+    })
+    await broadcast_install_state(
+        [device_id], "fail", entry["apk_filename"], "self-update timed out",
+    )
+    await broadcast_device_list()
+
+
+async def _self_update_verify_timeout(device_id: str, correlation_id: str) -> None:
+    """Close out a self-update stuck awaiting its auto-verify answer.
+
+    The device already re-registered (the update itself reported success), but never
+    returned the VERIFY_APK_RESULT for the server-initiated check. Report the
+    verification as errored and drop the entry rather than leaving it "verifying"
+    forever. Cancelled the moment the answer or a disconnect arrives.
+    """
+    await asyncio.sleep(SELF_UPDATE_VERIFY_TIMEOUT)
+    entry = pending_self_updates.get(device_id)
+    if (
+        entry is None
+        or entry.get("correlation_id") != correlation_id
+        or entry.get("phase") != "verifying"
+    ):
+        return
+    del pending_self_updates[device_id]
+    log.warning("Self-update verify timed out for %s (%s)", device_id, correlation_id)
+    await forward_to_admins({
+        "type": "SELF_UPDATE_VERIFIED",
+        "device_id": device_id,
+        "correlation_id": correlation_id,
+        "status": "error",
+        "detail": f"device did not answer the verify command within {int(SELF_UPDATE_VERIFY_TIMEOUT)}s",
+    })
+
+
+async def _resolve_pending_self_update(
+    device_id: str, ws: web.WebSocketResponse, version_code: int | None,
+) -> None:
+    """Settle an in-flight self-update when its device re-registers.
+
+    Success means the device came back running at least the target versionCode.
+    On success, when reference hashes exist, the update is additionally closed
+    out with an automatic EXECUTE_VERIFY_APK against the client's own package;
+    the answering VERIFY_APK_RESULT is consumed by _consume_self_update_verify.
+    """
+    entry = pending_self_updates.get(device_id)
+    if entry is None or entry.get("phase") != "updating":
+        return
+    timeout_task = entry.get("timeout_task")
+    if timeout_task is not None:
+        timeout_task.cancel()
+    target = entry["target_version_code"]
+    success = version_code is not None and version_code >= target
+    if success:
+        detail = f"re-registered with version_code {version_code}"
+    elif version_code is None:
+        detail = "client reported no version_code"
+    else:
+        detail = f"re-registered with version_code {version_code}, expected >= {target}"
+    log.info("Self-update %s for %s: %s",
+             "succeeded" if success else "failed", device_id, detail)
+    await forward_to_admins({
+        "type": "SELF_UPDATE_RESULT",
+        "device_id": device_id,
+        "correlation_id": entry["correlation_id"],
+        "status": "success" if success else "fail",
+        "version_code": version_code,
+        "target_version_code": target,
+        "detail": detail,
+    })
+    await broadcast_install_state(
+        [device_id], "success" if success else "fail", entry["apk_filename"], detail,
+    )
+    if not success:
+        del pending_self_updates[device_id]
+        return
+    if entry.get("expected_full_sha256") and entry.get("package_name"):
+        entry["phase"] = "verifying"
+        entry["timeout_task"] = None
+        try:
+            await ws.send_str(json.dumps({
+                "type": "EXECUTE_VERIFY_APK",
+                "package_name": entry["package_name"],
+            }))
+        except Exception as e:
+            del pending_self_updates[device_id]
+            await forward_to_admins({
+                "type": "SELF_UPDATE_VERIFIED",
+                "device_id": device_id,
+                "correlation_id": entry["correlation_id"],
+                "status": "error",
+                "detail": f"could not send the verify command: {e}",
+            })
+        else:
+            # Only once the command is on the wire: bound the wait for its answer so
+            # a silent client cannot pin the entry in the "verifying" phase forever.
+            entry["timeout_task"] = asyncio.create_task(
+                _self_update_verify_timeout(device_id, entry["correlation_id"])
+            )
+    else:
+        del pending_self_updates[device_id]
+        await forward_to_admins({
+            "type": "SELF_UPDATE_VERIFIED",
+            "device_id": device_id,
+            "correlation_id": entry["correlation_id"],
+            "status": "skipped",
+            "detail": "no reference hashes for the installed APK",
+        })
+
+
+async def _consume_self_update_verify(device_id: str, data: dict) -> bool:
+    """Absorb the VERIFY_APK_RESULT that answers a self-update auto-verify.
+
+    Returns True when the message was consumed. It must NOT be forwarded raw:
+    the console classifies a VERIFY_APK_RESULT against the reference the admin
+    picked in the browser, and for this server-initiated check there is none —
+    the row would flip to "✗ error (no local reference)". The comparison happens
+    here instead, and only the outcome goes to admins.
+    """
+    entry = pending_self_updates.get(device_id)
+    if entry is None or entry.get("phase") != "verifying":
+        return False
+    if data.get("package_name") != entry.get("package_name"):
+        return False
+    timeout_task = entry.get("timeout_task")
+    if timeout_task is not None:
+        timeout_task.cancel()
+    del pending_self_updates[device_id]
+    expected = entry.get("expected_full_sha256") or ""
+    got = data.get("full_sha256")
+    if not data.get("found"):
+        status, detail = "error", "package not found after the update"
+    elif not isinstance(got, str) or not got:
+        status, detail = "error", "device reported no full_sha256"
+    elif got.lower() == expected.lower():
+        status = "verified"
+        detail = f"installed APK matches the dispatched file (full_sha256 {expected[:12]}…)"
+    else:
+        status = "mismatch"
+        detail = (
+            f"installed full_sha256 {got[:12]}… does not match "
+            f"dispatched {expected[:12]}…"
+        )
+    log.info("Self-update verification for %s: %s (%s)", device_id, status, detail)
+    await forward_to_admins({
+        "type": "SELF_UPDATE_VERIFIED",
+        "device_id": device_id,
+        "correlation_id": entry["correlation_id"],
+        "status": status,
+        "detail": detail,
+    })
+    return True
+
+
+def _clear_pending_self_update_on_install_result(device_id: str) -> None:
+    """Drop a pending self-update when its device reports INSTALL_RESULT.
+
+    A *successful* self-update never produces one — the process is killed before
+    the callback can fire — so an INSTALL_RESULT while phase is "updating" means
+    the install failed on-device after SELF_UPDATE_STARTING was sent (e.g. the
+    installer returned an error and the client cancelled its power cycle). The
+    forwarded INSTALL_RESULT is the console's terminal state; the pending entry
+    must not linger and fire a spurious timeout.
+    """
+    entry = pending_self_updates.get(device_id)
+    if entry is None or entry.get("phase") != "updating":
+        return
+    timeout_task = entry.get("timeout_task")
+    if timeout_task is not None:
+        timeout_task.cancel()
+    del pending_self_updates[device_id]
+    log.info("Self-update cancelled by INSTALL_RESULT from %s", device_id)
+
+
 def resolve_target_ids(target_devices: list[str]) -> list[str]:
     """Return online device IDs matching a target list, or all devices for ["*"]."""
     if not target_devices or target_devices == ["*"]:
@@ -491,6 +757,48 @@ def sanitize_apk_filename(filename: str | None) -> str | None:
     if safe_name in {"", ".apk"}:
         return None
     return safe_name
+
+
+def _compute_apk_hashes(path: Path) -> dict:
+    """Blocking hash pass over an APK file; run in an executor."""
+    return {
+        "full_sha256": file_sha256(str(path)),
+        "cd_sha256": apk_cd_digest(str(path))[1],
+    }
+
+
+async def apk_hashes_for(apk_filename: str) -> dict | None:
+    """Reference hashes for an uploaded APK, or None when it cannot be hashed.
+
+    None covers: an invalid/traversal filename, a file that is not in APK_DIR
+    (e.g. the admin pointed apk_url somewhere else), or a file that fails to
+    parse as a ZIP. EXECUTE_INSTALL then simply omits the hash fields — a normal
+    install proceeds unverified as before, while a client refuses a *self*-update
+    without them (a bad self-update bricks the client, so it never installs
+    unverified bytes over itself).
+    """
+    safe = sanitize_apk_filename(apk_filename)
+    if safe is None:
+        return None
+    path = APK_DIR / safe
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (str(path), st.st_size, st.st_mtime_ns)
+    cached = _apk_hash_cache.get(key)
+    if cached is not None:
+        return cached
+    loop = asyncio.get_running_loop()
+    try:
+        hashes = await loop.run_in_executor(None, _compute_apk_hashes, path)
+    except (OSError, ValueError) as e:
+        log.warning("Could not hash %s for install verification: %s", safe, e)
+        return None
+    if len(_apk_hash_cache) >= 16:
+        _apk_hash_cache.clear()
+    _apk_hash_cache[key] = hashes
+    return hashes
 
 
 def unique_apk_path(filename: str) -> Path:
@@ -680,6 +988,12 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     model = data.get("model", "unknown")
                     ip = data.get("ip", request.remote or "unknown")
                     startup_app = data.get("startup_app")
+                    version_code = data.get("version_code")
+                    if isinstance(version_code, bool) or not isinstance(version_code, int):
+                        version_code = None
+                    version_name = data.get("version_name")
+                    if not isinstance(version_name, str):
+                        version_name = ""
                     prev = device_registry.get(device_id, {})
                     devices[device_id] = {
                         "ws": ws,
@@ -689,6 +1003,8 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "status": "online",
                         "startup_app": startup_app,
                         "battery": prev.get("battery"),
+                        "version_code": version_code,
+                        "version_name": version_name,
                     }
                     # Remember the device persistently so it stays in the list while
                     # offline; preserve any previously assigned label.
@@ -699,9 +1015,18 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "last_seen": time.time(),
                         "startup_app": startup_app,
                         "battery": prev.get("battery"),
+                        "version_code": version_code,
+                        "version_name": version_name,
                     }
                     save_registry()
-                    log.info("Device registered: %s (%s)", device_id, model)
+                    log.info(
+                        "Device registered: %s (%s, client v%s)",
+                        device_id, model, version_code if version_code is not None else "?",
+                    )
+                    # A re-registration is also how a self-updated client reports
+                    # back for duty: settle any pending update before the list
+                    # broadcast so admins see the result, then the row transition.
+                    await _resolve_pending_self_update(device_id, ws, version_code)
                     await broadcast_device_list()
 
                 elif msg_type == "BATTERY_UPDATE":
@@ -768,6 +1093,70 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     else:
                         log.warning("DOWNLOAD_COMPLETE before REGISTER")
 
+                elif msg_type == "SELF_UPDATE_STARTING":
+                    # The client's last words before killing itself with the
+                    # install: remember the update so the coming disconnect reads
+                    # as "updating" rather than "offline", and so the re-register
+                    # can be matched back by correlation id.
+                    if not device_id:
+                        log.warning("SELF_UPDATE_STARTING before REGISTER")
+                        continue
+                    correlation_id = data.get("correlation_id")
+                    target_vc = data.get("target_version_code")
+                    if (
+                        not isinstance(correlation_id, str) or not correlation_id
+                        or isinstance(target_vc, bool) or not isinstance(target_vc, int)
+                    ):
+                        log.warning(
+                            "Malformed SELF_UPDATE_STARTING from %s: %s",
+                            device_id, raw_msg.data[:200],
+                        )
+                        continue
+                    apk_filename = data.get("apk_filename", "")
+                    prev_pend = pending_self_updates.get(device_id)
+                    if prev_pend is not None and prev_pend.get("timeout_task"):
+                        prev_pend["timeout_task"].cancel()
+                    # Prefer the hashes captured when EXECUTE_INSTALL was dispatched
+                    # to this device: they pin the verify reference to the bytes we
+                    # actually sent, immune to a same-name re-upload or a wrong/empty
+                    # echo. Fall back to hashing the echoed filename only when there
+                    # is no dispatch record (e.g. the server restarted mid-update).
+                    dispatched = last_install_dispatch.get(device_id)
+                    if dispatched is not None:
+                        if apk_filename and apk_filename != dispatched.get("apk_filename"):
+                            log.warning(
+                                "SELF_UPDATE_STARTING from %s echoed apk_filename %r but "
+                                "last dispatch was %r; verifying against the dispatched file",
+                                device_id, apk_filename, dispatched.get("apk_filename"),
+                            )
+                        expected = {
+                            "full_sha256": dispatched.get("full_sha256"),
+                            "cd_sha256": dispatched.get("cd_sha256"),
+                        }
+                    else:
+                        expected = await apk_hashes_for(apk_filename) or {}
+                    entry = {
+                        "phase": "updating",
+                        "correlation_id": correlation_id,
+                        "target_version_code": target_vc,
+                        "apk_filename": apk_filename,
+                        "package_name": data.get("package_name", ""),
+                        "expected_full_sha256": expected.get("full_sha256"),
+                        "expected_cd_sha256": expected.get("cd_sha256"),
+                        "started_at": time.time(),
+                        # The entry holds the only strong reference to its task.
+                        "timeout_task": None,
+                    }
+                    pending_self_updates[device_id] = entry
+                    entry["timeout_task"] = asyncio.create_task(
+                        _self_update_timeout(device_id, correlation_id)
+                    )
+                    log.info(
+                        "Self-update starting on %s: -> version_code %s (%s)",
+                        device_id, target_vc, correlation_id,
+                    )
+                    await broadcast_install_state([device_id], "updating", apk_filename)
+
                 elif msg_type in {
                     "LAUNCH_RESULT",
                     "INSTALL_RESULT",
@@ -784,8 +1173,12 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     # ever frees its own job's slot.
                     if device_id and msg_type == "INSTALL_RESULT":
                         release_transfer_slot(device_id, "install_result", task=TASK_INSTALL)
+                        _clear_pending_self_update_on_install_result(device_id)
                     elif device_id and msg_type == "PUSH_FILES_RESULT":
                         release_transfer_slot(device_id, "push_files_result", task=TASK_PUSH)
+                    elif device_id and msg_type == "VERIFY_APK_RESULT":
+                        if await _consume_self_update_verify(device_id, data):
+                            continue
                     log.info("%s from %s: %s", msg_type, device_id, data.get("status"))
                     await forward_to_admins(data)
 
@@ -804,6 +1197,27 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
             # an install and a push at once — so a disconnect mid-job does not stall
             # the queue until the timeout fires.
             release_transfer_slot(device_id, "disconnect")
+            # The dispatch record only bridges dispatch -> SELF_UPDATE_STARTING; by a
+            # disconnect that announcement has already copied what it needed, so drop
+            # it rather than let it linger until the next install overwrites it.
+            last_install_dispatch.pop(device_id, None)
+            # A disconnect during a pending self-update is the *expected* kill-and-
+            # power-cycle, so the entry survives and the list broadcast below renders
+            # the row as "updating". A disconnect during the post-update verification
+            # phase, however, means the answer will never arrive: close it out.
+            pend = pending_self_updates.get(device_id)
+            if pend is not None and pend.get("phase") == "verifying":
+                verify_timeout = pend.get("timeout_task")
+                if verify_timeout is not None:
+                    verify_timeout.cancel()
+                del pending_self_updates[device_id]
+                await forward_to_admins({
+                    "type": "SELF_UPDATE_VERIFIED",
+                    "device_id": device_id,
+                    "correlation_id": pend["correlation_id"],
+                    "status": "error",
+                    "detail": "device disconnected before verification completed",
+                })
         if device_id and device_id in devices:
             del devices[device_id]
             # Keep the registry entry; just stop reporting the device as online and
@@ -1303,11 +1717,18 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
     loop = asyncio.get_running_loop()
     sem = transfer_slots()
 
-    execute_msg = json.dumps({
+    execute_payload = {
         "type": "EXECUTE_INSTALL",
         "apk_url": apk_url,
         "apk_filename": apk_filename,
-    })
+    }
+    # Reference hashes of the file being dispatched, so the client can verify the
+    # download before invoking the installer (#39). Hashed once per job, not per
+    # device. Absent when the APK is not a local upload — see apk_hashes_for.
+    hashes = await apk_hashes_for(apk_filename)
+    if hashes:
+        execute_payload.update(hashes)
+    execute_msg = json.dumps(execute_payload)
 
     # Job-local progress counters. The invariant
     #   total == queued + transferring + transferred + failed
@@ -1352,6 +1773,14 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
                 log.warning("Failed to send EXECUTE_INSTALL to %s: %s", device_id, e)
                 await fail_one(device_id, "Failed to send the install command")
                 return
+
+            # Remember exactly what we dispatched, so a self-update this device may
+            # announce next verifies against these bytes (see last_install_dispatch).
+            last_install_dispatch[device_id] = {
+                "apk_filename": apk_filename,
+                "full_sha256": (hashes or {}).get("full_sha256"),
+                "cd_sha256": (hashes or {}).get("cd_sha256"),
+            }
 
             counts["transferring"] += 1
             key = (device_id, TASK_INSTALL)

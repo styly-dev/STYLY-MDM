@@ -35,6 +35,13 @@ Usage: `./build.sh [debug|release] [prod|dev]` (defaults: `debug prod`).
 The generated APK is output to `mdm-client/app/build/outputs/apk/<flavor>/<type>/`,
 e.g. `apk/prod/debug/app-prod-debug.apk` or `apk/dev/debug/app-dev-debug.apk`.
 
+Gradle properties, for self-update testing (see [Client Self-Update](#client-self-update)):
+
+| Property | Default | Purpose |
+|---|---|---|
+| `-PversionCodeOverride=N` | `versionCode` in `app/build.gradle` | Push a strictly-increasing `versionCode` without editing the file |
+| `-PversionNameOverride=S` | `versionName` in `app/build.gradle` | Label a one-off build |
+
 ### Build from Android Studio
 
 1. Open the `mdm-client/` directory in Android Studio.
@@ -154,9 +161,15 @@ STYLY-MDM/
             ├── MdmClientApplication.kt   # Application entry point
             ├── MdmClientService.kt       # Foreground service; executes launch commands
             ├── WebSocketManager.kt       # WebSocket connection with auto-reconnect
-            ├── SettingsActivity.kt       # UI to configure server URL
+            ├── SettingsActivity.kt       # UI to configure server URL; Update Journal viewer
             ├── ServerDiscovery.kt        # UDP broadcast server discovery
-            └── BootReceiver.kt           # Auto-start on device boot
+            ├── BundleSync.kt             # Push/sync a file bundle into a device directory
+            ├── UpdateJournal.kt          # Persistent event log; survives a self-update kill
+            ├── UpdateJournalCodec.kt     # Journal serialization (unit-tested on the host JVM)
+            ├── InstallPolicy.kt          # Hash gate for downloaded APKs (host-JVM tested)
+            ├── PowerCycleSchedule.kt     # Shutdown/startup times for a self-update (host-JVM tested)
+            ├── PowerCycleTimers.kt       # Arms/disarms the PICO timing APIs around a self-update
+            └── BootReceiver.kt           # Auto-start on device boot; the self-update recovery path
 ```
 
 ## WebSocket Protocol Reference
@@ -165,7 +178,7 @@ STYLY-MDM/
 
 | Message type | Description |
 |---|---|
-| `REGISTER` | Sent on connect. Fields: `device_id`, `model`, `ip`, `startup_app` (optional) |
+| `REGISTER` | Sent on connect. Fields: `device_id`, `model`, `ip`, `version_code` (integer), `version_name`, `startup_app` (optional) |
 | `BATTERY_UPDATE` | Battery telemetry. Fields: `device_id`, `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds) |
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
@@ -173,13 +186,14 @@ STYLY-MDM/
 | `PUSH_FILES_RESULT` | Result of a push or sync. Fields: `status` (`success`/`fail`), `dest_path`, `added`, `updated`, `deleted` (counts; `deleted` is always 0 for a push), `error` (optional) |
 | `VERIFY_APK_RESULT` | Result of an APK integrity check. Fields: `package_name`, `found` (boolean), `size`, `cd_sha256`, `full_sha256`, `version_code`, `version_name`, `signer_sha256`, `error` (optional). Absent hash/version fields when `found` is false. |
 | `VERIFY_DIR_RESULT` | Result of a directory integrity check. Fields: `path`, `found` (boolean), `tree_hash`, `file_count`, `total_size`, `manifest` (optional array of `{relative_path, size, sha256}`, omitted above a cap), `error` (optional) |
+| `SELF_UPDATE_STARTING` | The client's last words before the silent installer kills its process for a self-update: tells the server to treat the coming disconnect as `updating`, not `offline`. Fields: `correlation_id`, `target_version_code`, `current_version_code`, `package_name`, `apk_filename`. See [Client Self-Update](#client-self-update). |
 
 ### Server → Device
 
 | Message type | Description |
 |---|---|
 | `EXECUTE_LAUNCH` | Launch an app. Fields: `package_name`, `extra` |
-| `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename` |
+| `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename`, plus `full_sha256` + `cd_sha256` (reference hashes of the file being dispatched; present only when the APK is a local upload in `apks/`). The client verifies the download against `full_sha256` before installing; a **self**-update is refused outright when the hashes are absent. |
 | `EXECUTE_PUSH_FILES` | Download a bundle and apply it to a directory. Fields: `bundle_url`, `bundle_filename`, `dest_path`, `delete_extras` (boolean; `false` = copy/overwrite only, `true` = full mirror. Read with a `false` default — a missing field must never delete) |
 | `EXECUTE_VERIFY_APK` | Compute `size` + Central-Directory digest (plus diagnostics) for an installed package. Fields: `package_name` |
 | `EXECUTE_VERIFY_DIR` | Compute a manifest + tree hash for a device directory (shared storage only). Fields: `path` |
@@ -213,11 +227,11 @@ STYLY-MDM/
 
 | Message type | Description |
 |---|---|
-| `DEVICE_LIST` | Current list of connected devices. Fields: `devices` (array; each device may include optional `battery`: `{level, charging, last_seen}`) |
+| `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — the latter while a self-update's power cycle is in flight), `version_code` / `version_name` (the client build, when known), and may include optional `battery`: `{level, charging, last_seen}`) |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
 | `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |
-| `INSTALL_DEVICE_STATE` | Per-device companion to `INSTALL_PROGRESS`: names the devices that just entered a state, so the console can label each row instead of showing the whole target set as installing. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `installing` / `fail`), `apk_filename`, `detail` (failure reason, may be empty) |
+| `INSTALL_DEVICE_STATE` | Per-device companion to `INSTALL_PROGRESS`: names the devices that just entered a state, so the console can label each row instead of showing the whole target set as installing. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `installing` / `updating` / `success` / `fail`; `updating` and its terminal `success`/`fail` are emitted only for a client self-update), `apk_filename`, `detail` (failure reason, may be empty) |
 | `PUSH_FILES_SENT` | Confirmation that a push/sync job was accepted (dispatch is throttled and runs in the background). Fields: `bundle_filename`, `dest_path`, `delete_extras`, `target_count`, `max_concurrent` |
 | `PUSH_PROGRESS` | The `INSTALL_PROGRESS` twin for a push/sync job. Fields: `bundle_filename`, `dest_path`, `delete_extras`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` |
 | `PUSH_DEVICE_STATE` | The `INSTALL_DEVICE_STATE` twin. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `applying` / `fail`), `dest_path`, `delete_extras` (so the console can name the action), `detail` |
@@ -226,7 +240,9 @@ STYLY-MDM/
 | `INSTALL_RESULT` | Forwarded install result from a device |
 | `VERIFY_SENT` | Confirmation that verify-APK commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `VERIFY_DIR_SENT` | Confirmation that verify-directory commands were dispatched. Fields: `path`, `sent_count`, `target_count` |
-| `VERIFY_APK_RESULT` / `VERIFY_DIR_RESULT` | Forwarded integrity result from a device (stamped with `device_id`). The console compares it against the local reference. |
+| `VERIFY_APK_RESULT` / `VERIFY_DIR_RESULT` | Forwarded integrity result from a device (stamped with `device_id`). The console compares it against the local reference. Exception: the `VERIFY_APK_RESULT` answering a self-update auto-verify is consumed by the server (which holds the reference) and surfaces as `SELF_UPDATE_VERIFIED` instead. |
+| `SELF_UPDATE_RESULT` | Outcome of a client self-update, settled when the device re-registers (or the window expires). Fields: `device_id`, `correlation_id`, `status` (`success` / `fail` / `timeout`), `version_code` (what the device came back with; `null` on timeout), `target_version_code`, `detail` |
+| `SELF_UPDATE_VERIFIED` | Outcome of the automatic post-update `EXECUTE_VERIFY_APK` the server runs against the client's own package. Fields: `device_id`, `correlation_id`, `status` (`verified` / `mismatch` / `skipped` / `error`), `detail` |
 | `GROUP_LIST` | Current device groups. Fields: `groups` (object mapping group name → array of member serials). The console derives each device's group membership from this; sent on connect and after any group change. |
 | `GROUP_CREATED` / `GROUP_RENAMED` / `GROUP_DELETED` | Acknowledgements for group create / rename / delete. |
 | `DEVICE_GROUPS_SET` | Acknowledgement of a device's group membership change. Fields: `device_id`, `groups` |
@@ -508,6 +524,116 @@ tree (which may differ from the server host):
 styly-mdm hash ./content            # directory -> {tree_hash, file_count, total_size, excluded_count, manifest}
 styly-mdm hash ./app-release.apk    # APK       -> {size, cd_sha256}
 ```
+
+## Client Self-Update
+
+Installing an APK whose package is `com.styly.mdmclient` makes the client replace *itself*.
+Android kills the process during package replacement, so the `IIntCallback` that normally
+reports the install result dies with the binder: on success it never fires and the WebSocket
+simply drops. The #39 device spike measured what happens next on PICO (A9210 / PUI 5.15.5 /
+Android 14): **nothing restarts the client** — `pbsAppKeepAlive` does not survive the
+replacement and `MY_PACKAGE_REPLACED` is never delivered, even to an enabled receiver of a
+non-stopped package. A device reboot, however, recovers fully unattended: `BootReceiver`
+gets both `com.pvr.tobservice.SERVICE_AUTO_BOOT` and `BOOT_COMPLETED`.
+
+The self-update flow is built on those two facts:
+
+1. **Hash gate.** `EXECUTE_INSTALL` carries `full_sha256`/`cd_sha256` of the file the
+   server is dispatching (computed once per job from the upload in `apks/`). After the
+   download, the client compares `full_sha256` (`InstallPolicy.hashGateError`) and refuses
+   on mismatch. A *self*-update is refused outright when the server sent no hashes — a bad
+   client build costs remote control of the device and Android offers no rollback.
+2. **Arm the power cycle.** `PowerCycleTimers.arm` schedules a one-shot shutdown at
+   now+2 min and startup at now+3 min via the PICO timing APIs
+   (`IToBServiceProxy.openTimingShutdown` / `openTimingStartup`, absolute
+   `(year, month-1-based, day, hour, minute)`; computed by `PowerCycleSchedule`, which is
+   unit-tested for the 0- vs 1-based month and date rollovers). If scheduling fails, the
+   self-update is refused — installing with no way back would strand the device. The armed
+   state is persisted so the replacement build knows to disarm. A *partial* failure (a
+   shutdown timer that opened while its paired startup did not) is the dangerous case: it
+   would power the device off with no scheduled return, and the disarm retry only runs at the
+   next process start, which a powered-off device never reaches. So `arm` does not simply
+   return on a partial failure — it closes both timers in-process with a bounded retry
+   (`resolvePartialArm`, unit-tested), and only reports the refusal as *safe* once the
+   shutdown timer is confirmed closed. If it cannot be, `arm` returns `REFUSED_UNSAFE` and the
+   client sends an `INSTALL_RESULT` fail whose detail flags the unsafe state, so a reachable
+   device surfaces it to the console rather than silently treating the refused install as
+   enough recovery. (No client code can force an unresponsive timing API to close, so a
+   persistent failure is surfaced, not eliminated.)
+3. **Announce, then install.** The client persists the update marker (target
+   `versionCode` + correlation id), sends `SELF_UPDATE_STARTING`, waits for the outbound
+   queue to flush (OkHttp `send()` only enqueues), and invokes the silent installer. The
+   process dies; the install commits ~30 s later.
+4. **Server-side `updating`.** The server records the pending update; the disconnect
+   renders the device as `updating` (not `offline`) in `DEVICE_LIST`, and the install cell
+   shows `Updating…` via `INSTALL_DEVICE_STATE`. If the device does not re-register within
+   `MDM_SELF_UPDATE_TIMEOUT` (default 480 s), the update is reported as `timeout` and the
+   row falls back to offline.
+5. **Reboot recovery.** The power cycle fires; the new build boots, disarms the timers and
+   deletes the leftover APK from `Downloads/styly-mdm/` (`MdmClientApplication`, once the
+   ToBService binder binds), reconnects, and re-registers with its `version_code`. Disarm is
+   treated as done only when both `closeTiming*` calls confirm success — neither throwing nor
+   returning a non-zero code (they are `int`-returning APIs). Any unconfirmed close keeps the
+   persisted armed flag set so the next process start retries, rather than retiring a shutdown
+   timer that may still be live; after `MAX_DISARM_ATTEMPTS` (3) starts the flag is retired
+   anyway, so a past-due one-shot timer that can no longer be closed does not loop the
+   recovery on every boot (`POWER_CYCLE_CLOSED` records `cleared` / `retry_pending` / `gave_up`).
+6. **Result + auto-verify.** The server settles the update by comparing the re-registered
+   `version_code` against the target (`SELF_UPDATE_RESULT`, carrying the correlation id),
+   then runs `EXECUTE_VERIFY_APK` against the client's own package and compares the
+   reported hash with its reference, broadcasting `SELF_UPDATE_VERIFIED`. The reference is
+   pinned to the hashes captured when `EXECUTE_INSTALL` was dispatched to that device
+   (`last_install_dispatch`), not a re-hash of the client-echoed filename, so a same-name
+   re-upload — or a wrong/empty echo — between dispatch and announcement cannot shift the
+   verify reference off the bytes the device actually installed. That answering
+   `VERIFY_APK_RESULT` is consumed server-side, never forwarded — the console would
+   otherwise classify it against a browser-local reference that does not exist. The
+   re-registered device is online and responsive, so this wait is bounded by
+   `MDM_SELF_UPDATE_VERIFY_TIMEOUT` (default 120 s): a client that never answers is
+   reported as a verify `error` rather than pinning the entry in the `verifying` phase.
+
+On **install failure** the process survives and the `IIntCallback` fires: the client
+disarms the timers and sends the usual `INSTALL_RESULT` fail, which also clears the
+server's pending state. Because the callback firing at all proves the process was *not*
+replaced, the client disarms regardless of the result code, not only on a non-zero one.
+The scheduled reboot doubles as the timeout recovery — if the install is invoked and
+nothing happens, the device still power-cycles and whichever build is installed comes
+back online.
+
+### Deployment invariants
+
+- **Deploy the server before pushing a new client.** A client refuses to self-update
+  without server-supplied hashes, so an old server cannot push the new client onto devices.
+- **The first rollout is manual.** Clients older than this feature (≤ v6) have no recovery
+  path: self-updating them still strands the device until a manual reboot. Plan one
+  cable/attended update per device to cross onto the new client.
+- **Only local uploads are verified.** An `apk_url` outside the server's `apks/` directory
+  yields no hashes: normal installs proceed unverified (as before), self-updates refuse.
+- **A server restart mid-update loses only the reporting.** The pending state is in-memory;
+  the device still recovers on its own (the power cycle is device-side) and re-registers as
+  a normal client. The `updating` label and the `SELF_UPDATE_RESULT` are the only casualties.
+
+### The update journal
+
+`UpdateJournal` is a persistent event log in `stylymdm_prefs`, and the only post-mortem that
+survives the process being killed. It is written with `commit()` rather than `apply()`,
+because `apply()`'s background writer thread does not survive package replacement.
+`MdmClientService.installApk` records the target `versionCode` and a correlation id *before*
+invoking the silent installer, so the replacement process can tell "I was updated" apart from
+"I crashed and restarted".
+
+The journal is readable in the headset under **Settings → Update Journal**, so diagnosing a
+failed update does not require adb. Serialization lives in `UpdateJournalCodec` (one
+tab-separated event per line) and is unit-tested on the host JVM. The events around a
+self-update: `INSTALL_REFUSED` (hash gate), `POWER_CYCLE_SCHEDULED` (with the PICO timing
+API read-back strings), `SELF_INSTALL_INVOKED`, then — in the replacement process —
+`APP_ONCREATE`, `SELF_UPDATE_CONFIRMED`, and `POWER_CYCLE_CLOSED reason=recovery`.
+`POWER_CYCLE_CLOSED reason=install_failed|schedule_failed` mark the failure paths.
+
+When testing, note that a debug-signed APK cannot replace a release-signed install (silent
+install fails with `106 Package conflict`), that the `prod` and `dev` flavors share
+`applicationId` and therefore replace each other, and that `versionCode` must strictly
+increase (`-PversionCodeOverride`).
 
 ## Server Discovery Protocol
 
