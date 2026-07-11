@@ -106,7 +106,16 @@ android {
 
 android.applicationVariants.all { variant ->
     def cap = variant.buildType.name.capitalize()
-    variant.mergeAssetsProvider.configure { dependsOn(tasks.named("copyGuardApk${cap}")) }
+    def copyGuard = tasks.named("copyGuardApk${cap}")
+    variant.mergeAssetsProvider.configure { dependsOn(copyGuard) }
+    // Lint scans the assets srcDirs too (lintVitalAnalyze<Variant>,
+    // generate<Variant>LintVitalReportModel, and their non-vital equivalents), so
+    // those tasks must also wait for the guard APK copy. Gradle 8 fails the build
+    // on this implicit dependency otherwise.
+    def variantCap = variant.name.capitalize()
+    tasks.matching { it.name.toLowerCase().contains("lint") && it.name.contains(variantCap) }.configureEach {
+        dependsOn(copyGuard)
+    }
 }
 
 dependencies {
