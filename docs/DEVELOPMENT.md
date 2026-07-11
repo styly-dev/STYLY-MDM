@@ -624,10 +624,11 @@ The self-update flow:
    row falls back to offline.
 5. **Revival.** The guard's next watchdog tick finds the client down and starts the new
    build through TobService (measured on device: down for ~3 s, `SELF_UPDATE_VERIFIED`
-   ~4 s after dispatch). The new build confirms the update marker, deletes the leftover
-   APK from `Downloads/styly-mdm/` (`MdmClientApplication`, once the ToBService binder
-   binds), reconnects, and re-registers with its `version_code`; its journal records the
-   start with `reason=guard`. On the power-cycle fallback the reboot does the same
+   ~4 s after dispatch). The new build confirms the update marker and — on that
+   confirmed landing, independent of which recovery mechanism brought it back — sweeps
+   the downloaded APK from `Downloads/styly-mdm/` (`MdmClientApplication.onCreate`; the
+   dead process could never delete it), reconnects, and re-registers with its
+   `version_code`; its journal records the start with `reason=guard`. On the power-cycle fallback the reboot does the same
    through the boot path, and the new build additionally disarms the timers: disarm is
    treated as done only when both `closeTiming*` calls confirm success — neither throwing
    nor returning a non-zero code (they are `int`-returning APIs). Any unconfirmed close

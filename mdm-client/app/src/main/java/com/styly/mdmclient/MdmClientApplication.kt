@@ -29,7 +29,13 @@ class MdmClientApplication : Application() {
         // Running the build a pending self-update targeted proves the replacement landed;
         // this retires the marker. The server learns the outcome from the version_code in
         // the REGISTER that follows once the service connects.
-        UpdateJournal.confirmSelfUpdateIfLanded(this)
+        if (UpdateJournal.confirmSelfUpdateIfLanded(this)) {
+            // First run of the replacement build: sweep the downloaded APK the dead
+            // process could never delete. This must not depend on the power-cycle armed
+            // flag — the guard recovery path never sets it (PR #51 review) — and needs
+            // no binder, so it runs here rather than in the bind callback.
+            cleanupDownloadedApks()
+        }
         bindTobService()
     }
 
@@ -64,12 +70,14 @@ class MdmClientApplication : Application() {
     }
 
     /**
-     * Post-self-update housekeeping that needs the ToBService binder, so it runs in
-     * the bind callback: disarm the power-cycle timers the previous build armed (a
-     * timer left armed would power the device off again at the next matching
-     * wall-clock time) and sweep the downloaded APK the dead process could never
-     * delete. Gated on the persisted armed flag, so an ordinary start touches
-     * neither; if disarming fails the flag survives and the next start retries.
+     * Power-cycle-fallback housekeeping that needs the ToBService binder, so it runs
+     * in the bind callback: disarm the timers the previous build armed (a timer left
+     * armed would power the device off again at the next matching wall-clock time).
+     * Gated on the persisted armed flag, so an ordinary start — and the guard
+     * recovery path, which opens no timers — touches nothing; if disarming fails the
+     * flag survives and the next start retries. The sweep also runs here (not only on
+     * a confirmed landing in onCreate) because an armed flag with no landing means a
+     * failed install whose process died before the callback could delete its download.
      */
     private fun recoverFromSelfUpdate() {
         if (!UpdateJournal.powerCycleTimersSet(this)) return

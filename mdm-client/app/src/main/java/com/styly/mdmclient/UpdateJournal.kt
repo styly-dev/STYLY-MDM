@@ -179,10 +179,15 @@ object UpdateJournal {
      *
      * A marker left behind means the replacement never ran the new build — which is the
      * outcome worth seeing.
+     *
+     * Returns true when a landing was confirmed here — i.e. this process start is the
+     * first run of the replacement build. The caller uses that to sweep the downloaded
+     * APK the dead process could never delete, independent of which recovery mechanism
+     * brought the build back (the power-cycle armed flag is only set on that fallback).
      */
-    fun confirmSelfUpdateIfLanded(context: Context) {
-        val pending = pendingSelfUpdate(context) ?: return
-        if (BuildConfig.VERSION_CODE.toLong() < pending.targetVersionCode) return
+    fun confirmSelfUpdateIfLanded(context: Context): Boolean {
+        val pending = pendingSelfUpdate(context) ?: return false
+        if (BuildConfig.VERSION_CODE.toLong() < pending.targetVersionCode) return false
 
         record(
             context,
@@ -198,6 +203,7 @@ object UpdateJournal {
                 .remove(PREF_CORRELATION_ID)
                 .commit()
         }
+        return true
     }
 
     fun clear(context: Context) {
