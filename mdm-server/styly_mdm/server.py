@@ -89,6 +89,16 @@ SELF_UPDATE_VERIFY_TIMEOUT = float(os.environ.get("MDM_SELF_UPDATE_VERIFY_TIMEOU
 # are lost.
 pending_self_updates: dict[str, dict] = {}
 
+# device_id -> {apk_filename, full_sha256, cd_sha256} captured when EXECUTE_INSTALL
+# is dispatched to that device. A self-update announced later (SELF_UPDATE_STARTING)
+# verifies against these dispatched bytes rather than re-hashing whatever the
+# client-echoed filename now points at: a same-name re-upload between dispatch and
+# announcement — or an empty/wrong echo — would otherwise shift the verify
+# reference off the file we actually told the device to install. Overwritten on the
+# next dispatch to the device and evicted on disconnect, so it holds at most one
+# entry per device. Hashes are None when the dispatched APK was not a local upload.
+last_install_dispatch: dict[str, dict] = {}
+
 # (path, size, mtime_ns) -> {"full_sha256", "cd_sha256"} for uploaded APKs, so a
 # fan-out to N devices hashes the file once, not N times. Keyed on stat identity:
 # replacing the file invalidates naturally.
@@ -1106,7 +1116,25 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     prev_pend = pending_self_updates.get(device_id)
                     if prev_pend is not None and prev_pend.get("timeout_task"):
                         prev_pend["timeout_task"].cancel()
-                    expected = await apk_hashes_for(apk_filename) or {}
+                    # Prefer the hashes captured when EXECUTE_INSTALL was dispatched
+                    # to this device: they pin the verify reference to the bytes we
+                    # actually sent, immune to a same-name re-upload or a wrong/empty
+                    # echo. Fall back to hashing the echoed filename only when there
+                    # is no dispatch record (e.g. the server restarted mid-update).
+                    dispatched = last_install_dispatch.get(device_id)
+                    if dispatched is not None:
+                        if apk_filename and apk_filename != dispatched.get("apk_filename"):
+                            log.warning(
+                                "SELF_UPDATE_STARTING from %s echoed apk_filename %r but "
+                                "last dispatch was %r; verifying against the dispatched file",
+                                device_id, apk_filename, dispatched.get("apk_filename"),
+                            )
+                        expected = {
+                            "full_sha256": dispatched.get("full_sha256"),
+                            "cd_sha256": dispatched.get("cd_sha256"),
+                        }
+                    else:
+                        expected = await apk_hashes_for(apk_filename) or {}
                     entry = {
                         "phase": "updating",
                         "correlation_id": correlation_id,
@@ -1169,6 +1197,10 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
             # an install and a push at once — so a disconnect mid-job does not stall
             # the queue until the timeout fires.
             release_transfer_slot(device_id, "disconnect")
+            # The dispatch record only bridges dispatch -> SELF_UPDATE_STARTING; by a
+            # disconnect that announcement has already copied what it needed, so drop
+            # it rather than let it linger until the next install overwrites it.
+            last_install_dispatch.pop(device_id, None)
             # A disconnect during a pending self-update is the *expected* kill-and-
             # power-cycle, so the entry survives and the list broadcast below renders
             # the row as "updating". A disconnect during the post-update verification
@@ -1741,6 +1773,14 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
                 log.warning("Failed to send EXECUTE_INSTALL to %s: %s", device_id, e)
                 await fail_one(device_id, "Failed to send the install command")
                 return
+
+            # Remember exactly what we dispatched, so a self-update this device may
+            # announce next verifies against these bytes (see last_install_dispatch).
+            last_install_dispatch[device_id] = {
+                "apk_filename": apk_filename,
+                "full_sha256": (hashes or {}).get("full_sha256"),
+                "cd_sha256": (hashes or {}).get("cd_sha256"),
+            }
 
             counts["transferring"] += 1
             key = (device_id, TASK_INSTALL)

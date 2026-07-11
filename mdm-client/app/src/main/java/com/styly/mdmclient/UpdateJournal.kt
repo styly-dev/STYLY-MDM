@@ -30,6 +30,7 @@ object UpdateJournal {
     private const val PREF_TARGET_VERSION_CODE = "update_target_version_code"
     private const val PREF_CORRELATION_ID = "update_correlation_id"
     private const val PREF_POWER_CYCLE_TIMERS = "power_cycle_timers_set"
+    private const val PREF_POWER_CYCLE_DISARM_ATTEMPTS = "power_cycle_disarm_attempts"
 
     private val lock = Any()
 
@@ -106,13 +107,41 @@ object UpdateJournal {
      */
     fun markPowerCycleTimersSet(context: Context) {
         synchronized(lock) {
-            prefs(context).edit().putBoolean(PREF_POWER_CYCLE_TIMERS, true).commit()
+            // A fresh arm starts a new disarm episode, so reset the failure count
+            // any earlier, abandoned episode left behind.
+            prefs(context).edit()
+                .putBoolean(PREF_POWER_CYCLE_TIMERS, true)
+                .remove(PREF_POWER_CYCLE_DISARM_ATTEMPTS)
+                .commit()
+        }
+    }
+
+    /**
+     * Records a disarm attempt that did not confirm both timers closed. Keeps the
+     * armed flag set so the next process start retries, and returns the running
+     * count of consecutive failures so the caller can stop an unbounded boot-time
+     * retry loop: a close call may report failure for a one-shot timer that already
+     * fired (a past-due timer can no longer fire), in which case retrying forever
+     * would be noise, not safety.
+     */
+    fun recordPowerCycleDisarmFailure(context: Context): Int {
+        synchronized(lock) {
+            val prefs = prefs(context)
+            val attempts = prefs.getInt(PREF_POWER_CYCLE_DISARM_ATTEMPTS, 0) + 1
+            prefs.edit()
+                .putBoolean(PREF_POWER_CYCLE_TIMERS, true)
+                .putInt(PREF_POWER_CYCLE_DISARM_ATTEMPTS, attempts)
+                .commit()
+            return attempts
         }
     }
 
     fun clearPowerCycleTimers(context: Context) {
         synchronized(lock) {
-            prefs(context).edit().remove(PREF_POWER_CYCLE_TIMERS).commit()
+            prefs(context).edit()
+                .remove(PREF_POWER_CYCLE_TIMERS)
+                .remove(PREF_POWER_CYCLE_DISARM_ATTEMPTS)
+                .commit()
         }
     }
 
@@ -165,6 +194,7 @@ object UpdateJournal {
                 .remove(PREF_TARGET_VERSION_CODE)
                 .remove(PREF_CORRELATION_ID)
                 .remove(PREF_POWER_CYCLE_TIMERS)
+                .remove(PREF_POWER_CYCLE_DISARM_ATTEMPTS)
                 .commit()
         }
     }

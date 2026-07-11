@@ -561,11 +561,21 @@ The self-update flow is built on those two facts:
    row falls back to offline.
 5. **Reboot recovery.** The power cycle fires; the new build boots, disarms the timers and
    deletes the leftover APK from `Downloads/styly-mdm/` (`MdmClientApplication`, once the
-   ToBService binder binds), reconnects, and re-registers with its `version_code`.
+   ToBService binder binds), reconnects, and re-registers with its `version_code`. Disarm is
+   treated as done only when both `closeTiming*` calls confirm success — neither throwing nor
+   returning a non-zero code (they are `int`-returning APIs). Any unconfirmed close keeps the
+   persisted armed flag set so the next process start retries, rather than retiring a shutdown
+   timer that may still be live; after `MAX_DISARM_ATTEMPTS` (3) starts the flag is retired
+   anyway, so a past-due one-shot timer that can no longer be closed does not loop the
+   recovery on every boot (`POWER_CYCLE_CLOSED` records `cleared` / `retry_pending` / `gave_up`).
 6. **Result + auto-verify.** The server settles the update by comparing the re-registered
    `version_code` against the target (`SELF_UPDATE_RESULT`, carrying the correlation id),
    then runs `EXECUTE_VERIFY_APK` against the client's own package and compares the
-   reported hash with its reference, broadcasting `SELF_UPDATE_VERIFIED`. That answering
+   reported hash with its reference, broadcasting `SELF_UPDATE_VERIFIED`. The reference is
+   pinned to the hashes captured when `EXECUTE_INSTALL` was dispatched to that device
+   (`last_install_dispatch`), not a re-hash of the client-echoed filename, so a same-name
+   re-upload — or a wrong/empty echo — between dispatch and announcement cannot shift the
+   verify reference off the bytes the device actually installed. That answering
    `VERIFY_APK_RESULT` is consumed server-side, never forwarded — the console would
    otherwise classify it against a browser-local reference that does not exist. The
    re-registered device is online and responsive, so this wait is bounded by

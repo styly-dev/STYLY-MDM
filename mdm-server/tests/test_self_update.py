@@ -615,6 +615,78 @@ def test_e2e_self_update_happy_path(tmp_path):
     asyncio.run(body())
 
 
+def test_e2e_self_update_verifies_against_dispatched_bytes_not_a_same_name_reupload(tmp_path):
+    """The verify reference is pinned to the dispatched EXECUTE_INSTALL hashes.
+
+    If a same-name APK is re-uploaded between dispatch and SELF_UPDATE_STARTING,
+    re-hashing the echoed filename would shift the reference onto bytes the device
+    never installed. The server must instead verify against what it dispatched.
+    """
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        server.MAX_CONCURRENT_TRANSFERS = 5
+        server.TRANSFER_TIMEOUT = 60
+        dispatched = write_apk(server.APK_DIR / "x.apk", payload=b"the-build-we-dispatched")
+        ts = TestServer(server.create_app())
+        await ts.start_server()
+        base = f"http://{ts.host}:{ts.port}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                d0 = await _register(session, base, "dev0", version_code=6)
+                admin = await session.ws_connect(base + "/ws/admin")
+                assert await _recv_type(admin, "DEVICE_LIST") is not None
+
+                await admin.send_json({
+                    "type": "INSTALL_APK", "target_devices": ["dev0"],
+                    "apk_url": base + "/apks/x.apk", "apk_filename": "x.apk",
+                })
+                execute = await _recv_type(d0, "EXECUTE_INSTALL")
+                assert execute["full_sha256"] == dispatched["full_sha256"]
+
+                # A different build lands under the same name before the announcement.
+                reupload = write_apk(
+                    server.APK_DIR / "x.apk", payload=b"a-totally-different-build-with-a-longer-body"
+                )
+                assert reupload["full_sha256"] != dispatched["full_sha256"]
+
+                await d0.send_json({
+                    "type": "SELF_UPDATE_STARTING", "correlation_id": "c-1",
+                    "target_version_code": 7, "current_version_code": 6,
+                    "package_name": CLIENT_PKG, "apk_filename": "x.apk",
+                })
+                await wait_until(lambda: "dev0" in server.pending_self_updates)
+                pend = server.pending_self_updates["dev0"]
+                # Pinned to the dispatched bytes, not the re-uploaded same-name file.
+                assert pend["expected_full_sha256"] == dispatched["full_sha256"]
+                assert pend["expected_full_sha256"] != reupload["full_sha256"]
+
+                state = await _recv_type(admin, "INSTALL_DEVICE_STATE")
+                while state["state"] != "updating":
+                    state = await _recv_type(admin, "INSTALL_DEVICE_STATE")
+                await d0.close()
+                assert (await _recv_type(admin, "DEVICE_LIST")) is not None
+
+                # The device reports the dispatched bytes it actually installed, so
+                # auto-verify passes — it would have failed against the re-upload.
+                d0b = await _register(session, base, "dev0", version_code=7)
+                assert (await _recv_type(admin, "SELF_UPDATE_RESULT"))["status"] == "success"
+                assert await _recv_type(d0b, "EXECUTE_VERIFY_APK") is not None
+                await d0b.send_json({
+                    "type": "VERIFY_APK_RESULT", "package_name": CLIENT_PKG,
+                    "found": True, "full_sha256": dispatched["full_sha256"],
+                    "cd_sha256": dispatched["cd_sha256"],
+                })
+                verified = await _recv_type(admin, "SELF_UPDATE_VERIFIED")
+                assert verified["status"] == "verified"
+
+                await d0b.close()
+                await admin.close()
+        finally:
+            await ts.close()
+
+    asyncio.run(body())
+
+
 def test_e2e_second_self_update_starting_replaces_pending(tmp_path):
     async def body():
         server._apply_data_dir(str(tmp_path))
