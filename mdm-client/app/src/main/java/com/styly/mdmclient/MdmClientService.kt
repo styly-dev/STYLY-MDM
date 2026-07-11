@@ -10,6 +10,8 @@ import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Log
 import com.pvr.tobservice.ToBServiceHelper
@@ -65,6 +67,13 @@ class MdmClientService : Service() {
             "documents", "alarms", "notifications", "podcasts", "ringtones"
         )
 
+        // Mutual watch with the guard app. The self-update gate blocks up to
+        // GUARD_START_WAIT_MS for the guard's process to be confirmed before relying
+        // on it for recovery; the periodic tick restarts a guard that is installed
+        // but down (first deployment, its own update, or a crash).
+        private const val GUARD_START_WAIT_MS = 5_000L
+        private const val GUARD_ENSURE_INTERVAL_MS = 60_000L
+
         // Integrity verification (issue #37). The ZIP End-Of-Central-Directory record is
         // the fixed 22-byte trailer plus an optional comment of up to 0xFFFF bytes.
         private const val EOCD_MIN = 22
@@ -81,6 +90,13 @@ class MdmClientService : Service() {
     }
 
     private lateinit var webSocketManager: WebSocketManager
+
+    // Mutual watch: off the main thread because each tick is a binder round-trip to
+    // TobService. Journal only the down→start transition, not every tick, so a guard
+    // that cannot start does not churn the 80-line journal.
+    private lateinit var guardEnsureThread: HandlerThread
+    private lateinit var guardEnsure: Handler
+    private var guardSeenDown = false
 
     override fun onCreate() {
         super.onCreate()
@@ -107,6 +123,10 @@ class MdmClientService : Service() {
         webSocketManager.connect()
 
         launchStartupAppIfConfigured()
+
+        guardEnsureThread = HandlerThread("guard-ensure").apply { start() }
+        guardEnsure = Handler(guardEnsureThread.looper)
+        guardEnsure.postDelayed(::guardEnsureTick, GUARD_ENSURE_INTERVAL_MS)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -131,8 +151,39 @@ class MdmClientService : Service() {
     override fun onDestroy() {
         Log.i(TAG, "MdmClientService destroyed")
         UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_DESTROYED)
+        guardEnsureThread.quitSafely()
         webSocketManager.disconnect()
         super.onDestroy()
+    }
+
+    /**
+     * The client's half of the mutual watch: restart the guard when it is installed
+     * but not running. Fire-and-forget — the next tick is the confirmation. See
+     * GuardLink for why the guard cannot rely on anything else to start it.
+     */
+    private fun guardEnsureTick() {
+        try {
+            val proxy = ToBServiceHelper.getInstance().serviceBinder as? IToBServiceProxy
+            if (proxy != null && GuardLink.isInstalled(this)) {
+                if (GuardLink.isRunning(proxy) == false) {
+                    if (!guardSeenDown) {
+                        guardSeenDown = true
+                        UpdateJournal.record(
+                            this,
+                            UpdateJournal.EVENT_GUARD_STARTED,
+                            "guard was not running"
+                        )
+                    }
+                    GuardLink.ensureRunning(this, proxy)
+                } else {
+                    guardSeenDown = false
+                }
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "Guard ensure tick failed", e)
+        } finally {
+            guardEnsure.postDelayed(::guardEnsureTick, GUARD_ENSURE_INTERVAL_MS)
+        }
     }
 
     private fun handleCommand(type: String, payload: JSONObject) {
@@ -366,45 +417,55 @@ class MdmClientService : Service() {
 
         // When the APK replaces our own package, Android kills this process and nothing
         // restarts it (measured: keep-alive does not survive, MY_PACKAGE_REPLACED is not
-        // delivered on PICO). Recovery is a one-shot power cycle armed *before* the
-        // installer runs: shutdown at +2 min (the install commits within ~30 s), startup
-        // at +3 min, then the boot path brings the new build back. Everything the
-        // replacement process needs is committed to disk before the installer is invoked,
-        // and the server is told last — ordering matters: if any earlier step fails,
-        // no state has leaked and the install is simply refused.
+        // delivered on PICO). Recovery must therefore be armed *before* the installer
+        // runs. Preferred: the guard app, a separate package the replace cannot kill,
+        // which revives the client through TobService within seconds. Fallback: the
+        // one-shot power-cycle timers (shutdown +2 min / startup +3 min) — kept for
+        // devices where they work, though firmware whose SELinux denies the RTC alarm
+        // HAL refuses them outright. Everything the replacement process needs is
+        // committed to disk before the installer is invoked, and the server is told
+        // last — ordering matters: if any earlier step fails, no state has leaked and
+        // the install is simply refused: installing with no way back would strand the
+        // device.
         if (isSelfUpdate) {
             val proxy = binder as? IToBServiceProxy
             if (proxy == null) {
                 apkFile.delete()
-                Log.e(TAG, "ToBService proxy unavailable; cannot arm the power cycle")
+                Log.e(TAG, "ToBService proxy unavailable; cannot arm self-update recovery")
                 sendInstallResult(
                     apkFilename, "fail",
-                    "ToBService proxy unavailable; self-update needs the power-cycle timers"
+                    "ToBService proxy unavailable; self-update needs it for recovery"
                 )
                 return
             }
-            when (PowerCycleTimers.arm(this, proxy)) {
-                PowerCycleTimers.ArmOutcome.ARMED -> Unit // proceed with the self-update
-                PowerCycleTimers.ArmOutcome.REFUSED_SAFE -> {
-                    apkFile.delete()
-                    sendInstallResult(
-                        apkFilename, "fail",
-                        "Power-cycle scheduling failed; refusing a self-update with no way back"
-                    )
-                    return
-                }
-                PowerCycleTimers.ArmOutcome.REFUSED_UNSAFE -> {
-                    apkFile.delete()
-                    sendInstallResult(
-                        apkFilename, "fail",
-                        "UNSAFE: power-cycle scheduling failed and a shutdown timer may still be armed " +
-                            "without a paired startup timer; the device may power off until it is manually restarted"
-                    )
-                    return
+            val recovery: String
+            if (GuardLink.ensureRunning(this, proxy, GUARD_START_WAIT_MS)) {
+                recovery = "guard"
+            } else {
+                when (PowerCycleTimers.arm(this, proxy)) {
+                    PowerCycleTimers.ArmOutcome.ARMED -> recovery = "power_cycle"
+                    PowerCycleTimers.ArmOutcome.REFUSED_SAFE -> {
+                        apkFile.delete()
+                        sendInstallResult(
+                            apkFilename, "fail",
+                            "Self-update recovery unavailable: the guard app is not running " +
+                                "and power-cycle scheduling failed; refusing an update with no way back"
+                        )
+                        return
+                    }
+                    PowerCycleTimers.ArmOutcome.REFUSED_UNSAFE -> {
+                        apkFile.delete()
+                        sendInstallResult(
+                            apkFilename, "fail",
+                            "UNSAFE: power-cycle scheduling failed and a shutdown timer may still be armed " +
+                                "without a paired startup timer; the device may power off until it is manually restarted"
+                        )
+                        return
+                    }
                 }
             }
             val correlationId = UUID.randomUUID().toString()
-            UpdateJournal.markSelfUpdateStarted(this, archive!!.versionCode, correlationId)
+            UpdateJournal.markSelfUpdateStarted(this, archive!!.versionCode, correlationId, recovery)
             sendSelfUpdateStarting(correlationId, archive.versionCode, apkFilename)
             // send() only enqueues; the installer is about to kill this process, so
             // give the announcement a bounded chance to reach the wire.
@@ -435,13 +496,17 @@ class MdmClientService : Service() {
                             UpdateJournal.EVENT_INSTALL_CALLBACK,
                             "result=$result (${installResultMessage(result)}) self_update=$isSelfUpdate"
                         )
-                        if (isSelfUpdate) {
+                        if (isSelfUpdate &&
+                            UpdateJournal.powerCycleTimersSet(this@MdmClientService)
+                        ) {
                             // The callback fired at all, which means the installer did NOT
                             // replace this process — a successful self-replace takes the
                             // process (and this binder) with it before any callback can run.
                             // So the process survived and the device must not power-cycle,
                             // regardless of the result code: disarm unconditionally rather
-                            // than trusting result != 0.
+                            // than trusting result != 0. Gated on the persisted armed flag:
+                            // on the guard recovery path no timers were ever opened, and a
+                            // disarm of nothing would only journal noise.
                             PowerCycleTimers.disarm(
                                 this@MdmClientService,
                                 if (result == 0) "install_callback_survived" else "install_failed"
@@ -461,7 +526,7 @@ class MdmClientService : Service() {
             )
         } catch (e: Exception) {
             apkFile.delete()
-            if (isSelfUpdate) {
+            if (isSelfUpdate && UpdateJournal.powerCycleTimersSet(this)) {
                 PowerCycleTimers.disarm(this, "install_failed")
             }
             throw e

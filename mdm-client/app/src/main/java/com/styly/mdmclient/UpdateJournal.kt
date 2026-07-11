@@ -60,6 +60,10 @@ object UpdateJournal {
     const val EVENT_POWER_CYCLE_SCHEDULED = "POWER_CYCLE_SCHEDULED"
     const val EVENT_POWER_CYCLE_CLOSED = "POWER_CYCLE_CLOSED"
 
+    // Recorded when the mutual-watch tick finds the guard app installed but down and
+    // has to start it (first deployment, the guard's own update, or a crash).
+    const val EVENT_GUARD_STARTED = "GUARD_STARTED"
+
     /**
      * Appends an event. Safe to call from any thread and from a BroadcastReceiver, and returns
      * only once the entry is on disk.
@@ -83,7 +87,12 @@ object UpdateJournal {
      * the process dies. The replacement process reads this back to tell "I was updated" from
      * "I crashed and restarted".
      */
-    fun markSelfUpdateStarted(context: Context, targetVersionCode: Long, correlationId: String) {
+    fun markSelfUpdateStarted(
+        context: Context,
+        targetVersionCode: Long,
+        correlationId: String,
+        recovery: String,
+    ) {
         synchronized(lock) {
             prefs(context).edit()
                 .putBoolean(PREF_UPDATE_IN_PROGRESS, true)
@@ -95,7 +104,7 @@ object UpdateJournal {
             context,
             EVENT_SELF_INSTALL_INVOKED,
             "target_version_code=$targetVersionCode correlation_id=$correlationId " +
-                "running_version_code=${BuildConfig.VERSION_CODE}"
+                "running_version_code=${BuildConfig.VERSION_CODE} recovery=$recovery"
         )
     }
 

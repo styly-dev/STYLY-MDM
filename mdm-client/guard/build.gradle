@@ -1,0 +1,47 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+// STYLY-MDM Guard: a tiny companion app that revives the mdm-client after its own
+// package is replaced by a self-update. The client's process dies with the install
+// and nothing on PICO restarts it (#39); the scheduled power-cycle fallback is dead
+// on current firmware (SELinux blocks the RTC alarm HAL). The guard is a separate
+// package, so the client's self-replace cannot kill it, and it starts the client
+// back up through the privileged TobService launch APIs.
+android {
+    namespace 'com.styly.mdmguard'
+    compileSdk 33
+
+    defaultConfig {
+        applicationId "com.styly.mdmguard"
+        minSdk 29
+        targetSdk 33
+        versionCode ((project.findProperty("guardVersionCodeOverride") ?: 1) as Integer)
+        versionName ((project.findProperty("guardVersionNameOverride") ?: "0.1.0").toString())
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.10.1'
+    implementation 'com.picoxr.tobservice:tobservicelib:4.3.16'
+    // tobservicelib uses Gson internally but its AAR ships no POM, so nothing pulls
+    // Gson transitively; a missing class surfaces as a process-killing
+    // NoClassDefFoundError (see app/build.gradle for the incident this caused).
+    implementation 'com.google.code.gson:gson:2.11.0'
+}

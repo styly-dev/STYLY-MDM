@@ -1,0 +1,244 @@
+package com.styly.mdmguard
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Intent
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.IBinder
+import android.os.SystemClock
+import android.util.Log
+import com.pvr.tobservice.ToBServiceHelper
+import com.pvr.tobservice.interfaces.IToBServiceProxy
+
+/**
+ * Watches the mdm-client and starts it back up when it is not running.
+ *
+ * A self-update replaces the client's own package: the installer kills its process
+ * and nothing on PICO restarts it — keep-alive does not survive the replace and
+ * MY_PACKAGE_REPLACED is never delivered (measured for #39). The scheduled
+ * power-cycle fallback is dead on current firmware (SELinux denies the poweroffalarm
+ * app the RTC alarm HAL). This service lives in a separate package, so the client's
+ * self-replace cannot take it down, and it restarts the client through the
+ * privileged TobService launch APIs, which are exempt from the background-start
+ * restrictions that apply to a plain startForegroundService() from here.
+ *
+ * Diagnostics: every state change and revival attempt is logged under the
+ * GuardService tag, and specific revival methods can be forced over adb:
+ *   adb shell am start-foreground-service -n com.styly.mdmguard/.GuardService -e cmd revive_fgs
+ * with cmd one of: check, revive_fgs, revive_service, revive_startapp,
+ * revive_keepalive, revive_local. (Forcing a start of the client is nothing another
+ * app could not already do — MdmClientService is exported — so this surface grants
+ * no new capability; there is deliberately no command that pauses the watch.)
+ */
+class GuardService : Service() {
+
+    companion object {
+        private const val TAG = "GuardService"
+        private const val CLIENT_PACKAGE = "com.styly.mdmclient"
+        private const val CLIENT_SERVICE = "com.styly.mdmclient.MdmClientService"
+        // Key the client's onStartCommand reads; shows up in its journal/log as reason=guard.
+        private const val CLIENT_EXTRA_START_REASON = "start_reason"
+        private const val START_REASON_GUARD = "guard"
+
+        private const val CHANNEL_ID = "guard"
+        private const val NOTIFICATION_ID = 1
+
+        private const val CHECK_INTERVAL_MS = 10_000L
+        // A revived client needs time to come up before a second attempt is warranted;
+        // also keeps a broken revival path from being hammered every tick.
+        private const val REVIVE_COOLDOWN_MS = 30_000L
+    }
+
+    private lateinit var watchdogThread: HandlerThread
+    private lateinit var watchdog: Handler
+
+    @Volatile private var watching = true
+    private var lastReviveAt = 0L
+    // Logged-once flag so a deliberately uninstalled client does not spam the log
+    // with a skipped revival every tick.
+    private var loggedClientMissing = false
+
+    private val proxy: IToBServiceProxy?
+        get() = ToBServiceHelper.getInstance().serviceBinder as? IToBServiceProxy
+
+    override fun onCreate() {
+        super.onCreate()
+        Log.i(TAG, "GuardService created")
+        startForeground(NOTIFICATION_ID, buildNotification())
+        bindTobService()
+        watchdogThread = HandlerThread("guard-watchdog").apply { start() }
+        watchdog = Handler(watchdogThread.looper)
+        watchdog.postDelayed(::watchdogTick, CHECK_INTERVAL_MS)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val cmd = intent?.getStringExtra("cmd") ?: "watch"
+        Log.i(TAG, "onStartCommand cmd=$cmd flags=$flags")
+        when (cmd) {
+            "watch" -> Unit // watchdog runs since onCreate
+            "check" -> watchdog.post { logLiveness() }
+            "revive_fgs", "revive_service", "revive_startapp", "revive_keepalive",
+            "revive_local" -> watchdog.post { revive(cmd) }
+            else -> Log.w(TAG, "Unknown cmd: $cmd")
+        }
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        Log.i(TAG, "GuardService destroyed")
+        watchdogThread.quitSafely()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun bindTobService() {
+        try {
+            ToBServiceHelper.getInstance().bindTobService(this) { status ->
+                Log.i(TAG, "TobService bind status: $status")
+                if (status) {
+                    try {
+                        ToBServiceHelper.getInstance().serviceBinder
+                            ?.pbsAppKeepAlive(packageName, true, 0)
+                        Log.i(TAG, "Guard keep-alive registered")
+                    } catch (e: Throwable) {
+                        Log.e(TAG, "Failed to register guard keep-alive", e)
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to bind TobService", e)
+        }
+    }
+
+    private fun watchdogTick() {
+        try {
+            if (watching) {
+                val alive = isClientAlive()
+                if (alive == false) {
+                    if (!isClientInstalled()) {
+                        // A missing package is a deliberate uninstall, not a crash:
+                        // reviving would fight the operator, so stand down until it
+                        // is installed again.
+                        if (!loggedClientMissing) {
+                            Log.w(TAG, "Client package not installed; standing down")
+                            loggedClientMissing = true
+                        }
+                    } else {
+                        loggedClientMissing = false
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - lastReviveAt >= REVIVE_COOLDOWN_MS) {
+                            Log.w(TAG, "Client is DOWN; attempting revival")
+                            lastReviveAt = now
+                            revive("revive_fgs")
+                        } else {
+                            Log.i(TAG, "Client is DOWN; within revive cooldown, waiting")
+                        }
+                    }
+                } else {
+                    loggedClientMissing = false
+                }
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "Watchdog tick failed", e)
+        } finally {
+            watchdog.postDelayed(::watchdogTick, CHECK_INTERVAL_MS)
+        }
+    }
+
+    /** true/false when TobService answered, null when liveness is unknowable right now. */
+    private fun isClientAlive(): Boolean? {
+        val p = proxy
+        if (p == null) {
+            Log.w(TAG, "Liveness UNKNOWN: TobService proxy not bound")
+            return null
+        }
+        return try {
+            val processes = p.runningAppProcesses
+            if (processes == null) {
+                Log.w(TAG, "Liveness UNKNOWN: getRunningAppProcesses returned null")
+                null
+            } else {
+                processes.any { it.processName == CLIENT_PACKAGE }
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "Liveness UNKNOWN: getRunningAppProcesses threw", e)
+            null
+        }
+    }
+
+    private fun logLiveness() {
+        Log.i(TAG, "Liveness check: client alive=${isClientAlive()}")
+    }
+
+    private fun isClientInstalled(): Boolean = try {
+        packageManager.getPackageInfo(CLIENT_PACKAGE, 0)
+        true
+    } catch (e: android.content.pm.PackageManager.NameNotFoundException) {
+        false
+    }
+
+    private fun clientServiceIntent(): Intent = Intent()
+        .setClassName(CLIENT_PACKAGE, CLIENT_SERVICE)
+        .putExtra(CLIENT_EXTRA_START_REASON, START_REASON_GUARD)
+
+    /**
+     * One revival attempt via the named method. Everything is caught and logged:
+     * the spike's job is to report which methods work, not to die trying.
+     */
+    private fun revive(method: String) {
+        val p = proxy
+        if (p == null && method != "revive_local") {
+            Log.e(TAG, "Cannot revive via $method: TobService proxy not bound")
+            return
+        }
+        Log.i(TAG, "Reviving client via $method")
+        try {
+            when (method) {
+                "revive_fgs" -> {
+                    val result = p!!.startForegroundService(clientServiceIntent())
+                    Log.i(TAG, "startForegroundService result: $result")
+                }
+                "revive_service" -> {
+                    val result = p!!.startService(clientServiceIntent())
+                    Log.i(TAG, "startService result: $result")
+                }
+                "revive_startapp" -> {
+                    val launch = Intent(Intent.ACTION_MAIN)
+                        .addCategory(Intent.CATEGORY_LAUNCHER)
+                        .setPackage(CLIENT_PACKAGE)
+                    val result = p!!.startApp(0, launch)
+                    Log.i(TAG, "startApp result: $result")
+                }
+                "revive_keepalive" -> {
+                    p!!.pbsAppKeepAlive(CLIENT_PACKAGE, true, 0)
+                    Log.i(TAG, "pbsAppKeepAlive($CLIENT_PACKAGE) issued")
+                }
+                "revive_local" -> {
+                    // Baseline: a plain cross-app start from this (foreground) service,
+                    // to measure what the platform allows without TobService.
+                    val result = startForegroundService(clientServiceIntent())
+                    Log.i(TAG, "local startForegroundService result: $result")
+                }
+                else -> Log.w(TAG, "Unknown revival method: $method")
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "Revival via $method threw", e)
+        }
+    }
+
+    private fun buildNotification(): Notification {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, "Guard", NotificationManager.IMPORTANCE_LOW)
+        )
+        return Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("STYLY-MDM Guard")
+            .setContentText("Watching the MDM client")
+            .setSmallIcon(android.R.drawable.stat_notify_sync_noanim)
+            .build()
+    }
+}
