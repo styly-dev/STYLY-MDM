@@ -239,6 +239,20 @@ class MdmClientService : Service() {
                 "reason=$reason version_code=${embedded.versionCode}"
             )
         }
+        // The staging directory is shared storage (the installer cannot read
+        // app-private files), so re-check the bytes at the last moment before
+        // handing the path to the privileged installer.
+        if (!GuardLink.verifyStaged(embedded)) {
+            guardInstallInFlight = false
+            embedded.file.delete()
+            Log.e(TAG, "Staged guard APK changed since extraction; refusing to install it")
+            UpdateJournal.record(
+                this,
+                UpdateJournal.EVENT_GUARD_INSTALLED,
+                "failed reason=staged file hash mismatch"
+            )
+            return
+        }
         try {
             binder.pbsControlAPPManger(
                 PBS_PackageControlEnum.PACKAGE_SILENCE_INSTALL,
