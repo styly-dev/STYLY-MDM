@@ -778,6 +778,7 @@ class MdmClientService : Service() {
                                             TAG,
                                             "Still alive after a 'successful' self-uninstall; treating the retire as failed"
                                         )
+                                        restoreKeepAlive()
                                         retireInProgress = false
                                     }
                                 }, GUARD_ENSURE_INTERVAL_MS)
@@ -795,15 +796,34 @@ class MdmClientService : Service() {
         }.start()
     }
 
-    /** Terminal failure of a retire: report it and re-open guard provisioning. */
+    /**
+     * Terminal failure of a retire: report it and restore the recovery posture the
+     * teardown dismantled — the guard (via the re-opened mutual-watch tick) and the
+     * ToBService keep-alive it deregistered.
+     */
     private fun failRetire(correlationId: String, detail: String, resultCode: Int?) {
         Log.e(TAG, "Self-uninstall failed: $detail")
         UpdateJournal.record(this, UpdateJournal.EVENT_RETIRE_FAILED, "detail=$detail")
         sendSelfUninstallResult(correlationId, detail, resultCode)
+        restoreKeepAlive()
         // The guard was deliberately uninstalled first; clearing the flag lets the
         // next mutual-watch tick reinstall it, so a failed retire never leaves the
         // device unguarded.
         retireInProgress = false
+    }
+
+    /**
+     * A failed retire leaves this process alive, so MdmClientApplication.onCreate
+     * will not run again to re-register the keep-alive the teardown deregistered.
+     * Re-register it here (best-effort; harmless when it was never deregistered)
+     * so the device keeps the same ToBService recovery it had before the attempt.
+     */
+    private fun restoreKeepAlive() {
+        try {
+            ToBServiceHelper.getInstance().serviceBinder?.pbsAppKeepAlive(packageName, true, 0)
+        } catch (e: Throwable) {
+            Log.w(TAG, "Could not re-register keep-alive after a failed retire", e)
+        }
     }
 
     /**
