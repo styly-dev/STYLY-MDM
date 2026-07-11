@@ -15,8 +15,8 @@ android {
         // workflow greps and seds them. Overrides are applied by assignment below so a
         // self-update test run can push a strictly-increasing versionCode without editing
         // this file. CI passes neither property and gets the committed values.
-        versionCode 6
-        versionName "0.2.3"
+        versionCode 7
+        versionName "0.3.0"
         if (project.hasProperty("versionCodeOverride")) {
             versionCode = project.property("versionCodeOverride") as Integer
         }
