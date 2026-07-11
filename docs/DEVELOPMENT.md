@@ -161,7 +161,7 @@ STYLY-MDM/
             ├── MdmClientApplication.kt   # Application entry point
             ├── MdmClientService.kt       # Foreground service; executes launch commands
             ├── WebSocketManager.kt       # WebSocket connection with auto-reconnect
-            ├── SettingsActivity.kt       # UI to configure server URL; Update Journal viewer
+            ├── SettingsActivity.kt       # UI to configure server URL; shows client build; Update Journal viewer
             ├── ServerDiscovery.kt        # UDP broadcast server discovery
             ├── BundleSync.kt             # Push/sync a file bundle into a device directory
             ├── UpdateJournal.kt          # Persistent event log; survives a self-update kill
@@ -227,7 +227,7 @@ STYLY-MDM/
 
 | Message type | Description |
 |---|---|
-| `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — the latter while a self-update's power cycle is in flight), `version_code` / `version_name` (the client build, when known), and may include optional `battery`: `{level, charging, last_seen}`) |
+| `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — the latter while a self-update's power cycle is in flight), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting), and may include optional `battery`: `{level, charging, last_seen}`) |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
 | `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |

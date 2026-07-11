@@ -152,6 +152,10 @@
     .dev-label-row { display: flex; align-items: center; gap: 6px; }
     .dev-label { font-weight: 600; font-size: 14px; }
     .dev-label.unlabeled { color: var(--text-secondary); font-weight: 400; }
+    /* Client build, pulled out of the grey sub-line and right-aligned so laggards are
+       scannable down the list after a rollout. Muted + "unknown" for pre-version clients. */
+    .dev-version { margin-left: auto; flex: 0 0 auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-weight: 600; color: var(--text-secondary); background: var(--bg-actions); border: 1px solid var(--border-soft); border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
+    .dev-version.unknown { color: var(--text-muted); font-weight: 400; }
     .dev-sub { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .dev-status { font-size: 13px; }
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 6px; vertical-align: middle; }
@@ -832,15 +836,19 @@
               '<button class="btn-mini btn-save" data-act="saveLabel" data-id="' + esc(id) + '">Save</button>' +
               '<button class="btn-mini btn-cancel" data-act="cancelLabel">Cancel</button></div>';
           } else {
+            // Client build, right-aligned in the label row so it reads as a column across
+            // rows; older clients that predate the version field show a muted "unknown".
+            const verBadge = d.version_name
+              ? '<span class="dev-version" title="Client build">v' + esc(d.version_name) + '</span>'
+              : '<span class="dev-version unknown" title="Client build unknown (device predates version reporting)">unknown</span>';
             deviceCell = '<div class="dev-label-row">' +
               (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') +
               '<button class="ic-btn ' + (d.label ? '' : 'assign-btn') + '" data-act="editLabel" data-id="' + esc(id) + '" title="' + (d.label ? 'Edit label' : 'Assign label') + '">✏</button>' +
               (startup ? '<span class="badge-startup" title="' + esc(startup) + '">★</span>' : '') +
+              verBadge +
               '</div>';
           }
-          deviceCell += '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') +
-            (d.version_name ? ' · v' + esc(d.version_name) + (d.version_code != null ? ' (' + esc(d.version_code) + ')' : '') : '') +
-            '</div>';
+          deviceCell += '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.ip || '-') + '</div>';
 
           let status;
           if (d.status === 'updating') {
