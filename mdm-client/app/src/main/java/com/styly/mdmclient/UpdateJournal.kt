@@ -29,6 +29,7 @@ object UpdateJournal {
     private const val PREF_UPDATE_IN_PROGRESS = "update_in_progress"
     private const val PREF_TARGET_VERSION_CODE = "update_target_version_code"
     private const val PREF_CORRELATION_ID = "update_correlation_id"
+    private const val PREF_POWER_CYCLE_TIMERS = "power_cycle_timers_set"
 
     private val lock = Any()
 
@@ -51,10 +52,12 @@ object UpdateJournal {
     const val EVENT_SELF_INSTALL_INVOKED = "SELF_INSTALL_INVOKED"
     const val EVENT_INSTALL_CALLBACK = "INSTALL_CALLBACK"
     const val EVENT_SELF_UPDATE_CONFIRMED = "SELF_UPDATE_CONFIRMED"
+    const val EVENT_INSTALL_REFUSED = "INSTALL_REFUSED"
 
-    // Recorded by PackageReplacedReceiver.
-    const val EVENT_PACKAGE_REPLACED = "PACKAGE_REPLACED"
-    const val EVENT_FGS_ATTEMPT = "FGS_ATTEMPT"
+    // Recorded around the power-cycle timers that bring the device back after a
+    // self-update kills this process (nothing else restarts the client — measured).
+    const val EVENT_POWER_CYCLE_SCHEDULED = "POWER_CYCLE_SCHEDULED"
+    const val EVENT_POWER_CYCLE_CLOSED = "POWER_CYCLE_CLOSED"
 
     /**
      * Appends an event. Safe to call from any thread and from a BroadcastReceiver, and returns
@@ -94,6 +97,27 @@ object UpdateJournal {
                 "running_version_code=${BuildConfig.VERSION_CODE}"
         )
     }
+
+    /**
+     * Persists that the one-shot shutdown/startup timers are armed, before the
+     * installer is invoked. The replacement process reads this back to know it must
+     * disarm them once the ToBService binder is available — a timer left armed
+     * would power the device off again on the next matching wall-clock minute.
+     */
+    fun markPowerCycleTimersSet(context: Context) {
+        synchronized(lock) {
+            prefs(context).edit().putBoolean(PREF_POWER_CYCLE_TIMERS, true).commit()
+        }
+    }
+
+    fun clearPowerCycleTimers(context: Context) {
+        synchronized(lock) {
+            prefs(context).edit().remove(PREF_POWER_CYCLE_TIMERS).commit()
+        }
+    }
+
+    fun powerCycleTimersSet(context: Context): Boolean =
+        prefs(context).getBoolean(PREF_POWER_CYCLE_TIMERS, false)
 
     /** The pending self-update, or null when no update is in flight. */
     fun pendingSelfUpdate(context: Context): PendingUpdate? {
@@ -140,6 +164,7 @@ object UpdateJournal {
                 .remove(PREF_UPDATE_IN_PROGRESS)
                 .remove(PREF_TARGET_VERSION_CODE)
                 .remove(PREF_CORRELATION_ID)
+                .remove(PREF_POWER_CYCLE_TIMERS)
                 .commit()
         }
     }
@@ -151,8 +176,7 @@ object UpdateJournal {
 
         val out = StringBuilder()
         out.append("running: versionCode=${BuildConfig.VERSION_CODE} ")
-            .append("versionName=${BuildConfig.VERSION_NAME} ")
-            .append("spikeMode=${BuildConfig.SPIKE_MODE}\n")
+            .append("versionName=${BuildConfig.VERSION_NAME}\n")
         val pending = pendingSelfUpdate(context)
         if (pending != null) {
             out.append(

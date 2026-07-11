@@ -110,6 +110,21 @@ class WebSocketManager(
         webSocket?.send(text)
     }
 
+    /**
+     * Best-effort wait for the outbound queue to drain. OkHttp's send() only
+     * enqueues; a self-updating client is about to be killed by the installer,
+     * so its last message needs a bounded chance to reach the wire first. Call
+     * from a worker thread only.
+     */
+    fun awaitOutboundFlush(timeoutMillis: Long) {
+        val deadline = System.currentTimeMillis() + timeoutMillis
+        while (System.currentTimeMillis() < deadline) {
+            val ws = webSocket ?: return
+            if (ws.queueSize() == 0L) return
+            Thread.sleep(50)
+        }
+    }
+
     private fun doConnect() {
         if (!isRunning) return
 

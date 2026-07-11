@@ -156,6 +156,7 @@
     .dev-status { font-size: 13px; }
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 6px; vertical-align: middle; }
     .dot.off { background: var(--text-muted); }
+    .dot.updating { background: var(--warning, #d29922); }
     .last-seen { color: var(--text-muted); font-size: 11px; margin-left: 4px; }
     .dev-battery { font-size: 12px; padding-right: 12px; }
     .battery { display: inline-flex; align-items: center; gap: 7px; color: var(--text-secondary); white-space: nowrap; }
@@ -549,7 +550,9 @@
       function getDeviceId(d) { return d.device_id || d.serial_number || ''; }
       function isOnline(d) { return d.status !== 'offline'; }
       function deviceById(id) { return devices.find(function (d) { return getDeviceId(d) === id; }); }
-      function getOnlineIds() { return devices.filter(isOnline).map(getDeviceId).filter(Boolean); }
+      // Command targets need a live WebSocket, which "updating" (mid self-update,
+      // device rebooting) does not have — only strictly-online devices qualify.
+      function getOnlineIds() { return devices.filter(function (d) { return d.status === 'online'; }).map(getDeviceId).filter(Boolean); }
       function knownIds() { return new Set(devices.map(getDeviceId).filter(Boolean)); }
       function labelFor(id) { if (!id) return '-'; const d = deviceById(id); return (d && d.label) ? d.label : id; }
       function groupNames() { return Object.keys(groups).sort(); }
@@ -600,8 +603,11 @@
             devices = msg.devices || [];
             const cur = knownIds();
             selectedIds.forEach(function (id) { if (!cur.has(id)) selectedIds.delete(id); });
-            const onlineNow = new Set(getOnlineIds());
-            Object.keys(deviceTaskState).forEach(function (id) { if (!onlineNow.has(id)) delete deviceTaskState[id]; });
+            // Purge task cells only for devices that went fully offline. Broader than
+            // getOnlineIds() on purpose: a device mid self-update ("updating") has no
+            // live socket but its Updating… cell must survive the list refresh.
+            const keepTask = new Set(devices.filter(isOnline).map(getDeviceId));
+            Object.keys(deviceTaskState).forEach(function (id) { if (!keepTask.has(id)) delete deviceTaskState[id]; });
             syncActiveGroupSelection();
             render();
             break;
@@ -706,6 +712,18 @@
             addLog('[' + (ok ? 'MATCH' : 'DIFF') + '] verify dir ' + (msg.path || '-') + ' on ' + labelFor(msg.device_id) + (cls.detail ? ' - ' + cls.detail : ''), ok ? 'success' : 'fail');
             break;
           }
+          case 'SELF_UPDATE_RESULT': {
+            const ok = msg.status === 'success';
+            const ver = (msg.version_code != null) ? ' now v' + msg.version_code : '';
+            addLog('[' + (ok ? 'OK' : 'FAIL') + '] self-update on ' + labelFor(msg.device_id) + ver + (msg.detail ? ' - ' + msg.detail : ''), ok ? 'success' : 'fail');
+            break;
+          }
+          case 'SELF_UPDATE_VERIFIED': {
+            const ok = msg.status === 'verified';
+            const level = ok ? 'success' : (msg.status === 'skipped' ? 'info' : 'fail');
+            addLog('[' + (ok ? 'MATCH' : (msg.status || 'error').toUpperCase()) + '] self-update verify on ' + labelFor(msg.device_id) + (msg.detail ? ' - ' + msg.detail : ''), level);
+            break;
+          }
           case 'ERROR': addLog('[ERROR] ' + (msg.message || 'Unknown error'), 'fail'); break;
           default: addLog('Received: ' + msg.type, 'info');
         }
@@ -780,10 +798,11 @@
         return members.map(function (serial) {
           const d = deviceById(serial);
           const label = (d && d.label) ? d.label : serial;
-          const status = !d ? 'Unknown' : (isOnline(d) ? 'Online' : 'Offline');
+          const updating = d && d.status === 'updating';
+          const status = !d ? 'Unknown' : (updating ? 'Updating…' : (isOnline(d) ? 'Online' : 'Offline'));
           const off = !d || !isOnline(d);
           return '<div class="group-dev">' +
-            '<span class="dot ' + (off ? 'off' : '') + '"></span>' +
+            '<span class="dot ' + (updating ? 'updating' : off ? 'off' : '') + '"></span>' +
             '<span class="group-dev-name">' + esc(label) + '</span>' +
             '<span class="group-dev-status">' + status + '</span>' +
             '<span class="group-dev-task" data-task-id="' + esc(serial) + '">' + taskCellHtml(serial) + '</span>' +
@@ -819,10 +838,14 @@
               (startup ? '<span class="badge-startup" title="' + esc(startup) + '">★</span>' : '') +
               '</div>';
           }
-          deviceCell += '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') + '</div>';
+          deviceCell += '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') +
+            (d.version_name ? ' · v' + esc(d.version_name) + (d.version_code != null ? ' (' + esc(d.version_code) + ')' : '') : '') +
+            '</div>';
 
           let status;
-          if (off) {
+          if (d.status === 'updating') {
+            status = '<span class="dot updating"></span>Updating…';
+          } else if (off) {
             status = '<span class="dot off"></span>Offline' +
               (d.last_seen ? '<span class="last-seen" title="Last seen ' + esc(new Date(d.last_seen * 1000).toLocaleString()) + '">' + esc(formatRelativeTime(d.last_seen)) + '</span>' : '') +
               '<button class="forget-btn" data-act="forget" data-id="' + esc(id) + '" title="Forget this device">🗑</button>';
@@ -882,6 +905,7 @@
         if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
         if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
         if (st.status === 'installing') return '<span class="ins-installing"><span class="spinner">⟳</span> Installing…</span>';
+        if (st.status === 'updating') return '<span class="ins-installing"><span class="spinner">⟳</span> Updating…</span>';
         if (st.status === 'success') return '<span class="ins-success">✓ installed</span>' + (st.filename ? ' <span class="ins-none">' + esc(st.filename) + '</span>' : '');
         return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
       }

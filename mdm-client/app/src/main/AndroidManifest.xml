@@ -61,19 +61,6 @@
             </intent-filter>
         </receiver>
 
-        <!-- Self-update spike (issue #39). `enabled` is false unless the build sets
-             -PspikeMode=observe|act, so the default build cannot restart itself and the
-             keep-alive-only baseline stays clean. MY_PACKAGE_REPLACED is a protected
-             broadcast, so exporting the receiver only exposes it to the system. -->
-        <receiver
-            android:name=".PackageReplacedReceiver"
-            android:enabled="${packageReplacedReceiverEnabled}"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
-            </intent-filter>
-        </receiver>
-
     </application>
 
 </manifest>

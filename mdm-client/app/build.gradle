@@ -3,20 +3,6 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
-// Self-update spike instrumentation (issue #39). MY_PACKAGE_REPLACED is delivered to the
-// *new* APK, so the pushed build — not the installed one — decides how the restart is
-// probed. Every spike run needs a fresh versionCode anyway, so the mode rides along as a
-// Gradle property instead of a runtime toggle.
-//   off     — receiver absent from the manifest; measures whether keep-alive alone restarts us
-//   observe — receiver records the broadcast but does not start the service
-//   act     — receiver also calls startForegroundService(), recording success or the throw
-// `off` is the shipped default: a normal build behaves exactly as before.
-def spikeMode = (project.findProperty("spikeMode") ?: "off").toString().toLowerCase()
-if (!(spikeMode in ["off", "observe", "act"])) {
-    throw new GradleException("spikeMode must be one of off|observe|act, got '${spikeMode}'")
-}
-def packageReplacedReceiverEnabled = (spikeMode != "off")
-
 android {
     namespace 'com.styly.mdmclient'
     compileSdk 33
@@ -25,14 +11,10 @@ android {
         applicationId "com.styly.mdmclient"
         minSdk 29
         targetSdk 33
-        // Overridable so a spike run can push a strictly-increasing versionCode without
-        // editing this file. CI passes neither property and gets the committed values.
+        // Overridable so a self-update test run can push a strictly-increasing versionCode
+        // without editing this file. CI passes neither property and gets the committed values.
         versionCode ((project.findProperty("versionCodeOverride") ?: 6) as Integer)
         versionName ((project.findProperty("versionNameOverride") ?: "0.2.3").toString())
-
-        buildConfigField "String", "SPIKE_MODE", "\"${spikeMode}\""
-        // Invariant: the receiver is present in the manifest iff SPIKE_MODE != "off".
-        manifestPlaceholders = [packageReplacedReceiverEnabled: packageReplacedReceiverEnabled.toString()]
     }
 
     signingConfigs {

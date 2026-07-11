@@ -29,6 +29,7 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
+import java.util.Calendar
 import java.util.UUID
 import java.util.zip.ZipFile
 
@@ -54,16 +55,7 @@ class MdmClientService : Service() {
         const val EXTRA_START_REASON = "start_reason"
         const val REASON_BOOT = "boot"
         const val REASON_SETTINGS = "settings"
-        const val REASON_PACKAGE_REPLACED = "package_replaced"
         private const val REASON_SYSTEM = "system"
-
-        /**
-         * Read by PackageReplacedReceiver, which runs in the same freshly-started process, to
-         * tell whether the foreground service was already up when the broadcast arrived.
-         */
-        @Volatile
-        var isRunning = false
-            private set
 
         // Top-level shared-storage directories that full-mirror push-files sync must never
         // target: mirroring into them would delete unrelated user/media/app data. Matched
@@ -106,7 +98,6 @@ class MdmClientService : Service() {
         // right call instead of leaving the two indistinguishable.
         startForeground(NOTIFICATION_ID, buildNotification("Initializing..."))
         UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_FOREGROUND_OK)
-        isRunning = true
 
         webSocketManager = WebSocketManager(
             context = this,
@@ -140,7 +131,6 @@ class MdmClientService : Service() {
     override fun onDestroy() {
         Log.i(TAG, "MdmClientService destroyed")
         UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_DESTROYED)
-        isRunning = false
         webSocketManager.disconnect()
         super.onDestroy()
     }
@@ -234,6 +224,7 @@ class MdmClientService : Service() {
     private fun executeInstall(payload: JSONObject) {
         val apkUrl = payload.optString("apk_url", "")
         val apkFilename = sanitizeApkFilename(payload.optString("apk_filename", ""))
+        val expectedFullSha256 = payload.optString("full_sha256", "")
 
         if (apkUrl.isEmpty()) {
             Log.e(TAG, "EXECUTE_INSTALL missing apk_url")
@@ -255,11 +246,33 @@ class MdmClientService : Service() {
             Log.i(TAG, "Downloading APK: $apkUrl")
             try {
                 val downloadedApk = downloadApk(apkUrl, apkFilename)
+                val resultName = apkFilename.ifEmpty { downloadedApk.name }
                 // Tell the server the network-heavy download is done so it can free
                 // this device's transfer slot and dispatch the next queued device,
-                // while the local (offline) install proceeds below.
-                sendDownloadComplete(task = "install", apkFilename = apkFilename.ifEmpty { downloadedApk.name })
-                installApk(downloadedApk, apkFilename.ifEmpty { downloadedApk.name })
+                // while the local (offline) hashing and install proceed below.
+                sendDownloadComplete(task = "install", apkFilename = resultName)
+
+                val archive = archiveIdentity(downloadedApk)
+                val isSelfUpdate = archive != null && archive.packageName == packageName
+                // The download travelled over plain LAN HTTP; this comparison against
+                // the server-computed reference is its only integrity check.
+                val actualSha256 =
+                    if (expectedFullSha256.isNotEmpty()) fileSha256(downloadedApk) else null
+                val refusal =
+                    InstallPolicy.hashGateError(expectedFullSha256, actualSha256, isSelfUpdate)
+                if (refusal != null) {
+                    Log.e(TAG, "Refusing to install $resultName: $refusal")
+                    UpdateJournal.record(
+                        this,
+                        UpdateJournal.EVENT_INSTALL_REFUSED,
+                        "self_update=$isSelfUpdate file=$resultName reason=$refusal"
+                    )
+                    downloadedApk.delete()
+                    sendInstallResult(resultName, "fail", refusal)
+                    return@Thread
+                }
+
+                installApk(downloadedApk, resultName, archive, isSelfUpdate)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to install APK from $apkUrl", e)
                 sendInstallResult(apkFilename.ifEmpty { apkUrl }, "fail", e.message ?: "Unknown error")
@@ -332,7 +345,12 @@ class MdmClientService : Service() {
         }
     }
 
-    private fun installApk(apkFile: File, apkFilename: String) {
+    private fun installApk(
+        apkFile: File,
+        apkFilename: String,
+        archive: ArchiveIdentity?,
+        isSelfUpdate: Boolean,
+    ) {
         val binder = ToBServiceHelper.getInstance().serviceBinder
         if (binder == null) {
             apkFile.delete()
@@ -341,17 +359,39 @@ class MdmClientService : Service() {
             return
         }
 
-        // When the APK replaces our own package, Android kills this process: the IIntCallback
-        // below never fires on success and the APK is left behind. Commit what we know to disk
-        // first so the replacement process can tell "I was updated" from "I crashed".
-        val archive = archiveIdentity(apkFile)
-        val isSelfUpdate = archive != null && archive.packageName == packageName
+        // When the APK replaces our own package, Android kills this process and nothing
+        // restarts it (measured: keep-alive does not survive, MY_PACKAGE_REPLACED is not
+        // delivered on PICO). Recovery is a one-shot power cycle armed *before* the
+        // installer runs: shutdown at +2 min (the install commits within ~30 s), startup
+        // at +3 min, then the boot path brings the new build back. Everything the
+        // replacement process needs is committed to disk before the installer is invoked,
+        // and the server is told last — ordering matters: if any earlier step fails,
+        // no state has leaked and the install is simply refused.
         if (isSelfUpdate) {
-            UpdateJournal.markSelfUpdateStarted(
-                this,
-                archive!!.versionCode,
-                UUID.randomUUID().toString()
-            )
+            val proxy = binder as? IToBServiceProxy
+            if (proxy == null) {
+                apkFile.delete()
+                Log.e(TAG, "ToBService proxy unavailable; cannot arm the power cycle")
+                sendInstallResult(
+                    apkFilename, "fail",
+                    "ToBService proxy unavailable; self-update needs the power-cycle timers"
+                )
+                return
+            }
+            if (!PowerCycleTimers.arm(this, proxy)) {
+                apkFile.delete()
+                sendInstallResult(
+                    apkFilename, "fail",
+                    "Power-cycle scheduling failed; refusing a self-update with no way back"
+                )
+                return
+            }
+            val correlationId = UUID.randomUUID().toString()
+            UpdateJournal.markSelfUpdateStarted(this, archive!!.versionCode, correlationId)
+            sendSelfUpdateStarting(correlationId, archive.versionCode, apkFilename)
+            // send() only enqueues; the installer is about to kill this process, so
+            // give the announcement a bounded chance to reach the wire.
+            webSocketManager.awaitOutboundFlush(2_000)
         } else {
             UpdateJournal.record(
                 this,
@@ -378,6 +418,18 @@ class MdmClientService : Service() {
                             UpdateJournal.EVENT_INSTALL_CALLBACK,
                             "result=$result (${installResultMessage(result)}) self_update=$isSelfUpdate"
                         )
+                        if (isSelfUpdate) {
+                            // The callback fired at all, which means the installer did NOT
+                            // replace this process — a successful self-replace takes the
+                            // process (and this binder) with it before any callback can run.
+                            // So the process survived and the device must not power-cycle,
+                            // regardless of the result code: disarm unconditionally rather
+                            // than trusting result != 0.
+                            PowerCycleTimers.disarm(
+                                this@MdmClientService,
+                                if (result == 0) "install_callback_survived" else "install_failed"
+                            )
+                        }
                         sendInstallResult(
                             apkFilename,
                             if (result == 0) "success" else "fail",
@@ -392,8 +444,31 @@ class MdmClientService : Service() {
             )
         } catch (e: Exception) {
             apkFile.delete()
+            if (isSelfUpdate) {
+                PowerCycleTimers.disarm(this, "install_failed")
+            }
             throw e
         }
+    }
+
+    /**
+     * The client's last words before the installer kills it: tells the server to
+     * treat the coming disconnect as an update in progress, not an outage, and
+     * hands over the correlation id the re-registration will be matched against.
+     */
+    private fun sendSelfUpdateStarting(
+        correlationId: String,
+        targetVersionCode: Long,
+        apkFilename: String,
+    ) {
+        webSocketManager.sendMessage(JSONObject().apply {
+            put("type", "SELF_UPDATE_STARTING")
+            put("correlation_id", correlationId)
+            put("target_version_code", targetVersionCode)
+            put("current_version_code", BuildConfig.VERSION_CODE)
+            put("package_name", packageName)
+            put("apk_filename", apkFilename)
+        })
     }
 
     /**
