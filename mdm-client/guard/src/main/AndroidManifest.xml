@@ -37,6 +37,10 @@
             </intent-filter>
         </receiver>
 
+        <!-- Deadman alarm target; reached only via our own PendingIntent. -->
+        <receiver
+            android:name=".DeadmanReceiver"
+            android:exported="false" />
     </application>
 
 </manifest>

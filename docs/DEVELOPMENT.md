@@ -45,6 +45,7 @@ Gradle properties, for self-update testing (see [Client Self-Update](#client-sel
 | `-PguardVersionNameOverride=S` | `versionName` in `guard/build.gradle` | Same, for the guard app |
 | `-PguardClientPackageOverride=P` | `com.styly.mdmclient` | Point the guard at a package that does not exist, to exercise stand-down/self-destruct without uninstalling the real client |
 | `-PguardSelfDestructGraceMsOverride=N` | `600000` (10 min) | Shorten the self-destruct grace for that test |
+| `-PguardDeadmanMsOverride=N` | `3600000` (60 min) | Shorten the guard's deadman-alarm interval for that test |
 
 ### Build from Android Studio
 
@@ -178,6 +179,7 @@ STYLY-MDM/
     └── guard/src/main/
         └── java/com/styly/mdmguard/
             ├── GuardService.kt           # Watchdog: revives a dead client via TobService
+            ├── DeadmanReceiver.kt        # Alarm target that restarts the watchdog itself
             └── BootReceiver.kt           # Auto-start on device boot
 ```
 
@@ -570,10 +572,17 @@ directly-deleted guard comes back within a tick, and guard upgrades ride client 
 (the replaced guard's process dies and the next tick restarts the new build). The
 guard's lifecycle is coupled to the client's: it has no launcher entry (no activity at
 all), so when the client's package goes *missing* — a true uninstall; a replace never
-reads as missing — the guard stands down and, after 10 minutes of continued absence,
+reads as missing — the guard stands down and, once 10 minutes of absence accumulate,
 silently uninstalls itself through TobService rather than squatting invisibly on the
 device (verified on device, including that TobService accepts an uninstall of the
-calling package). The power-cycle timers are kept only as the fallback for devices
+calling package). Two mechanisms make that survive the guard's own death: the absence
+clock is persisted wall-clock time (a restarted process resumes it instead of starting
+over — verified by crashing the guard mid-grace), and a self-chaining deadman alarm
+(`setAndAllowWhileIdle` + WAKEUP → `DeadmanReceiver`, hourly) restarts the service
+through process death and device sleep — needed because the watchdog's Handler ticks
+only run while the process is alive and the device is awake, and after the client's
+uninstall nothing else can bring the guard up to finish the job. Uninstalling the
+guard removes its alarms with it. The power-cycle timers are kept only as the fallback for devices
 whose firmware allows them.
 
 The self-update flow:

@@ -1,8 +1,10 @@
 package com.styly.mdmguard
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.os.Handler
@@ -29,9 +31,12 @@ import com.pvr.tobservice.interfaces.IToBServiceProxy
  *
  * The guard's lifecycle is coupled to the client's: it has no launcher entry, so when
  * the client is *uninstalled* (package missing — a replace never reads as missing) the
- * guard first stands down and then, once SELF_DESTRUCT_GRACE_MS passes without the
- * client coming back, silently uninstalls itself rather than squatting invisibly on
- * the device.
+ * guard first stands down and then, once SELF_DESTRUCT_GRACE_MS of absence
+ * accumulates, silently uninstalls itself rather than squatting invisibly on the
+ * device. The absence clock is persisted (wall clock) and a self-chaining deadman
+ * alarm restarts this service periodically, so the destruct fires even when this
+ * process dies or the device sleeps before the grace elapses — after the client's
+ * uninstall nothing else can bring the guard up to clean itself off.
  *
  * Diagnostics: every state change and revival attempt is logged under the
  * GuardService tag, and specific revival methods can be forced over adb:
@@ -55,6 +60,13 @@ class GuardService : Service() {
         private const val CHANNEL_ID = "guard"
         private const val NOTIFICATION_ID = 1
 
+        private const val PREFS = "guard_prefs"
+        // Wall-clock time the client's package was first seen missing; persisted so
+        // the absence accumulates across process deaths and reboots instead of
+        // resetting with every restart.
+        private const val PREF_CLIENT_MISSING_SINCE = "client_missing_since"
+        private const val DEADMAN_REQUEST_CODE = 1
+
         private const val CHECK_INTERVAL_MS = 10_000L
         // A revived client needs time to come up before a second attempt is warranted;
         // also keeps a broken revival path from being hammered every tick.
@@ -66,13 +78,6 @@ class GuardService : Service() {
 
     @Volatile private var watching = true
     private var lastReviveAt = 0L
-    // When the client's package went missing (elapsedRealtime), or null while it is
-    // installed. A missing package is a deliberate uninstall, not a crash: the guard
-    // stands down, and once the grace period passes it uninstalls itself — the guard
-    // has no launcher entry, so nothing else would ever clean up an orphaned one.
-    // The grace absorbs a dev's uninstall/reinstall gap; a package being *replaced*
-    // (self-update) never reads as missing.
-    private var clientMissingSince: Long? = null
 
     private val proxy: IToBServiceProxy?
         get() = ToBServiceHelper.getInstance().serviceBinder as? IToBServiceProxy
@@ -85,13 +90,15 @@ class GuardService : Service() {
         watchdogThread = HandlerThread("guard-watchdog").apply { start() }
         watchdog = Handler(watchdogThread.looper)
         watchdog.postDelayed(::watchdogTick, CHECK_INTERVAL_MS)
+        armDeadman()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val cmd = intent?.getStringExtra("cmd") ?: "watch"
         Log.i(TAG, "onStartCommand cmd=$cmd flags=$flags")
+        armDeadman()
         when (cmd) {
-            "watch" -> Unit // watchdog runs since onCreate
+            "watch", "deadman" -> Unit // watchdog runs since onCreate
             "check" -> watchdog.post { logLiveness() }
             "revive_fgs", "revive_service", "revive_startapp", "revive_keepalive",
             "revive_local" -> watchdog.post { revive(cmd) }
@@ -131,10 +138,16 @@ class GuardService : Service() {
         try {
             if (watching) {
                 if (!isClientInstalled()) {
-                    val now = SystemClock.elapsedRealtime()
-                    val since = clientMissingSince
-                    if (since == null) {
-                        clientMissingSince = now
+                    // A missing package is a deliberate uninstall, not a crash: stand
+                    // down, and once the grace passes uninstall ourselves — nothing
+                    // else would ever clean up a guard with no launcher entry. The
+                    // absence clock is persisted wall-clock time, so it accumulates
+                    // across process deaths and reboots; a clock that jumped backwards
+                    // is rebased rather than trusted.
+                    val now = System.currentTimeMillis()
+                    val since = prefs().getLong(PREF_CLIENT_MISSING_SINCE, 0L)
+                    if (since == 0L || now < since) {
+                        prefs().edit().putLong(PREF_CLIENT_MISSING_SINCE, now).commit()
                         Log.w(
                             TAG,
                             "Client package not installed; standing down " +
@@ -145,7 +158,9 @@ class GuardService : Service() {
                         selfDestruct()
                     }
                 } else {
-                    clientMissingSince = null
+                    if (prefs().getLong(PREF_CLIENT_MISSING_SINCE, 0L) != 0L) {
+                        prefs().edit().remove(PREF_CLIENT_MISSING_SINCE).commit()
+                    }
                     val alive = isClientAlive()
                     if (alive == false) {
                         val now = SystemClock.elapsedRealtime()
@@ -198,6 +213,38 @@ class GuardService : Service() {
         false
     }
 
+    private fun prefs() = getSharedPreferences(PREFS, MODE_PRIVATE)
+
+    /**
+     * (Re)arms the self-chaining deadman alarm. The watchdog's Handler ticks run only
+     * while this process is alive and the device is awake; the alarm survives both —
+     * an ordinary process death does not cancel alarms (only force-stop or uninstall
+     * does) and the WAKEUP variant fires through sleep — and its delivery restarts
+     * this service (see DeadmanReceiver), which re-arms the next link here. After the
+     * client's uninstall this chain is the only thing left that can bring the guard
+     * up to finish its self-destruct: the client, its usual resurrector, is gone.
+     * Uninstalling the guard removes its alarms with it, so the chain cannot outlive
+     * the package.
+     */
+    private fun armDeadman() {
+        try {
+            val alarmManager = getSystemService(AlarmManager::class.java)
+            val pending = PendingIntent.getBroadcast(
+                this,
+                DEADMAN_REQUEST_CODE,
+                Intent(this, DeadmanReceiver::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            alarmManager.setAndAllowWhileIdle(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + BuildConfig.DEADMAN_INTERVAL_MS,
+                pending
+            )
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to arm the deadman alarm", e)
+        }
+    }
+
     /**
      * Uninstalls this guard through TobService's silent uninstall. The guard exists
      * only to serve the client: with the client gone past the grace period, an
@@ -210,7 +257,7 @@ class GuardService : Service() {
         val p = proxy
         if (p == null) {
             Log.e(TAG, "Cannot self-destruct: TobService proxy not bound; will retry")
-            clientMissingSince = SystemClock.elapsedRealtime()
+            prefs().edit().putLong(PREF_CLIENT_MISSING_SINCE, System.currentTimeMillis()).commit()
             return
         }
         try {
@@ -229,7 +276,7 @@ class GuardService : Service() {
         }
         // Reached only if the uninstall did not (yet) kill us: restart the clock so a
         // rejected uninstall retries once per grace period instead of every tick.
-        clientMissingSince = SystemClock.elapsedRealtime()
+        prefs().edit().putLong(PREF_CLIENT_MISSING_SINCE, System.currentTimeMillis()).commit()
     }
 
     private fun clientServiceIntent(): Intent = Intent()
