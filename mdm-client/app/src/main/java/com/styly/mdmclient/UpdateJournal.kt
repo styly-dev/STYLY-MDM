@@ -69,6 +69,12 @@ object UpdateJournal {
     // episode so a persistently failing install cannot churn the journal.
     const val EVENT_GUARD_INSTALLED = "GUARD_INSTALLED"
 
+    // Recorded around the device-retire self-uninstall (#49). On success the journal
+    // disappears with the package; these entries exist for failure forensics.
+    const val EVENT_RETIRE_STARTED = "RETIRE_STARTED"
+    const val EVENT_RETIRE_GUARD_UNINSTALL = "RETIRE_GUARD_UNINSTALL"
+    const val EVENT_RETIRE_FAILED = "RETIRE_FAILED"
+
     /**
      * Appends an event. Safe to call from any thread and from a BroadcastReceiver, and returns
      * only once the entry is on disk.

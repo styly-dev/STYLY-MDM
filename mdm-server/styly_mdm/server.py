@@ -16,6 +16,7 @@ import socket
 import sys
 import tempfile
 import time
+import uuid
 import zipfile
 from pathlib import Path
 from urllib.parse import unquote
@@ -78,6 +79,15 @@ SELF_UPDATE_TIMEOUT = float(os.environ.get("MDM_SELF_UPDATE_TIMEOUT", "480"))
 # (and the "verifying" phase) in memory until the next disconnect or update.
 SELF_UPDATE_VERIFY_TIMEOUT = float(os.environ.get("MDM_SELF_UPDATE_VERIFY_TIMEOUT", "120"))
 
+# Seconds a retiring client may stay silent before the retire is declared
+# successful — for a retire (#49), silence IS the success signal: a removed
+# client can send nothing. Both failure modes resurface well inside this window:
+# a client whose uninstall never ran still holds its WebSocket (checked directly
+# at the deadline), and one that was merely killed is restarted by the ToBService
+# keep-alive and re-registers within the ≤30 s reconnect backoff. No reboot is
+# involved, so this is much shorter than SELF_UPDATE_TIMEOUT.
+RETIRE_TIMEOUT = float(os.environ.get("MDM_RETIRE_TIMEOUT", "120"))
+
 # device_id -> in-flight client self-update, created when the device announces
 # SELF_UPDATE_STARTING right before killing itself with the install:
 #   {phase: "updating"|"verifying", correlation_id, target_version_code,
@@ -88,6 +98,16 @@ SELF_UPDATE_VERIFY_TIMEOUT = float(os.environ.get("MDM_SELF_UPDATE_VERIFY_TIMEOU
 # through the no-pending path; only the "updating" label and the result report
 # are lost.
 pending_self_updates: dict[str, dict] = {}
+
+# device_id -> in-flight retire (#49), created when the device announces
+# SELF_UNINSTALL_STARTING right before uninstalling itself:
+#   {correlation_id, started_at, timeout_task}
+# The self-update semantics inverted: staying away past RETIRE_TIMEOUT is the
+# success (the registry record is then flagged retired), re-registering is the
+# failure. Deliberately in-memory: a server restart mid-retire loses the entry,
+# so a device can never be marked retired spuriously — it simply shows offline
+# and the operator re-checks it and uses Forget.
+pending_retires: dict[str, dict] = {}
 
 # device_id -> {apk_filename, full_sha256, cd_sha256} captured when EXECUTE_INSTALL
 # is dispatched to that device. A self-update announced later (SELF_UPDATE_STARTING)
@@ -179,6 +199,7 @@ def _coerce_record(value) -> dict | None:
             "battery": None,
             "version_code": None,
             "version_name": "",
+            "retired": False,
         }
     if isinstance(value, dict):
         label = value.get("label", "")
@@ -200,6 +221,7 @@ def _coerce_record(value) -> dict | None:
             "battery": battery,
             "version_code": version_code,
             "version_name": version_name if isinstance(version_name, str) else "",
+            "retired": value.get("retired") is True,
         }
     return None
 
@@ -346,13 +368,18 @@ def build_device_list_msg() -> str:
             continue
         # A device that killed itself for a self-update is expected back within
         # minutes; label it "updating" rather than "offline" until it re-registers
-        # or the update times out.
+        # or the update times out. A device that announced a self-uninstall is
+        # "retiring" until its timeout settles it, and "retired" is the terminal
+        # state a successful retire parks the record in.
         pend = pending_self_updates.get(serial)
-        status = (
-            "updating"
-            if pend is not None and pend.get("phase") == "updating"
-            else "offline"
-        )
+        if serial in pending_retires:
+            status = "retiring"
+        elif rec.get("retired"):
+            status = "retired"
+        elif pend is not None and pend.get("phase") == "updating":
+            status = "updating"
+        else:
+            status = "offline"
         device_list.append({
             "device_id": serial,
             "label": rec.get("label", ""),
@@ -739,6 +766,76 @@ def _clear_pending_self_update_on_install_result(device_id: str) -> None:
     log.info("Self-update cancelled by INSTALL_RESULT from %s", device_id)
 
 
+async def _retire_timeout(device_id: str, correlation_id: str) -> None:
+    """Settle a retire whose device stayed away — for a retire, silence is success.
+
+    A removed client can send nothing, so the terminal signal is the absence of a
+    re-registration for RETIRE_TIMEOUT after the announcement. The one failure
+    mode a silent wait would misread — an uninstall that never ran at all, leaving
+    the client alive and connected — is caught by checking the live connection at
+    the deadline.
+    """
+    # Cancellation (the device re-registered, reported failure, or was forgotten)
+    # propagates: swallowing it would make the task look "finished".
+    await asyncio.sleep(RETIRE_TIMEOUT)
+    entry = pending_retires.get(device_id)
+    if entry is None or entry.get("correlation_id") != correlation_id:
+        return
+    del pending_retires[device_id]
+    if device_id in devices:
+        log.warning("Retire failed for %s: still connected (%s)", device_id, correlation_id)
+        await forward_to_admins({
+            "type": "RETIRE_RESULT",
+            "device_id": device_id,
+            "correlation_id": correlation_id,
+            "status": "fail",
+            "detail": (
+                f"still connected {int(RETIRE_TIMEOUT)}s after announcing; "
+                "the uninstall apparently never ran"
+            ),
+        })
+        await broadcast_device_list()
+        return
+    # Tolerate a record forgotten mid-retire: the retire still happened, there is
+    # just nothing left to flag.
+    rec = device_registry.get(device_id)
+    if rec is not None:
+        rec["retired"] = True
+        save_registry()
+    log.info("Device retired: %s (%s)", device_id, correlation_id)
+    await forward_to_admins({
+        "type": "RETIRE_RESULT",
+        "device_id": device_id,
+        "correlation_id": correlation_id,
+        "status": "success",
+        "detail": f"no re-registration within {int(RETIRE_TIMEOUT)}s of the announcement",
+    })
+    await broadcast_device_list()
+
+
+async def _resolve_pending_retire(device_id: str) -> None:
+    """Fail an in-flight retire when its device re-registers.
+
+    The inverse of _resolve_pending_self_update: a retiring device reporting for
+    duty means the uninstall did not stick (ToBService refused it, or the process
+    was merely killed and the keep-alive restarted it).
+    """
+    entry = pending_retires.pop(device_id, None)
+    if entry is None:
+        return
+    timeout_task = entry.get("timeout_task")
+    if timeout_task is not None:
+        timeout_task.cancel()
+    log.warning("Retire failed for %s: device re-registered", device_id)
+    await forward_to_admins({
+        "type": "RETIRE_RESULT",
+        "device_id": device_id,
+        "correlation_id": entry["correlation_id"],
+        "status": "fail",
+        "detail": "device re-registered; the uninstall did not complete",
+    })
+
+
 def resolve_target_ids(target_devices: list[str]) -> list[str]:
     """Return online device IDs matching a target list, or all devices for ["*"]."""
     if not target_devices or target_devices == ["*"]:
@@ -1023,6 +1120,14 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "Device registered: %s (%s, client v%s)",
                         device_id, model, version_code if version_code is not None else "?",
                     )
+                    # A registration during a pending retire is the retire's
+                    # failure signal. Independently, a retired device reporting
+                    # for duty means its client was reinstalled: the registry
+                    # rewrite above deliberately dropped the terminal retired
+                    # flag, re-adopting the device.
+                    if prev.get("retired"):
+                        log.info("Retired device re-registered, re-adopting: %s", device_id)
+                    await _resolve_pending_retire(device_id)
                     # A re-registration is also how a self-updated client reports
                     # back for duty: settle any pending update before the list
                     # broadcast so admins see the result, then the row transition.
@@ -1157,6 +1262,67 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     )
                     await broadcast_install_state([device_id], "updating", apk_filename)
 
+                elif msg_type == "SELF_UNINSTALL_STARTING":
+                    # The client's last words before uninstalling itself (#49):
+                    # remember the retire so the coming disconnect reads as
+                    # "retiring" rather than "offline", and start the clock —
+                    # silence past RETIRE_TIMEOUT is the success signal.
+                    if not device_id:
+                        log.warning("SELF_UNINSTALL_STARTING before REGISTER")
+                        continue
+                    correlation_id = data.get("correlation_id")
+                    if not isinstance(correlation_id, str) or not correlation_id:
+                        log.warning(
+                            "Malformed SELF_UNINSTALL_STARTING from %s: %s",
+                            device_id, raw_msg.data[:200],
+                        )
+                        continue
+                    prev_pend = pending_retires.get(device_id)
+                    if prev_pend is not None and prev_pend.get("timeout_task"):
+                        prev_pend["timeout_task"].cancel()
+                    # A retire supersedes any in-flight self-update: drop its
+                    # pending entry (whatever phase) so its timeout cannot later
+                    # fire a spurious result for a deliberately removed device.
+                    stale = pending_self_updates.pop(device_id, None)
+                    if stale is not None and stale.get("timeout_task"):
+                        stale["timeout_task"].cancel()
+                    entry = {
+                        "correlation_id": correlation_id,
+                        "started_at": time.time(),
+                        # The entry holds the only strong reference to its task.
+                        "timeout_task": None,
+                    }
+                    pending_retires[device_id] = entry
+                    entry["timeout_task"] = asyncio.create_task(
+                        _retire_timeout(device_id, correlation_id)
+                    )
+                    log.info(
+                        "Self-uninstall starting on %s (%s)", device_id, correlation_id,
+                    )
+
+                elif msg_type == "SELF_UNINSTALL_RESULT":
+                    # Only failures arrive on this type: a successful self-uninstall
+                    # kills the client before any callback can run. Settle the
+                    # pending retire (when the failure came after the announcement)
+                    # and surface the failure to admins.
+                    if not device_id:
+                        log.warning("SELF_UNINSTALL_RESULT before REGISTER")
+                        continue
+                    entry = pending_retires.pop(device_id, None)
+                    if entry is not None and entry.get("timeout_task"):
+                        entry["timeout_task"].cancel()
+                    detail = data.get("detail")
+                    if not isinstance(detail, str) or not detail:
+                        detail = "client reported the uninstall failed"
+                    log.warning("Self-uninstall failed on %s: %s", device_id, detail)
+                    await forward_to_admins({
+                        "type": "RETIRE_RESULT",
+                        "device_id": device_id,
+                        "correlation_id": data.get("correlation_id"),
+                        "status": "fail",
+                        "detail": detail,
+                    })
+
                 elif msg_type in {
                     "LAUNCH_RESULT",
                     "INSTALL_RESULT",
@@ -1201,6 +1367,10 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
             # disconnect that announcement has already copied what it needed, so drop
             # it rather than let it linger until the next install overwrites it.
             last_install_dispatch.pop(device_id, None)
+            # A disconnect during a pending retire is likewise the *expected*
+            # teardown: the entry survives (no code needed — it lives in
+            # pending_retires) and the broadcast below renders the row as
+            # "retiring" until _retire_timeout settles it.
             # A disconnect during a pending self-update is the *expected* kill-and-
             # power-cycle, so the entry survives and the list broadcast below renders
             # the row as "updating". A disconnect during the post-update verification
@@ -1290,6 +1460,9 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 elif msg_type == "FORGET_DEVICE":
                     await handle_forget_device(ws, data)
+
+                elif msg_type == "RETIRE_DEVICE":
+                    await handle_retire_device(ws, data)
 
                 elif msg_type == "CREATE_GROUP":
                     await handle_create_group(ws, data)
@@ -1386,6 +1559,11 @@ async def handle_forget_device(admin_ws: web.WebSocketResponse, data: dict):
         return
 
     removed = device_registry.pop(serial, None) is not None
+    # A forget mid-"retiring" must also drop the pending retire, or its timeout
+    # would later report a result for a device the operator already removed.
+    pend = pending_retires.pop(serial, None)
+    if pend is not None and pend.get("timeout_task"):
+        pend["timeout_task"].cancel()
     # Decommission cleanly: drop the serial from every group so no group keeps a
     # dangling reference to a device that is no longer known.
     groups_changed = False
@@ -1650,6 +1828,48 @@ async def handle_launch_app(admin_ws: web.WebSocketResponse, data: dict):
     await admin_ws.send_str(json.dumps({
         "type": "LAUNCH_SENT",
         "package_name": package_name,
+        "sent_count": sent_count,
+        "target_count": len(target_ids),
+    }))
+
+
+async def handle_retire_device(admin_ws: web.WebSocketResponse, data: dict):
+    """Process a RETIRE_DEVICE command: tell target clients to uninstall themselves.
+
+    Retiring is remotely irreversible — recovery means physical adb access per
+    unit — so the console gates this behind its heaviest confirmation. Only
+    online devices can be retired (the uninstall has to run on the device); an
+    offline unit must be booted first. Each dispatch carries a fresh
+    server-generated correlation id that the client echoes back in
+    SELF_UNINSTALL_STARTING, tying announcement and result to this fan-out.
+    """
+    target_devices: list[str] = data.get("target_devices", [])
+    target_ids = resolve_target_ids(target_devices)
+
+    if not target_ids:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "No matching online devices found",
+        }))
+        return
+
+    sent_count = 0
+    for did in target_ids:
+        entry = devices.get(did)
+        if entry:
+            try:
+                await entry["ws"].send_str(json.dumps({
+                    "type": "EXECUTE_SELF_UNINSTALL",
+                    "correlation_id": uuid.uuid4().hex,
+                }))
+                sent_count += 1
+            except ConnectionResetError:
+                log.warning("Failed to send EXECUTE_SELF_UNINSTALL to %s (disconnected)", did)
+
+    log.info("RETIRE_DEVICE: sent to %d/%d devices", sent_count, len(target_ids))
+
+    await admin_ws.send_str(json.dumps({
+        "type": "RETIRE_SENT",
         "sent_count": sent_count,
         "target_count": len(target_ids),
     }))

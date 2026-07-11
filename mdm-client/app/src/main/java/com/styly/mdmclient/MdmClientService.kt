@@ -34,6 +34,8 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.util.Calendar
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.zip.ZipFile
 
 /**
@@ -78,6 +80,12 @@ class MdmClientService : Service() {
         private const val GUARD_ENSURE_INTERVAL_MS = 60_000L
         private const val GUARD_INSTALL_COOLDOWN_MS = 300_000L
 
+        // A retire (#49) uninstalls the guard before the client uninstalls itself.
+        // Bounded wait for the guard uninstall's callback: generous for a local
+        // package removal, but never a blocker — the retire proceeds regardless,
+        // since a surviving guard self-destructs on its own once the client is gone.
+        private const val GUARD_UNINSTALL_WAIT_MS = 15_000L
+
         // Integrity verification (issue #37). The ZIP End-Of-Central-Directory record is
         // the fixed 22-byte trailer plus an optional comment of up to 0xFFFF bytes.
         private const val EOCD_MIN = 22
@@ -108,6 +116,12 @@ class MdmClientService : Service() {
     private var guardInstallInFlight = false
     private var lastGuardInstallAt = 0L
     private var guardInstallJournaled = false
+
+    // A retire is underway: the guard has been (or is being) uninstalled on purpose,
+    // so the mutual-watch tick must not reinstall or restart it. Cleared again only
+    // when the retire fails, which re-opens guard provisioning on the next tick.
+    @Volatile
+    private var retireInProgress = false
 
     override fun onCreate() {
         super.onCreate()
@@ -175,6 +189,9 @@ class MdmClientService : Service() {
      */
     private fun guardEnsureTick() {
         try {
+            // The finally still reschedules, so a failed retire (which clears the
+            // flag) resumes guard provisioning without further ceremony.
+            if (retireInProgress) return
             ensureGuardProvisioned()
             val proxy = ToBServiceHelper.getInstance().serviceBinder as? IToBServiceProxy
             if (proxy != null && GuardLink.isInstalled(this)) {
@@ -292,6 +309,7 @@ class MdmClientService : Service() {
             "EXECUTE_VERIFY_DIR" -> executeVerifyDir(payload)
             "SET_STARTUP_APP" -> handleSetStartupApp(payload)
             "CLEAR_STARTUP_APP" -> handleClearStartupApp()
+            "EXECUTE_SELF_UNINSTALL" -> executeSelfUninstall(payload)
             else -> Log.w(TAG, "Unknown command type: $type")
         }
     }
@@ -646,6 +664,180 @@ class MdmClientService : Service() {
             put("current_version_code", BuildConfig.VERSION_CODE)
             put("package_name", packageName)
             put("apk_filename", apkFilename)
+        })
+    }
+
+    /**
+     * EXECUTE_SELF_UNINSTALL (#49): remove the MDM client from the device for good.
+     *
+     * The venue-handover teardown, ordered so every step still makes sense when a
+     * later one fails:
+     *  1. Close guard provisioning (retireInProgress) and uninstall the guard first.
+     *     Left behind, the guard would sit orphaned for up to its self-destruct grace
+     *     after the client is gone, and could fire one futile revive into the kill
+     *     window. Its outcome never blocks the retire: a surviving guard stands down
+     *     and self-destructs on its own once the client package is missing.
+     *  2. Deregister the ToBService keep-alive so nothing tries to resurrect a
+     *     removed package.
+     *  3. Announce SELF_UNINSTALL_STARTING and flush. The uninstall kills this
+     *     process, so the announcement is the server's only signal — its silence
+     *     afterwards is what the server reads as success.
+     *  4. Invoke the self-uninstall. The callback can only ever report failure (a
+     *     successful removal takes the process with it first); failure clears the
+     *     flag so the next mutual-watch tick reinstalls the guard this retire
+     *     already removed.
+     *
+     * Unlike a self-update, no recovery is armed and nothing is persisted: after a
+     * successful retire nothing is supposed to come back.
+     */
+    private fun executeSelfUninstall(payload: JSONObject) {
+        val correlationId = payload.optString("correlation_id")
+        if (retireInProgress) {
+            Log.w(TAG, "Retire already in progress; ignoring duplicate EXECUTE_SELF_UNINSTALL")
+            return
+        }
+        retireInProgress = true
+        UpdateJournal.record(
+            this,
+            UpdateJournal.EVENT_RETIRE_STARTED,
+            "correlation_id=$correlationId"
+        )
+        // Own thread: the guard uninstall below blocks on its callback, and the
+        // WebSocket reader thread must stay free to carry the announcement out.
+        Thread {
+            try {
+                val binder = ToBServiceHelper.getInstance().serviceBinder
+                if (binder == null) {
+                    failRetire(correlationId, "ToBService not available", null)
+                    return@Thread
+                }
+
+                if (GuardLink.isInstalled(this)) {
+                    val done = CountDownLatch(1)
+                    var guardResult = Int.MIN_VALUE
+                    try {
+                        binder.pbsControlAPPManger(
+                            PBS_PackageControlEnum.PACKAGE_SILENCE_UNINSTALL,
+                            GuardLink.GUARD_PACKAGE,
+                            0,
+                            object : IIntCallback.Stub() {
+                                override fun callback(result: Int) {
+                                    guardResult = result
+                                    done.countDown()
+                                }
+                            }
+                        )
+                        done.await(GUARD_UNINSTALL_WAIT_MS, TimeUnit.MILLISECONDS)
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "Guard uninstall threw; proceeding with the retire", e)
+                    }
+                    val outcome = when (guardResult) {
+                        Int.MIN_VALUE -> "no callback within ${GUARD_UNINSTALL_WAIT_MS}ms"
+                        0 -> "result=0"
+                        else -> "result=$guardResult (${installResultMessage(guardResult)})"
+                    }
+                    Log.i(TAG, "Guard uninstall before retire: $outcome")
+                    UpdateJournal.record(this, UpdateJournal.EVENT_RETIRE_GUARD_UNINSTALL, outcome)
+                }
+
+                try {
+                    binder.pbsAppKeepAlive(packageName, false, 0)
+                } catch (e: Throwable) {
+                    Log.w(TAG, "Keep-alive deregistration failed; proceeding", e)
+                }
+
+                sendSelfUninstallStarting(correlationId)
+                // send() only enqueues; the uninstall is about to kill this process,
+                // so give the announcement a bounded chance to reach the wire.
+                webSocketManager.awaitOutboundFlush(2_000)
+
+                Log.i(TAG, "Uninstalling own package: $packageName")
+                binder.pbsControlAPPManger(
+                    PBS_PackageControlEnum.PACKAGE_SILENCE_UNINSTALL,
+                    packageName,
+                    0,
+                    object : IIntCallback.Stub() {
+                        override fun callback(result: Int) {
+                            // A successful self-uninstall kills this process before the
+                            // callback can run, so running at all means trouble.
+                            if (result != 0) {
+                                failRetire(
+                                    correlationId,
+                                    "pbsControlAPPManger returned $result: ${installResultMessage(result)}",
+                                    result
+                                )
+                            } else {
+                                // "Success" with a surviving process: death may simply
+                                // lag the callback. If we are still here well past
+                                // that, the uninstall did not happen — re-open guard
+                                // provisioning; the server's still-connected check
+                                // reports the failure on its side.
+                                guardEnsure.postDelayed({
+                                    if (retireInProgress) {
+                                        Log.w(
+                                            TAG,
+                                            "Still alive after a 'successful' self-uninstall; treating the retire as failed"
+                                        )
+                                        retireInProgress = false
+                                    }
+                                }, GUARD_ENSURE_INTERVAL_MS)
+                            }
+                        }
+                    }
+                )
+            } catch (e: Throwable) {
+                failRetire(
+                    correlationId,
+                    e.message ?: "Self-uninstall threw ${e.javaClass.simpleName}",
+                    null
+                )
+            }
+        }.start()
+    }
+
+    /** Terminal failure of a retire: report it and re-open guard provisioning. */
+    private fun failRetire(correlationId: String, detail: String, resultCode: Int?) {
+        Log.e(TAG, "Self-uninstall failed: $detail")
+        UpdateJournal.record(this, UpdateJournal.EVENT_RETIRE_FAILED, "detail=$detail")
+        sendSelfUninstallResult(correlationId, detail, resultCode)
+        // The guard was deliberately uninstalled first; clearing the flag lets the
+        // next mutual-watch tick reinstall it, so a failed retire never leaves the
+        // device unguarded.
+        retireInProgress = false
+    }
+
+    /**
+     * The client's last words before the uninstall kills it: tells the server to
+     * treat the coming disconnect as a retire in progress — permanent silence
+     * afterwards is the success signal — echoing the correlation id the server
+     * issued with EXECUTE_SELF_UNINSTALL.
+     */
+    private fun sendSelfUninstallStarting(correlationId: String) {
+        webSocketManager.sendMessage(JSONObject().apply {
+            put("type", "SELF_UNINSTALL_STARTING")
+            put("correlation_id", correlationId)
+            put("package_name", packageName)
+            put("version_code", BuildConfig.VERSION_CODE)
+        })
+    }
+
+    /**
+     * Only ever a failure report: a successful self-uninstall leaves no process to
+     * send anything.
+     */
+    private fun sendSelfUninstallResult(
+        correlationId: String,
+        detail: String,
+        resultCode: Int?,
+    ) {
+        webSocketManager.sendMessage(JSONObject().apply {
+            put("type", "SELF_UNINSTALL_RESULT")
+            put("correlation_id", correlationId)
+            put("status", "fail")
+            put("detail", detail)
+            if (resultCode != null) {
+                put("result_code", resultCode)
+            }
         })
     }
 
