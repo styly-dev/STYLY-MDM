@@ -198,6 +198,8 @@ STYLY-MDM/
 | `VERIFY_APK_RESULT` | Result of an APK integrity check. Fields: `package_name`, `found` (boolean), `size`, `cd_sha256`, `full_sha256`, `version_code`, `version_name`, `signer_sha256`, `error` (optional). Absent hash/version fields when `found` is false. |
 | `VERIFY_DIR_RESULT` | Result of a directory integrity check. Fields: `path`, `found` (boolean), `tree_hash`, `file_count`, `total_size`, `manifest` (optional array of `{relative_path, size, sha256}`, omitted above a cap), `error` (optional) |
 | `SELF_UPDATE_STARTING` | The client's last words before the silent installer kills its process for a self-update: tells the server to treat the coming disconnect as `updating`, not `offline`. Fields: `correlation_id`, `target_version_code`, `current_version_code`, `package_name`, `apk_filename`. See [Client Self-Update](#client-self-update). |
+| `SELF_UNINSTALL_STARTING` | The client's last words before uninstalling itself for a retire: tells the server to treat the coming disconnect as `retiring` and to read permanent silence as success. Fields: `correlation_id` (echoed from `EXECUTE_SELF_UNINSTALL`), `package_name`, `version_code`. See [Device Retirement](#device-retirement). |
+| `SELF_UNINSTALL_RESULT` | Only ever a failure report — a successful self-uninstall leaves no process to send anything. Fields: `correlation_id`, `status` (always `fail`), `detail`, `result_code` (optional) |
 
 ### Server → Device
 
@@ -208,6 +210,7 @@ STYLY-MDM/
 | `EXECUTE_PUSH_FILES` | Download a bundle and apply it to a directory. Fields: `bundle_url`, `bundle_filename`, `dest_path`, `delete_extras` (boolean; `false` = copy/overwrite only, `true` = full mirror. Read with a `false` default — a missing field must never delete) |
 | `EXECUTE_VERIFY_APK` | Compute `size` + Central-Directory digest (plus diagnostics) for an installed package. Fields: `package_name` |
 | `EXECUTE_VERIFY_DIR` | Compute a manifest + tree hash for a device directory (shared storage only). Fields: `path` |
+| `EXECUTE_SELF_UNINSTALL` | Uninstall the guard, announce `SELF_UNINSTALL_STARTING`, then silently uninstall the client itself (venue handover). Fields: `correlation_id` (server-generated per device, echoed back by the announcement) |
 
 ### Admin → Server
 
@@ -224,6 +227,7 @@ STYLY-MDM/
 | `DELETE_GROUP` | Delete a group (member devices are not affected). Fields: `name` |
 | `SET_DEVICE_GROUPS` | Set the exact set of groups a device belongs to. Fields: `device_id`, `groups` (list of existing group names) |
 | `SET_GROUP_MEMBERS` | Set the exact member list of an existing group (group-centric). Fields: `name`, `members` (list of serials; offline/unknown serials allowed) |
+| `RETIRE_DEVICE` | Make target clients uninstall themselves (remotely irreversible — the console gates it behind its heaviest confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only). See [Device Retirement](#device-retirement). |
 
 ### Admin HTTP API
 
@@ -238,7 +242,7 @@ STYLY-MDM/
 
 | Message type | Description |
 |---|---|
-| `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — the latter while a self-update's power cycle is in flight), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting), and may include optional `battery`: `{level, charging, last_seen}`) |
+| `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting), and may include optional `battery`: `{level, charging, last_seen}`) |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
 | `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |
@@ -254,6 +258,8 @@ STYLY-MDM/
 | `VERIFY_APK_RESULT` / `VERIFY_DIR_RESULT` | Forwarded integrity result from a device (stamped with `device_id`). The console compares it against the local reference. Exception: the `VERIFY_APK_RESULT` answering a self-update auto-verify is consumed by the server (which holds the reference) and surfaces as `SELF_UPDATE_VERIFIED` instead. |
 | `SELF_UPDATE_RESULT` | Outcome of a client self-update, settled when the device re-registers (or the window expires). Fields: `device_id`, `correlation_id`, `status` (`success` / `fail` / `timeout`), `version_code` (what the device came back with; `null` on timeout), `target_version_code`, `detail` |
 | `SELF_UPDATE_VERIFIED` | Outcome of the automatic post-update `EXECUTE_VERIFY_APK` the server runs against the client's own package. Fields: `device_id`, `correlation_id`, `status` (`verified` / `mismatch` / `skipped` / `error`), `detail` |
+| `RETIRE_SENT` | Confirmation that `EXECUTE_SELF_UNINSTALL` commands were dispatched. Fields: `sent_count`, `target_count` |
+| `RETIRE_RESULT` | Outcome of a device retire. Success is settled by *silence*: the device announced, disconnected, and stayed away for the retire window. Failure means it re-registered, reported the uninstall failed, or was still connected at the deadline. Fields: `device_id`, `correlation_id`, `status` (`success` / `fail`), `detail` |
 | `GROUP_LIST` | Current device groups. Fields: `groups` (object mapping group name → array of member serials). The console derives each device's group membership from this; sent on connect and after any group change. |
 | `GROUP_CREATED` / `GROUP_RENAMED` / `GROUP_DELETED` | Acknowledgements for group create / rename / delete. |
 | `DEVICE_GROUPS_SET` | Acknowledgement of a device's group membership change. Fields: `device_id`, `groups` |
@@ -711,6 +717,75 @@ When testing, note that a debug-signed APK cannot replace a release-signed insta
 install fails with `106 Package conflict`), that the `prod` and `dev` flavors share
 `applicationId` and therefore replace each other, and that `versionCode` must strictly
 increase (`-PversionCodeOverride`).
+
+## Device Retirement
+
+At final venue handover the MDM client must not remain on delivered devices (issue #49):
+an orphaned client reconnect-loops and broadcasts discovery packets on the customer's
+network indefinitely, and an unmanaged remote-control agent should not ship with delivered
+hardware. The console's **Retire Devices** command makes selected clients uninstall
+themselves — the same `pbsControlAPPManger(PACKAGE_SILENCE_UNINSTALL, <own package>)`
+primitive the guard's self-destruct uses (device-verified there, including that TobService
+accepts an uninstall of the calling package).
+
+The flow inverts the self-update's success signal: a removed client can send nothing, so
+**silence is success**.
+
+1. The console (checkbox gate + a native confirm — the operation is remotely
+   irreversible; recovery means physical USB access per unit) sends `RETIRE_DEVICE`.
+   The server fans out `EXECUTE_SELF_UNINSTALL` to each online target with a fresh
+   server-generated `correlation_id` and acks with `RETIRE_SENT`. Offline devices cannot
+   be retired — the uninstall has to run on the device.
+2. The client, on `EXECUTE_SELF_UNINSTALL` (all on a dedicated thread, journalled as
+   `RETIRE_STARTED` / `RETIRE_GUARD_UNINSTALL` / `RETIRE_FAILED`):
+   1. sets `retireInProgress`, which pauses the mutual-watch tick so the guard is not
+      re-provisioned mid-teardown;
+   2. **uninstalls the guard first** (bounded 15 s wait, then proceeds regardless).
+      Left to its own self-destruct the guard would linger up to ~10 min — or up to
+      ~1 h if its process is down, until the deadman alarm — and could fire one futile
+      revive into the kill window. If this step fails, the passive self-destruct still
+      cleans it up;
+   3. best-effort deregisters the ToBService keep-alive so nothing tries to resurrect
+      a removed package;
+   4. sends `SELF_UNINSTALL_STARTING` (echoing the correlation id) and flushes the
+      socket, then invokes the self-uninstall. No recovery is armed and nothing is
+      persisted: after a successful retire nothing is supposed to come back.
+3. The server parks the announcement in `pending_retires` and starts the retire window
+   (`MDM_RETIRE_TIMEOUT`, default **120 s**). The coming disconnect renders the row as
+   `retiring`. Both failure modes surface well inside the window: a client whose
+   uninstall never ran still holds its WebSocket (checked directly at the deadline), and
+   a merely-killed client is restarted by the keep-alive and re-registers within the
+   ≤30 s reconnect backoff — no reboot is involved, which is why this window is much
+   shorter than `SELF_UPDATE_TIMEOUT`.
+4. Terminal states, reported as `RETIRE_RESULT`:
+   * **Success** — the device stayed away for the whole window. The registry record is
+     flagged `retired` (persisted in `device_registry.json`), the row turns to the
+     terminal greyed `retired` state, and the existing forget button removes it when
+     the operator is done. Retired devices are structurally excluded from command
+     targets (they are never online).
+   * **Fail** — the device re-registered within the window, sent a
+     `SELF_UNINSTALL_RESULT` failure (e.g. ToBService refused the uninstall), or was
+     still connected at the deadline. On the client, a failed retire clears
+     `retireInProgress` so the next mutual-watch tick reinstalls the guard the retire
+     already removed — a failed retire never leaves the device unguarded.
+
+A retire announced while a self-update is pending supersedes it (the stale entry and its
+timeout are dropped). A device that is later reinstalled by hand and re-registers is
+re-adopted: registration rewrites the registry record, deliberately dropping the
+`retired` flag. `pending_retires` is in-memory on purpose: a server restart mid-window
+loses the entry, so a device can never be marked retired spuriously — it simply shows
+`offline` and the operator re-checks it and uses Forget.
+
+What remains on the device after a retire: pushed content and the
+`Download/styly-mdm/` staging directory. **The console's Startup App feature does not
+survive a retire**: it is client state (the package name lives in the client's
+SharedPreferences and the launch happens when the client's own service starts), so once
+the client is gone nothing auto-launches the delivered content. A handover that needs
+boot-time auto-launch must configure the device's kiosk/boot app by other means before
+retiring. First-fleet verification checklist (once per firmware, on one unit): that the
+client and guard packages are both gone after the retire, and that no ToBService
+keep-alive or appops residue misbehaves (`MANAGE_EXTERNAL_STORAGE` pointing at a removed
+package is inert but worth a glance).
 
 ## Server Discovery Protocol
 

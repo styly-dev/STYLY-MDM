@@ -161,6 +161,7 @@
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 6px; vertical-align: middle; }
     .dot.off { background: var(--text-muted); }
     .dot.updating { background: var(--warning, #d29922); }
+    .dot.retiring { background: var(--danger, #f85149); }
     .last-seen { color: var(--text-muted); font-size: 11px; margin-left: 4px; }
     .dev-battery { font-size: 12px; padding-right: 12px; }
     .battery { display: inline-flex; align-items: center; gap: 7px; color: var(--text-secondary); white-space: nowrap; }
@@ -446,6 +447,15 @@
                 <div class="verify-hint">Reference is hashed locally in your browser — nothing is uploaded. Dropping a folder skips the &ldquo;Upload N files&rdquo; prompt that Chrome always shows for <em>Choose Folder</em>. Large trees hash faster with <code>styly-mdm hash &lt;path&gt;</code> — load its JSON here. Shared storage only.</div>
               </div>
             </div>
+            <div class="cmd-divider"></div>
+            <div class="cmd-section collapsed" data-cmd="retire">
+              <div class="cmd-head" data-act="toggleCmd"><span>Retire Devices</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <div class="push-warn">⚠ Permanently removes the MDM client (and its guard app) from the selected devices, for final handover. Retired devices go offline and can <strong>no longer be managed remotely</strong> — recovery requires physical USB access per unit. Pushed content remains, but a startup app set here stops auto-launching once the client is gone.</div>
+                <label class="push-confirm"><input type="checkbox" id="retireConfirm"> I understand the MDM client will be uninstalled and this cannot be undone from the console</label>
+                <button class="btn btn-danger-outline" id="btnRetire" disabled>Retire Selected</button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -540,6 +550,8 @@
       const verifyDirJson = document.getElementById('verifyDirJson');
       const verifyDirRefName = document.getElementById('verifyDirRefName');
       const btnVerifyDir = document.getElementById('btnVerifyDir');
+      const retireConfirm = document.getElementById('retireConfirm');
+      const btnRetire = document.getElementById('btnRetire');
       const logContainer = document.getElementById('logContainer');
       const logEmpty = document.getElementById('logEmpty');
       const btnClearLog = document.getElementById('btnClearLog');
@@ -552,7 +564,9 @@
       // string carrying a double quote would otherwise escape the attribute.
       function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML.replace(/"/g, '&quot;'); }
       function getDeviceId(d) { return d.device_id || d.serial_number || ''; }
-      function isOnline(d) { return d.status !== 'offline'; }
+      // Allowlist, not a "!== 'offline'" denylist: a new server-side status (e.g.
+      // retiring/retired) must default to the dimmed, not-a-command-target styling.
+      function isOnline(d) { return d.status === 'online' || d.status === 'updating'; }
       function deviceById(id) { return devices.find(function (d) { return getDeviceId(d) === id; }); }
       // Command targets need a live WebSocket, which "updating" (mid self-update,
       // device rebooting) does not have — only strictly-online devices qualify.
@@ -728,6 +742,12 @@
             addLog('[' + (ok ? 'MATCH' : (msg.status || 'error').toUpperCase()) + '] self-update verify on ' + labelFor(msg.device_id) + (msg.detail ? ' - ' + msg.detail : ''), level);
             break;
           }
+          case 'RETIRE_SENT': addLog('Retire command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'RETIRE_RESULT': {
+            const ok = msg.status === 'success';
+            addLog('[' + (ok ? 'OK' : 'FAIL') + '] retire ' + labelFor(msg.device_id) + (msg.detail ? ' - ' + msg.detail : ''), ok ? 'success' : 'fail');
+            break;
+          }
           case 'ERROR': addLog('[ERROR] ' + (msg.message || 'Unknown error'), 'fail'); break;
           default: addLog('Received: ' + msg.type, 'info');
         }
@@ -853,6 +873,12 @@
           let status;
           if (d.status === 'updating') {
             status = '<span class="dot updating"></span>Updating…';
+          } else if (d.status === 'retiring') {
+            status = '<span class="dot retiring"></span>Retiring…';
+          } else if (d.status === 'retired') {
+            status = '<span class="dot off"></span>Retired' +
+              (d.last_seen ? '<span class="last-seen" title="Last seen ' + esc(new Date(d.last_seen * 1000).toLocaleString()) + '">' + esc(formatRelativeTime(d.last_seen)) + '</span>' : '') +
+              '<button class="forget-btn" data-act="forget" data-id="' + esc(id) + '" title="Remove this retired device from the list">🗑</button>';
           } else if (off) {
             status = '<span class="dot off"></span>Offline' +
               (d.last_seen ? '<span class="last-seen" title="Last seen ' + esc(new Date(d.last_seen * 1000).toLocaleString()) + '">' + esc(formatRelativeTime(d.last_seen)) + '</span>' : '') +
@@ -956,6 +982,7 @@
         syncPanel.refreshButton(has);
         btnVerifyApk.disabled = !verifyApkRef || verifyApkPkg.value.trim() === '' || !has;
         btnVerifyDir.disabled = !verifyDirRef || verifyDirPath.value.trim() === '' || !has;
+        btnRetire.disabled = !retireConfirm.checked || !has;
       }
 
       // ---------------- Selection actions ----------------
@@ -1175,6 +1202,21 @@
         const online = onlineTargets(Array.from(selectedIds));
         if (!online.length) { addLog('No online devices selected to clear startup app', 'warn'); return; }
         if (wsSend({ type: 'CLEAR_STARTUP_APP', target_devices: online }, 'clear startup app')) addLog('Clearing startup app on ' + online.length + ' device(s)', 'info');
+      }
+
+      // Retiring uninstalls the MDM client from the device — remotely irreversible —
+      // so this command alone backs the checkbox gate with a native confirm.
+      function sendRetire() {
+        if (!retireConfirm.checked) return;
+        const online = onlineTargets(Array.from(selectedIds));
+        if (!online.length) { addLog('No online devices selected to retire', 'warn'); return; }
+        const names = online.map(labelFor).join(', ');
+        if (!confirm('Retire ' + online.length + ' device(s)?\n' + names + '\n\nThe MDM client will be uninstalled and these devices will permanently go offline.')) return;
+        if (wsSend({ type: 'RETIRE_DEVICE', target_devices: online }, 'retire devices')) {
+          addLog('Retiring ' + online.length + ' device(s)…', 'info');
+          retireConfirm.checked = false;
+          updateButtons();
+        }
       }
 
       // ---------------- Label / Forget ----------------
@@ -1928,6 +1970,8 @@
       verifyDirJson.addEventListener('change', onVerifyDirJson);
       verifyDirPath.addEventListener('input', updateButtons);
       btnVerifyDir.addEventListener('click', sendVerifyDir);
+      retireConfirm.addEventListener('change', updateButtons);
+      btnRetire.addEventListener('click', sendRetire);
       btnClearLog.addEventListener('click', function () { logContainer.innerHTML = ''; logContainer.appendChild(logEmpty); logEmpty.style.display = 'block'; });
 
       // Command sections accordion: only one open at a time (matches the original

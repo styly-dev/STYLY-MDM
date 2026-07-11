@@ -21,6 +21,7 @@ STYLY-MDM currently supports PICO devices (PICO OS with Business Mode). Support 
 - **Folder sync** — mirror a folder into a directory on selected devices, so the destination matches it exactly (new files added, changed files overwritten, **extras removed**). Requires an explicit confirmation, since it deletes. Both actions are limited to shared storage (`/sdcard`)
 - **Integrity verification** — on demand, check that an installed APK (or a shared-storage directory) on selected devices matches a local reference; the reference is hashed in your browser (or via the `styly-mdm hash` CLI) with no upload and no HTTPS requirement, and each device shows a ✓/✗ match
 - **Client self-update** — push a new MDM client build over MDM itself: the download is verified against server-computed hashes before installing, the device power-cycles itself to recover from the install killing the client, the console shows `updating` (not `offline`) across the restart, and the result — including a post-update integrity check — is reported per device
+- **Device retirement** — at final handover, remove the MDM client (and its guard app) from selected devices remotely: the client silently uninstalls itself, so no per-device cable work is needed. Remotely irreversible, so the console gates it behind an explicit confirmation; devices that stay silent for the retire window are parked in a terminal `retired` state, and a device that comes back instead is reported as a failed retire
 - **Auto-terminate on switch** — the current foreground app is force-stopped before launching a new one, preventing resource conflicts
 - **Server discovery** — devices can automatically find the MDM server on the LAN via UDP broadcast (port 7071), eliminating manual URL entry
 - **IP address display** — the server logs its LAN IP addresses on startup so you know exactly where to connect
@@ -73,6 +74,7 @@ Open `http://<server-ip>:7070` in a browser to access the web console.
 | Data directory (uploaded APKs, pushed bundles, device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
 | Simultaneous device downloads, server-wide | `MDM_MAX_CONCURRENT_TRANSFERS` | `--max-concurrent-transfers` | `5` |
 | Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `600` |
+| Seconds a retiring device must stay silent before the retire counts as done | `MDM_RETIRE_TIMEOUT` | — | `120` |
 
 The **data directory** holds everything the server persists: uploaded APKs (`apks/`), pushed file bundles (`bundles/`), and the device registry (`device_registry.json`). It defaults to the directory the server is started from, so `uvx styly-mdm` in a fresh directory comes up with no devices or groups. Pass `--data-dir` to pin it somewhere stable.
 
