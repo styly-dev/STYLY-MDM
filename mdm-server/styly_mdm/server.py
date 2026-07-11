@@ -2586,7 +2586,13 @@ async def run_server(port: int | None = None):
     app = create_app()
     ip_addresses = get_local_ip_addresses()
 
-    log.info("Starting STYLY-MDM server on port %d", port)
+    # Imported lazily to avoid a circular import: __init__ defines __version__ but
+    # also imports this module. setuptools_scm reports "0.0.0" from a checkout with
+    # no tags (or an install outside a git tree); label that so the log never reads
+    # like a real release.
+    from . import __version__
+    version_label = f"{__version__} (untagged)" if __version__ == "0.0.0" else __version__
+    log.info("Starting STYLY-MDM server v%s on port %d", version_label, port)
     if ip_addresses:
         for ip in ip_addresses:
             log.info("  Server running at http://%s:%d", ip, port)

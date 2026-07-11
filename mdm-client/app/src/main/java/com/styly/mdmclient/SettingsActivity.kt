@@ -50,6 +50,10 @@ class SettingsActivity : AppCompatActivity() {
         // started below, so the journal shows which route brought the client back.
         UpdateJournal.record(this, UpdateJournal.EVENT_ACTIVITY_ONCREATE)
 
+        // Surface the installed build on the settings screen (VERSION_NAME already carries
+        // the "-dev" suffix for the dev flavor, so no special-casing is needed here).
+        findViewById<TextView>(R.id.app_version).text = "v${BuildConfig.VERSION_NAME}"
+
         serverUrlInput = findViewById(R.id.server_url_input)
         statusText = findViewById(R.id.status_text)
         saveButton = findViewById(R.id.save_button)
