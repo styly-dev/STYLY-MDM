@@ -60,6 +60,15 @@ object UpdateJournal {
     const val EVENT_POWER_CYCLE_SCHEDULED = "POWER_CYCLE_SCHEDULED"
     const val EVENT_POWER_CYCLE_CLOSED = "POWER_CYCLE_CLOSED"
 
+    // Recorded when the mutual-watch tick finds the guard app installed but down and
+    // has to start it (first deployment, the guard's own update, or a crash).
+    const val EVENT_GUARD_STARTED = "GUARD_STARTED"
+
+    // Recorded when the tick installs the embedded guard APK (missing or outdated),
+    // and once more if that install reports failure. Gated to once per absence
+    // episode so a persistently failing install cannot churn the journal.
+    const val EVENT_GUARD_INSTALLED = "GUARD_INSTALLED"
+
     /**
      * Appends an event. Safe to call from any thread and from a BroadcastReceiver, and returns
      * only once the entry is on disk.
@@ -83,7 +92,12 @@ object UpdateJournal {
      * the process dies. The replacement process reads this back to tell "I was updated" from
      * "I crashed and restarted".
      */
-    fun markSelfUpdateStarted(context: Context, targetVersionCode: Long, correlationId: String) {
+    fun markSelfUpdateStarted(
+        context: Context,
+        targetVersionCode: Long,
+        correlationId: String,
+        recovery: String,
+    ) {
         synchronized(lock) {
             prefs(context).edit()
                 .putBoolean(PREF_UPDATE_IN_PROGRESS, true)
@@ -95,7 +109,7 @@ object UpdateJournal {
             context,
             EVENT_SELF_INSTALL_INVOKED,
             "target_version_code=$targetVersionCode correlation_id=$correlationId " +
-                "running_version_code=${BuildConfig.VERSION_CODE}"
+                "running_version_code=${BuildConfig.VERSION_CODE} recovery=$recovery"
         )
     }
 
@@ -165,10 +179,15 @@ object UpdateJournal {
      *
      * A marker left behind means the replacement never ran the new build — which is the
      * outcome worth seeing.
+     *
+     * Returns true when a landing was confirmed here — i.e. this process start is the
+     * first run of the replacement build. The caller uses that to sweep the downloaded
+     * APK the dead process could never delete, independent of which recovery mechanism
+     * brought the build back (the power-cycle armed flag is only set on that fallback).
      */
-    fun confirmSelfUpdateIfLanded(context: Context) {
-        val pending = pendingSelfUpdate(context) ?: return
-        if (BuildConfig.VERSION_CODE.toLong() < pending.targetVersionCode) return
+    fun confirmSelfUpdateIfLanded(context: Context): Boolean {
+        val pending = pendingSelfUpdate(context) ?: return false
+        if (BuildConfig.VERSION_CODE.toLong() < pending.targetVersionCode) return false
 
         record(
             context,
@@ -184,6 +203,7 @@ object UpdateJournal {
                 .remove(PREF_CORRELATION_ID)
                 .commit()
         }
+        return true
     }
 
     fun clear(context: Context) {

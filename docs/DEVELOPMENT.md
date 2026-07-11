@@ -41,6 +41,11 @@ Gradle properties, for self-update testing (see [Client Self-Update](#client-sel
 |---|---|---|
 | `-PversionCodeOverride=N` | `versionCode` in `app/build.gradle` | Push a strictly-increasing `versionCode` without editing the file |
 | `-PversionNameOverride=S` | `versionName` in `app/build.gradle` | Label a one-off build |
+| `-PguardVersionCodeOverride=N` | `versionCode` in `guard/build.gradle` | Same, for the guard app (`./gradlew :guard:assembleDebug`) |
+| `-PguardVersionNameOverride=S` | `versionName` in `guard/build.gradle` | Same, for the guard app |
+| `-PguardClientPackageOverride=P` | `com.styly.mdmclient` | Point the guard at a package that does not exist, to exercise stand-down/self-destruct without uninstalling the real client |
+| `-PguardSelfDestructGraceMsOverride=N` | `600000` (10 min) | Shorten the self-destruct grace for that test |
+| `-PguardDeadmanMsOverride=N` | `3600000` (60 min) | Shorten the guard's deadman-alarm interval for that test |
 
 ### Build from Android Studio
 
@@ -155,21 +160,27 @@ STYLY-MDM/
 │   └── tests/
 │       └── test_app.py      # Smoke tests
 └── mdm-client/
-    └── app/src/main/
-        ├── AndroidManifest.xml
-        └── java/com/styly/mdmclient/
-            ├── MdmClientApplication.kt   # Application entry point
-            ├── MdmClientService.kt       # Foreground service; executes launch commands
-            ├── WebSocketManager.kt       # WebSocket connection with auto-reconnect
-            ├── SettingsActivity.kt       # UI to configure server URL; shows client build; Update Journal viewer
-            ├── ServerDiscovery.kt        # UDP broadcast server discovery
-            ├── BundleSync.kt             # Push/sync a file bundle into a device directory
-            ├── UpdateJournal.kt          # Persistent event log; survives a self-update kill
-            ├── UpdateJournalCodec.kt     # Journal serialization (unit-tested on the host JVM)
-            ├── InstallPolicy.kt          # Hash gate for downloaded APKs (host-JVM tested)
-            ├── PowerCycleSchedule.kt     # Shutdown/startup times for a self-update (host-JVM tested)
-            ├── PowerCycleTimers.kt       # Arms/disarms the PICO timing APIs around a self-update
-            └── BootReceiver.kt           # Auto-start on device boot; the self-update recovery path
+    ├── app/src/main/
+    │   ├── AndroidManifest.xml
+    │   └── java/com/styly/mdmclient/
+    │       ├── MdmClientApplication.kt   # Application entry point
+    │       ├── MdmClientService.kt       # Foreground service; executes launch commands
+    │       ├── WebSocketManager.kt       # WebSocket connection with auto-reconnect
+    │       ├── SettingsActivity.kt       # UI to configure server URL; shows client build; Update Journal viewer
+    │       ├── ServerDiscovery.kt        # UDP broadcast server discovery
+    │       ├── BundleSync.kt             # Push/sync a file bundle into a device directory
+    │       ├── UpdateJournal.kt          # Persistent event log; survives a self-update kill
+    │       ├── UpdateJournalCodec.kt     # Journal serialization (unit-tested on the host JVM)
+    │       ├── InstallPolicy.kt          # Hash gate for downloaded APKs (host-JVM tested)
+    │       ├── GuardLink.kt              # Client half of the mutual watch with the guard app
+    │       ├── PowerCycleSchedule.kt     # Shutdown/startup times for a self-update (host-JVM tested)
+    │       ├── PowerCycleTimers.kt       # Arms/disarms the PICO timing APIs (self-update fallback)
+    │       └── BootReceiver.kt           # Auto-start on device boot
+    └── guard/src/main/
+        └── java/com/styly/mdmguard/
+            ├── GuardService.kt           # Watchdog: revives a dead client via TobService
+            ├── DeadmanReceiver.kt        # Alarm target that restarts the watchdog itself
+            └── BootReceiver.kt           # Auto-start on device boot
 ```
 
 ## WebSocket Protocol Reference
@@ -533,32 +544,74 @@ reports the install result dies with the binder: on success it never fires and t
 simply drops. The #39 device spike measured what happens next on PICO (A9210 / PUI 5.15.5 /
 Android 14): **nothing restarts the client** — `pbsAppKeepAlive` does not survive the
 replacement and `MY_PACKAGE_REPLACED` is never delivered, even to an enabled receiver of a
-non-stopped package. A device reboot, however, recovers fully unattended: `BootReceiver`
-gets both `com.pvr.tobservice.SERVICE_AUTO_BOOT` and `BOOT_COMPLETED`.
+non-stopped package. A device reboot recovers fully unattended (`BootReceiver` gets both
+`com.pvr.tobservice.SERVICE_AUTO_BOOT` and `BOOT_COMPLETED`), but the scheduled power
+cycle that was to force that reboot turned out to be dead on current firmware: the PICO
+timing APIs fail with `-1` because the firmware's SELinux policy denies the poweroffalarm
+app access to the Qualcomm RTC alarm HAL (`avc: denied { find }` for
+`vendor.qti.hardware.alarm.IAlarm`, `permissive=0`) — a platform decision no app code can
+change. (Also measured: the timing APIs resolve `com.google.gson.JsonObject` internally,
+and tobservicelib's AAR declares no dependencies, so without an explicit Gson dependency
+they kill the process with a `NoClassDefFoundError` that no `catch (Exception)` sees —
+which is why the SDK-facing guards catch `Throwable`.)
 
-The self-update flow is built on those two facts:
+Recovery therefore comes from the **guard app** (`guard/`, `com.styly.mdmguard`): a
+separate package the client's self-replace cannot kill. `GuardService` binds TobService,
+registers its own keep-alive, and every 10 s checks the client's process
+(`getRunningAppProcesses`); when the client is down (and its package still installed — a
+deliberate uninstall is not fought), it starts it back up with TobService's privileged
+`startForegroundService`, which is exempt from background-start restrictions and punches
+through the stopped state (verified on device: revival lands in seconds, even after
+`am force-stop`). The watch is mutual — the client *provisions* the guard: the guard APK
+ships embedded in the client build (`assets/guard.apk`, packed by `:app`'s
+`copyGuardApk*` tasks from `:guard`), and `MdmClientService`'s 60 s tick silent-installs
+it whenever it is missing or older than the embedded copy (journalling
+`GUARD_INSTALLED`), then starts it when it is installed but not running (journalling
+`GUARD_STARTED` on the transition). Deploying the client therefore deploys the guard, a
+directly-deleted guard comes back within a tick, and guard upgrades ride client updates
+(the replaced guard's process dies and the next tick restarts the new build). The
+guard's lifecycle is coupled to the client's: it has no launcher entry (no activity at
+all), so when the client's package goes *missing* — a true uninstall; a replace never
+reads as missing — the guard stands down and, once 10 minutes of absence accumulate,
+silently uninstalls itself through TobService rather than squatting invisibly on the
+device (verified on device, including that TobService accepts an uninstall of the
+calling package). Two mechanisms make that survive the guard's own death: the absence
+clock is persisted wall-clock time (a restarted process resumes it instead of starting
+over — verified by crashing the guard mid-grace), and a self-chaining deadman alarm
+(`setAndAllowWhileIdle` + WAKEUP → `DeadmanReceiver`, hourly) restarts the service
+through process death and device sleep — needed because the watchdog's Handler ticks
+only run while the process is alive and the device is awake, and after the client's
+uninstall nothing else can bring the guard up to finish the job. Uninstalling the
+guard removes its alarms with it. The power-cycle timers are kept only as the fallback for devices
+whose firmware allows them.
+
+The self-update flow:
 
 1. **Hash gate.** `EXECUTE_INSTALL` carries `full_sha256`/`cd_sha256` of the file the
    server is dispatching (computed once per job from the upload in `apks/`). After the
    download, the client compares `full_sha256` (`InstallPolicy.hashGateError`) and refuses
    on mismatch. A *self*-update is refused outright when the server sent no hashes — a bad
    client build costs remote control of the device and Android offers no rollback.
-2. **Arm the power cycle.** `PowerCycleTimers.arm` schedules a one-shot shutdown at
-   now+2 min and startup at now+3 min via the PICO timing APIs
-   (`IToBServiceProxy.openTimingShutdown` / `openTimingStartup`, absolute
-   `(year, month-1-based, day, hour, minute)`; computed by `PowerCycleSchedule`, which is
-   unit-tested for the 0- vs 1-based month and date rollovers). If scheduling fails, the
-   self-update is refused — installing with no way back would strand the device. The armed
-   state is persisted so the replacement build knows to disarm. A *partial* failure (a
-   shutdown timer that opened while its paired startup did not) is the dangerous case: it
-   would power the device off with no scheduled return, and the disarm retry only runs at the
-   next process start, which a powered-off device never reaches. So `arm` does not simply
-   return on a partial failure — it closes both timers in-process with a bounded retry
-   (`resolvePartialArm`, unit-tested), and only reports the refusal as *safe* once the
-   shutdown timer is confirmed closed. If it cannot be, `arm` returns `REFUSED_UNSAFE` and the
-   client sends an `INSTALL_RESULT` fail whose detail flags the unsafe state, so a reachable
-   device surfaces it to the console rather than silently treating the refused install as
-   enough recovery. (No client code can force an unresponsive timing API to close, so a
+2. **Arm recovery.** The client confirms the guard is running before relying on it:
+   `GuardLink.ensureRunning` checks the guard's process, starts it if needed, and polls up
+   to 5 s for it to appear. With the guard confirmed, the update proceeds with
+   `recovery=guard`. Otherwise the client falls back to the power-cycle timers:
+   `PowerCycleTimers.arm` schedules a one-shot shutdown at now+2 min and startup at
+   now+3 min via the PICO timing APIs (`IToBServiceProxy.openTimingShutdown` /
+   `openTimingStartup`, absolute `(year, month-1-based, day, hour, minute)`; computed by
+   `PowerCycleSchedule`, which is unit-tested for the 0- vs 1-based month and date
+   rollovers). If that also fails, the self-update is refused — installing with no way
+   back would strand the device. The armed state is persisted so the replacement build
+   knows to disarm. A *partial* arming failure (a shutdown timer that opened while its
+   paired startup did not) is the dangerous case: it would power the device off with no
+   scheduled return, and the disarm retry only runs at the next process start, which a
+   powered-off device never reaches. So `arm` does not simply return on a partial failure —
+   it closes both timers in-process with a bounded retry (`resolvePartialArm`,
+   unit-tested), and only reports the refusal as *safe* once the shutdown timer is
+   confirmed closed. If it cannot be, `arm` returns `REFUSED_UNSAFE` and the client sends
+   an `INSTALL_RESULT` fail whose detail flags the unsafe state, so a reachable device
+   surfaces it to the console rather than silently treating the refused install as enough
+   recovery. (No client code can force an unresponsive timing API to close, so a
    persistent failure is surfaced, not eliminated.)
 3. **Announce, then install.** The client persists the update marker (target
    `versionCode` + correlation id), sends `SELF_UPDATE_STARTING`, waits for the outbound
@@ -569,15 +622,21 @@ The self-update flow is built on those two facts:
    shows `Updating…` via `INSTALL_DEVICE_STATE`. If the device does not re-register within
    `MDM_SELF_UPDATE_TIMEOUT` (default 480 s), the update is reported as `timeout` and the
    row falls back to offline.
-5. **Reboot recovery.** The power cycle fires; the new build boots, disarms the timers and
-   deletes the leftover APK from `Downloads/styly-mdm/` (`MdmClientApplication`, once the
-   ToBService binder binds), reconnects, and re-registers with its `version_code`. Disarm is
-   treated as done only when both `closeTiming*` calls confirm success — neither throwing nor
-   returning a non-zero code (they are `int`-returning APIs). Any unconfirmed close keeps the
-   persisted armed flag set so the next process start retries, rather than retiring a shutdown
-   timer that may still be live; after `MAX_DISARM_ATTEMPTS` (3) starts the flag is retired
-   anyway, so a past-due one-shot timer that can no longer be closed does not loop the
-   recovery on every boot (`POWER_CYCLE_CLOSED` records `cleared` / `retry_pending` / `gave_up`).
+5. **Revival.** The guard's next watchdog tick finds the client down and starts the new
+   build through TobService (measured on device: down for ~3 s, `SELF_UPDATE_VERIFIED`
+   ~4 s after dispatch). The new build confirms the update marker and — on that
+   confirmed landing, independent of which recovery mechanism brought it back — sweeps
+   the downloaded APK from `Downloads/styly-mdm/` (`MdmClientApplication.onCreate`; the
+   dead process could never delete it), reconnects, and re-registers with its
+   `version_code`; its journal records the start with `reason=guard`. On the power-cycle fallback the reboot does the same
+   through the boot path, and the new build additionally disarms the timers: disarm is
+   treated as done only when both `closeTiming*` calls confirm success — neither throwing
+   nor returning a non-zero code (they are `int`-returning APIs). Any unconfirmed close
+   keeps the persisted armed flag set so the next process start retries, rather than
+   retiring a shutdown timer that may still be live; after `MAX_DISARM_ATTEMPTS` (3)
+   starts the flag is retired anyway, so a past-due one-shot timer that can no longer be
+   closed does not loop the recovery on every boot (`POWER_CYCLE_CLOSED` records
+   `cleared` / `retry_pending` / `gave_up`).
 6. **Result + auto-verify.** The server settles the update by comparing the re-registered
    `version_code` against the target (`SELF_UPDATE_RESULT`, carrying the correlation id),
    then runs `EXECUTE_VERIFY_APK` against the client's own package and compares the
@@ -593,20 +652,32 @@ The self-update flow is built on those two facts:
    reported as a verify `error` rather than pinning the entry in the `verifying` phase.
 
 On **install failure** the process survives and the `IIntCallback` fires: the client
-disarms the timers and sends the usual `INSTALL_RESULT` fail, which also clears the
-server's pending state. Because the callback firing at all proves the process was *not*
-replaced, the client disarms regardless of the result code, not only on a non-zero one.
-The scheduled reboot doubles as the timeout recovery — if the install is invoked and
-nothing happens, the device still power-cycles and whichever build is installed comes
-back online.
+sends the usual `INSTALL_RESULT` fail, which also clears the server's pending state, and —
+when the power-cycle fallback armed timers — disarms them. Because the callback firing at
+all proves the process was *not* replaced, the disarm ignores the result code; it is gated
+on the persisted armed flag, so the guard path (which opens no timers) skips it. The guard
+also doubles as the "install invoked, nothing happened" recovery: whichever build ends up
+installed, a dead client is started back up within one watchdog tick.
 
 ### Deployment invariants
 
 - **Deploy the server before pushing a new client.** A client refuses to self-update
   without server-supplied hashes, so an old server cannot push the new client onto devices.
+- **The guard needs no deployment of its own.** It ships inside the client APK and the
+  client's tick installs/starts/upgrades it (a release client embeds the release-signed
+  guard — `:guard` uses the same env-driven signing as `:app`, so `assembleProdRelease`
+  covers both). A freshly installed guard is in the stopped state and receives no boot
+  broadcast until a reboot; the tick starts it within a minute, and from then on boot
+  (`BootReceiver`), keep-alive, and the mutual watch keep it up. Uninstalling the client
+  releases its guard via the self-destruct grace — no separate cleanup step. Without a
+  running guard, a self-update falls back to the power-cycle timers and — on firmware
+  where those are refused — the update itself is refused with an `INSTALL_RESULT` fail
+  naming both.
 - **The first rollout is manual.** Clients older than this feature (≤ v6) have no recovery
-  path: self-updating them still strands the device until a manual reboot. Plan one
-  cable/attended update per device to cross onto the new client.
+  path: self-updating them still strands the device until a manual reboot. The same holds
+  for any client whose *running* build predates a fix in this area — the running build is
+  the one that executes the update, so a broken self-update path cannot be fixed *by* a
+  self-update. Plan one cable/attended update per device to cross onto the new client.
 - **Only local uploads are verified.** An `apk_url` outside the server's `apks/` directory
   yields no hashes: normal installs proceed unverified (as before), self-updates refuse.
 - **A server restart mid-update loses only the reporting.** The pending state is in-memory;
@@ -625,10 +696,16 @@ invoking the silent installer, so the replacement process can tell "I was update
 The journal is readable in the headset under **Settings → Update Journal**, so diagnosing a
 failed update does not require adb. Serialization lives in `UpdateJournalCodec` (one
 tab-separated event per line) and is unit-tested on the host JVM. The events around a
-self-update: `INSTALL_REFUSED` (hash gate), `POWER_CYCLE_SCHEDULED` (with the PICO timing
-API read-back strings), `SELF_INSTALL_INVOKED`, then — in the replacement process —
-`APP_ONCREATE`, `SELF_UPDATE_CONFIRMED`, and `POWER_CYCLE_CLOSED reason=recovery`.
-`POWER_CYCLE_CLOSED reason=install_failed|schedule_failed` mark the failure paths.
+self-update: `INSTALL_REFUSED` (hash gate), `SELF_INSTALL_INVOKED` (whose detail carries
+`recovery=guard|power_cycle`), then — in the replacement process — `APP_ONCREATE`,
+`SELF_UPDATE_CONFIRMED`, and `SERVICE_START_COMMAND reason=guard` when the guard did the
+revival. On the power-cycle path, `POWER_CYCLE_SCHEDULED` (with the PICO timing API
+read-back strings) precedes the install and `POWER_CYCLE_CLOSED reason=recovery` follows
+the reboot; `POWER_CYCLE_CLOSED reason=install_failed|schedule_failed` mark its failure
+paths. `GUARD_STARTED` and `GUARD_INSTALLED` record the client's half of the mutual
+watch: the tick started a guard that was installed but down, or silent-installed the
+embedded guard because it was missing or older (with a `failed result=` entry when that
+install reports an error; both are gated to once per absence episode).
 
 When testing, note that a debug-signed APK cannot replace a release-signed install (silent
 install fails with `106 Package conflict`), that the `prod` and `dev` flavors share

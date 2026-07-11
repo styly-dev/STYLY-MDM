@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Package visibility (Android 11+): the watchdog checks whether the client is
+         still installed before trying to revive it, so a deliberate uninstall is not
+         fought with a start attempt every tick. -->
+    <queries>
+        <package android:name="com.styly.mdmclient" />
+    </queries>
+
+    <application android:label="STYLY-MDM Guard">
+
+        <!-- Required for TobService high-risk APIs (app launch, keep-alive). -->
+        <meta-data
+            android:name="pico_advance_interface"
+            android:value="0" />
+
+        <!-- Exported so TobService's boot broadcast, the client's mutual-watch start,
+             and adb can all reach it. -->
+        <service
+            android:name=".GuardService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.pvr.tobservice.SERVICE_AUTO_BOOT" />
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="com.pvr.tobservice.SERVICE_AUTO_BOOT" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Deadman alarm target; reached only via our own PendingIntent. -->
+        <receiver
+            android:name=".DeadmanReceiver"
+            android:exported="false" />
+    </application>
+
+</manifest>
