@@ -55,12 +55,17 @@ object PowerCycleTimers {
      */
     fun arm(context: Context, proxy: IToBServiceProxy): ArmOutcome {
         val plan = PowerCycleSchedule.compute(Calendar.getInstance())
+        // These SDK calls are guarded with catch(Throwable), not catch(Exception): the
+        // timing APIs resolve com.google.gson.JsonObject internally, and a missing Gson
+        // raises NoClassDefFoundError (an Error). Treating any failure as a non-zero
+        // return keeps arm()'s "refuse safely on a scheduling failure" contract intact
+        // instead of letting the Error escape and kill the install thread.
         val shutdownRet = try {
             proxy.openTimingShutdown(
                 plan.shutdown.year, plan.shutdown.month, plan.shutdown.day,
                 plan.shutdown.hour, plan.shutdown.minute,
             )
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e(TAG, "openTimingShutdown threw", e)
             Int.MIN_VALUE
         }
@@ -69,7 +74,7 @@ object PowerCycleTimers {
                 plan.startup.year, plan.startup.month, plan.startup.day,
                 plan.startup.hour, plan.startup.minute,
             )
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e(TAG, "openTimingStartup threw", e)
             Int.MIN_VALUE
         }
@@ -79,12 +84,12 @@ object PowerCycleTimers {
         }
         val shutdownStatus = try {
             proxy.pbsGetTimingShutDownStatusTwo(0)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             "error ${e.javaClass.name}: ${e.message}"
         }
         val startupStatus = try {
             proxy.pbsGetTimingStartupStatusTwo(0)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             "error ${e.javaClass.name}: ${e.message}"
         }
         UpdateJournal.record(
@@ -130,13 +135,13 @@ object PowerCycleTimers {
             }
             val shutdownClosed = try {
                 proxy.closeTimingShutdown() == 0
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "closeTimingShutdown threw during refuse-close", e)
                 false
             }
             val startupClosed = try {
                 proxy.closeTimingStartup() == 0
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "closeTimingStartup threw during refuse-close", e)
                 false
             }
@@ -220,14 +225,14 @@ object PowerCycleTimers {
         var threw = false
         val shutdownRet = try {
             proxy.closeTimingShutdown()
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e(TAG, "closeTimingShutdown threw", e)
             threw = true
             Int.MIN_VALUE
         }
         val startupRet = try {
             proxy.closeTimingStartup()
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e(TAG, "closeTimingStartup threw", e)
             threw = true
             Int.MIN_VALUE

@@ -81,6 +81,11 @@ dependencies {
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.squareup.okhttp3:okhttp:4.11.0'
     implementation 'com.picoxr.tobservice:tobservicelib:4.3.16'
+    // tobservicelib's timing APIs (openTimingShutdown/openTimingStartup) serialize
+    // their request through com.google.gson.JsonObject but the AAR ships no POM, so
+    // Gson is not pulled transitively. Without it those calls raise NoClassDefFoundError
+    // (an Error, not an Exception) that bypasses every catch and kills the process.
+    implementation 'com.google.code.gson:gson:2.11.0'
 
     // Host JVM tests. BundleSync deletes files on the device, so its copy-vs-mirror
     // behaviour is proven here rather than only on real hardware.

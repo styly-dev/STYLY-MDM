@@ -273,7 +273,12 @@ class MdmClientService : Service() {
                 }
 
                 installApk(downloadedApk, resultName, archive, isSelfUpdate)
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
+                // Throwable, not Exception: a self-update runs on this thread and can
+                // hit linkage Errors from the ToBService SDK (e.g. NoClassDefFoundError
+                // when a transitive dependency is missing). An uncaught Error here kills
+                // the process before SELF_UPDATE_STARTING is ever sent, so the server
+                // never learns the install failed. Catching it lets the failure surface.
                 Log.e(TAG, "Failed to install APK from $apkUrl", e)
                 sendInstallResult(apkFilename.ifEmpty { apkUrl }, "fail", e.message ?: "Unknown error")
             }
