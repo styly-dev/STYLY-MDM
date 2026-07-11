@@ -549,7 +549,17 @@ The self-update flow is built on those two facts:
    `(year, month-1-based, day, hour, minute)`; computed by `PowerCycleSchedule`, which is
    unit-tested for the 0- vs 1-based month and date rollovers). If scheduling fails, the
    self-update is refused — installing with no way back would strand the device. The armed
-   state is persisted so the replacement build knows to disarm.
+   state is persisted so the replacement build knows to disarm. A *partial* failure (a
+   shutdown timer that opened while its paired startup did not) is the dangerous case: it
+   would power the device off with no scheduled return, and the disarm retry only runs at the
+   next process start, which a powered-off device never reaches. So `arm` does not simply
+   return on a partial failure — it closes both timers in-process with a bounded retry
+   (`resolvePartialArm`, unit-tested), and only reports the refusal as *safe* once the
+   shutdown timer is confirmed closed. If it cannot be, `arm` returns `REFUSED_UNSAFE` and the
+   client sends an `INSTALL_RESULT` fail whose detail flags the unsafe state, so a reachable
+   device surfaces it to the console rather than silently treating the refused install as
+   enough recovery. (No client code can force an unresponsive timing API to close, so a
+   persistent failure is surfaced, not eliminated.)
 3. **Announce, then install.** The client persists the update marker (target
    `versionCode` + correlation id), sends `SELF_UPDATE_STARTING`, waits for the outbound
    queue to flush (OkHttp `send()` only enqueues), and invokes the silent installer. The

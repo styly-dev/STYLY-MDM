@@ -378,13 +378,25 @@ class MdmClientService : Service() {
                 )
                 return
             }
-            if (!PowerCycleTimers.arm(this, proxy)) {
-                apkFile.delete()
-                sendInstallResult(
-                    apkFilename, "fail",
-                    "Power-cycle scheduling failed; refusing a self-update with no way back"
-                )
-                return
+            when (PowerCycleTimers.arm(this, proxy)) {
+                PowerCycleTimers.ArmOutcome.ARMED -> Unit // proceed with the self-update
+                PowerCycleTimers.ArmOutcome.REFUSED_SAFE -> {
+                    apkFile.delete()
+                    sendInstallResult(
+                        apkFilename, "fail",
+                        "Power-cycle scheduling failed; refusing a self-update with no way back"
+                    )
+                    return
+                }
+                PowerCycleTimers.ArmOutcome.REFUSED_UNSAFE -> {
+                    apkFile.delete()
+                    sendInstallResult(
+                        apkFilename, "fail",
+                        "UNSAFE: power-cycle scheduling failed and a shutdown timer may still be armed " +
+                            "without a paired startup timer; the device may power off until it is manually restarted"
+                    )
+                    return
+                }
             }
             val correlationId = UUID.randomUUID().toString()
             UpdateJournal.markSelfUpdateStarted(this, archive!!.versionCode, correlationId)

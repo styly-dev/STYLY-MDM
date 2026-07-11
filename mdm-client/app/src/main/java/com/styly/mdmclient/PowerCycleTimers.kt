@@ -28,12 +28,32 @@ object PowerCycleTimers {
     private const val MAX_DISARM_ATTEMPTS = 3
 
     /**
-     * Returns false — with both timers closed again — when any call fails: a
-     * self-update with no way back would strand the device. The read-back strings
-     * are journalled so a wrong wall-clock schedule (time zone, 1-based month) is
-     * diagnosable from the headset after the fact.
+     * Bounded in-process retry budget for closing timers when arming partially
+     * fails. `arm()` runs off the main thread (see MdmClientService, inside a
+     * Thread), so a short blocking backoff between attempts is safe; kept small so
+     * the total wait stays well under an ANR even if it ever moved.
      */
-    fun arm(context: Context, proxy: IToBServiceProxy): Boolean {
+    private const val MAX_ARM_CLOSE_ATTEMPTS = 4
+    private const val ARM_CLOSE_BACKOFF_MS = 150L
+
+    /** Outcome of [arm]. A refusal is safe only once no shutdown timer can remain armed alone. */
+    enum class ArmOutcome { ARMED, REFUSED_SAFE, REFUSED_UNSAFE }
+
+    /** Whether a single close pass confirmed each timer closed (returned 0, no throw). */
+    data class CloseResult(val shutdownClosed: Boolean, val startupClosed: Boolean)
+
+    /**
+     * Returns ARMED once both one-shot timers are scheduled. On any scheduling
+     * failure it refuses the self-update (installing with no way back would strand
+     * the device) but does not return until the dangerous shape — a shutdown timer
+     * armed without its paired startup, which would power the device off with no
+     * scheduled return — has been closed out or, if it cannot be, surfaced:
+     * REFUSED_UNSAFE tells the caller to report an unsafe state to the server
+     * rather than treating the refused install as enough recovery. The read-back
+     * strings are journalled so a wrong wall-clock schedule (time zone, 1-based
+     * month) is diagnosable from the headset after the fact.
+     */
+    fun arm(context: Context, proxy: IToBServiceProxy): ArmOutcome {
         val plan = PowerCycleSchedule.compute(Calendar.getInstance())
         val shutdownRet = try {
             proxy.openTimingShutdown(
@@ -55,8 +75,7 @@ object PowerCycleTimers {
         }
         if (shutdownRet != 0 || startupRet != 0) {
             Log.e(TAG, "Power-cycle scheduling failed: shutdown=$shutdownRet startup=$startupRet")
-            disarm(context, "schedule_failed shutdown_ret=$shutdownRet startup_ret=$startupRet")
-            return false
+            return refuseAndCloseOut(context, proxy, shutdownRet, startupRet)
         }
         val shutdownStatus = try {
             proxy.pbsGetTimingShutDownStatusTwo(0)
@@ -75,7 +94,106 @@ object PowerCycleTimers {
                 "shutdown_status=$shutdownStatus startup_status=$startupStatus"
         )
         UpdateJournal.markPowerCycleTimersSet(context)
-        return true
+        return ArmOutcome.ARMED
+    }
+
+    /**
+     * Handles a partial/total scheduling failure without ever leaving a shutdown
+     * timer armed alone if it can be helped. Closes *both* timers (the open return
+     * codes are not trusted to say what actually armed — same conservative stance
+     * as [disarm]) and retries within a bounded window, since the close itself can
+     * fail transiently. The persisted armed flag is set whenever anything may still
+     * be armed, so a reboot's recovery retries; the outcome is REFUSED_SAFE once
+     * the shutdown timer is confirmed closed (a lone startup timer is benign — it
+     * only powers an already-on device on) and REFUSED_UNSAFE otherwise.
+     */
+    private fun refuseAndCloseOut(
+        context: Context,
+        proxy: IToBServiceProxy,
+        shutdownRet: Int,
+        startupRet: Int,
+    ): ArmOutcome {
+        // Sticky across passes: a timer that any pass confirmed closed stays closed
+        // (re-closing an already-closed one-shot may return non-zero, which must not
+        // flip a safe state back to unsafe).
+        var shutdownEverClosed = false
+        var startupEverClosed = false
+        var attempt = 0
+        val shutdownWasArmed = shutdownRet == 0
+        val outcome = resolvePartialArm(MAX_ARM_CLOSE_ATTEMPTS, shutdownWasArmed) {
+            if (attempt++ > 0) {
+                try {
+                    Thread.sleep(ARM_CLOSE_BACKOFF_MS)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+            val shutdownClosed = try {
+                proxy.closeTimingShutdown() == 0
+            } catch (e: Exception) {
+                Log.e(TAG, "closeTimingShutdown threw during refuse-close", e)
+                false
+            }
+            val startupClosed = try {
+                proxy.closeTimingStartup() == 0
+            } catch (e: Exception) {
+                Log.e(TAG, "closeTimingStartup threw during refuse-close", e)
+                false
+            }
+            if (shutdownClosed) shutdownEverClosed = true
+            if (startupClosed) startupEverClosed = true
+            CloseResult(shutdownClosed, startupClosed)
+        }
+        // Only a timer that actually opened (ret == 0) and was not since confirmed
+        // closed may still be armed; trust the same open==0 signal arm() uses on its
+        // success path. A total open failure leaves nothing armed, so no retry flag.
+        val shutdownMaybeArmed = shutdownWasArmed && !shutdownEverClosed
+        val startupMaybeArmed = startupRet == 0 && !startupEverClosed
+        if (shutdownMaybeArmed || startupMaybeArmed) {
+            // Something may still be armed; a reboot's recovery must retry the close.
+            UpdateJournal.markPowerCycleTimersSet(context)
+        }
+        UpdateJournal.record(
+            context,
+            UpdateJournal.EVENT_POWER_CYCLE_CLOSED,
+            "reason=schedule_failed shutdown_ret=$shutdownRet startup_ret=$startupRet " +
+                "attempts=$attempt shutdown_was_armed=$shutdownWasArmed " +
+                "close_shutdown=$shutdownEverClosed close_startup=$startupEverClosed outcome=$outcome"
+        )
+        if (outcome == ArmOutcome.REFUSED_UNSAFE) {
+            Log.e(TAG, "Power-cycle arming left an unsafe state: shutdown may be armed without a paired startup")
+        }
+        return outcome
+    }
+
+    /**
+     * Pure decision for a partial arming failure: replays up to [maxAttempts] close
+     * passes, tracking per timer whether *any* pass confirmed it closed (a closed
+     * one-shot stays closed even if a later re-close reports non-zero). The only
+     * unsafe outcome is a shutdown timer that [shutdownWasArmed] and was never
+     * confirmed closed — that alone can power the device off with no scheduled
+     * return; when shutdown never armed there is nothing to strand the device, so
+     * the refusal is safe regardless of what the close of a never-armed timer
+     * reports. A lone startup timer is likewise benign (it only powers an
+     * already-on device on). Kept free of I/O so the control flow is unit-tested on
+     * the host JVM.
+     */
+    fun resolvePartialArm(
+        maxAttempts: Int,
+        shutdownWasArmed: Boolean,
+        closeAttempt: () -> CloseResult,
+    ): ArmOutcome {
+        var shutdownEverClosed = false
+        var startupEverClosed = false
+        repeat(maxAttempts) {
+            val pass = closeAttempt()
+            if (pass.shutdownClosed) shutdownEverClosed = true
+            if (pass.startupClosed) startupEverClosed = true
+            val shutdownSafe = !shutdownWasArmed || shutdownEverClosed
+            if (shutdownSafe && startupEverClosed) return ArmOutcome.REFUSED_SAFE
+        }
+        return if (!shutdownWasArmed || shutdownEverClosed) ArmOutcome.REFUSED_SAFE
+        else ArmOutcome.REFUSED_UNSAFE
     }
 
     /**
