@@ -45,6 +45,14 @@ DATA_DIR = Path(os.environ.get("MDM_DATA_DIR", ".")).resolve()
 APK_DIR = DATA_DIR / "apks"
 MAX_APK_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB
 
+# The signed styly-mdm-client APK matching this server is bundled inside the wheel
+# (read-only package data) and seeded into APK_DIR on startup, so the console can
+# offer it to out-of-date devices without an operator upload. Release APKs follow
+# the styly-mdm-client_<version>.apk convention (.github/workflows/release.yml);
+# the regex tolerates an optional "v" prefix and the "-<n>" upload-collision suffix.
+BUNDLED_CLIENT_DIR = Path(__file__).resolve().parent / "client"
+CLIENT_APK_RE = re.compile(r"^styly-mdm-client_v?(\d+(?:\.\d+)+)(?:-\d+)?\.apk$")
+
 # Maximum number of device downloads allowed in flight across the whole server.
 # Fanning a file out to a large group otherwise makes every device pull it from the
 # server at the same instant (an APK can be up to 2 GiB, a push bundle likewise),
@@ -447,6 +455,83 @@ async def forward_to_admins(payload: dict):
             stale.append(ws)
     for ws in stale:
         admin_connections.discard(ws)
+
+
+def _client_apk_version(name: str) -> tuple[str, tuple[int, ...]] | None:
+    """Parse a styly-mdm-client APK filename into (version_str, version_tuple).
+
+    Returns None when the name is not a client APK. The tuple is for ordering
+    (so "0.10.0" > "0.2.0"); the string is what the console displays/compares.
+    """
+    m = CLIENT_APK_RE.match(name)
+    if not m:
+        return None
+    ver_str = m.group(1)
+    return ver_str, tuple(int(part) for part in ver_str.split("."))
+
+
+def latest_client_apk() -> dict | None:
+    """The newest styly-mdm-client APK in APK_DIR, or None if there is none.
+
+    Newest wins by version tuple, ties broken by mtime (a re-upload of the same
+    tag lands as ``..._v0.3.0-1.apk``). The returned url is relative to the server
+    root; the console makes it absolute against its own origin, exactly like an
+    operator-uploaded APK's url.
+    """
+    best: tuple[tuple[tuple[int, ...], float], Path, str] | None = None
+    try:
+        entries = list(APK_DIR.glob("*.apk"))
+    except OSError:
+        return None
+    for path in entries:
+        parsed = _client_apk_version(path.name)
+        if parsed is None:
+            continue
+        ver_str, ver_tuple = parsed
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        key = (ver_tuple, mtime)
+        if best is None or key > best[0]:
+            best = (key, path, ver_str)
+    if best is None:
+        return None
+    _, path, ver_str = best
+    return {"filename": path.name, "url": f"/apks/{path.name}", "version": ver_str}
+
+
+def client_apk_info_payload() -> dict:
+    """The CLIENT_APK_INFO message body (apk is None when none is available)."""
+    return {"type": "CLIENT_APK_INFO", "apk": latest_client_apk()}
+
+
+def build_client_apk_msg() -> str:
+    return json.dumps(client_apk_info_payload())
+
+
+def seed_bundled_client_apk() -> None:
+    """Copy the wheel-bundled signed client APK into the writable APK_DIR.
+
+    The wheel ships the client APK under ``styly_mdm/client/`` (read-only
+    site-packages); copying it into APK_DIR makes it served and detected exactly
+    like an operator upload. Idempotent: names already present are left untouched,
+    so an operator's own upload of the same file is never clobbered.
+    """
+    if not BUNDLED_CLIENT_DIR.is_dir():
+        return
+    APK_DIR.mkdir(parents=True, exist_ok=True)
+    for src in sorted(BUNDLED_CLIENT_DIR.glob("*.apk")):
+        if CLIENT_APK_RE.match(src.name) is None:
+            continue
+        dest = APK_DIR / src.name
+        if dest.exists():
+            continue
+        try:
+            shutil.copy2(src, dest)
+            log.info("Seeded bundled client APK: %s", src.name)
+        except OSError:
+            log.exception("Failed to seed bundled client APK %s", src.name)
 
 
 def transfer_slots() -> asyncio.Semaphore:
@@ -1417,6 +1502,7 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
     from . import __version__
     try:
         await ws.send_str(json.dumps({"type": "SERVER_INFO", "version": __version__}))
+        await ws.send_str(build_client_apk_msg())
         await ws.send_str(build_device_list_msg())
         await ws.send_str(build_group_list_msg())
     except ConnectionResetError:
@@ -2416,6 +2502,10 @@ async def upload_apk_handler(request: web.Request) -> web.Response:
     apk_url = f"{request.scheme}://{request.host}/apks/{destination.name}"
     log.info("Uploaded APK: %s (%d bytes)", destination.name, size)
 
+    # A freshly uploaded client APK may be the newest one — refresh the console's
+    # per-device Update buttons for every admin, not just the uploader.
+    await forward_to_admins(client_apk_info_payload())
+
     return web.json_response({
         "apk_filename": destination.name,
         "apk_url": apk_url,
@@ -2765,6 +2855,7 @@ def create_app() -> web.Application:
     app.router.add_static("/static", static_dir)
 
     APK_DIR.mkdir(parents=True, exist_ok=True)
+    seed_bundled_client_apk()
     app.router.add_static("/apks", APK_DIR)
 
     BUNDLE_DIR.mkdir(parents=True, exist_ok=True)

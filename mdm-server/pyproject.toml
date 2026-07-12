@@ -44,7 +44,10 @@ styly-mdm = "styly_mdm.server:main"
 packages = ["styly_mdm"]
 
 [tool.setuptools.package-data]
-styly_mdm = ["static/*"]
+# static/* is the web console; client/* is the signed styly-mdm-client APK that
+# CI drops in before the wheel build, seeded into the data dir at startup so the
+# console can offer it to out-of-date devices (styly_mdm.server.seed_bundled_client_apk).
+styly_mdm = ["static/*", "client/*"]
 
 # Version is derived from git tags (vX.Y.Z) — single source of truth shared with
 # the APK release flow. The git root is the repo root, one level up from this

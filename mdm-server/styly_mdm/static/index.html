@@ -172,6 +172,8 @@
     .dev-version { margin-left: auto; flex: 0 0 auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-weight: 600; color: var(--text-secondary); background: var(--bg-actions); border: 1px solid var(--border-soft); border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
     .dev-version.unknown { color: var(--text-muted); font-weight: 400; }
     .dev-version.mismatch { color: var(--danger); border-color: var(--danger); font-weight: 700; }
+    .btn-update { margin-left: 6px; flex: 0 0 auto; font: 600 11px/1 inherit; color: #fff; background: var(--accent); border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; white-space: nowrap; }
+    .btn-update:hover { background: var(--accent-hover); }
     .dev-sub { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .dev-status { font-size: 13px; }
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 6px; vertical-align: middle; }
@@ -512,6 +514,7 @@
       let ws = null;
       let devices = [];
       let serverVersion = null;        // STYLY-MDM server version, from SERVER_INFO
+      let clientApk = null;            // newest styly-mdm-client APK on the server, from CLIENT_APK_INFO ({filename,url,version} or null)
       let groups = {};                 // name -> [serials]
       let selectedIds = new Set();
       let activeGroup = null;          // group name driving the selection, or null
@@ -715,6 +718,13 @@
       // ---------------- Message handling ----------------
       function handleMessage(msg) {
         switch (msg.type) {
+          case 'CLIENT_APK_INFO': {
+            // Sent on connect (right after SERVER_INFO, before DEVICE_LIST) and again
+            // whenever an APK is uploaded, so the per-device Update buttons stay current.
+            clientApk = msg.apk || null;
+            if (devices.length) render();
+            break;
+          }
           case 'SERVER_INFO': {
             serverVersion = msg.version || null;
             updateServerVersionBadge();
@@ -995,11 +1005,20 @@
                 (verBehind ? 'Client v' + esc(d.version_name) + ' trails server ' + esc(serverVersion) + ' — needs updating' : 'Client build') +
                 '">v' + esc(d.version_name) + '</span>'
             : '<span class="dev-version unknown" title="Client build unknown (device predates version reporting)">unknown</span>';
+          // Offer a one-click self-update only when the server's client APK would
+          // actually clear the mismatch — i.e. it reaches the server's major.minor.
+          // (A stale APK older than the server would leave the device still red.)
+          const canUpdate = verBehind && clientApk &&
+            cmpMajorMinor(parseMajorMinor(clientApk.version), srvMinor) >= 0;
+          const updateBtn = canUpdate
+            ? '<button class="btn-update" data-act="update" data-id="' + esc(id) + '" title="Install styly-mdm-client v' + esc(clientApk.version) + ' (the device reinstalls the MDM client and restarts)">Update</button>'
+            : '';
           deviceCell = '<div class="dev-label-row">' +
             (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') +
             '<button class="ic-btn ' + (d.label ? '' : 'assign-btn') + '" data-act="editLabel" data-id="' + esc(id) + '" title="' + (d.label ? 'Edit label' : 'Assign label') + '">✏</button>' +
             (startup ? '<span class="badge-startup" title="' + esc(startup) + '">★</span>' : '') +
             verBadge +
+            updateBtn +
             '</div>';
         }
         deviceCell += '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.ip || '-') + '</div>';
@@ -1386,6 +1405,22 @@
         editingLabelId = null;
         wsSend({ type: 'SET_DEVICE_LABEL', device_id: id, label: val }, 'set label');
         render();
+      }
+      // ---------------- Client update ----------------
+      // Reuses the normal install path pointed at the server's own client APK: the
+      // device recognises its own package and drives the self-update handshake.
+      function sendClientUpdate(id) {
+        if (!clientApk) { addLog('No client APK available on the server to update with', 'warn'); return; }
+        const d = deviceById(id);
+        if (!d || d.status !== 'online') { addLog('Cannot update: device is not online', 'warn'); return; }
+        const name = (d && d.label) || id;
+        if (!confirm('Update "' + name + '" to styly-mdm-client v' + clientApk.version + '?\n\nThe device will reinstall the MDM client and restart.')) return;
+        // Absolute URL against our own origin, exactly like an operator-uploaded APK.
+        const apkUrl = new URL(clientApk.url, location.origin).href;
+        if (!wsSend({ type: 'INSTALL_APK', target_devices: [id], apk_url: apkUrl, apk_filename: clientApk.filename }, 'update client')) return;
+        deviceTaskState[id] = { task: 'install', status: 'queued', filename: clientApk.filename, detail: '' };
+        updateTaskCell(id);
+        addLog('Updating ' + name + ' to client v' + clientApk.version, 'info');
       }
       function sendForget(id) {
         const d = deviceById(id); const name = (d && d.label) || id;
@@ -2088,6 +2123,7 @@
         else if (act === 'saveLabel') commitLabel(t.dataset.id);
         else if (act === 'cancelLabel') { editingLabelId = null; render(); }
         else if (act === 'forget') sendForget(t.dataset.id);
+        else if (act === 'update') sendClientUpdate(t.dataset.id);
       });
       // Targets label-edit keyboard
       targetsBody.addEventListener('keydown', function (e) {

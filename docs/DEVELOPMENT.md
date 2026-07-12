@@ -245,6 +245,7 @@ STYLY-MDM/
 | Message type | Description |
 |---|---|
 | `SERVER_INFO` | Server identity, sent once on connect (before the first `DEVICE_LIST`). Fields: `version` (the `styly_mdm` package version; the console renders it next to the `STYLY-MDM` brand in the top bar. Its `major.minor` is the compatibility reference — and the top-bar value itself turns red when a live client is on a *newer* `major.minor` (i.e. the server is the one lagging). See the compatibility note below). |
+| `CLIENT_APK_INFO` | The newest styly-mdm-client APK the server holds, sent on connect (right after `SERVER_INFO`, before `DEVICE_LIST`) and re-broadcast after every APK upload. Field: `apk` = `{filename, url, version}` or `null`. Drives the per-device **Update** button (see the client-update note below). |
 | `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting; a *stable-online* client whose `version_name` trails the server on `major.minor` is flagged red as needing an update — the reverse case, a client *ahead* of the server, reddens the top-bar server version instead. `updating` and offline rows are exempt, and the check is skipped only when the server version is the `0.0.0` untagged/not-installed fallback), and may include optional `battery`: `{level, charging, last_seen}`) |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
@@ -279,6 +280,22 @@ STYLY-MDM/
 > (`0.10` > `0.2`): a live client **behind** the server reddens that device's
 > badge (it needs updating), while a client **ahead** of the server reddens the
 > top-bar server version (the server is the one lagging).
+
+> **Client update (self-update) from the console.** Next to a red (behind) badge,
+> when the server holds a client APK newer than that device, the console shows an
+> **Update** button. It reuses the ordinary install path (`INSTALL_APK` targeting
+> the single device with the client APK's url) — the device recognises its own
+> package and drives the self-update handshake (`SELF_UPDATE_STARTING` → re-register
+> → verify). The server identifies its client APK by the release naming convention
+> `styly-mdm-client_<version>.apk` (`.github/workflows/release.yml`); the newest one
+> in `APK_DIR` wins (numeric compare; ties by mtime). That APK gets there two ways:
+> an operator upload, or the **signed** client APK **bundled in the wheel** under
+> `styly_mdm/client/` (package-data) and copied into `APK_DIR` on startup by
+> `seed_bundled_client_apk()` — so a matching client is available out of the box. The
+> bundled APK must be the signed release build: Android rejects an update signed with
+> a different key. (CI wiring to embed the `release.yml`-built signed asset into the
+> wheel before the build is a pending follow-up; until then the bundled copy is absent
+> and the button lights up only from an operator upload of a correctly-named APK.)
 
 > **Device groups** are a many-to-many grouping keyed by device serial, persisted
 > server-side in `device_registry.json` (under a `groups` key). Selecting a group
