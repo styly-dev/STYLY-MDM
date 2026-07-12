@@ -2819,6 +2819,16 @@ async def run_server(port: int | None = None):
     else:
         log.info("  Server running at http://0.0.0.0:%d", port)
 
+    # Data-dir paths are CWD-relative by default (see DATA_DIR), so log the resolved
+    # locations to make "where does this write" unambiguous at a glance.
+    log.info("Configuration:")
+    log.info("  Data directory:   %s", DATA_DIR)
+    log.info("  APK directory:    %s", APK_DIR)
+    log.info("  Bundle directory: %s", BUNDLE_DIR)
+    log.info("  Device registry:  %s", REGISTRY_PATH)
+    log.info("  WebSocket port:   %d", port)
+    log.info("  Discovery port:   %d", DISCOVERY_PORT)
+
     # Start UDP discovery responder alongside the HTTP server
     discovery_transport = await start_discovery_responder(port, ip_addresses)
 
