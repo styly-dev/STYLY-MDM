@@ -55,11 +55,20 @@ pip install -e .
 python -m styly_mdm      # or ./run.sh
 ```
 
-The server starts on port 7070 and displays its LAN IP addresses:
+The server starts on port 7070 and displays its LAN IP addresses and the
+resolved data-directory paths (handy because the data directory defaults to the
+current working directory — see the configuration table below):
 
 ```
 2026-02-24 [INFO] Starting STYLY-MDM server on port 7070
 2026-02-24 [INFO]   Server running at http://192.168.1.5:7070
+2026-02-24 [INFO] Configuration:
+2026-02-24 [INFO]   Data directory:   /srv/styly-mdm
+2026-02-24 [INFO]   APK directory:    /srv/styly-mdm/apks
+2026-02-24 [INFO]   Bundle directory: /srv/styly-mdm/bundles
+2026-02-24 [INFO]   Device registry:  /srv/styly-mdm/device_registry.json
+2026-02-24 [INFO]   WebSocket port:   7070
+2026-02-24 [INFO]   Discovery port:   7071
 2026-02-24 [INFO] UDP discovery responder listening on port 7071
 ```
 
