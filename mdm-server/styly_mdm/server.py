@@ -1412,8 +1412,11 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
     admin_connections.add(ws)
     log.info("Admin console connected from %s", request.remote)
 
-    # Send current device list and group list immediately on connect
+    # Send server info, current device list and group list immediately on connect.
+    # __version__ is imported lazily to avoid a circular import (see run_server).
+    from . import __version__
     try:
+        await ws.send_str(json.dumps({"type": "SERVER_INFO", "version": __version__}))
         await ws.send_str(build_device_list_msg())
         await ws.send_str(build_group_list_msg())
     except ConnectionResetError:

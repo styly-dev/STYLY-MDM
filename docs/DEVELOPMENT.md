@@ -244,7 +244,8 @@ STYLY-MDM/
 
 | Message type | Description |
 |---|---|
-| `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting), and may include optional `battery`: `{level, charging, last_seen}`) |
+| `SERVER_INFO` | Server identity, sent once on connect (before the first `DEVICE_LIST`). Fields: `version` (the `styly_mdm` package version; the console renders it next to the `STYLY-MDM` brand in the top bar. Its `major.minor` is the compatibility reference — and the top-bar value itself turns red when a live client is on a *newer* `major.minor` (i.e. the server is the one lagging). See the compatibility note below). |
+| `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting; a *stable-online* client whose `version_name` trails the server on `major.minor` is flagged red as needing an update — the reverse case, a client *ahead* of the server, reddens the top-bar server version instead. `updating` and offline rows are exempt, and the check is skipped only when the server version is the `0.0.0` untagged/not-installed fallback), and may include optional `battery`: `{level, charging, last_seen}`) |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
 | `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |
@@ -267,6 +268,17 @@ STYLY-MDM/
 | `DEVICE_GROUPS_SET` | Acknowledgement of a device's group membership change. Fields: `device_id`, `groups` |
 | `GROUP_MEMBERS_SET` | Acknowledgement of a group's member list change. Fields: `name`, `members` |
 | `ERROR` | Error message. Fields: `message` |
+
+> **Client/server compatibility** is keyed on `major.minor`. Policy: any change
+> that requires the client and server to move together (a wire-protocol or shared
+> behaviour change) **must** bump the minor (or major) version; the third
+> component ("build") is reserved for compatible, independent updates. This lets a
+> server ship a build-only patch — e.g. `v0.2.1` server against an unchanged
+> `v0.2.0` client — without the console flagging the fleet as out of sync. The
+> console applies exactly this rule, comparing only `major.minor` numerically
+> (`0.10` > `0.2`): a live client **behind** the server reddens that device's
+> badge (it needs updating), while a client **ahead** of the server reddens the
+> top-bar server version (the server is the one lagging).
 
 > **Device groups** are a many-to-many grouping keyed by device serial, persisted
 > server-side in `device_registry.json` (under a `groups` key). Selecting a group
