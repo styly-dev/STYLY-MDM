@@ -68,4 +68,8 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           APK=$(find mdm-client/app/build/outputs/apk/prod/release -name "*.apk" | head -1)
-          gh release upload "$RELEASE_TAG" "$APK" --clobber
+          # Upload under a descriptive, versioned name (e.g. styly-mdm-client_v0.3.0.apk)
+          # instead of Gradle's default app-prod-release.apk.
+          ASSET="styly-mdm-client_${RELEASE_TAG}.apk"
+          cp "$APK" "$ASSET"
+          gh release upload "$RELEASE_TAG" "$ASSET" --clobber
