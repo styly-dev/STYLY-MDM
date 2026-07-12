@@ -48,10 +48,13 @@ MAX_APK_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB
 # The signed styly-mdm-client APK matching this server is bundled inside the wheel
 # (read-only package data) and seeded into APK_DIR on startup, so the console can
 # offer it to out-of-date devices without an operator upload. Release APKs follow
-# the styly-mdm-client_<version>.apk convention (.github/workflows/release.yml);
-# the regex tolerates an optional "v" prefix and the "-<n>" upload-collision suffix.
+# the styly-mdm-client_<version>.apk convention (.github/workflows/release.yml).
+# The regex tolerates an optional "v" prefix and any collision suffix that
+# unique_apk_path() appends on re-upload (e.g. "-20260712-200000", optionally plus
+# "-<counter>"), so a re-uploaded build is still detected — the mtime tie-break in
+# latest_client_apk() then prefers it over the seeded original.
 BUNDLED_CLIENT_DIR = Path(__file__).resolve().parent / "client"
-CLIENT_APK_RE = re.compile(r"^styly-mdm-client_v?(\d+(?:\.\d+)+)(?:-\d+)?\.apk$")
+CLIENT_APK_RE = re.compile(r"^styly-mdm-client_v?(\d+(?:\.\d+)+)(?:-.*)?\.apk$")
 
 # Maximum number of device downloads allowed in flight across the whole server.
 # Fanning a file out to a large group otherwise makes every device pull it from the

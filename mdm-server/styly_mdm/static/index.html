@@ -1005,11 +1005,13 @@
                 (verBehind ? 'Client v' + esc(d.version_name) + ' trails server ' + esc(serverVersion) + ' — needs updating' : 'Client build') +
                 '">v' + esc(d.version_name) + '</span>'
             : '<span class="dev-version unknown" title="Client build unknown (device predates version reporting)">unknown</span>';
-          // Offer a one-click self-update only when the server's client APK would
-          // actually clear the mismatch — i.e. it reaches the server's major.minor.
-          // (A stale APK older than the server would leave the device still red.)
+          // Offer a one-click self-update only when the server's client APK is on the
+          // *same* major.minor as the server — installing it brings this behind device
+          // exactly in sync. A stale APK (older than the server) would leave it still
+          // red; one ahead of the server would push it past the server (flipping the
+          // top-bar red), which violates the lockstep policy. Neither is offered.
           const canUpdate = verBehind && clientApk &&
-            cmpMajorMinor(parseMajorMinor(clientApk.version), srvMinor) >= 0;
+            cmpMajorMinor(parseMajorMinor(clientApk.version), srvMinor) === 0;
           const updateBtn = canUpdate
             ? '<button class="btn-update" data-act="update" data-id="' + esc(id) + '" title="Install styly-mdm-client v' + esc(clientApk.version) + ' (the device reinstalls the MDM client and restarts)">Update</button>'
             : '';

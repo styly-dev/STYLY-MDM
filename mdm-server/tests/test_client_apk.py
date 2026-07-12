@@ -17,7 +17,9 @@ from styly_mdm import server
     [
         ("styly-mdm-client_v0.3.0.apk", ("0.3.0", (0, 3, 0))),
         ("styly-mdm-client_0.9.0.apk", ("0.9.0", (0, 9, 0))),  # optional "v"
-        ("styly-mdm-client_v0.3.0-1.apk", ("0.3.0", (0, 3, 0))),  # upload collision
+        # unique_apk_path() collision suffixes: -<timestamp> and -<timestamp>-<counter>.
+        ("styly-mdm-client_v0.3.0-20260712-200000.apk", ("0.3.0", (0, 3, 0))),
+        ("styly-mdm-client_v0.3.0-20260712-200000-2.apk", ("0.3.0", (0, 3, 0))),
         ("styly-mdm-client_v1.2.apk", ("1.2", (1, 2))),  # two-component version
         ("UserClient-20260710.apk", None),
         ("app-prod-release.apk", None),
@@ -46,6 +48,25 @@ def test_latest_client_apk_picks_highest_version_numerically(tmp_path):
         "url": "/apks/styly-mdm-client_v0.10.0.apk",
         "version": "0.10.0",
     }
+
+
+def test_latest_client_apk_prefers_newest_mtime_on_same_version(tmp_path):
+    # A re-upload of the same version lands under a collision name; the newer file
+    # (by mtime) must win, so the operator's fresh upload supersedes the seeded one.
+    server._apply_data_dir(str(tmp_path))
+    server.APK_DIR.mkdir(parents=True, exist_ok=True)
+    original = server.APK_DIR / "styly-mdm-client_v0.3.0.apk"
+    reupload = server.APK_DIR / "styly-mdm-client_v0.3.0-20260712-200000.apk"
+    original.write_bytes(b"old")
+    reupload.write_bytes(b"new")
+    import os
+
+    os.utime(original, (1000, 1000))
+    os.utime(reupload, (2000, 2000))  # newer
+
+    info = server.latest_client_apk()
+    assert info["filename"] == "styly-mdm-client_v0.3.0-20260712-200000.apk"
+    assert info["version"] == "0.3.0"
 
 
 def test_latest_client_apk_none_when_absent(tmp_path):
