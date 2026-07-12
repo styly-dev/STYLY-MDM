@@ -143,6 +143,19 @@
     .btn-edit:hover { color: var(--text-primary); border-color: #394056; }
 
     /* Device table */
+    /* Filter/sort bar for the main Devices list. Lives as a sibling of the scrolling
+       body so a background DEVICE_LIST re-render (battery/heartbeat ticks) can't destroy
+       the input mid-keystroke. */
+    .dev-toolbar { display: flex; gap: 8px; padding: 10px 20px 4px; flex: 0 0 auto; }
+    .dev-search-input { flex: 1 1 auto; min-width: 0; padding: 8px 11px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 7px; color: var(--text-primary); font-size: 13px; font-family: inherit; }
+    .dev-search-input:focus { outline: none; border-color: var(--accent); }
+    /* Sort lives on the Device column header (spreadsheet-style): click to toggle
+       ascending/descending, the arrow shows the current direction. */
+    .dev-sort-head { cursor: pointer; user-select: none; }
+    .dev-sort-head:hover { color: var(--text-primary); }
+    .sort-arrow { font-size: 9px; color: var(--text-muted); margin-left: 3px; }
+    .mg-sort-btn { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; padding: 0 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 7px; color: var(--text-secondary); font-size: 13px; font-family: inherit; cursor: pointer; }
+    .mg-sort-btn:hover { border-color: #394056; color: var(--text-primary); }
     .dev-table { width: 100%; }
     .dev-row { display: grid; grid-template-columns: 42px minmax(0, 2fr) minmax(76px, .7fr) minmax(96px, .85fr) minmax(92px, 1fr); align-items: center; padding: 10px 0; padding-left: 18px; border-top: 1px solid var(--border-soft); font-size: 13px; }
     .dev-head { padding-top: 9px; padding-bottom: 9px; border-top: none; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .5px; }
@@ -287,8 +300,8 @@
     .btn-outline { padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px; color: #cfd3e3; background: none; cursor: pointer; font-family: inherit; font-size: 12px; }
     .btn-outline:hover { border-color: #394056; }
     .mg-detail-head .btn-danger-outline { padding: 6px 12px; width: auto; margin: 0; font-size: 12px; font-weight: 400; }
-    .mg-search { padding: 14px 20px 8px; }
-    .mg-search-input { width: 100%; padding: 9px 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 7px; color: var(--text-primary); font-size: 13px; font-family: inherit; }
+    .mg-search { display: flex; gap: 8px; padding: 14px 20px 8px; }
+    .mg-search-input { flex: 1 1 auto; min-width: 0; padding: 9px 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 7px; color: var(--text-primary); font-size: 13px; font-family: inherit; }
     .mg-search-input:focus { outline: none; border-color: var(--accent); }
     .mg-dev-list { max-height: 320px; overflow-y: auto; padding: 2px 12px 10px; }
     .mg-dev { display: flex; align-items: center; gap: 12px; padding: 9px 10px; border-radius: 7px; cursor: pointer; }
@@ -341,6 +354,9 @@
             <button class="subtab active" id="tabGroups" data-tab="groups">Groups <span class="cnt" id="cntGroups">0</span></button>
             <button class="subtab" id="tabDevices" data-tab="devices">Devices <span class="cnt" id="cntDevices">0</span></button>
             <div class="subtabs-fill"></div>
+          </div>
+          <div class="dev-toolbar" id="devToolbar" style="display:none">
+            <input class="dev-search-input" id="devSearch" data-dev-search maxlength="64" placeholder="⌕ Filter devices by name…">
           </div>
           <div class="targets-body" id="targetsBody"></div>
         </div>
@@ -511,10 +527,16 @@
       let reconnectTimer = null;
       const RECONNECT_DELAY = 3000;
       const LOW_BATTERY_THRESHOLD = 20;
+      // Devices list filter/sort (issue #57). Module state so it survives the full
+      // re-renders driven by background DEVICE_LIST broadcasts, and so selection
+      // (selectedIds) is never touched by filtering.
+      let deviceSearch = '';
+      let deviceSort = 'label-asc';
       // Manage view
       let manageSelectedGroup = null;
       let manageMembers = new Set();
       let manageSearch = '';
+      let manageSort = 'label-asc';
       let renamingManageGroup = false;
       let pendingSelectGroup = null;   // select this group in manage once GROUP_LIST confirms it
 
@@ -529,6 +551,8 @@
       const cntGroups = document.getElementById('cntGroups');
       const cntDevices = document.getElementById('cntDevices');
       const targetsBody = document.getElementById('targetsBody');
+      const devToolbar = document.getElementById('devToolbar');
+      const devSearchInput = document.getElementById('devSearch');
       const selCard = document.getElementById('selCard');
       const apkFile = document.getElementById('apkFile');
       const apkName = document.getElementById('apkName');
@@ -573,6 +597,35 @@
       function getOnlineIds() { return devices.filter(function (d) { return d.status === 'online'; }).map(getDeviceId).filter(Boolean); }
       function knownIds() { return new Set(devices.map(getDeviceId).filter(Boolean)); }
       function labelFor(id) { if (!id) return '-'; const d = deviceById(id); return (d && d.label) ? d.label : id; }
+      // Shared filter/sort for both the main Devices list and the Manage Groups picker
+      // (issue #57). Name is the label, falling back to the id — matching how a device
+      // is displayed — so unlabeled devices still sort and match sensibly.
+      function deviceMatchesQuery(d, q) {
+        if (!q) return true;
+        // Match the device name (label) only. Unlabeled devices never match a non-empty
+        // query — deliberate: the filter is a by-name search.
+        return (d.label || '').toLowerCase().indexOf(q) !== -1;
+      }
+      function sortDevices(list, sortKey) {
+        const dir = sortKey === 'label-desc' ? -1 : 1;
+        const cmp = function (x, y) { return x.localeCompare(y, undefined, { numeric: true, sensitivity: 'base' }); };
+        return list.slice().sort(function (a, b) {
+          // Unlabeled devices always pin to the top, regardless of sort direction —
+          // they're the ones a user is hunting down in order to label them.
+          const ua = !a.label, ub = !b.label;
+          if (ua !== ub) return ua ? -1 : 1;
+          // Within the unlabeled cluster, order by id (stable, direction-independent).
+          if (ua && ub) return cmp(getDeviceId(a), getDeviceId(b));
+          // Numeric-aware compare so free-text labels order naturally: "Room 2" before
+          // "Room 10". Zero-padded conventions (DEV-001) sort correctly either way.
+          return cmp(a.label, b.label) * dir;
+        });
+      }
+      function filterSortDevices(search, sortKey) {
+        const q = search.trim().toLowerCase();
+        return sortDevices(devices.filter(function (d) { return deviceMatchesQuery(d, q); }), sortKey);
+      }
+      function visibleDevices() { return filterSortDevices(deviceSearch, deviceSort); }
       function groupNames() { return Object.keys(groups).sort(); }
       function offlineMembers(name) { return (groups[name] || []).filter(function (s) { const d = deviceById(s); return d && !isOnline(d); }).length; }
       function batteryHtml(d) {
@@ -780,6 +833,12 @@
       }
 
       function renderTargets() {
+        // The filter/sort bar is a static sibling of targetsBody, so replacing the body
+        // below never destroys its input. Just show it on the Devices tab and keep the
+        // controls in sync with module state (they persist across re-renders).
+        const showToolbar = targetTab === 'devices' && devices.length > 0;
+        devToolbar.style.display = showToolbar ? '' : 'none';
+        if (showToolbar && devSearchInput.value !== deviceSearch) devSearchInput.value = deviceSearch;
         targetsBody.innerHTML = targetTab === 'groups' ? renderGroupsHtml() : renderDevicesHtml();
         if (editingLabelId !== null && targetTab === 'devices') {
           const inp = targetsBody.querySelector('[data-label-input]');
@@ -836,69 +895,102 @@
 
       function renderDevicesHtml() {
         if (!devices.length) return '<div class="empty">No devices yet</div>';
-        const total = devices.length;
-        const sel = selectedIds.size;
-        const allSel = sel > 0 && devices.every(function (d) { return selectedIds.has(getDeviceId(d)); });
-        const someSel = sel > 0 && !allSel;
         let html = '<div class="dev-table">';
         html += '<div class="dev-row dev-head">' +
-          '<div class="selbox ' + (allSel ? 'on' : someSel ? 'mixed' : '') + '" data-act="selectAll">' + (allSel ? '✓' : someSel ? '–' : '') + '</div>' +
-          '<div>Device</div><div>Status</div><div>Battery</div><div>Progress</div></div>';
-        devices.forEach(function (d) {
-          const id = getDeviceId(d);
-          const checked = selectedIds.has(id);
-          const off = !isOnline(d);
-          const startup = d.startup_app && d.startup_app.package_name;
-          let deviceCell;
-          if (editingLabelId === id) {
-            deviceCell = '<div class="dev-edit">' +
-              '<input class="label-input" data-label-input maxlength="64" placeholder="DEV-001" value="' + esc(d.label || '') + '">' +
-              '<button class="btn-mini btn-save" data-act="saveLabel" data-id="' + esc(id) + '">Save</button>' +
-              '<button class="btn-mini btn-cancel" data-act="cancelLabel">Cancel</button></div>';
-          } else {
-            // Client build, right-aligned in the label row so it reads as a column across
-            // rows; older clients that predate the version field show a muted "unknown".
-            const verBadge = d.version_name
-              ? '<span class="dev-version" title="Client build">v' + esc(d.version_name) + '</span>'
-              : '<span class="dev-version unknown" title="Client build unknown (device predates version reporting)">unknown</span>';
-            deviceCell = '<div class="dev-label-row">' +
-              (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') +
-              '<button class="ic-btn ' + (d.label ? '' : 'assign-btn') + '" data-act="editLabel" data-id="' + esc(id) + '" title="' + (d.label ? 'Edit label' : 'Assign label') + '">✏</button>' +
-              (startup ? '<span class="badge-startup" title="' + esc(startup) + '">★</span>' : '') +
-              verBadge +
-              '</div>';
-          }
-          deviceCell += '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.ip || '-') + '</div>';
-
-          let status;
-          if (d.status === 'updating') {
-            status = '<span class="dot updating"></span>Updating…';
-          } else if (d.status === 'retiring') {
-            status = '<span class="dot retiring"></span>Retiring…';
-          } else if (d.status === 'retired') {
-            status = '<span class="dot off"></span>Retired' +
-              (d.last_seen ? '<span class="last-seen" title="Last seen ' + esc(new Date(d.last_seen * 1000).toLocaleString()) + '">' + esc(formatRelativeTime(d.last_seen)) + '</span>' : '') +
-              '<button class="forget-btn" data-act="forget" data-id="' + esc(id) + '" title="Remove this retired device from the list">🗑</button>';
-          } else if (off) {
-            status = '<span class="dot off"></span>Offline' +
-              (d.last_seen ? '<span class="last-seen" title="Last seen ' + esc(new Date(d.last_seen * 1000).toLocaleString()) + '">' + esc(formatRelativeTime(d.last_seen)) + '</span>' : '') +
-              '<button class="forget-btn" data-act="forget" data-id="' + esc(id) + '" title="Forget this device">🗑</button>';
-          } else {
-            status = '<span class="dot"></span>Online';
-          }
-
-          html += '<div class="dev-row' + (off ? ' offline' : '') + '" data-row-id="' + esc(id) + '">' +
-            '<div class="selbox ' + (checked ? 'on' : '') + '" data-act="toggleDevice" data-id="' + esc(id) + '">' + (checked ? '✓' : '') + '</div>' +
-            '<div class="dev-cell">' + deviceCell + '</div>' +
-            '<div class="dev-status">' + status + '</div>' +
-            '<div class="dev-battery">' + batteryHtml(d) + '</div>' +
-            '<div class="dev-task" data-task-id="' + esc(id) + '">' + taskCellHtml(id) + '</div>' +
-            '</div>';
-        });
+          '<div class="selbox ' + selectAllState() + '" data-act="selectAll">' + selectAllGlyph() + '</div>' +
+          '<div class="dev-sort-head" data-act="sortDevices" title="Sort by name">Device<span class="sort-arrow">' + sortArrowGlyph() + '</span></div>' +
+          '<div>Status</div><div>Battery</div><div>Progress</div></div>';
+        html += '<div id="devRows">' + deviceRowsHtml() + '</div>';
         html += '</div>';
-        // total is shown in the tab; touch the var to keep intent explicit
-        void total;
         return html;
+      }
+
+      // Rows only — filtered and sorted (issue #57). Split out so search/sort can refresh
+      // just this container, leaving the static toolbar input focused and selection intact.
+      function deviceRowsHtml() {
+        const list = visibleDevices();
+        if (!list.length) return '<div class="empty small">No matching devices</div>';
+        return list.map(deviceRowHtml).join('');
+      }
+
+      function deviceRowHtml(d) {
+        const id = getDeviceId(d);
+        const checked = selectedIds.has(id);
+        const off = !isOnline(d);
+        const startup = d.startup_app && d.startup_app.package_name;
+        let deviceCell;
+        if (editingLabelId === id) {
+          deviceCell = '<div class="dev-edit">' +
+            '<input class="label-input" data-label-input maxlength="64" placeholder="DEV-001" value="' + esc(d.label || '') + '">' +
+            '<button class="btn-mini btn-save" data-act="saveLabel" data-id="' + esc(id) + '">Save</button>' +
+            '<button class="btn-mini btn-cancel" data-act="cancelLabel">Cancel</button></div>';
+        } else {
+          // Client build, right-aligned in the label row so it reads as a column across
+          // rows; older clients that predate the version field show a muted "unknown".
+          const verBadge = d.version_name
+            ? '<span class="dev-version" title="Client build">v' + esc(d.version_name) + '</span>'
+            : '<span class="dev-version unknown" title="Client build unknown (device predates version reporting)">unknown</span>';
+          deviceCell = '<div class="dev-label-row">' +
+            (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') +
+            '<button class="ic-btn ' + (d.label ? '' : 'assign-btn') + '" data-act="editLabel" data-id="' + esc(id) + '" title="' + (d.label ? 'Edit label' : 'Assign label') + '">✏</button>' +
+            (startup ? '<span class="badge-startup" title="' + esc(startup) + '">★</span>' : '') +
+            verBadge +
+            '</div>';
+        }
+        deviceCell += '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.ip || '-') + '</div>';
+
+        let status;
+        if (d.status === 'updating') {
+          status = '<span class="dot updating"></span>Updating…';
+        } else if (d.status === 'retiring') {
+          status = '<span class="dot retiring"></span>Retiring…';
+        } else if (d.status === 'retired') {
+          status = '<span class="dot off"></span>Retired' +
+            (d.last_seen ? '<span class="last-seen" title="Last seen ' + esc(new Date(d.last_seen * 1000).toLocaleString()) + '">' + esc(formatRelativeTime(d.last_seen)) + '</span>' : '') +
+            '<button class="forget-btn" data-act="forget" data-id="' + esc(id) + '" title="Remove this retired device from the list">🗑</button>';
+        } else if (off) {
+          status = '<span class="dot off"></span>Offline' +
+            (d.last_seen ? '<span class="last-seen" title="Last seen ' + esc(new Date(d.last_seen * 1000).toLocaleString()) + '">' + esc(formatRelativeTime(d.last_seen)) + '</span>' : '') +
+            '<button class="forget-btn" data-act="forget" data-id="' + esc(id) + '" title="Forget this device">🗑</button>';
+        } else {
+          status = '<span class="dot"></span>Online';
+        }
+
+        return '<div class="dev-row' + (off ? ' offline' : '') + '" data-row-id="' + esc(id) + '">' +
+          '<div class="selbox ' + (checked ? 'on' : '') + '" data-act="toggleDevice" data-id="' + esc(id) + '">' + (checked ? '✓' : '') + '</div>' +
+          '<div class="dev-cell">' + deviceCell + '</div>' +
+          '<div class="dev-status">' + status + '</div>' +
+          '<div class="dev-battery">' + batteryHtml(d) + '</div>' +
+          '<div class="dev-task" data-task-id="' + esc(id) + '">' + taskCellHtml(id) + '</div>' +
+          '</div>';
+      }
+
+      // Header select-all reflects the currently visible (filtered) set, so with a filter
+      // active "select all" means "the rows you can see". Reduces to today's behavior when
+      // the filter is empty (visibleDevices() === all devices).
+      function selectAllState() {
+        const vis = visibleDevices();
+        if (!vis.length || !selectedIds.size) return '';
+        return vis.every(function (d) { return selectedIds.has(getDeviceId(d)); }) ? 'on' : 'mixed';
+      }
+      function selectAllGlyph() { const s = selectAllState(); return s === 'on' ? '✓' : s === 'mixed' ? '–' : ''; }
+      function sortArrowGlyph() { return deviceSort === 'label-desc' ? '▼' : '▲'; }
+
+      // Clicking the Device column header toggles the sort direction.
+      function toggleDeviceSort() {
+        deviceSort = deviceSort === 'label-asc' ? 'label-desc' : 'label-asc';
+        refreshDeviceRows();
+      }
+
+      // Refresh only the rows + header (selbox, sort arrow) after a filter/sort change,
+      // leaving the toolbar input focused and the rest of the page untouched.
+      function refreshDeviceRows() {
+        const rows = document.getElementById('devRows');
+        if (rows) rows.innerHTML = deviceRowsHtml();
+        const box = targetsBody.querySelector('.dev-head [data-act="selectAll"]');
+        if (box) { box.className = 'selbox ' + selectAllState(); box.textContent = selectAllGlyph(); }
+        const arrow = targetsBody.querySelector('.dev-head .sort-arrow');
+        if (arrow) arrow.textContent = sortArrowGlyph();
       }
 
       // The cell shows whichever job last touched the device: install, push or verify.
@@ -1009,9 +1101,12 @@
         render();
       }
       function toggleSelectAll() {
-        const all = devices.length > 0 && devices.every(function (d) { return selectedIds.has(getDeviceId(d)); });
-        if (all) selectedIds.clear();
-        else devices.forEach(function (d) { const id = getDeviceId(d); if (id) selectedIds.add(id); });
+        // Operates on the visible (filtered) set: when a filter is active, select-all
+        // toggles only what the user can see, not the whole hidden fleet.
+        const vis = visibleDevices();
+        const all = vis.length > 0 && vis.every(function (d) { return selectedIds.has(getDeviceId(d)); });
+        if (all) vis.forEach(function (d) { selectedIds.delete(getDeviceId(d)); });
+        else vis.forEach(function (d) { const id = getDeviceId(d); if (id) selectedIds.add(id); });
         activeGroup = null;
         render();
       }
@@ -1287,7 +1382,8 @@
             '<button class="btn-danger-outline" data-act="deleteGroup" data-group="' + esc(name) + '">Delete</button></div>';
         mgDetail.innerHTML =
           '<div class="mg-detail-head">' + head + '</div>' +
-          '<div class="mg-search"><input class="mg-search-input" data-mg-search placeholder="⌕ Search devices to add…" value="' + esc(manageSearch) + '"></div>' +
+          '<div class="mg-search"><input class="mg-search-input" data-mg-search placeholder="⌕ Search devices to add…" value="' + esc(manageSearch) + '">' +
+          '<button class="mg-sort-btn" data-act="sortManage" title="Sort by name">Name<span class="sort-arrow">' + (manageSort === 'label-desc' ? '▼' : '▲') + '</span></button></div>' +
           '<div class="mg-dev-list" id="mgDevList">' + renderMgDevListHtml() + '</div>' +
           '<div class="mg-footer"><span class="mg-foot-count">' + manageMembers.size + ' selected</span>' +
           '<div class="spacer"></div>' +
@@ -1297,12 +1393,8 @@
 
       function renderMgDevListHtml() {
         if (!devices.length) return '<div class="empty small">No devices yet</div>';
-        const q = manageSearch.trim().toLowerCase();
-        const list = devices.filter(function (d) {
-          if (!q) return true;
-          const id = getDeviceId(d);
-          return (d.label || '').toLowerCase().indexOf(q) !== -1 || id.toLowerCase().indexOf(q) !== -1;
-        });
+        // Filter (by device name/label) and sort via the shared helper (issue #57).
+        const list = filterSortDevices(manageSearch, manageSort);
         if (!list.length) return '<div class="empty small">No matching devices</div>';
         return list.map(function (d) {
           const id = getDeviceId(d); const mem = manageMembers.has(id); const off = !isOnline(d);
@@ -1926,6 +2018,7 @@
         else if (act === 'editGroup') openManage(t.dataset.group);
         else if (act === 'toggleDevice') toggleDevice(t.dataset.id);
         else if (act === 'selectAll') toggleSelectAll();
+        else if (act === 'sortDevices') toggleDeviceSort();
         else if (act === 'editLabel') { editingLabelId = t.dataset.id; render(); }
         else if (act === 'saveLabel') commitLabel(t.dataset.id);
         else if (act === 'cancelLabel') { editingLabelId = null; render(); }
@@ -1938,6 +2031,12 @@
         if (e.key === 'Enter') { e.preventDefault(); commitLabel(editingLabelId); }
         else if (e.key === 'Escape') { e.preventDefault(); editingLabelId = null; render(); }
       });
+
+      // Devices filter (issue #57). Refreshes only the rows, so the input keeps focus
+      // while typing and selection/scroll of the rest of the page is untouched. (Sort is
+      // driven by the clickable Device column header, handled in the targetsBody click
+      // delegation above.)
+      devSearchInput.addEventListener('input', function () { deviceSearch = devSearchInput.value; refreshDeviceRows(); });
 
       // Selection card delegation
       selCard.addEventListener('click', function (e) {
@@ -1992,6 +2091,13 @@
         if (!t) return;
         const act = t.dataset.act;
         if (act === 'back') backToConsole();
+        else if (act === 'sortManage') {
+          // Toggle sort direction and refresh only the list (keeps search focus/scroll).
+          manageSort = manageSort === 'label-asc' ? 'label-desc' : 'label-asc';
+          const arr = t.querySelector('.sort-arrow');
+          if (arr) arr.textContent = manageSort === 'label-desc' ? '▼' : '▲';
+          refreshMgDevList();
+        }
         else if (act === 'selectManageGroup') { selectManageGroup(t.dataset.group); renderManageSidebar(); renderManageDetail(); }
         else if (act === 'addGroup') {
           const inp = mgSidebar.querySelector('[data-mg-new]'); const name = inp ? inp.value.trim() : '';

@@ -119,8 +119,10 @@ The ports come from `BuildConfig` fields defined per flavor in
 ### Seeding dummy devices for UI testing
 
 `mdm-server/scripts/seed_dummy_devices.py` populates a **running** server with fake
-devices, so you can exercise console UI that only matters at scale (e.g. the Manage
-Groups device list scrolling). It is a dev-only helper and is not shipped in the wheel.
+devices, so you can exercise console UI that only matters at scale — the Manage Groups
+device list scrolling, and the Devices-list / group-picker **filter and sort** controls
+(filter matches the device name/label; sort by device name, ascending or descending). It
+is a dev-only helper and is not shipped in the wheel.
 
 It registers through the live `/ws/device` WebSocket rather than editing
 `device_registry.json`, because a running server owns that file: any register/battery/
