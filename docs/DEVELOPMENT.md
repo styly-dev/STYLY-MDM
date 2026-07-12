@@ -293,9 +293,13 @@ STYLY-MDM/
 > `styly_mdm/client/` (package-data) and copied into `APK_DIR` on startup by
 > `seed_bundled_client_apk()` — so a matching client is available out of the box. The
 > bundled APK must be the signed release build: Android rejects an update signed with
-> a different key. (CI wiring to embed the `release.yml`-built signed asset into the
-> wheel before the build is a pending follow-up; until then the bundled copy is absent
-> and the button lights up only from an operator upload of a correctly-named APK.)
+> a different key. On a published release, `publish-pypi.yml`'s build job downloads the
+> signed `styly-mdm-client_<tag>.apk` asset that `release.yml` uploads (polling, since
+> the two run in parallel) into `styly_mdm/client/` before building the wheel, and
+> fails closed if it never appears. The **wheel** carries the APK (via the `client/*`
+> package-data glob); an **sdist** source build does not (setuptools-scm only packs
+> git-tracked files), but `pip`/`uvx` install the wheel — so a released server ships
+> with its matching client, while a from-source run relies on an operator upload.
 
 > **Device groups** are a many-to-many grouping keyed by device serial, persisted
 > server-side in `device_registry.json` (under a `groups` key). Selecting a group
