@@ -3,9 +3,12 @@ package com.styly.mdmclient
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -18,14 +21,24 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
+import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.concurrent.TimeUnit
 
 /**
- * Manages WebSocket connection to the STYLY-MDM server.
- * Handles auto-reconnect with exponential backoff, device registration,
- * and dispatching received commands.
+ * Manages WebSocket connection to the STYLY-MDM server: device registration,
+ * dispatching received commands, and the bounded connection window (#67).
+ *
+ * Connection attempts are allowed only inside a window that opens on each
+ * network-available transition (which also covers process restart) and on an
+ * established connection dropping. Inside the window every attempt cycle runs
+ * UDP discovery first and then connects to the saved URL, retrying on a fixed
+ * interval; when the window expires without a connection the client goes fully
+ * silent until the next network transition. Window duration and retry interval
+ * come from [ClientConfig] (defaults overridable via /sdcard/styly-mdm/config.json).
+ * The state logic lives in [ConnectionScheduler]; all of it runs on the main
+ * looper via [reconnectHandler].
  */
 class WebSocketManager(
     private val context: Context,
@@ -42,10 +55,9 @@ class WebSocketManager(
         // never falls back to the production port and accidentally connects to a
         // production server. The IP is just a placeholder; discovery is the real path.
         val DEFAULT_SERVER_URL = "ws://192.168.1.100:${BuildConfig.DEFAULT_WS_PORT}/ws/device"
-        private const val INITIAL_RECONNECT_DELAY_MS = 1000L
-        private const val MAX_RECONNECT_DELAY_MS = 30000L
-        private const val DISCOVERY_INTERVAL_MS = 15000L
-        private const val DISCOVERY_FAILURE_THRESHOLD = 3
+        // Short enough that a single black-holed connect attempt cannot consume
+        // the whole connection window (OkHttp's default would be 10 s).
+        private const val CONNECT_TIMEOUT_SECONDS = 3L
         private const val PING_INTERVAL_SECONDS = 15L
         private const val BATTERY_UPDATE_INTERVAL_MS = 5 * 60 * 1000L
 
@@ -54,17 +66,47 @@ class WebSocketManager(
     }
 
     private val client = OkHttpClient.Builder()
+        .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .pingInterval(PING_INTERVAL_SECONDS, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
 
     private var webSocket: WebSocket? = null
-    private var reconnectDelay = INITIAL_RECONNECT_DELAY_MS
     private var isRunning = false
-    private var consecutiveFailures = 0
     private val reconnectHandler = Handler(Looper.getMainLooper())
     private val reconnectToken = Object()
     private val batteryTelemetryToken = Object()
+
+    private val scheduler = ConnectionScheduler {
+        ClientConfig.load(File(Environment.getExternalStorageDirectory(), ClientConfig.CONFIG_RELATIVE_PATH))
+    }
+
+    // Invalidates the in-flight discovery thread when its attempt is cancelled.
+    private var attemptGeneration = 0
+
+    // registerDefaultNetworkCallback can report the new network's onAvailable
+    // before the old network's onLost when the default network switches; only
+    // the loss of the network we currently consider active may close the window.
+    private var activeNetwork: Network? = null
+    private var networkCallbackRegistered = false
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            reconnectHandler.post {
+                if (!isRunning) return@post
+                activeNetwork = network
+                dispatch(scheduler.onNetworkAvailable(SystemClock.uptimeMillis()))
+            }
+        }
+
+        override fun onLost(network: Network) {
+            reconnectHandler.post {
+                if (!isRunning || network != activeNetwork) return@post
+                activeNetwork = null
+                onStatusChanged(false, "Waiting for network...")
+                dispatch(scheduler.onNetworkLost())
+            }
+        }
+    }
 
     fun getServerUrl(): String {
         val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
@@ -78,27 +120,22 @@ class WebSocketManager(
 
     fun connect() {
         isRunning = true
-        // If no URL has been explicitly saved, try auto-discovery first
-        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-        if (!prefs.contains(PREF_SERVER_URL)) {
-            onStatusChanged(false, "Discovering server...")
-            Thread {
-                val discovered = ServerDiscovery.discover()
-                if (discovered != null && isValidWsUrl(discovered)) {
-                    Log.i(TAG, "Auto-discovered server: $discovered")
-                    setServerUrl(discovered)
-                } else {
-                    Log.i(TAG, "Auto-discovery failed, using default URL")
-                }
-                reconnectHandler.post { doConnect() }
-            }.start()
-        } else {
-            doConnect()
-        }
+        onStatusChanged(false, "Waiting for network...")
+        // The connection window is anchored on network availability, not on
+        // service start: the callback fires immediately when a network is
+        // already up, and again on every later network-available transition.
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        cm.registerDefaultNetworkCallback(networkCallback)
+        networkCallbackRegistered = true
     }
 
     fun disconnect() {
         isRunning = false
+        if (networkCallbackRegistered) {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.unregisterNetworkCallback(networkCallback)
+            networkCallbackRegistered = false
+        }
         reconnectHandler.removeCallbacksAndMessages(null)
         webSocket?.close(1000, "Client disconnecting")
         webSocket = null
@@ -125,6 +162,68 @@ class WebSocketManager(
         }
     }
 
+    /** Executes the side effects the scheduler decided on. Main looper only. */
+    private fun dispatch(actions: List<ConnectionScheduler.Action>) {
+        for (action in actions) {
+            when (action) {
+                is ConnectionScheduler.Action.StartAttempt -> startAttempt()
+                is ConnectionScheduler.Action.ScheduleRetry -> {
+                    onStatusChanged(false, "Reconnecting in ${action.delayMs / 1000}s...")
+                    reconnectHandler.postAtTime(
+                        { dispatch(scheduler.onRetryElapsed()) },
+                        reconnectToken,
+                        SystemClock.uptimeMillis() + action.delayMs
+                    )
+                }
+                is ConnectionScheduler.Action.ScheduleWindowExpiry -> {
+                    reconnectHandler.postAtTime(
+                        { dispatch(scheduler.onWindowExpired()) },
+                        reconnectToken,
+                        SystemClock.uptimeMillis() + action.delayMs
+                    )
+                }
+                is ConnectionScheduler.Action.CancelTimers ->
+                    reconnectHandler.removeCallbacksAndMessages(reconnectToken)
+                is ConnectionScheduler.Action.CancelAttempt -> cancelAttempt()
+                is ConnectionScheduler.Action.EnterSilence -> {
+                    Log.i(TAG, "No server found within the connection window, going silent")
+                    onStatusChanged(false, "Standby (no server found)")
+                }
+            }
+        }
+    }
+
+    /**
+     * One attempt cycle: UDP discovery first (a saved-but-stale URL must not
+     * keep the client away from a relocated server), then connect to the saved
+     * URL — which discovery just refreshed if a server answered.
+     */
+    private fun startAttempt() {
+        val generation = ++attemptGeneration
+        onStatusChanged(false, "Discovering server...")
+        Thread {
+            val discovered = ServerDiscovery.discover()
+            reconnectHandler.post {
+                if (!isRunning || generation != attemptGeneration ||
+                    scheduler.state != ConnectionScheduler.State.WINDOW_OPEN
+                ) return@post
+                if (discovered != null && isValidWsUrl(discovered)) {
+                    Log.i(TAG, "Discovered server at: $discovered")
+                    setServerUrl(discovered)
+                }
+                doConnect()
+            }
+        }.start()
+    }
+
+    private fun cancelAttempt() {
+        attemptGeneration++
+        // cancel() aborts without a close handshake — the window expired or the
+        // network vanished, so there is nothing to say goodbye to.
+        webSocket?.cancel()
+        webSocket = null
+    }
+
     private fun doConnect() {
         if (!isRunning) return
 
@@ -138,12 +237,12 @@ class WebSocketManager(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.i(TAG, "WebSocket connected")
                 reconnectHandler.post {
-                    reconnectDelay = INITIAL_RECONNECT_DELAY_MS
-                    consecutiveFailures = 0
+                    if (this@WebSocketManager.webSocket !== webSocket) return@post
+                    dispatch(scheduler.onConnected())
+                    onStatusChanged(true, "Connected")
+                    sendRegistration()
+                    startBatteryTelemetry()
                 }
-                onStatusChanged(true, "Connected")
-                sendRegistration()
-                startBatteryTelemetry()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -166,64 +265,24 @@ class WebSocketManager(
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.i(TAG, "WebSocket closed: $code $reason")
-                onStatusChanged(false, "Disconnected: $reason")
-                stopBatteryTelemetry()
-                scheduleReconnect()
+                onSocketGone(webSocket, "Disconnected: $reason")
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 Log.e(TAG, "WebSocket failure: ${t.message}")
-                onStatusChanged(false, "Connection failed: ${t.message}")
-                stopBatteryTelemetry()
-                scheduleReconnect()
+                onSocketGone(webSocket, "Connection failed: ${t.message}")
             }
         })
     }
 
-    private fun scheduleReconnect() {
-        // Post to main looper to ensure all reconnect state is accessed from a single thread
+    /** Routes a dead socket into the scheduler, ignoring cancelled/stale sockets. */
+    private fun onSocketGone(deadSocket: WebSocket, message: String) {
         reconnectHandler.post {
-            if (!isRunning) return@post
-
-            // Cancel any previously scheduled reconnect to prevent duplicate attempts
-            reconnectHandler.removeCallbacksAndMessages(reconnectToken)
-
-            consecutiveFailures++
-
-            if (consecutiveFailures >= DISCOVERY_FAILURE_THRESHOLD) {
-                // Saved URL isn't working — switch to discovery mode.
-                // Once in this branch, discovery runs on every reconnect cycle
-                // (every DISCOVERY_INTERVAL_MS) until a connection succeeds.
-                Log.i(TAG, "Connection failed $consecutiveFailures times, attempting server discovery")
-                onStatusChanged(false, "Discovering server...")
-
-                reconnectHandler.postAtTime({
-                    Thread {
-                        val discovered = ServerDiscovery.discover()
-                        reconnectHandler.post {
-                            if (discovered != null && isValidWsUrl(discovered)) {
-                                Log.i(TAG, "Discovered server at: $discovered")
-                                setServerUrl(discovered)
-                                consecutiveFailures = 0
-                                reconnectDelay = INITIAL_RECONNECT_DELAY_MS
-                            } else {
-                                Log.i(TAG, "Server discovery failed, will retry")
-                            }
-                            doConnect()
-                        }
-                    }.start()
-                }, reconnectToken, SystemClock.uptimeMillis() + DISCOVERY_INTERVAL_MS)
-            } else {
-                // First few failures — retry saved URL with exponential backoff
-                Log.i(TAG, "Reconnecting in ${reconnectDelay}ms")
-                onStatusChanged(false, "Reconnecting in ${reconnectDelay / 1000}s...")
-
-                reconnectHandler.postAtTime({
-                    doConnect()
-                }, reconnectToken, SystemClock.uptimeMillis() + reconnectDelay)
-
-                reconnectDelay = (reconnectDelay * 2).coerceAtMost(MAX_RECONNECT_DELAY_MS)
-            }
+            if (webSocket !== deadSocket) return@post
+            webSocket = null
+            stopBatteryTelemetry()
+            onStatusChanged(false, message)
+            dispatch(scheduler.onSocketDisconnected(SystemClock.uptimeMillis()))
         }
     }
 

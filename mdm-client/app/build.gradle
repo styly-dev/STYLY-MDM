@@ -132,4 +132,7 @@ dependencies {
     // Host JVM tests. BundleSync deletes files on the device, so its copy-vs-mirror
     // behaviour is proven here rather than only on real hardware.
     testImplementation 'junit:junit:4.13.2'
+    // Android's bundled org.json is a stub on the host JVM; ClientConfig parsing
+    // needs the real implementation to be testable under plain JUnit.
+    testImplementation 'org.json:json:20240303'
 }
