@@ -19,6 +19,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # gh release download (fetch the signed client APK asset)
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -47,6 +49,41 @@ jobs:
       - name: Run tests
         working-directory: mdm-server
         run: python -m pytest -q
+
+      - name: Bundle the signed client APK into the package
+        # release.yml builds and uploads the signed styly-mdm-client_<tag>.apk asset
+        # in parallel on this same event; fetch it so the wheel ships a matching,
+        # same-signing-key client (Android rejects a differently signed update). The
+        # wheel picks it up via the styly_mdm/client/* package-data glob and seeds it
+        # into the data dir at startup. workflow_dispatch dry runs have no release
+        # asset, so they skip this and build a wheel without the bundled client.
+        if: github.event_name == 'release'
+        working-directory: mdm-server
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          mkdir -p styly_mdm/client
+          # Match release.yml's exact asset name for this tag (styly-mdm-client_<tag>.apk),
+          # not a wildcard, so a stray/older client asset on the release can't be picked up.
+          ASSET="styly-mdm-client_${TAG}.apk"
+          # Poll: this job usually reaches here before the parallel APK build has
+          # finished uploading (cold runner: Android SDK + first gradle can take
+          # ~10 min). 30 x 60s = 30 min ceiling. The explicit file check makes success
+          # require the actual asset on disk, so a download that reports success but
+          # writes nothing still fails closed rather than shipping a client-less wheel.
+          for attempt in $(seq 1 30); do
+            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --pattern "$ASSET" --dir styly_mdm/client/ --clobber \
+               && [ -f "styly_mdm/client/$ASSET" ]; then
+              echo "Bundled client APK:"; ls -l styly_mdm/client/
+              exit 0
+            fi
+            echo "Signed client APK ($ASSET) not on release $TAG yet (attempt $attempt/30); waiting 60s…"
+            sleep 60
+          done
+          echo "::error::Signed client APK ($ASSET) never appeared on release $TAG; refusing to build a server wheel without it."
+          exit 1
 
       - name: Build sdist and wheel
         working-directory: mdm-server

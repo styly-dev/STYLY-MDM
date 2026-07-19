@@ -65,6 +65,8 @@
     }
     .brand { font: 700 19px/1 -apple-system, sans-serif; letter-spacing: .5px; }
     .brand span { color: var(--accent); }
+    .brand .brand-version { margin-left: 8px; font-size: 12px; font-weight: 600; color: var(--text-secondary); letter-spacing: 0; }
+    .brand .brand-version.mismatch { color: var(--danger); font-weight: 700; }
     .conn { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); }
     .conn-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); transition: background .3s; }
     .conn-dot.connected { background: var(--success); }
@@ -169,6 +171,9 @@
        scannable down the list after a rollout. Muted + "unknown" for pre-version clients. */
     .dev-version { margin-left: auto; flex: 0 0 auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-weight: 600; color: var(--text-secondary); background: var(--bg-actions); border: 1px solid var(--border-soft); border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
     .dev-version.unknown { color: var(--text-muted); font-weight: 400; }
+    .dev-version.mismatch { color: var(--danger); border-color: var(--danger); font-weight: 700; }
+    .btn-update { margin-left: 6px; flex: 0 0 auto; font: 600 11px/1 inherit; color: #fff; background: var(--accent); border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; white-space: nowrap; }
+    .btn-update:hover { background: var(--accent-hover); }
     .dev-sub { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .dev-status { font-size: 13px; }
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 6px; vertical-align: middle; }
@@ -339,7 +344,7 @@
     <!-- ===================== CONSOLE VIEW ===================== -->
     <div id="consoleView" class="card">
       <div class="topbar">
-        <div class="brand">STYLY-<span>MDM</span></div>
+        <div class="brand">STYLY-<span>MDM</span><span class="brand-version" id="serverVersion"></span></div>
         <div class="conn"><span class="conn-dot" id="connDot"></span><span id="connText">Disconnected</span></div>
       </div>
 
@@ -508,6 +513,8 @@
       // ---------------- State ----------------
       let ws = null;
       let devices = [];
+      let serverVersion = null;        // STYLY-MDM server version, from SERVER_INFO
+      let clientApk = null;            // newest styly-mdm-client APK on the server, from CLIENT_APK_INFO ({filename,url,version} or null)
       let groups = {};                 // name -> [serials]
       let selectedIds = new Set();
       let activeGroup = null;          // group name driving the selection, or null
@@ -591,6 +598,47 @@
       // Allowlist, not a "!== 'offline'" denylist: a new server-side status (e.g.
       // retiring/retired) must default to the dimmed, not-a-command-target styling.
       function isOnline(d) { return d.status === 'online' || d.status === 'updating'; }
+      // Compatibility is keyed on major.minor, not the full version. Policy: any
+      // change that requires the client and server to move together bumps the minor
+      // (or major); the third component ("build") is reserved for compatible,
+      // independent updates. So a v0.2.1 server happily talks to a v0.2.0 client, but
+      // a differing minor means the fleet is out of sync. Parse the [major, minor]
+      // prefix into numbers (so "0.10" > "0.2"), or null when there is no prefix.
+      function parseMajorMinor(v) {
+        const m = /^(\d+)\.(\d+)/.exec(v || '');
+        return m ? [parseInt(m[1], 10), parseInt(m[2], 10)] : null;
+      }
+      // Numeric compare of two [major, minor] pairs: -1 if a < b, 1 if a > b, else 0.
+      function cmpMajorMinor(a, b) {
+        if (a[0] !== b[0]) return a[0] < b[0] ? -1 : 1;
+        if (a[1] !== b[1]) return a[1] < b[1] ? -1 : 1;
+        return 0;
+      }
+      // The server's minor is meaningful even on a setuptools_scm dev build
+      // ("0.3.1.dev4" -> [0, 3]), so we compare against it directly. The only value we
+      // can't key on is the "0.0.0" fallback (untagged / not installed), which we skip.
+      function serverMajorMinor() {
+        return serverVersion && serverVersion !== '0.0.0' ? parseMajorMinor(serverVersion) : null;
+      }
+      // The server is out of date when any live client is on a newer major.minor —
+      // then it's the server (top bar), not the device, that gets flagged.
+      function serverIsBehindAnyDevice() {
+        const srv = serverMajorMinor();
+        if (!srv) return false;
+        return devices.some(function (d) {
+          const dev = d.status === 'online' && parseMajorMinor(d.version_name);
+          return dev && cmpMajorMinor(dev, srv) > 0;
+        });
+      }
+      // Paint the top-bar server version, red when the server trails a live client.
+      function updateServerVersionBadge() {
+        const el = document.getElementById('serverVersion');
+        if (!el) return;
+        el.textContent = serverVersion ? 'v' + serverVersion : '';
+        const behind = serverIsBehindAnyDevice();
+        el.classList.toggle('mismatch', behind);
+        el.title = behind ? 'Server is behind — a connected client runs a newer major.minor' : '';
+      }
       function deviceById(id) { return devices.find(function (d) { return getDeviceId(d) === id; }); }
       // Command targets need a live WebSocket, which "updating" (mid self-update,
       // device rebooting) does not have — only strictly-online devices qualify.
@@ -670,6 +718,22 @@
       // ---------------- Message handling ----------------
       function handleMessage(msg) {
         switch (msg.type) {
+          case 'CLIENT_APK_INFO': {
+            // Sent on connect (right after SERVER_INFO, before DEVICE_LIST) and again
+            // whenever an APK is uploaded, so the per-device Update buttons stay current.
+            clientApk = msg.apk || null;
+            if (devices.length) render();
+            break;
+          }
+          case 'SERVER_INFO': {
+            serverVersion = msg.version || null;
+            updateServerVersionBadge();
+            // Sent once on connect, just before DEVICE_LIST (which renders). Only
+            // re-render here if a device list is already on screen, so a late info
+            // update repaints the version badges without depending on init order.
+            if (devices.length) render();
+            break;
+          }
           case 'DEVICE_LIST': {
             devices = msg.devices || [];
             const cur = knownIds();
@@ -808,6 +872,9 @@
 
       // ---------------- Render (master) ----------------
       function render() {
+        // The top-bar version's red state depends on the device list, so refresh it
+        // on every render (device rows below carry the reverse, client-behind flag).
+        updateServerVersionBadge();
         if (view === 'manage') {
           manageView.style.display = '';
           consoleView.style.display = 'none';
@@ -927,14 +994,33 @@
         } else {
           // Client build, right-aligned in the label row so it reads as a column across
           // rows; older clients that predate the version field show a muted "unknown".
+          // A stable-online client whose major.minor trails the server needs updating,
+          // so its badge is flagged red. A client *ahead* of the server is the server's
+          // problem, not the device's — that reddens the top-bar version instead.
+          const srvMinor = serverMajorMinor();
+          const devMinor = parseMajorMinor(d.version_name);
+          const verBehind = srvMinor && devMinor && d.status === 'online' && cmpMajorMinor(devMinor, srvMinor) < 0;
           const verBadge = d.version_name
-            ? '<span class="dev-version" title="Client build">v' + esc(d.version_name) + '</span>'
+            ? '<span class="dev-version' + (verBehind ? ' mismatch' : '') + '" title="' +
+                (verBehind ? 'Client v' + esc(d.version_name) + ' trails server ' + esc(serverVersion) + ' — needs updating' : 'Client build') +
+                '">v' + esc(d.version_name) + '</span>'
             : '<span class="dev-version unknown" title="Client build unknown (device predates version reporting)">unknown</span>';
+          // Offer a one-click self-update only when the server's client APK is on the
+          // *same* major.minor as the server — installing it brings this behind device
+          // exactly in sync. A stale APK (older than the server) would leave it still
+          // red; one ahead of the server would push it past the server (flipping the
+          // top-bar red), which violates the lockstep policy. Neither is offered.
+          const canUpdate = verBehind && clientApk &&
+            cmpMajorMinor(parseMajorMinor(clientApk.version), srvMinor) === 0;
+          const updateBtn = canUpdate
+            ? '<button class="btn-update" data-act="update" data-id="' + esc(id) + '" title="Install styly-mdm-client v' + esc(clientApk.version) + ' (the device reinstalls the MDM client and restarts)">Update</button>'
+            : '';
           deviceCell = '<div class="dev-label-row">' +
             (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') +
             '<button class="ic-btn ' + (d.label ? '' : 'assign-btn') + '" data-act="editLabel" data-id="' + esc(id) + '" title="' + (d.label ? 'Edit label' : 'Assign label') + '">✏</button>' +
             (startup ? '<span class="badge-startup" title="' + esc(startup) + '">★</span>' : '') +
             verBadge +
+            updateBtn +
             '</div>';
         }
         deviceCell += '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.ip || '-') + '</div>';
@@ -1321,6 +1407,22 @@
         editingLabelId = null;
         wsSend({ type: 'SET_DEVICE_LABEL', device_id: id, label: val }, 'set label');
         render();
+      }
+      // ---------------- Client update ----------------
+      // Reuses the normal install path pointed at the server's own client APK: the
+      // device recognises its own package and drives the self-update handshake.
+      function sendClientUpdate(id) {
+        if (!clientApk) { addLog('No client APK available on the server to update with', 'warn'); return; }
+        const d = deviceById(id);
+        if (!d || d.status !== 'online') { addLog('Cannot update: device is not online', 'warn'); return; }
+        const name = (d && d.label) || id;
+        if (!confirm('Update "' + name + '" to styly-mdm-client v' + clientApk.version + '?\n\nThe device will reinstall the MDM client and restart.')) return;
+        // Absolute URL against our own origin, exactly like an operator-uploaded APK.
+        const apkUrl = new URL(clientApk.url, location.origin).href;
+        if (!wsSend({ type: 'INSTALL_APK', target_devices: [id], apk_url: apkUrl, apk_filename: clientApk.filename }, 'update client')) return;
+        deviceTaskState[id] = { task: 'install', status: 'queued', filename: clientApk.filename, detail: '' };
+        updateTaskCell(id);
+        addLog('Updating ' + name + ' to client v' + clientApk.version, 'info');
       }
       function sendForget(id) {
         const d = deviceById(id); const name = (d && d.label) || id;
@@ -2023,6 +2125,7 @@
         else if (act === 'saveLabel') commitLabel(t.dataset.id);
         else if (act === 'cancelLabel') { editingLabelId = null; render(); }
         else if (act === 'forget') sendForget(t.dataset.id);
+        else if (act === 'update') sendClientUpdate(t.dataset.id);
       });
       // Targets label-edit keyboard
       targetsBody.addEventListener('keydown', function (e) {
