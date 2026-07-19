@@ -13,7 +13,7 @@ STYLY-MDM currently supports PICO devices (PICO OS with Business Mode). Support 
 - **Multi-device launch** — select devices with the checkboxes (use the header checkbox to select all) and send an app launch command to them at once; offline devices are skipped automatically
 - **Persistent device list** — once an HMD has connected it stays in the list with an `online`/`offline` status instead of vanishing on disconnect; offline devices keep their last-known details, can be pre-labeled, and can be forgotten when decommissioned
 - **Battery monitoring** — connected clients report battery percentage and charging state, and the console highlights low-battery devices
-- **Auto-reconnect** — both the MDM client and the web console reconnect automatically with exponential backoff
+- **Auto-reconnect with a bounded window** — the web console reconnects automatically with exponential backoff; the MDM client retries (with UDP discovery) only inside a short connection window after a network change or disconnect, then goes fully silent — `Standby (no server found)` — so a fleet running without a server pays no standby-battery or network cost. Toggling Wi-Fi, rebooting, or restarting the client opens a fresh window; the window length and retry interval are configurable via `/sdcard/styly-mdm/config.json` (see [Client standby behavior](#client-standby-behavior-and-how-to-tune-it))
 - **Boot persistence** — the MDM client starts automatically on HMD boot via `BOOT_COMPLETED` and PICO auto-boot intents
 - **Activity log** — every launch command and result is shown in the web console with timestamps
 - **APK deployment** — upload an APK from the web console and install it silently on selected online devices
@@ -115,6 +115,42 @@ Install the MDM client APK on the HMD (see the [Developer Guide](docs/DEVELOPMEN
 
 The MDM client connects to the server, registers the device (serial number, model, IP address), and runs as a foreground service in the background.
 
+### Client standby behavior (and how to tune it)
+
+The mdm-server does not have to run permanently: at an installed venue it may be
+started only when devices actually need to be managed. The client is designed so that
+an unreachable server never drains device batteries or puts useless traffic on the
+venue network:
+
+- After a network change, an app restart, or losing an established connection, the
+  client tries to find a server for a short **connection window** (default **10
+  seconds**, one discovery + connect attempt every **2 seconds**).
+- If no server is found in time, it stops all network traffic and shows
+  **`Standby (no server found)`** in its notification and settings screen. A standby
+  client sends nothing at all — no reconnect attempts, no discovery broadcasts, no
+  pings — so the Wi-Fi radio can stay in power-save and the device pays no
+  standby-battery cost for a server that is not there.
+- A standby client does **not** notice a server that starts up later. To bring a device
+  back under management, give it a new connection window: **toggle Wi-Fi off/on**,
+  **reboot the device**, or restart the client app — with the server running.
+
+Both durations can be changed per device by placing an optional JSON file at
+`/sdcard/styly-mdm/config.json`:
+
+```json
+{ "connect_window_seconds": 10, "connect_retry_interval_seconds": 2 }
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `connect_window_seconds` | 10 | How long the client keeps searching before going to standby |
+| `connect_retry_interval_seconds` | 2 | Delay between attempts inside the window |
+
+Place it with `adb push` (or the headset's file manager), or deliver it to a connected
+fleet with the console's file-push feature. The file is re-read every time a new
+connection window opens, so changes take effect on the next Wi-Fi toggle, disconnect,
+or reboot — no reinstall needed. Missing or invalid values fall back to the defaults.
+
 ### 3. Launch Apps from the Web Console
 
 1. Open `http://<server-ip>:7070` in a browser.
@@ -159,7 +195,13 @@ Device labels and group definitions live in a single file, `<data-dir>/device_re
    styly-mdm --data-dir /srv/styly-mdm
    ```
 
-Devices rediscover the new server over UDP and reconnect on their own. The `ip` and `last_seen` fields refresh on reconnect, and group membership is keyed by serial number, so devices that are offline during the move keep their groups.
+Devices do **not** reconnect on their own: while the old server was down they went to
+standby (see [Client standby behavior](#client-standby-behavior-and-how-to-tune-it)),
+and a standby client does not notice the new server. Once the new server is running,
+toggle Wi-Fi off/on or reboot each headset — the fresh connection window rediscovers
+the new server over UDP and reconnects. The `ip` and `last_seen` fields refresh on
+reconnect, and group membership is keyed by serial number, so devices that are offline
+during the move keep their groups.
 
 Uploaded APKs (`<data-dir>/apks/`) and pushed file bundles (`<data-dir>/bundles/`) are not part of the registry. Copy those directories separately with `rsync` or `scp` if the new server needs them — a single APK can be up to 2 GiB, so they are not worth moving through a browser.
 

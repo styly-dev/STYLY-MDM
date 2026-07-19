@@ -167,7 +167,9 @@ STYLY-MDM/
     │   └── java/com/styly/mdmclient/
     │       ├── MdmClientApplication.kt   # Application entry point
     │       ├── MdmClientService.kt       # Foreground service; executes launch commands
-    │       ├── WebSocketManager.kt       # WebSocket connection with auto-reconnect
+    │       ├── WebSocketManager.kt       # WebSocket connection inside the bounded connection window
+    │       ├── ConnectionScheduler.kt    # Connection-window state machine (host-JVM tested)
+    │       ├── ClientConfig.kt           # Window/retry tunables + config-file overrides (host-JVM tested)
     │       ├── SettingsActivity.kt       # UI to configure server URL; shows client build; Update Journal viewer
     │       ├── ServerDiscovery.kt        # UDP broadcast server discovery
     │       ├── BundleSync.kt             # Push/sync a file bundle into a device directory
@@ -756,9 +758,9 @@ increase (`-PversionCodeOverride`).
 ## Device Retirement
 
 At final venue handover the MDM client must not remain on delivered devices (issue #49):
-an orphaned client reconnect-loops and broadcasts discovery packets on the customer's
-network indefinitely, and an unmanaged remote-control agent should not ship with delivered
-hardware. The console's **Retire Devices** command makes selected clients uninstall
+an orphaned client still probes for a server on every network transition (and, before the
+bounded connection window, reconnect-looped indefinitely), and an unmanaged
+remote-control agent should not ship with delivered hardware. The console's **Retire Devices** command makes selected clients uninstall
 themselves — the same `pbsControlAPPManger(PACKAGE_SILENCE_UNINSTALL, <own package>)`
 primitive the guard's self-destruct uses (device-verified there, including that TobService
 accepts an uninstall of the calling package).
@@ -790,8 +792,8 @@ The flow inverts the self-update's success signal: a removed client can send not
    `retiring`. Both failure modes surface well inside the window: a client whose
    uninstall never ran still holds its WebSocket (checked directly at the deadline), and
    a merely-killed client is restarted by the keep-alive and re-registers within the
-   ≤30 s reconnect backoff — no reboot is involved, which is why this window is much
-   shorter than `SELF_UPDATE_TIMEOUT`.
+   fresh connection window its process restart opens (seconds) — no reboot is involved,
+   which is why this window is much shorter than `SELF_UPDATE_TIMEOUT`.
 4. Terminal states, reported as `RETIRE_RESULT`:
    * **Success** — the device stayed away for the whole window. The registry record is
      flagged `retired` (persisted in `device_registry.json`), the row turns to the
@@ -822,6 +824,55 @@ client and guard packages are both gone after the retire, and that no ToBService
 keep-alive or appops residue misbehaves (`MANAGE_EXTERNAL_STORAGE` pointing at a removed
 package is inert but worth a glance).
 
+## Client Connection Lifecycle (bounded connection window)
+
+At an installed venue the mdm-server is not necessarily running all the time — it may
+be brought up only when devices need to be managed. The client therefore never retries
+forever (issue #67 — every retry wakes the Wi-Fi radio out of power-save and every
+discovery broadcast lands on the venue network). Instead, connection attempts are only allowed
+inside a **connection window**, driven by a plain-Kotlin state machine
+(`ConnectionScheduler`: `IDLE` / `WINDOW_OPEN` / `CONNECTED` / `SILENT`, host-JVM
+tested) that `WebSocketManager` executes on the main looper:
+
+1. **The window opens on a network-available transition**, not on boot: the client
+   registers a `ConnectivityManager` default-network callback, which also fires
+   immediately when a network is already up — so a process restart (self-update,
+   settings save, reboot) gets a fresh window too. A fresh window likewise opens when
+   an **established connection drops** while the network is still up.
+2. **Inside the window** every attempt cycle runs UDP discovery first (a saved-but-stale
+   URL must not keep the client away from a relocated server), then connects to the
+   saved URL, which discovery just refreshed if a server answered. Failed attempts
+   retry on a fixed interval; OkHttp's `connectTimeout` is shortened to 3 s so a single
+   black-holed attempt cannot consume the window.
+3. **On expiry without a connection** the in-flight socket is aborted (`cancel()`, no
+   close handshake) and the client goes fully **silent** — no WebSocket attempts, no
+   UDP, no pings — showing `Standby (no server found)` in the notification and
+   Settings screen. Losing the network cancels everything the same way (`IDLE`).
+4. **Recovery from silence** is any new network-available transition: toggling Wi-Fi,
+   rebooting while the server is up, or restarting the client process.
+
+### Connection tunables (`/sdcard/styly-mdm/config.json`)
+
+The window duration and retry interval have built-in defaults and can be overridden by
+an optional JSON file on shared storage — placed by an operator (file manager / `adb
+push`) or delivered to a connected fleet via `EXECUTE_PUSH_FILES` (the path is outside
+the protected top-level media dirs precisely so a push bundle may write it):
+
+```json
+{ "connect_window_seconds": 10, "connect_retry_interval_seconds": 2 }
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `connect_window_seconds` | 10 | How long after a network-available transition (or a connection drop) the client keeps trying before going silent |
+| `connect_retry_interval_seconds` | 2 | Delay between attempt cycles inside the window |
+
+Each key falls back to its default independently when missing or invalid
+(non-numeric/non-positive); fractional seconds are accepted. The file is re-read every
+time a window opens, so a pushed config takes effect on the next network transition or
+disconnect — no reinstall or reboot. A device that has never reached a server can only
+run on the defaults (the push channel needs a live socket).
+
 ## Server Discovery Protocol
 
 STYLY-MDM supports automatic server discovery via UDP broadcast on the LAN.
@@ -831,7 +882,10 @@ STYLY-MDM supports automatic server discovery via UDP broadcast on the LAN.
 | 1 | Client → Broadcast | Send `STYLYMDM_DISCOVER` as UTF-8 to `255.255.255.255:7071` (UDP) |
 | 2 | Server → Client | Respond with JSON: `{"service": "stylymdm", "ws_url": "ws://<ip>:7070/ws/device", "version": "1.0"}` |
 
-The client waits up to 3 seconds for a response. If no server replies, discovery fails silently and the client falls back to the default or saved URL.
+The client runs one discovery exchange at the start of every attempt cycle inside its
+[connection window](#client-connection-lifecycle-bounded-connection-window), waiting up
+to 3 seconds for a response. If no server replies, discovery fails silently and the
+cycle proceeds against the saved (or default) URL.
 
 > The ports above are the production defaults. A development server/client uses
 > port 7081 (discovery) and 7080 (WebSocket) instead — see
