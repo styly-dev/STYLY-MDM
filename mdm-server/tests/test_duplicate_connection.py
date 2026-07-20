@@ -181,6 +181,91 @@ def test_e2e_single_connection_disconnect_still_goes_offline(tmp_path):
     asyncio.run(body())
 
 
+def test_e2e_download_complete_on_a_superseded_socket_does_not_release_the_slot(tmp_path):
+    """A stale socket must not advance the live connection's install (PR #71 review).
+
+    The job was dispatched to the connection that owns the device_id; a leftover
+    socket reporting progress would finish it behind the live client's back.
+    """
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        ts = TestServer(server.create_app())
+        await ts.start_server()
+        base = f"http://{ts.host}:{ts.port}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                stale = await _register(session, base, "dev0")
+                live = await _register(session, base, "dev0")
+                admin = await session.ws_connect(base + "/ws/admin")
+                assert await _recv_type(admin, "DEVICE_LIST") is not None
+                await asyncio.sleep(0.1)
+
+                slot = asyncio.get_running_loop().create_future()
+                server.pending_transfers[("dev0", server.TASK_INSTALL)] = slot
+
+                await stale.send_json({
+                    "type": "DOWNLOAD_COMPLETE", "task": server.TASK_INSTALL,
+                    "apk_filename": "x.apk",
+                })
+                await asyncio.sleep(0.1)
+                assert not slot.done(), "stale socket released the live install's slot"
+                assert await _recv_type(admin, "INSTALL_PROGRESS", timeout=0.3) is None
+
+                # The owning connection still drives the job.
+                await live.send_json({
+                    "type": "DOWNLOAD_COMPLETE", "task": server.TASK_INSTALL,
+                    "apk_filename": "x.apk",
+                })
+                await asyncio.sleep(0.1)
+                assert slot.done()
+
+                await stale.close()
+                await live.close()
+                await admin.close()
+        finally:
+            await ts.close()
+
+    asyncio.run(body())
+
+
+def test_e2e_terminal_result_on_a_superseded_socket_is_not_forwarded(tmp_path):
+    """INSTALL_RESULT from a leftover socket must not settle the live job."""
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        ts = TestServer(server.create_app())
+        await ts.start_server()
+        base = f"http://{ts.host}:{ts.port}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                stale = await _register(session, base, "dev0")
+                live = await _register(session, base, "dev0")
+                admin = await session.ws_connect(base + "/ws/admin")
+                assert await _recv_type(admin, "DEVICE_LIST") is not None
+                await asyncio.sleep(0.1)
+
+                await stale.send_json({
+                    "type": "INSTALL_RESULT", "device_id": "dev0",
+                    "status": "fail", "detail": "from the stale socket",
+                })
+                assert await _recv_type(admin, "INSTALL_RESULT", timeout=0.3) is None
+
+                # The owning connection's result still reaches the console.
+                await live.send_json({
+                    "type": "INSTALL_RESULT", "device_id": "dev0",
+                    "status": "success", "detail": "",
+                })
+                forwarded = await _recv_type(admin, "INSTALL_RESULT")
+                assert forwarded is not None and forwarded["status"] == "success"
+
+                await stale.close()
+                await live.close()
+                await admin.close()
+        finally:
+            await ts.close()
+
+    asyncio.run(body())
+
+
 def test_e2e_stale_teardown_does_not_free_the_live_transfer_slot(tmp_path):
     """A superseded socket closing must not release the live device's slot."""
     async def body():
