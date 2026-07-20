@@ -103,6 +103,8 @@ The **data directory** holds everything the server persists: uploaded APKs (`apk
 
 ### 2. Configure the MDM Client
 
+> **Getting the APK.** A released server already holds a matching signed client APK, and the web console's top bar offers it as a **⬇ Client APK v`<version>`** download link — so you can grab the APK for sideloading straight from the console, without visiting this repository's releases page. The link is hidden when the server has no client APK (a from-source run that has never had one uploaded).
+
 Install the MDM client APK on the HMD (see the [Developer Guide](docs/DEVELOPMENT.md) for build and install instructions), then:
 
 1. Launch **STYLY-MDM Client** on the HMD.

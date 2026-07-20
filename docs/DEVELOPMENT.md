@@ -143,6 +143,38 @@ Repeated runs continue numbering, so counts add up; dummies use the serial prefi
 `DUMMY-TEST-` (override with `--prefix`) and are removed by that prefix. Only offline
 devices can be forgotten, so stop an `--online` run before `--remove`.
 
+### Seeding a client APK for UI testing
+
+**A server run from source holds no client APK at all.** The signed
+`styly-mdm-client_<version>.apk` is placed in `styly_mdm/client/` by CI at release
+time and shipped inside the *wheel*; the source tree has no such directory, so
+`seed_bundled_client_apk()` has nothing to copy and `latest_client_apk()` returns
+`None`. Everything driven by `CLIENT_APK_INFO` is therefore invisible from source:
+the top-bar **⬇ Client APK** download link *and* the per-device **Update** button.
+This is expected — on a released server (`pip`/`uvx`) both always appear.
+
+To exercise them, put one file matching the release naming convention in the
+server's `APK_DIR`. No restart is needed for the file itself, but `CLIENT_APK_INFO`
+is only sent on admin connect and after an upload, so **reload the console** (or
+upload through the console, which re-broadcasts it).
+
+```bash
+# A throwaway server on its own ports and its own data dir
+mkdir -p /tmp/mdm-dev/apks
+# any real APK will do; the name is what the server keys on. Newest dev build:
+cp "$(ls -t mdm-server/apks/app-dev-debug-*.apk | head -1)" \
+   /tmp/mdm-dev/apks/styly-mdm-client_v0.3.0.apk
+cd mdm-server
+MDM_DISCOVERY_PORT=7099 PYTHONPATH=. python -m styly_mdm \
+  --data-dir /tmp/mdm-dev --port 7079
+```
+
+> **Use a separate data directory, not your everyday one.** `CLIENT_APK_INFO` feeds
+> the per-device **Update** button too, so a debug-signed dev APK sitting in the data
+> directory you use with real headsets makes the console offer it as a legitimate
+> client update. Android rejects the install (different signing key), but the console
+> shows a genuine-looking Update button for an APK that can never apply.
+
 ## Project Structure
 
 ```
@@ -238,7 +270,7 @@ STYLY-MDM/
 | Endpoint | Description |
 |---|---|
 | `POST /api/apks` | Multipart upload with field `apk`. Returns `apk_url`, `apk_filename`, and `size`. |
-| `GET /apks/{filename}` | Serves uploaded APK files to devices on the LAN. |
+| `GET /apks/{filename}` | Serves uploaded APK files to devices on the LAN, and backs the console's top-bar client-APK download link (see the client-APK download note below). |
 | `POST /api/bundles` | Multipart upload with repeated field `files`; each part's filename carries its folder-relative path. The server zips the reconstructed tree into a bundle, excluding OS metadata (`.DS_Store`, `._*`, `Thumbs.db`, …). Returns `bundle_url`, `bundle_filename`, `size`, `entry_count` (files in the bundle), and `skipped_count` (files excluded). 400 if every uploaded file was excluded. |
 | `GET /bundles/{filename}` | Serves generated file/folder bundles (zip) to devices on the LAN. |
 
@@ -247,7 +279,7 @@ STYLY-MDM/
 | Message type | Description |
 |---|---|
 | `SERVER_INFO` | Server identity, sent once on connect (before the first `DEVICE_LIST`). Fields: `version` (the `styly_mdm` package version; the console renders it next to the `STYLY-MDM` brand in the top bar. Its `major.minor` is the compatibility reference — and the top-bar value itself turns red when a live client is on a *newer* `major.minor` (i.e. the server is the one lagging). See the compatibility note below). |
-| `CLIENT_APK_INFO` | The newest styly-mdm-client APK the server holds, sent on connect (right after `SERVER_INFO`, before `DEVICE_LIST`) and re-broadcast after every APK upload. Field: `apk` = `{filename, url, version}` or `null`. Drives the per-device **Update** button (see the client-update note below). |
+| `CLIENT_APK_INFO` | The newest styly-mdm-client APK the server holds, sent on connect (right after `SERVER_INFO`, before `DEVICE_LIST`) and re-broadcast after every APK upload. Field: `apk` = `{filename, url, version}` or `null`. Drives the per-device **Update** button and the top-bar client-APK download link (see the notes below). |
 | `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting; a *stable-online* client whose `version_name` trails the server on `major.minor` is flagged red as needing an update — the reverse case, a client *ahead* of the server, reddens the top-bar server version instead. `updating` and offline rows are exempt, and the check is skipped only when the server version is the `0.0.0` untagged/not-installed fallback), and may include optional `battery`: `{level, charging, last_seen}`) |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
@@ -302,6 +334,18 @@ STYLY-MDM/
 > package-data glob); an **sdist** source build does not (setuptools-scm only packs
 > git-tracked files), but `pip`/`uvx` install the wheel — so a released server ships
 > with its matching client, while a from-source run relies on an operator upload.
+
+> **Downloading the client APK from the console.** The same APK that drives the
+> per-device **Update** button is also offered to the operator directly: when
+> `CLIENT_APK_INFO` carries an `apk`, the console's top bar shows a
+> **⬇ Client APK v`<version>`** link pointing at `apk.url` (i.e. the existing
+> `GET /apks/{filename}` static mount — no dedicated download endpoint). It is a
+> plain `<a href download>`, so it works on the non-secure `http://<LAN-IP>` origin
+> the console is normally served from, and aiohttp serves APKs as
+> `application/octet-stream`, so the browser saves rather than renders them. When
+> `apk` is `null` (no client APK in `APK_DIR`) the link is hidden entirely. This
+> means sideloading or hand-installing a client never requires reaching this
+> repository's GitHub Releases page — the console alone is enough.
 
 > **Device groups** are a many-to-many grouping keyed by device serial, persisted
 > server-side in `device_registry.json` (under a `groups` key). Selecting a group

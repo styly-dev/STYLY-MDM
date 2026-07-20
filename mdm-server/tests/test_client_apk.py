@@ -5,9 +5,12 @@ client APK; the server finds the newest one in APK_DIR by the release naming
 convention and seeds a wheel-bundled copy into APK_DIR on startup.
 """
 
+import asyncio
 import json
 
+import aiohttp
 import pytest
+from aiohttp.test_utils import TestServer
 
 from styly_mdm import server
 
@@ -96,3 +99,35 @@ def test_seed_bundled_client_apk_copies_once(tmp_path, monkeypatch):
     seeded.write_bytes(b"operator-copy")
     server.seed_bundled_client_apk()
     assert seeded.read_bytes() == b"operator-copy"
+
+
+def test_client_apk_url_is_downloadable_over_http(tmp_path, monkeypatch):
+    """The console's top-bar download link points at latest_client_apk()["url"].
+
+    That URL is only a plain <a href download> away from the operator's browser,
+    so it must resolve to the APK bytes through the ordinary /apks static mount
+    with no extra endpoint and no secure-context-only browser API involved.
+    """
+
+    # create_app() seeds from the real package client/ dir; point it at an empty
+    # one so a locally built wheel's bundled APK cannot outrank the fixture below.
+    monkeypatch.setattr(server, "BUNDLED_CLIENT_DIR", tmp_path / "no-bundle")
+
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        app = server.create_app()
+        (server.APK_DIR / "styly-mdm-client_v0.3.0.apk").write_bytes(b"apk-bytes")
+
+        ts = TestServer(app)
+        await ts.start_server()
+        try:
+            info = server.latest_client_apk()
+            assert info["url"] == "/apks/styly-mdm-client_v0.3.0.apk"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"http://{ts.host}:{ts.port}{info['url']}") as resp:
+                    assert resp.status == 200
+                    assert await resp.read() == b"apk-bytes"
+        finally:
+            await ts.close()
+
+    asyncio.run(body())

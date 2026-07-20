@@ -67,6 +67,13 @@
     .brand span { color: var(--accent); }
     .brand .brand-version { margin-left: 8px; font-size: 12px; font-weight: 600; color: var(--text-secondary); letter-spacing: 0; }
     .brand .brand-version.mismatch { color: var(--danger); font-weight: 700; }
+    .bar-right { display: flex; align-items: center; gap: 16px; }
+    .apk-download {
+      display: none; align-items: center; gap: 6px; font-size: 13px; font-weight: 600;
+      color: var(--accent); text-decoration: none;
+    }
+    .apk-download.shown { display: flex; }
+    .apk-download:hover { text-decoration: underline; }
     .conn { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); }
     .conn-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); transition: background .3s; }
     .conn-dot.connected { background: var(--success); }
@@ -345,7 +352,10 @@
     <div id="consoleView" class="card">
       <div class="topbar">
         <div class="brand">STYLY-<span>MDM</span><span class="brand-version" id="serverVersion"></span></div>
-        <div class="conn"><span class="conn-dot" id="connDot"></span><span id="connText">Disconnected</span></div>
+        <div class="bar-right">
+          <a class="apk-download" id="clientApkLink" href="#" download>⬇ Client APK</a>
+          <div class="conn"><span class="conn-dot" id="connDot"></span><span id="connText">Disconnected</span></div>
+        </div>
       </div>
 
       <div class="zones">
@@ -639,6 +649,24 @@
         el.classList.toggle('mismatch', behind);
         el.title = behind ? 'Server is behind — a connected client runs a newer major.minor' : '';
       }
+      // Top-bar link that hands the operator the client APK the server already holds,
+      // so sideloading a device does not require reaching the GitHub releases page.
+      // A plain <a download> works on the non-secure http://<LAN-IP> origin the console
+      // is usually served from; hidden entirely when the server has no client APK.
+      function updateClientApkLink() {
+        const el = document.getElementById('clientApkLink');
+        if (!el) return;
+        if (!clientApk) {
+          el.classList.remove('shown');
+          el.removeAttribute('href');
+          return;
+        }
+        el.href = clientApk.url;
+        el.setAttribute('download', clientApk.filename);
+        el.textContent = '⬇ Client APK v' + clientApk.version;
+        el.title = 'Download ' + clientApk.filename + ' to this machine for manual install';
+        el.classList.add('shown');
+      }
       function deviceById(id) { return devices.find(function (d) { return getDeviceId(d) === id; }); }
       // Command targets need a live WebSocket, which "updating" (mid self-update,
       // device rebooting) does not have — only strictly-online devices qualify.
@@ -722,6 +750,7 @@
             // Sent on connect (right after SERVER_INFO, before DEVICE_LIST) and again
             // whenever an APK is uploaded, so the per-device Update buttons stay current.
             clientApk = msg.apk || null;
+            updateClientApkLink();
             if (devices.length) render();
             break;
           }
