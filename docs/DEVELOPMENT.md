@@ -917,6 +917,25 @@ time a window opens, so a pushed config takes effect on the next network transit
 disconnect — no reinstall or reboot. A device that has never reached a server can only
 run on the defaults (the push channel needs a live socket).
 
+### Duplicate connections: the newest registration owns the device
+
+A reboot does not always close the client's socket cleanly — the server can still hold
+the pre-reboot WebSocket open (it only notices at the next 30 s heartbeat) when the
+rebooted client has already reconnected and re-registered. Two live connections then
+carry the same `device_id`, and the invariant is that **the newest `REGISTER` owns the
+entry in `devices`**: `devices[device_id]["ws"]` is the connection every command is sent
+to, and only that connection may tear the entry down.
+
+Every per-connection teardown step in `device_ws_handler` is therefore gated on socket
+identity (`devices[device_id]["ws"] is ws`) — deleting the registration, freeing
+transfer slots, dropping the install-dispatch record, and failing a pending self-update
+verification. Message handlers that index `devices[device_id]` apply the same check and
+ignore frames arriving on a superseded socket.
+
+Without that guard the stale socket's teardown deleted the *live* registration, so a
+reconnected device showed as `offline` in the console until its next `BATTERY_UPDATE`
+raised `KeyError` and killed the surviving connection (issue #70).
+
 ## Server Discovery Protocol
 
 STYLY-MDM supports automatic server discovery via UDP broadcast on the LAN.

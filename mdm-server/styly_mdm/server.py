@@ -1234,11 +1234,19 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     if battery is None:
                         log.warning("Invalid BATTERY_UPDATE from %s: %s", device_id, data)
                         continue
+                    # Telemetry from a socket the device has already replaced is not
+                    # worth an unhandled KeyError that takes the live connection's
+                    # handler down with it (#70).
+                    live_entry = devices.get(device_id)
+                    if live_entry is None or live_entry.get("ws") is not ws:
+                        log.info("Ignoring BATTERY_UPDATE from superseded connection: %s",
+                                 device_id)
+                        continue
 
                     # Use server receipt time for stale-display semantics; client clocks
                     # can drift, and the console only needs last-known freshness.
                     battery["last_seen"] = time.time()
-                    devices[device_id]["battery"] = battery
+                    live_entry["battery"] = battery
                     rec = device_registry.get(device_id)
                     if rec is not None:
                         rec["battery"] = battery
@@ -1446,7 +1454,18 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
             elif raw_msg.type == web.WSMsgType.ERROR:
                 log.error("Device WS error: %s", ws.exception())
     finally:
-        if device_id:
+        # A reboot does not always close the old socket cleanly, so the pre-reboot
+        # connection can still be open here when the rebooted client has already
+        # reconnected and re-registered. Every teardown step below belongs to the
+        # connection that currently *owns* the device_id: a superseded socket must
+        # not free the live connection's transfer slots, settle its pending state,
+        # or delete its registration — that last one left a connected device stuck
+        # on "offline" until the next BATTERY_UPDATE crashed the survivor (#70).
+        entry = devices.get(device_id) if device_id else None
+        is_current = entry is not None and entry.get("ws") is ws
+        if device_id and not is_current:
+            log.info("Superseded device connection closed, ignoring: %s", device_id)
+        if device_id and is_current:
             # Free every transfer slot this device was holding — it may have been in
             # an install and a push at once — so a disconnect mid-job does not stall
             # the queue until the timeout fires.
@@ -1476,7 +1495,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     "status": "error",
                     "detail": "device disconnected before verification completed",
                 })
-        if device_id and device_id in devices:
+        if device_id and is_current:
             del devices[device_id]
             # Keep the registry entry; just stop reporting the device as online and
             # stamp when it was last seen so it shows as offline in the list.
