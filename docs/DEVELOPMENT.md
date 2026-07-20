@@ -917,6 +917,32 @@ time a window opens, so a pushed config takes effect on the next network transit
 disconnect — no reinstall or reboot. A device that has never reached a server can only
 run on the defaults (the push channel needs a live socket).
 
+### Duplicate connections: the newest registration owns the device
+
+A reboot does not always close the client's socket cleanly — the server can still hold
+the pre-reboot WebSocket open (it only notices at the next 30 s heartbeat) when the
+rebooted client has already reconnected and re-registered. Two live connections then
+carry the same `device_id`, and the invariant is that **the newest `REGISTER` owns the
+entry in `devices`**: `devices[device_id]["ws"]` is the connection every command is sent
+to, and only that connection may tear the entry down.
+
+`device_ws_handler` enforces that in two places, both via `_owns_device()`:
+
+- **Inbound frames.** One guard above the message dispatch chain drops every
+  device-originated message except `REGISTER` when the socket no longer owns the
+  device_id. Without it a leftover socket could release the live connection's transfer
+  slot (`DOWNLOAD_COMPLETE`), forward a terminal result (`INSTALL_RESULT`,
+  `PUSH_FILES_RESULT`), or consume a self-update verification — finishing the live
+  client's job behind its back. `REGISTER` is the one exception: that is how a
+  connection claims ownership in the first place.
+- **Teardown.** The `finally` block runs only for the owning connection: deleting the
+  registration, freeing transfer slots, dropping the install-dispatch record, and
+  failing a pending self-update verification.
+
+Without that guard the stale socket's teardown deleted the *live* registration, so a
+reconnected device showed as `offline` in the console until its next `BATTERY_UPDATE`
+raised `KeyError` and killed the surviving connection (issue #70).
+
 ## Server Discovery Protocol
 
 STYLY-MDM supports automatic server discovery via UDP broadcast on the LAN.

@@ -1147,6 +1147,21 @@ def zip_tree(root: Path, dest_zip: Path) -> None:
 # Device WebSocket handler  (/ws/device)
 # ---------------------------------------------------------------------------
 
+def _owns_device(device_id: str | None, ws: web.WebSocketResponse) -> bool:
+    """True when ``ws`` is the connection that currently owns ``device_id``.
+
+    A reboot does not always close the client's socket cleanly, so the server can
+    still hold the pre-reboot connection open (it only notices at the next
+    heartbeat) when the rebooted client has already reconnected and re-registered.
+    Both sockets then carry the same device_id, and the newest REGISTER is the
+    owner: ``devices[device_id]["ws"]`` is where commands are sent, so it is also
+    the only connection allowed to mutate that device's state or tear it down
+    (#70).
+    """
+    entry = devices.get(device_id) if device_id else None
+    return entry is not None and entry.get("ws") is ws
+
+
 async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
@@ -1164,6 +1179,17 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     continue
 
                 msg_type = data.get("type")
+
+                # A newer REGISTER has taken ownership of this device_id, so this
+                # socket is a leftover from a reboot the server has not noticed yet.
+                # It must not advance or settle any per-device state — releasing a
+                # transfer slot or forwarding a terminal result from here would
+                # finish the *live* connection's job behind its back (#70). REGISTER
+                # is the one exception: that is how a connection claims ownership.
+                if msg_type != "REGISTER" and device_id and not _owns_device(device_id, ws):
+                    log.info("Ignoring %s from superseded connection: %s",
+                             msg_type, device_id)
+                    continue
 
                 if msg_type == "REGISTER":
                     device_id = data.get("device_id")
@@ -1234,10 +1260,11 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     if battery is None:
                         log.warning("Invalid BATTERY_UPDATE from %s: %s", device_id, data)
                         continue
-
                     # Use server receipt time for stale-display semantics; client clocks
                     # can drift, and the console only needs last-known freshness.
                     battery["last_seen"] = time.time()
+                    # The ownership guard above the dispatch chain has already dropped
+                    # frames from a superseded socket, so the entry is present here.
                     devices[device_id]["battery"] = battery
                     rec = device_registry.get(device_id)
                     if rec is not None:
@@ -1446,7 +1473,15 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
             elif raw_msg.type == web.WSMsgType.ERROR:
                 log.error("Device WS error: %s", ws.exception())
     finally:
-        if device_id:
+        # Every teardown step below belongs to the connection that currently owns
+        # the device_id: a superseded socket must not free the live connection's
+        # transfer slots, settle its pending state, or delete its registration —
+        # that last one left a connected device stuck on "offline" until the next
+        # BATTERY_UPDATE crashed the survivor (#70). See _owns_device.
+        is_current = _owns_device(device_id, ws)
+        if device_id and not is_current:
+            log.info("Superseded device connection closed, ignoring: %s", device_id)
+        if device_id and is_current:
             # Free every transfer slot this device was holding — it may have been in
             # an install and a push at once — so a disconnect mid-job does not stall
             # the queue until the timeout fires.
@@ -1476,7 +1511,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     "status": "error",
                     "detail": "device disconnected before verification completed",
                 })
-        if device_id and device_id in devices:
+        if device_id and is_current:
             del devices[device_id]
             # Keep the registry entry; just stop reporting the device as online and
             # stamp when it was last seen so it shows as offline in the list.
