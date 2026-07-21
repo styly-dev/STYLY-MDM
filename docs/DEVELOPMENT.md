@@ -250,6 +250,7 @@ STYLY-MDM/
 | `REGISTER` | Sent on connect. Fields: `device_id`, `model`, `ip`, `version_code` (integer), `version_name`, `startup_app` (optional) |
 | `BATTERY_UPDATE` | Battery telemetry. Fields: `device_id`, `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds) |
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
+| `REBOOT_RESULT` / `POWER_OFF_RESULT` | Acknowledgement of a power command. `status` is `accepted` (the client received it and flushed this before invoking the SDK — a successful reboot/shutdown tears down the socket first, so no `success` is ever sent) or `fail` (the SDK rejected the call, so the device stayed up to report it). Fields: `status`, `error` (optional). See [Remote Power Control](#remote-power-control). |
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
 | `DOWNLOAD_COMPLETE` | Sent right after a download finishes, before the local work it feeds (the install, or the unzip + mirror). Frees the server's transfer slot so the next queued device can start downloading. Fields: `task` (`install` / `push`; absent means `install`), `apk_filename` (install), `dest_path` + `delete_extras` (push). Optional — see the transfer-throttling note below. |
 | `PUSH_FILES_RESULT` | Result of a push or sync. Fields: `status` (`success`/`fail`), `dest_path`, `added`, `updated`, `deleted` (counts; `deleted` is always 0 for a push), `error` (optional) |
@@ -264,6 +265,7 @@ STYLY-MDM/
 | Message type | Description |
 |---|---|
 | `EXECUTE_LAUNCH` | Launch an app. Fields: `package_name`, `extra` |
+| `EXECUTE_REBOOT` / `EXECUTE_POWER_OFF` | Reboot or power off the device immediately via the PICO advanced device-control API (`pbsControlSetDeviceAction`). No fields. See [Remote Power Control](#remote-power-control). |
 | `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename`, plus `full_sha256` + `cd_sha256` (reference hashes of the file being dispatched; present only when the APK is a local upload in `apks/`). The client verifies the download against `full_sha256` before installing; a **self**-update is refused outright when the hashes are absent. |
 | `EXECUTE_PUSH_FILES` | Download a bundle and apply it to a directory. Fields: `bundle_url`, `bundle_filename`, `dest_path`, `delete_extras` (boolean; `false` = copy/overwrite only, `true` = full mirror. Read with a `false` default — a missing field must never delete) |
 | `EXECUTE_VERIFY_APK` | Compute `size` + Central-Directory digest (plus diagnostics) for an installed package. Fields: `package_name` |
@@ -275,6 +277,7 @@ STYLY-MDM/
 | Message type | Description |
 |---|---|
 | `LAUNCH_APP` | Launch an app on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `package_name`, `extra_data` |
+| `REBOOT_DEVICE` / `POWER_OFF_DEVICE` | Reboot or power off target devices (the console gates both behind a shared confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only). See [Remote Power Control](#remote-power-control). |
 | `INSTALL_APK` | Install an uploaded APK on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `apk_url`, `apk_filename` |
 | `PUSH_FILES` | Apply a bundle to a directory on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `bundle_url`, `bundle_filename`, `dest_path`, `delete_extras` (boolean, optional; only a literal `true` requests a full mirror) |
 | `VERIFY_APK` | Verify an installed package against a local reference on target devices. Fields: `target_devices`, `package_name`. The reference (`size` + CD digest) is computed and compared in the browser and is **never** sent to the server. |
@@ -304,6 +307,7 @@ STYLY-MDM/
 | `CLIENT_APK_INFO` | The newest styly-mdm-client APK the server holds, sent on connect (right after `SERVER_INFO`, before `DEVICE_LIST`) and re-broadcast after every APK upload. Field: `apk` = `{filename, url, version}` or `null`. Drives the per-device **Update** button and the top-bar client-APK download link (see the notes below). |
 | `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting; a *stable-online* client whose `version_name` trails the server on `major.minor` is flagged red as needing an update — the reverse case, a client *ahead* of the server, reddens the top-bar server version instead. `updating` and offline rows are exempt, and the check is skipped only when the server version is the `0.0.0` untagged/not-installed fallback), and may include optional `battery`: `{level, charging, last_seen}`) |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
+| `REBOOT_SENT` / `POWER_OFF_SENT` | Confirmation that reboot/power-off commands were dispatched. Fields: `sent_count`, `target_count` |
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
 | `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |
 | `INSTALL_DEVICE_STATE` | Per-device companion to `INSTALL_PROGRESS`: names the devices that just entered a state, so the console can label each row instead of showing the whole target set as installing. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `installing` / `updating` / `success` / `fail`; `updating` and its terminal `success`/`fail` are emitted only for a client self-update), `apk_filename`, `detail` (failure reason, may be empty) |
@@ -312,6 +316,7 @@ STYLY-MDM/
 | `PUSH_DEVICE_STATE` | The `INSTALL_DEVICE_STATE` twin. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `applying` / `fail`), `dest_path`, `delete_extras` (so the console can name the action), `detail` |
 | `PUSH_FILES_RESULT` | Forwarded file/folder result from a device (adds `device_id`) |
 | `LAUNCH_RESULT` | Forwarded result from a device |
+| `REBOOT_RESULT` / `POWER_OFF_RESULT` | Forwarded power-command acknowledgement from a device (adds `device_id`). `accepted` = received and going down (confirm via the row dropping offline); `fail` = the SDK rejected it. See [Remote Power Control](#remote-power-control). |
 | `INSTALL_RESULT` | Forwarded install result from a device |
 | `VERIFY_SENT` | Confirmation that verify-APK commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `VERIFY_DIR_SENT` | Confirmation that verify-directory commands were dispatched. Fields: `path`, `sent_count`, `target_count` |
@@ -889,6 +894,47 @@ retiring. First-fleet verification checklist (once per firmware, on one unit): t
 client and guard packages are both gone after the retire, and that no ToBService
 keep-alive or appops residue misbehaves (`MANAGE_EXTERNAL_STORAGE` pointing at a removed
 package is inert but worth a glance).
+
+## Remote Power Control
+
+An operator can reboot or power off selected devices from the console's **Power Control**
+section (`REBOOT_DEVICE` / `POWER_OFF_DEVICE` → `EXECUTE_REBOOT` / `EXECUTE_POWER_OFF`,
+fanned out to online targets exactly like `LAUNCH_APP`, un-throttled since the message
+carries no transfer). On the device this is the PICO advanced device-control API,
+`IToBService.pbsControlSetDeviceAction(DEVICE_CONTROL_REBOOT | DEVICE_CONTROL_SHUTDOWN,
+…)` — reachable on the same TobService binder the silent-install path already uses and
+gated by the `pico_advance_interface` manifest flag the client already declares. No new
+permission and no SDK addition were needed; shipping the two command handlers is what
+requires a client update + redeploy.
+
+**Power off while charging.** A PICO headset refuses a full power-off while a USB/charging
+cable is connected unless the device-wide *"power off with USB cable"* setting is enabled —
+so a plain `DEVICE_CONTROL_SHUTDOWN` leaves a cabled (venue) device on. The shutdown path
+therefore calls `pbsControlSetPowerOffwithUSBCable(S_ON, 0)` as a **precondition** — before
+the `accepted` ack — so a cabled device actually powers off; if the setting cannot be applied
+the client reports `POWER_OFF_RESULT: fail` and does not proceed, rather than acking
+`accepted` on a device that would stay online. This is a persistent, device-wide setting and the
+trade-off is deliberate: a headset on a charging dock **can be remotely powered off and then
+stranded until it is physically woken** — which is exactly the intended venue capability, and
+why the console gates power-off behind a confirmation. Reboot does not touch this setting (it
+cycles regardless of charge state).
+
+**Outcome model — the success signal is the device going offline, not a RESULT.** A
+successful reboot/shutdown tears down the client process and the WebSocket before any
+`*_RESULT: success` could flush, so the client instead sends `REBOOT_RESULT` /
+`POWER_OFF_RESULT` with `status: accepted` **before** invoking the SDK call (flushing it
+to the wire on a worker thread via `awaitOutboundFlush`), and only ever sends
+`status: fail` when the SDK *rejects* the call — in which case the device stays up and the
+frame reaches the server. The real confirmation is therefore the row dropping **offline**
+(and, for a reboot, reconnecting after ~30–60s), read from the connection status. The
+console logs `accepted` as "watch for it to go offline" and never waits for a success
+frame that cannot come.
+
+Both actions are disruptive (a powered-off headset **cannot be turned back on remotely** —
+it must be woken physically), so the console gates the two buttons behind one shared
+confirmation checkbox plus a per-action `confirm()` dialog naming the targets, mirroring the
+Retire pattern. Offline devices are filtered out of the target set before dispatch (the
+SDK call has to run on the device).
 
 ## Client Connection Lifecycle (bounded connection window)
 

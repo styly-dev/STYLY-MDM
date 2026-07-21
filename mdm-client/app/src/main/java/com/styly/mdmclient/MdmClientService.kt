@@ -16,7 +16,9 @@ import android.os.IBinder
 import android.os.SystemClock
 import android.util.Log
 import com.pvr.tobservice.ToBServiceHelper
+import com.pvr.tobservice.enums.PBS_DeviceControlEnum
 import com.pvr.tobservice.enums.PBS_PackageControlEnum
+import com.pvr.tobservice.enums.PBS_SwitchEnum
 import com.pvr.tobservice.interfaces.IIntCallback
 import com.pvr.tobservice.interfaces.IToBServiceProxy
 import org.json.JSONArray
@@ -310,6 +312,12 @@ class MdmClientService : Service() {
             "SET_STARTUP_APP" -> handleSetStartupApp(payload)
             "CLEAR_STARTUP_APP" -> handleClearStartupApp()
             "EXECUTE_SELF_UNINSTALL" -> executeSelfUninstall(payload)
+            "EXECUTE_REBOOT" -> executePowerControl(
+                PBS_DeviceControlEnum.DEVICE_CONTROL_REBOOT, "REBOOT_RESULT"
+            )
+            "EXECUTE_POWER_OFF" -> executePowerControl(
+                PBS_DeviceControlEnum.DEVICE_CONTROL_SHUTDOWN, "POWER_OFF_RESULT"
+            )
             else -> Log.w(TAG, "Unknown command type: $type")
         }
     }
@@ -384,6 +392,95 @@ class MdmClientService : Service() {
             Log.e(TAG, "Failed to launch $packageName", e)
             onResult("fail", e.message ?: "Unknown error")
         }
+    }
+
+    /**
+     * Reboot or power off the device via the PICO advanced device-control API
+     * (`pbsControlSetDeviceAction`), reachable on the same TobService binder the
+     * silent-install path already uses and gated by the `pico_advance_interface`
+     * manifest flag the client already declares.
+     *
+     * A successful reboot/shutdown tears down this process and the WebSocket
+     * before any success frame could reach the server, so the client first
+     * acknowledges receipt with a `*_RESULT: accepted` and flushes it to the wire
+     * (on a worker thread) *before* invoking the SDK call. The real success
+     * signal, server-side, is the device going offline (and, for reboot,
+     * reconnecting). A `*_RESULT: fail` is only ever observed when the SDK
+     * rejects the call — the device stays up, so that frame does flush.
+     *
+     * A PICO headset refuses a full power-off while a USB/charging cable is
+     * connected unless the device-wide "power off with USB cable" setting is
+     * enabled. Venue devices are typically on charge, so shutdown treats that
+     * setting as a **precondition**: it is applied *before* the `accepted` ack,
+     * and if it cannot be applied the client reports `fail` and does not proceed
+     * — otherwise the console would show `accepted` while a cabled headset stays
+     * online. Reboot is unaffected (it cycles regardless of charge) and keeps the
+     * plain pre-ack model.
+     */
+    private fun executePowerControl(action: PBS_DeviceControlEnum, resultType: String) {
+        Thread {
+            try {
+                val binder = ToBServiceHelper.getInstance().serviceBinder
+                if (binder == null) {
+                    Log.e(TAG, "TobService binder not available for $resultType")
+                    sendPowerResult(resultType, "fail", "TobService not available")
+                    return@Thread
+                }
+                // Shutdown precondition: allow power-off while charging BEFORE acking, so
+                // a failure to apply it reports "fail" rather than a misleading "accepted"
+                // on a cabled device that then stays online. The trailing int is the
+                // standard TobService ext/process arg (0); the call returns void, so a
+                // thrown RemoteException is the only failure signal.
+                if (action == PBS_DeviceControlEnum.DEVICE_CONTROL_SHUTDOWN) {
+                    try {
+                        binder.pbsControlSetPowerOffwithUSBCable(PBS_SwitchEnum.S_ON, 0)
+                        Log.i(TAG, "Enabled power-off-with-USB-cable before shutdown")
+                    } catch (e: Throwable) {
+                        Log.e(TAG, "Could not allow power-off while charging; aborting shutdown", e)
+                        sendPowerResult(
+                            resultType, "fail",
+                            "Could not enable power-off while charging: ${e.message ?: e.javaClass.simpleName}"
+                        )
+                        return@Thread
+                    }
+                }
+                // Acknowledge (the precondition, if any, has now succeeded), then give the
+                // ack a bounded chance to reach the wire before the reboot/shutdown takes
+                // the connection down — sendMessage only enqueues.
+                sendPowerResult(resultType, "accepted", "")
+                webSocketManager.awaitOutboundFlush(2_000)
+                Log.i(TAG, "Invoking pbsControlSetDeviceAction: $action")
+                binder.pbsControlSetDeviceAction(action, object : IIntCallback.Stub() {
+                    override fun callback(result: Int) {
+                        // A callback running at all means the device did NOT power
+                        // down (a real reboot/shutdown takes the process first), so a
+                        // non-zero code is a rejection worth reporting. On 0 the
+                        // action was accepted and the device is on its way down.
+                        Log.i(TAG, "pbsControlSetDeviceAction result: $result for $action")
+                        if (result != 0) {
+                            sendPowerResult(
+                                resultType, "fail",
+                                "pbsControlSetDeviceAction returned $result"
+                            )
+                        }
+                    }
+                })
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to run $resultType", e)
+                sendPowerResult(resultType, "fail", e.message ?: "Unknown error")
+            }
+        }.start()
+    }
+
+    private fun sendPowerResult(resultType: String, status: String, error: String) {
+        val result = JSONObject().apply {
+            put("type", resultType)
+            put("status", status)
+            if (error.isNotEmpty()) {
+                put("error", error)
+            }
+        }
+        webSocketManager.sendMessage(result)
     }
 
     private fun executeInstall(payload: JSONObject) {
