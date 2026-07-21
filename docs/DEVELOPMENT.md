@@ -124,6 +124,17 @@ device list scrolling, and the Devices-list / group-picker **filter and sort** c
 (filter matches the device name/label; sort by device name, ascending or descending). It
 is a dev-only helper and is not shipped in the wheel.
 
+On the main Devices list the filter never hides a **selected** device: the visible set is
+`matching ∪ selected`, so a device staged for a command always has a row, and the header
+select-all cannot report a state that is untrue of the whole selection. A row kept only
+because it is selected is marked with an amber wash so it stays distinguishable from a
+genuine match. The Manage Groups picker is unaffected — it filters strictly by query,
+because group membership is a durable roster rather than a set of pending command targets.
+
+A consequence worth knowing: selecting a group stages every member, so a filter applied
+afterwards cannot narrow it — the members stay on screen, marked. That is deliberate, since
+those members are exactly what an action would dispatch to.
+
 It registers through the live `/ws/device` WebSocket rather than editing
 `device_registry.json`, because a running server owns that file: any register/battery/
 group change triggers `save_registry()`, which rewrites the file from in-memory state
