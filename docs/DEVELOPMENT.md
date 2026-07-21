@@ -116,24 +116,35 @@ The ports come from `BuildConfig` fields defined per flavor in
 > build (e.g. debug over a release install) must be uninstalled first, which clears
 > device-owner status, so you would need to re-provision.
 
-### Seeding dummy devices for UI testing
+### Filtering and selecting devices
 
-`mdm-server/scripts/seed_dummy_devices.py` populates a **running** server with fake
-devices, so you can exercise console UI that only matters at scale — the Manage Groups
-device list scrolling, and the Devices-list / group-picker **filter and sort** controls
-(filter matches the device name/label; sort by device name, ascending or descending). It
-is a dev-only helper and is not shipped in the wheel.
+The main Devices list has a **name filter** (matches the device name/label), a **sort** by
+device name (ascending/descending, toggled from the Device column header), and an **Any /
+Online / Offline** status filter beside the name input. Together they let an operator narrow a
+large fleet — e.g. to the currently-online subset — and select all of the narrowed rows at
+once. `Online` means `status === 'online'`, the same predicate as `getOnlineIds()` and the
+STATUS column's "Online" text, so filtering to Online then selecting all yields a set that
+dispatch does not trim as offline. `Offline` is the complement (`updating` / `retiring` /
+`retired` devices count as offline), so Online and Offline partition the list. The three
+controls compose. They apply to the main Devices list only, not the Manage Groups picker.
 
-On the main Devices list the filter never hides a **selected** device: the visible set is
-`matching ∪ selected`, so a device staged for a command always has a row, and the header
-select-all cannot report a state that is untrue of the whole selection. A row kept only
-because it is selected is marked with an amber wash so it stays distinguishable from a
-genuine match. The Manage Groups picker is unaffected — it filters strictly by query,
+The filter never hides a **selected** device: the visible set is `matching ∪ selected`, so a
+device staged for a command always has a row, and the header select-all cannot report a state
+that is untrue of the whole selection. A row kept only because it is selected (it no longer
+matches the name or status filter) is marked with an amber wash so it stays distinguishable
+from a genuine match. The Manage Groups picker is unaffected — it filters strictly by query,
 because group membership is a durable roster rather than a set of pending command targets.
 
 A consequence worth knowing: selecting a group stages every member, so a filter applied
 afterwards cannot narrow it — the members stay on screen, marked. That is deliberate, since
 those members are exactly what an action would dispatch to.
+
+### Seeding dummy devices for UI testing
+
+`mdm-server/scripts/seed_dummy_devices.py` populates a **running** server with fake
+devices, so you can exercise console UI that only matters at scale — the Manage Groups
+device list scrolling and the Devices-list filter/sort controls described above. It is a
+dev-only helper and is not shipped in the wheel.
 
 It registers through the live `/ws/device` WebSocket rather than editing
 `device_registry.json`, because a running server owns that file: any register/battery/

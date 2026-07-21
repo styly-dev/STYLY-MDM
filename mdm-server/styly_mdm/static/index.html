@@ -165,6 +165,13 @@
     .sort-arrow { font-size: 9px; color: var(--text-muted); margin-left: 3px; }
     .mg-sort-btn { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; padding: 0 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 7px; color: var(--text-secondary); font-size: 13px; font-family: inherit; cursor: pointer; }
     .mg-sort-btn:hover { border-color: #394056; color: var(--text-primary); }
+    /* Segmented status filter (issue #62): Any / Online / Offline, sharing the card/border
+       tokens with the search input so the toolbar reads as one control strip. */
+    .seg { flex: 0 0 auto; display: inline-flex; background: var(--bg-card); border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+    .seg-btn { padding: 0 12px; background: none; border: none; border-left: 1px solid var(--border); color: var(--text-secondary); font-size: 13px; font-family: inherit; cursor: pointer; }
+    .seg-btn:first-child { border-left: none; }
+    .seg-btn:hover { color: var(--text-primary); }
+    .seg-btn.active { background: var(--accent); color: #fff; }
     .dev-table { width: 100%; }
     .dev-row { display: grid; grid-template-columns: 42px minmax(0, 2fr) minmax(76px, .7fr) minmax(96px, .85fr) minmax(92px, 1fr); align-items: center; padding: 10px 0; padding-left: 18px; border-top: 1px solid var(--border-soft); font-size: 13px; }
     .dev-head { padding-top: 9px; padding-bottom: 9px; border-top: none; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .5px; }
@@ -381,6 +388,11 @@
           </div>
           <div class="dev-toolbar" id="devToolbar" style="display:none">
             <input class="dev-search-input" id="devSearch" data-dev-search maxlength="64" placeholder="⌕ Filter devices by name…">
+            <div class="seg" id="devStatusFilter" role="group" aria-label="Filter by connection status">
+              <button class="seg-btn active" data-status="any" title="Show all devices">Any</button>
+              <button class="seg-btn" data-status="online" title="Show only devices that are online now">Online</button>
+              <button class="seg-btn" data-status="offline" title="Show only devices that are not online">Offline</button>
+            </div>
           </div>
           <div class="targets-body" id="targetsBody"></div>
         </div>
@@ -558,6 +570,10 @@
       // (selectedIds) is never touched by filtering.
       let deviceSearch = '';
       let deviceSort = 'label-asc';
+      // Main Devices list only (issue #62). 'online' follows getOnlineIds() (status ===
+      // 'online'); 'offline' is the complement, so updating/retiring/retired count as
+      // offline and Online + Offline partition the list.
+      let deviceStatusFilter = 'any';  // 'any' | 'online' | 'offline'
       // Manage view
       let manageSelectedGroup = null;
       let manageMembers = new Set();
@@ -579,6 +595,7 @@
       const targetsBody = document.getElementById('targetsBody');
       const devToolbar = document.getElementById('devToolbar');
       const devSearchInput = document.getElementById('devSearch');
+      const devStatusFilter = document.getElementById('devStatusFilter');
       const selCard = document.getElementById('selCard');
       const apkFile = document.getElementById('apkFile');
       const apkName = document.getElementById('apkName');
@@ -710,6 +727,20 @@
         const q = search.trim().toLowerCase();
         return sortDevices(devices.filter(function (d) { return deviceMatchesQuery(d, q); }), sortKey);
       }
+      // Status filter for the main Devices list (issue #62). 'online' mirrors getOnlineIds()
+      // so "filter to Online then select all" yields a set onlineTargets() will not trim;
+      // 'offline' is the complement (updating/retiring/retired included).
+      function deviceMatchesStatus(d) {
+        if (deviceStatusFilter === 'online') return d.status === 'online';
+        if (deviceStatusFilter === 'offline') return d.status !== 'online';
+        return true;
+      }
+      // A row is a match for the main list when it clears both the name query and the status
+      // filter. Status is just a second dimension of "matching", so the #72 machinery below
+      // (union with the selection, mark the exception) extends to it with no new plumbing.
+      function deviceMatchesFilter(d, q) { return deviceMatchesQuery(d, q) && deviceMatchesStatus(d); }
+      // True when any filter (name or status) is narrowing the list.
+      function deviceFilterActive() { return deviceSearch.trim() !== '' || deviceStatusFilter !== 'any'; }
       // The main list shows (matching ∪ selected), not just matching (issue #72). A device
       // staged for a command must never be hidden by a filter, or an action dispatches to a
       // row the operator cannot see. This keeps selected ⊆ visible, which is what makes
@@ -720,7 +751,7 @@
       function visibleDevices() {
         const q = deviceSearch.trim().toLowerCase();
         return sortDevices(devices.filter(function (d) {
-          return deviceMatchesQuery(d, q) || selectedIds.has(getDeviceId(d));
+          return deviceMatchesFilter(d, q) || selectedIds.has(getDeviceId(d));
         }), deviceSort);
       }
       // True when a row is on screen only because it is selected. Marking these keeps the
@@ -729,7 +760,7 @@
       // top, so selecting a device never makes its row jump.
       function keptBySelection(d) {
         const q = deviceSearch.trim().toLowerCase();
-        return !!q && !deviceMatchesQuery(d, q) && selectedIds.has(getDeviceId(d));
+        return deviceFilterActive() && !deviceMatchesFilter(d, q) && selectedIds.has(getDeviceId(d));
       }
       function groupNames() { return Object.keys(groups).sort(); }
       function offlineMembers(name) { return (groups[name] || []).filter(function (s) { const d = deviceById(s); return d && !isOnline(d); }).length; }
@@ -964,6 +995,7 @@
         const showToolbar = targetTab === 'devices' && devices.length > 0;
         devToolbar.style.display = showToolbar ? '' : 'none';
         if (showToolbar && devSearchInput.value !== deviceSearch) devSearchInput.value = deviceSearch;
+        if (showToolbar) syncStatusFilterButtons();
         targetsBody.innerHTML = targetTab === 'groups' ? renderGroupsHtml() : renderDevicesHtml();
         if (editingLabelId !== null && targetTab === 'devices') {
           const inp = targetsBody.querySelector('[data-label-input]');
@@ -1140,6 +1172,15 @@
         if (box) { box.className = 'selbox ' + selectAllState(); box.textContent = selectAllGlyph(); }
         const arrow = targetsBody.querySelector('.dev-head .sort-arrow');
         if (arrow) arrow.textContent = sortArrowGlyph();
+      }
+
+      // The status segmented control is static (outside targetsBody), so reflect module
+      // state onto it directly rather than re-rendering it.
+      function syncStatusFilterButtons() {
+        const btns = devStatusFilter.querySelectorAll('.seg-btn');
+        for (let i = 0; i < btns.length; i++) {
+          btns[i].classList.toggle('active', btns[i].getAttribute('data-status') === deviceStatusFilter);
+        }
       }
 
       // The cell shows whichever job last touched the device: install, push or verify.
@@ -2205,6 +2246,17 @@
       // driven by the clickable Device column header, handled in the targetsBody click
       // delegation above.)
       devSearchInput.addEventListener('input', function () { deviceSearch = devSearchInput.value; refreshDeviceRows(); });
+
+      // Status filter (issue #62). The control is a static sibling of the rows, so it is not
+      // reached by the targetsBody click delegation — wire it directly. Selection is never
+      // touched (a selected device that leaves the filter stays visible, marked kept).
+      devStatusFilter.addEventListener('click', function (e) {
+        const btn = e.target.closest('.seg-btn');
+        if (!btn) return;
+        deviceStatusFilter = btn.getAttribute('data-status');
+        syncStatusFilterButtons();
+        refreshDeviceRows();
+      });
 
       // Selection card delegation
       selCard.addEventListener('click', function (e) {
