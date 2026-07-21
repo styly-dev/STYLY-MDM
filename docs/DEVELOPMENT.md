@@ -910,8 +910,10 @@ requires a client update + redeploy.
 **Power off while charging.** A PICO headset refuses a full power-off while a USB/charging
 cable is connected unless the device-wide *"power off with USB cable"* setting is enabled —
 so a plain `DEVICE_CONTROL_SHUTDOWN` leaves a cabled (venue) device on. The shutdown path
-therefore calls `pbsControlSetPowerOffwithUSBCable(S_ON, 0)` immediately before the shutdown
-so a cabled device actually powers off. This is a persistent, device-wide setting and the
+therefore calls `pbsControlSetPowerOffwithUSBCable(S_ON, 0)` as a **precondition** — before
+the `accepted` ack — so a cabled device actually powers off; if the setting cannot be applied
+the client reports `POWER_OFF_RESULT: fail` and does not proceed, rather than acking
+`accepted` on a device that would stay online. This is a persistent, device-wide setting and the
 trade-off is deliberate: a headset on a charging dock **can be remotely powered off and then
 stranded until it is physically woken** — which is exactly the intended venue capability, and
 why the console gates power-off behind a confirmation. Reboot does not touch this setting (it
