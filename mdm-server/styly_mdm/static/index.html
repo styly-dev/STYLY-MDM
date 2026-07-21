@@ -170,6 +170,15 @@
     .dev-head { padding-top: 9px; padding-bottom: 9px; border-top: none; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .5px; }
     .dev-row.offline { opacity: .55; }
     .dev-row.offline:hover { opacity: .75; }
+    /* Kept only because it is selected, not because it matches the filter (issue #72).
+       Marks the exception, not the matches: matching rows are the majority right after a
+       filter is applied, so styling them would bury the one row that needs attention.
+       An amber wash (--warning), not the accent: a left accent bar reads as a selection
+       affordance, which is the one thing this is NOT signalling — the row is already known
+       to be selected (its checkbox is on); what the wash adds is "outside the filter".
+       Kept rows are dimmed less than plain offline rows so the wash stays legible. */
+    .dev-row.kept { background: rgba(251, 191, 36, .16); }
+    .dev-row.kept.offline { opacity: .7; }
     .dev-cell { min-width: 0; padding-right: 10px; }
     .dev-label-row { display: flex; align-items: center; gap: 6px; }
     .dev-label { font-weight: 600; font-size: 14px; }
@@ -701,7 +710,27 @@
         const q = search.trim().toLowerCase();
         return sortDevices(devices.filter(function (d) { return deviceMatchesQuery(d, q); }), sortKey);
       }
-      function visibleDevices() { return filterSortDevices(deviceSearch, deviceSort); }
+      // The main list shows (matching ∪ selected), not just matching (issue #72). A device
+      // staged for a command must never be hidden by a filter, or an action dispatches to a
+      // row the operator cannot see. This keeps selected ⊆ visible, which is what makes
+      // selectAllState()/toggleSelectAll() correct rather than only correct-looking: with no
+      // hidden selections, "all visible are selected" and "all selected" cannot disagree.
+      // Deliberately not folded into filterSortDevices(): the Manage Groups picker tracks a
+      // different set (manageMembers) and must keep filtering strictly by query.
+      function visibleDevices() {
+        const q = deviceSearch.trim().toLowerCase();
+        return sortDevices(devices.filter(function (d) {
+          return deviceMatchesQuery(d, q) || selectedIds.has(getDeviceId(d));
+        }), deviceSort);
+      }
+      // True when a row is on screen only because it is selected. Marking these keeps the
+      // filter honest: a visible row is either a match or a kept selection, and which one
+      // must be tellable at a glance. Kept rows sort in place rather than pinning to the
+      // top, so selecting a device never makes its row jump.
+      function keptBySelection(d) {
+        const q = deviceSearch.trim().toLowerCase();
+        return !!q && !deviceMatchesQuery(d, q) && selectedIds.has(getDeviceId(d));
+      }
       function groupNames() { return Object.keys(groups).sort(); }
       function offlineMembers(name) { return (groups[name] || []).filter(function (s) { const d = deviceById(s); return d && !isOnline(d); }).length; }
       function batteryHtml(d) {
@@ -1013,6 +1042,7 @@
         const id = getDeviceId(d);
         const checked = selectedIds.has(id);
         const off = !isOnline(d);
+        const kept = keptBySelection(d);
         const startup = d.startup_app && d.startup_app.package_name;
         let deviceCell;
         if (editingLabelId === id) {
@@ -1071,7 +1101,9 @@
           status = '<span class="dot"></span>Online';
         }
 
-        return '<div class="dev-row' + (off ? ' offline' : '') + '" data-row-id="' + esc(id) + '">' +
+        return '<div class="dev-row' + (off ? ' offline' : '') + (kept ? ' kept' : '') + '"' +
+          (kept ? ' title="Does not match the filter - shown because it is selected"' : '') +
+          ' data-row-id="' + esc(id) + '">' +
           '<div class="selbox ' + (checked ? 'on' : '') + '" data-act="toggleDevice" data-id="' + esc(id) + '">' + (checked ? '✓' : '') + '</div>' +
           '<div class="dev-cell">' + deviceCell + '</div>' +
           '<div class="dev-status">' + status + '</div>' +
@@ -1080,9 +1112,11 @@
           '</div>';
       }
 
-      // Header select-all reflects the currently visible (filtered) set, so with a filter
-      // active "select all" means "the rows you can see". Reduces to today's behavior when
-      // the filter is empty (visibleDevices() === all devices).
+      // Header select-all reflects the currently visible set, so with a filter active
+      // "select all" means "the rows you can see". Reduces to today's behavior when the
+      // filter is empty (visibleDevices() === all devices). Accurate for the selection as a
+      // whole, not just a subset, because visibleDevices() keeps selected ⊆ visible: there
+      // are no selected-but-hidden devices for this glyph to misreport (issue #72).
       function selectAllState() {
         const vis = visibleDevices();
         if (!vis.length || !selectedIds.size) return '';
@@ -1216,8 +1250,10 @@
         render();
       }
       function toggleSelectAll() {
-        // Operates on the visible (filtered) set: when a filter is active, select-all
-        // toggles only what the user can see, not the whole hidden fleet.
+        // Operates on the visible set: when a filter is active, select-all toggles only
+        // what the user can see, not the whole hidden fleet. Deselecting reaches the entire
+        // selection (so this always clears to 0) because selected ⊆ visible — see
+        // visibleDevices() (issue #72).
         const vis = visibleDevices();
         const all = vis.length > 0 && vis.every(function (d) { return selectedIds.has(getDeviceId(d)); });
         if (all) vis.forEach(function (d) { selectedIds.delete(getDeviceId(d)); });
