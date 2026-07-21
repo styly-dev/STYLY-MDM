@@ -500,6 +500,18 @@
               </div>
             </div>
             <div class="cmd-divider"></div>
+            <div class="cmd-section collapsed" data-cmd="power">
+              <div class="cmd-head" data-act="toggleCmd"><span>Power Control</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <div class="push-warn">⚠ Reboot or power off the selected devices — whatever is running is interrupted. Power off works <strong>even while charging</strong>, and a powered-off headset stays off and <strong>cannot be turned back on remotely</strong> — it must be woken physically. Success shows as the device dropping offline (a reboot reconnects on its own after ~30–60s).</div>
+                <label class="push-confirm"><input type="checkbox" id="powerConfirm"> I understand the selected devices will be interrupted</label>
+                <div class="btn-row">
+                  <button class="btn btn-danger-outline" id="btnReboot" disabled>Reboot Selected</button>
+                  <button class="btn btn-danger-outline" id="btnPowerOff" disabled>Power Off Selected</button>
+                </div>
+              </div>
+            </div>
+            <div class="cmd-divider"></div>
             <div class="cmd-section collapsed" data-cmd="retire">
               <div class="cmd-head" data-act="toggleCmd"><span>Retire Devices</span><span class="cmd-chevron">▾</span></div>
               <div class="cmd-body">
@@ -617,6 +629,9 @@
       const verifyDirJson = document.getElementById('verifyDirJson');
       const verifyDirRefName = document.getElementById('verifyDirRefName');
       const btnVerifyDir = document.getElementById('btnVerifyDir');
+      const powerConfirm = document.getElementById('powerConfirm');
+      const btnReboot = document.getElementById('btnReboot');
+      const btnPowerOff = document.getElementById('btnPowerOff');
       const retireConfirm = document.getElementById('retireConfirm');
       const btnRetire = document.getElementById('btnRetire');
       const logContainer = document.getElementById('logContainer');
@@ -853,6 +868,10 @@
             break;
           }
           case 'LAUNCH_SENT': addLog('Launch command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'REBOOT_SENT': addLog('Reboot command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'POWER_OFF_SENT': addLog('Power-off command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'REBOOT_RESULT': logPowerResult('Reboot', msg); break;
+          case 'POWER_OFF_RESULT': logPowerResult('Power off', msg); break;
           case 'INSTALL_SENT': addLog('Install job queued for ' + msg.target_count + ' device(s)' + (msg.max_concurrent ? ' (max ' + msg.max_concurrent + ' concurrent transfer(s))' : ''), 'info'); break;
           case 'INSTALL_PROGRESS': showTransferProgress('install', msg); break;
           case 'INSTALL_DEVICE_STATE': {
@@ -1264,6 +1283,8 @@
         syncPanel.refreshButton(has);
         btnVerifyApk.disabled = !verifyApkRef || verifyApkPkg.value.trim() === '' || !has;
         btnVerifyDir.disabled = !verifyDirRef || verifyDirPath.value.trim() === '' || !has;
+        btnReboot.disabled = !powerConfirm.checked || !has;
+        btnPowerOff.disabled = !powerConfirm.checked || !has;
         btnRetire.disabled = !retireConfirm.checked || !has;
       }
 
@@ -1503,6 +1524,40 @@
           addLog('Retiring ' + online.length + ' device(s)…', 'info');
           retireConfirm.checked = false;
           updateButtons();
+        }
+      }
+
+      // Reboot / power off share one confirm gate. A successful reboot/shutdown
+      // kills the device's socket before any success frame arrives, so the outcome
+      // is read from the connection status (offline = done), not a RESULT here.
+      function sendPower(kind) {
+        if (!powerConfirm.checked) return;
+        const isReboot = kind === 'reboot';
+        const verb = isReboot ? 'Reboot' : 'Power off';
+        const type = isReboot ? 'REBOOT_DEVICE' : 'POWER_OFF_DEVICE';
+        const online = onlineTargets(Array.from(selectedIds));
+        if (!online.length) { addLog('No online devices selected to ' + verb.toLowerCase(), 'warn'); return; }
+        const names = online.map(labelFor).join(', ');
+        const extra = isReboot
+          ? 'These devices will restart and reconnect on their own.'
+          : 'These devices will power off and CANNOT be turned back on remotely.';
+        if (!confirm(verb + ' ' + online.length + ' device(s)?\n' + names + '\n\n' + extra)) return;
+        if (wsSend({ type: type, target_devices: online }, verb.toLowerCase() + ' devices')) {
+          addLog(verb + ' command sent to ' + online.length + ' device(s)…', 'info');
+          powerConfirm.checked = false;
+          updateButtons();
+        }
+      }
+
+      // 'accepted' = the device got the command and is going down (confirm via it
+      // dropping offline); 'fail' = the SDK rejected it and the device stayed up.
+      // A 'success' status is never expected — the reboot takes the socket first.
+      function logPowerResult(verb, msg) {
+        if (msg.status === 'accepted') {
+          addLog('[OK] ' + verb + ' accepted on ' + labelFor(msg.device_id) + ' — watch for it to go offline', 'success');
+        } else {
+          const detail = msg.error || msg.message || '';
+          addLog('[FAIL] ' + verb + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), 'fail');
         }
       }
 
@@ -2289,6 +2344,9 @@
       verifyDirJson.addEventListener('change', onVerifyDirJson);
       verifyDirPath.addEventListener('input', updateButtons);
       btnVerifyDir.addEventListener('click', sendVerifyDir);
+      powerConfirm.addEventListener('change', updateButtons);
+      btnReboot.addEventListener('click', function () { sendPower('reboot'); });
+      btnPowerOff.addEventListener('click', function () { sendPower('power_off'); });
       retireConfirm.addEventListener('change', updateButtons);
       btnRetire.addEventListener('click', sendRetire);
       btnClearLog.addEventListener('click', function () { logContainer.innerHTML = ''; logContainer.appendChild(logEmpty); logEmpty.style.display = 'block'; });

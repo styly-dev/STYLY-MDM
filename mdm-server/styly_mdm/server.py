@@ -1440,6 +1440,8 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 elif msg_type in {
                     "LAUNCH_RESULT",
+                    "REBOOT_RESULT",
+                    "POWER_OFF_RESULT",
                     "INSTALL_RESULT",
                     "PUSH_FILES_RESULT",
                     "VERIFY_APK_RESULT",
@@ -1560,6 +1562,12 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 if msg_type == "LAUNCH_APP":
                     await handle_launch_app(ws, data)
+
+                elif msg_type == "REBOOT_DEVICE":
+                    await handle_reboot_device(ws, data)
+
+                elif msg_type == "POWER_OFF_DEVICE":
+                    await handle_power_off_device(ws, data)
 
                 elif msg_type == "INSTALL_APK":
                     await handle_install_apk(ws, data)
@@ -1955,6 +1963,74 @@ async def handle_launch_app(admin_ws: web.WebSocketResponse, data: dict):
     await admin_ws.send_str(json.dumps({
         "type": "LAUNCH_SENT",
         "package_name": package_name,
+        "sent_count": sent_count,
+        "target_count": len(target_ids),
+    }))
+
+
+async def handle_reboot_device(admin_ws: web.WebSocketResponse, data: dict):
+    """Process a REBOOT_DEVICE command from an admin and reboot target HMDs."""
+    await _dispatch_power_command(
+        admin_ws, data,
+        execute_type="EXECUTE_REBOOT",
+        sent_type="REBOOT_SENT",
+        label="REBOOT_DEVICE",
+    )
+
+
+async def handle_power_off_device(admin_ws: web.WebSocketResponse, data: dict):
+    """Process a POWER_OFF_DEVICE command from an admin and shut down target HMDs."""
+    await _dispatch_power_command(
+        admin_ws, data,
+        execute_type="EXECUTE_POWER_OFF",
+        sent_type="POWER_OFF_SENT",
+        label="POWER_OFF_DEVICE",
+    )
+
+
+async def _dispatch_power_command(
+    admin_ws: web.WebSocketResponse,
+    data: dict,
+    *,
+    execute_type: str,
+    sent_type: str,
+    label: str,
+):
+    """Fan a payload-less power command out to the resolved target device sockets.
+
+    Reboot and power-off carry no transfer and no per-device state, so this is
+    the un-throttled launch-style fan-out, not the queued install path. The
+    device acknowledges receipt with a ``*_RESULT: accepted`` before it invokes
+    the SDK call — a successful reboot/shutdown tears the socket down before any
+    success frame could flush, so the real success signal is the device going
+    offline (and, for reboot, reconnecting), tracked by the connection status.
+    """
+    target_devices: list[str] = data.get("target_devices", [])
+    target_ids = resolve_target_ids(target_devices)
+
+    if not target_ids:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "No matching online devices found",
+        }))
+        return
+
+    execute_msg = json.dumps({"type": execute_type})
+
+    sent_count = 0
+    for did in target_ids:
+        entry = devices.get(did)
+        if entry:
+            try:
+                await entry["ws"].send_str(execute_msg)
+                sent_count += 1
+            except ConnectionResetError:
+                log.warning("Failed to send %s to %s (disconnected)", execute_type, did)
+
+    log.info("%s: sent to %d/%d devices", label, sent_count, len(target_ids))
+
+    await admin_ws.send_str(json.dumps({
+        "type": sent_type,
         "sent_count": sent_count,
         "target_count": len(target_ids),
     }))
