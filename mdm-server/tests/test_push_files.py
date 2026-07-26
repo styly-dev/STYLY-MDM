@@ -7,6 +7,7 @@ used: async handlers run via asyncio.run with in-memory fakes / the aiohttp test
 
 import asyncio
 import json
+import time
 import zipfile
 
 import aiohttp
@@ -94,6 +95,18 @@ def test_unique_bundle_path_avoids_collision(tmp_path):
     assert second.suffix == ".zip"
 
 
+def test_reserve_unique_bundle_path_claims_distinct_names(tmp_path):
+    server._apply_data_dir(str(tmp_path))
+    server.BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
+
+    first = server.reserve_unique_bundle_path("content.zip")
+    second = server.reserve_unique_bundle_path("content.zip")
+
+    assert first != second
+    assert first.is_file()
+    assert second.is_file()
+
+
 def test_zip_tree_stores_forward_slash_relative_names(tmp_path):
     root = tmp_path / "src"
     (root / "sub").mkdir(parents=True)
@@ -108,6 +121,74 @@ def test_zip_tree_stores_forward_slash_relative_names(tmp_path):
         assert z.read("sub/b.txt") == b"BBB"
 
 
+def test_zip_tree_async_keeps_event_loop_responsive(tmp_path, monkeypatch):
+    root = tmp_path / "src"
+    root.mkdir()
+    dest_zip = tmp_path / "out.zip"
+
+    def slow_zip(_root, _dest_zip):
+        time.sleep(0.15)
+
+    monkeypatch.setattr(server, "zip_tree", slow_zip)
+
+    async def run():
+        task = asyncio.create_task(server.zip_tree_async(root, dest_zip))
+        await asyncio.sleep(0.02)
+        assert not task.done()
+        await task
+
+    asyncio.run(run())
+
+
+def test_zip_tree_async_waits_for_worker_before_propagating_cancellation(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "src"
+    root.mkdir()
+    dest_zip = tmp_path / "out.zip"
+    finished = False
+
+    def slow_zip(_root, _dest_zip):
+        nonlocal finished
+        time.sleep(0.1)
+        finished = True
+
+    monkeypatch.setattr(server, "zip_tree", slow_zip)
+
+    async def run():
+        task = asyncio.create_task(server.zip_tree_async(root, dest_zip))
+        await asyncio.sleep(0.02)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished
+
+    asyncio.run(run())
+
+
+def test_zip_tree_async_preserves_cancellation_when_worker_fails(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "src"
+    root.mkdir()
+    dest_zip = tmp_path / "out.zip"
+
+    def failing_zip(_root, _dest_zip):
+        time.sleep(0.05)
+        raise OSError("simulated worker failure")
+
+    monkeypatch.setattr(server, "zip_tree", failing_zip)
+
+    async def run():
+        task = asyncio.create_task(server.zip_tree_async(root, dest_zip))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+
 # ---------------------------------------------------------------------------
 # Route registration
 # ---------------------------------------------------------------------------
@@ -120,6 +201,13 @@ def test_create_app_registers_bundle_routes(tmp_path):
     assert ("POST", "/api/bundles") in method_paths
     assert any(c.startswith("/bundles") for c in canonicals)
     assert (tmp_path / "bundles").is_dir()
+    assert app._client_max_size == (
+        max(server.MAX_APK_SIZE, server.MAX_BUNDLE_SIZE) + 10 * 1024 * 1024
+    )
+
+
+def test_bundle_size_limit_is_64_gib():
+    assert server.MAX_BUNDLE_SIZE == 64 * 1024 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +370,34 @@ def test_upload_bundle_requires_files(tmp_path):
             return resp.status
 
     assert asyncio.run(_empty()) == 400
+
+
+def test_upload_bundle_rejects_total_size_over_limit(tmp_path, monkeypatch):
+    server._apply_data_dir(str(tmp_path))
+    monkeypatch.setattr(server, "MAX_BUNDLE_SIZE", 4)
+    app = styly_mdm.create_app()
+
+    status, body = asyncio.run(_upload(app, [("a.bin", b"12345")]))
+
+    assert status == 413
+    assert "exceeds" in body["error"]
+    assert list(server.BUNDLE_DIR.iterdir()) == []
+
+
+def test_upload_bundle_removes_partial_zip_when_build_fails(tmp_path, monkeypatch):
+    server._apply_data_dir(str(tmp_path))
+    app = styly_mdm.create_app()
+
+    def fail_after_partial_write(_root, dest_zip):
+        dest_zip.write_bytes(b"partial")
+        raise OSError("simulated ZIP failure")
+
+    monkeypatch.setattr(server, "zip_tree", fail_after_partial_write)
+    status, body = asyncio.run(_upload(app, [("a.txt", b"A")]))
+
+    assert status == 500
+    assert "simulated ZIP failure" in body["error"]
+    assert list(server.BUNDLE_DIR.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------

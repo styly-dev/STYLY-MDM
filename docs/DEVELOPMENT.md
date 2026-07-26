@@ -390,7 +390,7 @@ STYLY-MDM/
 
 > **Transfer throttling.** An `INSTALL_APK` or a `PUSH_FILES` targeting a large group
 > would otherwise make every device pull the file from the server at the same instant
-> (an APK can be up to 2 GiB, a push bundle likewise), spiking LAN/server bandwidth.
+> (an APK can be up to 2 GiB and a push bundle 64 GiB), spiking LAN/server bandwidth.
 > Instead the server owns a pool of **N** transfer slots
 > (`MDM_MAX_CONCURRENT_TRANSFERS` env var / `--max-concurrent-transfers` flag,
 > default **5**) and every byte-moving fan-out — install, push, sync — must take one
@@ -414,10 +414,13 @@ STYLY-MDM/
 >    older clients that never emit `DOWNLOAD_COMPLETE`, and clients whose download
 >    failed outright).
 > 3. Device disconnect (frees every slot the device held, immediately).
-> 4. A per-device timeout (`MDM_TRANSFER_TIMEOUT` seconds, default **600**) so a
+> 4. A per-device timeout (`MDM_TRANSFER_TIMEOUT` seconds, default **1800**) so a
 >    silent/stuck device cannot block the queue. Lowering it recovers stuck slots
 >    sooner but risks releasing a slow-but-healthy transfer early, which only
 >    relaxes throttling and never drops the job itself.
+>    The timeout does not cancel the device download. At 100 Mbps, a 64 GiB bundle
+>    takes about 92 minutes ideally, so the default 30-minute timeout will mark that
+>    transfer failed and release its slot while the device continues downloading.
 >
 > `pending_transfers` is keyed by **`(device_id, task)`**, not by device: an admin can
 > push files to a group that is already installing an APK, so one device may hold an
@@ -474,6 +477,17 @@ STYLY-MDM/
 > |---|---|---|
 > | **Push Files** (file or folder) | `false` | Copy and overwrite. Nothing at the destination is removed; `deleted` is always 0. |
 > | **Sync Folder** (folder only) | `true` | Full mirror: extras at the destination — including now-empty directories — are deleted, so it ends up identical to the bundle (`rsync --delete` semantics). |
+>
+> The upload limit is **64 GiB of source files before compression**. There is no free-space
+> preflight: in the worst case the server briefly needs about 128 GiB for the reconstructed
+> tree plus ZIP, and a device may need about 192 GiB while it holds the ZIP, extracted staging
+> tree, and destination files. Python creates ZIP64 archives automatically when required, but
+> bundles above 4 GiB must be acceptance-tested on the target PICO firmware.
+>
+> ZIP creation runs through `asyncio.to_thread`; doing multi-gigabyte compression on aiohttp's
+> event-loop thread would starve device/admin WebSocket heartbeats. The worker is shielded from
+> request-task cancellation, and cancellation is not propagated until the worker exits, so
+> staging and partial-ZIP cleanup cannot race file reads or writes still running in the thread.
 >
 > These are two console panels rather than one panel with a delete toggle so the
 > destructive operation has to be chosen **by name**. Only Sync Folder shows the

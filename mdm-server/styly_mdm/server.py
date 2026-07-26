@@ -58,7 +58,7 @@ CLIENT_APK_RE = re.compile(r"^styly-mdm-client_v?(\d+(?:\.\d+)+)(?:-.*)?\.apk$")
 
 # Maximum number of device downloads allowed in flight across the whole server.
 # Fanning a file out to a large group otherwise makes every device pull it from the
-# server at the same instant (an APK can be up to 2 GiB, a push bundle likewise),
+# server at the same instant (an APK can be up to 2 GiB and a push bundle 64 GiB),
 # spiking LAN/server bandwidth and stalling transfers. Every byte-moving fan-out —
 # install, push, sync — gates its dispatch on the same pool of this many slots; a
 # slot frees as soon as its device reports the download finished. Read when the pool
@@ -70,7 +70,9 @@ MAX_CONCURRENT_TRANSFERS = max(1, int(os.environ.get("MDM_MAX_CONCURRENT_TRANSFE
 # default: a large APK over a slow LAN can legitimately take minutes. Lowering it
 # recovers stuck slots sooner at the risk of releasing a slow-but-healthy transfer
 # early, which only relaxes throttling and never drops the job itself.
-TRANSFER_TIMEOUT = float(os.environ.get("MDM_TRANSFER_TIMEOUT", "600"))
+DEFAULT_TRANSFER_TIMEOUT = 30 * 60
+TRANSFER_TIMEOUT = float(
+    os.environ.get("MDM_TRANSFER_TIMEOUT", str(DEFAULT_TRANSFER_TIMEOUT)))
 
 # The two kinds of byte-moving job. A device can be in one of each at the same time
 # (an admin can push files to a group already installing an APK), so both the slot
@@ -140,7 +142,7 @@ _apk_hash_cache: dict[tuple[str, int, int], dict] = {}
 # devices, which mirror it into a destination directory. Kept separate from APK_DIR so the
 # APK workflow is untouched.
 BUNDLE_DIR = DATA_DIR / "bundles"
-MAX_BUNDLE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB (total uploaded bytes before zipping)
+MAX_BUNDLE_SIZE = 64 * 1024 * 1024 * 1024  # 64 GiB (total uploaded bytes before zipping)
 MAX_BUNDLE_ENTRIES = 5000  # cap files per bundle to bound tree reconstruction
 
 # Persistent per-device registry: serial -> {label, model, ip, last_seen, startup_app, battery}
@@ -1098,6 +1100,23 @@ def unique_bundle_path(filename: str) -> Path:
     return candidate
 
 
+def reserve_unique_bundle_path(filename: str) -> Path:
+    """Atomically reserve a unique path before ZIP work leaves the event loop.
+
+    Once ZIP creation runs in a worker thread, another upload can arrive while the
+    first archive is still being built. Exclusively creating a placeholder prevents
+    both workers from selecting and writing the same destination.
+    """
+    while True:
+        destination = unique_bundle_path(filename)
+        try:
+            destination.touch(exist_ok=False)
+            return destination
+        except FileExistsError:
+            # A concurrent process may claim the path after the existence check.
+            continue
+
+
 def bundle_basename(relpaths: list[str]) -> str:
     """Derive a safe base name (no extension) for the bundle zip from its entries.
 
@@ -1141,6 +1160,42 @@ def zip_tree(root: Path, dest_zip: Path) -> None:
         for path in sorted(root.rglob("*")):
             if path.is_file():
                 zf.write(path, path.relative_to(root).as_posix())
+
+
+async def zip_tree_async(root: Path, dest_zip: Path) -> None:
+    """Run ZIP creation off the event loop and finish it before propagating cancellation.
+
+    Large bundles can spend minutes in ``zipfile``. Running that work in the aiohttp
+    event-loop thread starves WebSocket heartbeats and disconnects consoles/devices.
+
+    Cancelling ``to_thread`` cannot stop its worker thread. Shield the task and, if this
+    coroutine is cancelled, wait until the worker really exits before returning control
+    to the upload handler; only then is it safe for the handler to remove the staging tree
+    or a partial ZIP.
+    """
+    worker = asyncio.create_task(asyncio.to_thread(zip_tree, root, dest_zip))
+    try:
+        await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # A second cancellation can interrupt an ordinary ``await worker``. Keep shielding
+        # until the thread has actually finished so caller cleanup cannot race its file I/O.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                # Retrieve and log it below without replacing the caller's cancellation.
+                break
+
+        # Preserve the caller's cancellation even if the worker failed while we waited.
+        try:
+            worker.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("Bundle ZIP creation failed after request cancellation")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -2649,6 +2704,7 @@ async def upload_bundle_handler(request: web.Request) -> web.Response:
     total_size = 0
     relpaths: list[str] = []
     skipped: list[str] = []
+    bundle_path: Path | None = None
 
     try:
         while True:
@@ -2691,7 +2747,7 @@ async def upload_bundle_handler(request: web.Request) -> web.Response:
                         break
                     total_size += len(chunk)
                     if total_size > MAX_BUNDLE_SIZE:
-                        return web.json_response({"error": "Bundle exceeds 2 GiB limit"}, status=413)
+                        return web.json_response({"error": "Bundle exceeds 64 GiB limit"}, status=413)
                     f.write(chunk)
             relpaths.append(relpath)
 
@@ -2708,14 +2764,21 @@ async def upload_bundle_handler(request: web.Request) -> web.Response:
         root, _stripped = strip_common_root(relpaths)
         content_root = staging / root if root is not None else staging
         base = bundle_basename([root]) if root is not None else bundle_basename(relpaths)
-        bundle_path = unique_bundle_path(f"{base}.zip")
-        zip_tree(content_root, bundle_path)
+        bundle_path = reserve_unique_bundle_path(f"{base}.zip")
+        await zip_tree_async(content_root, bundle_path)
+    except asyncio.CancelledError:
+        if bundle_path is not None:
+            bundle_path.unlink(missing_ok=True)
+        raise
     except Exception as e:
+        if bundle_path is not None:
+            bundle_path.unlink(missing_ok=True)
         log.exception("Failed to build uploaded bundle")
         return web.json_response({"error": f"Failed to build bundle: {e}"}, status=500)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
+    assert bundle_path is not None
     size = bundle_path.stat().st_size
     bundle_url = f"{request.scheme}://{request.host}/bundles/{bundle_path.name}"
     log.info("Built bundle: %s (%d entries, %d bytes zipped)",

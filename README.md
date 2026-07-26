@@ -83,12 +83,12 @@ Open `http://<server-ip>:7070` in a browser to access the web console.
 | UDP discovery port | `MDM_DISCOVERY_PORT` | — | `7071` |
 | Data directory (uploaded APKs, pushed bundles, device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
 | Simultaneous device downloads, server-wide | `MDM_MAX_CONCURRENT_TRANSFERS` | `--max-concurrent-transfers` | `5` |
-| Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `600` |
+| Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `1800` |
 | Seconds a retiring device must stay silent before the retire counts as done | `MDM_RETIRE_TIMEOUT` | — | `120` |
 
 The **data directory** holds everything the server persists: uploaded APKs (`apks/`), pushed file bundles (`bundles/`), and the device registry (`device_registry.json`). It defaults to the directory the server is started from, so `uvx styly-mdm` in a fresh directory comes up with no devices or groups. Pass `--data-dir` to pin it somewhere stable.
 
-**Transfer throttling** keeps a large fan-out — an APK install, a file push, or a folder sync — from making every device download at the same instant (an APK or a pushed bundle can be up to 2 GiB). All jobs share one server-wide pool: at most `--max-concurrent-transfers` devices download at once; the rest queue, and a slot frees as soon as its device reports the download finished. `MDM_TRANSFER_TIMEOUT` caps how long one device may hold a slot, so a stuck device cannot block the queue. The [Developer Guide](docs/DEVELOPMENT.md) documents the full slot-release rules.
+**Transfer throttling** keeps a large fan-out — an APK install, a file push, or a folder sync — from making every device download at the same instant (an APK can be up to 2 GiB and a pushed bundle up to 64 GiB). All jobs share one server-wide pool: at most `--max-concurrent-transfers` devices download at once; the rest queue, and a slot frees as soon as its device reports the download finished. `MDM_TRANSFER_TIMEOUT` caps how long one device may hold a slot, so a stuck device cannot block the queue. The [Developer Guide](docs/DEVELOPMENT.md) documents the full slot-release rules.
 
 > **Only one server per discovery port.** Devices connect to whichever server answers discovery first, so two servers sharing a discovery port would split them nondeterministically. To prevent that, the server broadcasts a probe on startup and exits if another STYLY-MDM server answers:
 >
@@ -205,7 +205,7 @@ the new server over UDP and reconnects. The `ip` and `last_seen` fields refresh 
 reconnect, and group membership is keyed by serial number, so devices that are offline
 during the move keep their groups.
 
-Uploaded APKs (`<data-dir>/apks/`) and pushed file bundles (`<data-dir>/bundles/`) are not part of the registry. Copy those directories separately with `rsync` or `scp` if the new server needs them — a single APK can be up to 2 GiB, so they are not worth moving through a browser.
+Uploaded APKs (`<data-dir>/apks/`) and pushed file bundles (`<data-dir>/bundles/`) are not part of the registry. Copy those directories separately with `rsync` or `scp` if the new server needs them — an APK can be up to 2 GiB and a pushed bundle up to 64 GiB, so they are not worth moving through a browser.
 
 ## Documentation
 

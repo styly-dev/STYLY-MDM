@@ -31,6 +31,10 @@ BUNDLE_URL = "http://x/bundles/b.zip"
 DEST = "/sdcard/STYLY/content"
 
 
+def test_default_transfer_timeout_is_30_minutes():
+    assert server.DEFAULT_TRANSFER_TIMEOUT == 30 * 60
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures / helpers
 # ---------------------------------------------------------------------------
