@@ -70,7 +70,7 @@ MAX_CONCURRENT_TRANSFERS = max(1, int(os.environ.get("MDM_MAX_CONCURRENT_TRANSFE
 # default: a large APK over a slow LAN can legitimately take minutes. Lowering it
 # recovers stuck slots sooner at the risk of releasing a slow-but-healthy transfer
 # early, which only relaxes throttling and never drops the job itself.
-DEFAULT_TRANSFER_TIMEOUT = 30 * 60
+DEFAULT_TRANSFER_TIMEOUT = 60 * 60
 TRANSFER_TIMEOUT = float(
     os.environ.get("MDM_TRANSFER_TIMEOUT", str(DEFAULT_TRANSFER_TIMEOUT)))
 

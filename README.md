@@ -83,7 +83,7 @@ Open `http://<server-ip>:7070` in a browser to access the web console.
 | UDP discovery port | `MDM_DISCOVERY_PORT` | — | `7071` |
 | Data directory (uploaded APKs, pushed bundles, device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
 | Simultaneous device downloads, server-wide | `MDM_MAX_CONCURRENT_TRANSFERS` | `--max-concurrent-transfers` | `5` |
-| Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `1800` |
+| Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `3600` |
 | Seconds a retiring device must stay silent before the retire counts as done | `MDM_RETIRE_TIMEOUT` | — | `120` |
 
 The **data directory** holds everything the server persists: uploaded APKs (`apks/`), pushed file bundles (`bundles/`), and the device registry (`device_registry.json`). It defaults to the directory the server is started from, so `uvx styly-mdm` in a fresh directory comes up with no devices or groups. Pass `--data-dir` to pin it somewhere stable.

@@ -35,7 +35,7 @@ A command-line flag overrides the corresponding environment variable.
 | UDP discovery port | `MDM_DISCOVERY_PORT` | — | `7071` |
 | Data directory (uploaded APKs, pushed bundles, device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
 | Simultaneous device downloads, server-wide | `MDM_MAX_CONCURRENT_TRANSFERS` | `--max-concurrent-transfers` | `5` |
-| Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `1800` |
+| Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `3600` |
 
 The data directory holds everything the server persists: uploaded APKs
 (`<data-dir>/apks/`), pushed file bundles (`<data-dir>/bundles/`), and the device

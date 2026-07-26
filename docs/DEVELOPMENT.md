@@ -414,12 +414,12 @@ STYLY-MDM/
 >    older clients that never emit `DOWNLOAD_COMPLETE`, and clients whose download
 >    failed outright).
 > 3. Device disconnect (frees every slot the device held, immediately).
-> 4. A per-device timeout (`MDM_TRANSFER_TIMEOUT` seconds, default **1800**) so a
+> 4. A per-device timeout (`MDM_TRANSFER_TIMEOUT` seconds, default **3600**) so a
 >    silent/stuck device cannot block the queue. Lowering it recovers stuck slots
 >    sooner but risks releasing a slow-but-healthy transfer early, which only
 >    relaxes throttling and never drops the job itself.
 >    The timeout does not cancel the device download. At 100 Mbps, a 64 GiB bundle
->    takes about 92 minutes ideally, so the default 30-minute timeout will mark that
+>    takes about 92 minutes ideally, so the default 60-minute timeout will mark that
 >    transfer failed and release its slot while the device continues downloading.
 >
 > `pending_transfers` is keyed by **`(device_id, task)`**, not by device: an admin can
