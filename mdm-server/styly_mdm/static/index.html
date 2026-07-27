@@ -417,6 +417,14 @@
               </div>
             </div>
             <div class="cmd-divider"></div>
+            <div class="cmd-section collapsed" data-cmd="updateClient">
+              <div class="cmd-head" data-act="toggleCmd"><span>Update MDM Client</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <div class="push-note">Reinstalls the server's own MDM client APK on every selected device that is <strong>online and behind</strong> the server version — each reinstalls the client and restarts. Devices already current, offline, or of unknown version are skipped; the button shows how many will actually update. Needs a server client APK on the same major.minor as the server (the same one the per-device Update button uses).</div>
+                <button class="btn btn-success" id="btnUpdateClients" disabled>Update Selected</button>
+              </div>
+            </div>
+            <div class="cmd-divider"></div>
             <div class="cmd-section collapsed" data-cmd="push">
               <div class="cmd-head" data-act="toggleCmd"><span>Push Files</span><span class="cmd-chevron">▾</span></div>
               <div class="cmd-body">
@@ -612,6 +620,7 @@
       const apkFile = document.getElementById('apkFile');
       const apkName = document.getElementById('apkName');
       const btnInstall = document.getElementById('btnInstall');
+      const btnUpdateClients = document.getElementById('btnUpdateClients');
       const launchPkg = document.getElementById('launchPkg');
       const launchExtra = document.getElementById('launchExtra');
       const btnLaunch = document.getElementById('btnLaunch');
@@ -1089,6 +1098,26 @@
         return list.map(deviceRowHtml).join('');
       }
 
+      // A stable-online client whose major.minor trails the server needs updating. Shared by
+      // the per-row version badge and the bulk "Update Selected" target filter so both agree
+      // on which devices are behind (an offline or `updating` device is never behind here).
+      function deviceVerBehind(d) {
+        if (!d) return false;
+        const srvMinor = serverMajorMinor();
+        const devMinor = parseMajorMinor(d.version_name);
+        return !!(srvMinor && devMinor && d.status === 'online' && cmpMajorMinor(devMinor, srvMinor) < 0);
+      }
+      // A one-click self-update is only offered when the server's client APK is on the *same*
+      // major.minor as the server — installing it brings a behind device exactly in sync. A
+      // stale APK (older than the server) would leave it still red; one ahead would push it past
+      // the server (flipping the top-bar red), which violates the lockstep policy. Neither is
+      // offered. Mirrors the per-row Update gate so the bulk button targets exactly the rows
+      // that show an individual button.
+      function canUpdateDevice(d) {
+        if (!deviceVerBehind(d)) return false;
+        return !!(clientApk && cmpMajorMinor(parseMajorMinor(clientApk.version), serverMajorMinor()) === 0);
+      }
+
       function deviceRowHtml(d) {
         const id = getDeviceId(d);
         const checked = selectedIds.has(id);
@@ -1107,21 +1136,13 @@
           // A stable-online client whose major.minor trails the server needs updating,
           // so its badge is flagged red. A client *ahead* of the server is the server's
           // problem, not the device's — that reddens the top-bar version instead.
-          const srvMinor = serverMajorMinor();
-          const devMinor = parseMajorMinor(d.version_name);
-          const verBehind = srvMinor && devMinor && d.status === 'online' && cmpMajorMinor(devMinor, srvMinor) < 0;
+          const verBehind = deviceVerBehind(d);
           const verBadge = d.version_name
             ? '<span class="dev-version' + (verBehind ? ' mismatch' : '') + '" title="' +
                 (verBehind ? 'Client v' + esc(d.version_name) + ' trails server ' + esc(serverVersion) + ' — needs updating' : 'Client build') +
                 '">v' + esc(d.version_name) + '</span>'
             : '<span class="dev-version unknown" title="Client build unknown (device predates version reporting)">unknown</span>';
-          // Offer a one-click self-update only when the server's client APK is on the
-          // *same* major.minor as the server — installing it brings this behind device
-          // exactly in sync. A stale APK (older than the server) would leave it still
-          // red; one ahead of the server would push it past the server (flipping the
-          // top-bar red), which violates the lockstep policy. Neither is offered.
-          const canUpdate = verBehind && clientApk &&
-            cmpMajorMinor(parseMajorMinor(clientApk.version), srvMinor) === 0;
+          const canUpdate = canUpdateDevice(d);
           const updateBtn = canUpdate
             ? '<button class="btn-update" data-act="update" data-id="' + esc(id) + '" title="Install styly-mdm-client v' + esc(clientApk.version) + ' (the device reinstalls the MDM client and restarts)">Update</button>'
             : '';
@@ -1286,6 +1307,12 @@
         btnReboot.disabled = !powerConfirm.checked || !has;
         btnPowerOff.disabled = !powerConfirm.checked || !has;
         btnRetire.disabled = !retireConfirm.checked || !has;
+        // Enabled only when at least one selected device is actually behind and updatable; the
+        // count tells the operator how many of the selection this one click will update.
+        let updatable = 0;
+        selectedIds.forEach(function (id) { if (canUpdateDevice(deviceById(id))) updatable++; });
+        btnUpdateClients.disabled = updatable === 0;
+        btnUpdateClients.textContent = updatable ? 'Update Selected (' + updatable + ')' : 'Update Selected';
       }
 
       // ---------------- Selection actions ----------------
@@ -1584,6 +1611,24 @@
         deviceTaskState[id] = { task: 'install', status: 'queued', filename: clientApk.filename, detail: '' };
         updateTaskCell(id);
         addLog('Updating ' + name + ' to client v' + clientApk.version, 'info');
+      }
+      // Bulk sibling of sendClientUpdate: fan the server's own client APK out to every selected
+      // device that is online and behind (canUpdateDevice), skipping already-current, offline,
+      // and unknown-version ones. The server throttles the actual fan-out (INSTALL_APK →
+      // _run_install_job), so one message carries the whole batch — 100 clicks become one.
+      function sendClientUpdateBulk() {
+        if (!clientApk) { addLog('No client APK available on the server to update with', 'warn'); return; }
+        const selected = Array.from(selectedIds);
+        const targets = selected.filter(function (id) { return canUpdateDevice(deviceById(id)); });
+        const skipped = selected.length - targets.length;
+        if (!targets.length) { addLog('No selected devices need a client update (already current or offline)', 'warn'); return; }
+        if (!confirm('Update ' + targets.length + ' device(s) to styly-mdm-client v' + clientApk.version + '?\n\nEach device will reinstall the MDM client and restart.')) return;
+        // Absolute URL against our own origin, exactly like an operator-uploaded APK.
+        const apkUrl = new URL(clientApk.url, location.origin).href;
+        if (!wsSend({ type: 'INSTALL_APK', target_devices: targets, apk_url: apkUrl, apk_filename: clientApk.filename }, 'update client')) return;
+        targets.forEach(function (id) { deviceTaskState[id] = { task: 'install', status: 'queued', filename: clientApk.filename, detail: '' }; updateTaskCell(id); });
+        addLog('Updating ' + targets.length + ' device(s) to client v' + clientApk.version +
+          (skipped ? ' · ' + skipped + ' selected skipped (already current or offline)' : ''), 'info');
       }
       function sendForget(id) {
         const d = deviceById(id); const name = (d && d.label) || id;
@@ -2328,6 +2373,7 @@
       launchPkg.addEventListener('input', updateButtons);
       startupPkg.addEventListener('input', updateButtons);
       btnInstall.addEventListener('click', sendInstall);
+      btnUpdateClients.addEventListener('click', sendClientUpdateBulk);
       btnLaunch.addEventListener('click', sendLaunch);
       btnStartupSet.addEventListener('click', sendSetStartup);
       btnStartupClear.addEventListener('click', sendClearStartup);
