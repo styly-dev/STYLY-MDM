@@ -304,7 +304,7 @@ STYLY-MDM/
 | Message type | Description |
 |---|---|
 | `SERVER_INFO` | Server identity, sent once on connect (before the first `DEVICE_LIST`). Fields: `version` (the `styly_mdm` package version; the console renders it next to the `STYLY-MDM` brand in the top bar. Its `major.minor` is the compatibility reference — and the top-bar value itself turns red when a live client is on a *newer* `major.minor` (i.e. the server is the one lagging). See the compatibility note below). |
-| `CLIENT_APK_INFO` | The newest styly-mdm-client APK the server holds, sent on connect (right after `SERVER_INFO`, before `DEVICE_LIST`) and re-broadcast after every APK upload. Field: `apk` = `{filename, url, version}` or `null`. Drives the per-device **Update** button and the top-bar client-APK download link (see the notes below). |
+| `CLIENT_APK_INFO` | The newest styly-mdm-client APK the server holds, sent on connect (right after `SERVER_INFO`, before `DEVICE_LIST`) and re-broadcast after every APK upload. Field: `apk` = `{filename, url, version}` or `null`. Drives the per-device and bulk **Update** buttons and the top-bar client-APK download link (see the notes below). |
 | `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting; a *stable-online* client whose `version_name` trails the server on `major.minor` is flagged red as needing an update — the reverse case, a client *ahead* of the server, reddens the top-bar server version instead. `updating` and offline rows are exempt, and the check is skipped only when the server version is the `0.0.0` untagged/not-installed fallback), and may include optional `battery`: `{level, charging, last_seen}`) |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `REBOOT_SENT` / `POWER_OFF_SENT` | Confirmation that reboot/power-off commands were dispatched. Fields: `sent_count`, `target_count` |
@@ -361,6 +361,20 @@ STYLY-MDM/
 > package-data glob); an **sdist** source build does not (setuptools-scm only packs
 > git-tracked files), but `pip`/`uvx` install the wheel — so a released server ships
 > with its matching client, while a from-source run relies on an operator upload.
+
+> **Bulk client update (Update Selected).** The **Update MDM Client** command section
+> extends the per-device Update button to the whole selection. It targets exactly the
+> selected devices that are online *and* behind the server on `major.minor` — the same
+> `canUpdateDevice` gate the per-row button uses — skipping the already-current,
+> offline, and unknown-version ones. The button label carries the live count,
+> **Update Selected (N)**, and is disabled when none of the selection is behind (e.g.
+> the server holds no client APK on its own `major.minor`), so an operator can filter to
+> *Online*, select all, and update a fleet in one click. It emits a single `INSTALL_APK`
+> carrying every target device id — the same batched path `Install to Selected` uses,
+> which the server throttles (`_run_install_job`) — and writes the skipped count to the
+> activity log, so the gap between *selected* and *updated* is explicit. Because it
+> reuses the existing `INSTALL_APK` message and install job, no new component or message
+> type is introduced (the architecture / message-flow diagrams are unchanged).
 
 > **Downloading the client APK from the console.** The same APK that drives the
 > per-device **Update** button is also offered to the operator directly: when
