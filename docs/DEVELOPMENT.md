@@ -1101,14 +1101,33 @@ discovery.
 
 ```bash
 cd mdm-server
-pip install -e '.[dev]'
-python -m pytest        # smoke tests
-python -m build         # sdist + wheel into dist/  (pip install build first)
+uv sync --extra dev     # editable install + pytest (plain `uv sync` drops the dev extra)
+uv run pytest           # smoke tests
+uv build                # sdist + wheel into dist/
 ```
 
 **Versioning.** The package version is derived from the `vX.Y.Z` git tag via
 `setuptools-scm` — the same tag the APK release flow uses, so server and APK share one
 version. There is no hardcoded version to bump.
+
+> **The version is frozen at install time, not at run time.** `styly_mdm.__version__`
+> reads `importlib.metadata.version("styly-mdm")`, so the value setuptools-scm computes is
+> baked into the installed package's metadata when you install it. A new tag or a plain
+> `git pull` does **not** change what an already-installed server reports (and the console
+> shows the server's version via `SERVER_INFO`) — you have to reinstall. Worse, `run.sh`
+> runs from `mdm-server/`, which puts that directory on `sys.path[0]`, so a stale
+> `mdm-server/styly_mdm.egg-info/` there **shadows every venv's dist-info** — recreating
+> the venv alone will not help. After any version bump, force a clean recompute:
+>
+> ```bash
+> cd mdm-server && rm -rf styly_mdm.egg-info && uv sync --extra dev
+> ```
+>
+> Verify with `uv run python -c "from styly_mdm import __version__; print(__version__)"`.
+> A server left behind shows up in the console as the top-bar version turning **red** — but
+> only once a client on a newer `major.minor` is actually `online` (offline / `updating` /
+> unknown-version devices never trigger it). Restart the running server afterwards, since
+> `__version__` is read once at import.
 
 **Release automation.** `.github/workflows/publish-pypi.yml` runs on the same
 `release: published` event as the APK build (`release.yml`): a human publishes the

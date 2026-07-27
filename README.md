@@ -52,8 +52,8 @@ Or run from a clone (for development):
 
 ```bash
 cd mdm-server
-pip install -e .
-python -m styly_mdm      # or ./run.sh
+uv sync                  # editable install into .venv
+uv run python -m styly_mdm   # or ./run.sh
 ```
 
 The server starts on port 7070 and displays its LAN IP addresses and the
