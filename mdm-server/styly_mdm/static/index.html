@@ -575,6 +575,13 @@
       let view = 'console';            // 'console' | 'manage'
       let deviceTaskState = {};           // id -> { task, status, filename, detail, note, verb }
       let editingLabelId = null;
+      // The rows are re-rendered from scratch on every DEVICE_LIST (a battery report from
+      // any device triggers one), which destroys the open editor's <input>. Keep the typed
+      // text and caret in module state so a broadcast mid-rename cannot silently revert it
+      // — otherwise the next Enter/Save commits the old label and reads as a cancel.
+      let editingLabelDraft = '';
+      let editingLabelCaret = null;    // null = select the whole draft (editor just opened)
+      let editingLabelRefocus = false; // one-shot: focus the editor on the next render
       let uploadedApk = null;
       let uploadInProgress = false;
       // Integrity verification (issue #37). The reference is computed locally in the
@@ -600,6 +607,11 @@
       let manageSearch = '';
       let manageSort = 'label-asc';
       let renamingManageGroup = false;
+      // Same story as editingLabelDraft: renderManageDetail() runs on every DEVICE_LIST /
+      // GROUP_LIST, so the group-rename input needs its text kept outside the DOM too.
+      let renameGroupDraft = '';
+      let renameGroupCaret = null;     // null = select the whole draft (editor just opened)
+      let renameGroupRefocus = false;  // one-shot: focus the editor on the next render
       let pendingSelectGroup = null;   // select this group in manage once GROUP_LIST confirms it
 
       // ---------------- DOM refs ----------------
@@ -1024,11 +1036,32 @@
         devToolbar.style.display = showToolbar ? '' : 'none';
         if (showToolbar && devSearchInput.value !== deviceSearch) devSearchInput.value = deviceSearch;
         if (showToolbar) syncStatusFilterButtons();
+        const hadFocus = labelInputFocused();
         targetsBody.innerHTML = targetTab === 'groups' ? renderGroupsHtml() : renderDevicesHtml();
-        if (editingLabelId !== null && targetTab === 'devices') {
-          const inp = targetsBody.querySelector('[data-label-input]');
-          if (inp) setTimeout(function () { inp.focus(); inp.select(); }, 0);
-        }
+        if (targetTab === 'devices') restoreLabelEditFocus(hadFocus);
+      }
+
+      function labelInputFocused() {
+        const a = document.activeElement;
+        return !!(a && a.matches && a.matches('[data-label-input]'));
+      }
+
+      // Re-focus the label editor after its row was rebuilt. The value itself comes from
+      // editingLabelDraft, so only focus and caret need restoring: a freshly opened editor
+      // selects the whole name, a re-render mid-typing puts the caret back where it was.
+      // Only ever steals focus back if the editor already had it (or was just opened) —
+      // otherwise a re-render would yank the caret out of the device search box.
+      function restoreLabelEditFocus(hadFocus) {
+        if (editingLabelId === null) return;
+        if (!hadFocus && !editingLabelRefocus) return;
+        editingLabelRefocus = false;
+        const inp = targetsBody.querySelector('[data-label-input]');
+        if (!inp) return;
+        setTimeout(function () {
+          inp.focus();
+          if (editingLabelCaret === null) inp.select();
+          else inp.setSelectionRange(editingLabelCaret, editingLabelCaret);
+        }, 0);
       }
 
       function renderGroupsHtml() {
@@ -1127,7 +1160,7 @@
         let deviceCell;
         if (editingLabelId === id) {
           deviceCell = '<div class="dev-edit">' +
-            '<input class="label-input" data-label-input maxlength="64" placeholder="DEV-001" value="' + esc(d.label || '') + '">' +
+            '<input class="label-input" data-label-input maxlength="64" placeholder="DEV-001" value="' + esc(editingLabelDraft) + '">' +
             '<button class="btn-mini btn-save" data-act="saveLabel" data-id="' + esc(id) + '">Save</button>' +
             '<button class="btn-mini btn-cancel" data-act="cancelLabel">Cancel</button></div>';
         } else {
@@ -1207,11 +1240,13 @@
       // leaving the toolbar input focused and the rest of the page untouched.
       function refreshDeviceRows() {
         const rows = document.getElementById('devRows');
+        const hadFocus = labelInputFocused();
         if (rows) rows.innerHTML = deviceRowsHtml();
         const box = targetsBody.querySelector('.dev-head [data-act="selectAll"]');
         if (box) { box.className = 'selbox ' + selectAllState(); box.textContent = selectAllGlyph(); }
         const arrow = targetsBody.querySelector('.dev-head .sort-arrow');
         if (arrow) arrow.textContent = sortArrowGlyph();
+        restoreLabelEditFocus(hadFocus);
       }
 
       // The status segmented control is static (outside targetsBody), so reflect module
@@ -1589,12 +1624,29 @@
       }
 
       // ---------------- Label / Forget ----------------
-      function commitLabel(id) {
-        const inp = targetsBody.querySelector('[data-label-input]');
-        const val = inp ? inp.value.trim() : '';
-        editingLabelId = null;
-        wsSend({ type: 'SET_DEVICE_LABEL', device_id: id, label: val }, 'set label');
+      function openLabelEditor(id) {
+        const d = deviceById(id);
+        editingLabelId = id;
+        editingLabelDraft = (d && d.label) || '';
+        editingLabelCaret = null;
+        editingLabelRefocus = true;
         render();
+      }
+      function closeLabelEditor() {
+        editingLabelId = null;
+        editingLabelDraft = '';
+        editingLabelCaret = null;
+        editingLabelRefocus = false;
+        render();
+      }
+      function commitLabel(id) {
+        if (!id || editingLabelId === null) return;
+        // The live input is the source of truth when it exists; the draft covers the case
+        // where a re-render replaced it between the last keystroke and this commit.
+        const inp = targetsBody.querySelector('[data-label-input]');
+        const val = (inp ? inp.value : editingLabelDraft).trim();
+        closeLabelEditor();
+        wsSend({ type: 'SET_DEVICE_LABEL', device_id: id, label: val }, 'set label');
       }
       // ---------------- Client update ----------------
       // Reuses the normal install path pointed at the server's own client APK: the
@@ -1649,12 +1701,15 @@
         if (group && (group in groups)) selectManageGroup(group);
         render();
       }
-      function backToConsole() { view = 'console'; renamingManageGroup = false; render(); }
+      function backToConsole() { view = 'console'; renamingManageGroup = false; renameGroupDraft = ''; renameGroupCaret = null; renameGroupRefocus = false; render(); }
       function selectManageGroup(name) {
         manageSelectedGroup = name;
         manageMembers = new Set(groups[name] || []);
         manageSearch = '';
         renamingManageGroup = false;
+        renameGroupDraft = '';
+        renameGroupCaret = null;
+        renameGroupRefocus = false;
       }
 
       function renderManageSidebar() {
@@ -1673,6 +1728,7 @@
       }
 
       function renderManageDetail() {
+        const hadRenameFocus = renameInputFocused();
         if (!manageSelectedGroup || !(manageSelectedGroup in groups)) {
           mgDetail.innerHTML = '<div class="mg-detail-empty">Select a group, or create one.</div>';
           return;
@@ -1682,7 +1738,7 @@
         const offCount = memArr.filter(function (s) { const d = deviceById(s); return !d || !isOnline(d); }).length;
         const onCount = memArr.length - offCount;
         const head = renamingManageGroup
-          ? '<div class="dev-edit"><input class="label-input" data-mg-rename maxlength="64" value="' + esc(name) + '">' +
+          ? '<div class="dev-edit"><input class="label-input" data-mg-rename maxlength="64" value="' + esc(renameGroupDraft) + '">' +
             '<button class="btn-mini btn-save" data-act="saveRename">Save</button>' +
             '<button class="btn-mini btn-cancel" data-act="cancelRename">Cancel</button></div>'
           : '<div><div class="mg-title">' + esc(name) + '</div><div class="mg-sub">' + onCount + ' online, ' + offCount + ' offline</div></div>' +
@@ -1697,6 +1753,52 @@
           '<div class="spacer"></div>' +
           '<button class="btn-text" data-act="cancelMembers">Cancel</button>' +
           '<button class="btn-primary" data-act="saveMembers">Save</button></div>';
+        restoreRenameGroupFocus(hadRenameFocus);
+      }
+
+      function renameInputFocused() {
+        const a = document.activeElement;
+        return !!(a && a.matches && a.matches('[data-mg-rename]'));
+      }
+
+      // Counterpart of restoreLabelEditFocus() for the group-rename input, with the same
+      // "only if it already had focus" rule so the manage-view search box keeps the caret.
+      function restoreRenameGroupFocus(hadFocus) {
+        if (!renamingManageGroup) return;
+        if (!hadFocus && !renameGroupRefocus) return;
+        renameGroupRefocus = false;
+        const r = mgDetail.querySelector('[data-mg-rename]');
+        if (!r) return;
+        setTimeout(function () {
+          r.focus();
+          if (renameGroupCaret === null) r.select();
+          else r.setSelectionRange(renameGroupCaret, renameGroupCaret);
+        }, 0);
+      }
+
+      function openRenameGroupEditor() {
+        renamingManageGroup = true;
+        renameGroupDraft = manageSelectedGroup || '';
+        renameGroupCaret = null;
+        renameGroupRefocus = true;
+        renderManageDetail();
+      }
+      function closeRenameGroupEditor() {
+        renamingManageGroup = false;
+        renameGroupDraft = '';
+        renameGroupCaret = null;
+        renameGroupRefocus = false;
+        renderManageDetail();
+      }
+      // Commit the group rename from the live input, falling back to the draft if a
+      // re-render replaced the input since the last keystroke.
+      function commitRenameGroup() {
+        if (!renamingManageGroup) return;
+        const r = mgDetail.querySelector('[data-mg-rename]');
+        const nn = (r ? r.value : renameGroupDraft).trim();
+        const from = manageSelectedGroup;
+        closeRenameGroupEditor();
+        if (nn && nn !== from) sendRenameGroup(from, nn);
       }
 
       function renderMgDevListHtml() {
@@ -2327,9 +2429,9 @@
         else if (act === 'toggleDevice') toggleDevice(t.dataset.id);
         else if (act === 'selectAll') toggleSelectAll();
         else if (act === 'sortDevices') toggleDeviceSort();
-        else if (act === 'editLabel') { editingLabelId = t.dataset.id; render(); }
+        else if (act === 'editLabel') openLabelEditor(t.dataset.id);
         else if (act === 'saveLabel') commitLabel(t.dataset.id);
-        else if (act === 'cancelLabel') { editingLabelId = null; render(); }
+        else if (act === 'cancelLabel') closeLabelEditor();
         else if (act === 'forget') sendForget(t.dataset.id);
         else if (act === 'update') sendClientUpdate(t.dataset.id);
       });
@@ -2338,7 +2440,14 @@
         if (!e.target.matches('[data-label-input]')) return;
         if (e.isComposing || e.keyCode === 229) return; // ignore IME composition-confirming keys
         if (e.key === 'Enter') { e.preventDefault(); commitLabel(editingLabelId); }
-        else if (e.key === 'Escape') { e.preventDefault(); editingLabelId = null; render(); }
+        else if (e.key === 'Escape') { e.preventDefault(); closeLabelEditor(); }
+      });
+      // Mirror every keystroke into module state so a re-render can rebuild the editor
+      // with the text the admin actually typed (see editingLabelDraft).
+      targetsBody.addEventListener('input', function (e) {
+        if (!e.target.matches('[data-label-input]')) return;
+        editingLabelDraft = e.target.value;
+        editingLabelCaret = e.target.selectionStart;
       });
 
       // Devices filter (issue #57). Refreshes only the rows, so the input keeps focus
@@ -2438,19 +2547,15 @@
         }
         else if (act === 'saveMembers') sendSetGroupMembers(manageSelectedGroup, Array.from(manageMembers));
         else if (act === 'cancelMembers') { manageMembers = new Set(groups[manageSelectedGroup] || []); renderManageDetail(); }
-        else if (act === 'renameGroup') { renamingManageGroup = true; renderManageDetail(); const r = mgDetail.querySelector('[data-mg-rename]'); if (r) setTimeout(function () { r.focus(); r.select(); }, 0); }
-        else if (act === 'saveRename') {
-          const r = mgDetail.querySelector('[data-mg-rename]'); const nn = r ? r.value.trim() : '';
-          renamingManageGroup = false;
-          if (nn && nn !== manageSelectedGroup) sendRenameGroup(manageSelectedGroup, nn);
-          renderManageDetail();
-        }
-        else if (act === 'cancelRename') { renamingManageGroup = false; renderManageDetail(); }
+        else if (act === 'renameGroup') openRenameGroupEditor();
+        else if (act === 'saveRename') commitRenameGroup();
+        else if (act === 'cancelRename') closeRenameGroupEditor();
         else if (act === 'deleteGroup') { const name = t.dataset.group; if (confirm('Delete group "' + name + '"?\nDevices are not removed, only the group.')) sendDeleteGroup(name); }
       });
       // Manage search + keyboard
       manageView.addEventListener('input', function (e) {
         if (e.target.matches('[data-mg-search]')) { manageSearch = e.target.value; refreshMgDevList(); }
+        else if (e.target.matches('[data-mg-rename]')) { renameGroupDraft = e.target.value; renameGroupCaret = e.target.selectionStart; }
       });
       manageView.addEventListener('keydown', function (e) {
         if (e.isComposing || e.keyCode === 229) return; // ignore IME composition-confirming keys
@@ -2458,8 +2563,8 @@
           e.preventDefault();
           const name = e.target.value.trim(); if (name) { sendCreateGroup(name); pendingSelectGroup = name; e.target.value = ''; }
         } else if (e.target.matches('[data-mg-rename]')) {
-          if (e.key === 'Enter') { e.preventDefault(); const nn = e.target.value.trim(); renamingManageGroup = false; if (nn && nn !== manageSelectedGroup) sendRenameGroup(manageSelectedGroup, nn); renderManageDetail(); }
-          else if (e.key === 'Escape') { e.preventDefault(); renamingManageGroup = false; renderManageDetail(); }
+          if (e.key === 'Enter') { e.preventDefault(); commitRenameGroup(); }
+          else if (e.key === 'Escape') { e.preventDefault(); closeRenameGroupEditor(); }
         }
       });
 
