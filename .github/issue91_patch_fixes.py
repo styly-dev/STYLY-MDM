@@ -47,7 +47,7 @@ clear_method = '''    async def clear_fence_on_process_replacement(
 replace_between(
     store_path,
     '    async def clear_fence_on_process_replacement(\n',
-    '    async def active_assignment_for_device(\n',
+    '    async def active_assignment_for_device(self, device_id: str)',
     clear_method,
 )
 
