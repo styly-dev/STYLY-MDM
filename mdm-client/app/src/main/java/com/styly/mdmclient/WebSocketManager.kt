@@ -30,15 +30,8 @@ import java.util.concurrent.TimeUnit
  * Manages WebSocket connection to the STYLY-MDM server: device registration,
  * dispatching received commands, and the bounded connection window (#67).
  *
- * Connection attempts are allowed only inside a window that opens on each
- * network-available transition (which also covers process restart) and on an
- * established connection dropping. Inside the window every attempt cycle runs
- * UDP discovery first and then connects to the saved URL, retrying on a fixed
- * interval; when the window expires without a connection the client goes fully
- * silent until the next network transition. Window duration and retry interval
- * come from [ClientConfig] (defaults overridable via /sdcard/styly-mdm/config.json).
- * The state logic lives in [ConnectionScheduler]; all of it runs on the main
- * looper via [reconnectHandler].
+ * Push/Sync protocol messages are routed to the Application-scoped
+ * [PushJobCoordinator]; established commands continue to [onCommand].
  */
 class WebSocketManager(
     private val context: Context,
@@ -71,6 +64,7 @@ class WebSocketManager(
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
 
+    private val pushCoordinator = MdmClientApplication.pushJobCoordinator()
     private var webSocket: WebSocket? = null
     private var isRunning = false
     private val reconnectHandler = Handler(Looper.getMainLooper())
@@ -137,7 +131,9 @@ class WebSocketManager(
             networkCallbackRegistered = false
         }
         reconnectHandler.removeCallbacksAndMessages(null)
-        webSocket?.close(1000, "Client disconnecting")
+        val current = webSocket
+        if (current != null) pushCoordinator.detachTransport(current)
+        current?.close(1000, "Client disconnecting")
         webSocket = null
     }
 
@@ -220,7 +216,9 @@ class WebSocketManager(
         attemptGeneration++
         // cancel() aborts without a close handshake — the window expired or the
         // network vanished, so there is nothing to say goodbye to.
-        webSocket?.cancel()
+        val current = webSocket
+        if (current != null) pushCoordinator.detachTransport(current)
+        current?.cancel()
         webSocket = null
     }
 
@@ -240,6 +238,7 @@ class WebSocketManager(
                     if (this@WebSocketManager.webSocket !== webSocket) return@post
                     dispatch(scheduler.onConnected())
                     onStatusChanged(true, "Connected")
+                    pushCoordinator.attachTransport(webSocket, ::sendMessage)
                     sendRegistration()
                     startBatteryTelemetry()
                 }
@@ -250,7 +249,7 @@ class WebSocketManager(
                 try {
                     val json = JSONObject(text)
                     val type = json.optString("type", "")
-                    if (type.isNotEmpty()) {
+                    if (type.isNotEmpty() && !pushCoordinator.handleServerMessage(type, json)) {
                         onCommand(type, json)
                     }
                 } catch (e: Exception) {
@@ -278,6 +277,7 @@ class WebSocketManager(
     /** Routes a dead socket into the scheduler, ignoring cancelled/stale sockets. */
     private fun onSocketGone(deadSocket: WebSocket, message: String) {
         reconnectHandler.post {
+            pushCoordinator.detachTransport(deadSocket)
             if (webSocket !== deadSocket) return@post
             webSocket = null
             stopBatteryTelemetry()
@@ -309,6 +309,11 @@ class WebSocketManager(
             // Lets the server confirm which build re-registered after a self-update (#39).
             put("version_code", BuildConfig.VERSION_CODE)
             put("version_name", BuildConfig.VERSION_NAME)
+
+            val pushFields = pushCoordinator.registrationFields()
+            put("process_instance_id", pushFields.getString("process_instance_id"))
+            put("capabilities", pushFields.getJSONArray("capabilities"))
+            put("push_runtime", pushFields.getJSONObject("push_runtime"))
 
             val startupConfig = getStartupAppConfig()
             if (startupConfig != null) {
