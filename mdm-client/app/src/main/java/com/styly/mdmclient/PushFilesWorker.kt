@@ -10,6 +10,10 @@ import java.util.UUID
 import java.util.zip.ZipFile
 
 class PushFilesWorker {
+    companion object {
+        private const val MAX_ENTRIES = 5000
+        private const val MAX_EXTRACTED_BYTES = 2L * 1024 * 1024 * 1024
+    }
     data class Callbacks(
         val onTransferComplete: (Long) -> Unit,
         val onValidated: () -> Unit,
@@ -95,11 +99,17 @@ class PushFilesWorker {
         val root = staging.canonicalFile
         val seen = HashSet<String>()
         val kinds = HashMap<String, Boolean>() // true=directory
+        var entryCount = 0
+        var extractedBytes = 0L
         ZipFile(bundle).use { zip ->
             val entries = zip.entries()
             while (entries.hasMoreElements()) {
                 val entry = entries.nextElement()
-                val normalized = entry.name.replace('\\', '/').trimStart('/')
+                entryCount += 1
+                if (entryCount > MAX_ENTRIES) throw IllegalStateException("validation_failed: too many ZIP entries")
+                val raw = entry.name.replace('\\', '/')
+                if (raw.startsWith('/')) throw IllegalStateException("validation_failed: absolute ZIP path")
+                val normalized = raw
                 val parts = normalized.split('/').filter { it.isNotEmpty() && it != "." }
                 if (parts.isEmpty() || parts.any { it == ".." }) {
                     throw IllegalStateException("validation_failed: invalid ZIP entry ${entry.name}")
@@ -131,7 +141,19 @@ class PushFilesWorker {
                 } else {
                     target.parentFile?.mkdirs()
                     zip.getInputStream(entry).use { input ->
-                        FileOutputStream(target).use { output -> input.copyTo(output) }
+                        FileOutputStream(target).use { output ->
+                            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                            while (true) {
+                                val read = input.read(buffer)
+                                if (read < 0) break
+                                extractedBytes += read
+                                if (extractedBytes > MAX_EXTRACTED_BYTES) {
+                                    throw IllegalStateException("validation_failed: extracted size limit exceeded")
+                                }
+                                output.write(buffer, 0, read)
+                            }
+                            output.fd.sync()
+                        }
                     }
                 }
             }

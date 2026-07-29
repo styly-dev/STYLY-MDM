@@ -40,11 +40,12 @@ class PushJobCoordinator(context: Context) {
     private var transportSend: ((JSONObject) -> Unit)? = null
 
     init {
-        actor.execute {
-            state = recover(store.load())
-            gate.restore(state.active?.command)
-            persist()
-        }
+        // Load/recover the small durable record before the first REGISTER can be
+        // built.  Otherwise a fast WebSocket connection could advertise active=null
+        // while recovery was still queued on the actor.
+        state = recover(store.load())
+        gate.restore(state.active?.command)
+        persist()
     }
 
     fun attachTransport(token: Any, send: (JSONObject) -> Unit) {
@@ -347,7 +348,7 @@ class PushJobCoordinator(context: Context) {
         val interrupted = PushProtocol.Result(
             active.command.jobId,
             active.command.attempt,
-            "fail",
+            "interrupted",
             active.command.destPath,
             0, 0, 0,
             "client process restarted; the previous worker did not survive and the destination may be partially applied"

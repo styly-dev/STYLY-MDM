@@ -94,7 +94,14 @@ class ArtifactStore:
         flags = os.O_RDONLY
         if hasattr(os, "O_DIRECTORY"):
             flags |= os.O_DIRECTORY
-        fd = os.open(path, flags)
+        try:
+            fd = os.open(path, flags)
+        except OSError:
+            # Windows does not support opening directories for fsync.  File fsync
+            # and atomic replace still provide the strongest available guarantee.
+            if os.name == "nt":
+                return
+            raise
         try:
             os.fsync(fd)
         finally:

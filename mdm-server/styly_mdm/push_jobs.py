@@ -13,7 +13,7 @@ import json
 import posixpath
 import uuid
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 from typing import Any, Iterable, Mapping
 
 
@@ -23,17 +23,24 @@ CAP_PUSH_RESUME_V1 = "push_resume_v1"
 CAP_PUSH_CANCEL_V1 = "push_cancel_v1"
 
 
-class PushMode(StrEnum):
+class StringEnum(str, Enum):
+    """Python 3.10-compatible equivalent of enum.StrEnum."""
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class PushMode(StringEnum):
     PUSH = "push"
     SYNC = "sync"
 
 
-class ProtocolMode(StrEnum):
+class ProtocolMode(StringEnum):
     JOB_V1 = "job_v1"
     LEGACY = "legacy"
 
 
-class JobState(StrEnum):
+class JobState(StringEnum):
     CREATED = "created"
     UPLOADING = "uploading"
     PACKAGING = "packaging"
@@ -47,7 +54,7 @@ class JobState(StrEnum):
     CANCELLED = "cancelled"  # reserved for #89
 
 
-class DeviceState(StrEnum):
+class DeviceState(StringEnum):
     QUEUED = "queued"
     WAITING_TRANSFER = "waiting_transfer"
     DISPATCHING = "dispatching"

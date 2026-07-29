@@ -24,6 +24,7 @@ class LiveSession:
     capabilities: frozenset[str]
     process_instance_id: str | None
     send_lock: asyncio.Lock
+    origin: str = ""
 
 
 class PushScheduler:
@@ -98,156 +99,160 @@ class PushScheduler:
         attempt = assignment["attempt"]
         protocol = ProtocolMode(assignment["protocol_mode"])
         key = TransferKey("push", device_id, job_id, attempt)
+        accept_key = (job_id, device_id, attempt)
         loop = asyncio.get_running_loop()
         transfer_future: asyncio.Future[str] = loop.create_future()
         accept_future: asyncio.Future[tuple[str, dict[str, Any]]] | None = None
+        waiter_registered = False
 
-        async with self.transfer_slots():
-            session = self.sessions().get(device_id)
-            if session is None:
-                await self._fail_before_send(job_id, device_id, "device_offline_before_dispatch", "Device went offline before dispatch")
-                return
-            if protocol is ProtocolMode.JOB_V1 and CAP_PUSH_JOB_ID_V1 not in session.capabilities:
-                await self._fail_before_send(
-                    job_id,
-                    device_id,
-                    "capability_changed_before_dispatch",
-                    "push_job_id_v1 was not present on the live dispatch session",
-                )
-                return
-
-            accept_deadline = now_ms() + int(self.accept_timeout * 1000)
-            try:
-                snapshot = await self.store.mark_dispatching(
-                    job_id, device_id, session.capabilities, accept_deadline
-                )
-            except StoreConflict:
-                self.wake()
-                return
-            await self.publish(snapshot)
-            self.transfer_registry.register(key, transfer_future)
-            if protocol is ProtocolMode.JOB_V1:
-                accept_future = loop.create_future()
-                self._accept_waiters[(job_id, device_id, attempt)] = accept_future
-
-            command = self._command(snapshot, device_id, protocol)
-            try:
-                async with session.send_lock:
-                    current = self.sessions().get(device_id)
-                    if current is not session or current.session_id != session.session_id:
-                        raise ConnectionError("device WebSocket owner changed before send")
-                    await asyncio.wait_for(
-                        session.ws.send_str(json.dumps(command, separators=(",", ":"))),
-                        self.send_timeout,
+        try:
+            async with self.transfer_slots():
+                session = self.sessions().get(device_id)
+                if session is None:
+                    await self._fail_before_send(
+                        job_id, device_id, "device_offline_before_dispatch",
+                        "Device went offline before dispatch",
                     )
-            except Exception as exc:
-                self.transfer_registry.release_exact(key, "command_send_failed")
-                await self._fail_before_send(
-                    job_id, device_id, "command_send_failed", f"Could not send EXECUTE_PUSH_FILES: {exc}"
-                )
-                return
-
-            if protocol is ProtocolMode.LEGACY:
-                try:
-                    snapshot = await self.store.transition_device(
-                        job_id,
-                        device_id,
-                        expected={DeviceState.DISPATCHING},
-                        target=DeviceState.DOWNLOADING,
-                        fields={"accepted_at": now_ms(), "accept_deadline": None},
-                    )
-                    await self.publish(snapshot)
-                except StoreConflict:
                     return
-            else:
-                assert accept_future is not None
+                if protocol is ProtocolMode.JOB_V1 and CAP_PUSH_JOB_ID_V1 not in session.capabilities:
+                    await self._fail_before_send(
+                        job_id, device_id, "capability_changed_before_dispatch",
+                        "push_job_id_v1 was not present on the live dispatch session",
+                    )
+                    return
+
+                # Register exact waiters before the canonical dispatching commit.  A
+                # disconnect/result racing with the commit can therefore always release
+                # the resource it owns; a failed commit removes these exact waiters.
+                self.transfer_registry.register(key, transfer_future)
+                waiter_registered = True
+                if protocol is ProtocolMode.JOB_V1:
+                    accept_future = loop.create_future()
+                    self._accept_waiters[accept_key] = accept_future
+
+                accept_deadline = now_ms() + int(self.accept_timeout * 1000)
                 try:
-                    outcome, payload = await asyncio.wait_for(accept_future, self.accept_timeout)
-                except asyncio.TimeoutError:
-                    deadline = now_ms() + int(self.accept_reconciliation_timeout * 1000)
+                    snapshot = await self.store.mark_dispatching(
+                        job_id, device_id, session.capabilities, accept_deadline
+                    )
+                except StoreConflict:
+                    self.wake()
+                    return
+                await self.publish(snapshot)
+
+                command = self._command(snapshot, device_id, protocol, session)
+                try:
+                    # send_lock is stable per device (not per WebSocket session).
+                    # REGISTER/disconnect use the same lock, so ownership cannot change
+                    # between this check and bounded send completion.
+                    async with session.send_lock:
+                        current = self.sessions().get(device_id)
+                        if current is not session or current.session_id != session.session_id:
+                            raise ConnectionError("device WebSocket owner changed before send")
+                        await asyncio.wait_for(
+                            session.ws.send_str(json.dumps(command, separators=(",", ":"))),
+                            self.send_timeout,
+                        )
+                except Exception as exc:
+                    self.transfer_registry.release_exact(key, "command_send_failed")
+                    await self._fail_before_send(
+                        job_id, device_id, "command_send_failed",
+                        f"Could not send EXECUTE_PUSH_FILES: {exc}",
+                    )
+                    return
+
+                if protocol is ProtocolMode.LEGACY:
                     try:
-                        snapshot = await self.store.mark_reconciling(
-                            job_id,
-                            device_id,
+                        snapshot = await self.store.transition_device(
+                            job_id, device_id,
                             expected={DeviceState.DISPATCHING},
-                            reason="command_accept_timeout",
-                            deadline=deadline,
+                            target=DeviceState.DOWNLOADING,
+                            fields={"accepted_at": now_ms(), "accept_deadline": None},
                         )
                         await self.publish(snapshot)
-                        await self._send_reconcile(session, snapshot, device_id)
-                    except (StoreConflict, ConnectionError):
-                        pass
+                    except StoreConflict:
+                        return
                 else:
-                    if outcome == "accepted":
-                        try:
-                            snapshot = await self.store.transition_device(
-                                job_id,
-                                device_id,
-                                expected={DeviceState.DISPATCHING, DeviceState.RECONCILING},
-                                target=DeviceState.DOWNLOADING,
-                                fields={
-                                    "accepted_at": now_ms(),
-                                    "accept_deadline": None,
-                                    "reconciliation_reason": None,
-                                    "reconciliation_deadline": None,
-                                },
-                            )
-                            await self.publish(snapshot)
-                        except StoreConflict:
-                            pass
-                    elif outcome == "busy":
-                        self.transfer_registry.release_exact(key, "device_busy")
-                        try:
-                            snapshot = await self.store.transition_device(
-                                job_id,
-                                device_id,
-                                expected={DeviceState.DISPATCHING},
-                                target=DeviceState.QUEUED,
-                                fields={
-                                    "queue_reason": "same_device_job",
-                                    "accept_deadline": None,
-                                },
-                            )
-                            await self.publish(snapshot)
-                        except StoreConflict:
-                            pass
-                        self.wake()
-                        return
-                    else:
-                        self.transfer_registry.release_exact(key, "rejected")
-                        reason = payload.get("reason") or "command_rejected"
-                        await self._fail_before_send(job_id, device_id, reason, reason)
-                        return
-
-            try:
-                await asyncio.wait_for(transfer_future, self.transfer_timeout)
-            except asyncio.TimeoutError:
-                # Resource timeout is not a terminal outcome.  Recover the global slot,
-                # then reconcile the accepted/possibly-running device execution.
-                deadline = now_ms() + int(self.reconciliation_timeout * 1000)
-                active = await self.store.active_assignment_for_device(device_id)
-                if active and active["job_id"] == job_id:
-                    current = DeviceState(active["state"])
-                    if current in {
-                        DeviceState.DISPATCHING,
-                        DeviceState.DOWNLOADING,
-                        DeviceState.VALIDATING,
-                        DeviceState.APPLYING,
-                    }:
+                    assert accept_future is not None
+                    try:
+                        outcome, payload = await asyncio.wait_for(accept_future, self.accept_timeout)
+                    except asyncio.TimeoutError:
+                        if self._accept_waiters.get(accept_key) is accept_future:
+                            self._accept_waiters.pop(accept_key, None)
+                        deadline = now_ms() + int(self.accept_reconciliation_timeout * 1000)
                         try:
                             snapshot = await self.store.mark_reconciling(
-                                job_id,
-                                device_id,
-                                expected={current},
-                                reason="transfer_timeout",
+                                job_id, device_id,
+                                expected={DeviceState.DISPATCHING},
+                                reason="command_accept_timeout",
                                 deadline=deadline,
                             )
                             await self.publish(snapshot)
-                        except StoreConflict:
+                            await self._send_reconcile(session, snapshot, device_id)
+                        except (StoreConflict, ConnectionError, asyncio.TimeoutError):
                             pass
-            finally:
+                    else:
+                        if outcome == "accepted":
+                            try:
+                                snapshot = await self.store.transition_device(
+                                    job_id, device_id,
+                                    expected={DeviceState.DISPATCHING, DeviceState.RECONCILING},
+                                    target=DeviceState.DOWNLOADING,
+                                    fields={
+                                        "accepted_at": now_ms(),
+                                        "accept_deadline": None,
+                                        "reconciliation_reason": None,
+                                        "reconciliation_deadline": None,
+                                    },
+                                )
+                                await self.publish(snapshot)
+                            except StoreConflict:
+                                pass
+                        elif outcome == "busy":
+                            self.transfer_registry.release_exact(key, "device_busy")
+                            try:
+                                _action, snapshots = await self.store.handle_busy_rejection(
+                                    job_id, device_id, attempt, payload.get("active_job"),
+                                    session.process_instance_id,
+                                )
+                                for changed in snapshots:
+                                    await self.publish(changed)
+                            except StoreConflict:
+                                pass
+                            self.wake()
+                            return
+                        else:
+                            self.transfer_registry.release_exact(key, "rejected")
+                            reason = payload.get("reason") or "command_rejected"
+                            await self._fail_before_send(job_id, device_id, reason, reason)
+                            return
+
+                try:
+                    await asyncio.wait_for(transfer_future, self.transfer_timeout)
+                except asyncio.TimeoutError:
+                    # A transfer timeout only recovers the network resource; device
+                    # execution remains owned and enters bounded reconciliation.
+                    deadline = now_ms() + int(self.reconciliation_timeout * 1000)
+                    active = await self.store.active_assignment_for_device(device_id)
+                    if active and active["job_id"] == job_id:
+                        current = DeviceState(active["state"])
+                        if current in {
+                            DeviceState.DISPATCHING, DeviceState.DOWNLOADING,
+                            DeviceState.VALIDATING, DeviceState.APPLYING,
+                        }:
+                            try:
+                                snapshot = await self.store.mark_reconciling(
+                                    job_id, device_id, expected={current},
+                                    reason="transfer_timeout", deadline=deadline,
+                                )
+                                await self.publish(snapshot)
+                            except StoreConflict:
+                                pass
+        finally:
+            if waiter_registered:
                 self.transfer_registry.remove_if_same(key, transfer_future)
-                self._accept_waiters.pop((job_id, device_id, attempt), None)
+            if accept_future is not None and self._accept_waiters.get(accept_key) is accept_future:
+                self._accept_waiters.pop(accept_key, None)
 
     async def _fail_before_send(self, job_id: str, device_id: str, code: str, detail: str) -> None:
         active = await self.store.active_assignment_for_device(device_id)
@@ -269,12 +274,17 @@ class PushScheduler:
             self.wake()
 
     @staticmethod
-    def _command(snapshot: dict[str, Any], device_id: str, protocol: ProtocolMode) -> dict[str, Any]:
+    def _command(
+        snapshot: dict[str, Any], device_id: str, protocol: ProtocolMode, session: LiveSession
+    ) -> dict[str, Any]:
         artifact = snapshot["artifact"]
         assert artifact is not None
+        artifact_url = artifact["url"]
+        if artifact_url.startswith("/"):
+            artifact_url = session.origin.rstrip("/") + artifact_url
         common = {
             "type": "EXECUTE_PUSH_FILES",
-            "bundle_url": artifact["url"],
+            "bundle_url": artifact_url,
             "bundle_filename": artifact["display_filename"],
             "dest_path": snapshot["dest_path"],
             "delete_extras": snapshot["mode"] == "sync",
@@ -286,7 +296,7 @@ class PushScheduler:
                     "attempt": snapshot["devices"][device_id]["attempt"],
                     "revision": snapshot["revision"],
                     "artifact_id": artifact["artifact_id"],
-                    "artifact_url": artifact["url"],
+                    "artifact_url": artifact_url,
                     "artifact_size": artifact["byte_size"],
                     "artifact_sha256": artifact["sha256"],
                 }

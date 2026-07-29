@@ -2,6 +2,8 @@ package com.styly.mdmclient
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URI
+import java.security.MessageDigest
 import java.util.UUID
 
 object PushProtocol {
@@ -123,8 +125,13 @@ object PushProtocol {
             ""
         )
         if (artifactUrl.isBlank()) throw IllegalArgumentException("malformed_command: artifact_url is required")
-        val destPath = payload.optString("dest_path", "").trim()
-        if (destPath.isBlank()) throw IllegalArgumentException("invalid_destination: destination is required")
+        if (jobId != null) {
+            val uri = try { URI(artifactUrl) } catch (_: Exception) { null }
+            if (uri == null || !uri.isAbsolute || uri.scheme !in setOf("http", "https") || uri.host.isNullOrBlank()) {
+                throw IllegalArgumentException("malformed_command: artifact_url must be an absolute HTTP(S) URL")
+            }
+        }
+        val destPath = canonicalDestination(payload.optString("dest_path", ""))
         val artifactSize = if (payload.has("artifact_size")) payload.optLong("artifact_size", -1L) else null
         if (artifactSize != null && artifactSize < 0) {
             throw IllegalArgumentException("malformed_command: artifact_size must be non-negative")
@@ -135,11 +142,42 @@ object PushProtocol {
             artifactId = artifactId,
             artifactUrl = artifactUrl,
             artifactSize = artifactSize,
-            artifactSha256 = payload.optString("artifact_sha256", "").ifBlank { null },
+            artifactSha256 = payload.optString("artifact_sha256", "").ifBlank { null }.also { value ->
+                if (jobId != null && (value == null || value.length != 64 || value.any { !it.isDigit() && it.lowercaseChar() !in 'a'..'f' })) {
+                    throw IllegalArgumentException("malformed_command: artifact_sha256 must be 64 hexadecimal characters")
+                }
+            },
             bundleFilename = payload.optString("bundle_filename", "bundle.zip"),
             destPath = destPath,
             deleteExtras = payload.optBoolean("delete_extras", false),
         )
+    }
+
+    private fun canonicalDestination(value: String): String {
+        val text = value.trim().replace('\\', '/')
+        if (text.isEmpty() || '\u0000' in text || !text.startsWith('/')) {
+            throw IllegalArgumentException("invalid_destination: destination must be an absolute shared-storage path")
+        }
+        val rawParts = text.split('/').filter { it.isNotEmpty() }
+        if (rawParts.any { it == ".." }) {
+            throw IllegalArgumentException("invalid_destination: '..' is not allowed")
+        }
+        val normalizedParts = rawParts.filter { it != "." }
+        val prefixLength = when {
+            normalizedParts.firstOrNull() == "sdcard" -> 1
+            normalizedParts.size >= 3 && normalizedParts.take(3) == listOf("storage", "emulated", "0") -> 3
+            else -> throw IllegalArgumentException("invalid_destination: destination must be under shared storage")
+        }
+        val remainder = normalizedParts.drop(prefixLength)
+        if (remainder.isEmpty()) throw IllegalArgumentException("invalid_destination: shared-storage root is forbidden")
+        val protected = setOf(
+            "android", "download", "downloads", "dcim", "pictures", "movies", "music",
+            "documents", "alarms", "notifications", "podcasts", "ringtones"
+        )
+        if (remainder.first().lowercase() in protected) {
+            throw IllegalArgumentException("invalid_destination: protected top-level directory")
+        }
+        return "/sdcard/" + remainder.joinToString("/")
     }
 
     fun commandFromJson(json: JSONObject): Command = Command(

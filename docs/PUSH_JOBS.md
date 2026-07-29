@@ -106,3 +106,18 @@ sequenceDiagram
     S-->>D: PUSH_RESULT_ACK
     D->>D: remove matching outbox entry
 ```
+
+## Correctness hardening verified in implementation
+
+The implementation additionally enforces the following details from the canonical design:
+
+- Python 3.10 remains supported; no Python 3.11-only enum API is required.
+- The oldest active per-device queue entry cannot be bypassed while restart dispatch is paused.
+- A pre-accept `absent` report replays the exact attempt at most once; restart-originated ambiguity never auto-requeues.
+- Transfer and command-accept waiters are registered before `dispatching` is committed.
+- Device WebSocket replacement, disconnect, and command send share one stable per-device ownership lock.
+- Artifact URLs sent to Android are absolute URLs derived from the device-visible WebSocket origin.
+- Unknown `device_busy` identities persist a fence instead of entering an unbounded redispatch loop.
+- Client-side destination, artifact URL, ZIP path/count/extracted-size checks run before apply.
+- Client process restart is preserved as `interrupted`, not collapsed into a generic apply failure.
+- Startup detects SQLite artifact references whose immutable file is missing.
