@@ -55,7 +55,9 @@ jobs:
           ./gradlew test --stacktrace
 
       - name: Remove temporary verification files
-        run: python .github/issue91_fix_and_verify.py cleanup
+        run: |
+          python .github/issue91_fix_and_verify.py cleanup
+          rm -f .github/issue91-verification-trigger.txt
 
       - name: Commit and push verified source changes
         run: |
