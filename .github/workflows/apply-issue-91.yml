@@ -7,6 +7,13 @@ on:
     paths:
       - .github/issue91-payload/**
       - .github/workflows/apply-issue-91.yml
+  pull_request:
+    branches:
+      - develop
+    types: [opened, synchronize, reopened]
+    paths:
+      - .github/issue91-payload/**
+      - .github/workflows/apply-issue-91.yml
 
 permissions:
   contents: write
