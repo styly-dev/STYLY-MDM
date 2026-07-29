@@ -41,8 +41,18 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e './mdm-server[dev]'
 
+      - name: Run server tests file by file with bounded diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r file; do
+            echo "===== ${file} ====="
+            PYTHONUNBUFFERED=1 timeout --signal=TERM 180s \
+              python -m pytest -vv -s --tb=short -o faulthandler_timeout=60 "${file}"
+          done < <(find mdm-server/tests -maxdepth 1 -name 'test_*.py' -print | sort)
+
       - name: Run complete server test suite
-        run: python -m pytest -q mdm-server/tests
+        run: PYTHONUNBUFFERED=1 timeout --signal=TERM 300s python -m pytest -q mdm-server/tests
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
