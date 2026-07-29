@@ -47,7 +47,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --disable-pip-version-check -e './mdm-server[dev]'
+          python -m pip install --disable-pip-version-check -e './mdm-server[dev]' 'pytest-asyncio>=0.23'
           python -m compileall -q mdm-server/styly_mdm
           pytest -q \
             mdm-server/tests/test_push_job_domain.py \
