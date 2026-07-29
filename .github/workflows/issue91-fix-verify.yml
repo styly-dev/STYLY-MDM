@@ -26,10 +26,11 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Repair and apply reviewed hardening patch
+      - name: Apply reviewed hardening patches
         run: |
           python .github/issue91_patch_fixes.py
           python .github/issue91_fix_and_verify.py apply
+          python .github/issue91_runtime_order_fix.py
 
       - name: Validate Python syntax and patch whitespace
         run: |
@@ -69,7 +70,10 @@ jobs:
       - name: Remove temporary verification files
         run: |
           python .github/issue91_fix_and_verify.py cleanup
-          rm -f .github/issue91_patch_fixes.py .github/issue91-verification-trigger.txt
+          rm -f \
+            .github/issue91_patch_fixes.py \
+            .github/issue91_runtime_order_fix.py \
+            .github/issue91-verification-trigger.txt
 
       - name: Commit and push verified source changes
         run: |
