@@ -1,0 +1,72 @@
+name: Issue 91 Final Recovery Verification
+
+on:
+  pull_request:
+    branches:
+      - suu/issue-91-push-job-model
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-commit:
+    if: github.head_ref == 'suu/issue-91-final-verification'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out verification head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Apply final reviewed patch
+        run: python .github/issue91_followup.py
+
+      - name: Validate source syntax and whitespace
+        run: |
+          git diff --check
+          python -m compileall -q mdm-server/styly_mdm mdm-server/tests
+          node --check mdm-server/styly_mdm/static/push-jobs-v1.js
+
+      - name: Install server test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e './mdm-server[dev]'
+
+      - name: Run complete server suite
+        run: PYTHONUNBUFFERED=1 python -m pytest -q mdm-server/tests
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Run complete Android unit suite
+        run: |
+          chmod +x mdm-client/gradlew
+          cd mdm-client
+          ./gradlew test --stacktrace
+
+      - name: Remove temporary verification files
+        run: |
+          rm -f \
+            .github/issue91_followup.py \
+            .github/workflows/issue91-followup-verify.yml \
+            .github/issue91-final-verification.txt
+
+      - name: Commit and push verified source changes
+        run: |
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix: complete push job recovery invariants'
+          git push origin HEAD:suu/issue-91-push-job-model
