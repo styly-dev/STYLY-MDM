@@ -1532,7 +1532,13 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
 # ---------------------------------------------------------------------------
 
 async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
-    ws = web.WebSocketResponse(heartbeat=30)
+    # Admin messages are small control JSON, so compression saves effectively
+    # nothing. More importantly, Chrome/aiohttp interoperability after a long
+    # concurrent HTTP upload can produce reserved-bit errors on the browser's
+    # next control frame, closing this otherwise healthy connection.
+    # Keep compression enabled for the device channel, where messages can be
+    # larger, but remove the extension from this browser-facing channel.
+    ws = web.WebSocketResponse(heartbeat=30, compress=False)
     await ws.prepare(request)
     admin_connections.add(ws)
     log.info("Admin console connected from %s", request.remote)
