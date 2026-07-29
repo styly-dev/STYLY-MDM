@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repair WebSocket ordering after the bulk Issue #91 patch is applied."""
+"""Repair WebSocket/legacy ordering after the bulk Issue #91 patch is applied."""
 from pathlib import Path
 
 
@@ -88,6 +88,53 @@ replace_once(
     '''                    self._push_device_id = device_id
                     self._schedule_push_register(runtime, payload)
                 return message
+''',
+)
+
+replace_once(
+    '''def _release_transfer_slot(device_id: str, reason: str, task: str | None = None) -> bool:
+    runtime = runtime_for_current_server()
+    if task == "install":
+        return runtime.transfers.release_exact(TransferKey("install", device_id), reason)
+    if task == "push":
+        future = runtime.legacy_transfers.get((device_id, "push"))
+        if future is None:
+            return False
+        key = runtime.legacy_transfers._key((device_id, "push"))
+        return runtime.transfers.release_exact(key, reason)
+    return bool(runtime.transfers.release_all_for_device(device_id, reason))
+''',
+    '''def _release_transfer_slot(device_id: str, reason: str, task: str | None = None) -> bool:
+    from . import server
+
+    current = server.pending_transfers
+    if isinstance(current, _LegacyTransferAdapter):
+        registry = current.registry
+        if task == "install":
+            return registry.release_exact(TransferKey("install", device_id), reason)
+        if task == "push":
+            future = current.get((device_id, "push"))
+            if future is None:
+                return False
+            return registry.release_exact(current._key((device_id, "push")), reason)
+        return bool(registry.release_all_for_device(device_id, reason))
+
+    # Some established unit-level callers exercise the legacy dispatcher before
+    # create_app() has installed the runtime adapter.  Preserve those already-owned
+    # futures instead of creating a runtime and replacing the mapping underneath an
+    # active job.  Production app startup always switches to the typed adapter first.
+    if task is not None:
+        future = current.get((device_id, task))
+        if future is None or future.done():
+            return False
+        future.set_result(reason)
+        return True
+    released = False
+    for (owned_device_id, _task), future in list(current.items()):
+        if owned_device_id == device_id and not future.done():
+            future.set_result(reason)
+            released = True
+    return released
 ''',
 )
 
