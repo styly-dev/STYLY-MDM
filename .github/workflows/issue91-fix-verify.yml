@@ -1,22 +1,24 @@
 name: Issue 91 Fix and Verify
 
 on:
-  push:
+  pull_request:
     branches:
       - suu/issue-91-push-job-model
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: write
 
 jobs:
   fix-verify-commit:
-    if: github.actor != 'github-actions[bot]'
+    if: github.head_ref == 'suu/issue-91-verification-run'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Check out branch
+      - name: Check out verification head
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       - name: Set up Python 3.10
@@ -25,115 +27,41 @@ jobs:
           python-version: '3.10'
 
       - name: Apply reviewed hardening patch
-        id: apply
-        shell: bash
-        run: |
-          set +e
-          python .github/issue91_fix_and_verify.py apply > /tmp/issue91-apply.log 2>&1
-          rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          exit 0
+        run: python .github/issue91_fix_and_verify.py apply
 
       - name: Validate Python syntax and patch whitespace
-        id: syntax
-        if: steps.apply.outputs.rc == '0'
-        shell: bash
         run: |
-          set +e
-          { git diff --check && python -m compileall -q mdm-server/styly_mdm; } > /tmp/issue91-syntax.log 2>&1
-          rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          exit 0
+          git diff --check
+          python -m compileall -q mdm-server/styly_mdm
 
       - name: Install server test dependencies
-        id: install
-        if: steps.syntax.outputs.rc == '0'
-        shell: bash
         run: |
-          set +e
-          { python -m pip install --upgrade pip && python -m pip install -e './mdm-server[dev]'; } > /tmp/issue91-install.log 2>&1
-          rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          exit 0
+          python -m pip install --upgrade pip
+          python -m pip install -e './mdm-server[dev]'
 
       - name: Run complete server test suite
-        id: server
-        if: steps.install.outputs.rc == '0'
-        shell: bash
-        run: |
-          set +e
-          python -m pytest -q mdm-server/tests > /tmp/issue91-server.log 2>&1
-          rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          exit 0
+        run: python -m pytest -q mdm-server/tests
 
       - name: Set up Java 17
-        id: java
-        if: steps.server.outputs.rc == '0'
-        continue-on-error: true
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Run complete Android unit test suite
-        id: android
-        if: steps.server.outputs.rc == '0' && steps.java.outcome == 'success'
-        shell: bash
         run: |
-          set +e
           chmod +x mdm-client/gradlew
-          { cd mdm-client && ./gradlew test --stacktrace; } > /tmp/issue91-android.log 2>&1
-          rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          exit 0
+          cd mdm-client
+          ./gradlew test --stacktrace
 
-      - name: Commit verified changes or failure report
-        if: always()
-        shell: bash
-        env:
-          APPLY_RC: ${{ steps.apply.outputs.rc }}
-          SYNTAX_RC: ${{ steps.syntax.outputs.rc }}
-          INSTALL_RC: ${{ steps.install.outputs.rc }}
-          SERVER_RC: ${{ steps.server.outputs.rc }}
-          JAVA_OUTCOME: ${{ steps.java.outcome }}
-          ANDROID_RC: ${{ steps.android.outputs.rc }}
+      - name: Remove temporary verification files
+        run: python .github/issue91_fix_and_verify.py cleanup
+
+      - name: Commit and push verified source changes
         run: |
-          set -e
+          git diff --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-
-          if [[ "$APPLY_RC" == "0" && "$SYNTAX_RC" == "0" && "$INSTALL_RC" == "0" && "$SERVER_RC" == "0" && "$JAVA_OUTCOME" == "success" && "$ANDROID_RC" == "0" ]]; then
-            rm -f .github/issue91-verification-result.txt
-            python .github/issue91_fix_and_verify.py cleanup
-            git diff --check
-            git add -A
-            git commit -m 'fix: harden push job lifecycle and recovery'
-          else
-            report=/tmp/issue91-verification-result.txt
-            {
-              echo 'Issue #91 verification failed.'
-              echo "commit=${GITHUB_SHA}"
-              echo "apply_rc=${APPLY_RC:-not-run}"
-              echo "syntax_rc=${SYNTAX_RC:-not-run}"
-              echo "install_rc=${INSTALL_RC:-not-run}"
-              echo "server_rc=${SERVER_RC:-not-run}"
-              echo "java_outcome=${JAVA_OUTCOME:-not-run}"
-              echo "android_rc=${ANDROID_RC:-not-run}"
-              for log in /tmp/issue91-apply.log /tmp/issue91-syntax.log /tmp/issue91-install.log /tmp/issue91-server.log /tmp/issue91-android.log; do
-                if [[ -f "$log" ]]; then
-                  echo
-                  echo "===== $(basename "$log") (last 500 lines) ====="
-                  tail -n 500 "$log"
-                fi
-              done
-            } > "$report"
-            git reset --hard HEAD
-            git clean -fd
-            mkdir -p .github
-            cp "$report" .github/issue91-verification-result.txt
-            git add .github/issue91-verification-result.txt
-            git commit -m 'chore: record Issue 91 verification failure'
-          fi
-
+          git add -A
+          git commit -m 'fix: harden push job lifecycle and recovery'
           git push origin HEAD:suu/issue-91-push-job-model
