@@ -8,6 +8,17 @@ import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
+internal fun persistPushStateBeforePublishing(
+    nextState: PushProtocol.State,
+    save: (PushProtocol.State) -> PushProtocol.State,
+    afterPublish: () -> Unit = {},
+    publish: (PushProtocol.State) -> Unit,
+) {
+    val persisted = save(nextState)
+    publish(persisted)
+    afterPublish()
+}
+
 /**
  * Application-scoped single owner for every Push/Sync execution.
  *
@@ -43,9 +54,8 @@ class PushJobCoordinator(context: Context) {
         actor.execute {
             val loaded = store.load()
             val recovery = recover(loaded)
-            state = recovery.state
+            persist(recovery.state)
             gate.restore(state.active?.command)
-            persist()
             recovery.cleanupCommand?.let { command ->
                 workerExecutor.execute {
                     try {
@@ -159,11 +169,11 @@ class PushJobCoordinator(context: Context) {
     }
 
     private fun accept(command: PushProtocol.Command) {
-        state = state.copy(
+        val nextState = state.copy(
             active = PushProtocol.Active(command, PushProtocol.PHASE_DOWNLOADING),
         )
         try {
-            persist() // durability before acceptance and before worker start
+            persist(nextState) // durability before acceptance and before worker start
         } catch (error: Throwable) {
             gate.release(command)
             throw error
@@ -300,13 +310,16 @@ class PushJobCoordinator(context: Context) {
         val receipt = PushProtocol.Receipt(command, execution.result)
         val pending = if (command.isJobV1) state.pendingResults + receipt else state.pendingResults
         val completed = (state.completedReceipts + receipt).takeLast(MAX_RECEIPTS)
-        state = state.copy(
+        val nextState = state.copy(
             active = null,
             pendingResults = pending,
             completedReceipts = completed,
         )
-        persist() // durable terminal outbox before lease release, cleanup, and send
-        gate.release(command)
+        // Persist the terminal outbox before releasing the lease, cleaning up, or sending.
+        persist(
+            nextState,
+            afterPublish = { gate.release(command) },
+        )
         cleanupExecution(execution)
         send(execution.result.toJson())
     }
@@ -324,8 +337,7 @@ class PushJobCoordinator(context: Context) {
     private fun setPhase(command: PushProtocol.Command, phase: String): Boolean {
         val active = state.active ?: return false
         if (active.command.identity != command.identity) return false
-        state = state.copy(active = active.copy(phase = phase))
-        persist()
+        persist(state.copy(active = active.copy(phase = phase)))
         return true
     }
 
@@ -353,8 +365,7 @@ class PushJobCoordinator(context: Context) {
             it.result.jobId == ack.jobId && it.result.attempt == ack.attempt
         }
         if (next.size == state.pendingResults.size) return
-        state = state.copy(pendingResults = next)
-        persist()
+        persist(state.copy(pendingResults = next))
     }
 
     private fun replayPendingResults() {
@@ -443,9 +454,23 @@ class PushJobCoordinator(context: Context) {
             "styly-mdm/.push-tmp/jobs/${command.jobId ?: "legacy"}/${command.attempt}",
         )
 
-    private fun persist() {
-        state = store.save(state)
-        visibleState = state
+    private fun persist(
+        nextState: PushProtocol.State,
+        afterPublish: () -> Unit = {},
+    ) {
+        try {
+            persistPushStateBeforePublishing(
+                nextState,
+                save = store::save,
+                afterPublish = afterPublish,
+            ) { persisted ->
+                state = persisted
+                visibleState = persisted
+            }
+        } catch (error: Throwable) {
+            Log.e(TAG, "Could not persist durable Push/Sync state", error)
+            throw error
+        }
     }
 
     private fun send(message: JSONObject) {

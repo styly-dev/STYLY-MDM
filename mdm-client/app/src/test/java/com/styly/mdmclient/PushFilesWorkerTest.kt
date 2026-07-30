@@ -1,12 +1,14 @@
 package com.styly.mdmclient
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.io.FileOutputStream
+import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -24,6 +26,47 @@ class PushFilesWorkerTest {
             }
         }
         return archive
+    }
+
+    private fun command() = PushProtocol.Command(
+        jobId = UUID.randomUUID().toString(),
+        attempt = PushProtocol.ATTEMPT_V1,
+        artifactId = UUID.randomUUID().toString(),
+        artifactUrl = "http://server/artifacts/value",
+        artifactSize = 42,
+        artifactSha256 = "a".repeat(64),
+        bundleFilename = "bundle.zip",
+        destPath = "/sdcard/STYLY/content",
+        deleteExtras = false,
+    )
+
+    @Test
+    fun `missing all-files access returns a stable permission failure before file work`() {
+        val work = File(tmp.root, "permission-denied")
+        var callbackInvoked = false
+        val execution = PushFilesWorker(
+            hasExternalStorageAccess = { false },
+            attemptDirectoryProvider = { work },
+        ).execute(
+            command(),
+            PushFilesWorker.Callbacks(
+                onTransferComplete = { callbackInvoked = true },
+                onValidated = { callbackInvoked = true },
+                onApplying = { callbackInvoked = true },
+            ),
+        )
+
+        assertEquals("fail", execution.result.status)
+        assertEquals(
+            PushFilesWorker.EXTERNAL_STORAGE_PERMISSION_FAILURE,
+            execution.result.failureCode,
+        )
+        assertEquals(
+            PushFilesWorker.EXTERNAL_STORAGE_PERMISSION_DETAIL,
+            execution.result.detail,
+        )
+        assertFalse(callbackInvoked)
+        assertFalse(work.exists())
     }
 
     @Test
@@ -78,7 +121,7 @@ class PushFilesWorkerTest {
     fun `destination validation accepts an ordinary shared storage child`() {
         val root = tmp.newFolder("ordinary-shared")
         val target = PushFilesWorker().validateDestinationAgainstRoot(
-            "${root.absolutePath}/safe/content",
+            "${root.canonicalPath}/safe/content",
             root,
         )
         assertEquals(File(root, "safe/content").canonicalFile, target)

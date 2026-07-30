@@ -22,6 +22,8 @@ from .transfer_registry import TransferKey, TransferRegistry
 
 log = logging.getLogger("stylymdm.push")
 
+_RUN_RETRY_DELAY = 1.0
+
 
 class ConnectionOwnerChanged(ConnectionError):
     pass
@@ -67,17 +69,19 @@ class PushScheduler:
         self.allow_legacy = allow_legacy
         self._wake = asyncio.Event()
         self._runner: asyncio.Task[None] | None = None
+        self._stopping = False
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._accept_waiters: dict[
             tuple[str, str, int], asyncio.Future[tuple[str, dict[str, Any]]]
         ] = {}
 
     def start(self) -> None:
-        if self._runner is None or self._runner.done():
+        if not self._stopping and (self._runner is None or self._runner.done()):
             self._runner = asyncio.create_task(self._run(), name="push-job-scheduler")
             self._wake.set()
 
     async def stop(self) -> None:
+        self._stopping = True
         if self._runner is not None:
             self._runner.cancel()
         for task in tuple(self._dispatch_tasks):
@@ -92,8 +96,11 @@ class PushScheduler:
             if not future.done():
                 future.cancel()
         self._accept_waiters.clear()
+        self._stopping = False
 
     def wake(self) -> None:
+        if self._runner is None or self._runner.done():
+            self.start()
         self._wake.set()
 
     async def _run(self) -> None:
@@ -101,17 +108,48 @@ class PushScheduler:
             await self._wake.wait()
             self._wake.clear()
             while True:
-                assignment = await self.manager.claim_next(self.sessions().keys())
-                if assignment is None:
-                    break
-                task = asyncio.create_task(
-                    self._dispatch_assignment(assignment),
-                    name=f"push-{assignment['job']['job_id']}-{assignment['device_id']}",
-                )
-                self._dispatch_tasks.add(task)
-                task.add_done_callback(self._dispatch_tasks.discard)
+                try:
+                    assignment = await self.manager.claim_next(self.sessions().keys())
+                    if assignment is None:
+                        break
+                    job_id = assignment["job"]["job_id"]
+                    device_id = assignment["device_id"]
+                    task = asyncio.create_task(
+                        self._dispatch_assignment(assignment),
+                        name=f"push-{job_id}-{device_id}",
+                    )
+                    self._dispatch_tasks.add(task)
+                    task.add_done_callback(self._dispatch_done)
+                except Exception:
+                    log.exception("Unexpected failure in Push scheduler loop")
+                    await asyncio.sleep(_RUN_RETRY_DELAY)
+
+    def _dispatch_done(self, task: asyncio.Task[None]) -> None:
+        self._dispatch_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            log.error(
+                "Unexpected Push dispatch failure",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        self.wake()
 
     async def _dispatch_assignment(self, assignment: dict[str, Any]) -> None:
+        try:
+            await self._dispatch_assignment_inner(assignment)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log.exception(
+                "Unexpected Push dispatch failure for %s/%s",
+                assignment["job"]["job_id"],
+                assignment["device_id"],
+            )
+            await self._recover_unexpected_dispatch_failure(assignment, error)
+
+    async def _dispatch_assignment_inner(self, assignment: dict[str, Any]) -> None:
         job = assignment["job"]
         job_id = job["job_id"]
         device_id = assignment["device_id"]
@@ -120,7 +158,6 @@ class PushScheduler:
         loop = asyncio.get_running_loop()
         transfer_future: asyncio.Future[str] = loop.create_future()
         accept_future: asyncio.Future[tuple[str, dict[str, Any]]] | None = None
-        waiter_registered = False
 
         async with self.transfer_slots():
             session = self.sessions().get(device_id)
@@ -149,7 +186,6 @@ class PushScheduler:
             # client frame can arrive immediately after send; no completion window may
             # exist without an exact waiter.
             self.transfer_registry.register(key, transfer_future)
-            waiter_registered = True
             if protocol is ProtocolMode.JOB_V1:
                 accept_future = loop.create_future()
                 self._accept_waiters[(job_id, device_id, attempt)] = accept_future
@@ -167,10 +203,13 @@ class PushScheduler:
                     accept_deadline=accept_deadline,
                 )
             except BaseException:
-                self.transfer_registry.remove_if_same(key, transfer_future)
-                self._accept_waiters.pop((job_id, device_id, attempt), None)
+                self._clear_dispatch_waiters(key, transfer_future)
                 raise
-            await self.publish(snapshot)
+            try:
+                await self.publish(snapshot)
+            except BaseException:
+                self._clear_dispatch_waiters(key, transfer_future)
+                raise
 
             command = self._command(snapshot, device_id, protocol, session.http_base)
             try:
@@ -189,10 +228,15 @@ class PushScheduler:
                     )
             except ConnectionOwnerChanged as exc:
                 self.transfer_registry.release_exact(key, "connection_replaced")
+                self._clear_dispatch_waiters(key, transfer_future)
                 await self._requeue_after_send_race(job_id, device_id, str(exc))
                 return
+            except asyncio.CancelledError:
+                self._clear_dispatch_waiters(key, transfer_future)
+                raise
             except BaseException as exc:
                 self.transfer_registry.release_exact(key, "command_send_failed")
+                self._clear_dispatch_waiters(key, transfer_future)
                 await self._fail_current(
                     job_id,
                     device_id,
@@ -213,17 +257,23 @@ class PushScheduler:
                     )
                     await self.publish(snapshot)
                 except StoreConflict:
+                    self._clear_dispatch_waiters(key, transfer_future)
                     return
             else:
                 assert accept_future is not None
-                accepted = await self._await_acceptance(
-                    session,
-                    snapshot,
-                    device_id,
-                    accept_future,
-                    key,
-                )
+                try:
+                    accepted = await self._await_acceptance(
+                        session,
+                        snapshot,
+                        device_id,
+                        accept_future,
+                        key,
+                    )
+                except BaseException:
+                    self._clear_dispatch_waiters(key, transfer_future)
+                    raise
                 if not accepted:
+                    self._clear_dispatch_waiters(key, transfer_future)
                     return
 
             try:
@@ -252,14 +302,120 @@ class PushScheduler:
                             await self.publish(snapshot)
                             live = self.sessions().get(device_id)
                             if live is not None:
-                                await self._send_reconcile(live, snapshot, device_id)
+                                await self.send_reconcile(live, snapshot, device_id)
                         except (StoreConflict, ConnectionError, asyncio.TimeoutError):
                             pass
             finally:
-                if waiter_registered:
-                    self.transfer_registry.remove_if_same(key, transfer_future)
-                self._accept_waiters.pop((job_id, device_id, attempt), None)
-                self.wake()
+                self._clear_dispatch_waiters(key, transfer_future)
+
+    def _clear_dispatch_waiters(
+        self,
+        key: TransferKey,
+        transfer_future: asyncio.Future[str],
+    ) -> None:
+        assert key.job_id is not None
+        assert key.attempt is not None
+        if not transfer_future.done():
+            transfer_future.cancel()
+        self.transfer_registry.remove_if_same(key, transfer_future)
+        accept_future = self._accept_waiters.pop(
+            (key.job_id, key.device_id, key.attempt),
+            None,
+        )
+        if accept_future is not None and not accept_future.done():
+            accept_future.cancel()
+        self.wake()
+
+    async def _recover_unexpected_dispatch_failure(
+        self, assignment: dict[str, Any], error: Exception
+    ) -> None:
+        """Recover durable ownership after an unexpected dispatch-task exception."""
+
+        job_id = assignment["job"]["job_id"]
+        device_id = assignment["device_id"]
+        attempt = assignment["attempt"]
+        key = TransferKey("push", device_id, job_id, attempt)
+        transfer_future = self.transfer_registry.get(key)
+        if transfer_future is not None:
+            if not transfer_future.done():
+                transfer_future.cancel()
+            self.transfer_registry.remove_if_same(key, transfer_future)
+        accept_future = self._accept_waiters.pop((job_id, device_id, attempt), None)
+        if accept_future is not None and not accept_future.done():
+            accept_future.cancel()
+
+        while not self._stopping:
+            try:
+                current_row = await self.manager.assignment(job_id, device_id)
+                if current_row is None or current_row["attempt"] != attempt:
+                    return
+                current = DeviceState(current_row["state"])
+                if current is DeviceState.WAITING_TRANSFER:
+                    snapshot = await self.manager.transition_device(
+                        job_id,
+                        device_id,
+                        expected={DeviceState.WAITING_TRANSFER},
+                        target=DeviceState.QUEUED,
+                        fields={
+                            "queue_reason": "dispatch_recovery",
+                            "failure_code": None,
+                            "failure_detail": str(error)[:2000],
+                        },
+                    )
+                    await self.publish(snapshot)
+                    return
+                if current in {
+                    DeviceState.DISPATCHING,
+                    DeviceState.DOWNLOADING,
+                    DeviceState.VALIDATING,
+                    DeviceState.APPLYING,
+                }:
+                    pre_accept = current is DeviceState.DISPATCHING and (
+                        current_row.get("accepted_at") is None
+                    )
+                    timeout = (
+                        self.accept_reconciliation_timeout
+                        if pre_accept
+                        else self.reconciliation_timeout
+                    )
+                    snapshot = await self.manager.mark_reconciling(
+                        job_id,
+                        device_id,
+                        expected={current},
+                        reason="unexpected_dispatch_failure",
+                        deadline=now_ms() + int(timeout * 1000),
+                    )
+                elif current is DeviceState.RECONCILING:
+                    snapshot = await self.manager.get_snapshot(job_id)
+                else:
+                    return
+
+                await self.publish(snapshot)
+                session = self.sessions().get(device_id)
+                if (
+                    session is not None
+                    and current_row.get("protocol_mode") == ProtocolMode.JOB_V1.value
+                ):
+                    try:
+                        await self.send_reconcile(session, snapshot, device_id)
+                    except (ConnectionError, asyncio.TimeoutError):
+                        log.info(
+                            "Could not send recovery reconciliation for %s/%s",
+                            job_id,
+                            device_id,
+                        )
+                return
+            except asyncio.CancelledError:
+                raise
+            except StoreConflict:
+                continue
+            except Exception:
+                log.exception(
+                    "Could not recover Push dispatch ownership for %s/%s",
+                    job_id,
+                    device_id,
+                )
+                await asyncio.sleep(_RUN_RETRY_DELAY)
 
     def _protocol_for(self, session: LiveSession) -> ProtocolMode | None:
         if CAP_PUSH_JOB_ID_V1 in session.capabilities:
@@ -291,7 +447,7 @@ class PushScheduler:
                     deadline=deadline,
                 )
                 await self.publish(next_snapshot)
-                await self._send_reconcile(session, next_snapshot, device_id)
+                await self.send_reconcile(session, next_snapshot, device_id)
                 # Keep the exact transfer slot while the short probe is unresolved.
                 return True
             except (StoreConflict, ConnectionError, asyncio.TimeoutError):
@@ -426,7 +582,7 @@ class PushScheduler:
                 if matches_fence:
                     live = self.sessions().get(device_id)
                     if live is not None:
-                        await self._send_exact_reconcile(
+                        await self.send_exact_reconcile(
                             live,
                             active_job_id,
                             1,
@@ -542,18 +698,20 @@ class PushScheduler:
             )
         return common
 
-    async def _send_reconcile(
+    async def send_reconcile(
         self, session: LiveSession, snapshot: dict[str, Any], device_id: str
     ) -> None:
+        """Send reconciliation for one canonical assignment."""
+
         artifact = snapshot.get("artifact") or {}
-        await self._send_exact_reconcile(
+        await self.send_exact_reconcile(
             session,
             snapshot["job_id"],
             snapshot["devices"][device_id]["attempt"],
             artifact.get("artifact_id"),
         )
 
-    async def _send_exact_reconcile(
+    async def send_exact_reconcile(
         self,
         session: LiveSession,
         job_id: str,
@@ -586,6 +744,48 @@ class PushScheduler:
         else:
             async with session.owner_lock:
                 await send_owned()
+
+    async def handle_late_command_response(
+        self,
+        *,
+        job_id: str,
+        device_id: str,
+        outcome: str,
+        payload: dict[str, Any],
+        owner_lock_held: bool = False,
+    ) -> None:
+        """Apply a command response that arrived after the acceptance waiter expired."""
+
+        assignment = await self.manager.assignment(job_id, device_id)
+        if assignment is None or assignment["state"] != DeviceState.RECONCILING.value:
+            return
+        key = TransferKey("push", device_id, job_id, 1)
+        if outcome == "busy":
+            snapshot = await self.manager.get_snapshot(job_id)
+            keep_transfer = await self._handle_busy(
+                snapshot,
+                device_id,
+                payload,
+                owner_lock_held=owner_lock_held,
+            )
+            if not keep_transfer:
+                self.transfer_registry.release_exact(key, "late_device_busy")
+            return
+
+        self.transfer_registry.release_exact(key, "late_command_rejected")
+        reason = payload.get("reason")
+        if not isinstance(reason, str) or not reason:
+            reason = "command_rejected"
+        detail = payload.get("detail")
+        if not isinstance(detail, str) or not detail:
+            detail = reason
+        await self._fail_current(
+            job_id,
+            device_id,
+            {DeviceState.RECONCILING},
+            reason,
+            detail,
+        )
 
     def command_response(
         self,

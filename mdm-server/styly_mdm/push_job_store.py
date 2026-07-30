@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import logging
 import queue
 import sqlite3
 import threading
@@ -20,7 +21,6 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from .push_jobs import (
-    ACTIVE_DEVICE_STATES,
     DeviceState,
     JobState,
     ProtocolMode,
@@ -33,6 +33,7 @@ from .push_jobs import (
 )
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 
 def now_ms() -> int:
@@ -55,6 +56,10 @@ class UploadDeadlineExpired(StoreConflict):
         self.snapshot = snapshot
 
 
+class _DbWorkerStopped(RuntimeError):
+    pass
+
+
 class _DbWorker:
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -62,6 +67,9 @@ class _DbWorker:
         self._thread = threading.Thread(target=self._run, name="push-job-db", daemon=True)
         self._ready = threading.Event()
         self._startup_error: BaseException | None = None
+        self._state_lock = threading.Lock()
+        self._fatal_error: BaseException | None = None
+        self._closed = False
         self._thread.start()
         self._ready.wait()
         if self._startup_error is not None:
@@ -82,26 +90,88 @@ class _DbWorker:
             self._ready.set()
             return
         self._ready.set()
-        while True:
-            fn, future = self._queue.get()
-            if fn is None:
-                break
-            assert future is not None
-            if future.cancelled():
-                continue
+        fatal_error: BaseException | None = None
+        active_future: concurrent.futures.Future[Any] | None = None
+        try:
+            while True:
+                fn, future = self._queue.get()
+                if fn is None:
+                    break
+                assert future is not None
+                active_future = future
+                if not future.set_running_or_notify_cancel():
+                    active_future = None
+                    continue
+                try:
+                    result = fn(conn)
+                except BaseException as exc:
+                    future.set_exception(exc)
+                else:
+                    future.set_result(result)
+                active_future = None
+        except BaseException as exc:  # pragma: no cover - guarded by failure-injection test
+            fatal_error = exc
+        finally:
             try:
-                future.set_result(fn(conn))
-            except BaseException as exc:
-                future.set_exception(exc)
-        conn.close()
+                conn.close()
+            except BaseException as exc:  # pragma: no cover - sqlite close failure
+                if fatal_error is None:
+                    fatal_error = exc
+            if fatal_error is not None:
+                self._fail(fatal_error, active_future)
+
+    @staticmethod
+    def _stopped_exception(cause: BaseException) -> _DbWorkerStopped:
+        error = _DbWorkerStopped("push job database worker stopped unexpectedly")
+        error.__cause__ = cause
+        return error
+
+    def _fail(
+        self,
+        cause: BaseException,
+        active_future: concurrent.futures.Future[Any] | None,
+    ) -> None:
+        pending: list[concurrent.futures.Future[Any]] = []
+        with self._state_lock:
+            self._fatal_error = cause
+            if active_future is not None and not active_future.done():
+                pending.append(active_future)
+            while True:
+                try:
+                    _, future = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if future is not None and not future.done():
+                    pending.append(future)
+        logger.error(
+            "Push job database worker stopped unexpectedly",
+            exc_info=(type(cause), cause, cause.__traceback__),
+        )
+        for future in pending:
+            try:
+                future.set_exception(self._stopped_exception(cause))
+            except concurrent.futures.InvalidStateError:
+                # Cancellation may win after done() is checked.
+                pass
 
     def submit(self, fn: Callable[[sqlite3.Connection], T]) -> concurrent.futures.Future[T]:
         future: concurrent.futures.Future[T] = concurrent.futures.Future()
-        self._queue.put((fn, future))
+        with self._state_lock:
+            if self._fatal_error is not None:
+                future.set_exception(self._stopped_exception(self._fatal_error))
+            elif self._closed:
+                future.set_exception(_DbWorkerStopped("push job database worker is closed"))
+            else:
+                self._queue.put((fn, future))
         return future
 
     def close(self) -> None:
-        self._queue.put((None, None))
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._fatal_error is None:
+                self._queue.put((None, None))
         self._thread.join(timeout=5)
 
 
@@ -466,25 +536,6 @@ class PushJobStore:
     async def get_snapshot(self, job_id: str) -> dict[str, Any]:
         return await self._call(lambda conn: self._snapshot(conn, job_id))
 
-    async def list_snapshots(self, recent_limit: int, recent_since_ms: int) -> list[dict[str, Any]]:
-        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-            active = conn.execute(
-                "SELECT job_id FROM push_jobs WHERE terminal_at IS NULL ORDER BY created_at"
-            ).fetchall()
-            terminal = conn.execute(
-                """
-                SELECT job_id FROM push_jobs
-                WHERE terminal_at IS NOT NULL AND terminal_at >= ?
-                ORDER BY terminal_at DESC LIMIT ?
-                """,
-                (recent_since_ms, recent_limit),
-            ).fetchall()
-            ids = [row["job_id"] for row in active]
-            ids.extend(row["job_id"] for row in terminal if row["job_id"] not in ids)
-            return [self._snapshot(conn, job_id) for job_id in ids]
-
-        return await self._call(op)
-
     async def start_upload(self, job_id: str) -> dict[str, Any]:
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
             self._begin(conn)
@@ -653,78 +704,6 @@ class PushJobStore:
 
         return await self._call(op)
 
-    async def claim_next(self, online_device_ids: Iterable[str]) -> dict[str, Any] | None:
-        online = tuple(sorted(set(online_device_ids)))
-        if not online:
-            return None
-
-        def op(conn: sqlite3.Connection) -> dict[str, Any] | None:
-            self._begin(conn)
-            try:
-                placeholders = ",".join("?" for _ in online)
-                row = conn.execute(
-                    f"""
-                    SELECT d.job_id, d.device_id, d.protocol_mode, d.attempt, d.enqueue_seq
-                    FROM push_job_devices d
-                    JOIN push_jobs j ON j.job_id=d.job_id
-                    WHERE d.state='queued'
-                      AND j.dispatch_enabled=1
-                      AND j.state IN ('running', 'reconciling')
-                      AND d.device_id IN ({placeholders})
-                      AND NOT EXISTS (
-                        SELECT 1 FROM push_device_fences f WHERE f.device_id=d.device_id
-                      )
-                      AND d.enqueue_seq=(
-                        SELECT MIN(d2.enqueue_seq) FROM push_job_devices d2
-                        JOIN push_jobs j2 ON j2.job_id=d2.job_id
-                        WHERE d2.device_id=d.device_id AND d2.state='queued'
-                          AND j2.dispatch_enabled=1
-                      )
-                      AND NOT EXISTS (
-                        SELECT 1 FROM push_job_devices active
-                        WHERE active.device_id=d.device_id
-                          AND active.state IN ('waiting_transfer','dispatching','downloading','validating','applying','reconciling')
-                      )
-                    ORDER BY d.enqueue_seq LIMIT 1
-                    """,
-                    online,
-                ).fetchone()
-                if row is None:
-                    self._commit(conn)
-                    return None
-                timestamp = now_ms()
-                cursor = conn.execute(
-                    """
-                    UPDATE push_job_devices SET state='waiting_transfer', queue_reason=NULL,
-                        updated_at=? WHERE job_id=? AND device_id=? AND state='queued'
-                    """,
-                    (timestamp, row["job_id"], row["device_id"]),
-                )
-                if cursor.rowcount != 1:
-                    self._commit(conn)
-                    return None
-                self._increment_revision(conn, row["job_id"], timestamp)
-                self._rederive_job(conn, row["job_id"], timestamp)
-                snapshot = self._snapshot(conn, row["job_id"])
-                self._commit(conn)
-                device = snapshot["devices"][row["device_id"]]
-                return {
-                    "job": snapshot,
-                    "device_id": row["device_id"],
-                    "protocol_mode": row["protocol_mode"],
-                    "attempt": row["attempt"],
-                    "enqueue_seq": row["enqueue_seq"],
-                    "device": device,
-                }
-            except sqlite3.IntegrityError:
-                self._rollback(conn)
-                return None
-            except BaseException:
-                self._rollback(conn)
-                raise
-
-        return await self._call(op)
-
     async def mark_dispatching(
         self,
         job_id: str,
@@ -856,9 +835,17 @@ class PushJobStore:
                 current = DeviceState(row["state"])
                 if current in TERMINAL_DEVICE_STATES:
                     same = current is target and (
-                        current is not DeviceState.SUCCEEDED
-                        or (row["added"], row["updated"], row["deleted"])
-                        == (added, updated, deleted)
+                        row["failure_code"],
+                        row["failure_detail"],
+                        row["added"],
+                        row["updated"],
+                        row["deleted"],
+                    ) == (
+                        failure_code,
+                        failure_detail,
+                        added,
+                        updated,
+                        deleted,
                     )
                     snapshot = self._snapshot(conn, job_id)
                     self._commit(conn)
@@ -1235,22 +1222,6 @@ class PushJobStore:
                 (device_id,),
             ).fetchone()
             return dict(row) if row else None
-
-        return await self._call(op)
-
-    async def expired_reconciliations(self, timestamp: int) -> list[dict[str, Any]]:
-        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-            rows = conn.execute(
-                """
-                SELECT d.job_id, d.device_id, d.attempt, d.protocol_mode
-                FROM push_job_devices d
-                WHERE d.state='reconciling' AND d.reconciliation_deadline IS NOT NULL
-                  AND d.reconciliation_deadline <= ?
-                ORDER BY d.reconciliation_deadline
-                """,
-                (timestamp,),
-            ).fetchall()
-            return [dict(row) for row in rows]
 
         return await self._call(op)
 

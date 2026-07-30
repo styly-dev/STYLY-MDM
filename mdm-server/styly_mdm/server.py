@@ -420,15 +420,7 @@ def build_device_list_msg() -> str:
 
 async def broadcast_device_list():
     """Send the current device list to every connected admin."""
-    msg = build_device_list_msg()
-    stale: list[web.WebSocketResponse] = []
-    for ws in admin_connections:
-        try:
-            await ws.send_str(msg)
-        except ConnectionResetError:
-            stale.append(ws)
-    for ws in stale:
-        admin_connections.discard(ws)
+    await _broadcast_admin_message(build_device_list_msg())
 
 
 def build_group_list_msg() -> str:
@@ -445,28 +437,22 @@ def build_group_list_msg() -> str:
 
 async def broadcast_group_list():
     """Send the current group list to every connected admin."""
-    msg = build_group_list_msg()
-    stale: list[web.WebSocketResponse] = []
-    for ws in admin_connections:
+    await _broadcast_admin_message(build_group_list_msg())
+
+
+async def _broadcast_admin_message(message: str) -> None:
+    """Best-effort admin fan-out; one stale socket must not stop server work."""
+    for ws in tuple(admin_connections):
         try:
-            await ws.send_str(msg)
-        except ConnectionResetError:
-            stale.append(ws)
-    for ws in stale:
-        admin_connections.discard(ws)
+            await ws.send_str(message)
+        except Exception:
+            log.warning("Could not send message to admin WebSocket", exc_info=True)
+            admin_connections.discard(ws)
 
 
 async def forward_to_admins(payload: dict):
     """Forward a message (e.g. LAUNCH_RESULT) to all admin connections."""
-    msg = json.dumps(payload)
-    stale: list[web.WebSocketResponse] = []
-    for ws in admin_connections:
-        try:
-            await ws.send_str(msg)
-        except ConnectionResetError:
-            stale.append(ws)
-    for ws in stale:
-        admin_connections.discard(ws)
+    await _broadcast_admin_message(json.dumps(payload))
 
 
 def _client_apk_version(name: str) -> tuple[str, tuple[int, ...]] | None:

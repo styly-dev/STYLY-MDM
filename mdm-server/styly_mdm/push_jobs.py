@@ -13,8 +13,38 @@ import json
 import posixpath
 import uuid
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Any, Iterable, Mapping
+
+try:
+    from enum import StrEnum
+except ImportError:  # Python 3.10
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        """Python 3.10 compatibility shim for :class:`enum.StrEnum`."""
+
+        def __new__(cls, *values: Any) -> "StrEnum":
+            if len(values) > 3:
+                raise TypeError(f"too many arguments for str(): {values!r}")
+            if len(values) == 1 and not isinstance(values[0], str):
+                raise TypeError(f"{values[0]!r} is not a string")
+            if len(values) >= 2 and not isinstance(values[1], str):
+                raise TypeError(f"encoding must be a string, not {values[1]!r}")
+            if len(values) == 3 and not isinstance(values[2], str):
+                raise TypeError(f"errors must be a string, not {values[2]!r}")
+            value = str(*values)
+            member = str.__new__(cls, value)
+            member._value_ = value
+            return member
+
+        @staticmethod
+        def _generate_next_value_(
+            name: str, start: int, count: int, last_values: list[Any]
+        ) -> str:
+            return name.lower()
+
+        __str__ = str.__str__
+        __format__ = str.__format__
 
 
 CAP_PUSH_JOB_ID_V1 = "push_job_id_v1"

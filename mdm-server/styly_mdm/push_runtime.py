@@ -44,8 +44,9 @@ log = logging.getLogger("stylymdm.push")
 
 _INSTALLED = False
 _ORIGINAL_CREATE_APP: Any = None
-_ORIGINAL_FILE_RESPONSE = aiohttp_web.FileResponse
 _RUNTIME_BY_DATA_DIR: dict[Path, "PushRuntime"] = {}
+_BACKGROUND_LOOP_RETRY_DELAY = 1.0
+_RECONCILIATION_POLL_INTERVAL = 1.0
 
 
 def _env_seconds(name: str, default: float) -> float:
@@ -1038,34 +1039,13 @@ class PushRuntime:
                     payload=payload,
                 )
             if not delivered and self.scheduler is not None:
-                assignment = await self.manager.assignment(job_id, device_id)
-                if assignment and assignment["state"] == DeviceState.RECONCILING.value:
-                    key = TransferKey("push", device_id, job_id, 1)
-                    if outcome == "busy":
-                        snapshot = await self.store.get_snapshot(job_id)
-                        keep_transfer = await self.scheduler._handle_busy(
-                            snapshot,
-                            device_id,
-                            payload,
-                            owner_lock_held=True,
-                        )
-                        if not keep_transfer:
-                            self.transfers.release_exact(key, "late_device_busy")
-                    else:
-                        self.transfers.release_exact(key, "late_command_rejected")
-                        reason = payload.get("reason")
-                        if not isinstance(reason, str) or not reason:
-                            reason = "command_rejected"
-                        detail = payload.get("detail")
-                        if not isinstance(detail, str) or not detail:
-                            detail = reason
-                        await self.scheduler._fail_current(
-                            job_id,
-                            device_id,
-                            {DeviceState.RECONCILING},
-                            reason,
-                            detail,
-                        )
+                await self.scheduler.handle_late_command_response(
+                    job_id=job_id,
+                    device_id=device_id,
+                    outcome=outcome,
+                    payload=payload,
+                    owner_lock_held=True,
+                )
             return True
         if message_type == "PUSH_TRANSFER_COMPLETE" and isinstance(job_id, str):
             await self._handle_transfer_complete(device_id, payload)
@@ -1491,11 +1471,11 @@ class PushRuntime:
         active = await self.manager.active_assignment_for_device(device_id)
         if active and active["state"] == DeviceState.RECONCILING.value:
             snapshot = await self.store.get_snapshot(active["job_id"])
-            await self.scheduler._send_reconcile(session, snapshot, device_id)
+            await self.scheduler.send_reconcile(session, snapshot, device_id)
             return
         fence = await self.manager.fenced_assignment_for_device(device_id)
         if fence and fence.get("blocking_job_id") and fence.get("blocking_attempt") == 1:
-            await self.scheduler._send_exact_reconcile(
+            await self.scheduler.send_exact_reconcile(
                 session,
                 fence["blocking_job_id"],
                 1,
@@ -1504,7 +1484,7 @@ class PushRuntime:
             return
         opaque = await self.manager.opaque_reconcile_target(device_id)
         if opaque is not None:
-            await self.scheduler._send_exact_reconcile(
+            await self.scheduler.send_exact_reconcile(
                 session,
                 opaque["job_id"],
                 opaque["attempt"],
@@ -1565,59 +1545,97 @@ class PushRuntime:
 
     async def _created_deadline_loop(self) -> None:
         while True:
-            self.created_deadline_wake.clear()
-            nearest = await self.manager.next_created_deadline()
-            if nearest is None:
-                await self.created_deadline_wake.wait()
-                continue
-            job_id, deadline = nearest
-            delay = max(0, deadline - now_ms()) / 1000
             try:
-                await asyncio.wait_for(
-                    self.created_deadline_wake.wait(), timeout=delay
-                )
-                continue
-            except asyncio.TimeoutError:
-                pass
-            try:
-                snapshot = await self.store.expire_created(job_id, deadline)
-            except (StoreConflict, StoreNotFound):
-                snapshot = None
-            if snapshot is not None:
-                await self.publish(snapshot)
-                await asyncio.to_thread(
-                    self.artifacts.cleanup_work_best_effort, job_id
-                )
-                if self.scheduler is not None:
-                    self.scheduler.wake()
+                self.created_deadline_wake.clear()
+                nearest = await self.manager.next_created_deadline()
+                if nearest is None:
+                    await self.created_deadline_wake.wait()
+                    continue
+                job_id, deadline = nearest
+                delay = max(0, deadline - now_ms()) / 1000
+                try:
+                    await asyncio.wait_for(
+                        self.created_deadline_wake.wait(), timeout=delay
+                    )
+                    continue
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    snapshot = await self.store.expire_created(job_id, deadline)
+                except (StoreConflict, StoreNotFound):
+                    snapshot = None
+                if snapshot is not None:
+                    try:
+                        await self.publish(snapshot)
+                    finally:
+                        try:
+                            await asyncio.to_thread(
+                                self.artifacts.cleanup_work_best_effort, job_id
+                            )
+                        finally:
+                            if self.scheduler is not None:
+                                self.scheduler.wake()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Unexpected failure in Push created-deadline loop")
+                await asyncio.sleep(_BACKGROUND_LOOP_RETRY_DELAY)
 
     async def _reconciliation_housekeeping(self) -> None:
         while True:
-            await asyncio.sleep(1)
-            timestamp = now_ms()
-            for row in await self.manager.expired_reconciliations(timestamp):
-                session = self.sessions.get(row["device_id"])
+            await asyncio.sleep(_RECONCILIATION_POLL_INTERVAL)
+            try:
+                rows = await self.manager.expired_reconciliations(now_ms())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Could not query expired Push reconciliations")
+                continue
+            for row in rows:
                 try:
+                    job_id = row["job_id"]
+                    device_id = row["device_id"]
+                    attempt = row["attempt"]
+                    deadline = row["reconciliation_deadline"]
+                    session = self.sessions.get(device_id)
+                    timestamp = now_ms()
                     snapshots = await self.manager.mark_unconfirmed(
-                        row["job_id"],
-                        row["device_id"],
+                        job_id,
+                        device_id,
                         session.process_instance_id if session else None,
                         "reconciliation deadline elapsed without matching evidence",
-                        expected_deadline=row["reconciliation_deadline"],
+                        expected_deadline=deadline,
                         observed_now=timestamp,
                     )
                 except StoreConflict:
                     continue
-                self.transfers.release_exact(
-                    TransferKey(
-                        "push", row["device_id"], row["job_id"], row["attempt"]
-                    ),
-                    "reconciliation_timeout",
-                )
-                for snapshot in snapshots:
-                    await self.publish(snapshot)
-                if self.scheduler is not None:
-                    self.scheduler.wake()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "Could not expire Push reconciliation row %r",
+                        row,
+                    )
+                    continue
+                try:
+                    try:
+                        self.transfers.release_exact(
+                            TransferKey("push", device_id, job_id, attempt),
+                            "reconciliation_timeout",
+                        )
+                        for snapshot in snapshots:
+                            await self.publish(snapshot)
+                    finally:
+                        if self.scheduler is not None:
+                            self.scheduler.wake()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "Could not publish expired Push reconciliation %s/%s",
+                        job_id,
+                        device_id,
+                    )
 
     @staticmethod
     def _nonnegative_int(value: Any) -> int:
@@ -1664,17 +1682,6 @@ def _release_transfer_slot(
     return released
 
 
-def _file_response(path: Any, *args: Any, **kwargs: Any) -> Any:
-    file_path = Path(path)
-    if file_path.name == "index.html" and file_path.parent.name == "static":
-        text = file_path.read_text(encoding="utf-8")
-        marker = '<script src="/static/push-jobs-v1.js"></script>'
-        if marker not in text:
-            text = text.replace("</head>", f"  {marker}\n</head>")
-        return aiohttp_web.Response(text=text, content_type="text/html")
-    return _ORIGINAL_FILE_RESPONSE(path, *args, **kwargs)
-
-
 def install(server: Any) -> None:
     global _INSTALLED, _ORIGINAL_CREATE_APP
     if _INSTALLED:
@@ -1682,7 +1689,6 @@ def install(server: Any) -> None:
     _INSTALLED = True
     _ORIGINAL_CREATE_APP = server.create_app
     server.web.WebSocketResponse = RuntimeWebSocketResponse
-    server.web.FileResponse = _file_response
     server.release_transfer_slot = _release_transfer_slot
 
     def create_app() -> aiohttp_web.Application:

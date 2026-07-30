@@ -56,7 +56,7 @@ def test_exact_reconcile_can_reuse_held_owner_lock():
         scheduler.sessions = lambda: {'D1': session}
         async with lock:
             await asyncio.wait_for(
-                scheduler._send_exact_reconcile(
+                scheduler.send_exact_reconcile(
                     session, 'job', 1, 'artifact', owner_lock_held=True
                 ),
                 timeout=0.5,

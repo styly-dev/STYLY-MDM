@@ -173,7 +173,7 @@ class _Scheduler:
     def wake(self):
         self.wake_count += 1
 
-    async def _send_exact_reconcile(self, session, job_id, attempt, artifact_id):
+    async def send_exact_reconcile(self, session, job_id, attempt, artifact_id):
         self.reconciles.append((session.device_id, job_id, attempt, artifact_id))
 
 

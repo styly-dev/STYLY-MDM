@@ -1,8 +1,12 @@
 import itertools
+import subprocess
+import sys
 import uuid
+from pathlib import Path
 
 import pytest
 
+import styly_mdm.push_jobs as push_jobs
 from styly_mdm.push_jobs import (
     CAP_PUSH_JOB_ID_V1,
     DeviceState,
@@ -15,6 +19,39 @@ from styly_mdm.push_jobs import (
     parse_capabilities,
     validate_device_transition,
 )
+
+
+def test_strenum_members_keep_string_semantics():
+    state = JobState.CREATED
+    assert isinstance(state, str)
+    assert str(state) == "created"
+    assert format(state) == "created"
+    assert f"{state}" == "created"
+    assert repr(state) == "<JobState.CREATED: 'created'>"
+
+
+def test_push_jobs_imports_without_stdlib_strenum():
+    script = """
+import enum
+import importlib.util
+import sys
+
+if hasattr(enum, "StrEnum"):
+    del enum.StrEnum
+spec = importlib.util.spec_from_file_location("_push_jobs_compat_test", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+state = module.JobState.CREATED
+assert isinstance(state, str)
+assert str(state) == "created"
+assert format(state) == "created"
+assert repr(state) == "<JobState.CREATED: 'created'>"
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, str(Path(push_jobs.__file__))],
+        check=True,
+    )
 
 
 def request(**overrides):

@@ -1,10 +1,18 @@
 import asyncio
+import threading
 import time
 import uuid
 
 import pytest
 
-from styly_mdm.push_job_store import PushJobStore, StoreConflict, now_ms
+from styly_mdm.push_job_manager import PushJobManager
+from styly_mdm.push_job_store import (
+    PushJobStore,
+    StoreConflict,
+    _DbWorker,
+    _DbWorkerStopped,
+    now_ms,
+)
 from styly_mdm.push_jobs import (
     DeviceState,
     JobState,
@@ -34,6 +42,76 @@ def store(tmp_path):
     value = PushJobStore(tmp_path / "push_jobs.sqlite3")
     yield value
     value.close()
+
+
+@pytest.fixture
+def manager(store):
+    return PushJobManager(store)
+
+
+@pytest.mark.asyncio
+async def test_db_worker_survives_cancellation_during_sqlite_work(tmp_path):
+    worker = _DbWorker(tmp_path / "push_jobs.sqlite3")
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_call(_conn):
+        started.set()
+        assert release.wait(timeout=1)
+        return "finished"
+
+    try:
+        wrapped = asyncio.wrap_future(worker.submit(blocking_call))
+        assert await asyncio.to_thread(started.wait, 1)
+        wrapped.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await wrapped
+
+        follow_up = asyncio.wrap_future(worker.submit(lambda _conn: "still alive"))
+        assert await asyncio.wait_for(follow_up, timeout=1) == "still alive"
+    finally:
+        release.set()
+        worker.close()
+
+
+def test_db_worker_fails_pending_and_future_submissions_after_unexpected_exit(tmp_path):
+    worker = _DbWorker(tmp_path / "push_jobs.sqlite3")
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_call(_conn):
+        started.set()
+        assert release.wait(timeout=1)
+        return "worker result"
+
+    try:
+        active = worker.submit(blocking_call)
+        assert started.wait(timeout=1)
+        pending = worker.submit(lambda _conn: "never executed")
+        callback_ran = threading.Event()
+        callback_error = []
+
+        def submit_from_callback(_future):
+            callback_error.append(worker.submit(lambda _conn: "never queued").exception())
+            callback_ran.set()
+
+        pending.add_done_callback(submit_from_callback)
+
+        # Simulate an internal completion invariant violation after execution
+        # has started. The worker must fail closed instead of abandoning its queue.
+        active.set_result("injected result")
+        release.set()
+
+        with pytest.raises(_DbWorkerStopped, match="stopped unexpectedly"):
+            pending.result(timeout=1)
+        assert callback_ran.wait(timeout=1)
+        assert isinstance(callback_error[0], _DbWorkerStopped)
+        with pytest.raises(_DbWorkerStopped, match="stopped unexpectedly"):
+            worker.submit(lambda _conn: "never queued").result(timeout=1)
+    finally:
+        release.set()
+        worker.close()
 
 
 @pytest.mark.asyncio
@@ -68,7 +146,7 @@ async def test_same_request_id_with_different_fingerprint_conflicts(store):
 
 
 @pytest.mark.asyncio
-async def test_same_device_jobs_are_ordered_by_enqueue_sequence(store):
+async def test_same_device_jobs_are_ordered_by_enqueue_sequence(store, manager):
     protocols = {"D1": (ProtocolMode.JOB_V1, {"push_job_id_v1"})}
     _, first = await store.create_job(canonical(), protocols, 60_000)
     _, second = await store.create_job(canonical(), protocols, 60_000)
@@ -81,13 +159,13 @@ async def test_same_device_jobs_are_ordered_by_enqueue_sequence(store):
             "display_filename": "x.zip", "byte_size": 1, "sha256": "a" * 64, "entry_count": 1,
         })
         await store.enable_dispatch(snapshot["job_id"])
-    claimed = await store.claim_next(["D1"])
+    claimed = await manager.claim_next(["D1"])
     assert claimed["job"]["job_id"] == first["job_id"]
-    assert await store.claim_next(["D1"]) is None
+    assert await manager.claim_next(["D1"]) is None
 
 
 @pytest.mark.asyncio
-async def test_terminal_result_wakes_canonical_aggregate(store):
+async def test_terminal_result_wakes_canonical_aggregate(store, manager):
     protocols = {"D1": (ProtocolMode.JOB_V1, {"push_job_id_v1"})}
     _, job = await store.create_job(canonical(), protocols, 60_000)
     job_id = job["job_id"]
@@ -98,7 +176,7 @@ async def test_terminal_result_wakes_canonical_aggregate(store):
         "display_filename": "x.zip", "byte_size": 1, "sha256": "a" * 64, "entry_count": 1,
     })
     await store.enable_dispatch(job_id)
-    await store.claim_next(["D1"])
+    await manager.claim_next(["D1"])
     await store.mark_dispatching(job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000)
     await store.transition_device(job_id, "D1", expected={DeviceState.DISPATCHING}, target=DeviceState.DOWNLOADING)
     accepted, reason, snapshot = await store.settle_result(job_id, "D1", 1, "success", added=1)
@@ -118,7 +196,54 @@ async def test_stale_attempt_does_not_change_terminal_state(store):
 
 
 @pytest.mark.asyncio
-async def test_unconfirmed_creates_persistent_fence_and_late_result_only_clears_it(store):
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"failure_code": "other_failure"},
+        {"failure_detail": "different detail"},
+        {"added": 2},
+        {"updated": 3},
+        {"deleted": 4},
+    ],
+)
+async def test_failed_terminal_replay_requires_all_result_fields_to_match(store, changed):
+    protocols = {"D1": (ProtocolMode.JOB_V1, {"push_job_id_v1"})}
+    _, job = await store.create_job(canonical(), protocols, 60_000)
+    job_id = job["job_id"]
+    original = {
+        "failure_code": "apply_failed",
+        "failure_detail": "copy failed",
+        "added": 1,
+        "updated": 2,
+        "deleted": 3,
+    }
+
+    accepted, reason, first = await store.settle_result(
+        job_id, "D1", 1, "fail", **original
+    )
+    assert accepted is True
+    assert reason is None
+
+    accepted, reason, replay = await store.settle_result(
+        job_id, "D1", 1, "fail", **original
+    )
+    assert accepted is True
+    assert reason is None
+    assert replay["revision"] == first["revision"]
+
+    conflicting = {**original, **changed}
+    accepted, reason, replay = await store.settle_result(
+        job_id, "D1", 1, "fail", **conflicting
+    )
+    assert accepted is False
+    assert reason == "conflicting_terminal_result"
+    assert replay["revision"] == first["revision"]
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_creates_persistent_fence_and_late_result_only_clears_it(
+    store, manager
+):
     protocols = {"D1": (ProtocolMode.JOB_V1, {"push_job_id_v1"})}
     _, job = await store.create_job(canonical(), protocols, 60_000)
     job_id = job["job_id"]
@@ -129,7 +254,7 @@ async def test_unconfirmed_creates_persistent_fence_and_late_result_only_clears_
         "display_filename": "x.zip", "byte_size": 1, "sha256": "a" * 64, "entry_count": 1,
     })
     await store.enable_dispatch(job_id)
-    await store.claim_next(["D1"])
+    await manager.claim_next(["D1"])
     await store.mark_dispatching(job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000)
     await store.mark_reconciling(job_id, "D1", expected={DeviceState.DISPATCHING}, reason="lost", deadline=now_ms())
     terminal = await store.mark_unconfirmed(job_id, "D1", "process-a", "timeout")
@@ -143,7 +268,9 @@ async def test_unconfirmed_creates_persistent_fence_and_late_result_only_clears_
 
 
 @pytest.mark.asyncio
-async def test_process_replacement_clears_job_v1_fence_but_same_process_does_not(store):
+async def test_process_replacement_clears_job_v1_fence_but_same_process_does_not(
+    store, manager
+):
     protocols = {"D1": (ProtocolMode.JOB_V1, {"push_job_id_v1"})}
     _, job = await store.create_job(canonical(), protocols, 60_000)
     job_id = job["job_id"]
@@ -154,7 +281,7 @@ async def test_process_replacement_clears_job_v1_fence_but_same_process_does_not
         "display_filename": "x.zip", "byte_size": 1, "sha256": "a" * 64, "entry_count": 1,
     })
     await store.enable_dispatch(job_id)
-    await store.claim_next(["D1"])
+    await manager.claim_next(["D1"])
     await store.mark_dispatching(job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000)
     await store.mark_reconciling(job_id, "D1", expected={DeviceState.DISPATCHING}, reason="lost", deadline=now_ms())
     await store.mark_unconfirmed(job_id, "D1", "process-a", "timeout")
@@ -167,6 +294,7 @@ async def test_process_replacement_clears_job_v1_fence_but_same_process_does_not
 def test_restart_recovery_does_not_redispatch_waiting_transfer(tmp_path):
     path = tmp_path / "push_jobs.sqlite3"
     first = PushJobStore(path)
+    manager = PushJobManager(first)
     req = canonical()
     protocols = {"D1": (ProtocolMode.JOB_V1, {"push_job_id_v1"})}
 
@@ -180,7 +308,7 @@ def test_restart_recovery_does_not_redispatch_waiting_transfer(tmp_path):
             "display_filename": "x.zip", "byte_size": 1, "sha256": "a" * 64, "entry_count": 1,
         })
         await first.enable_dispatch(job_id)
-        await first.claim_next(["D1"])
+        await manager.claim_next(["D1"])
         return job_id
 
     import asyncio
@@ -198,7 +326,9 @@ def test_restart_recovery_does_not_redispatch_waiting_transfer(tmp_path):
     assert current["devices"]["D1"]["state"] == DeviceState.QUEUED.value
 
 @pytest.mark.asyncio
-async def test_reconcile_absent_clears_matching_fence_and_returns_exact_snapshot(store):
+async def test_reconcile_absent_clears_matching_fence_and_returns_exact_snapshot(
+    store, manager
+):
     protocols = {"D1": (ProtocolMode.JOB_V1, {"push_job_id_v1"})}
     _, job = await store.create_job(canonical(), protocols, 60_000)
     job_id = job["job_id"]
@@ -209,7 +339,7 @@ async def test_reconcile_absent_clears_matching_fence_and_returns_exact_snapshot
         "display_filename": "x.zip", "byte_size": 1, "sha256": "a" * 64, "entry_count": 1,
     })
     await store.enable_dispatch(job_id)
-    await store.claim_next(["D1"])
+    await manager.claim_next(["D1"])
     await store.mark_dispatching(job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000)
     await store.mark_reconciling(
         job_id, "D1", expected={DeviceState.DISPATCHING}, reason="lost", deadline=now_ms()
@@ -225,7 +355,9 @@ async def test_reconcile_absent_clears_matching_fence_and_returns_exact_snapshot
 
 
 @pytest.mark.asyncio
-async def test_clear_matching_fence_rejects_wrong_attempt_without_mutation(store):
+async def test_clear_matching_fence_rejects_wrong_attempt_without_mutation(
+    store, manager
+):
     protocols = {"D1": (ProtocolMode.JOB_V1, {"push_job_id_v1"})}
     _, job = await store.create_job(canonical(), protocols, 60_000)
     job_id = job["job_id"]
@@ -236,7 +368,7 @@ async def test_clear_matching_fence_rejects_wrong_attempt_without_mutation(store
         "display_filename": "x.zip", "byte_size": 1, "sha256": "a" * 64, "entry_count": 1,
     })
     await store.enable_dispatch(job_id)
-    await store.claim_next(["D1"])
+    await manager.claim_next(["D1"])
     await store.mark_dispatching(job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000)
     await store.mark_reconciling(
         job_id, "D1", expected={DeviceState.DISPATCHING}, reason="lost", deadline=now_ms()
@@ -254,6 +386,7 @@ async def test_clear_matching_fence_rejects_wrong_attempt_without_mutation(store
 def test_restart_recovery_uses_short_deadline_for_existing_preaccept_reconciliation(tmp_path):
     path = tmp_path / "push_jobs.sqlite3"
     first = PushJobStore(path)
+    manager = PushJobManager(first)
     protocols = {"D1": (ProtocolMode.JOB_V1, {"push_job_id_v1"})}
 
     async def prepare():
@@ -270,7 +403,7 @@ def test_restart_recovery_uses_short_deadline_for_existing_preaccept_reconciliat
             "entry_count": 1,
         })
         await first.enable_dispatch(job_id)
-        await first.claim_next(["D1"])
+        await manager.claim_next(["D1"])
         await first.mark_dispatching(
             job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000
         )

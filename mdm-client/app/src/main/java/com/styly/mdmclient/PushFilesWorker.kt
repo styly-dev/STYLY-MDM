@@ -1,5 +1,6 @@
 package com.styly.mdmclient
 
+import android.os.Build
 import android.os.Environment
 import java.io.File
 import java.io.FileOutputStream
@@ -12,8 +13,23 @@ import java.util.UUID
 import java.util.zip.ZipFile
 
 /** Blocking Push/Sync download, validation, extraction, and apply worker. */
-class PushFilesWorker {
+class PushFilesWorker internal constructor(
+    private val hasExternalStorageAccess: () -> Boolean,
+    private val attemptDirectoryProvider: (PushProtocol.Command) -> File,
+) {
+    constructor() : this(
+        hasExternalStorageAccess = {
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.R ||
+                Environment.isExternalStorageManager()
+        },
+        attemptDirectoryProvider = ::defaultAttemptDirectory,
+    )
+
     companion object {
+        internal const val EXTERNAL_STORAGE_PERMISSION_FAILURE =
+            "external_storage_permission_denied"
+        internal const val EXTERNAL_STORAGE_PERMISSION_DETAIL =
+            "All files access (MANAGE_EXTERNAL_STORAGE) is not granted on this device"
         private const val CONNECT_TIMEOUT_MS = 15_000
         private const val READ_TIMEOUT_MS = 120_000
         private const val MAX_ARCHIVE_ENTRIES = 5_000
@@ -22,6 +38,13 @@ class PushFilesWorker {
             "android", "download", "downloads", "dcim", "pictures", "movies", "music",
             "documents", "alarms", "notifications", "podcasts", "ringtones",
         )
+
+        private fun defaultAttemptDirectory(command: PushProtocol.Command): File {
+            val key = command.jobId?.let { UUID.fromString(it).toString() } ?: "legacy"
+            val downloads =
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            return File(downloads, "styly-mdm/.push-tmp/jobs/$key/${command.attempt}")
+        }
     }
 
     data class Callbacks(
@@ -36,7 +59,21 @@ class PushFilesWorker {
     )
 
     fun execute(command: PushProtocol.Command, callbacks: Callbacks): Execution {
-        val work = attemptDirectory(command)
+        if (!hasExternalStorageAccess()) {
+            val work = attemptDirectoryProvider(command)
+            return Execution(
+                PushProtocol.Result(
+                    jobId = command.jobId,
+                    attempt = command.attempt,
+                    status = "fail",
+                    destPath = command.destPath,
+                    failureCode = EXTERNAL_STORAGE_PERMISSION_FAILURE,
+                    detail = EXTERNAL_STORAGE_PERMISSION_DETAIL,
+                ),
+                work,
+            )
+        }
+        val work = attemptDirectoryProvider(command)
         val result = try {
             recreateDirectory(work)
             val bundle = download(command, work)
@@ -340,13 +377,6 @@ class PushFilesWorker {
             throw PushWorkerException("validation_failed", "ZIP contains an unsafe entry path")
         }
         return normalized
-    }
-
-    private fun attemptDirectory(command: PushProtocol.Command): File {
-        val key = command.jobId?.let { UUID.fromString(it).toString() } ?: "legacy"
-        val downloads =
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        return File(downloads, "styly-mdm/.push-tmp/jobs/$key/${command.attempt}")
     }
 
     private fun recreateDirectory(directory: File) {
