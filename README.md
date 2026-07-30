@@ -110,10 +110,13 @@ Install the MDM client APK on the HMD (see the [Developer Guide](docs/DEVELOPMEN
 1. Launch **STYLY-MDM Client** on the HMD.
 2. Tap **Discover Server** to automatically find the server on the LAN.
    - If discovery succeeds, the URL field is populated automatically.
-   - Alternatively, enter the server URL manually: `ws://<server-ip>:7070/ws/device`
+   - Alternatively, enter the server URL manually: `ws://<server-ip>:7070/ws/device`.
+     The client keeps this manual URL separate from automatic discovery and tries
+     it once at the start of each connection window.
 3. Tap **Save & Connect**.
 
-> **Note:** On first launch with no saved URL, the client automatically attempts server discovery before falling back to the default URL.
+> **Note:** On first launch with no manual URL, the client automatically attempts
+> server discovery before falling back to the last discovered or default URL.
 
 The MDM client connects to the server, registers the device (serial number, model, IP address), and runs as a foreground service in the background.
 
@@ -126,7 +129,8 @@ venue network:
 
 - After a network change, an app restart, or losing an established connection, the
   client tries to find a server for a short **connection window** (default **10
-  seconds**, one discovery + connect attempt every **2 seconds**).
+  seconds**). A saved manual URL is tried once first; later failed attempts retry
+  after **2 seconds** and start with discovery.
 - If no server is found in time, it stops all network traffic and shows
   **`Standby (no server found)`** in its notification and settings screen. A standby
   client sends nothing at all — no reconnect attempts, no discovery broadcasts, no

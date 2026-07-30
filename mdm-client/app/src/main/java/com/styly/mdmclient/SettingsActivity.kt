@@ -64,10 +64,7 @@ class SettingsActivity : AppCompatActivity() {
         journalRefreshButton = findViewById(R.id.journal_refresh_button)
         journalClearButton = findViewById(R.id.journal_clear_button)
 
-        // Load current server URL
-        val prefs = getSharedPreferences("stylymdm_prefs", MODE_PRIVATE)
-        val currentUrl = prefs.getString("server_url", WebSocketManager.DEFAULT_SERVER_URL) ?: ""
-        serverUrlInput.setText(currentUrl)
+        serverUrlInput.setText(WebSocketManager.getConfiguredServerUrl(this))
 
         saveButton.setOnClickListener {
             saveAndRestart()
@@ -137,7 +134,10 @@ class SettingsActivity : AppCompatActivity() {
         val url = serverUrlInput.text.toString().trim()
         if (url.isEmpty()) return
 
-        WebSocketManager.saveManualServerUrl(this, url)
+        if (!WebSocketManager.saveManualServerUrl(this, url)) {
+            Toast.makeText(this, "Enter a valid ws:// or wss:// URL", Toast.LENGTH_SHORT).show()
+            return
+        }
 
         // Restart the service to apply new URL
         stopService(Intent(this, MdmClientService::class.java))

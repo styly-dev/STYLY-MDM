@@ -20,7 +20,7 @@ class ConnectionScheduler(
     enum class State { IDLE, WINDOW_OPEN, CONNECTED, SILENT }
 
     sealed class Action {
-        /** Begin a discovery-then-connect attempt now. */
+        /** Begin the next connection attempt now. */
         object StartAttempt : Action()
 
         /** Re-enter [StartAttempt] after [delayMs] (report via onRetryElapsed). */
