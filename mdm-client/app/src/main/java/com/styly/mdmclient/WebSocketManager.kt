@@ -76,8 +76,12 @@ class WebSocketManager(
             return true
         }
 
-        internal fun clearManualServerUrl(context: Context) {
-            preferences(context).edit().remove(PREF_MANUAL_SERVER_URL).apply()
+        internal fun clearServerUrlsForAutoDiscovery(context: Context) {
+            preferences(context)
+                .edit()
+                .remove(PREF_MANUAL_SERVER_URL)
+                .remove(PREF_SERVER_URL)
+                .apply()
         }
 
         internal fun getManualServerUrl(context: Context): String? {

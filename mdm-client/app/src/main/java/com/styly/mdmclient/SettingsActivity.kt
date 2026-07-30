@@ -132,7 +132,7 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun useAutoDiscovery() {
-        WebSocketManager.clearManualServerUrl(this)
+        WebSocketManager.clearServerUrlsForAutoDiscovery(this)
         serverUrlInput.text.clear()
         restartService("Discovering...")
     }

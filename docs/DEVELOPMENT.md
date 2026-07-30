@@ -985,9 +985,9 @@ tested) that `WebSocketManager` executes on the main looper:
 Older clients stored both Settings input and discovery results under `server_url`, so
 their origin cannot be recovered during upgrade. That legacy value is treated as a
 discovery cache. Operators who need it pinned as a manual endpoint must re-enter it in
-Settings and tap **Save & Connect**. **Use Auto-Discovery** removes the manual preference,
-leaves the discovery cache available as a fallback, and restarts the service so discovery
-begins immediately.
+Settings and tap **Save & Connect**. **Use Auto-Discovery** removes both the manual
+preference and the previous discovery cache, then restarts the service so a fresh discovery
+begins immediately. A successful discovery creates a new cache for later fallback.
 
 ### Connection tunables (`/sdcard/styly-mdm/config.json`)
 

@@ -109,8 +109,8 @@ Install the MDM client APK on the HMD (see the [Developer Guide](docs/DEVELOPMEN
 
 1. Launch **STYLY-MDM Client** on the HMD.
 2. Choose the connection mode:
-   - Tap **Use Auto-Discovery** to clear any manual override and immediately start
-     discovery on the LAN.
+   - Tap **Use Auto-Discovery** to clear any manual override and previous discovery
+     cache, then immediately start fresh discovery on the LAN.
    - Or enter a manual URL such as `ws://<server-ip>:7070/ws/device`, then tap
      **Save & Connect**. The client keeps this URL separate from discovery results
      and tries it once at the start of each connection window.
