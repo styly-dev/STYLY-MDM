@@ -1478,19 +1478,19 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     # so the client clears the setting before removing it (#63).
                     # Only a successful uninstall is acted on: on a failure the
                     # client restores what it cleared, and the app is still
-                    # installed either way. The client's startup_app_cleared flag
-                    # is not the only trigger — the two sides can disagree (a
-                    # SET_STARTUP_APP is recorded here at dispatch, before the
-                    # device confirms), and a record still naming the package that
-                    # was just removed is stale whatever the device believed.
+                    # installed either way.
+                    #
+                    # What is cleared is the *record naming the removed package* —
+                    # never merely "whatever is recorded now", and not on the
+                    # client's startup_app_cleared flag alone. A SET_STARTUP_APP
+                    # issued while the uninstall was in flight is already recorded
+                    # here (handle_set_startup_app records at dispatch), and a
+                    # late result must not wipe that newer, still-valid setting.
                     if (
                         device_id
                         and msg_type == "DELETE_APP_RESULT"
                         and data.get("status") == "success"
-                        and (
-                            data.get("startup_app_cleared")
-                            or _startup_app_is(device_id, data.get("package_name"))
-                        )
+                        and _startup_app_is(device_id, data.get("package_name"))
                     ):
                         _clear_startup_app_record(device_id)
                         await broadcast_device_list()

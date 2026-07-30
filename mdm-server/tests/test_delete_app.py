@@ -324,6 +324,55 @@ def test_e2e_successful_uninstall_clears_a_stale_startup_app_without_the_flag(tm
     asyncio.run(body())
 
 
+def test_e2e_a_newer_startup_app_survives_a_late_uninstall_result(tmp_path):
+    """`startup_app_cleared` must not wipe a startup app set after the dispatch.
+
+    handle_set_startup_app records the new package immediately, so a result that
+    was in flight across that change arrives with the flag set while the record
+    already names something else — clearing on the flag alone would lose a valid,
+    newer setting.
+    """
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        ts = TestServer(server.create_app())
+        await ts.start_server()
+        base = f"http://{ts.host}:{ts.port}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                old = {"package_name": "com.example.app", "extra": ""}
+                d0 = await _register(session, base, "dev0", startup_app=old)
+                admin = await session.ws_connect(base + "/ws/admin")
+                assert await _recv_type(admin, "DEVICE_LIST") is not None
+
+                # The operator points the device at a different startup app while
+                # the uninstall of the old one is still running.
+                await admin.send_json({
+                    "type": "SET_STARTUP_APP",
+                    "target_devices": ["dev0"],
+                    "package_name": "com.example.newkiosk",
+                })
+                assert await _recv_type(admin, "SET_STARTUP_APP_SENT") is not None
+
+                await d0.send_json({
+                    "type": "DELETE_APP_RESULT",
+                    "status": "success",
+                    "package_name": "com.example.app",
+                    "startup_app_cleared": True,
+                })
+                assert await _recv_type(admin, "DELETE_APP_RESULT") is not None
+
+                startup = server.devices["dev0"]["startup_app"]
+                assert startup is not None
+                assert startup["package_name"] == "com.example.newkiosk"
+
+                await d0.close()
+                await admin.close()
+        finally:
+            await ts.close()
+
+    asyncio.run(body())
+
+
 def test_e2e_uninstalling_another_package_leaves_the_startup_app_alone(tmp_path):
     async def body():
         server._apply_data_dir(str(tmp_path))

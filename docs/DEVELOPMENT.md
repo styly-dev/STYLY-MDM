@@ -250,7 +250,7 @@ STYLY-MDM/
 | `REGISTER` | Sent on connect. Fields: `device_id`, `model`, `ip`, `version_code` (integer), `version_name`, `startup_app` (optional) |
 | `BATTERY_UPDATE` | Battery telemetry. Fields: `device_id`, `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds) |
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
-| `DELETE_APP_RESULT` | Result of a remote app uninstall. The client survives it, so this always arrives (unlike `SELF_UNINSTALL_RESULT`). Fields: `status` (`success`/`fail`), `package_name`, `error` (optional), `result_code` (optional), `startup_app_cleared` (optional; only meaningful on `success` — a failed uninstall restores the setting device-side). See [Remote App Uninstall](#remote-app-uninstall). |
+| `DELETE_APP_RESULT` | Result of a remote app uninstall — exactly one per `EXECUTE_UNINSTALL`. The client survives it, so this always arrives (unlike `SELF_UNINSTALL_RESULT`). Fields: `status` (`success`/`fail`), `package_name`, `error` (optional), `result_code` (optional), `startup_app_cleared` (optional; reports what the device did — the server decides from its own record, see below). See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_RESULT` / `POWER_OFF_RESULT` | Acknowledgement of a power command. `status` is `accepted` (the client received it and flushed this before invoking the SDK — a successful reboot/shutdown tears down the socket first, so no `success` is ever sent) or `fail` (the SDK rejected the call, so the device stayed up to report it). Fields: `status`, `error` (optional). See [Remote Power Control](#remote-power-control). |
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
 | `DOWNLOAD_COMPLETE` | Sent right after a download finishes, before the local work it feeds (the install, or the unzip + mirror). Frees the server's transfer slot so the next queued device can start downloading. Fields: `task` (`install` / `push`; absent means `install`), `apk_filename` (install), `dest_path` + `delete_extras` (push). Optional — see the transfer-throttling note below. |
@@ -320,7 +320,7 @@ STYLY-MDM/
 | `PUSH_DEVICE_STATE` | The `INSTALL_DEVICE_STATE` twin. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `applying` / `fail`), `dest_path`, `delete_extras` (so the console can name the action), `detail` |
 | `PUSH_FILES_RESULT` | Forwarded file/folder result from a device (adds `device_id`) |
 | `LAUNCH_RESULT` | Forwarded result from a device |
-| `DELETE_APP_RESULT` | Forwarded uninstall result from a device (adds `device_id`). A `success` is followed by a fresh `DEVICE_LIST` when it clears that device's recorded startup app — either because the device said so (`startup_app_cleared`) or because the record still named the removed package. See [Remote App Uninstall](#remote-app-uninstall). |
+| `DELETE_APP_RESULT` | Forwarded uninstall result from a device (adds `device_id`). A `success` is followed by a fresh `DEVICE_LIST` when the device's recorded startup app still named the removed package, since the server then drops that record. See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_RESULT` / `POWER_OFF_RESULT` | Forwarded power-command acknowledgement from a device (adds `device_id`). `accepted` = received and going down (confirm via the row dropping offline); `fail` = the SDK rejected it. See [Remote Power Control](#remote-power-control). |
 | `INSTALL_RESULT` | Forwarded install result from a device |
 | `VERIFY_SENT` | Confirmation that verify-APK commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
@@ -976,6 +976,15 @@ failure directly, like `INSTALL_RESULT`. A package that is not installed is caug
 the SDK call and reported as a plain `Package not installed` failure rather than a raw
 PICO result code.
 
+Every attempt still carries its own token, and exactly one terminal `DELETE_APP_RESULT`
+is sent per `EXECUTE_UNINSTALL`. A callback that never arrives is bounded by a wait, and
+the package list — not a guess — decides the outcome at that point: gone means the
+uninstall did happen. A callback that arrives *after* that wait is dropped rather than
+allowed to touch state, since a retry may already own the package by then; and a
+duplicate command for a package already in flight is answered with an immediate
+failure rather than silence, because the server acked its dispatch with
+`DELETE_APP_SENT` and the operator is owed an outcome for it.
+
 **STYLY-MDM's own packages are refused**, on the server (`PROTECTED_PACKAGES`) *and*
 again on the client (checked against its own package name and `GuardLink.GUARD_PACKAGE`,
 so a drift between the two lists degrades to a device-side refusal). Uninstalling the
@@ -988,12 +997,14 @@ is the only sanctioned path.
 app, or every boot would launch something that no longer exists. The client therefore
 clears the startup-app setting *before* the uninstall and reports `startup_app_cleared`;
 the server then drops its own record and re-broadcasts `DEVICE_LIST`. If the uninstall
-fails, the client puts the setting back and the server ignores the flag (it is honoured
-only on `status: success`), so a failed operation changes nothing. The flag is not the
-server's only trigger: a successful uninstall also clears the record whenever it still
-names the removed package. The two sides can disagree — `SET_STARTUP_APP` is recorded
-server-side at dispatch, before the device confirms it — and a record pointing at a
-package that is now gone is stale whatever the device believed.
+fails, the client puts the setting back, so a failed operation changes nothing.
+
+Both sides scope that to *the package being removed*, never to "whatever is set now" —
+an operator can point the device at a new startup app while the uninstall is still
+running, and that newer setting must survive. The server clears only a record that
+still names the uninstalled package (`SET_STARTUP_APP` is recorded at dispatch, so a
+late result would otherwise wipe the new one); the client restores only when nothing
+else has set a startup app since.
 
 The action is irreversible from the console — the app's data goes with it and the APK has
 to be pushed again — so the console gates it behind a confirmation checkbox plus a

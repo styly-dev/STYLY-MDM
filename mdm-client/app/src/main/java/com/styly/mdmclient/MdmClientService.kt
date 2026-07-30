@@ -131,14 +131,16 @@ class MdmClientService : Service() {
     @Volatile
     private var retireInProgress = false
 
-    // Packages with an EXECUTE_UNINSTALL (#63) still running. A re-sent command
-    // must not start a second uninstall of the same package while the first one
-    // is between the startup-app clear and its callback, or the restore-on-failure
-    // of one could undo the other. Deliberately separate from retireInProgress,
-    // whose semantics (guard provisioning paused, client going away) are specific
-    // to the retire ceremony.
-    private val uninstallsInFlight =
-        java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    // package -> the token of the EXECUTE_UNINSTALL (#63) attempt that owns it. A
+    // re-sent command must not start a second uninstall of the same package while
+    // the first is between the startup-app clear and its callback, or the
+    // restore-on-failure of one could undo the other. The token — rather than mere
+    // membership — is what keeps a late callback from a timed-out attempt out of a
+    // retry that has since claimed the same package. Guarded by synchronizing on
+    // the map itself; deliberately separate from retireInProgress, whose semantics
+    // (guard provisioning paused, client going away) are specific to the retire.
+    private val uninstallsInFlight = mutableMapOf<String, Long>()
+    private val uninstallOpSeq = java.util.concurrent.atomic.AtomicLong()
 
     override fun onCreate() {
         super.onCreate()
@@ -438,8 +440,19 @@ class MdmClientService : Service() {
             )
             return
         }
-        if (!uninstallsInFlight.add(target)) {
-            Log.w(TAG, "Uninstall of $target already in flight; ignoring the duplicate")
+        // Each attempt gets its own token. Everything below reports through it, so
+        // a slow callback from a timed-out attempt cannot settle — or consume the
+        // in-flight key of — the retry that replaced it.
+        val op = uninstallOpSeq.incrementAndGet()
+        val claimed = synchronized(uninstallsInFlight) {
+            if (uninstallsInFlight.containsKey(target)) false
+            else { uninstallsInFlight[target] = op; true }
+        }
+        if (!claimed) {
+            // The server acked this dispatch with DELETE_APP_SENT, so staying
+            // silent would leave the operator with a "sent" and no outcome.
+            Log.w(TAG, "Uninstall of $target already in flight; reporting the duplicate as failed")
+            sendUninstallResult(target, "fail", "An uninstall of this package is already in flight")
             return
         }
 
@@ -452,13 +465,13 @@ class MdmClientService : Service() {
             var clearedStartup: Pair<String, String>? = null
             try {
                 if (!isPackageInstalled(target)) {
-                    finishUninstall(target, "fail", "Package not installed", null, false)
+                    finishUninstall(target, op, "fail", "Package not installed", null, false)
                     return@Thread
                 }
 
                 val binder = ToBServiceHelper.getInstance().serviceBinder
                 if (binder == null) {
-                    finishUninstall(target, "fail", "TobService not available", null, false)
+                    finishUninstall(target, op, "fail", "TobService not available", null, false)
                     return@Thread
                 }
 
@@ -483,57 +496,94 @@ class MdmClientService : Service() {
                         override fun callback(result: Int) {
                             Log.i(TAG, "pbsControlAPPManger uninstall result: $result for $target")
                             done.countDown()
-                            val restore = clearedStartup
-                            if (result != 0 && restore != null) {
-                                setStartupAppPrefs(restore.first, restore.second)
-                                Log.i(TAG, "Restored the startup app after a failed uninstall")
+                            if (!ownsUninstall(target, op)) {
+                                // This attempt already timed out and something else
+                                // may own the package now. Touching prefs or sending
+                                // a result here would corrupt that newer operation.
+                                Log.w(TAG, "Late uninstall callback for $target (result=$result); dropping it")
+                                return
                             }
+                            val restored = result != 0 && restoreStartupApp(clearedStartup)
                             finishUninstall(
                                 target,
+                                op,
                                 if (result == 0) "success" else "fail",
                                 if (result == 0) ""
                                 else "pbsControlAPPManger returned $result: ${installResultMessage(result)}",
                                 result,
-                                restore != null && result == 0
+                                clearedStartup != null && result == 0
                             )
+                            if (result != 0 && clearedStartup != null && !restored) {
+                                Log.i(TAG, "Startup app changed during the uninstall; left the newer setting alone")
+                            }
                         }
                     }
                 )
                 // A callback that never comes would otherwise leave the package
                 // blocked from every later attempt and the console waiting on a
-                // result that cannot arrive. Time it out into an ordinary failure
-                // — the package list is what the operator re-checks anyway.
+                // result that cannot arrive. The package list is the ground truth
+                // at that point, so read it rather than guessing.
                 if (!done.await(UNINSTALL_CALLBACK_WAIT_MS, TimeUnit.MILLISECONDS)) {
-                    Log.w(TAG, "No uninstall callback for $target within ${UNINSTALL_CALLBACK_WAIT_MS}ms")
-                    clearedStartup?.let { setStartupAppPrefs(it.first, it.second) }
+                    val gone = !isPackageInstalled(target)
+                    Log.w(
+                        TAG,
+                        "No uninstall callback for $target within ${UNINSTALL_CALLBACK_WAIT_MS}ms " +
+                            "(package ${if (gone) "is gone" else "is still installed"})"
+                    )
+                    if (!gone) restoreStartupApp(clearedStartup)
                     finishUninstall(
-                        target, "fail",
-                        "No uninstall callback within ${UNINSTALL_CALLBACK_WAIT_MS / 1000}s",
-                        null, false
+                        target,
+                        op,
+                        if (gone) "success" else "fail",
+                        if (gone) ""
+                        else "No uninstall callback within ${UNINSTALL_CALLBACK_WAIT_MS / 1000}s",
+                        null,
+                        clearedStartup != null && gone
                     )
                 }
             } catch (e: Throwable) {
                 Log.e(TAG, "Uninstall of $target threw", e)
-                clearedStartup?.let { setStartupAppPrefs(it.first, it.second) }
-                finishUninstall(target, "fail", e.message ?: "Unknown error", null, false)
+                restoreStartupApp(clearedStartup)
+                finishUninstall(target, op, "fail", e.message ?: "Unknown error", null, false)
             }
         }.start()
     }
 
+    private fun ownsUninstall(target: String, op: Long): Boolean =
+        synchronized(uninstallsInFlight) { uninstallsInFlight[target] == op }
+
     /**
-     * Report an uninstall exactly once. Leaving the in-flight set is the guard: a
-     * callback that arrives just after the wait timed out finds the package gone
-     * and stays quiet, so the console never sees two results for one command.
+     * Put back a startup app this uninstall cleared — but only if nothing else has
+     * set one since. An operator who configured a new startup app while the
+     * uninstall was running must not have it replaced by the package we just tried
+     * (and failed) to remove. Returns whether the restore happened.
+     */
+    private fun restoreStartupApp(cleared: Pair<String, String>?): Boolean {
+        if (cleared == null) return false
+        if (webSocketManager.getStartupAppConfig() != null) return false
+        setStartupAppPrefs(cleared.first, cleared.second)
+        Log.i(TAG, "Restored the startup app after a failed uninstall")
+        return true
+    }
+
+    /**
+     * Report an uninstall exactly once, and only for the attempt that still owns
+     * the package. Releasing the in-flight entry is part of the same guarded step,
+     * so a timed-out attempt can neither report twice nor free a retry's claim.
      */
     private fun finishUninstall(
         target: String,
+        op: Long,
         status: String,
         error: String,
         resultCode: Int?,
         startupAppCleared: Boolean
     ) {
-        if (!uninstallsInFlight.remove(target)) {
-            Log.i(TAG, "Uninstall of $target was already reported; dropping the late result")
+        val owns = synchronized(uninstallsInFlight) {
+            if (uninstallsInFlight[target] == op) { uninstallsInFlight.remove(target); true } else false
+        }
+        if (!owns) {
+            Log.i(TAG, "Uninstall $op of $target no longer owns the package; dropping the result")
             return
         }
         sendUninstallResult(target, status, error, resultCode, startupAppCleared)
