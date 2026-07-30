@@ -972,7 +972,9 @@ tested) that `WebSocketManager` executes on the main looper:
    configuration and the discovery cache use separate preference keys, so discovery
    never overwrites the operator's URL. Failed attempts retry on a fixed interval;
    OkHttp's `connectTimeout` is shortened to 3 s so a single black-holed attempt cannot
-   consume the window.
+   consume the window. With the 10 s / 2 s defaults, a full 3 s manual timeout plus
+   retry delay and 3 s discovery timeout leaves about 2 s for the cached fallback;
+   deployments that need another slow fallback attempt should lengthen the window.
 3. **On expiry without a connection** the in-flight socket is aborted (`cancel()`, no
    close handshake) and the client goes fully **silent** — no WebSocket attempts, no
    UDP, no pings — showing `Standby (no server found)` in the notification and
@@ -982,8 +984,10 @@ tested) that `WebSocketManager` executes on the main looper:
 
 Older clients stored both Settings input and discovery results under `server_url`, so
 their origin cannot be recovered during upgrade. That legacy value is treated as a
-discovery cache. Operators who need it pinned as a manual endpoint must open Settings
-and tap **Save & Connect** once; the screen pre-populates the legacy value.
+discovery cache. Operators who need it pinned as a manual endpoint must re-enter it in
+Settings and tap **Save & Connect**. **Use Auto-Discovery** removes the manual preference,
+leaves the discovery cache available as a fallback, and restarts the service so discovery
+begins immediately.
 
 ### Connection tunables (`/sdcard/styly-mdm/config.json`)
 

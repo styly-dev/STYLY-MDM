@@ -51,7 +51,7 @@ class WebSocketManager(
         const val PREF_NAME = "stylymdm_prefs"
         private const val PREF_SERVER_URL = "server_url"
         // Kept separate from PREF_SERVER_URL, which is only a discovery cache.
-        private const val PREF_MANUAL_SERVER_URL = "manual_server_url"
+        private const val PREF_MANUAL_SERVER_URL = "manual_server_url_value"
         // Last-resort fallback used only when discovery fails and no URL is saved.
         // The port is flavor-aware (BuildConfig.DEFAULT_WS_PORT) so the dev build
         // never falls back to the production port and accidentally connects to a
@@ -66,7 +66,7 @@ class WebSocketManager(
         const val PREF_STARTUP_APP_PACKAGE = "startup_app_package"
         const val PREF_STARTUP_APP_EXTRA = "startup_app_extra"
 
-        fun saveManualServerUrl(context: Context, url: String): Boolean {
+        internal fun saveManualServerUrl(context: Context, url: String): Boolean {
             val normalized = url.trim()
             if (!isValidWsUrl(normalized)) return false
             preferences(context)
@@ -76,23 +76,14 @@ class WebSocketManager(
             return true
         }
 
-        fun getConfiguredServerUrl(context: Context): String {
-            return getManualServerUrl(context) ?: getCachedServerUrl(context)
+        internal fun clearManualServerUrl(context: Context) {
+            preferences(context).edit().remove(PREF_MANUAL_SERVER_URL).apply()
         }
 
-        private fun getManualServerUrl(context: Context): String? {
-            val prefs = preferences(context)
-            val stored = prefs.all[PREF_MANUAL_SERVER_URL]
-            val url = when (stored) {
-                is String -> stored
-                // An earlier draft used true to identify an explicit Settings save.
-                true -> prefs.getString(PREF_SERVER_URL, null)
-                else -> null
-            }?.takeIf(::isValidWsUrl)
-            if (stored == true && url != null) {
-                prefs.edit().putString(PREF_MANUAL_SERVER_URL, url).apply()
-            }
-            return url
+        internal fun getManualServerUrl(context: Context): String? {
+            return preferences(context)
+                .getString(PREF_MANUAL_SERVER_URL, null)
+                ?.takeIf(::isValidWsUrl)
         }
 
         private fun getCachedServerUrl(context: Context): String {
@@ -108,6 +99,7 @@ class WebSocketManager(
         private fun isValidWsUrl(url: String): Boolean {
             if (!url.startsWith("ws://") && !url.startsWith("wss://")) return false
             return try {
+                // OkHttp accepts WebSocket URLs here by normalizing ws/wss to http/https.
                 Request.Builder().url(url).build()
                 true
             } catch (_: IllegalArgumentException) {
@@ -146,11 +138,7 @@ class WebSocketManager(
             reconnectHandler.post {
                 if (!isRunning) return@post
                 activeNetwork = network
-                val actions = scheduler.onNetworkAvailable(SystemClock.uptimeMillis())
-                if (actions.contains(ConnectionScheduler.Action.StartAttempt)) {
-                    manualUrlAttempt.onWindowOpened(getManualServerUrl(context))
-                }
-                dispatch(actions)
+                dispatch(scheduler.onNetworkAvailable(SystemClock.uptimeMillis()))
             }
         }
 
@@ -216,6 +204,8 @@ class WebSocketManager(
     private fun dispatch(actions: List<ConnectionScheduler.Action>) {
         for (action in actions) {
             when (action) {
+                is ConnectionScheduler.Action.WindowOpened ->
+                    manualUrlAttempt.onWindowOpened(getManualServerUrl(context))
                 is ConnectionScheduler.Action.StartAttempt -> startAttempt()
                 is ConnectionScheduler.Action.ScheduleRetry -> {
                     onStatusChanged(false, "Reconnecting in ${action.delayMs / 1000}s...")
@@ -332,10 +322,6 @@ class WebSocketManager(
     private fun onSocketGone(deadSocket: WebSocket, message: String) {
         reconnectHandler.post {
             if (webSocket !== deadSocket) return@post
-            manualUrlAttempt.onSocketGone(
-                wasConnected = scheduler.state == ConnectionScheduler.State.CONNECTED,
-                manualUrl = getManualServerUrl(context),
-            )
             webSocket = null
             stopBatteryTelemetry()
             onStatusChanged(false, message)

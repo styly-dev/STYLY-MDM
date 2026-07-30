@@ -19,34 +19,12 @@ class ManualServerUrlAttemptTest {
     }
 
     @Test
-    fun failedAttemptDoesNotRearmManualUrl() {
-        val attempt = ManualServerUrlAttempt()
-        attempt.onWindowOpened(manualUrl)
-        attempt.take()
-
-        attempt.onSocketGone(wasConnected = false, manualUrl = manualUrl)
-
-        assertNull(attempt.take())
-    }
-
-    @Test
     fun laterWindowRearmsPersistedManualUrl() {
         val attempt = ManualServerUrlAttempt()
         attempt.onWindowOpened(manualUrl)
         attempt.take()
 
         attempt.onWindowOpened(manualUrl)
-
-        assertEquals(manualUrl, attempt.take())
-    }
-
-    @Test
-    fun establishedConnectionDropRearmsManualUrl() {
-        val attempt = ManualServerUrlAttempt()
-        attempt.onWindowOpened(manualUrl)
-        attempt.take()
-
-        attempt.onSocketGone(wasConnected = true, manualUrl = manualUrl)
 
         assertEquals(manualUrl, attempt.take())
     }

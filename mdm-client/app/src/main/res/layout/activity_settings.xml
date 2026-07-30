@@ -56,19 +56,28 @@
             android:singleLine="true"
             android:layout_marginBottom="8dp" />
 
-        <Button
-            android:id="@+id/discover_button"
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="@string/discover_server"
-            android:layout_marginBottom="8dp" />
+            android:layout_marginBottom="32dp"
+            android:orientation="horizontal">
 
-        <Button
-            android:id="@+id/save_button"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/save_and_connect"
-            android:layout_marginBottom="32dp" />
+            <Button
+                android:id="@+id/save_button"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="4dp"
+                android:layout_weight="1"
+                android:text="@string/save_and_connect" />
+
+            <Button
+                android:id="@+id/use_auto_discovery_button"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:layout_weight="1"
+                android:text="@string/use_auto_discovery" />
+        </LinearLayout>
 
         <TextView
             android:layout_width="match_parent"

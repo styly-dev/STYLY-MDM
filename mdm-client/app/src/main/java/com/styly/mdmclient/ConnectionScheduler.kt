@@ -20,6 +20,9 @@ class ConnectionScheduler(
     enum class State { IDLE, WINDOW_OPEN, CONNECTED, SILENT }
 
     sealed class Action {
+        /** A fresh connection window opened; arm policies that run once per window. */
+        object WindowOpened : Action()
+
         /** Begin the next connection attempt now. */
         object StartAttempt : Action()
 
@@ -104,6 +107,7 @@ class ConnectionScheduler(
         val actions = mutableListOf<Action>(Action.CancelTimers)
         if (cancelAttempt) actions.add(Action.CancelAttempt)
         actions.add(Action.ScheduleWindowExpiry(values.connectWindowMs))
+        actions.add(Action.WindowOpened)
         actions.add(Action.StartAttempt)
         return actions
     }
