@@ -250,6 +250,7 @@ STYLY-MDM/
 | `REGISTER` | Sent on connect. Fields: `device_id`, `model`, `ip`, `version_code` (integer), `version_name`, `startup_app` (optional) |
 | `BATTERY_UPDATE` | Battery telemetry. Fields: `device_id`, `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds) |
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
+| `DELETE_APP_RESULT` | Result of a remote app uninstall. The client survives it, so this always arrives (unlike `SELF_UNINSTALL_RESULT`). Fields: `status` (`success`/`fail`), `package_name`, `error` (optional), `result_code` (optional), `startup_app_cleared` (optional; only meaningful on `success` — a failed uninstall restores the setting device-side). See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_RESULT` / `POWER_OFF_RESULT` | Acknowledgement of a power command. `status` is `accepted` (the client received it and flushed this before invoking the SDK — a successful reboot/shutdown tears down the socket first, so no `success` is ever sent) or `fail` (the SDK rejected the call, so the device stayed up to report it). Fields: `status`, `error` (optional). See [Remote Power Control](#remote-power-control). |
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
 | `DOWNLOAD_COMPLETE` | Sent right after a download finishes, before the local work it feeds (the install, or the unzip + mirror). Frees the server's transfer slot so the next queued device can start downloading. Fields: `task` (`install` / `push`; absent means `install`), `apk_filename` (install), `dest_path` + `delete_extras` (push). Optional — see the transfer-throttling note below. |
@@ -265,6 +266,7 @@ STYLY-MDM/
 | Message type | Description |
 |---|---|
 | `EXECUTE_LAUNCH` | Launch an app. Fields: `package_name`, `extra` |
+| `EXECUTE_UNINSTALL` | Silently uninstall an app (`pbsControlAPPManger` / `PACKAGE_SILENCE_UNINSTALL`). Fields: `package_name`. The client refuses its own and the guard's package, and clears the startup app first when the target is it. See [Remote App Uninstall](#remote-app-uninstall). |
 | `EXECUTE_REBOOT` / `EXECUTE_POWER_OFF` | Reboot or power off the device immediately via the PICO advanced device-control API (`pbsControlSetDeviceAction`). No fields. See [Remote Power Control](#remote-power-control). |
 | `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename`, plus `full_sha256` + `cd_sha256` (reference hashes of the file being dispatched; present only when the APK is a local upload in `apks/`). The client verifies the download against `full_sha256` before installing; a **self**-update is refused outright when the hashes are absent. |
 | `EXECUTE_PUSH_FILES` | Download a bundle and apply it to a directory. Fields: `bundle_url`, `bundle_filename`, `dest_path`, `delete_extras` (boolean; `false` = copy/overwrite only, `true` = full mirror. Read with a `false` default — a missing field must never delete) |
@@ -277,6 +279,7 @@ STYLY-MDM/
 | Message type | Description |
 |---|---|
 | `LAUNCH_APP` | Launch an app on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `package_name`, `extra_data` |
+| `DELETE_APP` | Uninstall an app from target devices (the console gates it behind a confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only), `package_name`. STYLY-MDM's own packages are rejected — `RETIRE_DEVICE` is the only sanctioned way to remove the client. See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_DEVICE` / `POWER_OFF_DEVICE` | Reboot or power off target devices (the console gates both behind a shared confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only). See [Remote Power Control](#remote-power-control). |
 | `INSTALL_APK` | Install an uploaded APK on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `apk_url`, `apk_filename` |
 | `PUSH_FILES` | Apply a bundle to a directory on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `bundle_url`, `bundle_filename`, `dest_path`, `delete_extras` (boolean, optional; only a literal `true` requests a full mirror) |
@@ -307,6 +310,7 @@ STYLY-MDM/
 | `CLIENT_APK_INFO` | The newest styly-mdm-client APK the server holds, sent on connect (right after `SERVER_INFO`, before `DEVICE_LIST`) and re-broadcast after every APK upload. Field: `apk` = `{filename, url, version}` or `null`. Drives the per-device and bulk **Update** buttons and the top-bar client-APK download link (see the notes below). |
 | `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting; a *stable-online* client whose `version_name` trails the server on `major.minor` is flagged red as needing an update — the reverse case, a client *ahead* of the server, reddens the top-bar server version instead. `updating` and offline rows are exempt, and the check is skipped only when the server version is the `0.0.0` untagged/not-installed fallback), and may include optional `battery`: `{level, charging, last_seen}`) |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
+| `DELETE_APP_SENT` | Confirmation that uninstall commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `REBOOT_SENT` / `POWER_OFF_SENT` | Confirmation that reboot/power-off commands were dispatched. Fields: `sent_count`, `target_count` |
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
 | `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |
@@ -316,6 +320,7 @@ STYLY-MDM/
 | `PUSH_DEVICE_STATE` | The `INSTALL_DEVICE_STATE` twin. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `applying` / `fail`), `dest_path`, `delete_extras` (so the console can name the action), `detail` |
 | `PUSH_FILES_RESULT` | Forwarded file/folder result from a device (adds `device_id`) |
 | `LAUNCH_RESULT` | Forwarded result from a device |
+| `DELETE_APP_RESULT` | Forwarded uninstall result from a device (adds `device_id`). A `success` is followed by a fresh `DEVICE_LIST` when it clears that device's recorded startup app — either because the device said so (`startup_app_cleared`) or because the record still named the removed package. See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_RESULT` / `POWER_OFF_RESULT` | Forwarded power-command acknowledgement from a device (adds `device_id`). `accepted` = received and going down (confirm via the row dropping offline); `fail` = the SDK rejected it. See [Remote Power Control](#remote-power-control). |
 | `INSTALL_RESULT` | Forwarded install result from a device |
 | `VERIFY_SENT` | Confirmation that verify-APK commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
@@ -949,6 +954,51 @@ it must be woken physically), so the console gates the two buttons behind one sh
 confirmation checkbox plus a per-action `confirm()` dialog naming the targets, mirroring the
 Retire pattern. Offline devices are filtered out of the target set before dispatch (the
 SDK call has to run on the device).
+
+## Remote App Uninstall
+
+An operator can remove a pushed content app from selected devices in the console's
+**Uninstall App** section (`DELETE_APP` → `EXECUTE_UNINSTALL` → `DELETE_APP_RESULT`,
+issue #63). Without it the only way to remove an app was physical access per unit
+(`adb uninstall`) — the per-device handling MDM exists to avoid. The fan-out is the
+`LAUNCH_APP` shape (online targets only, un-throttled: nothing is transferred), and on
+the device it is the same silent-package API the install and retire paths already use,
+`pbsControlAPPManger(PACKAGE_SILENCE_UNINSTALL, package_name, …)`, on the TobService
+binder gated by the `pico_advance_interface` manifest flag the client already declares.
+The operator supplies the package name; there is no installed-app inventory to pick from
+yet.
+
+**Outcome model — a normal, always-arriving result.** This is *not* the retire flow.
+Retire's "silence is success" machinery exists only because a self-uninstall kills the
+process before the `IIntCallback` can matter; uninstalling somebody else's package leaves
+the client alive, so the callback always fires and `DELETE_APP_RESULT` reports success or
+failure directly, like `INSTALL_RESULT`. A package that is not installed is caught before
+the SDK call and reported as a plain `Package not installed` failure rather than a raw
+PICO result code.
+
+**STYLY-MDM's own packages are refused**, on the server (`PROTECTED_PACKAGES`) *and*
+again on the client (checked against its own package name and `GuardLink.GUARD_PACKAGE`,
+so a drift between the two lists degrades to a device-side refusal). Uninstalling the
+client here would skip the entire ordered retire ceremony — guard first, keep-alive
+deregistration, the `SELF_UNINSTALL_STARTING` announcement, recovery on failure — and
+leave a device unmanaged with no console-side way back. [Device Retirement](#device-retirement)
+is the only sanctioned path.
+
+**Startup App interaction.** An uninstalled package must not stay the device's startup
+app, or every boot would launch something that no longer exists. The client therefore
+clears the startup-app setting *before* the uninstall and reports `startup_app_cleared`;
+the server then drops its own record and re-broadcasts `DEVICE_LIST`. If the uninstall
+fails, the client puts the setting back and the server ignores the flag (it is honoured
+only on `status: success`), so a failed operation changes nothing. The flag is not the
+server's only trigger: a successful uninstall also clears the record whenever it still
+names the removed package. The two sides can disagree — `SET_STARTUP_APP` is recorded
+server-side at dispatch, before the device confirms it — and a record pointing at a
+package that is now gone is stale whatever the device believed.
+
+The action is irreversible from the console — the app's data goes with it and the APK has
+to be pushed again — so the console gates it behind a confirmation checkbox plus a
+`confirm()` dialog naming the package and the target devices, mirroring the Retire and
+Power Control pattern.
 
 ## Client Connection Lifecycle (bounded connection window)
 

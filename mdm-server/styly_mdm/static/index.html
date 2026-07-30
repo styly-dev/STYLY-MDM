@@ -465,6 +465,16 @@
               </div>
             </div>
             <div class="cmd-divider"></div>
+            <div class="cmd-section collapsed" data-cmd="uninstall">
+              <div class="cmd-head" data-act="toggleCmd"><span>Uninstall App</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <div class="push-warn">⚠ Silently uninstalls the app from the selected devices — its app data is removed with it and this <strong>cannot be undone from the console</strong>; the APK has to be pushed again. If the package is the device's startup app, that setting is cleared too. STYLY-MDM's own packages are refused here — use <em>Retire Devices</em> for that.</div>
+                <input type="text" class="field" id="uninstallPkg" placeholder="com.example.app (package name)">
+                <label class="push-confirm"><input type="checkbox" id="uninstallConfirm"> I understand the app and its data will be deleted</label>
+                <button class="btn btn-danger-outline" id="btnUninstall" disabled>Uninstall on Selected</button>
+              </div>
+            </div>
+            <div class="cmd-divider"></div>
             <div class="cmd-section collapsed" data-cmd="startup">
               <div class="cmd-head" data-act="toggleCmd"><span>Startup App</span><span class="cmd-chevron">▾</span></div>
               <div class="cmd-body">
@@ -636,6 +646,9 @@
       const launchPkg = document.getElementById('launchPkg');
       const launchExtra = document.getElementById('launchExtra');
       const btnLaunch = document.getElementById('btnLaunch');
+      const uninstallPkg = document.getElementById('uninstallPkg');
+      const uninstallConfirm = document.getElementById('uninstallConfirm');
+      const btnUninstall = document.getElementById('btnUninstall');
       const startupPkg = document.getElementById('startupPkg');
       const startupExtra = document.getElementById('startupExtra');
       const btnStartupSet = document.getElementById('btnStartupSet');
@@ -889,6 +902,14 @@
             break;
           }
           case 'LAUNCH_SENT': addLog('Launch command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'DELETE_APP_SENT': addLog('Uninstall command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'DELETE_APP_RESULT': {
+            const ok = msg.status === 'success';
+            const detail = msg.error || msg.message || '';
+            addLog('[' + (ok ? 'OK' : 'FAIL') + '] Uninstall ' + msg.package_name + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), ok ? 'success' : 'fail');
+            if (ok && msg.startup_app_cleared) addLog('Startup app cleared on ' + labelFor(msg.device_id) + ' (its package was uninstalled)', 'info');
+            break;
+          }
           case 'REBOOT_SENT': addLog('Reboot command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
           case 'POWER_OFF_SENT': addLog('Power-off command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
           case 'REBOOT_RESULT': logPowerResult('Reboot', msg); break;
@@ -1333,6 +1354,7 @@
         const has = selectedIds.size > 0;
         btnInstall.disabled = uploadInProgress || apkFile.files.length === 0 || !has;
         btnLaunch.disabled = launchPkg.value.trim() === '' || !has;
+        btnUninstall.disabled = !uninstallConfirm.checked || uninstallPkg.value.trim() === '' || !has;
         btnStartupSet.disabled = startupPkg.value.trim() === '' || !has;
         btnStartupClear.disabled = !has;
         pushPanel.refreshButton(has);
@@ -1405,6 +1427,22 @@
         const msg = { type: 'LAUNCH_APP', target_devices: online, package_name: pkg };
         const extra = launchExtra.value.trim(); if (extra) msg.extra_data = extra;
         if (wsSend(msg, 'launch')) addLog('Launching ' + pkg + ' on ' + online.length + ' device(s)', 'info');
+      }
+
+      function sendUninstall() {
+        if (!uninstallConfirm.checked) return;
+        const pkg = uninstallPkg.value.trim();
+        if (!pkg) return;
+        const online = onlineTargets(Array.from(selectedIds));
+        if (!online.length) { addLog('No online devices selected to uninstall from', 'warn'); return; }
+        const names = online.map(labelFor).join(', ');
+        if (!confirm('Uninstall ' + pkg + ' from ' + online.length + ' device(s)?\n' + names +
+          '\n\nThe app and its data will be deleted. This cannot be undone from the console.')) return;
+        if (wsSend({ type: 'DELETE_APP', target_devices: online, package_name: pkg }, 'uninstall app')) {
+          addLog('Uninstalling ' + pkg + ' on ' + online.length + ' device(s)…', 'info');
+          uninstallConfirm.checked = false;
+          updateButtons();
+        }
       }
 
       function ensureUploaded() {
@@ -2480,10 +2518,13 @@
         updateButtons();
       });
       launchPkg.addEventListener('input', updateButtons);
+      uninstallPkg.addEventListener('input', updateButtons);
+      uninstallConfirm.addEventListener('change', updateButtons);
       startupPkg.addEventListener('input', updateButtons);
       btnInstall.addEventListener('click', sendInstall);
       btnUpdateClients.addEventListener('click', sendClientUpdateBulk);
       btnLaunch.addEventListener('click', sendLaunch);
+      btnUninstall.addEventListener('click', sendUninstall);
       btnStartupSet.addEventListener('click', sendSetStartup);
       btnStartupClear.addEventListener('click', sendClearStartup);
       verifyApkFile.addEventListener('change', onVerifyApkFile);

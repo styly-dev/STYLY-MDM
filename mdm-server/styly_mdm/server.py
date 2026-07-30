@@ -143,6 +143,15 @@ BUNDLE_DIR = DATA_DIR / "bundles"
 MAX_BUNDLE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB (total uploaded bytes before zipping)
 MAX_BUNDLE_ENTRIES = 5000  # cap files per bundle to bound tree reconstruction
 
+# Packages DELETE_APP refuses to touch (#63). Removing either of these behind the
+# console's back would leave the device unmanaged: the client must only ever go
+# through the ordered retire ceremony (RETIRE_DEVICE), which uninstalls the guard
+# first, drops the keep-alive and announces itself before disappearing. Nothing
+# enforces that these strings track the client's applicationId / GuardLink.
+# GUARD_PACKAGE — the client re-checks against its own package names on arrival,
+# so a drift here degrades to a device-side refusal rather than a lost device.
+PROTECTED_PACKAGES = {"com.styly.mdmclient", "com.styly.mdmguard"}
+
 # Persistent per-device registry: serial -> {label, model, ip, last_seen, startup_app, battery}
 REGISTRY_PATH = DATA_DIR / "device_registry.json"
 MAX_LABEL_LEN = 64
@@ -1446,6 +1455,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     "PUSH_FILES_RESULT",
                     "VERIFY_APK_RESULT",
                     "VERIFY_DIR_RESULT",
+                    "DELETE_APP_RESULT",
                 }:
                     if device_id:
                         data.setdefault("device_id", device_id)
@@ -1464,6 +1474,26 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                             continue
                     log.info("%s from %s: %s", msg_type, device_id, data.get("status"))
                     await forward_to_admins(data)
+                    # An uninstalled package cannot stay the device's startup app,
+                    # so the client clears the setting before removing it (#63).
+                    # Only a successful uninstall is acted on: on a failure the
+                    # client restores what it cleared, and the app is still
+                    # installed either way. The client's startup_app_cleared flag
+                    # is not the only trigger — the two sides can disagree (a
+                    # SET_STARTUP_APP is recorded here at dispatch, before the
+                    # device confirms), and a record still naming the package that
+                    # was just removed is stale whatever the device believed.
+                    if (
+                        device_id
+                        and msg_type == "DELETE_APP_RESULT"
+                        and data.get("status") == "success"
+                        and (
+                            data.get("startup_app_cleared")
+                            or _startup_app_is(device_id, data.get("package_name"))
+                        )
+                    ):
+                        _clear_startup_app_record(device_id)
+                        await broadcast_device_list()
 
                 elif msg_type == "STARTUP_APP_RESULT":
                     log.info("Startup app result from %s: %s", device_id, data.get("status"))
@@ -1562,6 +1592,9 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 if msg_type == "LAUNCH_APP":
                     await handle_launch_app(ws, data)
+
+                elif msg_type == "DELETE_APP":
+                    await handle_delete_app(ws, data)
 
                 elif msg_type == "REBOOT_DEVICE":
                     await handle_reboot_device(ws, data)
@@ -1962,6 +1995,88 @@ async def handle_launch_app(admin_ws: web.WebSocketResponse, data: dict):
 
     await admin_ws.send_str(json.dumps({
         "type": "LAUNCH_SENT",
+        "package_name": package_name,
+        "sent_count": sent_count,
+        "target_count": len(target_ids),
+    }))
+
+
+def _startup_app_is(device_id: str, package_name: str | None) -> bool:
+    """True when the device's recorded startup app is this package."""
+    if not package_name:
+        return False
+    entry = devices.get(device_id) or device_registry.get(device_id) or {}
+    startup = entry.get("startup_app")
+    return isinstance(startup, dict) and startup.get("package_name") == package_name
+
+
+def _clear_startup_app_record(device_id: str) -> None:
+    """Forget a device's startup app after the client cleared it on the device."""
+    entry = devices.get(device_id)
+    if entry is not None:
+        entry["startup_app"] = None
+    rec = device_registry.get(device_id)
+    if rec is not None:
+        rec["startup_app"] = None
+    save_registry()
+    log.info("Startup app cleared on %s (its package was uninstalled)", device_id)
+
+
+async def handle_delete_app(admin_ws: web.WebSocketResponse, data: dict):
+    """Process a DELETE_APP command from an admin and uninstall on target HMDs (#63).
+
+    The launch-style un-throttled fan-out: nothing is transferred, so there is no
+    slot to take. The devices answer individually with DELETE_APP_RESULT, which
+    the device loop relays to every admin.
+    """
+    target_devices: list[str] = data.get("target_devices", [])
+    package_name: str = data.get("package_name", "").strip()
+
+    if not package_name:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "package_name is required",
+        }))
+        return
+
+    if package_name in PROTECTED_PACKAGES:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": (
+                f"{package_name} belongs to STYLY-MDM itself; "
+                "use Retire Device to remove the MDM client"
+            ),
+        }))
+        return
+
+    target_ids = resolve_target_ids(target_devices)
+
+    if not target_ids:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "No matching online devices found",
+        }))
+        return
+
+    execute_msg = json.dumps({
+        "type": "EXECUTE_UNINSTALL",
+        "package_name": package_name,
+    })
+
+    sent_count = 0
+    for did in target_ids:
+        entry = devices.get(did)
+        if entry:
+            try:
+                await entry["ws"].send_str(execute_msg)
+                sent_count += 1
+            except ConnectionResetError:
+                log.warning("Failed to send EXECUTE_UNINSTALL to %s (disconnected)", did)
+
+    log.info("DELETE_APP: sent %s to %d/%d devices", package_name, sent_count, len(target_ids))
+
+    await admin_ws.send_str(json.dumps({
+        "type": "DELETE_APP_SENT",
         "package_name": package_name,
         "sent_count": sent_count,
         "target_count": len(target_ids),
