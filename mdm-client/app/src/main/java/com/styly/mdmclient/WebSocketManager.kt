@@ -32,9 +32,9 @@ import java.util.concurrent.TimeUnit
  *
  * Connection attempts are allowed only inside a window that opens on each
  * network-available transition (which also covers process restart) and on an
- * established connection dropping. Inside the window every attempt cycle runs
- * UDP discovery first and then connects to the saved URL, retrying on a fixed
- * interval; when the window expires without a connection the client goes fully
+ * established connection dropping. A manually configured URL is attempted first;
+ * subsequent attempts use UDP discovery, retrying on a fixed interval. When the
+ * window expires without a connection the client goes fully
  * silent until the next network transition. Window duration and retry interval
  * come from [ClientConfig] (defaults overridable via /sdcard/styly-mdm/config.json).
  * The state logic lives in [ConnectionScheduler]; all of it runs on the main
@@ -50,6 +50,7 @@ class WebSocketManager(
         private const val TAG = "WebSocketManager"
         const val PREF_NAME = "stylymdm_prefs"
         private const val PREF_SERVER_URL = "server_url"
+        private const val PREF_MANUAL_SERVER_URL = "manual_server_url"
         // Last-resort fallback used only when discovery fails and no URL is saved.
         // The port is flavor-aware (BuildConfig.DEFAULT_WS_PORT) so the dev build
         // never falls back to the production port and accidentally connects to a
@@ -63,6 +64,14 @@ class WebSocketManager(
 
         const val PREF_STARTUP_APP_PACKAGE = "startup_app_package"
         const val PREF_STARTUP_APP_EXTRA = "startup_app_extra"
+
+        fun saveManualServerUrl(context: Context, url: String) {
+            context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(PREF_SERVER_URL, url)
+                .putBoolean(PREF_MANUAL_SERVER_URL, true)
+                .apply()
+        }
     }
 
     private val client = OkHttpClient.Builder()
@@ -83,6 +92,7 @@ class WebSocketManager(
 
     // Invalidates the in-flight discovery thread when its attempt is cancelled.
     private var attemptGeneration = 0
+    private var manualUrlAttemptPending = false
 
     // registerDefaultNetworkCallback can report the new network's onAvailable
     // before the old network's onLost when the default network switches; only
@@ -94,6 +104,7 @@ class WebSocketManager(
             reconnectHandler.post {
                 if (!isRunning) return@post
                 activeNetwork = network
+                manualUrlAttemptPending = hasManualServerUrl()
                 dispatch(scheduler.onNetworkAvailable(SystemClock.uptimeMillis()))
             }
         }
@@ -115,7 +126,10 @@ class WebSocketManager(
 
     fun setServerUrl(url: String) {
         val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putString(PREF_SERVER_URL, url).apply()
+        prefs.edit()
+            .putString(PREF_SERVER_URL, url)
+            .putBoolean(PREF_MANUAL_SERVER_URL, false)
+            .apply()
     }
 
     fun connect() {
@@ -193,12 +207,14 @@ class WebSocketManager(
         }
     }
 
-    /**
-     * One attempt cycle: UDP discovery first (a saved-but-stale URL must not
-     * keep the client away from a relocated server), then connect to the saved
-     * URL — which discovery just refreshed if a server answered.
-     */
+    /** Attempts a manual URL once, then falls back to UDP discovery within the window. */
     private fun startAttempt() {
+        if (manualUrlAttemptPending) {
+            manualUrlAttemptPending = false
+            doConnect()
+            return
+        }
+
         val generation = ++attemptGeneration
         onStatusChanged(false, "Discovering server...")
         Thread {
@@ -279,6 +295,9 @@ class WebSocketManager(
     private fun onSocketGone(deadSocket: WebSocket, message: String) {
         reconnectHandler.post {
             if (webSocket !== deadSocket) return@post
+            if (scheduler.state == ConnectionScheduler.State.CONNECTED) {
+                manualUrlAttemptPending = hasManualServerUrl()
+            }
             webSocket = null
             stopBatteryTelemetry()
             onStatusChanged(false, message)
@@ -298,6 +317,17 @@ class WebSocketManager(
 
     private fun isValidWsUrl(url: String): Boolean {
         return url.isNotBlank() && (url.startsWith("ws://") || url.startsWith("wss://"))
+    }
+
+    private fun hasManualServerUrl(): Boolean {
+        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        return if (prefs.contains(PREF_MANUAL_SERVER_URL)) {
+            prefs.getBoolean(PREF_MANUAL_SERVER_URL, false)
+        } else {
+            // Existing installs did not distinguish manual and discovered URLs.
+            // Preserve their explicit URL as the first connection attempt.
+            prefs.contains(PREF_SERVER_URL)
+        }
     }
 
     private fun sendRegistration() {

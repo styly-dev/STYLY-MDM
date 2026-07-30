@@ -137,9 +137,7 @@ class SettingsActivity : AppCompatActivity() {
         val url = serverUrlInput.text.toString().trim()
         if (url.isEmpty()) return
 
-        // Save the URL
-        val prefs = getSharedPreferences("stylymdm_prefs", MODE_PRIVATE)
-        prefs.edit().putString("server_url", url).apply()
+        WebSocketManager.saveManualServerUrl(this, url)
 
         // Restart the service to apply new URL
         stopService(Intent(this, MdmClientService::class.java))
