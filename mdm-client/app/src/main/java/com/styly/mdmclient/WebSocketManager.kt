@@ -32,9 +32,9 @@ import java.util.concurrent.TimeUnit
  *
  * Connection attempts are allowed only inside a window that opens on each
  * network-available transition (which also covers process restart) and on an
- * established connection dropping. A manually configured URL is attempted first;
- * subsequent attempts use UDP discovery, retrying on a fixed interval. When the
- * window expires without a connection the client goes fully
+ * established connection dropping. Manual mode retries only the configured URL;
+ * Auto-Discovery mode runs UDP discovery before its cached/default fallback. When
+ * the window expires without a connection the client goes fully
  * silent until the next network transition. Window duration and retry interval
  * come from [ClientConfig] (defaults overridable via /sdcard/styly-mdm/config.json).
  * The state logic lives in [ConnectionScheduler]; all of it runs on the main
@@ -130,7 +130,7 @@ class WebSocketManager(
 
     // Invalidates the in-flight discovery thread when its attempt is cancelled.
     private var attemptGeneration = 0
-    private val manualUrlAttempt = ManualServerUrlAttempt()
+    private val connectionAttemptPolicy = ConnectionAttemptPolicy()
 
     // registerDefaultNetworkCallback can report the new network's onAvailable
     // before the old network's onLost when the default network switches; only
@@ -209,7 +209,7 @@ class WebSocketManager(
         for (action in actions) {
             when (action) {
                 is ConnectionScheduler.Action.WindowOpened ->
-                    manualUrlAttempt.onWindowOpened(getManualServerUrl(context))
+                    connectionAttemptPolicy.onWindowOpened(getManualServerUrl(context))
                 is ConnectionScheduler.Action.StartAttempt -> startAttempt()
                 is ConnectionScheduler.Action.ScheduleRetry -> {
                     onStatusChanged(false, "Reconnecting in ${action.delayMs / 1000}s...")
@@ -237,14 +237,15 @@ class WebSocketManager(
         }
     }
 
-    /** Attempts a manual URL once, then falls back to UDP discovery within the window. */
+    /** Starts an attempt using the connection mode fixed when the window opened. */
     private fun startAttempt() {
-        val manualUrl = manualUrlAttempt.take()
-        if (manualUrl != null) {
-            doConnect(manualUrl)
-            return
+        when (val target = connectionAttemptPolicy.targetForAttempt()) {
+            is ConnectionAttemptPolicy.Target.Manual -> doConnect(target.url)
+            ConnectionAttemptPolicy.Target.AutoDiscovery -> startAutoDiscoveryAttempt()
         }
+    }
 
+    private fun startAutoDiscoveryAttempt() {
         val generation = ++attemptGeneration
         onStatusChanged(false, "Discovering server...")
         Thread {

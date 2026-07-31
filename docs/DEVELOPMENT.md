@@ -223,7 +223,7 @@ STYLY-MDM/
     │       ├── MdmClientService.kt       # Foreground service; executes launch commands
     │       ├── WebSocketManager.kt       # WebSocket connection inside the bounded connection window
     │       ├── ConnectionScheduler.kt    # Connection-window state machine (host-JVM tested)
-    │       ├── ManualServerUrlAttempt.kt # One-shot manual URL ordering policy (host-JVM tested)
+    │       ├── ConnectionAttemptPolicy.kt # Per-window manual/auto target policy (host-JVM tested)
     │       ├── ClientConfig.kt           # Window/retry tunables + config-file overrides (host-JVM tested)
     │       ├── SettingsActivity.kt       # UI to configure server URL; shows client build; Update Journal viewer
     │       ├── ServerDiscovery.kt        # UDP broadcast server discovery
@@ -966,15 +966,14 @@ tested) that `WebSocketManager` executes on the main looper:
    immediately when a network is already up — so a process restart (self-update,
    settings save, reboot) gets a fresh window too. A fresh window likewise opens when
    an **established connection drops** while the network is still up.
-2. **Inside the window**, a URL saved manually in Settings is attempted once first.
-   If that attempt fails, later cycles run UDP discovery and connect to the discovered
-   URL, or fall back to the last discovery cache/default when nobody answers. Manual
-   configuration and the discovery cache use separate preference keys, so discovery
-   never overwrites the operator's URL. Failed attempts retry on a fixed interval;
-   OkHttp's `connectTimeout` is shortened to 3 s so a single black-holed attempt cannot
-   consume the window. With the 10 s / 2 s defaults, a full 3 s manual timeout plus
-   retry delay and 3 s discovery timeout leaves about 2 s for the cached fallback;
-   deployments that need another slow fallback attempt should lengthen the window.
+2. **Inside the window**, the connection target is fixed when the window opens. Manual
+   mode retries only the URL saved in Settings; it never runs UDP discovery or falls
+   back to the discovery cache/default URL. Auto-Discovery mode starts every attempt
+   with UDP discovery and connects to the discovered URL, or falls back to the last
+   discovery cache/default when nobody answers. Manual configuration and the discovery
+   cache use separate preference keys, so discovery never overwrites the operator's
+   URL. Failed attempts retry on a fixed interval; OkHttp's `connectTimeout` is
+   shortened to 3 s so a single black-holed attempt cannot consume the window.
 3. **On expiry without a connection** the in-flight socket is aborted (`cancel()`, no
    close handshake) and the client goes fully **silent** — no WebSocket attempts, no
    UDP, no pings — showing `Standby (no server found)` in the notification and
@@ -1046,12 +1045,10 @@ STYLY-MDM supports automatic server discovery via UDP broadcast on the LAN.
 | 1 | Client → Broadcast | Send `STYLYMDM_DISCOVER` as UTF-8 to `255.255.255.255:7071` (UDP) |
 | 2 | Server → Client | Respond with JSON: `{"service": "stylymdm", "ws_url": "ws://<ip>:7070/ws/device", "version": "1.0"}` |
 
-When a connection window has a manually configured URL, the client attempts it once
-before discovery. Every later attempt cycle starts with one discovery exchange, waiting
-up to 3 seconds for a response. If no server replies, discovery fails silently and the
-cycle proceeds against the last discovery cache (or the default URL). Discovery never
-changes the separately stored manual URL, so the next connection window prioritizes it
-again.
+Discovery runs only in Auto-Discovery mode. Every attempt cycle starts with one discovery
+exchange, waiting up to 3 seconds for a response. If no server replies, discovery fails
+silently and the cycle proceeds against the last discovery cache (or the default URL).
+Manual mode retries only the configured WebSocket URL and sends no discovery broadcasts.
 
 > The ports above are the production defaults. A development server/client uses
 > port 7081 (discovery) and 7080 (WebSocket) instead — see

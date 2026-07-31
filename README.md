@@ -113,7 +113,7 @@ Install the MDM client APK on the HMD (see the [Developer Guide](docs/DEVELOPMEN
      cache, then immediately start fresh discovery on the LAN.
    - Or enter a manual URL such as `ws://<server-ip>:7070/ws/device`, then tap
      **Save & Connect**. The client keeps this URL separate from discovery results
-     and tries it once at the start of each connection window.
+     and retries only that URL throughout each connection window.
 
 > **Note:** On first launch with no manual URL, the client automatically attempts
 > server discovery before falling back to the last discovered or default URL.
@@ -129,12 +129,10 @@ venue network:
 
 - After a network change, an app restart, or losing an established connection, the
   client tries to find a server for a short **connection window** (default **10
-  seconds**). A saved manual URL is tried once first; later failed attempts retry
-  after **2 seconds** and start with discovery.
-- With the defaults, a black-holed manual URL can use 3 seconds, followed by the
-  2-second retry delay and a discovery timeout of up to 3 seconds. This leaves only
-  about 2 seconds for the cached fallback connection. Increase
-  `connect_window_seconds` if that fallback must tolerate another slow timeout.
+  seconds**). Manual mode retries only the saved URL; Auto-Discovery mode starts
+  each attempt with discovery and then uses the discovery cache/default URL. Failed
+  attempts retry after **2 seconds**. Increase `connect_window_seconds` when the
+  server needs longer to boot before accepting connections.
 - If no server is found in time, it stops all network traffic and shows
   **`Standby (no server found)`** in its notification and settings screen. A standby
   client sends nothing at all — no reconnect attempts, no discovery broadcasts, no
