@@ -88,6 +88,12 @@ class MdmClientService : Service() {
         // since a surviving guard self-destructs on its own once the client is gone.
         private const val GUARD_UNINSTALL_WAIT_MS = 15_000L
 
+        // EXECUTE_UNINSTALL (#63) reports from the SDK callback, which — unlike the
+        // self-uninstall — always fires because the client survives. This bounds
+        // the wait anyway: without it a callback that never came would leave the
+        // package blocked from every later attempt and the console with no result.
+        private const val UNINSTALL_CALLBACK_WAIT_MS = 60_000L
+
         // Integrity verification (issue #37). The ZIP End-Of-Central-Directory record is
         // the fixed 22-byte trailer plus an optional comment of up to 0xFFFF bytes.
         private const val EOCD_MIN = 22
@@ -124,6 +130,17 @@ class MdmClientService : Service() {
     // when the retire fails, which re-opens guard provisioning on the next tick.
     @Volatile
     private var retireInProgress = false
+
+    // package -> the token of the EXECUTE_UNINSTALL (#63) attempt that owns it. A
+    // re-sent command must not start a second uninstall of the same package while
+    // the first is between the startup-app clear and its callback, or the
+    // restore-on-failure of one could undo the other. The token — rather than mere
+    // membership — is what keeps a late callback from a timed-out attempt out of a
+    // retry that has since claimed the same package. Guarded by synchronizing on
+    // the map itself; deliberately separate from retireInProgress, whose semantics
+    // (guard provisioning paused, client going away) are specific to the retire.
+    private val uninstallsInFlight = mutableMapOf<String, Long>()
+    private val uninstallOpSeq = java.util.concurrent.atomic.AtomicLong()
 
     override fun onCreate() {
         super.onCreate()
@@ -305,6 +322,7 @@ class MdmClientService : Service() {
         Log.i(TAG, "Handling command: $type")
         when (type) {
             "EXECUTE_LAUNCH" -> executeLaunch(payload)
+            "EXECUTE_UNINSTALL" -> executeUninstall(payload)
             "EXECUTE_INSTALL" -> executeInstall(payload)
             "EXECUTE_PUSH_FILES" -> executePushFiles(payload)
             "EXECUTE_VERIFY_APK" -> executeVerifyApk(payload)
@@ -391,6 +409,192 @@ class MdmClientService : Service() {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to launch $packageName", e)
             onResult("fail", e.message ?: "Unknown error")
+        }
+    }
+
+    /**
+     * EXECUTE_UNINSTALL (#63): silently remove a content app the console pushed.
+     *
+     * Unlike the retire path this uninstalls someone *else's* package, so the
+     * process survives whatever happens and the SDK callback always fires — the
+     * result is reported from it exactly like a silent install, rather than
+     * retire's "silence is success".
+     *
+     * The MDM client's own package and the guard are refused here as well as on
+     * the server: removing either behind the console's back would leave the
+     * device unmanaged, and the only sanctioned way out is the ordered retire
+     * ceremony in [executeSelfUninstall].
+     */
+    private fun executeUninstall(payload: JSONObject) {
+        val target = payload.optString("package_name", "").trim()
+        if (target.isEmpty()) {
+            Log.e(TAG, "EXECUTE_UNINSTALL missing package_name")
+            sendUninstallResult(target, "fail", "Missing package_name")
+            return
+        }
+        if (target == packageName || target == GuardLink.GUARD_PACKAGE) {
+            Log.w(TAG, "Refusing to uninstall the STYLY-MDM package $target")
+            sendUninstallResult(
+                target, "fail",
+                "$target belongs to STYLY-MDM itself; use Retire Device to remove the MDM client"
+            )
+            return
+        }
+        // Each attempt gets its own token. Everything below reports through it, so
+        // a slow callback from a timed-out attempt cannot settle — or consume the
+        // in-flight key of — the retry that replaced it.
+        val op = uninstallOpSeq.incrementAndGet()
+        val claimed = synchronized(uninstallsInFlight) {
+            if (uninstallsInFlight.containsKey(target)) false
+            else { uninstallsInFlight[target] = op; true }
+        }
+        if (!claimed) {
+            // The server acked this dispatch with DELETE_APP_SENT, so staying
+            // silent would leave the operator with a "sent" and no outcome.
+            Log.w(TAG, "Uninstall of $target already in flight; reporting the duplicate as failed")
+            sendUninstallResult(target, "fail", "An uninstall of this package is already in flight")
+            return
+        }
+
+        // Own thread: every step below is a binder call (PackageManager included)
+        // and the WebSocket reader thread must stay free to carry every other
+        // command and result.
+        Thread {
+            // Non-null once the startup app has been cleared for this uninstall,
+            // holding what to put back if the uninstall then fails.
+            var clearedStartup: Pair<String, String>? = null
+            try {
+                if (!isPackageInstalled(target)) {
+                    finishUninstall(target, op, "fail", "Package not installed", null, false)
+                    return@Thread
+                }
+
+                val binder = ToBServiceHelper.getInstance().serviceBinder
+                if (binder == null) {
+                    finishUninstall(target, op, "fail", "TobService not available", null, false)
+                    return@Thread
+                }
+
+                // A package that is about to disappear must not stay the device's
+                // startup app, or every boot would launch something missing. The
+                // setting is cleared first and restored below if the uninstall
+                // fails, so a failed operation changes nothing.
+                val startupConfig = webSocketManager.getStartupAppConfig()
+                if (startupConfig != null && startupConfig.first == target) {
+                    clearStartupAppPrefs()
+                    clearedStartup = startupConfig
+                    Log.i(TAG, "Cleared the startup app before uninstalling $target")
+                }
+
+                Log.i(TAG, "Uninstalling package: $target")
+                val done = CountDownLatch(1)
+                binder.pbsControlAPPManger(
+                    PBS_PackageControlEnum.PACKAGE_SILENCE_UNINSTALL,
+                    target,
+                    0,
+                    object : IIntCallback.Stub() {
+                        override fun callback(result: Int) {
+                            Log.i(TAG, "pbsControlAPPManger uninstall result: $result for $target")
+                            done.countDown()
+                            if (!ownsUninstall(target, op)) {
+                                // This attempt already timed out and something else
+                                // may own the package now. Touching prefs or sending
+                                // a result here would corrupt that newer operation.
+                                Log.w(TAG, "Late uninstall callback for $target (result=$result); dropping it")
+                                return
+                            }
+                            val restored = result != 0 && restoreStartupApp(clearedStartup)
+                            finishUninstall(
+                                target,
+                                op,
+                                if (result == 0) "success" else "fail",
+                                if (result == 0) ""
+                                else "pbsControlAPPManger returned $result: ${installResultMessage(result)}",
+                                result,
+                                clearedStartup != null && result == 0
+                            )
+                            if (result != 0 && clearedStartup != null && !restored) {
+                                Log.i(TAG, "Startup app changed during the uninstall; left the newer setting alone")
+                            }
+                        }
+                    }
+                )
+                // A callback that never comes would otherwise leave the package
+                // blocked from every later attempt and the console waiting on a
+                // result that cannot arrive. The package list is the ground truth
+                // at that point, so read it rather than guessing.
+                if (!done.await(UNINSTALL_CALLBACK_WAIT_MS, TimeUnit.MILLISECONDS)) {
+                    val gone = !isPackageInstalled(target)
+                    Log.w(
+                        TAG,
+                        "No uninstall callback for $target within ${UNINSTALL_CALLBACK_WAIT_MS}ms " +
+                            "(package ${if (gone) "is gone" else "is still installed"})"
+                    )
+                    if (!gone) restoreStartupApp(clearedStartup)
+                    finishUninstall(
+                        target,
+                        op,
+                        if (gone) "success" else "fail",
+                        if (gone) ""
+                        else "No uninstall callback within ${UNINSTALL_CALLBACK_WAIT_MS / 1000}s",
+                        null,
+                        clearedStartup != null && gone
+                    )
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "Uninstall of $target threw", e)
+                restoreStartupApp(clearedStartup)
+                finishUninstall(target, op, "fail", e.message ?: "Unknown error", null, false)
+            }
+        }.start()
+    }
+
+    private fun ownsUninstall(target: String, op: Long): Boolean =
+        synchronized(uninstallsInFlight) { uninstallsInFlight[target] == op }
+
+    /**
+     * Put back a startup app this uninstall cleared — but only if nothing else has
+     * set one since. An operator who configured a new startup app while the
+     * uninstall was running must not have it replaced by the package we just tried
+     * (and failed) to remove. Returns whether the restore happened.
+     */
+    private fun restoreStartupApp(cleared: Pair<String, String>?): Boolean {
+        if (cleared == null) return false
+        if (webSocketManager.getStartupAppConfig() != null) return false
+        setStartupAppPrefs(cleared.first, cleared.second)
+        Log.i(TAG, "Restored the startup app after a failed uninstall")
+        return true
+    }
+
+    /**
+     * Report an uninstall exactly once, and only for the attempt that still owns
+     * the package. Releasing the in-flight entry is part of the same guarded step,
+     * so a timed-out attempt can neither report twice nor free a retry's claim.
+     */
+    private fun finishUninstall(
+        target: String,
+        op: Long,
+        status: String,
+        error: String,
+        resultCode: Int?,
+        startupAppCleared: Boolean
+    ) {
+        val owns = synchronized(uninstallsInFlight) {
+            if (uninstallsInFlight[target] == op) { uninstallsInFlight.remove(target); true } else false
+        }
+        if (!owns) {
+            Log.i(TAG, "Uninstall $op of $target no longer owns the package; dropping the result")
+            return
+        }
+        sendUninstallResult(target, status, error, resultCode, startupAppCleared)
+    }
+
+    private fun isPackageInstalled(target: String): Boolean {
+        return try {
+            packageManager.getPackageInfo(target, 0)
+            true
+        } catch (e: android.content.pm.PackageManager.NameNotFoundException) {
+            false
         }
     }
 
@@ -1211,29 +1415,38 @@ class MdmClientService : Service() {
             return
         }
 
-        val prefs = getSharedPreferences(
-            WebSocketManager.PREF_NAME, android.content.Context.MODE_PRIVATE
-        )
-        prefs.edit()
-            .putString(WebSocketManager.PREF_STARTUP_APP_PACKAGE, packageName)
-            .putString(WebSocketManager.PREF_STARTUP_APP_EXTRA, extra)
-            .apply()
+        setStartupAppPrefs(packageName, extra)
 
         Log.i(TAG, "Startup app set: $packageName")
         sendStartupAppResult("success", "", packageName)
     }
 
     private fun handleClearStartupApp() {
-        val prefs = getSharedPreferences(
-            WebSocketManager.PREF_NAME, android.content.Context.MODE_PRIVATE
-        )
-        prefs.edit()
-            .remove(WebSocketManager.PREF_STARTUP_APP_PACKAGE)
-            .remove(WebSocketManager.PREF_STARTUP_APP_EXTRA)
-            .apply()
+        clearStartupAppPrefs()
 
         Log.i(TAG, "Startup app cleared")
         sendStartupAppResult("success", "")
+    }
+
+    /**
+     * Persist the startup app without reporting it. Shared by SET_STARTUP_APP and
+     * the uninstall path, which restores a startup app it cleared speculatively
+     * and must not emit a STARTUP_APP_RESULT for a command nobody sent.
+     */
+    private fun setStartupAppPrefs(packageName: String, extra: String) {
+        getSharedPreferences(WebSocketManager.PREF_NAME, android.content.Context.MODE_PRIVATE)
+            .edit()
+            .putString(WebSocketManager.PREF_STARTUP_APP_PACKAGE, packageName)
+            .putString(WebSocketManager.PREF_STARTUP_APP_EXTRA, extra)
+            .apply()
+    }
+
+    private fun clearStartupAppPrefs() {
+        getSharedPreferences(WebSocketManager.PREF_NAME, android.content.Context.MODE_PRIVATE)
+            .edit()
+            .remove(WebSocketManager.PREF_STARTUP_APP_PACKAGE)
+            .remove(WebSocketManager.PREF_STARTUP_APP_EXTRA)
+            .apply()
     }
 
     private fun sendStartupAppResult(status: String, error: String, packageName: String = "") {
@@ -1263,6 +1476,30 @@ class MdmClientService : Service() {
                 Log.i(TAG, "Startup app launch result: $status ${if (error.isNotEmpty()) "- $error" else ""}")
             }
         }, 3000L)
+    }
+
+    private fun sendUninstallResult(
+        packageName: String,
+        status: String,
+        error: String,
+        resultCode: Int? = null,
+        startupAppCleared: Boolean = false
+    ) {
+        val result = JSONObject().apply {
+            put("type", "DELETE_APP_RESULT")
+            put("status", status)
+            put("package_name", packageName)
+            if (error.isNotEmpty()) {
+                put("error", error)
+            }
+            if (resultCode != null) {
+                put("result_code", resultCode)
+            }
+            if (startupAppCleared) {
+                put("startup_app_cleared", true)
+            }
+        }
+        webSocketManager.sendMessage(result)
     }
 
     private fun sendLaunchResult(packageName: String, status: String, error: String) {
