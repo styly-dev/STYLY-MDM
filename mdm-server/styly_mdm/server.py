@@ -1532,8 +1532,11 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
 # ---------------------------------------------------------------------------
 
 async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
-    # A compressed admin connection was observed closing with a reserved-bit
-    # protocol error on the first control frame after a long HTTP upload.
+    # On aiohttp 3.14.3, the server-side reader rejected Chrome's first PUSH_FILES
+    # text frame after a long upload with "Received frame with non-zero reserved
+    # bits". The failure was observed only on the inbound Chrome admin frame.
+    # The device channel receives compressed OkHttp frames through the same
+    # reader, so device-side immunity is unverified and remains under observation.
     # Admin messages are small control JSON, so compression saves effectively
     # nothing on this channel.
     # Keep compression enabled for the device channel, where messages can be
