@@ -26,7 +26,7 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var serverUrlInput: EditText
     private lateinit var statusText: TextView
     private lateinit var saveButton: Button
-    private lateinit var discoverButton: Button
+    private lateinit var autoDiscoveryButton: Button
     private lateinit var storagePermissionStatus: TextView
     private lateinit var grantStorageButton: Button
     private lateinit var journalText: TextView
@@ -57,24 +57,21 @@ class SettingsActivity : AppCompatActivity() {
         serverUrlInput = findViewById(R.id.server_url_input)
         statusText = findViewById(R.id.status_text)
         saveButton = findViewById(R.id.save_button)
-        discoverButton = findViewById(R.id.discover_button)
+        autoDiscoveryButton = findViewById(R.id.use_auto_discovery_button)
         storagePermissionStatus = findViewById(R.id.storage_permission_status)
         grantStorageButton = findViewById(R.id.grant_storage_button)
         journalText = findViewById(R.id.journal_text)
         journalRefreshButton = findViewById(R.id.journal_refresh_button)
         journalClearButton = findViewById(R.id.journal_clear_button)
 
-        // Load current server URL
-        val prefs = getSharedPreferences("stylymdm_prefs", MODE_PRIVATE)
-        val currentUrl = prefs.getString("server_url", WebSocketManager.DEFAULT_SERVER_URL) ?: ""
-        serverUrlInput.setText(currentUrl)
+        serverUrlInput.setText(WebSocketManager.getManualServerUrl(this).orEmpty())
 
         saveButton.setOnClickListener {
             saveAndRestart()
         }
 
-        discoverButton.setOnClickListener {
-            discoverServer()
+        autoDiscoveryButton.setOnClickListener {
+            useAutoDiscovery()
         }
 
         grantStorageButton.setOnClickListener {
@@ -115,40 +112,38 @@ class SettingsActivity : AppCompatActivity() {
         unregisterReceiver(statusReceiver)
     }
 
-    private fun discoverServer() {
-        discoverButton.isEnabled = false
-        discoverButton.text = "Discovering..."
-        Thread {
-            val url = ServerDiscovery.discover()
-            runOnUiThread {
-                discoverButton.isEnabled = true
-                discoverButton.text = getString(R.string.discover_server)
-                if (url != null) {
-                    serverUrlInput.setText(url)
-                    Toast.makeText(this, "Server found!", Toast.LENGTH_SHORT).show()
-                } else {
-                    Toast.makeText(this, "No server found on LAN", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }.start()
-    }
-
     private fun saveAndRestart() {
         val url = serverUrlInput.text.toString().trim()
-        if (url.isEmpty()) return
+        if (url.isEmpty()) {
+            Toast.makeText(
+                this,
+                "Enter a manual URL or use Auto-Discovery",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
 
-        // Save the URL
-        val prefs = getSharedPreferences("stylymdm_prefs", MODE_PRIVATE)
-        prefs.edit().putString("server_url", url).apply()
+        if (!WebSocketManager.saveManualServerUrl(this, url)) {
+            Toast.makeText(this, "Enter a valid ws:// or wss:// URL", Toast.LENGTH_SHORT).show()
+            return
+        }
 
-        // Restart the service to apply new URL
+        restartService("Reconnecting...")
+    }
+
+    private fun useAutoDiscovery() {
+        WebSocketManager.clearServerUrlsForAutoDiscovery(this)
+        serverUrlInput.text.clear()
+        restartService("Discovering...")
+    }
+
+    private fun restartService(status: String) {
         stopService(Intent(this, MdmClientService::class.java))
         startForegroundService(
             Intent(this, MdmClientService::class.java)
                 .putExtra(MdmClientService.EXTRA_START_REASON, MdmClientService.REASON_SETTINGS)
         )
-
-        statusText.text = "Reconnecting..."
+        statusText.text = status
     }
 
     /**

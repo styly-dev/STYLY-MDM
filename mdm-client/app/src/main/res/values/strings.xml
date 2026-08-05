@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">STYLY-MDM Client</string>
-    <string name="server_url_label">Server URL</string>
+    <string name="server_url_label">Manual Server URL (optional)</string>
     <string name="server_url_hint">ws://192.168.1.100:7070/ws/device</string>
-    <string name="discover_server">Discover Server</string>
+    <string name="use_auto_discovery">Use Auto-Discovery</string>
     <string name="save_and_connect">Save &amp; Connect</string>
     <string name="connection_status_label">Connection Status</string>
     <string name="status_unknown">Not connected</string>

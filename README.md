@@ -108,12 +108,15 @@ The **data directory** holds everything the server persists: uploaded APKs (`apk
 Install the MDM client APK on the HMD (see the [Developer Guide](docs/DEVELOPMENT.md) for build and install instructions), then:
 
 1. Launch **STYLY-MDM Client** on the HMD.
-2. Tap **Discover Server** to automatically find the server on the LAN.
-   - If discovery succeeds, the URL field is populated automatically.
-   - Alternatively, enter the server URL manually: `ws://<server-ip>:7070/ws/device`
-3. Tap **Save & Connect**.
+2. Choose the connection mode:
+   - Tap **Use Auto-Discovery** to clear any manual override and previous discovery
+     cache, then immediately start fresh discovery on the LAN.
+   - Or enter a manual URL such as `ws://<server-ip>:7070/ws/device`, then tap
+     **Save & Connect**. The client keeps this URL separate from discovery results
+     and retries only that URL throughout each connection window.
 
-> **Note:** On first launch with no saved URL, the client automatically attempts server discovery before falling back to the default URL.
+> **Note:** On first launch with no manual URL, the client automatically attempts
+> server discovery before falling back to the last discovered or default URL.
 
 The MDM client connects to the server, registers the device (serial number, model, IP address), and runs as a foreground service in the background.
 
@@ -126,7 +129,10 @@ venue network:
 
 - After a network change, an app restart, or losing an established connection, the
   client tries to find a server for a short **connection window** (default **10
-  seconds**, one discovery + connect attempt every **2 seconds**).
+  seconds**). Manual mode retries only the saved URL; Auto-Discovery mode starts
+  each attempt with discovery and then uses the discovery cache/default URL. Failed
+  attempts retry after **2 seconds**. Increase `connect_window_seconds` when the
+  server needs longer to boot before accepting connections.
 - If no server is found in time, it stops all network traffic and shows
   **`Standby (no server found)`** in its notification and settings screen. A standby
   client sends nothing at all — no reconnect attempts, no discovery broadcasts, no

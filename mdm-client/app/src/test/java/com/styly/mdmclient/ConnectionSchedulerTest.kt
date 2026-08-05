@@ -3,6 +3,7 @@ package com.styly.mdmclient
 import com.styly.mdmclient.ConnectionScheduler.Action
 import com.styly.mdmclient.ConnectionScheduler.State
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -18,8 +19,15 @@ class ConnectionSchedulerTest {
         val s = scheduler()
         val actions = s.onNetworkAvailable(now = 1_000L)
         assertEquals(State.WINDOW_OPEN, s.state)
-        assertTrue(actions.contains(Action.StartAttempt))
-        assertTrue(actions.contains(Action.ScheduleWindowExpiry(ClientConfig.DEFAULT_CONNECT_WINDOW_MS)))
+        assertEquals(
+            listOf(
+                Action.CancelTimers,
+                Action.ScheduleWindowExpiry(ClientConfig.DEFAULT_CONNECT_WINDOW_MS),
+                Action.WindowOpened,
+                Action.StartAttempt,
+            ),
+            actions,
+        )
     }
 
     @Test
@@ -28,6 +36,7 @@ class ConnectionSchedulerTest {
         s.onNetworkAvailable(now = 0L)
         val actions = s.onSocketDisconnected(now = 3_000L)
         assertEquals(listOf<Action>(Action.ScheduleRetry(7_000L)), actions)
+        assertFalse(actions.contains(Action.WindowOpened))
         assertEquals(State.WINDOW_OPEN, s.state)
     }
 
@@ -97,6 +106,7 @@ class ConnectionSchedulerTest {
         assertEquals(State.CONNECTED, s.state)
         val actions = s.onSocketDisconnected(now = 500_000L)
         assertEquals(State.WINDOW_OPEN, s.state)
+        assertTrue(actions.contains(Action.WindowOpened))
         assertTrue(actions.contains(Action.StartAttempt))
         assertTrue(actions.contains(Action.ScheduleWindowExpiry(ClientConfig.DEFAULT_CONNECT_WINDOW_MS)))
         // The fresh window is anchored on the drop time, not the original window.

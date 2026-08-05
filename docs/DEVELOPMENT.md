@@ -223,6 +223,7 @@ STYLY-MDM/
     │       ├── MdmClientService.kt       # Foreground service; executes launch commands
     │       ├── WebSocketManager.kt       # WebSocket connection inside the bounded connection window
     │       ├── ConnectionScheduler.kt    # Connection-window state machine (host-JVM tested)
+    │       ├── ConnectionAttemptPolicy.kt # Per-window manual/auto target policy (host-JVM tested)
     │       ├── ClientConfig.kt           # Window/retry tunables + config-file overrides (host-JVM tested)
     │       ├── SettingsActivity.kt       # UI to configure server URL; shows client build; Update Journal viewer
     │       ├── ServerDiscovery.kt        # UDP broadcast server discovery
@@ -1026,17 +1027,27 @@ tested) that `WebSocketManager` executes on the main looper:
    immediately when a network is already up — so a process restart (self-update,
    settings save, reboot) gets a fresh window too. A fresh window likewise opens when
    an **established connection drops** while the network is still up.
-2. **Inside the window** every attempt cycle runs UDP discovery first (a saved-but-stale
-   URL must not keep the client away from a relocated server), then connects to the
-   saved URL, which discovery just refreshed if a server answered. Failed attempts
-   retry on a fixed interval; OkHttp's `connectTimeout` is shortened to 3 s so a single
-   black-holed attempt cannot consume the window.
+2. **Inside the window**, the connection target is fixed when the window opens. Manual
+   mode retries only the URL saved in Settings; it never runs UDP discovery or falls
+   back to the discovery cache/default URL. Auto-Discovery mode starts every attempt
+   with UDP discovery and connects to the discovered URL, or falls back to the last
+   discovery cache/default when nobody answers. Manual configuration and the discovery
+   cache use separate preference keys, so discovery never overwrites the operator's
+   URL. Failed attempts retry on a fixed interval; OkHttp's `connectTimeout` is
+   shortened to 3 s so a single black-holed attempt cannot consume the window.
 3. **On expiry without a connection** the in-flight socket is aborted (`cancel()`, no
    close handshake) and the client goes fully **silent** — no WebSocket attempts, no
    UDP, no pings — showing `Standby (no server found)` in the notification and
    Settings screen. Losing the network cancels everything the same way (`IDLE`).
 4. **Recovery from silence** is any new network-available transition: toggling Wi-Fi,
    rebooting while the server is up, or restarting the client process.
+
+Older clients stored both Settings input and discovery results under `server_url`, so
+their origin cannot be recovered during upgrade. That legacy value is treated as a
+discovery cache. Operators who need it pinned as a manual endpoint must re-enter it in
+Settings and tap **Save & Connect**. **Use Auto-Discovery** removes both the manual
+preference and the previous discovery cache, then restarts the service so a fresh discovery
+begins immediately. A successful discovery creates a new cache for later fallback.
 
 ### Connection tunables (`/sdcard/styly-mdm/config.json`)
 
@@ -1095,10 +1106,10 @@ STYLY-MDM supports automatic server discovery via UDP broadcast on the LAN.
 | 1 | Client → Broadcast | Send `STYLYMDM_DISCOVER` as UTF-8 to `255.255.255.255:7071` (UDP) |
 | 2 | Server → Client | Respond with JSON: `{"service": "stylymdm", "ws_url": "ws://<ip>:7070/ws/device", "version": "1.0"}` |
 
-The client runs one discovery exchange at the start of every attempt cycle inside its
-[connection window](#client-connection-lifecycle-bounded-connection-window), waiting up
-to 3 seconds for a response. If no server replies, discovery fails silently and the
-cycle proceeds against the saved (or default) URL.
+Discovery runs only in Auto-Discovery mode. Every attempt cycle starts with one discovery
+exchange, waiting up to 3 seconds for a response. If no server replies, discovery fails
+silently and the cycle proceeds against the last discovery cache (or the default URL).
+Manual mode retries only the configured WebSocket URL and sends no discovery broadcasts.
 
 > The ports above are the production defaults. A development server/client uses
 > port 7081 (discovery) and 7080 (WebSocket) instead — see

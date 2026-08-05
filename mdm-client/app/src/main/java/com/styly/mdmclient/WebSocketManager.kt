@@ -32,9 +32,9 @@ import java.util.concurrent.TimeUnit
  *
  * Connection attempts are allowed only inside a window that opens on each
  * network-available transition (which also covers process restart) and on an
- * established connection dropping. Inside the window every attempt cycle runs
- * UDP discovery first and then connects to the saved URL, retrying on a fixed
- * interval; when the window expires without a connection the client goes fully
+ * established connection dropping. Manual mode retries only the configured URL;
+ * Auto-Discovery mode runs UDP discovery before its cached/default fallback. When
+ * the window expires without a connection the client goes fully
  * silent until the next network transition. Window duration and retry interval
  * come from [ClientConfig] (defaults overridable via /sdcard/styly-mdm/config.json).
  * The state logic lives in [ConnectionScheduler]; all of it runs on the main
@@ -50,6 +50,8 @@ class WebSocketManager(
         private const val TAG = "WebSocketManager"
         const val PREF_NAME = "stylymdm_prefs"
         private const val PREF_SERVER_URL = "server_url"
+        // Kept separate from PREF_SERVER_URL, which is only a discovery cache.
+        private const val PREF_MANUAL_SERVER_URL = "manual_server_url_value"
         // Last-resort fallback used only when discovery fails and no URL is saved.
         // The port is flavor-aware (BuildConfig.DEFAULT_WS_PORT) so the dev build
         // never falls back to the production port and accidentally connects to a
@@ -63,6 +65,51 @@ class WebSocketManager(
 
         const val PREF_STARTUP_APP_PACKAGE = "startup_app_package"
         const val PREF_STARTUP_APP_EXTRA = "startup_app_extra"
+
+        internal fun saveManualServerUrl(context: Context, url: String): Boolean {
+            val normalized = url.trim()
+            if (!isValidWsUrl(normalized)) return false
+            preferences(context)
+                .edit()
+                .putString(PREF_MANUAL_SERVER_URL, normalized)
+                .apply()
+            return true
+        }
+
+        internal fun clearServerUrlsForAutoDiscovery(context: Context) {
+            preferences(context)
+                .edit()
+                .remove(PREF_MANUAL_SERVER_URL)
+                .remove(PREF_SERVER_URL)
+                .apply()
+        }
+
+        internal fun getManualServerUrl(context: Context): String? {
+            return preferences(context)
+                .getString(PREF_MANUAL_SERVER_URL, null)
+                ?.takeIf(::isValidWsUrl)
+        }
+
+        private fun getCachedServerUrl(context: Context): String {
+            return preferences(context)
+                .getString(PREF_SERVER_URL, null)
+                ?.takeIf(::isValidWsUrl)
+                ?: DEFAULT_SERVER_URL
+        }
+
+        private fun preferences(context: Context) =
+            context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+
+        private fun isValidWsUrl(url: String): Boolean {
+            if (!url.startsWith("ws://") && !url.startsWith("wss://")) return false
+            return try {
+                // OkHttp accepts WebSocket URLs here by normalizing ws/wss to http/https.
+                Request.Builder().url(url).build()
+                true
+            } catch (_: IllegalArgumentException) {
+                false
+            }
+        }
     }
 
     private val client = OkHttpClient.Builder()
@@ -83,6 +130,7 @@ class WebSocketManager(
 
     // Invalidates the in-flight discovery thread when its attempt is cancelled.
     private var attemptGeneration = 0
+    private val connectionAttemptPolicy = ConnectionAttemptPolicy()
 
     // registerDefaultNetworkCallback can report the new network's onAvailable
     // before the old network's onLost when the default network switches; only
@@ -108,14 +156,8 @@ class WebSocketManager(
         }
     }
 
-    fun getServerUrl(): String {
-        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-        return prefs.getString(PREF_SERVER_URL, DEFAULT_SERVER_URL) ?: DEFAULT_SERVER_URL
-    }
-
-    fun setServerUrl(url: String) {
-        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putString(PREF_SERVER_URL, url).apply()
+    private fun saveDiscoveredServerUrl(url: String) {
+        preferences(context).edit().putString(PREF_SERVER_URL, url).apply()
     }
 
     fun connect() {
@@ -166,6 +208,8 @@ class WebSocketManager(
     private fun dispatch(actions: List<ConnectionScheduler.Action>) {
         for (action in actions) {
             when (action) {
+                is ConnectionScheduler.Action.WindowOpened ->
+                    connectionAttemptPolicy.onWindowOpened(getManualServerUrl(context))
                 is ConnectionScheduler.Action.StartAttempt -> startAttempt()
                 is ConnectionScheduler.Action.ScheduleRetry -> {
                     onStatusChanged(false, "Reconnecting in ${action.delayMs / 1000}s...")
@@ -193,12 +237,15 @@ class WebSocketManager(
         }
     }
 
-    /**
-     * One attempt cycle: UDP discovery first (a saved-but-stale URL must not
-     * keep the client away from a relocated server), then connect to the saved
-     * URL — which discovery just refreshed if a server answered.
-     */
+    /** Starts an attempt using the connection mode fixed when the window opened. */
     private fun startAttempt() {
+        when (val target = connectionAttemptPolicy.targetForAttempt()) {
+            is ConnectionAttemptPolicy.Target.Manual -> doConnect(target.url)
+            ConnectionAttemptPolicy.Target.AutoDiscovery -> startAutoDiscoveryAttempt()
+        }
+    }
+
+    private fun startAutoDiscoveryAttempt() {
         val generation = ++attemptGeneration
         onStatusChanged(false, "Discovering server...")
         Thread {
@@ -209,9 +256,11 @@ class WebSocketManager(
                 ) return@post
                 if (discovered != null && isValidWsUrl(discovered)) {
                     Log.i(TAG, "Discovered server at: $discovered")
-                    setServerUrl(discovered)
+                    saveDiscoveredServerUrl(discovered)
+                    doConnect(discovered)
+                } else {
+                    doConnect(getCachedServerUrl(context))
                 }
-                doConnect()
             }
         }.start()
     }
@@ -224,10 +273,9 @@ class WebSocketManager(
         webSocket = null
     }
 
-    private fun doConnect() {
+    private fun doConnect(url: String) {
         if (!isRunning) return
 
-        val url = getServerUrl()
         Log.i(TAG, "Connecting to $url")
         onStatusChanged(false, "Connecting to $url...")
 
@@ -294,10 +342,6 @@ class WebSocketManager(
         val pkg = prefs.getString(PREF_STARTUP_APP_PACKAGE, null) ?: return null
         val extra = prefs.getString(PREF_STARTUP_APP_EXTRA, "") ?: ""
         return Pair(pkg, extra)
-    }
-
-    private fun isValidWsUrl(url: String): Boolean {
-        return url.isNotBlank() && (url.startsWith("ws://") || url.startsWith("wss://"))
     }
 
     private fun sendRegistration() {
