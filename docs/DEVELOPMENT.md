@@ -928,10 +928,11 @@ requires a client update + redeploy.
 
 **Power off while charging.** The shutdown path invokes
 `DEVICE_CONTROL_SHUTDOWN` without changing the PICO device-wide *"power off with USB cable"*
-setting. This prevents a remote power-off from modifying a persistent system setting. Whether
-a cabled headset can power off is therefore controlled by the device's existing PICO setting;
-if the SDK rejects the shutdown, the client reports `POWER_OFF_RESULT: fail`. Reboot does not
-touch this setting.
+setting. This prevents a remote power-off from modifying a persistent system setting. On tested
+PICO devices, whether a cabled headset can power off depends on the current PICO setting and
+device firmware; behavior may vary by model and PUI version. If the device remains online,
+check that setting. If the SDK rejects the shutdown, the client reports `POWER_OFF_RESULT: fail`.
+Reboot does not touch this setting.
 
 **Outcome model — the success signal is the device going offline, not a RESULT.** A
 successful reboot/shutdown tears down the client process and the WebSocket before any
