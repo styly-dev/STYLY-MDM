@@ -927,17 +927,13 @@ gated by the `pico_advance_interface` manifest flag the client already declares.
 permission and no SDK addition were needed; shipping the two command handlers is what
 requires a client update + redeploy.
 
-**Power off while charging.** A PICO headset refuses a full power-off while a USB/charging
-cable is connected unless the device-wide *"power off with USB cable"* setting is enabled —
-so a plain `DEVICE_CONTROL_SHUTDOWN` leaves a cabled (venue) device on. The shutdown path
-therefore calls `pbsControlSetPowerOffwithUSBCable(S_ON, 0)` as a **precondition** — before
-the `accepted` ack — so a cabled device actually powers off; if the setting cannot be applied
-the client reports `POWER_OFF_RESULT: fail` and does not proceed, rather than acking
-`accepted` on a device that would stay online. This is a persistent, device-wide setting and the
-trade-off is deliberate: a headset on a charging dock **can be remotely powered off and then
-stranded until it is physically woken** — which is exactly the intended venue capability, and
-why the console gates power-off behind a confirmation. Reboot does not touch this setting (it
-cycles regardless of charge state).
+**Power off while charging.** The shutdown path invokes
+`DEVICE_CONTROL_SHUTDOWN` without changing the PICO device-wide *"power off with USB cable"*
+setting. This prevents a remote power-off from modifying a persistent system setting. On tested
+PICO devices, whether a cabled headset can power off depends on the current PICO setting and
+device firmware; behavior may vary by model and PUI version. If the device remains online,
+check that setting. If the SDK rejects the shutdown, the client reports `POWER_OFF_RESULT: fail`.
+Reboot does not touch this setting.
 
 **Outcome model — the success signal is the device going offline, not a RESULT.** A
 successful reboot/shutdown tears down the client process and the WebSocket before any
