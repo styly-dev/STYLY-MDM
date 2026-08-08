@@ -1111,6 +1111,23 @@ Manual mode retries only the configured WebSocket URL and sends no discovery bro
 > port 7081 (discovery) and 7080 (WebSocket) instead — see
 > [Running a Dev Environment Alongside Production](#running-a-dev-environment-alongside-production).
 
+### Which address the server advertises
+
+A server machine rarely has one "own" IP: a laptop carries Wi-Fi plus an unplugged
+Ethernet port holding a self-assigned `169.254.x.x`, and a Windows host sharing its
+connection (ICS) carries `192.168.137.1` alongside its uplink NIC. The address a device
+must connect to therefore depends on **which network that device broadcast from**.
+
+So `ws_url` is resolved per request, not at startup. `source_ip_for()` opens a connected
+UDP socket toward the requester — `connect()` consults the routing table without sending
+a packet — and reports the local address on the interface facing them. Only if that
+lookup fails does the server fall back to the first entry of the startup-time
+`get_local_ip_addresses()` list.
+
+That list drops link-local (`169.254.0.0/16`) addresses as well as loopback. Link-local
+addresses are self-assigned to interfaces that failed DHCP, so they are never reachable
+from a device on the real LAN; advertising one strands every client that believes it.
+
 ### Startup duplicate-server guard
 
 Because the client takes the **first** discovery response it receives, two

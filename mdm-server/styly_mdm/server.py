@@ -2968,6 +2968,25 @@ DISCOVERY_PORT = int(os.environ.get("MDM_DISCOVERY_PORT", "7071"))
 DISCOVERY_REQUEST = b"STYLYMDM_DISCOVER"
 
 
+def source_ip_for(peer: str) -> str | None:
+    """Return the local IPv4 the kernel would use to reach ``peer``, or None.
+
+    A connected UDP socket sends nothing — ``connect()`` only consults the routing
+    table — so this is a cheap, side-effect-free way to ask "which of my interfaces
+    faces this device?". That question is the whole point: a machine with several
+    interfaces (Wi-Fi plus an unplugged Ethernet holding a self-assigned
+    169.254.x.x, or Windows ICS alongside an uplink NIC) has no single "own" IP,
+    and the right answer differs per requester.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((peer, 9))
+            ip = s.getsockname()[0]
+    except OSError:
+        return None
+    return ip if ip and not ip.startswith("127.") else None
+
+
 class _UdpDiscoveryProtocol(asyncio.DatagramProtocol):
     """Responds to UDP broadcast discovery requests with the server's WebSocket URL."""
 
@@ -2980,7 +2999,12 @@ class _UdpDiscoveryProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]):
         if data.strip() == DISCOVERY_REQUEST:
-            server_ip = self._ip_addresses[0] if self._ip_addresses else "0.0.0.0"
+            # Answer with the address on the interface facing *this* requester. The
+            # startup-time list is only a fallback: it is fixed at boot and cannot
+            # know which network a device broadcast from.
+            server_ip = source_ip_for(addr[0])
+            if server_ip is None:
+                server_ip = self._ip_addresses[0] if self._ip_addresses else "0.0.0.0"
             response = json.dumps({
                 "service": "stylymdm",
                 "ws_url": f"ws://{server_ip}:{self._ws_port}/ws/device",
@@ -3094,12 +3118,19 @@ def create_app() -> web.Application:
 
 
 def get_local_ip_addresses() -> list[str]:
-    """Return a list of non-loopback IPv4 addresses for this machine."""
+    """Return this machine's usable non-loopback IPv4 addresses.
+
+    Feeds the startup banner and the discovery responder's fallback. Link-local
+    (169.254.0.0/16) addresses are dropped: they are self-assigned to interfaces
+    that failed DHCP — an unplugged Ethernet port or a Thunderbolt bridge — so they
+    are never reachable from a device on the real LAN. Advertising one to a client
+    is strictly worse than advertising nothing.
+    """
     addresses: list[str] = []
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
             ip = info[4][0]
-            if not ip.startswith("127."):
+            if not ip.startswith("127.") and not ip.startswith("169.254."):
                 addresses.append(ip)
     except OSError:
         pass
