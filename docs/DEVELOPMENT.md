@@ -244,6 +244,10 @@ STYLY-MDM/
 
 ## WebSocket Protocol Reference
 
+Transport note: `/ws/admin` intentionally does not negotiate per-message
+compression as a workaround for the Chrome-to-server reserved-bit failure
+documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
+
 ### Device → Server
 
 | Message type | Description |
