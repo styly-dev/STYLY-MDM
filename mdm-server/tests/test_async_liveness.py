@@ -290,14 +290,18 @@ async def test_console_serves_push_job_adapter_without_file_response_patch(tmp_p
 
 
 class _AdminWebSocket:
-    def __init__(self, *, error=None, mutate=False, block=None, delay=0):
+    def __init__(
+        self, *, error=None, mutate=False, block=None, delay=0, close_block=None
+    ):
         self.error = error
         self.mutate = mutate
         self.block = block
         self.delay = delay
+        self.close_block = close_block
         self.messages = []
         self.active = 0
         self.max_active = 0
+        self.close_calls = []
 
     async def send_str(self, message):
         self.active += 1
@@ -315,6 +319,12 @@ class _AdminWebSocket:
         finally:
             self.active -= 1
 
+    async def close(self, **kwargs):
+        self.close_calls.append(kwargs)
+        if self.close_block is not None:
+            await self.close_block.wait()
+        return True
+
 
 @pytest.mark.asyncio
 async def test_admin_broadcast_isolates_bad_connection_and_set_mutation():
@@ -328,6 +338,9 @@ async def test_admin_broadcast_isolates_bad_connection_and_set_mutation():
         assert good.messages == [{"type": "TEST"}]
         assert mutating.messages == [{"type": "TEST"}]
         assert bad not in server.admin_connections
+        assert len(bad.close_calls) == 1
+        assert bad.close_calls[0]["code"] == server.WSCloseCode.GOING_AWAY
+        assert bad.close_calls[0]["drain"] is False
     finally:
         server.admin_connections.clear()
 
@@ -336,13 +349,16 @@ async def test_admin_broadcast_isolates_bad_connection_and_set_mutation():
 async def test_admin_broadcast_does_not_block_healthy_peer(monkeypatch):
     monkeypatch.setattr(server, "ADMIN_SEND_TIMEOUT", 0.01)
     good = _AdminWebSocket()
-    blocked = _AdminWebSocket(block=asyncio.Event())
+    blocked = _AdminWebSocket(block=asyncio.Event(), close_block=asyncio.Event())
     server.admin_connections.clear()
     server.admin_connections.update({good, blocked})
     try:
         await asyncio.wait_for(server.forward_to_admins({"type": "TEST"}), timeout=0.2)
         assert good.messages == [{"type": "TEST"}]
         assert blocked not in server.admin_connections
+        assert len(blocked.close_calls) == 1
+        assert blocked.close_calls[0]["code"] == server.WSCloseCode.GOING_AWAY
+        assert blocked.close_calls[0]["drain"] is False
     finally:
         server.admin_connections.clear()
         server._admin_send_locks.clear()

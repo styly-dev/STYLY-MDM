@@ -20,7 +20,7 @@ import uuid
 import zipfile
 from pathlib import Path
 from urllib.parse import unquote
-from aiohttp import web
+from aiohttp import WSCloseCode, web
 
 # Bundling and integrity references must agree on what counts as content, or a reference
 # built from a folder could never match the device that folder was pushed to.
@@ -465,6 +465,19 @@ async def _broadcast_admin_message(message: str) -> None:
             log.warning("Could not send message to admin WebSocket", exc_info=True)
             admin_connections.discard(ws)
             _admin_send_locks.pop(ws, None)
+            try:
+                await asyncio.wait_for(
+                    ws.close(
+                        code=WSCloseCode.GOING_AWAY,
+                        message=b"admin send failed",
+                        drain=False,
+                    ),
+                    ADMIN_SEND_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except (Exception, asyncio.TimeoutError):
+                log.warning("Could not close failed admin WebSocket", exc_info=True)
 
     await asyncio.gather(*(send_one(ws) for ws in tuple(admin_connections)))
 
