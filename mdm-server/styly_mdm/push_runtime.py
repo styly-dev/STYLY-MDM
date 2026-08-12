@@ -17,7 +17,7 @@ from collections.abc import Iterator, MutableMapping
 from pathlib import Path
 from typing import Any
 
-from aiohttp import WSMsgType, web as aiohttp_web
+from aiohttp import WSCloseCode, WSMsgType, web as aiohttp_web
 
 from .push_artifacts import ArtifactStore
 from .push_job_manager import PushJobManager
@@ -353,8 +353,24 @@ class PushRuntime:
                     separators=(",", ":"),
                 )
             )
-        except BaseException:
+        except asyncio.CancelledError:
+            raise
+        except Exception as snapshot_error:
             log.exception("Could not send initial Push job snapshot")
+            try:
+                await asyncio.wait_for(
+                    ws.close(
+                        code=WSCloseCode.GOING_AWAY,
+                        message=b"initial Push snapshot failed",
+                        drain=False,
+                    ),
+                    self.send_timeout,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Could not close admin after initial Push snapshot failure")
+                raise snapshot_error
 
     async def create_job_handler(self, request: aiohttp_web.Request) -> aiohttp_web.Response:
         try:

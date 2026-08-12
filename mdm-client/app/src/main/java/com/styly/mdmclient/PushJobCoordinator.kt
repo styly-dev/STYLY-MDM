@@ -12,11 +12,18 @@ internal fun persistPushStateBeforePublishing(
     nextState: PushProtocol.State,
     save: (PushProtocol.State) -> PushProtocol.State,
     afterPublish: () -> Unit = {},
+    onFailure: (Throwable) -> Unit = {},
     publish: (PushProtocol.State) -> Unit,
-) {
-    val persisted = save(nextState)
+): Boolean {
+    val persisted = try {
+        save(nextState)
+    } catch (error: Throwable) {
+        onFailure(error)
+        return false
+    }
     publish(persisted)
     afterPublish()
+    return true
 }
 
 internal fun applyPushResultAckToState(
@@ -64,6 +71,7 @@ class PushJobCoordinator(context: Context) {
     @Volatile
     private var visibleState: PushProtocol.State = store.emptyState()
     private var state: PushProtocol.State = store.emptyState()
+    private var durabilityAvailable = false
     private var transportToken: Any? = null
     private var transportSend: ((JSONObject) -> Unit)? = null
 
@@ -71,7 +79,7 @@ class PushJobCoordinator(context: Context) {
         actor.execute {
             val loaded = store.load()
             val recovery = recover(loaded)
-            persist(recovery.state)
+            if (!persist(recovery.state)) return@execute
             gate.restore(state.active?.command)
             recovery.cleanupCommand?.let { command ->
                 workerExecutor.execute {
@@ -177,6 +185,11 @@ class PushJobCoordinator(context: Context) {
             return
         }
 
+        if (!durabilityAvailable) {
+            rejectPersistenceUnavailable(command)
+            return
+        }
+
         when (val decision = gate.offer(command)) {
             PushExecutionGate.Decision.Accepted -> accept(command)
             is PushExecutionGate.Decision.Duplicate -> handleDuplicate(command)
@@ -189,11 +202,10 @@ class PushJobCoordinator(context: Context) {
         val nextState = state.copy(
             active = PushProtocol.Active(command, PushProtocol.PHASE_DOWNLOADING),
         )
-        try {
-            persist(nextState) // durability before acceptance and before worker start
-        } catch (error: Throwable) {
+        if (!persist(nextState)) { // durability before acceptance and before worker start
             gate.release(command)
-            throw error
+            rejectPersistenceUnavailable(command)
+            return
         }
         if (command.isJobV1) sendAccepted(command, PushProtocol.PHASE_DOWNLOADING)
         workerExecutor.execute {
@@ -271,6 +283,28 @@ class PushJobCoordinator(context: Context) {
         })
     }
 
+    private fun rejectPersistenceUnavailable(command: PushProtocol.Command) {
+        if (command.isJobV1) {
+            send(JSONObject().apply {
+                put("type", "PUSH_JOB_REJECTED")
+                put("job_id", command.jobId)
+                put("attempt", command.attempt)
+                put("reason", "client_persistence_unavailable")
+                put("retryable", false)
+                put("detail", "Device could not save durable Push/Sync state")
+            })
+            return
+        }
+        send(PushProtocol.Result(
+            jobId = null,
+            attempt = PushProtocol.ATTEMPT_V1,
+            status = "fail",
+            destPath = command.destPath,
+            failureCode = "client_persistence_unavailable",
+            detail = "Device could not save durable Push/Sync state",
+        ).toJson())
+    }
+
     private fun onTransferComplete(command: PushProtocol.Command, received: Long) {
         if (!setPhase(command, PushProtocol.PHASE_VALIDATING)) return
         if (command.isJobV1) {
@@ -292,7 +326,11 @@ class PushJobCoordinator(context: Context) {
     }
 
     private fun onValidated(command: PushProtocol.Command) {
-        if (!isCurrent(command) || !command.isJobV1) return
+        val active = state.active
+        if (active?.command?.identity != command.identity ||
+            active.phase != PushProtocol.PHASE_VALIDATING ||
+            !command.isJobV1
+        ) return
         send(JSONObject().apply {
             put("type", "DOWNLOAD_COMPLETE")
             put("task", "push")
@@ -333,10 +371,10 @@ class PushJobCoordinator(context: Context) {
             completedReceipts = completed,
         )
         // Persist the terminal outbox before releasing the lease, cleaning up, or sending.
-        persist(
+        if (!persist(
             nextState,
             afterPublish = { gate.release(command) },
-        )
+        )) return
         cleanupExecution(execution)
         send(execution.result.toJson())
     }
@@ -354,8 +392,7 @@ class PushJobCoordinator(context: Context) {
     private fun setPhase(command: PushProtocol.Command, phase: String): Boolean {
         val active = state.active ?: return false
         if (active.command.identity != command.identity) return false
-        persist(state.copy(active = active.copy(phase = phase)))
-        return true
+        return persist(state.copy(active = active.copy(phase = phase)))
     }
 
     private fun isCurrent(command: PushProtocol.Command): Boolean =
@@ -471,20 +508,20 @@ class PushJobCoordinator(context: Context) {
     private fun persist(
         nextState: PushProtocol.State,
         afterPublish: () -> Unit = {},
-    ) {
-        try {
-            persistPushStateBeforePublishing(
-                nextState,
-                save = store::save,
-                afterPublish = afterPublish,
-            ) { persisted ->
-                state = persisted
-                visibleState = persisted
-            }
-        } catch (error: Throwable) {
-            Log.e(TAG, "Could not persist durable Push/Sync state", error)
-            throw error
+    ): Boolean {
+        val persisted = persistPushStateBeforePublishing(
+            nextState,
+            save = store::save,
+            afterPublish = afterPublish,
+            onFailure = { error ->
+                Log.e(TAG, "Could not persist durable Push/Sync state", error)
+            },
+        ) { saved ->
+            state = saved
+            visibleState = saved
         }
+        durabilityAvailable = persisted
+        return persisted
     }
 
     private fun send(message: JSONObject) {

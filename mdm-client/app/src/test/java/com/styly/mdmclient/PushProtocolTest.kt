@@ -75,4 +75,37 @@ class PushProtocolTest {
         assertEquals("validation_failed", wire.getString("failure_code"))
         assertTrue(wire.getString("detail").contains("invalid"))
     }
+
+    @Test
+    fun `malformed active does not erase valid durable receipts`() {
+        val command = PushProtocol.parseCommand(payload())
+        val result = PushProtocol.Result(
+            jobId = command.jobId,
+            attempt = command.attempt,
+            status = "fail",
+            destPath = command.destPath,
+            failureCode = "client_restarted",
+            detail = "worker did not survive",
+            completedAt = 1234,
+        )
+        val receipt = PushProtocol.Receipt(command, result)
+        val json = PushProtocol.stateToJson(
+            PushProtocol.State(
+                active = null,
+                pendingResults = listOf(receipt),
+                completedReceipts = listOf(receipt),
+            )
+        ).apply {
+            put("active", JSONObject().apply {
+                put("command", JSONObject().apply { put("job_id", "not-a-uuid") })
+                put("phase", PushProtocol.PHASE_DOWNLOADING)
+            })
+        }
+
+        val decoded = PushProtocol.stateFromJson(json)
+
+        assertEquals(null, decoded.active)
+        assertEquals(listOf(receipt), decoded.pendingResults)
+        assertEquals(listOf(receipt), decoded.completedReceipts)
+    }
 }

@@ -3,7 +3,6 @@ package com.styly.mdmclient
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
-import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.UUID
@@ -34,15 +33,17 @@ class PushJobCoordinatorStateTest {
         var published = previous
         var released = false
 
-        assertThrows(IllegalStateException::class.java) {
-            persistPushStateBeforePublishing(
-                replacement,
-                save = { throw IllegalStateException("injected persistence failure") },
-                afterPublish = { released = true },
-                publish = { published = it },
-            )
-        }
+        var failure: Throwable? = null
+        val persisted = persistPushStateBeforePublishing(
+            replacement,
+            save = { throw IllegalStateException("injected persistence failure") },
+            afterPublish = { released = true },
+            onFailure = { failure = it },
+            publish = { published = it },
+        )
 
+        assertFalse(persisted)
+        assertTrue(failure is IllegalStateException)
         assertSame(previous, published)
         assertFalse(released)
     }
@@ -58,13 +59,14 @@ class PushJobCoordinatorStateTest {
         var published: PushProtocol.State? = null
         var publishedBeforeRelease = false
 
-        persistPushStateBeforePublishing(
+        val persisted = persistPushStateBeforePublishing(
             next,
             save = { normalized },
             afterPublish = { publishedBeforeRelease = published === normalized },
             publish = { published = it },
         )
 
+        assertTrue(persisted)
         assertSame(normalized, published)
         assertTrue(publishedBeforeRelease)
     }

@@ -334,10 +334,17 @@ async def test_unconfirmed_creates_persistent_fence_and_late_result_only_clears_
     await manager.claim_next(["D1"])
     await store.mark_dispatching(job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000)
     await store.mark_reconciling(job_id, "D1", expected={DeviceState.DISPATCHING}, reason="lost", deadline=now_ms())
-    terminal = await store.mark_unconfirmed(job_id, "D1", "process-a", "timeout")
+    terminal = next(
+        snapshot
+        for snapshot in await manager.mark_unconfirmed(
+            job_id, "D1", "process-a", "timeout"
+        )
+        if snapshot["job_id"] == job_id
+    )
     assert terminal["state"] == JobState.COMPLETED_WITH_ERRORS.value
     assert terminal["devices"]["D1"]["device_fence"] is not None
-    accepted, after = await store.settle_late_fenced_result(job_id, "D1", 1)
+    accepted, snapshots = await manager.settle_late_fenced_result(job_id, "D1", 1)
+    after = next(snapshot for snapshot in snapshots if snapshot["job_id"] == job_id)
     assert accepted
     assert after["state"] == JobState.COMPLETED_WITH_ERRORS.value
     assert after["devices"]["D1"]["state"] == DeviceState.UNCONFIRMED.value
@@ -361,9 +368,9 @@ async def test_process_replacement_clears_job_v1_fence_but_same_process_does_not
     await manager.claim_next(["D1"])
     await store.mark_dispatching(job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000)
     await store.mark_reconciling(job_id, "D1", expected={DeviceState.DISPATCHING}, reason="lost", deadline=now_ms())
-    await store.mark_unconfirmed(job_id, "D1", "process-a", "timeout")
-    assert await store.clear_fence_on_process_replacement("D1", "process-a", True) == []
-    snapshots = await store.clear_fence_on_process_replacement("D1", "process-b", True)
+    await manager.mark_unconfirmed(job_id, "D1", "process-a", "timeout")
+    assert await manager.clear_fence_on_process_replacement("D1", "process-a", True) == []
+    snapshots = await manager.clear_fence_on_process_replacement("D1", "process-b", True)
     assert len(snapshots) == 1
     assert snapshots[0]["devices"]["D1"]["device_fence"] is None
 
@@ -421,11 +428,11 @@ async def test_reconcile_absent_clears_matching_fence_and_returns_exact_snapshot
     await store.mark_reconciling(
         job_id, "D1", expected={DeviceState.DISPATCHING}, reason="lost", deadline=now_ms()
     )
-    await store.mark_unconfirmed(job_id, "D1", "process-a", "timeout")
+    await manager.mark_unconfirmed(job_id, "D1", "process-a", "timeout")
 
     # An exact explicit absence report after the assignment is terminal clears only
     # the matching fence. The canonical unconfirmed result remains terminal.
-    snapshots = await store.clear_matching_fence(job_id, "D1", 1)
+    snapshots = await manager.clear_matching_fence(job_id, "D1", 1)
     current = next(snapshot for snapshot in snapshots if snapshot["job_id"] == job_id)
     assert current["devices"]["D1"]["state"] == DeviceState.UNCONFIRMED.value
     assert current["devices"]["D1"]["device_fence"] is None
@@ -450,10 +457,16 @@ async def test_clear_matching_fence_rejects_wrong_attempt_without_mutation(
     await store.mark_reconciling(
         job_id, "D1", expected={DeviceState.DISPATCHING}, reason="lost", deadline=now_ms()
     )
-    terminal = await store.mark_unconfirmed(job_id, "D1", "process-a", "timeout")
+    terminal = next(
+        snapshot
+        for snapshot in await manager.mark_unconfirmed(
+            job_id, "D1", "process-a", "timeout"
+        )
+        if snapshot["job_id"] == job_id
+    )
     revision = terminal["revision"]
 
-    assert await store.clear_matching_fence(job_id, "D1", 2) == []
+    assert await manager.clear_matching_fence(job_id, "D1", 2) == []
     current = await store.get_snapshot(job_id)
     assert current["revision"] == revision
     assert current["devices"]["D1"]["device_fence"] is not None

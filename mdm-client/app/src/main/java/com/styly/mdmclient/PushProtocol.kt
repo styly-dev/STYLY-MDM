@@ -226,8 +226,13 @@ object PushProtocol {
     }
 
     fun stateFromJson(json: JSONObject): State {
-        val active = json.optJSONObject("active")?.let {
-            Active(commandFromJson(it.getJSONObject("command")), it.getString("phase"))
+        val active = try {
+            json.optJSONObject("active")?.let {
+                Active(commandFromJson(it.getJSONObject("command")), it.getString("phase"))
+            }
+        } catch (_: RuntimeException) {
+            // A corrupt active record must not erase independently valid result receipts.
+            null
         }
         fun receipts(name: String): List<Receipt> {
             val array = json.optJSONArray(name) ?: JSONArray()

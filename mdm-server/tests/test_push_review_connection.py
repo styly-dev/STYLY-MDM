@@ -5,6 +5,7 @@ import uuid
 
 import pytest
 
+from styly_mdm import push_runtime
 from styly_mdm.push_job_manager import PushJobManager
 from styly_mdm.push_job_store import PushJobStore, now_ms
 from styly_mdm.push_jobs import DeviceState, ProtocolMode, canonicalize_create_request
@@ -77,6 +78,16 @@ class Ws:
         self.messages.append(json.loads(value))
 
 
+class SnapshotWs(Ws):
+    def __init__(self):
+        super().__init__()
+        self.close_calls = []
+
+    async def close(self, **kwargs):
+        self.close_calls.append(kwargs)
+        return True
+
+
 class Scheduler:
     def __init__(self):
         self.wake_count = 0
@@ -95,6 +106,46 @@ class RegistrationManager:
 
     async def active_assignment_for_device(self, _device_id):
         return None
+
+
+@pytest.mark.asyncio
+async def test_initial_snapshot_failure_closes_admin_for_reconnect():
+    class Manager:
+        async def list_snapshots(self, *_args):
+            raise RuntimeError("snapshot unavailable")
+
+    runtime = object.__new__(PushRuntime)
+    runtime.manager = Manager()
+    runtime.recent_days = 30
+    runtime.recent_limit = 100
+    runtime.send_timeout = 1
+    ws = SnapshotWs()
+
+    await runtime.send_initial_snapshot(ws)
+
+    assert len(ws.close_calls) == 1
+    assert ws.close_calls[0]["code"] == push_runtime.WSCloseCode.GOING_AWAY
+    assert ws.close_calls[0]["message"] == b"initial Push snapshot failed"
+    assert ws.close_calls[0]["drain"] is False
+
+
+@pytest.mark.asyncio
+async def test_initial_snapshot_cancellation_is_not_swallowed():
+    class Manager:
+        async def list_snapshots(self, *_args):
+            raise asyncio.CancelledError()
+
+    runtime = object.__new__(PushRuntime)
+    runtime.manager = Manager()
+    runtime.recent_days = 30
+    runtime.recent_limit = 100
+    runtime.send_timeout = 1
+    ws = SnapshotWs()
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime.send_initial_snapshot(ws)
+
+    assert ws.close_calls == []
 
 
 @pytest.mark.asyncio

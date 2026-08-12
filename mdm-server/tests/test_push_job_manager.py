@@ -48,6 +48,20 @@ def manager(tmp_path):
     store.close()
 
 
+def test_policy_mutations_have_one_owner():
+    policy_methods = {
+        'settle_late_fenced_result',
+        'reconcile_report',
+        'mark_unconfirmed',
+        'add_opaque_fence',
+        'clear_matching_fence',
+        'clear_fence_on_process_replacement',
+    }
+
+    assert policy_methods <= PushJobManager.__dict__.keys()
+    assert policy_methods.isdisjoint(PushJobStore.__dict__.keys())
+
+
 @pytest.mark.asyncio
 async def test_idempotent_lookup_does_not_depend_on_current_connection(manager):
     req = request()
