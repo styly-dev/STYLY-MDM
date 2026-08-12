@@ -19,6 +19,23 @@ internal fun persistPushStateBeforePublishing(
     afterPublish()
 }
 
+internal fun applyPushResultAckToState(
+    current: PushProtocol.State,
+    ack: PushProtocol.ResultAck,
+    maxReceipts: Int,
+): PushProtocol.State {
+    if (!ack.accepted && ack.retryable) return current
+    fun matches(receipt: PushProtocol.Receipt): Boolean =
+        receipt.result.jobId == ack.jobId && receipt.result.attempt == ack.attempt
+
+    val settled = current.pendingResults.lastOrNull(::matches) ?: return current
+    return current.copy(
+        pendingResults = current.pendingResults.filterNot(::matches),
+        completedReceipts = (current.completedReceipts.filterNot(::matches) + settled)
+            .takeLast(maxReceipts),
+    )
+}
+
 /**
  * Application-scoped single owner for every Push/Sync execution.
  *
@@ -360,12 +377,9 @@ class PushJobCoordinator(context: Context) {
             Log.w(TAG, "Ignoring malformed Push result ACK: ${error.message}")
             return
         }
-        if (!ack.accepted) return
-        val next = state.pendingResults.filterNot {
-            it.result.jobId == ack.jobId && it.result.attempt == ack.attempt
-        }
-        if (next.size == state.pendingResults.size) return
-        persist(state.copy(pendingResults = next))
+        val next = applyPushResultAckToState(state, ack, MAX_RECEIPTS)
+        if (next === state) return
+        persist(next)
     }
 
     private fun replayPendingResults() {

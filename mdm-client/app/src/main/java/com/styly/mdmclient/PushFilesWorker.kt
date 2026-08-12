@@ -16,6 +16,7 @@ import java.util.zip.ZipFile
 class PushFilesWorker internal constructor(
     private val hasExternalStorageAccess: () -> Boolean,
     private val attemptDirectoryProvider: (PushProtocol.Command) -> File,
+    private val destinationProvider: ((String) -> File)? = null,
 ) {
     constructor() : this(
         hasExternalStorageAccess = {
@@ -81,8 +82,9 @@ class PushFilesWorker internal constructor(
             val staging = File(work, "staging")
             validateAndExtract(bundle, staging)
             callbacks.onValidated()
+            val destination = destinationProvider?.invoke(command.destPath)
+                ?: validateDestination(command.destPath)
             callbacks.onApplying()
-            val destination = validateDestination(command.destPath)
             val applied = BundleSync.apply(staging, destination, command.deleteExtras)
             PushProtocol.Result(
                 jobId = command.jobId,

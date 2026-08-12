@@ -126,6 +126,7 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self._push_send_lock = asyncio.Lock()
         self._push_runtime: PushRuntime | None = None
         self._push_path = ""
         self._push_http_base = ""
@@ -133,6 +134,10 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
         self._push_pending_registration: dict[str, Any] | None = None
         self._push_disconnect_notified = False
         self._push_admin_snapshot_sent = False
+
+    async def send_str(self, data: str, compress: int | None = None) -> None:
+        async with self._push_send_lock:
+            await super().send_str(data, compress=compress)
 
     async def prepare(self, request: aiohttp_web.Request) -> Any:
         result = await super().prepare(request)
@@ -217,6 +222,11 @@ class PushRuntime:
         self.housekeeping_task: asyncio.Task[None] | None = None
         self.created_deadline_task: asyncio.Task[None] | None = None
         self.created_deadline_wake = asyncio.Event()
+        self.publication_task: asyncio.Task[None] | None = None
+        self.publication_wake = asyncio.Event()
+        self.pending_publications: dict[str, dict[str, Any]] = {}
+        self.publication_revisions: dict[str, int] = {}
+        self.publication_stopping = False
         self.startup_snapshots, self.startup_cleanup = self.store.recover_startup_sync(
             accept_reconciliation_timeout_ms=int(
                 _env_seconds("MDM_PUSH_ACCEPT_RECONCILIATION_TIMEOUT", 60) * 1000
@@ -274,6 +284,10 @@ class PushRuntime:
         }
 
     async def on_startup(self, _app: aiohttp_web.Application) -> None:
+        self.publication_stopping = False
+        self.publication_task = asyncio.create_task(
+            self._publication_loop(), name="push-job-publication"
+        )
         for job_id in self.startup_cleanup:
             await asyncio.to_thread(self.artifacts.cleanup_work_best_effort, job_id)
         self.startup_cleanup.clear()
@@ -317,6 +331,11 @@ class PushRuntime:
         )
         if self.scheduler is not None:
             await self.scheduler.stop()
+        self.publication_stopping = True
+        self.publication_wake.set()
+        if self.publication_task is not None:
+            await asyncio.gather(self.publication_task, return_exceptions=True)
+            self.publication_task = None
         for device_id in tuple(self.sessions):
             self.transfers.release_all_for_device(device_id, "shutdown")
         self.sessions.clear()
@@ -1172,7 +1191,27 @@ class PushRuntime:
         job_id = payload.get("job_id")
         attempt = payload.get("attempt")
         status = payload.get("status")
-        if not isinstance(job_id, str) or attempt != 1 or status not in {"success", "fail"}:
+        if not isinstance(job_id, str):
+            return
+        if attempt != 1:
+            await self._send_result_ack(
+                device_id,
+                job_id,
+                False,
+                None,
+                "stale_result",
+                owned_session=owned_session,
+            )
+            return
+        if status not in {"success", "fail"}:
+            await self._send_result_ack(
+                device_id,
+                job_id,
+                False,
+                None,
+                "malformed_terminal_result",
+                owned_session=owned_session,
+            )
             return
         if status == "success" and any(
             isinstance(payload.get(name), bool)
@@ -1218,15 +1257,34 @@ class PushRuntime:
             return
 
         assignment = await self.manager.assignment(job_id, device_id)
-        if assignment is None or assignment["attempt"] != 1:
+        if assignment is None:
+            await self._send_result_ack(
+                device_id,
+                job_id,
+                False,
+                None,
+                "unknown_job",
+                owned_session=owned_session,
+            )
             return
-        self.transfers.release_exact(
-            TransferKey("push", device_id, job_id, 1), "terminal_result"
-        )
+        if assignment["attempt"] != 1:
+            await self._send_result_ack(
+                device_id,
+                job_id,
+                False,
+                None,
+                "stale_result",
+                owned_session=owned_session,
+            )
+            return
         if assignment["state"] == DeviceState.UNCONFIRMED.value:
             accepted, snapshots = await self.manager.settle_late_fenced_result(
                 job_id, device_id, 1
             )
+            if accepted:
+                self.transfers.release_exact(
+                    TransferKey("push", device_id, job_id, 1), "terminal_result"
+                )
             for snapshot in snapshots:
                 await self.publish(snapshot)
             revision = next(
@@ -1270,16 +1328,12 @@ class PushRuntime:
             failure_code=failure_code,
             failure_detail=detail,
         )
-        if snapshot is not None and not was_terminal:
+        if accepted:
+            self.transfers.release_exact(
+                TransferKey("push", device_id, job_id, 1), "terminal_result"
+            )
+        if accepted and snapshot is not None and not was_terminal:
             await self.publish(snapshot)
-            if accepted:
-                await self._forward_terminal_result(
-                    device_id,
-                    payload,
-                    snapshot,
-                    failure_code,
-                    detail,
-                )
         await self._send_result_ack(
             device_id,
             job_id,
@@ -1290,37 +1344,6 @@ class PushRuntime:
         )
         if accepted and self.scheduler is not None:
             self.scheduler.wake()
-
-    async def _forward_terminal_result(
-        self,
-        device_id: str,
-        source: dict[str, Any],
-        snapshot: dict[str, Any],
-        failure_code: str | None,
-        detail: str,
-    ) -> None:
-        event: dict[str, Any] = {
-            "type": "PUSH_FILES_RESULT",
-            "job_id": snapshot["job_id"],
-            "revision": snapshot["revision"],
-            "device_id": device_id,
-            "attempt": 1,
-            "status": source["status"],
-            "dest_path": snapshot["dest_path"],
-        }
-        if source["status"] == "success":
-            event.update(
-                {
-                    "added": self._nonnegative_int(source.get("added")),
-                    "updated": self._nonnegative_int(source.get("updated")),
-                    "deleted": self._nonnegative_int(source.get("deleted")),
-                }
-            )
-        else:
-            event["failure_code"] = failure_code
-            event["detail"] = detail
-            event["error"] = detail
-        await self.legacy.forward_to_admins(event)
 
     async def _send_result_ack(
         self,
@@ -1345,6 +1368,8 @@ class PushRuntime:
             payload["revision"] = revision
         if reason:
             payload["reason"] = reason
+        if not accepted:
+            payload["retryable"] = False
         if owned_session is not None:
             if self.sessions.get(device_id) is not session:
                 return
@@ -1492,46 +1517,34 @@ class PushRuntime:
             )
 
     async def publish(self, snapshot: dict[str, Any]) -> None:
-        event = {
-            "type": "PUSH_JOB_UPDATED",
-            "job_id": snapshot["job_id"],
-            "revision": snapshot["revision"],
-            "job": snapshot,
-        }
-        await self.legacy.forward_to_admins(event)
-        aggregate = snapshot["aggregate"]
-        await self.legacy.forward_to_admins(
-            {
-                "type": "PUSH_PROGRESS",
-                "job_id": snapshot["job_id"],
-                "revision": snapshot["revision"],
-                "mode": snapshot["mode"],
-                "dest_path": snapshot["dest_path"],
-                **aggregate,
-                "done": snapshot["state"]
-                in {
-                    JobState.SUCCEEDED.value,
-                    JobState.COMPLETED_WITH_ERRORS.value,
-                    JobState.FAILED.value,
-                    JobState.INTERRUPTED.value,
-                },
-            }
-        )
-        for device_id, device in snapshot["devices"].items():
-            await self.legacy.forward_to_admins(
-                {
-                    "type": "PUSH_DEVICE_STATE",
-                    "job_id": snapshot["job_id"],
+        job_id = snapshot["job_id"]
+        revision = snapshot["revision"]
+        if revision <= self.publication_revisions.get(job_id, -1):
+            return
+        self.publication_revisions[job_id] = revision
+        self.pending_publications[job_id] = snapshot
+        self.publication_wake.set()
+
+    async def _publication_loop(self) -> None:
+        while True:
+            await self.publication_wake.wait()
+            self.publication_wake.clear()
+            while self.pending_publications:
+                job_id, snapshot = self.pending_publications.popitem()
+                event = {
+                    "type": "PUSH_JOB_UPDATED",
+                    "job_id": job_id,
                     "revision": snapshot["revision"],
-                    "device_id": device_id,
-                    "device_ids": [device_id],
-                    "attempt": device["attempt"],
-                    "state": device["state"],
-                    "dest_path": snapshot["dest_path"],
-                    "delete_extras": snapshot["mode"] == "sync",
-                    "detail": (device.get("failure") or {}).get("detail", ""),
+                    "job": snapshot,
                 }
-            )
+                try:
+                    await self.legacy.forward_to_admins(event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Could not publish Push job update for %s", job_id)
+            if self.publication_stopping and not self.pending_publications:
+                return
 
     def arm_created_deadline(self) -> None:
         if self.created_deadline_task is None or self.created_deadline_task.done():
@@ -1688,7 +1701,7 @@ def install(server: Any) -> None:
         return
     _INSTALLED = True
     _ORIGINAL_CREATE_APP = server.create_app
-    server.web.WebSocketResponse = RuntimeWebSocketResponse
+    server._websocket_response_factory = RuntimeWebSocketResponse
     server.release_transfer_slot = _release_transfer_slot
 
     def create_app() -> aiohttp_web.Application:

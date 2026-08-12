@@ -8,6 +8,8 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.io.FileOutputStream
+import java.net.InetAddress
+import java.net.ServerSocket
 import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -28,17 +30,49 @@ class PushFilesWorkerTest {
         return archive
     }
 
-    private fun command() = PushProtocol.Command(
-        jobId = UUID.randomUUID().toString(),
+    private fun command(
+        jobId: String? = UUID.randomUUID().toString(),
+        artifactId: String? = UUID.randomUUID().toString(),
+        artifactUrl: String = "http://server/artifacts/value",
+        artifactSize: Long? = 42,
+        artifactSha256: String? = "a".repeat(64),
+    ) = PushProtocol.Command(
+        jobId = jobId,
         attempt = PushProtocol.ATTEMPT_V1,
-        artifactId = UUID.randomUUID().toString(),
-        artifactUrl = "http://server/artifacts/value",
-        artifactSize = 42,
-        artifactSha256 = "a".repeat(64),
+        artifactId = artifactId,
+        artifactUrl = artifactUrl,
+        artifactSize = artifactSize,
+        artifactSha256 = artifactSha256,
         bundleFilename = "bundle.zip",
         destPath = "/sdcard/STYLY/content",
         deleteExtras = false,
     )
+
+    private class ArtifactServer(private val content: ByteArray) : AutoCloseable {
+        private val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
+        val url = "http://127.0.0.1:${server.localPort}/artifact.zip"
+        private val thread = Thread({
+            server.accept().use { client ->
+                val reader = client.getInputStream().bufferedReader(Charsets.US_ASCII)
+                while (reader.readLine()?.isNotEmpty() == true) Unit
+                client.getOutputStream().use { output ->
+                    output.write(
+                        ("HTTP/1.1 200 OK\r\n" +
+                            "Content-Length: ${content.size}\r\n" +
+                            "Connection: close\r\n\r\n")
+                            .toByteArray(Charsets.US_ASCII),
+                    )
+                    output.write(content)
+                    output.flush()
+                }
+            }
+        }, "push-worker-test-http").apply { start() }
+
+        override fun close() {
+            server.close()
+            thread.join(5_000)
+        }
+    }
 
     @Test
     fun `missing all-files access returns a stable permission failure before file work`() {
@@ -67,6 +101,40 @@ class PushFilesWorkerTest {
         )
         assertFalse(callbackInvoked)
         assertFalse(work.exists())
+    }
+
+    @Test
+    fun `invalid destination is rejected after validation without applying callback`() {
+        val archive = zip("content.txt" to "verified").readBytes()
+        val destination = tmp.newFolder("invalid-destination")
+        val sentinel = File(destination, "existing.txt").apply { writeText("unchanged") }
+        val callbacks = mutableListOf<String>()
+
+        ArtifactServer(archive).use { server ->
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { File(tmp.root, "invalid-destination-work") },
+                destinationProvider = {
+                    throw PushWorkerException("invalid_destination", "destination rejected")
+                },
+            ).execute(
+                command(
+                    artifactUrl = server.url,
+                    artifactSize = archive.size.toLong(),
+                    artifactSha256 = "a".repeat(64),
+                ),
+                PushFilesWorker.Callbacks(
+                    onTransferComplete = { callbacks += "transfer" },
+                    onValidated = { callbacks += "validated" },
+                    onApplying = { callbacks += "applying" },
+                ),
+            )
+
+            assertEquals("fail", execution.result.status)
+            assertEquals("invalid_destination", execution.result.failureCode)
+        }
+        assertEquals(listOf("transfer", "validated"), callbacks)
+        assertEquals("unchanged", sentinel.readText())
     }
 
     @Test

@@ -33,9 +33,9 @@ legacy migration model after the fixes recorded in this branch.
 | Persistent device fence | Conformant | local and opaque job-v1 fences require matching terminal/absence or process replacement; visible jobs receive revisions |
 | Server restart gate | Conformant | no automatic redispatch; queued rows survive and require operator dispatch of the same job |
 | Superseded WebSocket guard | Conformant | inbound job-v1 settlement and outbound command send share the per-device owner lock |
-| Console reload reconstruction | Conformant | full snapshot + revisioned Map merge; concurrent jobs and safe fence reconcile action |
+| Console reload reconstruction | Conformant | full-replacement snapshot, pre-snapshot update buffer, revisioned merge, canonical per-device rows, and safe fence reconcile action |
 | Restricted legacy fallback | Conformant with documented limitations | no identity guessing; one active legacy execution and typed opaque transfer/fence identity |
-| Non-goals (#85/#89/#94) | Conformant | no byte progress, cancellation, upload resume, Range resume, or Install job integration |
+| Deferred follow-ups (#85/#89/#94) | Conformant | no byte progress, cancellation, upload resume, Range resume, final artifact SHA-256 verification, or Install job integration |
 
 ## Deviations found and corrected during review
 
@@ -79,6 +79,12 @@ areas; they were defects or incomplete pieces and were corrected:
 35. canonical legacy results were also forwarded by the old identity-less handler;
 36. job-aware derived device/result events could overwrite the revisioned Console row through the legacy handler;
 37. duplicate terminal results rebroadcast unchanged canonical snapshots and terminal logs.
+38. admin publication awaited slow browsers while holding device ownership and transfer resources;
+39. the console merged reconnect snapshots without removing expired jobs and could leave optimistic rows queued;
+40. terminal results could settle assignments that had not reached a result-capable state;
+41. runtime installation mutated aiohttp's process-wide `WebSocketResponse` class;
+42. the client announced `applying` before final destination validation;
+43. permanently rejected terminal results remained in the durable pending outbox forever.
 
 Targeted tests cover queue ordering, fence revisions, one-time exact replay, stale
 deadline callbacks, process replacement, opaque-fence matching, committed upload expiry,

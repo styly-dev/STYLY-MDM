@@ -290,17 +290,30 @@ async def test_console_serves_push_job_adapter_without_file_response_patch(tmp_p
 
 
 class _AdminWebSocket:
-    def __init__(self, *, error=None, mutate=False):
+    def __init__(self, *, error=None, mutate=False, block=None, delay=0):
         self.error = error
         self.mutate = mutate
+        self.block = block
+        self.delay = delay
         self.messages = []
+        self.active = 0
+        self.max_active = 0
 
     async def send_str(self, message):
-        if self.mutate:
-            server.admin_connections.discard(self)
-        if self.error is not None:
-            raise self.error
-        self.messages.append(json.loads(message))
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if self.block is not None:
+                await self.block.wait()
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            if self.mutate:
+                server.admin_connections.discard(self)
+            if self.error is not None:
+                raise self.error
+            self.messages.append(json.loads(message))
+        finally:
+            self.active -= 1
 
 
 @pytest.mark.asyncio
@@ -320,9 +333,43 @@ async def test_admin_broadcast_isolates_bad_connection_and_set_mutation():
 
 
 @pytest.mark.asyncio
+async def test_admin_broadcast_does_not_block_healthy_peer(monkeypatch):
+    monkeypatch.setattr(server, "ADMIN_SEND_TIMEOUT", 0.01)
+    good = _AdminWebSocket()
+    blocked = _AdminWebSocket(block=asyncio.Event())
+    server.admin_connections.clear()
+    server.admin_connections.update({good, blocked})
+    try:
+        await asyncio.wait_for(server.forward_to_admins({"type": "TEST"}), timeout=0.2)
+        assert good.messages == [{"type": "TEST"}]
+        assert blocked not in server.admin_connections
+    finally:
+        server.admin_connections.clear()
+        server._admin_send_locks.clear()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_admin_broadcasts_serialize_each_connection():
+    ws = _AdminWebSocket(delay=0.01)
+    server.admin_connections.clear()
+    server.admin_connections.add(ws)
+    try:
+        await asyncio.gather(
+            server.forward_to_admins({"type": "FIRST"}),
+            server.forward_to_admins({"type": "SECOND"}),
+        )
+        assert ws.max_active == 1
+        assert {message["type"] for message in ws.messages} == {"FIRST", "SECOND"}
+    finally:
+        server.admin_connections.clear()
+        server._admin_send_locks.clear()
+
+
+@pytest.mark.asyncio
 async def test_created_deadline_loop_survives_unexpected_publish_error(monkeypatch):
     monkeypatch.setattr(push_runtime, "_BACKGROUND_LOOP_RETRY_DELAY", 0)
     published = asyncio.Event()
+    cleaned_all = asyncio.Event()
     cleaned = []
 
     class Manager:
@@ -342,6 +389,8 @@ async def test_created_deadline_loop_survives_unexpected_publish_error(monkeypat
     class Artifacts:
         def cleanup_work_best_effort(self, job_id):
             cleaned.append(job_id)
+            if job_id == "job-2":
+                cleaned_all.set()
 
     class Scheduler:
         def __init__(self):
@@ -372,6 +421,7 @@ async def test_created_deadline_loop_survives_unexpected_publish_error(monkeypat
     assert task is not None
     try:
         await asyncio.wait_for(published.wait(), timeout=1)
+        await asyncio.wait_for(cleaned_all.wait(), timeout=1)
         assert not task.done()
     finally:
         task.cancel()
@@ -379,6 +429,134 @@ async def test_created_deadline_loop_survives_unexpected_publish_error(monkeypat
     assert task.cancelled()
     assert cleaned == ["job-1", "job-2"]
     assert runtime.scheduler.wake_count == 2
+
+
+class _PublicationLegacy:
+    def __init__(self, *, fail_first=False):
+        self.fail_first = fail_first
+        self.calls = 0
+        self.active = 0
+        self.max_active = 0
+        self.events = []
+        self.sent = asyncio.Event()
+
+    async def forward_to_admins(self, payload):
+        self.calls += 1
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            await asyncio.sleep(0)
+            if self.fail_first and self.calls == 1:
+                raise RuntimeError("temporary admin publication failure")
+            self.events.append(payload)
+            self.sent.set()
+        finally:
+            self.active -= 1
+
+
+def _publication_runtime(legacy):
+    runtime = object.__new__(PushRuntime)
+    runtime.legacy = legacy
+    runtime.pending_publications = {}
+    runtime.publication_revisions = {}
+    runtime.publication_wake = asyncio.Event()
+    runtime.publication_stopping = False
+    runtime.publication_task = asyncio.create_task(runtime._publication_loop())
+    return runtime
+
+
+@pytest.mark.asyncio
+async def test_publication_worker_coalesces_latest_revision_and_serializes_sends():
+    legacy = _PublicationLegacy()
+    runtime = _publication_runtime(legacy)
+    await runtime.publish({"job_id": "job", "revision": 1})
+    await runtime.publish({"job_id": "job", "revision": 3})
+    await runtime.publish({"job_id": "job", "revision": 2})
+    await asyncio.wait_for(legacy.sent.wait(), timeout=1)
+    await runtime.publish({"job_id": "job", "revision": 1})
+    await asyncio.sleep(0)
+    runtime.publication_stopping = True
+    runtime.publication_wake.set()
+    await runtime.publication_task
+    assert [event["revision"] for event in legacy.events] == [3]
+    assert legacy.events[0]["type"] == "PUSH_JOB_UPDATED"
+    assert legacy.max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_publication_worker_continues_after_exception():
+    legacy = _PublicationLegacy(fail_first=True)
+    runtime = _publication_runtime(legacy)
+    await runtime.publish({"job_id": "first", "revision": 1})
+    await runtime.publish({"job_id": "second", "revision": 1})
+    await asyncio.wait_for(legacy.sent.wait(), timeout=1)
+    assert runtime.publication_task is not None and not runtime.publication_task.done()
+    runtime.publication_stopping = True
+    runtime.publication_wake.set()
+    await runtime.publication_task
+    assert legacy.calls == 2
+    assert len(legacy.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_cleanup_drains_publication_before_store_close(tmp_path):
+    legacy = _PublicationLegacy()
+    runtime = _publication_runtime(legacy)
+    runtime.created_deadline_task = None
+    runtime.housekeeping_task = None
+    runtime.scheduler = None
+    runtime.sessions = {}
+    runtime.registration_candidates = {}
+    runtime.transfers = TransferRegistry()
+    runtime.data_dir = tmp_path
+
+    class Store:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            assert legacy.events
+            self.closed = True
+
+    runtime.store = Store()
+    await runtime.publish({"job_id": "job", "revision": 1})
+    await runtime.on_cleanup(None)
+    assert runtime.store.closed
+    assert runtime.publication_task is None
+
+
+@pytest.mark.asyncio
+async def test_server_local_websocket_factory_preserves_aiohttp_and_handles_register(tmp_path):
+    original = aiohttp.web.WebSocketResponse
+    assert server._websocket_response_factory is push_runtime.RuntimeWebSocketResponse
+    assert aiohttp.web.WebSocketResponse is original
+
+    server._apply_data_dir(str(tmp_path))
+    test_server = TestServer(server.create_app())
+    await test_server.start_server()
+    try:
+        async with aiohttp.ClientSession() as session:
+            ws = await session.ws_connect(
+                f"http://{test_server.host}:{test_server.port}/ws/device"
+            )
+            await ws.send_json({
+                "type": "REGISTER",
+                "device_id": "factory-device",
+                "model": "test",
+                "process_instance_id": "0b1d4b9b-b80e-4f62-bde1-605111230dc1",
+                "capabilities": ["push_job_id_v1"],
+                "push_runtime": {"active": None},
+            })
+            message = await asyncio.wait_for(ws.receive_json(), timeout=1)
+            assert message["type"] == "REGISTERED"
+            runtime = test_server.app["push_runtime"]
+            assert isinstance(
+                runtime.sessions["factory-device"].ws,
+                push_runtime.RuntimeWebSocketResponse,
+            )
+            await ws.close()
+    finally:
+        await test_server.close()
 
 
 @pytest.mark.asyncio

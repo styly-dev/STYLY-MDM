@@ -113,6 +113,8 @@ object PushProtocol {
         val jobId: String,
         val attempt: Int,
         val accepted: Boolean,
+        val retryable: Boolean,
+        val reason: String?,
     )
 
     data class ReconcileIdentity(
@@ -181,7 +183,9 @@ object PushProtocol {
             throw IllegalArgumentException("stale_attempt: only attempt=1 is supported")
         }
         val accepted = strictBoolean(payload, "accepted", false)
-        return ResultAck(jobId, attempt, accepted)
+        val retryable = strictBoolean(payload, "retryable", !accepted)
+        val reason = optionalString(payload, "reason")?.ifBlank { null }
+        return ResultAck(jobId, attempt, accepted, retryable, reason)
     }
 
     fun parseReconcileIdentity(payload: JSONObject): ReconcileIdentity {

@@ -69,6 +69,22 @@ class PushProtocolStrictTypesTest {
         }
         val parsed = PushProtocol.parseResultAck(valid)
         assertTrue(parsed.accepted)
+        assertFalse(parsed.retryable)
+
+        val legacyRejected = PushProtocol.parseResultAck(
+            JSONObject(valid.toString()).apply { put("accepted", false) },
+        )
+        assertTrue(legacyRejected.retryable)
+
+        val permanentRejected = PushProtocol.parseResultAck(
+            JSONObject(valid.toString()).apply {
+                put("accepted", false)
+                put("retryable", false)
+                put("reason", "malformed_terminal_result")
+            },
+        )
+        assertFalse(permanentRejected.retryable)
+        assertTrue(permanentRejected.reason == "malformed_terminal_result")
 
         assertThrows(IllegalArgumentException::class.java) {
             PushProtocol.parseResultAck(JSONObject(valid.toString()).apply {
@@ -83,6 +99,11 @@ class PushProtocolStrictTypesTest {
         assertThrows(IllegalArgumentException::class.java) {
             PushProtocol.parseResultAck(JSONObject(valid.toString()).apply {
                 put("job_id", 1)
+            })
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            PushProtocol.parseResultAck(JSONObject(valid.toString()).apply {
+                put("retryable", "false")
             })
         }
     }

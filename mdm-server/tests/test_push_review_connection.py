@@ -321,7 +321,7 @@ class LegacyEvents:
 
 
 @pytest.mark.asyncio
-async def test_first_terminal_result_is_derived_once_and_duplicate_is_noop(tmp_path):
+async def test_first_terminal_result_queues_one_canonical_update_and_duplicate_is_noop(tmp_path):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
@@ -350,6 +350,9 @@ async def test_first_terminal_result_is_derived_once_and_duplicate_is_noop(tmp_p
         runtime.send_timeout = 1
         runtime.legacy = LegacyEvents()
         runtime.sessions = {}
+        runtime.pending_publications = {}
+        runtime.publication_revisions = {}
+        runtime.publication_wake = asyncio.Event()
         session = LiveSession(
             device_id="D1",
             session_id="session",
@@ -371,23 +374,126 @@ async def test_first_terminal_result_is_derived_once_and_duplicate_is_noop(tmp_p
         }
 
         await runtime._handle_result("D1", result, owned_session=session)
-        derived = [
-            event for event in runtime.legacy.events
-            if event.get("type") == "PUSH_FILES_RESULT"
-        ]
-        device_events = [
-            event for event in runtime.legacy.events
-            if event.get("type") == "PUSH_DEVICE_STATE"
-        ]
-        assert len(derived) == 1
-        assert derived[0]["job_id"] == job_id
-        assert isinstance(derived[0]["revision"], int)
-        assert device_events[-1]["device_ids"] == ["D1"]
+        assert runtime.legacy.events == []
+        assert runtime.pending_publications[job_id]["state"] == "succeeded"
 
-        event_count = len(runtime.legacy.events)
+        queued_revision = runtime.pending_publications[job_id]["revision"]
         await runtime._handle_result("D1", result, owned_session=session)
-        assert len(runtime.legacy.events) == event_count
+        assert runtime.legacy.events == []
+        assert runtime.pending_publications[job_id]["revision"] == queued_revision
         assert session.ws.messages[-1]["accepted"] is True
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_early_success_does_not_release_waiter_and_acks_permanent(tmp_path):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        active = await downloading_job(store, manager)
+        job_id = active["job_id"]
+        runtime = object.__new__(PushRuntime)
+        runtime.store = store
+        runtime.manager = manager
+        runtime.transfers = TransferRegistry()
+        runtime.scheduler = Scheduler()
+        runtime.send_timeout = 1
+        runtime.legacy = LegacyEvents()
+        runtime.sessions = {}
+        runtime.pending_publications = {}
+        runtime.publication_revisions = {}
+        runtime.publication_wake = asyncio.Event()
+        ws = Ws()
+        session = LiveSession(
+            device_id="D1",
+            session_id="session",
+            ws=ws,
+            capabilities=frozenset({"push_job_id_v1"}),
+            process_instance_id="process-a",
+            owner_lock=asyncio.Lock(),
+            http_base="http://server",
+        )
+        runtime.sessions["D1"] = session
+        waiter = asyncio.get_running_loop().create_future()
+        runtime.transfers.register(TransferKey("push", "D1", job_id, 1), waiter)
+        before = await store.get_snapshot(job_id)
+
+        await runtime._handle_result(
+            "D1",
+            {
+                "job_id": job_id,
+                "attempt": 1,
+                "status": "success",
+                "added": 0,
+                "updated": 0,
+                "deleted": 0,
+            },
+            owned_session=session,
+        )
+
+        after = await store.get_snapshot(job_id)
+        assert after == before
+        assert not waiter.done()
+        assert runtime.pending_publications == {}
+        assert ws.messages[-1] == {
+            "type": "PUSH_RESULT_ACK",
+            "job_id": job_id,
+            "attempt": 1,
+            "accepted": False,
+            "revision": before["revision"],
+            "reason": "unexpected_result_state",
+            "retryable": False,
+        }
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_result_receives_negative_nonretryable_ack(tmp_path):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        runtime = object.__new__(PushRuntime)
+        runtime.store = store
+        runtime.manager = manager
+        runtime.transfers = TransferRegistry()
+        runtime.scheduler = Scheduler()
+        runtime.send_timeout = 1
+        runtime.legacy = LegacyEvents()
+        runtime.sessions = {}
+        ws = Ws()
+        session = LiveSession(
+            device_id="D1",
+            session_id="session",
+            ws=ws,
+            capabilities=frozenset({"push_job_id_v1"}),
+            process_instance_id="process-a",
+            owner_lock=asyncio.Lock(),
+            http_base="http://server",
+        )
+        runtime.sessions["D1"] = session
+        job_id = str(uuid.uuid4())
+
+        await runtime._handle_result(
+            "D1",
+            {
+                "job_id": job_id,
+                "attempt": 1,
+                "status": "fail",
+                "failure_code": "apply_failed",
+            },
+            owned_session=session,
+        )
+
+        assert ws.messages[-1] == {
+            "type": "PUSH_RESULT_ACK",
+            "job_id": job_id,
+            "attempt": 1,
+            "accepted": False,
+            "reason": "unknown_job",
+            "retryable": False,
+        }
     finally:
         store.close()
 
@@ -430,6 +536,18 @@ async def test_canonical_legacy_result_is_consumed_once(tmp_path):
             target=DeviceState.DOWNLOADING,
             fields={"accepted_at": now_ms()},
         )
+        await manager.transition_device(
+            job_id,
+            "D1",
+            expected={DeviceState.DOWNLOADING},
+            target=DeviceState.VALIDATING,
+        )
+        await manager.transition_device(
+            job_id,
+            "D1",
+            expected={DeviceState.VALIDATING},
+            target=DeviceState.APPLYING,
+        )
 
         runtime = object.__new__(PushRuntime)
         runtime.store = store
@@ -441,6 +559,9 @@ async def test_canonical_legacy_result_is_consumed_once(tmp_path):
         runtime.device_locks = {}
         runtime.registration_candidates = {}
         runtime.registration_previous = {}
+        runtime.pending_publications = {}
+        runtime.publication_revisions = {}
+        runtime.publication_wake = asyncio.Event()
         ws = Ws()
         lock = runtime._device_lock("D1")
         session = LiveSession(
@@ -466,11 +587,7 @@ async def test_canonical_legacy_result_is_consumed_once(tmp_path):
             },
         )
         assert consumed is True
-        derived = [
-            event for event in runtime.legacy.events
-            if event.get("type") == "PUSH_FILES_RESULT"
-        ]
-        assert len(derived) == 1
-        assert derived[0]["job_id"] == job_id
+        assert runtime.legacy.events == []
+        assert runtime.pending_publications[job_id]["devices"]["D1"]["state"] == "succeeded"
     finally:
         store.close()

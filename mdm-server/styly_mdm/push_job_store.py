@@ -817,6 +817,8 @@ class PushJobStore:
     ) -> tuple[bool, str | None, dict[str, Any]]:
         if attempt != 1:
             raise StoreConflict("stale_attempt")
+        if status not in {"success", "fail"}:
+            raise ValueError("status must be success or fail")
         target = DeviceState.SUCCEEDED if status == "success" else DeviceState.FAILED
 
         def op(conn: sqlite3.Connection) -> tuple[bool, str | None, dict[str, Any]]:
@@ -850,6 +852,21 @@ class PushJobStore:
                     snapshot = self._snapshot(conn, job_id)
                     self._commit(conn)
                     return same, None if same else "conflicting_terminal_result", snapshot
+                allowed = (
+                    {
+                        DeviceState.DISPATCHING,
+                        DeviceState.DOWNLOADING,
+                        DeviceState.VALIDATING,
+                        DeviceState.APPLYING,
+                        DeviceState.RECONCILING,
+                    }
+                    if status == "fail"
+                    else {DeviceState.APPLYING, DeviceState.RECONCILING}
+                )
+                if current not in allowed:
+                    snapshot = self._snapshot(conn, job_id)
+                    self._commit(conn)
+                    return False, "unexpected_result_state", snapshot
                 timestamp = now_ms()
                 conn.execute(
                     """

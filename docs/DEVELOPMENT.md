@@ -305,7 +305,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename`, plus `full_sha256` + `cd_sha256` (reference hashes of the file being dispatched; present only when the APK is a local upload in `apks/`). The client verifies the download against `full_sha256` before installing; a **self**-update is refused outright when the hashes are absent. |
 | `REGISTERED` | Server acknowledgement after ownership/capability processing. Field: `session_id`. The client then replays its durable pending terminal outbox. |
 | `EXECUTE_PUSH_FILES` | Job-v1 fields: `job_id`, fixed `attempt=1`, observed `revision`, immutable `artifact_id`, absolute `artifact_url`, exact size/SHA-256 metadata, destination, and server-derived `delete_extras`. Legacy fields remain accepted during migration. Safety-critical fields require their exact JSON types. |
-| `PUSH_RESULT_ACK` | Sent only after the server commits a matching terminal result. Fields: exact identity, `accepted`, and committed `revision` when a local canonical job exists. |
+| `PUSH_RESULT_ACK` | Terminal-result disposition. Fields: exact identity, `accepted`, committed `revision` when a local canonical job exists, and on rejection `reason` plus `retryable`. The client retains retryable results; accepted or permanently rejected results leave the pending outbox while remaining in bounded dedupe receipts. |
 | `PUSH_RECONCILE_REQUEST` | Requests exact status for one or more `{job_id, attempt, artifact_id}` identities. It never directly clears a fence. |
 | `EXECUTE_VERIFY_APK` | Compute `size` + Central-Directory digest (plus diagnostics) for an installed package. Fields: `package_name` |
 | `EXECUTE_VERIFY_DIR` | Compute a manifest + tree hash for a device directory (shared storage only). Fields: `path` |
@@ -356,11 +356,9 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
 | `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |
 | `INSTALL_DEVICE_STATE` | Per-device companion to `INSTALL_PROGRESS`: names the devices that just entered a state, so the console can label each row instead of showing the whole target set as installing. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `installing` / `updating` / `success` / `fail`; `updating` and its terminal `success`/`fail` are emitted only for a client self-update), `apk_filename`, `detail` (failure reason, may be empty) |
-| `PUSH_JOBS_SNAPSHOT` | Sent after the normal initial admin metadata. Contains every non-terminal job, bounded recent terminal jobs, and fence-visible metadata as full snapshots. |
-| `PUSH_JOB_UPDATED` | Canonical full snapshot after a committed mutation. Console state merges by `job_id` and monotonically newer `revision`. |
+| `PUSH_JOBS_SNAPSHOT` | Sent after the normal initial admin metadata. Contains every non-terminal job, bounded recent terminal jobs, and fence-visible metadata as a complete replacement snapshot. Updates that race ahead of it on the same connection are buffered and revision-merged by the console. |
+| `PUSH_JOB_UPDATED` | Canonical full snapshot after a committed mutation. A single server publisher coalesces pending revisions per `job_id`; console state merges only monotonically newer revisions. |
 | `PUSH_FILES_SENT` | Job dispatch/resume acknowledgement. Fields include `job_id`, committed `revision`, canonical state/gate, target count, and shared transfer limit. |
-| `PUSH_PROGRESS` / `PUSH_DEVICE_STATE` | Derived compatibility events carrying `job_id` + the same committed `revision`; canonical truth remains the full snapshot. |
-| `PUSH_FILES_RESULT` | Derived first terminal result carrying `device_id`, exact job identity, and committed revision. Duplicate terminal replay is ACKed without a new mutation/event. |
 | `LAUNCH_RESULT` | Forwarded result from a device |
 | `DELETE_APP_RESULT` | Forwarded uninstall result from a device (adds `device_id`). A `success` is followed by a fresh `DEVICE_LIST` when the device's recorded startup app still named the removed package, since the server then drops that record. See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_RESULT` / `POWER_OFF_RESULT` | Forwarded power-command acknowledgement from a device (adds `device_id`). `accepted` = received and going down (confirm via the row dropping offline); `fail` = the SDK rejected it. See [Remote Power Control](#remote-power-control). |
@@ -492,16 +490,15 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > an install release (pre-#44) — at worst that frees an install slot early, which only
 > relaxes throttling.
 >
-> Admins see aggregate progress via `INSTALL_PROGRESS` / `PUSH_PROGRESS` (queued /
-> transferring / transferred / failed counts).
+> Admins see install aggregate progress via `INSTALL_PROGRESS`. `PUSH_PROGRESS` is
+> retained only for the migration-only legacy Push path; the current job-v1 console
+> uses full `PUSH_JOB_UPDATED` snapshots instead.
 
-> **Per-device transfer state.** `INSTALL_PROGRESS` / `PUSH_PROGRESS` carry only
-> aggregate counts, which cannot be mapped back to rows, so the server also broadcasts
-> `INSTALL_DEVICE_STATE` / `PUSH_DEVICE_STATE` as each device moves. The console's
-> PROGRESS column shows `Waiting…` → `Transferring…` → `Installing…` / `Pushing…` /
-> `Syncing…` → `✓ installed` / `✓ pushed` / `✓ synced` / `✗ failed`, which is what
-> distinguishes a device queued behind a transfer slot from one that is genuinely
-> working.
+> **Per-device transfer state.** `INSTALL_PROGRESS` carries only aggregate counts, so
+> install also broadcasts `INSTALL_DEVICE_STATE`. The migration-only legacy Push path
+> retains its corresponding `PUSH_PROGRESS` / `PUSH_DEVICE_STATE`; job-v1 derives the
+> same `Waiting…` → `Transferring…` → `Pushing…` / `Syncing…` → terminal display from
+> canonical assignment states in each full job snapshot.
 >
 > Which side emits which state is deliberate:
 >
@@ -580,17 +577,14 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 >
 > Both actions reuse the per-device PROGRESS column, showing `Waiting…` →
 > `Transferring…` → `Pushing…` / `Syncing…` → `✓ pushed` / `✓ synced` (with the
-> `+added ~updated -deleted` summary) / `✗ failed`. Like install, these transitions are
-> server-driven (`PUSH_DEVICE_STATE`), because the bundle transfer draws on the same
-> server-wide slot pool and the server therefore knows where each device is. A device
-> that drops offline mid-job clears its cell on the next `DEVICE_LIST`.
-> `PUSH_FILES_RESULT` does not name the mode, so the console carries the verb over from
-> the `delete_extras` that rode along on the preceding `PUSH_DEVICE_STATE` (a page
-> reloaded mid-job falls back to "pushed"). The column holds one state per device, so a
-> push, an install and a verify targeting the same device overwrite each other's cell —
-> the last transition received wins, even though a push and an install hold independent
-> transfer slots. That state lives in `deviceTaskState[id] = {task, status, …}` and is
-> painted by `taskCellHtml()`; the log keeps the full history of every job regardless.
+> `+added ~updated -deleted` summary) / `✗ failed`. The current console derives these
+> states and the Push/Sync verb from each canonical `PUSH_JOBS_SNAPSHOT` /
+> `PUSH_JOB_UPDATED` assignment. The initial snapshot is a full replacement, so a
+> reconnect also removes jobs outside the server's retention window instead of leaving
+> stale rows. The column still holds one state per device: a later install or verify
+> replaces the Push/Sync cell, and older job snapshots cannot reclaim that non-push
+> state. The bridge stores its owned state in `deviceTaskState[id]` and `taskCellHtml()`
+> repaints it after `DEVICE_LIST` renders; the log keeps the retained canonical jobs.
 
 ## Integrity Verification
 

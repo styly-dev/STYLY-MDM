@@ -13,8 +13,11 @@
   const nativeSend = NativeWebSocket.prototype.send;
   const pushJobs = new Map();
   const jobEntries = new Map();
+  const renderedAssignments = new Map();
   const pendingUploads = new Map();
   let currentAdminSocket = null;
+  let awaitingInitialSnapshot = false;
+  let bufferedUpdates = new Map();
 
   function uuid() {
     if (window.crypto && typeof window.crypto.randomUUID === 'function') {
@@ -171,13 +174,49 @@
     return nativeSend.call(this, data);
   };
 
+  function validJob(job) {
+    return !!job && !!job.job_id && typeof job.revision === 'number';
+  }
+
   function applyJob(job) {
-    if (!job || !job.job_id || typeof job.revision !== 'number') return;
+    if (!validJob(job)) return;
     const current = pushJobs.get(job.job_id);
     if (current && current.revision >= job.revision) return;
     pushJobs.set(job.job_id, job);
     renderJob(job);
-    renderDeviceAssignments();
+    syncDeviceAssignments();
+  }
+
+  function bufferJob(job) {
+    if (!validJob(job)) return;
+    const current = bufferedUpdates.get(job.job_id);
+    if (!current || current.revision < job.revision) {
+      bufferedUpdates.set(job.job_id, job);
+    }
+  }
+
+  function replaceJobs(jobs) {
+    const replacement = new Map();
+    (Array.isArray(jobs) ? jobs : []).forEach(function (job) {
+      if (!validJob(job)) return;
+      const current = replacement.get(job.job_id);
+      if (!current || current.revision < job.revision) replacement.set(job.job_id, job);
+    });
+    bufferedUpdates.forEach(function (job, jobId) {
+      const current = replacement.get(jobId);
+      if (!current || current.revision < job.revision) replacement.set(jobId, job);
+    });
+    bufferedUpdates = new Map();
+
+    jobEntries.forEach(function (entry, jobId) {
+      if (replacement.has(jobId)) return;
+      if (entry.root && entry.root.isConnected) entry.root.remove();
+      jobEntries.delete(jobId);
+    });
+    pushJobs.clear();
+    replacement.forEach(function (job, jobId) { pushJobs.set(jobId, job); });
+    pushJobs.forEach(renderJob);
+    syncDeviceAssignments();
   }
 
   function aggregateText(job) {
@@ -280,38 +319,93 @@
     }).sort(function (left, right) {
       return left.assignment.enqueue_seq - right.assignment.enqueue_seq;
     });
-    return queued.length ? queued[0] : null;
+    if (queued.length) return queued[0];
+    const terminalStates = new Set([
+      'succeeded', 'failed', 'interrupted', 'unconfirmed',
+    ]);
+    const terminal = candidates.filter(function (candidate) {
+      return terminalStates.has(candidate.assignment.state);
+    }).sort(function (left, right) {
+      const enqueueDelta = (right.assignment.enqueue_seq || 0) -
+        (left.assignment.enqueue_seq || 0);
+      if (enqueueDelta) return enqueueDelta;
+      return (right.job.updated_at || 0) - (left.job.updated_at || 0);
+    });
+    return terminal.length ? terminal[0] : null;
   }
 
-  function renderDeviceAssignments() {
-    const cells = Array.from(document.querySelectorAll('[data-task-id]'));
-    cells.forEach(function (cell) {
-      cell.querySelectorAll('.push-job-v1-device').forEach(function (badge) {
-        badge.remove();
+  function displayStatus(state) {
+    if (['queued', 'waiting_transfer', 'dispatching'].indexOf(state) >= 0) {
+      return 'queued';
+    }
+    if (state === 'downloading') return 'transferring';
+    if (['validating', 'applying', 'reconciling'].indexOf(state) >= 0) {
+      return 'applying';
+    }
+    if (state === 'succeeded') return 'success';
+    return 'fail';
+  }
+
+  function assignmentView(selected, deviceId) {
+    const job = selected.job;
+    const assignment = selected.assignment;
+    const result = assignment.result || {};
+    const failure = assignment.failure || {};
+    const jobFailure = job.failure || {};
+    const success = assignment.state === 'succeeded';
+    return {
+      device_id: deviceId,
+      job_id: job.job_id,
+      client_request_id: job.client_request_id,
+      revision: job.revision,
+      enqueue_seq: assignment.enqueue_seq,
+      status: displayStatus(assignment.state),
+      verb: job.mode === 'sync' ? 'Sync' : 'Push',
+      filename: job.dest_path || '',
+      note: success ? '+' + (result.added || 0) + ' ~' +
+        (result.updated || 0) + ' -' + (result.deleted || 0) : '',
+      detail: failure.detail || failure.code || jobFailure.detail || jobFailure.code ||
+        assignment.reconciliation_reason ||
+        ((assignment.state === 'unconfirmed') ? 'result unconfirmed' : ''),
+    };
+  }
+
+  function syncDeviceAssignments() {
+    const bridge = window.__stylyPushJobsV1Bridge;
+    if (!bridge) return;
+    const deviceIds = new Set(renderedAssignments.keys());
+    pushJobs.forEach(function (job) {
+      Object.keys(job.devices || {}).forEach(function (deviceId) {
+        deviceIds.add(deviceId);
       });
-      const deviceId = cell.getAttribute('data-task-id');
+    });
+    deviceIds.forEach(function (deviceId) {
       const selected = selectedAssignmentFor(deviceId);
-      if (!selected) return;
-      const badge = document.createElement('span');
-      badge.className = 'push-job-v1-device';
-      badge.style.marginLeft = '4px';
-      badge.title = selected.job.job_id;
-      badge.textContent = '#' + selected.job.job_id.slice(0, 8) +
-        ' ' + selected.assignment.state;
-      cell.appendChild(badge);
+      const renderedJobId = renderedAssignments.get(deviceId);
+      if (selected) {
+        bridge.applyAssignment(assignmentView(selected, deviceId));
+        renderedAssignments.set(deviceId, selected.job.job_id);
+      } else {
+        bridge.clearAssignment(deviceId, renderedJobId);
+        renderedAssignments.delete(deviceId);
+      }
     });
   }
 
-  function observeMessage(event) {
+  function observeMessage(socket, event) {
     let message;
     try { message = JSON.parse(event.data); } catch (_ignored) { return; }
     if (!message || !message.type) return;
     if (message.type === 'PUSH_JOBS_SNAPSHOT') {
       event.stopImmediatePropagation();
-      (message.jobs || []).forEach(applyJob);
+      if (socket !== currentAdminSocket) return;
+      replaceJobs(message.jobs);
+      awaitingInitialSnapshot = false;
     } else if (message.type === 'PUSH_JOB_UPDATED') {
       event.stopImmediatePropagation();
-      applyJob(message.job);
+      if (socket !== currentAdminSocket) return;
+      if (awaitingInitialSnapshot) bufferJob(message.job);
+      else applyJob(message.job);
     } else if (message.type === 'PUSH_PROGRESS' && message.job_id) {
       // Full revisioned snapshots already render concurrent jobs independently.
       event.stopImmediatePropagation();
@@ -332,8 +426,14 @@
     const socket = protocols === undefined
       ? new NativeWebSocket(url)
       : new NativeWebSocket(url, protocols);
-    if (String(url).indexOf('/ws/admin') >= 0) currentAdminSocket = socket;
-    socket.addEventListener('message', observeMessage);
+    if (String(url).indexOf('/ws/admin') >= 0) {
+      currentAdminSocket = socket;
+      awaitingInitialSnapshot = true;
+      bufferedUpdates = new Map();
+    }
+    socket.addEventListener('message', function (event) {
+      observeMessage(socket, event);
+    });
     return socket;
   }
   PatchedWebSocket.prototype = NativeWebSocket.prototype;
