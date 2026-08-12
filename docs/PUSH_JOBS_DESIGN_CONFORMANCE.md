@@ -35,7 +35,7 @@ legacy migration model after the fixes recorded in this branch.
 | Superseded WebSocket guard | Conformant | inbound job-v1 settlement and outbound command send share the per-device owner lock |
 | Console reload reconstruction | Conformant | full-replacement snapshot, pre-snapshot update buffer, revisioned merge, canonical per-device rows, and safe fence reconcile action |
 | Restricted legacy fallback | Conformant with documented limitations | no identity guessing; one active legacy execution and typed opaque transfer/fence identity |
-| Deferred follow-ups (#85/#89/#94) | Conformant | no byte progress, cancellation, upload resume, Range resume, final artifact SHA-256 verification, or Install job integration |
+| Deferred follow-ups (#85/#89/#94) | Conformant with one safety item completed | no byte progress, cancellation, upload resume, Range resume, or Install job integration; exact job-v1 artifact SHA-256 verification is now completed |
 
 ## Deviations found and corrected during review
 
@@ -83,7 +83,7 @@ areas; they were defects or incomplete pieces and were corrected:
 39. the console merged reconnect snapshots without removing expired jobs and could leave optimistic rows queued;
 40. terminal results could settle assignments that had not reached a result-capable state;
 41. runtime installation mutated aiohttp's process-wide `WebSocketResponse` class;
-42. the client announced `applying` before final destination validation;
+42. the client announced `applying` before final destination validation and did not verify the declared artifact SHA-256;
 43. permanently rejected terminal results remained in the durable pending outbox forever.
 
 Targeted tests cover queue ordering, fence revisions, one-time exact replay, stale

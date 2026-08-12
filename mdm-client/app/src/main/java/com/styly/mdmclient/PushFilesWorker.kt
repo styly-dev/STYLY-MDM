@@ -9,6 +9,7 @@ import java.net.URI
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.zip.ZipFile
 
@@ -216,6 +217,7 @@ class PushFilesWorker internal constructor(
         }
         val partial = File(work, "artifact.part")
         val completed = File(work, "artifact.zip")
+        val digest = MessageDigest.getInstance("SHA-256")
         val connection = (URI(command.artifactUrl).toURL().openConnection() as HttpURLConnection).apply {
             connectTimeout = CONNECT_TIMEOUT_MS
             readTimeout = READ_TIMEOUT_MS
@@ -249,6 +251,7 @@ class PushFilesWorker internal constructor(
                             )
                         }
                         output.write(buffer, 0, read)
+                        digest.update(buffer, 0, read)
                     }
                     output.flush()
                     output.fd.sync()
@@ -259,6 +262,18 @@ class PushFilesWorker internal constructor(
                     "artifact_identity_mismatch",
                     "received $received bytes but expected $expectedSize",
                 )
+            }
+            val expectedSha256 = command.artifactSha256
+            if (expectedSha256 != null) {
+                val actualSha256 = digest.digest().joinToString("") {
+                    "%02x".format(it.toInt() and 0xff)
+                }
+                if (!actualSha256.equals(expectedSha256, ignoreCase = true)) {
+                    throw PushWorkerException(
+                        "artifact_identity_mismatch",
+                        "artifact SHA-256 did not match its declared identity",
+                    )
+                }
             }
             atomicMove(partial, completed)
             return completed

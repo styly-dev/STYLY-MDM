@@ -10,6 +10,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -47,6 +48,11 @@ class PushFilesWorkerTest {
         destPath = "/sdcard/STYLY/content",
         deleteExtras = false,
     )
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { "%02x".format(it) }
 
     private class ArtifactServer(private val content: ByteArray) : AutoCloseable {
         private val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
@@ -104,6 +110,98 @@ class PushFilesWorkerTest {
     }
 
     @Test
+    fun `matching artifact SHA is verified before callbacks and apply`() {
+        val archive = zip("content.txt" to "verified").readBytes()
+        val destination = tmp.newFolder("sha-match-destination")
+        val work = File(tmp.root, "sha-match-work")
+        val callbacks = mutableListOf<String>()
+
+        ArtifactServer(archive).use { server ->
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+                destinationProvider = { destination },
+            ).execute(
+                command(
+                    artifactUrl = server.url,
+                    artifactSize = archive.size.toLong(),
+                    artifactSha256 = sha256(archive).uppercase(),
+                ),
+                PushFilesWorker.Callbacks(
+                    onTransferComplete = { callbacks += "transfer" },
+                    onValidated = { callbacks += "validated" },
+                    onApplying = { callbacks += "applying" },
+                ),
+            )
+
+            assertEquals("success", execution.result.status)
+        }
+        assertEquals(listOf("transfer", "validated", "applying"), callbacks)
+        assertEquals("verified", File(destination, "content.txt").readText())
+    }
+
+    @Test
+    fun `legacy artifact without SHA remains compatible`() {
+        val archive = zip("content.txt" to "legacy").readBytes()
+        val destination = tmp.newFolder("legacy-no-sha-destination")
+
+        ArtifactServer(archive).use { server ->
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { File(tmp.root, "legacy-no-sha-work") },
+                destinationProvider = { destination },
+            ).execute(
+                command(
+                    jobId = null,
+                    artifactId = null,
+                    artifactUrl = server.url,
+                    artifactSize = archive.size.toLong(),
+                    artifactSha256 = null,
+                ),
+                PushFilesWorker.Callbacks({}, {}, {}),
+            )
+
+            assertEquals("success", execution.result.status)
+        }
+        assertEquals("legacy", File(destination, "content.txt").readText())
+    }
+
+    @Test
+    fun `mismatched artifact SHA stops before callbacks and destination changes`() {
+        val archive = zip("content.txt" to "untrusted").readBytes()
+        val destination = tmp.newFolder("sha-mismatch-destination")
+        val sentinel = File(destination, "existing.txt").apply { writeText("unchanged") }
+        val work = File(tmp.root, "sha-mismatch-work")
+        var callbackInvoked = false
+
+        ArtifactServer(archive).use { server ->
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+                destinationProvider = { destination },
+            ).execute(
+                command(
+                    artifactUrl = server.url,
+                    artifactSize = archive.size.toLong(),
+                    artifactSha256 = "0".repeat(64),
+                ),
+                PushFilesWorker.Callbacks(
+                    onTransferComplete = { callbackInvoked = true },
+                    onValidated = { callbackInvoked = true },
+                    onApplying = { callbackInvoked = true },
+                ),
+            )
+
+            assertEquals("fail", execution.result.status)
+            assertEquals("artifact_identity_mismatch", execution.result.failureCode)
+        }
+        assertFalse(callbackInvoked)
+        assertEquals("unchanged", sentinel.readText())
+        assertFalse(File(work, "artifact.part").exists())
+        assertFalse(File(work, "artifact.zip").exists())
+    }
+
+    @Test
     fun `invalid destination is rejected after validation without applying callback`() {
         val archive = zip("content.txt" to "verified").readBytes()
         val destination = tmp.newFolder("invalid-destination")
@@ -121,7 +219,7 @@ class PushFilesWorkerTest {
                 command(
                     artifactUrl = server.url,
                     artifactSize = archive.size.toLong(),
-                    artifactSha256 = "a".repeat(64),
+                    artifactSha256 = sha256(archive),
                 ),
                 PushFilesWorker.Callbacks(
                     onTransferComplete = { callbacks += "transfer" },

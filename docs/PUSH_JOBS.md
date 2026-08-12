@@ -38,7 +38,7 @@ New clients register:
 
 `PushJobCoordinator` is owned by `MdmClientApplication`, not by a Service instance. It serializes commands on one actor, permits one active Push/Sync worker, persists active state before `PUSH_JOB_ACCEPTED`, and stores terminal results in an outbox until a matching `PUSH_RESULT_ACK` either accepts the result or marks its rejection as permanent with `retryable: false`. An older server that omits `retryable` is treated as retryable. Completed receipts retain the original command metadata for at most 256 entries and seven days.
 
-The worker validates destination paths on the device as well as the server. It accepts only a shared-storage subdirectory, rejects protected top-level media/app directories, does not traverse destination symlinks, bounds ZIP entry count and expanded bytes, rejects duplicate or conflicting archive paths, and validates exact job-v1 artifact size. Destination validation completes before the client reports `applying`. SHA-256 final verification remains the #94 responsibility.
+The worker validates destination paths on the device as well as the server. It accepts only a shared-storage subdirectory, rejects protected top-level media/app directories, does not traverse destination symlinks, bounds ZIP entry count and expanded bytes, rejects duplicate or conflicting archive paths, and validates the exact job-v1 artifact size and SHA-256 before publishing the downloaded ZIP or touching the destination. Destination validation completes before the client reports `applying`.
 
 Legacy commands remain supported through the same client execution gate. Legacy downloads may lack `artifact_size`; they remain bounded by the server/client size limit but cannot receive job-v1 exact-size guarantees.
 
