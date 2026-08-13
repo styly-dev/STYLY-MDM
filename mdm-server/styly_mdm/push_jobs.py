@@ -50,7 +50,6 @@ except ImportError:  # Python 3.10
 CAP_PUSH_JOB_ID_V1 = "push_job_id_v1"
 CAP_PUSH_PROGRESS_V1 = "push_progress_v1"
 CAP_PUSH_RESUME_V1 = "push_resume_v1"
-CAP_PUSH_CANCEL_V1 = "push_cancel_v1"
 
 
 class PushMode(StrEnum):
@@ -74,7 +73,6 @@ class JobState(StrEnum):
     COMPLETED_WITH_ERRORS = "completed_with_errors"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
-    CANCELLED = "cancelled"  # reserved for #89
 
 
 class DeviceState(StrEnum):
@@ -89,7 +87,6 @@ class DeviceState(StrEnum):
     FAILED = "failed"
     INTERRUPTED = "interrupted"
     UNCONFIRMED = "unconfirmed"
-    CANCELLED = "cancelled"  # reserved for #89
 
 
 TERMINAL_JOB_STATES = frozenset(
@@ -98,7 +95,6 @@ TERMINAL_JOB_STATES = frozenset(
         JobState.COMPLETED_WITH_ERRORS,
         JobState.FAILED,
         JobState.INTERRUPTED,
-        JobState.CANCELLED,
     }
 )
 TERMINAL_DEVICE_STATES = frozenset(
@@ -107,7 +103,6 @@ TERMINAL_DEVICE_STATES = frozenset(
         DeviceState.FAILED,
         DeviceState.INTERRUPTED,
         DeviceState.UNCONFIRMED,
-        DeviceState.CANCELLED,
     }
 )
 ACTIVE_DEVICE_STATES = frozenset(
@@ -366,16 +361,11 @@ def validate_device_transition(current: str | DeviceState, target: str | DeviceS
 
 
 def aggregate_device_states(states: Iterable[str | DeviceState]) -> dict[str, int]:
-    counts = {state.value: 0 for state in DeviceState if state is not DeviceState.CANCELLED}
+    counts = {state.value: 0 for state in DeviceState}
     total = 0
     for raw in states:
         state = DeviceState(raw)
-        if state is DeviceState.CANCELLED:
-            # Reserved state is kept out of #91 aggregate fields until #89 owns it.
-            counts.setdefault("cancelled", 0)
-            counts["cancelled"] += 1
-        else:
-            counts[state.value] += 1
+        counts[state.value] += 1
         total += 1
     counts["total"] = total
     return counts

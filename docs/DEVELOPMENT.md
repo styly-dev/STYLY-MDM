@@ -342,7 +342,6 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `GET /apks/{filename}` | Serves uploaded APK files to devices on the LAN, and backs the console's top-bar client-APK download link (see the client-APK download note below). |
 | `POST /api/push-jobs` | Validate a canonical request and commit `job_id` + per-device rows before any upload bytes. `client_request_id` makes identical replay idempotent; conflicting reuse is 409. |
 | `POST /api/push-jobs/{job_id}/upload` | Job-owned multipart upload, measured limits, packaging, fsync + atomic immutable artifact publication, then `ready`. |
-| `GET /api/push-jobs/{job_id}` | Full exact-revision canonical snapshot for recovery/debug. |
 | `GET /artifacts/{artifact_id}` | DB-resolved immutable ZIP with exact length, identity encoding, and SHA-256 strong ETag. |
 | `POST /api/bundles` / `GET /bundles/{filename}` | Legacy compatibility only. The new console Push/Sync flow does not use these routes. |
 

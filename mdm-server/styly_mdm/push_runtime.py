@@ -474,14 +474,6 @@ class PushRuntime:
             ],
         }
 
-    async def get_job_handler(self, request: aiohttp_web.Request) -> aiohttp_web.Response:
-        try:
-            return aiohttp_web.json_response(
-                await self.store.get_snapshot(request.match_info["job_id"])
-            )
-        except (StoreNotFound, ValueError):
-            raise aiohttp_web.HTTPNotFound()
-
     async def upload_handler(self, request: aiohttp_web.Request) -> aiohttp_web.Response:
         job_id = request.match_info["job_id"]
         packaging = False
@@ -1824,7 +1816,6 @@ def install(server: Any) -> None:
         app.router.add_post(
             "/api/push-jobs/{job_id}/upload", runtime.upload_handler
         )
-        app.router.add_get("/api/push-jobs/{job_id}", runtime.get_job_handler)
         app.router.add_get("/artifacts/{artifact_id}", runtime.artifact_handler)
         app.on_startup.append(runtime.on_startup)
         app.on_cleanup.append(runtime.on_cleanup)
