@@ -155,6 +155,118 @@ async def test_preaccept_absent_requeues_same_attempt_only_once(manager):
 
 
 @pytest.mark.asyncio
+async def test_exact_absent_clears_fence_when_reconciliation_deadline_wins(manager):
+    snapshot = await ready(manager.store, request(), 'deadline-race')
+    job_id = snapshot['job_id']
+    await manager.enable_dispatch(job_id)
+    await manager.claim_next(['D1'])
+    await manager.prepare_dispatch(
+        job_id, 'D1', protocol_mode=ProtocolMode.JOB_V1,
+        live_capabilities={'push_job_id_v1'}, accept_deadline=now_ms() + 1_000,
+    )
+    await manager.mark_reconciling(
+        job_id, 'D1', expected={DeviceState.DISPATCHING},
+        reason='command_accept_timeout', deadline=now_ms(),
+    )
+
+    # The runtime may have observed reconciling immediately before housekeeping
+    # commits unconfirmed. The exact report must still clear the matching fence.
+    await manager.mark_unconfirmed(job_id, 'D1', 'process-a', 'deadline elapsed')
+    outcome, snapshots = await manager.reconcile_report(
+        job_id, 'D1', 1, 'absent', None, None,
+    )
+
+    assert outcome == 'fence_cleared'
+    current = next(item for item in snapshots if item['job_id'] == job_id)
+    assert current['devices']['D1']['state'] == DeviceState.UNCONFIRMED.value
+    assert current['devices']['D1']['device_fence'] is None
+
+
+@pytest.mark.asyncio
+async def test_expired_acceptance_query_tracks_only_unaccepted_dispatches(manager):
+    snapshot = await ready(manager.store, request(), 'accept-deadline')
+    job_id = snapshot['job_id']
+    await manager.enable_dispatch(job_id)
+    await manager.claim_next(['D1'])
+    deadline = now_ms() - 1
+    await manager.prepare_dispatch(
+        job_id, 'D1', protocol_mode=ProtocolMode.JOB_V1,
+        live_capabilities={'push_job_id_v1'}, accept_deadline=deadline,
+    )
+
+    expired = await manager.expired_acceptances(now_ms())
+    assert expired == [{
+        'job_id': job_id,
+        'device_id': 'D1',
+        'attempt': 1,
+        'accept_deadline': deadline,
+    }]
+
+    await manager.transition_device(
+        job_id,
+        'D1',
+        expected={DeviceState.DISPATCHING},
+        target=DeviceState.DOWNLOADING,
+        fields={'accepted_at': now_ms(), 'accept_deadline': None},
+    )
+    assert await manager.expired_acceptances(now_ms()) == []
+
+
+@pytest.mark.asyncio
+async def test_stale_expired_acceptance_cannot_reconcile_replayed_dispatch(manager):
+    snapshot = await ready(manager.store, request(), 'stale-accept-deadline')
+    job_id = snapshot['job_id']
+    await manager.enable_dispatch(job_id)
+    await manager.claim_next(['D1'])
+    first_deadline = now_ms() - 1
+    await manager.prepare_dispatch(
+        job_id, 'D1', protocol_mode=ProtocolMode.JOB_V1,
+        live_capabilities={'push_job_id_v1'}, accept_deadline=first_deadline,
+    )
+
+    changed, reconciling = await manager.mark_acceptance_reconciling(
+        job_id,
+        'D1',
+        expected_accept_deadline=first_deadline,
+        reconciliation_deadline=now_ms() + 60_000,
+    )
+    assert changed is True
+    current_row = await manager.assignment(job_id, 'D1')
+    assert current_row['accept_deadline'] == first_deadline
+    changed, duplicate = await manager.mark_acceptance_reconciling(
+        job_id,
+        'D1',
+        expected_accept_deadline=first_deadline,
+        reconciliation_deadline=now_ms() + 60_000,
+    )
+    assert changed is False
+    assert duplicate['revision'] == reconciling['revision']
+
+    outcome, _ = await manager.reconcile_report(
+        job_id, 'D1', 1, 'absent', None, None,
+    )
+    assert outcome == 'requeued'
+    await manager.claim_next(['D1'])
+    second_deadline = first_deadline + 120_000
+    await manager.prepare_dispatch(
+        job_id, 'D1', protocol_mode=ProtocolMode.JOB_V1,
+        live_capabilities={'push_job_id_v1'}, accept_deadline=second_deadline,
+    )
+
+    with pytest.raises(StoreConflict, match='accept deadline no longer owns dispatch'):
+        await manager.mark_acceptance_reconciling(
+            job_id,
+            'D1',
+            expected_accept_deadline=first_deadline,
+            reconciliation_deadline=now_ms() + 60_000,
+        )
+    current = await manager.get_snapshot(job_id)
+    assert current['devices']['D1']['state'] == DeviceState.DISPATCHING.value
+    current_row = await manager.assignment(job_id, 'D1')
+    assert current_row['accept_deadline'] == second_deadline
+
+
+@pytest.mark.asyncio
 async def test_new_job_v1_process_safely_clears_legacy_fence(manager):
     _, queued = await manager.create_job(
         request(), {'D1': (ProtocolMode.JOB_V1, {'push_job_id_v1'})}, 600_000,

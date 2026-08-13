@@ -5,6 +5,7 @@ import android.util.AtomicFile
 import android.util.Log
 import org.json.JSONObject
 import java.io.File
+import java.io.FileNotFoundException
 
 /** Atomic persistence for active execution, terminal outbox, and dedupe receipts. */
 class PushJobStore(
@@ -22,10 +23,11 @@ class PushJobStore(
 
     @Synchronized
     fun load(): PushProtocol.State {
-        if (!atomicFile.baseFile.exists()) return emptyState()
         return try {
             val text = atomicFile.openRead().bufferedReader(Charsets.UTF_8).use { it.readText() }
             trim(PushProtocol.stateFromJson(JSONObject(text)))
+        } catch (_: FileNotFoundException) {
+            emptyState()
         } catch (error: Exception) {
             // A corrupt state file is serious, but crashing the foreground service would
             // prevent registration and operational recovery. Keep the file for diagnosis.

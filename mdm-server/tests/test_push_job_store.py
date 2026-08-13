@@ -261,9 +261,9 @@ async def test_failed_terminal_replay_requires_all_result_fields_to_match(store,
         (DeviceState.APPLYING, "fail", True),
         (DeviceState.RECONCILING, "fail", True),
         (DeviceState.WAITING_TRANSFER, "fail", False),
-        (DeviceState.DISPATCHING, "success", False),
-        (DeviceState.DOWNLOADING, "success", False),
-        (DeviceState.VALIDATING, "success", False),
+        (DeviceState.DISPATCHING, "success", True),
+        (DeviceState.DOWNLOADING, "success", True),
+        (DeviceState.VALIDATING, "success", True),
         (DeviceState.APPLYING, "success", True),
         (DeviceState.RECONCILING, "success", True),
     ],
@@ -307,12 +307,44 @@ async def test_result_settlement_state_table_preserves_rejected_revision(
 
     before = await store.get_snapshot(job_id)
     result_accepted, reason, after = await store.settle_result(
-        job_id, "D1", 1, status, failure_code="apply_failed" if status == "fail" else None
+        job_id,
+        "D1",
+        1,
+        status,
+        added=1 if status == "success" else 0,
+        updated=2 if status == "success" else 0,
+        deleted=3 if status == "success" else 0,
+        failure_code="apply_failed" if status == "fail" else None,
     )
     assert result_accepted is accepted
     if accepted:
         assert reason is None
         assert after["revision"] == before["revision"] + 1
+        terminal = "succeeded" if status == "success" else "failed"
+        assert after["devices"]["D1"]["state"] == terminal
+        assert after["aggregate"][terminal] == 1
+        if status == "success":
+            assert after["devices"]["D1"]["result"] == {
+                "added": 1,
+                "updated": 2,
+                "deleted": 3,
+            }
+        else:
+            assert after["devices"]["D1"]["failure"]["code"] == "apply_failed"
+
+        duplicate_accepted, duplicate_reason, duplicate = await store.settle_result(
+            job_id,
+            "D1",
+            1,
+            status,
+            added=1 if status == "success" else 0,
+            updated=2 if status == "success" else 0,
+            deleted=3 if status == "success" else 0,
+            failure_code="apply_failed" if status == "fail" else None,
+        )
+        assert duplicate_accepted is True
+        assert duplicate_reason is None
+        assert duplicate["revision"] == after["revision"]
     else:
         assert reason == "unexpected_result_state"
         assert after == before

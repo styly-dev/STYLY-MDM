@@ -241,6 +241,92 @@ class PushJobManager:
 
         return await self.store._call(op)
 
+    async def expired_acceptances(self, timestamp: int) -> list[dict[str, Any]]:
+        """Return dispatches whose in-memory acceptance waiter may have been lost."""
+
+        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                """
+                SELECT job_id, device_id, attempt, accept_deadline
+                FROM push_job_devices
+                WHERE state=? AND accepted_at IS NULL AND accept_deadline IS NOT NULL
+                  AND accept_deadline<=?
+                ORDER BY accept_deadline, enqueue_seq
+                """,
+                (DeviceState.DISPATCHING.value, timestamp),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+        return await self.store._call(op)
+
+    async def mark_acceptance_reconciling(
+        self,
+        job_id: str,
+        device_id: str,
+        *,
+        expected_accept_deadline: int,
+        reconciliation_deadline: int,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Move one exact expired dispatch to reconciliation.
+
+        The accept deadline is the durable dispatch token. Keeping and comparing it
+        prevents a stale housekeeping row from changing a later replay of the same
+        job/attempt.
+        """
+
+        def op(conn: sqlite3.Connection) -> tuple[bool, dict[str, Any]]:
+            self.store._begin(conn)
+            try:
+                row = conn.execute(
+                    "SELECT state, accepted_at, accept_deadline, reconciliation_reason "
+                    "FROM push_job_devices WHERE job_id=? AND device_id=?",
+                    (job_id, device_id),
+                ).fetchone()
+                if row is None:
+                    raise StoreNotFound(f"{job_id}/{device_id}")
+                current = DeviceState(row["state"])
+                exact_deadline = row["accept_deadline"] == expected_accept_deadline
+                if (
+                    current is DeviceState.RECONCILING
+                    and row["accepted_at"] is None
+                    and exact_deadline
+                    and row["reconciliation_reason"] == "command_accept_timeout"
+                ):
+                    snapshot = self.store._snapshot(conn, job_id)
+                    self.store._commit(conn)
+                    return False, snapshot
+                if (
+                    current is not DeviceState.DISPATCHING
+                    or row["accepted_at"] is not None
+                    or not exact_deadline
+                ):
+                    raise StoreConflict("accept deadline no longer owns dispatch")
+                validate_device_transition(current, DeviceState.RECONCILING)
+                timestamp = now_ms()
+                conn.execute(
+                    "UPDATE push_job_devices SET state=?, reconciliation_reason=?, "
+                    "reconciliation_deadline=?, updated_at=? "
+                    "WHERE job_id=? AND device_id=?",
+                    (
+                        DeviceState.RECONCILING.value,
+                        "command_accept_timeout",
+                        reconciliation_deadline,
+                        timestamp,
+                        job_id,
+                        device_id,
+                    ),
+                )
+                self.store._increment_revision(conn, job_id, timestamp)
+                self.store._rederive_job(conn, job_id, timestamp)
+                snapshot = self.store._snapshot(conn, job_id)
+                self.store._commit(conn)
+                return True, snapshot
+            except BaseException:
+                self.store._rollback(conn)
+                raise
+
+        return await self.store._call(op)
+
     async def next_created_deadline(self) -> tuple[str, int] | None:
         def op(conn: sqlite3.Connection) -> tuple[str, int] | None:
             row = conn.execute(
@@ -869,6 +955,33 @@ class PushJobManager:
                 if row["attempt"] != 1:
                     raise StoreConflict("stale_attempt")
                 current = DeviceState(row["state"])
+                if current is DeviceState.UNCONFIRMED and status in {
+                    "absent",
+                    "interrupted",
+                }:
+                    fence = conn.execute(
+                        "SELECT * FROM push_device_fences WHERE device_id=?",
+                        (device_id,),
+                    ).fetchone()
+                    if (
+                        fence is None
+                        or fence["blocking_job_id"] != job_id
+                        or fence["blocking_attempt"] != attempt
+                    ):
+                        raise StoreConflict("exact reconciliation fence is absent")
+                    conn.execute(
+                        "DELETE FROM push_device_fences WHERE device_id=?",
+                        (device_id,),
+                    )
+                    timestamp = now_ms()
+                    ids = self._visible_job_ids(self.store, conn, device_id, job_id)
+                    for affected in ids:
+                        self.store._increment_revision(conn, affected, timestamp)
+                    snapshots = [
+                        self.store._snapshot(conn, affected) for affected in ids
+                    ]
+                    self.store._commit(conn)
+                    return "fence_cleared", snapshots
                 if current is not DeviceState.RECONCILING:
                     raise StoreConflict("assignment is not reconciling")
                 timestamp = now_ms()

@@ -244,6 +244,7 @@ class PushRuntime:
 
         self.create_timeout = _env_seconds("MDM_PUSH_CREATE_TIMEOUT", 600)
         self.send_timeout = _env_seconds("MDM_PUSH_COMMAND_SEND_TIMEOUT", 5)
+        self.admin_send_timeout = legacy_server.ADMIN_SEND_TIMEOUT
         self.accept_timeout = _env_seconds("MDM_PUSH_COMMAND_ACCEPT_TIMEOUT", 15)
         self.accept_reconciliation_timeout = _env_seconds(
             "MDM_PUSH_ACCEPT_RECONCILIATION_TIMEOUT", 60
@@ -347,11 +348,14 @@ class PushRuntime:
         try:
             cutoff = now_ms() - self.recent_days * 86_400_000
             snapshots = await self.manager.list_snapshots(self.recent_limit, cutoff)
-            await ws.send_str(
-                json.dumps(
-                    {"type": "PUSH_JOBS_SNAPSHOT", "jobs": snapshots},
-                    separators=(",", ":"),
-                )
+            await asyncio.wait_for(
+                ws.send_str(
+                    json.dumps(
+                        {"type": "PUSH_JOBS_SNAPSHOT", "jobs": snapshots},
+                        separators=(",", ":"),
+                    )
+                ),
+                self.admin_send_timeout,
             )
         except asyncio.CancelledError:
             raise
@@ -364,13 +368,36 @@ class PushRuntime:
                         message=b"initial Push snapshot failed",
                         drain=False,
                     ),
-                    self.send_timeout,
+                    self.admin_send_timeout,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("Could not close admin after initial Push snapshot failure")
                 raise snapshot_error
+
+    async def _close_failed_admin_socket(
+        self, ws: RuntimeWebSocketResponse, message: bytes
+    ) -> None:
+        connections = getattr(self.legacy, "admin_connections", None)
+        if connections is not None:
+            connections.discard(ws)
+        locks = getattr(self.legacy, "_admin_send_locks", None)
+        if locks is not None:
+            locks.pop(ws, None)
+        try:
+            await asyncio.wait_for(
+                ws.close(
+                    code=WSCloseCode.GOING_AWAY,
+                    message=message,
+                    drain=False,
+                ),
+                self.admin_send_timeout,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (Exception, asyncio.TimeoutError):
+            log.warning("Could not close failed admin WebSocket", exc_info=True)
 
     async def create_job_handler(self, request: aiohttp_web.Request) -> aiohttp_web.Response:
         try:
@@ -875,6 +902,7 @@ class PushRuntime:
         if not device_id:
             return
         lock = self._device_lock(device_id)
+        snapshot: dict[str, Any] | None = None
         async with lock:
             if self.registration_candidates.get(device_id) is ws:
                 self.registration_candidates.pop(device_id, None)
@@ -882,51 +910,55 @@ class PushRuntime:
             if session is None or session.ws is not ws:
                 return
             self.sessions.pop(device_id, None)
-        active = await self.manager.active_assignment_for_device(device_id)
-        if active is None:
-            return
-        job_id = active["job_id"]
-        attempt = active["attempt"]
-        state = DeviceState(active["state"])
-        self.transfers.release_exact(
-            TransferKey("push", device_id, job_id, attempt), "device_disconnect"
-        )
-        try:
-            if state is DeviceState.WAITING_TRANSFER:
-                snapshot = await self.manager.transition_device(
-                    job_id,
-                    device_id,
-                    expected={state},
-                    target=DeviceState.QUEUED,
-                    fields={"queue_reason": "awaiting_dispatch"},
-                )
-            elif state in {
-                DeviceState.DISPATCHING,
-                DeviceState.DOWNLOADING,
-                DeviceState.VALIDATING,
-                DeviceState.APPLYING,
-            }:
-                short = state is DeviceState.DISPATCHING and active.get("accepted_at") is None
-                deadline = now_ms() + int(
-                    (
-                        self.accept_reconciliation_timeout
-                        if short
-                        else self.reconciliation_timeout
-                    )
-                    * 1000
-                )
-                snapshot = await self.manager.mark_reconciling(
-                    job_id,
-                    device_id,
-                    expected={state},
-                    reason="disconnect_before_accept" if short else "device_disconnect",
-                    deadline=deadline,
-                )
-            else:
+            active = await self.manager.active_assignment_for_device(device_id)
+            if active is None:
                 return
+            job_id = active["job_id"]
+            attempt = active["attempt"]
+            state = DeviceState(active["state"])
+            self.transfers.release_exact(
+                TransferKey("push", device_id, job_id, attempt), "device_disconnect"
+            )
+            try:
+                if state is DeviceState.WAITING_TRANSFER:
+                    snapshot = await self.manager.transition_device(
+                        job_id,
+                        device_id,
+                        expected={state},
+                        target=DeviceState.QUEUED,
+                        fields={"queue_reason": "awaiting_dispatch"},
+                    )
+                elif state in {
+                    DeviceState.DISPATCHING,
+                    DeviceState.DOWNLOADING,
+                    DeviceState.VALIDATING,
+                    DeviceState.APPLYING,
+                }:
+                    short = (
+                        state is DeviceState.DISPATCHING
+                        and active.get("accepted_at") is None
+                    )
+                    deadline = now_ms() + int(
+                        (
+                            self.accept_reconciliation_timeout
+                            if short
+                            else self.reconciliation_timeout
+                        )
+                        * 1000
+                    )
+                    snapshot = await self.manager.mark_reconciling(
+                        job_id,
+                        device_id,
+                        expected={state},
+                        reason=(
+                            "disconnect_before_accept" if short else "device_disconnect"
+                        ),
+                        deadline=deadline,
+                    )
+            except StoreConflict:
+                pass
+        if snapshot is not None:
             await self.publish(snapshot)
-        except StoreConflict:
-            pass
 
     async def handle_device_message(
         self,
@@ -1202,7 +1234,7 @@ class PushRuntime:
         self,
         device_id: str,
         payload: dict[str, Any],
-        owned_session: LiveSession | None = None,
+        owned_session: LiveSession,
     ) -> None:
         job_id = payload.get("job_id")
         attempt = payload.get("attempt")
@@ -1344,11 +1376,35 @@ class PushRuntime:
             failure_code=failure_code,
             failure_detail=detail,
         )
+        late_snapshots: list[dict[str, Any]] = []
+        current_after_settle = snapshot["devices"].get(device_id) if snapshot else None
+        if (
+            not accepted
+            and reason in {"unexpected_result_state", "conflicting_terminal_result"}
+            and current_after_settle is not None
+            and current_after_settle["state"] == DeviceState.UNCONFIRMED.value
+        ):
+            # Reconciliation housekeeping may commit RECONCILING -> UNCONFIRMED
+            # between the assignment read above and settle_result's transaction.
+            # Re-check the exact fence through the canonical Manager policy so a
+            # matching late result clears it instead of receiving a permanent ACK.
+            accepted, late_snapshots = await self.manager.settle_late_fenced_result(
+                job_id, device_id, 1
+            )
+            if accepted:
+                reason = None
+                snapshot = next(
+                    (item for item in late_snapshots if item["job_id"] == job_id),
+                    snapshot,
+                )
         if accepted:
             self.transfers.release_exact(
                 TransferKey("push", device_id, job_id, 1), "terminal_result"
             )
-        if accepted and snapshot is not None and not was_terminal:
+        if accepted and late_snapshots:
+            for late_snapshot in late_snapshots:
+                await self.publish(late_snapshot)
+        elif accepted and snapshot is not None and not was_terminal:
             await self.publish(snapshot)
         await self._send_result_ack(
             device_id,
@@ -1369,11 +1425,9 @@ class PushRuntime:
         revision: int | None,
         reason: str | None,
         *,
-        owned_session: LiveSession | None = None,
+        owned_session: LiveSession,
     ) -> None:
-        session = owned_session or self.sessions.get(device_id)
-        if session is None:
-            return
+        session = owned_session
         payload: dict[str, Any] = {
             "type": "PUSH_RESULT_ACK",
             "job_id": job_id,
@@ -1386,27 +1440,15 @@ class PushRuntime:
             payload["reason"] = reason
         if not accepted:
             payload["retryable"] = False
-        if owned_session is not None:
-            if self.sessions.get(device_id) is not session:
-                return
-            try:
-                await asyncio.wait_for(
-                    session.ws.send_str(json.dumps(payload, separators=(",", ":"))),
-                    self.send_timeout,
-                )
-            except (ConnectionError, asyncio.TimeoutError):
-                pass
+        if self.sessions.get(device_id) is not session:
             return
-        async with session.owner_lock:
-            if self.sessions.get(device_id) is not session:
-                return
-            try:
-                await asyncio.wait_for(
-                    session.ws.send_str(json.dumps(payload, separators=(",", ":"))),
-                    self.send_timeout,
-                )
-            except (ConnectionError, asyncio.TimeoutError):
-                pass
+        try:
+            await asyncio.wait_for(
+                session.ws.send_str(json.dumps(payload, separators=(",", ":"))),
+                self.send_timeout,
+            )
+        except (ConnectionError, asyncio.TimeoutError):
+            pass
 
     async def _handle_reconcile_report(
         self, device_id: str, payload: dict[str, Any]
@@ -1473,11 +1515,28 @@ class PushRuntime:
             job_id = payload["job_id"]
             try:
                 changed, snapshot = await self.store.enable_dispatch(job_id)
+            except (StoreConflict, StoreNotFound) as exc:
+                try:
+                    await asyncio.wait_for(
+                        ws.send_str(json.dumps({"type": "ERROR", "message": str(exc)})),
+                        self.admin_send_timeout,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except (Exception, asyncio.TimeoutError):
+                    log.warning("Could not send Push dispatch error to admin", exc_info=True)
+                    await self._close_failed_admin_socket(ws, b"admin send failed")
+                return True
+            scheduler_woken = False
+            if self.scheduler is not None:
+                self.scheduler.wake()
+                scheduler_woken = True
+            try:
                 if changed:
                     await self.publish(snapshot)
-                await ws.send_str(
-                    json.dumps(
-                        {
+                await asyncio.wait_for(
+                    ws.send_str(
+                        json.dumps({
                             "type": "PUSH_FILES_SENT",
                             "job_id": job_id,
                             "revision": snapshot["revision"],
@@ -1487,16 +1546,18 @@ class PushRuntime:
                             "max_concurrent": self.legacy.MAX_CONCURRENT_TRANSFERS,
                             "delete_extras": snapshot["mode"] == "sync",
                             "dest_path": snapshot["dest_path"],
-                        },
-                        separators=(",", ":"),
-                    )
+                        }, separators=(",", ":"))
+                    ),
+                    self.admin_send_timeout,
                 )
-                if self.scheduler is not None:
+            except asyncio.CancelledError:
+                raise
+            except (Exception, asyncio.TimeoutError):
+                log.warning("Could not acknowledge Push dispatch to admin", exc_info=True)
+                await self._close_failed_admin_socket(ws, b"admin send failed")
+            finally:
+                if self.scheduler is not None and not scheduler_woken:
                     self.scheduler.wake()
-            except (StoreConflict, StoreNotFound) as exc:
-                await ws.send_str(
-                    json.dumps({"type": "ERROR", "message": str(exc)})
-                )
             return True
         if message_type == "RECONCILE_PUSH_DEVICE":
             device_id = payload.get("device_id")
@@ -1614,12 +1675,47 @@ class PushRuntime:
         while True:
             await asyncio.sleep(_RECONCILIATION_POLL_INTERVAL)
             try:
-                rows = await self.manager.expired_reconciliations(now_ms())
+                timestamp = now_ms()
+                acceptance_rows = await self.manager.expired_acceptances(timestamp)
+                rows = await self.manager.expired_reconciliations(timestamp)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("Could not query expired Push reconciliations")
+                log.exception("Could not query expired Push deadlines")
                 continue
+            for row in acceptance_rows:
+                if self.scheduler is not None and self.scheduler.has_live_acceptance_waiter(
+                    row["job_id"], row["device_id"], row["attempt"]
+                ):
+                    continue
+                try:
+                    job_id = row["job_id"]
+                    device_id = row["device_id"]
+                    changed, snapshot = await self.manager.mark_acceptance_reconciling(
+                        job_id,
+                        device_id,
+                        expected_accept_deadline=row["accept_deadline"],
+                        reconciliation_deadline=(
+                            now_ms()
+                            + int(self.accept_reconciliation_timeout * 1000)
+                        ),
+                    )
+                    if changed:
+                        await self.publish(snapshot)
+                    await self.request_reconcile(device_id)
+                except StoreConflict:
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "Could not recover expired Push acceptance %s/%s",
+                        row.get("job_id"),
+                        row.get("device_id"),
+                    )
+                finally:
+                    if self.scheduler is not None:
+                        self.scheduler.wake()
             for row in rows:
                 try:
                     job_id = row["job_id"]

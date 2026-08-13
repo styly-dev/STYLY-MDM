@@ -119,6 +119,7 @@ async def test_initial_snapshot_failure_closes_admin_for_reconnect():
     runtime.recent_days = 30
     runtime.recent_limit = 100
     runtime.send_timeout = 1
+    runtime.admin_send_timeout = 1
     ws = SnapshotWs()
 
     await runtime.send_initial_snapshot(ws)
@@ -127,6 +128,29 @@ async def test_initial_snapshot_failure_closes_admin_for_reconnect():
     assert ws.close_calls[0]["code"] == push_runtime.WSCloseCode.GOING_AWAY
     assert ws.close_calls[0]["message"] == b"initial Push snapshot failed"
     assert ws.close_calls[0]["drain"] is False
+
+
+@pytest.mark.asyncio
+async def test_initial_snapshot_send_timeout_closes_admin_for_reconnect():
+    class Manager:
+        async def list_snapshots(self, *_args):
+            return []
+
+    class BlockingSnapshotWs(SnapshotWs):
+        async def send_str(self, _value):
+            await asyncio.Future()
+
+    runtime = object.__new__(PushRuntime)
+    runtime.manager = Manager()
+    runtime.recent_days = 30
+    runtime.recent_limit = 100
+    runtime.admin_send_timeout = 0.01
+    ws = BlockingSnapshotWs()
+
+    await asyncio.wait_for(runtime.send_initial_snapshot(ws), timeout=1)
+
+    assert len(ws.close_calls) == 1
+    assert ws.close_calls[0]["code"] == push_runtime.WSCloseCode.GOING_AWAY
 
 
 @pytest.mark.asyncio
@@ -140,12 +164,128 @@ async def test_initial_snapshot_cancellation_is_not_swallowed():
     runtime.recent_days = 30
     runtime.recent_limit = 100
     runtime.send_timeout = 1
+    runtime.admin_send_timeout = 1
     ws = SnapshotWs()
 
     with pytest.raises(asyncio.CancelledError):
         await runtime.send_initial_snapshot(ws)
 
     assert ws.close_calls == []
+
+
+@pytest.mark.asyncio
+async def test_ready_job_can_be_dispatched_with_existing_job_id(tmp_path):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        ready = await ready_job(store, manager)
+        runtime = object.__new__(PushRuntime)
+        runtime.store = store
+        runtime.scheduler = Scheduler()
+        runtime.admin_send_timeout = 1
+        runtime.legacy = types.SimpleNamespace(MAX_CONCURRENT_TRANSFERS=5)
+        published = []
+
+        async def publish(snapshot):
+            published.append(snapshot)
+
+        runtime.publish = publish
+        ws = Ws()
+
+        consumed = await runtime.handle_admin_message(ws, {
+            "type": "PUSH_FILES",
+            "job_id": ready["job_id"],
+        })
+
+        current = await store.get_snapshot(ready["job_id"])
+        assert consumed is True
+        assert current["dispatch_enabled"] is True
+        assert current["dispatch_paused_reason"] is None
+        assert published[-1]["revision"] == current["revision"]
+        assert runtime.scheduler.wake_count == 1
+        assert ws.messages[-1]["type"] == "PUSH_FILES_SENT"
+        assert ws.messages[-1]["job_id"] == ready["job_id"]
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_ack_timeout_still_wakes_scheduler_and_closes_admin(tmp_path):
+    class BlockingWs(SnapshotWs):
+        def __init__(self):
+            super().__init__()
+            self.send_started = asyncio.Event()
+
+        async def send_str(self, _value):
+            self.send_started.set()
+            await asyncio.Future()
+
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        ready = await ready_job(store, manager)
+        runtime = object.__new__(PushRuntime)
+        runtime.store = store
+        runtime.scheduler = Scheduler()
+        runtime.admin_send_timeout = 0.01
+        ws = BlockingWs()
+        runtime.legacy = types.SimpleNamespace(
+            MAX_CONCURRENT_TRANSFERS=5,
+            admin_connections={ws},
+            _admin_send_locks={ws: asyncio.Lock()},
+        )
+        runtime.publish = lambda _snapshot: asyncio.sleep(0)
+
+        handling = asyncio.create_task(runtime.handle_admin_message(ws, {
+            "type": "PUSH_FILES",
+            "job_id": ready["job_id"],
+        }))
+        await asyncio.wait_for(ws.send_started.wait(), timeout=1)
+        assert runtime.scheduler.wake_count == 1
+        consumed = await asyncio.wait_for(handling, timeout=1)
+
+        current = await store.get_snapshot(ready["job_id"])
+        assert consumed is True
+        assert current["dispatch_enabled"] is True
+        assert runtime.scheduler.wake_count == 1
+        assert ws.close_calls
+        assert ws not in runtime.legacy.admin_connections
+        assert ws not in runtime.legacy._admin_send_locks
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_error_timeout_closes_admin_without_waking_scheduler(tmp_path):
+    class BlockingWs(SnapshotWs):
+        async def send_str(self, _value):
+            await asyncio.Future()
+
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    try:
+        runtime = object.__new__(PushRuntime)
+        runtime.store = store
+        runtime.scheduler = Scheduler()
+        runtime.admin_send_timeout = 0.01
+        ws = BlockingWs()
+        runtime.legacy = types.SimpleNamespace(
+            MAX_CONCURRENT_TRANSFERS=5,
+            admin_connections={ws},
+            _admin_send_locks={ws: asyncio.Lock()},
+        )
+
+        consumed = await asyncio.wait_for(runtime.handle_admin_message(ws, {
+            "type": "PUSH_FILES",
+            "job_id": str(uuid.uuid4()),
+        }), timeout=1)
+
+        assert consumed is True
+        assert runtime.scheduler.wake_count == 0
+        assert ws.close_calls
+        assert ws not in runtime.legacy.admin_connections
+        assert ws not in runtime.legacy._admin_send_locks
+    finally:
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -438,7 +578,7 @@ async def test_first_terminal_result_queues_one_canonical_update_and_duplicate_i
 
 
 @pytest.mark.asyncio
-async def test_rejected_early_success_does_not_release_waiter_and_acks_permanent(tmp_path):
+async def test_exact_success_settles_even_when_applying_phase_was_lost(tmp_path):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
@@ -468,8 +608,6 @@ async def test_rejected_early_success_does_not_release_waiter_and_acks_permanent
         runtime.sessions["D1"] = session
         waiter = asyncio.get_running_loop().create_future()
         runtime.transfers.register(TransferKey("push", "D1", job_id, 1), waiter)
-        before = await store.get_snapshot(job_id)
-
         await runtime._handle_result(
             "D1",
             {
@@ -484,18 +622,170 @@ async def test_rejected_early_success_does_not_release_waiter_and_acks_permanent
         )
 
         after = await store.get_snapshot(job_id)
-        assert after == before
-        assert not waiter.done()
-        assert runtime.pending_publications == {}
+        assert after["devices"]["D1"]["state"] == "succeeded"
+        assert waiter.result() == "terminal_result"
+        assert runtime.pending_publications[job_id]["revision"] == after["revision"]
         assert ws.messages[-1] == {
             "type": "PUSH_RESULT_ACK",
             "job_id": job_id,
             "attempt": 1,
-            "accepted": False,
-            "revision": before["revision"],
-            "reason": "unexpected_result_state",
-            "retryable": False,
+            "accepted": True,
+            "revision": after["revision"],
         }
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_transition_finishes_before_replacement_register(tmp_path):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        active = await downloading_job(store, manager)
+        job_id = active["job_id"]
+        artifact_id = active["artifact"]["artifact_id"]
+        runtime = object.__new__(PushRuntime)
+        runtime.manager = manager
+        runtime.sessions = {}
+        runtime.device_locks = {}
+        runtime.registration_candidates = {}
+        runtime.transfers = TransferRegistry()
+        runtime.accept_reconciliation_timeout = 0.1
+        runtime.reconciliation_timeout = 1
+        runtime.scheduler = Scheduler()
+        runtime.send_timeout = 1
+        published = []
+
+        async def publish(snapshot):
+            published.append(snapshot)
+
+        runtime.publish = publish
+        lock = runtime._device_lock("D1")
+        old = Ws()
+        new = Ws()
+        runtime.sessions["D1"] = LiveSession(
+            device_id="D1",
+            session_id="old",
+            ws=old,
+            capabilities=frozenset({"push_job_id_v1"}),
+            process_instance_id="old-process",
+            owner_lock=lock,
+            http_base="http://server",
+        )
+        runtime.legacy = types.SimpleNamespace(devices={"D1": {"ws": new}})
+        runtime.note_registration_candidate(new, "D1")
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_active = manager.active_assignment_for_device
+        first_query = True
+
+        async def blocked_active(device_id):
+            nonlocal first_query
+            if first_query:
+                first_query = False
+                entered.set()
+                await release.wait()
+            return await original_active(device_id)
+
+        manager.active_assignment_for_device = blocked_active
+        disconnect = asyncio.create_task(runtime.disconnect_device("D1", old))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        registration = asyncio.create_task(runtime.register_device(
+            new,
+            {
+                "device_id": "D1",
+                "process_instance_id": str(uuid.uuid4()),
+                "capabilities": ["push_job_id_v1"],
+                "push_runtime": {"active": {
+                    "job_id": job_id,
+                    "attempt": 1,
+                    "artifact_id": artifact_id,
+                    "phase": "downloading",
+                }},
+            },
+            "http://server",
+        ))
+        await asyncio.sleep(0)
+        assert not registration.done()
+
+        release.set()
+        await asyncio.gather(disconnect, registration)
+
+        current = await manager.assignment(job_id, "D1")
+        assert runtime.sessions["D1"].ws is new
+        assert current["state"] == DeviceState.DOWNLOADING.value
+        assert published[-1]["devices"]["D1"]["state"] == DeviceState.DOWNLOADING.value
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_result_racing_unconfirmed_clears_exact_fence_and_is_acked(tmp_path):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        active = await downloading_job(store, manager)
+        job_id = active["job_id"]
+        await manager.mark_reconciling(
+            job_id,
+            "D1",
+            expected={DeviceState.DOWNLOADING},
+            reason="device_disconnect",
+            deadline=now_ms(),
+        )
+        runtime = object.__new__(PushRuntime)
+        runtime.store = store
+        runtime.manager = manager
+        runtime.transfers = TransferRegistry()
+        runtime.scheduler = Scheduler()
+        runtime.send_timeout = 1
+        runtime.legacy = LegacyEvents()
+        runtime.sessions = {}
+        runtime.pending_publications = {}
+        runtime.publication_revisions = {}
+        runtime.publication_wake = asyncio.Event()
+        ws = Ws()
+        session = LiveSession(
+            device_id="D1",
+            session_id="session",
+            ws=ws,
+            capabilities=frozenset({"push_job_id_v1"}),
+            process_instance_id="process-a",
+            owner_lock=asyncio.Lock(),
+            http_base="http://server",
+        )
+        runtime.sessions["D1"] = session
+        waiter = asyncio.get_running_loop().create_future()
+        runtime.transfers.register(TransferKey("push", "D1", job_id, 1), waiter)
+        settle = store.settle_result
+
+        async def settle_after_timeout(*args, **kwargs):
+            await manager.mark_unconfirmed(
+                job_id, "D1", "process-a", "reconciliation timed out"
+            )
+            return await settle(*args, **kwargs)
+
+        store.settle_result = settle_after_timeout
+        await runtime._handle_result(
+            "D1",
+            {
+                "job_id": job_id,
+                "attempt": 1,
+                "status": "success",
+                "added": 1,
+                "updated": 0,
+                "deleted": 0,
+            },
+            owned_session=session,
+        )
+
+        after = await store.get_snapshot(job_id)
+        assert after["devices"]["D1"]["state"] == "unconfirmed"
+        assert after["devices"]["D1"]["device_fence"] is None
+        assert waiter.result() == "terminal_result"
+        assert ws.messages[-1]["accepted"] is True
+        assert ws.messages[-1]["revision"] == after["revision"]
     finally:
         store.close()
 

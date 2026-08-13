@@ -43,6 +43,12 @@ internal fun applyPushResultAckToState(
     )
 }
 
+internal fun findPushReconcileReceipt(
+    state: PushProtocol.State,
+    matches: (PushProtocol.Command) -> Boolean,
+): PushProtocol.Receipt? = state.pendingResults.firstOrNull { matches(it.command) }
+    ?: state.completedReceipts.firstOrNull { matches(it.command) }
+
 /**
  * Application-scoped single owner for every Push/Sync execution.
  *
@@ -451,11 +457,9 @@ class PushJobCoordinator(context: Context) {
                 })
                 continue
             }
-            val pending = state.pendingResults.firstOrNull {
-                matches(it.command)
-            }
-            if (pending != null) {
-                send(pending.result.toJson())
+            val settled = findPushReconcileReceipt(state) { matches(it) }
+            if (settled != null) {
+                send(settled.result.toJson())
                 continue
             }
             send(JSONObject().apply {

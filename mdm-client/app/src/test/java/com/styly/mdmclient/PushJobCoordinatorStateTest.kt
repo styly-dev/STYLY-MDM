@@ -134,6 +134,22 @@ class PushJobCoordinatorStateTest {
         assertEquals(listOf(older, settled), next.completedReceipts)
     }
 
+    @Test
+    fun `reconciliation replays an exact completed receipt after ACK`() {
+        val completed = receipt()
+        val state = PushProtocol.State(
+            active = null,
+            pendingResults = emptyList(),
+            completedReceipts = listOf(completed),
+        )
+
+        val found = findPushReconcileReceipt(state) { command ->
+            command.identity == completed.command.identity
+        }
+
+        assertEquals(completed, found)
+    }
+
     private fun receipt(): PushProtocol.Receipt {
         val command = command()
         return PushProtocol.Receipt(

@@ -852,17 +852,15 @@ class PushJobStore:
                     snapshot = self._snapshot(conn, job_id)
                     self._commit(conn)
                     return same, None if same else "conflicting_terminal_result", snapshot
-                allowed = (
-                    {
-                        DeviceState.DISPATCHING,
-                        DeviceState.DOWNLOADING,
-                        DeviceState.VALIDATING,
-                        DeviceState.APPLYING,
-                        DeviceState.RECONCILING,
-                    }
-                    if status == "fail"
-                    else {DeviceState.APPLYING, DeviceState.RECONCILING}
-                )
+                # The exact terminal result is stronger evidence than intermediate
+                # phase frames, which can be lost at a WebSocket ownership boundary.
+                allowed = {
+                    DeviceState.DISPATCHING,
+                    DeviceState.DOWNLOADING,
+                    DeviceState.VALIDATING,
+                    DeviceState.APPLYING,
+                    DeviceState.RECONCILING,
+                }
                 if current not in allowed:
                     snapshot = self._snapshot(conn, job_id)
                     self._commit(conn)

@@ -136,6 +136,11 @@ async def test_dispatch_exception_moves_uncertain_send_to_reconciliation(monkeyp
     registry.register(key, transfer_future)
     accept_future = asyncio.get_running_loop().create_future()
     scheduler._accept_waiters[(job_id, device_id, 1)] = accept_future
+    scheduler._dispatch_waiters[asyncio.current_task()] = (
+        key,
+        transfer_future,
+        accept_future,
+    )
 
     async def fail(_assignment):
         raise RuntimeError("synthetic post-send failure")
@@ -147,6 +152,102 @@ async def test_dispatch_exception_moves_uncertain_send_to_reconciliation(monkeyp
     assert transfer_future.cancelled()
     assert accept_future.cancelled()
     assert published and published[0]["job_id"] == job_id
+
+
+@pytest.mark.asyncio
+async def test_old_dispatch_cleanup_preserves_replacement_waiters():
+    registry = TransferRegistry()
+    scheduler = PushScheduler(
+        manager=None,
+        transfer_registry=registry,
+        transfer_slots=lambda: asyncio.Semaphore(1),
+        sessions=lambda: {},
+        publish=lambda _snapshot: None,
+        send_timeout=1,
+        accept_timeout=1,
+        accept_reconciliation_timeout=1,
+        reconciliation_timeout=1,
+        transfer_timeout=1,
+        allow_legacy=False,
+    )
+    scheduler.wake = lambda: None
+    key = TransferKey("push", "D1", "job-1", 1)
+    loop = asyncio.get_running_loop()
+    old_transfer = loop.create_future()
+    old_accept = loop.create_future()
+    registry.register(key, old_transfer)
+    old_transfer.set_result("requeued")
+
+    new_transfer = loop.create_future()
+    new_accept = loop.create_future()
+    registry.register(key, new_transfer)
+    scheduler._accept_waiters[("job-1", "D1", 1)] = new_accept
+    current_task = asyncio.current_task()
+    assert current_task is not None
+    scheduler._dispatch_waiters[current_task] = (key, new_transfer, new_accept)
+    assert scheduler.has_live_acceptance_waiter("job-1", "D1", 1) is True
+
+    scheduler._clear_dispatch_waiters(key, old_transfer, old_accept)
+
+    assert registry.get(key) is new_transfer
+    assert scheduler._accept_waiters[("job-1", "D1", 1)] is new_accept
+    assert scheduler.has_live_acceptance_waiter("job-1", "D1", 1) is True
+    assert not new_transfer.done()
+    assert not new_accept.done()
+
+
+@pytest.mark.asyncio
+async def test_accept_timeout_already_reconciled_keeps_exact_transfer_slot(monkeypatch):
+    deadline = 1234
+
+    class Manager:
+        async def mark_acceptance_reconciling(self, job_id, device_id, **kwargs):
+            assert job_id == "job-1"
+            assert device_id == "D1"
+            assert kwargs["expected_accept_deadline"] == deadline
+            return False, {
+                "job_id": job_id,
+                "devices": {device_id: {"attempt": 1, "accept_deadline": deadline}},
+            }
+
+    registry = TransferRegistry()
+    scheduler = PushScheduler(
+        manager=Manager(),
+        transfer_registry=registry,
+        transfer_slots=lambda: asyncio.Semaphore(1),
+        sessions=lambda: {},
+        publish=_publish,
+        send_timeout=1,
+        accept_timeout=0,
+        accept_reconciliation_timeout=1,
+        reconciliation_timeout=1,
+        transfer_timeout=1,
+        allow_legacy=False,
+    )
+    sent = []
+
+    async def send_reconcile(_session, snapshot, device_id):
+        sent.append((snapshot, device_id))
+
+    monkeypatch.setattr(scheduler, "send_reconcile", send_reconcile)
+    key = TransferKey("push", "D1", "job-1", 1)
+    transfer_future = asyncio.get_running_loop().create_future()
+    registry.register(key, transfer_future)
+    accepted = await scheduler._await_acceptance(
+        object(),
+        {
+            "job_id": "job-1",
+            "devices": {"D1": {"attempt": 1, "accept_deadline": deadline}},
+        },
+        "D1",
+        asyncio.get_running_loop().create_future(),
+        key,
+        deadline,
+    )
+
+    assert accepted is True
+    assert registry.get(key) is transfer_future
+    assert sent and sent[0][1] == "D1"
 
 
 async def _record(target, value):
@@ -576,6 +677,125 @@ async def test_server_local_websocket_factory_preserves_aiohttp_and_handles_regi
 
 
 @pytest.mark.asyncio
+async def test_housekeeping_recovers_expired_acceptance_waiter(monkeypatch):
+    monkeypatch.setattr(push_runtime, "_RECONCILIATION_POLL_INTERVAL", 0)
+    recovered = asyncio.Event()
+
+    class Manager:
+        def __init__(self):
+            self.returned = False
+
+        async def expired_acceptances(self, _timestamp):
+            if self.returned:
+                return []
+            self.returned = True
+            return [{
+                "job_id": "job-1",
+                "device_id": "D1",
+                "attempt": 1,
+                "accept_deadline": 0,
+            }]
+
+        async def expired_reconciliations(self, _timestamp):
+            return []
+
+        async def mark_acceptance_reconciling(self, job_id, device_id, **kwargs):
+            assert job_id == "job-1"
+            assert device_id == "D1"
+            assert kwargs["expected_accept_deadline"] == 0
+            return True, {"job_id": job_id}
+
+    class Scheduler:
+        def __init__(self):
+            self.wake_count = 0
+
+        def has_live_acceptance_waiter(self, _job_id, _device_id, _attempt):
+            return False
+
+        def wake(self):
+            self.wake_count += 1
+
+    runtime = object.__new__(PushRuntime)
+    runtime.manager = Manager()
+    runtime.scheduler = Scheduler()
+    runtime.accept_reconciliation_timeout = 60
+    runtime.sessions = {}
+
+    async def publish(_snapshot):
+        return None
+
+    async def request_reconcile(device_id):
+        assert device_id == "D1"
+        recovered.set()
+
+    runtime.publish = publish
+    runtime.request_reconcile = request_reconcile
+    task = asyncio.create_task(runtime._reconciliation_housekeeping())
+    try:
+        await asyncio.wait_for(recovered.wait(), timeout=1)
+        assert runtime.scheduler.wake_count >= 1
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_housekeeping_leaves_live_acceptance_waiter_to_dispatch_task(monkeypatch):
+    monkeypatch.setattr(push_runtime, "_RECONCILIATION_POLL_INTERVAL", 0)
+    checked = asyncio.Event()
+    transitioned = False
+
+    class Manager:
+        def __init__(self):
+            self.returned = False
+
+        async def expired_acceptances(self, _timestamp):
+            if self.returned:
+                return []
+            self.returned = True
+            return [{
+                "job_id": "job-1",
+                "device_id": "D1",
+                "attempt": 1,
+                "accept_deadline": 0,
+            }]
+
+        async def expired_reconciliations(self, _timestamp):
+            return []
+
+        async def mark_acceptance_reconciling(self, *_args, **_kwargs):
+            nonlocal transitioned
+            transitioned = True
+            raise AssertionError("a live acceptance waiter owns this deadline")
+
+    class Scheduler:
+        def has_live_acceptance_waiter(self, job_id, device_id, attempt):
+            assert (job_id, device_id, attempt) == ("job-1", "D1", 1)
+            checked.set()
+            return True
+
+        def wake(self):
+            raise AssertionError("a skipped live waiter must not wake the scheduler")
+
+    runtime = object.__new__(PushRuntime)
+    runtime.manager = Manager()
+    runtime.scheduler = Scheduler()
+    runtime.accept_reconciliation_timeout = 60
+    runtime.sessions = {}
+    runtime.publish = lambda _snapshot: asyncio.sleep(0)
+    runtime.request_reconcile = lambda _device_id: asyncio.sleep(0)
+
+    task = asyncio.create_task(runtime._reconciliation_housekeeping())
+    try:
+        await asyncio.wait_for(checked.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert transitioned is False
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_reconciliation_housekeeping_isolates_query_and_row_errors(monkeypatch):
     monkeypatch.setattr(push_runtime, "_RECONCILIATION_POLL_INTERVAL", 0)
     published = asyncio.Event()
@@ -604,6 +824,9 @@ async def test_reconciliation_housekeeping_isolates_query_and_row_errors(monkeyp
     class Manager:
         def __init__(self):
             self.queries = 0
+
+        async def expired_acceptances(self, _timestamp):
+            return []
 
         async def expired_reconciliations(self, _timestamp):
             self.queries += 1

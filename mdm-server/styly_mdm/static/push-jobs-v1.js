@@ -149,6 +149,10 @@
       appendLog('Dispatched job ' + ready.job_id.slice(0, 8) +
         ' after immutable artifact publication', 'success');
     }).catch(function (error) {
+      const bridge = window.__stylyPushJobsV1Bridge;
+      if (bridge && typeof bridge.clearPendingRequest === 'function') {
+        bridge.clearPendingRequest(staged.requestId);
+      }
       appendLog('Push/Sync job failed before dispatch: ' + error.message, 'fail');
     });
   }
@@ -184,6 +188,7 @@
     if (current && current.revision >= job.revision) return;
     pushJobs.set(job.job_id, job);
     renderJob(job);
+    renderPausedJobs();
     syncDeviceAssignments();
   }
 
@@ -216,6 +221,7 @@
     pushJobs.clear();
     replacement.forEach(function (job, jobId) { pushJobs.set(jobId, job); });
     pushJobs.forEach(renderJob);
+    renderPausedJobs();
     syncDeviceAssignments();
   }
 
@@ -296,6 +302,65 @@
       entry.body.appendChild(button);
     }
     container.scrollTop = container.scrollHeight;
+  }
+
+  function needsDispatchAction(job) {
+    const terminal = ['succeeded', 'completed_with_errors', 'failed', 'interrupted']
+      .indexOf(job.state) >= 0;
+    return !terminal && job.dispatch_enabled === false &&
+      ['ready', 'running', 'reconciling'].indexOf(job.state) >= 0;
+  }
+
+  function renderPausedJobs() {
+    const container = document.getElementById('pushJobsAttention');
+    if (!container) return;
+    const paused = Array.from(pushJobs.values()).filter(needsDispatchAction);
+    container.replaceChildren();
+    container.style.display = paused.length ? '' : 'none';
+    if (!paused.length) return;
+
+    const title = document.createElement('div');
+    title.className = 'push-attention-title';
+    title.textContent = 'Push / Sync jobs need attention';
+    container.appendChild(title);
+    paused.forEach(function (job) {
+      const item = document.createElement('div');
+      item.className = 'push-attention-item';
+      const label = document.createElement('span');
+      label.className = 'push-attention-job';
+      label.textContent = (job.mode === 'sync' ? 'Sync' : 'Push') + ' #' +
+        job.job_id.slice(0, 8) + ' → ' + job.dest_path;
+      const resume = document.createElement('button');
+      resume.type = 'button';
+      resume.className = 'push-resume';
+      const actionLabel = job.state === 'ready' ? 'Dispatch' : 'Resume';
+      resume.textContent = actionLabel;
+      resume.addEventListener('click', function () {
+        if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return;
+        resume.disabled = true;
+        resume.textContent = actionLabel === 'Dispatch' ? 'Dispatching…' : 'Resuming…';
+        try {
+          nativeSend.call(currentAdminSocket, JSON.stringify({
+            type: 'PUSH_FILES',
+            job_id: job.job_id,
+          }));
+        } catch (error) {
+          resume.disabled = false;
+          resume.textContent = actionLabel;
+          appendLog('Could not ' + actionLabel.toLowerCase() + ' job ' +
+            job.job_id.slice(0, 8) + ': ' + error.message, 'fail');
+          return;
+        }
+        setTimeout(function () {
+          if (!resume.isConnected) return;
+          resume.disabled = false;
+          resume.textContent = actionLabel;
+        }, 5000);
+      });
+      item.appendChild(label);
+      item.appendChild(resume);
+      container.appendChild(item);
+    });
   }
 
   function selectedAssignmentFor(deviceId) {

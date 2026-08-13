@@ -23,7 +23,10 @@ For end-user setup and usage, see the [README](../README.md).
 Issue #91 gives **Push Files** and **Sync Folder** a server-owned UUID job identity,
 SQLite-backed lifecycle, immutable artifact identity, per-device queue, exact transfer
 ownership, restart reconciliation, and an Application-scoped single-active client
-worker. APK Install intentionally remains on its existing path.
+worker. Exact-token durable accept deadlines recover lost in-memory waiters without
+competing with a live local waiter or capturing a later replay, and the console exposes
+undispatched `ready` jobs plus restart-paused jobs without allocating a replacement job.
+APK Install intentionally remains on its existing path.
 
 The authoritative implementation and protocol guide is
 [`PUSH_JOBS.md`](PUSH_JOBS.md). Its sequence diagram covers create-before-upload,
@@ -288,7 +291,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `PUSH_TRANSFER_COMPLETE` | Job-v1 network EOF checkpoint. Fields: `job_id`, `attempt`, `artifact_id`, exact `received_size`. This matching message releases only that job's transfer slot. |
 | `PUSH_PHASE` | Job-v1 phase transition, currently `phase=applying`, carrying exact identity. |
 | `PUSH_RECONCILE_REPORT` | Exact `active`, `absent`, or `interrupted` answer to a server reconciliation request. `absent` is sent only in response to that request. |
-| `PUSH_FILES_RESULT` | Durable terminal result. Job-v1 fields: `job_id`, fixed `attempt=1`, `status`, `dest_path`, success counts or `failure_code` + `detail`. The client retains it until a matching accepted ACK. |
+| `PUSH_FILES_RESULT` | Durable terminal result. Job-v1 fields: `job_id`, fixed `attempt=1`, `status`, `dest_path`, success counts or `failure_code` + `detail`. The client retains it until a matching accepted or permanent-rejection ACK and can replay the bounded completed receipt during exact reconciliation. |
 | `VERIFY_APK_RESULT` | Result of an APK integrity check. Fields: `package_name`, `found` (boolean), `size`, `cd_sha256`, `full_sha256`, `version_code`, `version_name`, `signer_sha256`, `error` (optional). Absent hash/version fields when `found` is false. |
 | `VERIFY_DIR_RESULT` | Result of a directory integrity check. Fields: `path`, `found` (boolean), `tree_hash`, `file_count`, `total_size`, `manifest` (optional array of `{relative_path, size, sha256}`, omitted above a cap), `error` (optional) |
 | `SELF_UPDATE_STARTING` | The client's last words before the silent installer kills its process for a self-update: tells the server to treat the coming disconnect as `updating`, not `offline`. Fields: `correlation_id`, `target_version_code`, `current_version_code`, `package_name`, `apk_filename`. See [Client Self-Update](#client-self-update). |

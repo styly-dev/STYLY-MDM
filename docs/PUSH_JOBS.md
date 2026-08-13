@@ -22,7 +22,7 @@ Push/Sync uses three independent ownership mechanisms:
 
 The transfer registry uses typed keys. A job-v1 slot is addressed by `(job_id, device_id, attempt=1)`; a stale result cannot release a different job's slot. Install and migration-only legacy Push use the same typed registry and the existing server-wide transfer semaphore.
 
-The device queue is ordered by the server-wide monotonic `enqueue_seq`. A later enabled job cannot jump over an older non-terminal queued assignment merely because the older job is still uploading or has its restart dispatch gate paused.
+The device queue is ordered by the server-wide monotonic `enqueue_seq`. A later enabled job cannot jump over an older non-terminal queued assignment merely because the older job is still uploading or has its dispatch gate paused. The console therefore keeps every dispatchable `ready`, `running`, or `reconciling` job with a closed gate in a stable attention panel; an uploaded `ready` job can be dispatched with its existing `job_id` even if the original browser send was lost.
 
 ## Client capability and durability
 
@@ -53,9 +53,9 @@ The server coalesces pending publication by `job_id` and sends only the newest q
 
 ## Scheduling and connection ownership
 
-The exact transfer waiter is registered before `waiting_transfer -> dispatching` commits and before the command is sent. After slot acquisition, the scheduler rechecks the live connection and capability. It then holds the same per-device owner lock used by REGISTER replacement and disconnect while performing the final session check and bounded `send_str`.
+The exact transfer waiter is registered before `waiting_transfer -> dispatching` commits and before the command is sent. Waiter cleanup is identity-checked, so a superseded dispatch task cannot cancel a replacement task's waiter. The durable `accept_deadline` is swept into short reconciliation only when no live dispatch task still owns the exact in-memory acceptance waiter. The local waiter owns the normal timeout; the durable sweep recovers process/background-task loss. Its transition compares the exact stored deadline in the same transaction, so a stale sweep cannot capture a later replay of the same attempt. After slot acquisition, the scheduler rechecks the live connection and capability. It then holds the same per-device owner lock used by REGISTER replacement and disconnect while performing the final session check and bounded `send_str`.
 
-Job-v1 messages from a device are also checked and settled under that owner lock. Once a replacement REGISTER owns the device, the superseded socket cannot settle an ACK, phase, transfer completion, result, or reconciliation report. Committed admin snapshots are queued for publication and sent after this correctness path returns; browser backpressure is not part of device ownership.
+Job-v1 messages from a device are also checked and settled under that owner lock. Disconnect removes the old owner and commits its canonical queue/reconciliation transition before a replacement REGISTER may acquire ownership. Once a replacement REGISTER owns the device, the superseded socket cannot settle an ACK, phase, transfer completion, result, or reconciliation report. Committed admin snapshots are queued for publication and sent after this correctness path returns; browser backpressure is not part of device ownership.
 
 Artifact URLs in device commands are absolute HTTP(S) URLs derived from the accepted device connection's server authority. The canonical snapshot retains the relative `/artifacts/{artifact_id}` route for console/API use.
 
@@ -68,7 +68,8 @@ On server restart:
 - `waiting_transfer` returns to `queued`;
 - dispatched phases become `reconciling`;
 - dispatch is paused and no command is automatically resent;
-- the operator resumes queued assignments by sending `PUSH_FILES {job_id}` again.
+- the operator re-enables an existing job by using the console's **Dispatch** or **Resume** action, which sends `PUSH_FILES {job_id}` again; this also covers an uploaded `ready` job whose original dispatch send was lost;
+- scheduler wake-up immediately follows the durable re-enable and does not wait for its direct admin acknowledgement.
 
 A missing DB-referenced immutable artifact is never substituted. Startup fails the work that still needs that artifact. Canonical UUID-named artifact files with no owning DB row are treated as publication-crash orphans and removed; unknown files are left for the general stale-file policy.
 
@@ -77,9 +78,12 @@ A client process restart converts a persisted active record into an interrupted 
 - a matching active report restores the reported phase;
 - an explicit pre-accept `absent` report requeues the same attempt at most once;
 - restart-origin `absent` becomes `interrupted` and is never automatically requeued;
-- an elapsed deadline becomes `unconfirmed` only if the callback's stored deadline still matches;
+- an elapsed accept deadline enters the short exact reconciliation probe even if its in-memory waiter was lost;
+- an elapsed reconciliation deadline becomes `unconfirmed` only if the callback's stored deadline still matches;
 - a matching late result or exact `absent|interrupted` clears the fence without rewriting the old terminal job;
 - a different job-v1 process UUID proves process replacement; a new job-v1 process also safely replaces a legacy fence that had no process UUID.
+
+An exact terminal result from the current owner settles any dispatched active phase even if an intermediate phase frame was lost during WebSocket replacement. Reconciliation can replay a matching completed receipt after its original result was already ACKed, allowing a server that missed that ACK boundary to converge without rerunning the worker.
 
 ## Configuration
 

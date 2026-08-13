@@ -103,7 +103,7 @@
     .targets { border-right: 1px solid var(--border); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
     .actions { background: var(--bg-actions); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
     .targets-head, .subtabs { flex: 0 0 auto; }
-    .actions > .zone-label, .sel-card { flex: 0 0 auto; }
+    .actions > .zone-label, .sel-card, .push-attention { flex: 0 0 auto; }
 
     /* Drag handles */
     .v-gutter { cursor: col-resize; background: transparent; transition: background .15s; }
@@ -255,6 +255,14 @@
     .sel-clear:hover { color: var(--text-primary); }
     .sel-ctx { font-size: 12px; color: #9bb0d6; margin-top: 7px; }
 
+    .push-attention { margin: 0 18px 12px; padding: 11px 12px; max-height: 180px; overflow-y: auto; background: #2a2415; border: 1px solid #665321; border-radius: 8px; }
+    .push-attention-title { color: var(--warning); font-size: 11px; font-weight: 700; letter-spacing: .7px; text-transform: uppercase; margin-bottom: 7px; }
+    .push-attention-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-primary); }
+    .push-attention-item + .push-attention-item { margin-top: 7px; padding-top: 7px; border-top: 1px solid #55461f; }
+    .push-attention-job { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .push-resume { flex: 0 0 auto; border: none; border-radius: 5px; padding: 5px 10px; background: var(--warning); color: #17130a; font: 600 12px inherit; cursor: pointer; }
+    .push-resume:disabled { opacity: .55; cursor: wait; }
+
     .commands { padding: 0 18px 18px; display: flex; flex-direction: column; gap: 14px; flex: 1 1 0; min-height: 0; overflow-y: auto; }
     .cmd-divider { height: 1px; background: var(--border); }
     .cmd-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 8px; cursor: pointer; user-select: none; }
@@ -405,6 +413,7 @@
         <div class="actions">
           <div class="zone-label">② Actions</div>
           <div class="sel-card" id="selCard"></div>
+          <div class="push-attention" id="pushJobsAttention" style="display:none"></div>
           <div class="commands">
             <div class="cmd-section collapsed" data-cmd="install">
               <div class="cmd-head" data-act="toggleCmd"><span>Quick Install</span><span class="cmd-chevron">▾</span></div>
@@ -1368,6 +1377,18 @@
           delete deviceTaskState[deviceId];
           updateTaskCell(deviceId);
           return true;
+        },
+        clearPendingRequest: function (requestId) {
+          let cleared = false;
+          Object.keys(deviceTaskState).forEach(function (deviceId) {
+            const current = deviceTaskState[deviceId];
+            if (!current || current.owner !== 'push-job-v1' ||
+                current.pending_request_id !== requestId) return;
+            delete deviceTaskState[deviceId];
+            updateTaskCell(deviceId);
+            cleared = true;
+          });
+          return cleared;
         },
       };
 
