@@ -141,6 +141,36 @@ class PushFilesWorkerTest {
     }
 
     @Test
+    fun `artifact download is not limited by the extracted byte ceiling`() {
+        val archive = zip("content.txt" to "larger-than-extracted-limit").readBytes()
+        val callbacks = mutableListOf<String>()
+
+        ArtifactServer(archive).use { server ->
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { File(tmp.root, "artifact-over-extracted-limit") },
+                destinationProvider = { throw AssertionError("validation must fail before apply") },
+                maxExtractedBytes = 1,
+            ).execute(
+                command(
+                    artifactUrl = server.url,
+                    artifactSize = archive.size.toLong(),
+                    artifactSha256 = sha256(archive),
+                ),
+                PushFilesWorker.Callbacks(
+                    onTransferComplete = { callbacks += "transfer" },
+                    onValidated = { callbacks += "validated" },
+                    onApplying = { callbacks += "applying" },
+                ),
+            )
+
+            assertEquals("fail", execution.result.status)
+            assertEquals("validation_failed", execution.result.failureCode)
+        }
+        assertEquals(listOf("transfer"), callbacks)
+    }
+
+    @Test
     fun `legacy artifact without SHA remains compatible`() {
         val archive = zip("content.txt" to "legacy").readBytes()
         val destination = tmp.newFolder("legacy-no-sha-destination")

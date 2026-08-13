@@ -18,6 +18,7 @@ class PushFilesWorker internal constructor(
     private val hasExternalStorageAccess: () -> Boolean,
     private val attemptDirectoryProvider: (PushProtocol.Command) -> File,
     private val destinationProvider: ((String) -> File)? = null,
+    private val maxExtractedBytes: Long = MAX_EXTRACTED_BYTES,
 ) {
     constructor() : this(
         hasExternalStorageAccess = {
@@ -35,7 +36,7 @@ class PushFilesWorker internal constructor(
         private const val CONNECT_TIMEOUT_MS = 15_000
         private const val READ_TIMEOUT_MS = 120_000
         private const val MAX_ARCHIVE_ENTRIES = 5_000
-        private const val MAX_UNCOMPRESSED_BYTES = 2L * 1024 * 1024 * 1024
+        private const val MAX_EXTRACTED_BYTES = 2L * 1024 * 1024 * 1024
         private val PROTECTED_TOPLEVEL_DIRS = setOf(
             "android", "download", "downloads", "dcim", "pictures", "movies", "music",
             "documents", "alarms", "notifications", "podcasts", "ringtones",
@@ -212,9 +213,6 @@ class PushFilesWorker internal constructor(
 
     private fun download(command: PushProtocol.Command, work: File): File {
         val expectedSize = command.artifactSize
-        if (expectedSize != null && expectedSize > MAX_UNCOMPRESSED_BYTES) {
-            throw PushWorkerException("artifact_identity_mismatch", "artifact exceeds the size limit")
-        }
         val partial = File(work, "artifact.part")
         val completed = File(work, "artifact.zip")
         val digest = MessageDigest.getInstance("SHA-256")
@@ -238,12 +236,6 @@ class PushFilesWorker internal constructor(
                         val read = input.read(buffer)
                         if (read < 0) break
                         received = safeAdd(received, read.toLong())
-                        if (received > MAX_UNCOMPRESSED_BYTES) {
-                            throw PushWorkerException(
-                                "artifact_identity_mismatch",
-                                "artifact exceeded the configured size limit",
-                            )
-                        }
                         if (expectedSize != null && received > expectedSize) {
                             throw PushWorkerException(
                                 "artifact_identity_mismatch",
@@ -361,7 +353,7 @@ class PushFilesWorker internal constructor(
                                     val read = input.read(buffer)
                                     if (read < 0) break
                                     extractedBytes = safeAdd(extractedBytes, read.toLong())
-                                    if (extractedBytes > MAX_UNCOMPRESSED_BYTES) {
+                                    if (extractedBytes > maxExtractedBytes) {
                                         throw PushWorkerException(
                                             "validation_failed",
                                             "ZIP expands beyond the allowed size",
