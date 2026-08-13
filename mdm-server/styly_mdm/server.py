@@ -479,7 +479,19 @@ async def _broadcast_admin_message(message: str) -> None:
             except (Exception, asyncio.TimeoutError):
                 log.warning("Could not close failed admin WebSocket", exc_info=True)
 
-    await asyncio.gather(*(send_one(ws) for ws in tuple(admin_connections)))
+    connections = tuple(admin_connections)
+    if not connections:
+        return
+
+    fanout = asyncio.gather(*(send_one(ws) for ws in connections))
+    try:
+        await asyncio.shield(fanout)
+    except asyncio.CancelledError:
+        # aiohttp may cancel a device request handler while its finally block is
+        # broadcasting the disconnect. Keep the already-bounded admin sends alive
+        # so the console receives that terminal state before cancellation escapes.
+        await asyncio.shield(fanout)
+        raise
 
 
 async def forward_to_admins(payload: dict):

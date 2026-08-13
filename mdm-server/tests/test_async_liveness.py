@@ -392,13 +392,15 @@ async def test_console_serves_push_job_adapter_without_file_response_patch(tmp_p
 
 class _AdminWebSocket:
     def __init__(
-        self, *, error=None, mutate=False, block=None, delay=0, close_block=None
+        self, *, error=None, mutate=False, block=None, delay=0, close_block=None,
+        started=None,
     ):
         self.error = error
         self.mutate = mutate
         self.block = block
         self.delay = delay
         self.close_block = close_block
+        self.started = started
         self.messages = []
         self.active = 0
         self.max_active = 0
@@ -408,6 +410,8 @@ class _AdminWebSocket:
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
+            if self.started is not None:
+                self.started.set()
             if self.block is not None:
                 await self.block.wait()
             if self.delay:
@@ -477,6 +481,28 @@ async def test_concurrent_admin_broadcasts_serialize_each_connection():
         )
         assert ws.max_active == 1
         assert {message["type"] for message in ws.messages} == {"FIRST", "SECOND"}
+    finally:
+        server.admin_connections.clear()
+        server._admin_send_locks.clear()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_admin_broadcast_finishes_bounded_send_before_reraising():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    ws = _AdminWebSocket(block=release, started=started)
+    server.admin_connections.clear()
+    server.admin_connections.add(ws)
+    try:
+        broadcast = asyncio.create_task(server.forward_to_admins({"type": "OFFLINE"}))
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        broadcast.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await broadcast
+
+        assert ws.messages == [{"type": "OFFLINE"}]
     finally:
         server.admin_connections.clear()
         server._admin_send_locks.clear()
