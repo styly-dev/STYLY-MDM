@@ -1049,6 +1049,12 @@ Settings and tap **Save & Connect**. **Use Auto-Discovery** removes both the man
 preference and the previous discovery cache, then restarts the service so a fresh discovery
 begins immediately. A successful discovery creates a new cache for later fallback.
 
+The manual Settings field accepts an IPv4 address or hostname with an explicit
+port, for example `192.168.1.100:7070` or `mdm.local:7070`. The client expands it
+to `ws://<address>:<port>/ws/device`; inputs containing a scheme or path are
+rejected. After a successful connection, the Settings screen and foreground
+notification show the target as `Connected (<address>:<port>)`.
+
 ### Connection tunables (`/sdcard/styly-mdm/config.json`)
 
 The window duration and retry interval have built-in defaults and can be overridden by

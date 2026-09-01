@@ -24,6 +24,7 @@ import org.json.JSONObject
 import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 /**
@@ -52,6 +53,7 @@ class WebSocketManager(
         private const val PREF_SERVER_URL = "server_url"
         // Kept separate from PREF_SERVER_URL, which is only a discovery cache.
         private const val PREF_MANUAL_SERVER_URL = "manual_server_url_value"
+        private const val MANUAL_SERVER_PATH = "/ws/device"
         // Last-resort fallback used only when discovery fails and no URL is saved.
         // The port is flavor-aware (BuildConfig.DEFAULT_WS_PORT) so the dev build
         // never falls back to the production port and accidentally connects to a
@@ -67,8 +69,7 @@ class WebSocketManager(
         const val PREF_STARTUP_APP_EXTRA = "startup_app_extra"
 
         internal fun saveManualServerUrl(context: Context, url: String): Boolean {
-            val normalized = url.trim()
-            if (!isValidWsUrl(normalized)) return false
+            val normalized = normalizeManualServerUrl(url) ?: return false
             preferences(context)
                 .edit()
                 .putString(PREF_MANUAL_SERVER_URL, normalized)
@@ -87,7 +88,29 @@ class WebSocketManager(
         internal fun getManualServerUrl(context: Context): String? {
             return preferences(context)
                 .getString(PREF_MANUAL_SERVER_URL, null)
-                ?.takeIf(::isValidWsUrl)
+                ?.takeIf(::isCanonicalManualServerUrl)
+        }
+
+        internal fun getManualServerAddress(context: Context): String? {
+            return getManualServerUrl(context)?.let(::serverAddress)
+        }
+
+        internal fun normalizeManualServerUrl(input: String): String? {
+            val address = input.trim().lowercase(Locale.ROOT)
+            if (!isValidServerAddress(address)) return null
+            val candidate = "ws://$address$MANUAL_SERVER_PATH"
+            return candidate.takeIf(::isCanonicalManualServerUrl)
+        }
+
+        internal fun serverAddress(url: String): String {
+            val httpUrl = Request.Builder().url(url).build().url
+            val host = httpUrl.host
+            val formattedHost = if (host.contains(":") && !host.startsWith("[")) {
+                "[$host]"
+            } else {
+                host
+            }
+            return "$formattedHost:${httpUrl.port}"
         }
 
         private fun getCachedServerUrl(context: Context): String {
@@ -109,6 +132,60 @@ class WebSocketManager(
             } catch (_: IllegalArgumentException) {
                 false
             }
+        }
+
+        private fun isCanonicalManualServerUrl(url: String): Boolean {
+            if (!url.startsWith("ws://")) return false
+            return try {
+                val httpUrl = Request.Builder().url(url).build().url
+                if (httpUrl.encodedPath != MANUAL_SERVER_PATH ||
+                    httpUrl.encodedQuery != null ||
+                    httpUrl.encodedFragment != null
+                ) {
+                    return false
+                }
+                val address = "${httpUrl.host}:${httpUrl.port}"
+                isValidServerAddress(address) && url == "ws://$address$MANUAL_SERVER_PATH"
+            } catch (_: IllegalArgumentException) {
+                false
+            }
+        }
+
+        private fun isValidServerAddress(address: String): Boolean {
+            val parts = address.split(":")
+            if (parts.size != 2) return false
+
+            if (!isValidServerHost(parts[0])) return false
+
+            if (!isAsciiDigits(parts[1])) return false
+            val port = parts[1].toIntOrNull() ?: return false
+            return port in 1..65535
+        }
+
+        private fun isValidServerHost(host: String): Boolean {
+            if (host.isEmpty()) return false
+            if (host.all { it in '0'..'9' || it == '.' }) {
+                val octets = host.split(".")
+                return octets.size == 4 && octets.none(::isInvalidOctet)
+            }
+            if (host.length > 253) return false
+            return host.split(".").all { label ->
+                label.isNotEmpty() &&
+                    label.length <= 63 &&
+                    label.first().isLetterOrDigit() &&
+                    label.last().isLetterOrDigit() &&
+                    label.all { it.isLetterOrDigit() || it == '-' }
+            }
+        }
+
+        private fun isInvalidOctet(value: String): Boolean {
+            if (!isAsciiDigits(value)) return true
+            val octet = value.toIntOrNull() ?: return true
+            return octet !in 0..255
+        }
+
+        private fun isAsciiDigits(value: String): Boolean {
+            return value.isNotEmpty() && value.all { it in '0'..'9' }
         }
     }
 
@@ -287,7 +364,7 @@ class WebSocketManager(
                 reconnectHandler.post {
                     if (this@WebSocketManager.webSocket !== webSocket) return@post
                     dispatch(scheduler.onConnected())
-                    onStatusChanged(true, "Connected")
+                    onStatusChanged(true, "Connected (${serverAddress(url)})")
                     sendRegistration()
                     startBatteryTelemetry()
                 }

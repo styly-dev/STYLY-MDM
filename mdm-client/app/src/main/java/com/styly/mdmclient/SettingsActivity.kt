@@ -64,7 +64,7 @@ class SettingsActivity : AppCompatActivity() {
         journalRefreshButton = findViewById(R.id.journal_refresh_button)
         journalClearButton = findViewById(R.id.journal_clear_button)
 
-        serverUrlInput.setText(WebSocketManager.getManualServerUrl(this).orEmpty())
+        serverUrlInput.setText(WebSocketManager.getManualServerAddress(this).orEmpty())
 
         saveButton.setOnClickListener {
             saveAndRestart()
@@ -117,14 +117,18 @@ class SettingsActivity : AppCompatActivity() {
         if (url.isEmpty()) {
             Toast.makeText(
                 this,
-                "Enter a manual URL or use Auto-Discovery",
+                "Enter a manual server address or use Auto-Discovery",
                 Toast.LENGTH_SHORT,
             ).show()
             return
         }
 
         if (!WebSocketManager.saveManualServerUrl(this, url)) {
-            Toast.makeText(this, "Enter a valid ws:// or wss:// URL", Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                this,
+                "Enter a valid server address such as 192.168.1.100:7070",
+                Toast.LENGTH_SHORT,
+            ).show()
             return
         }
 
@@ -187,7 +191,7 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun updateStatusDisplay(connected: Boolean, message: String) {
-        statusText.text = if (connected) "Connected" else message
+        statusText.text = if (connected && message.isEmpty()) "Connected" else message
         statusText.setTextColor(
             if (connected) 0xFF4CAF50.toInt() else 0xFFFF5722.toInt()
         )

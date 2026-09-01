@@ -1842,7 +1842,7 @@ class MdmClientService : Service() {
 
     private fun handleStatusChanged(connected: Boolean, message: String) {
         Log.i(TAG, "Connection status: connected=$connected, message=$message")
-        updateNotification(if (connected) "Connected" else message)
+        updateNotification(message)
 
         // Broadcast status for SettingsActivity
         val intent = Intent(ACTION_STATUS_UPDATE).apply {

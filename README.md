@@ -111,11 +111,13 @@ Install the MDM client APK on the HMD (see the [Developer Guide](docs/DEVELOPMEN
 2. Choose the connection mode:
    - Tap **Use Auto-Discovery** to clear any manual override and previous discovery
      cache, then immediately start fresh discovery on the LAN.
-   - Or enter a manual URL such as `ws://<server-ip>:7070/ws/device`, then tap
-     **Save & Connect**. The client keeps this URL separate from discovery results
-     and retries only that URL throughout each connection window.
+   - Or enter a manual server address such as `<server-ip>:7070` or
+     `<server-name>:7070`, then tap
+     **Save & Connect**. The client adds `ws://` and `/ws/device` automatically,
+     keeps the endpoint separate from discovery results, and retries only that
+     endpoint throughout each connection window.
 
-> **Note:** On first launch with no manual URL, the client automatically attempts
+> **Note:** On first launch with no manual address, the client automatically attempts
 > server discovery before falling back to the last discovered or default URL.
 
 The MDM client connects to the server, registers the device (serial number, model, IP address), and runs as a foreground service in the background.
