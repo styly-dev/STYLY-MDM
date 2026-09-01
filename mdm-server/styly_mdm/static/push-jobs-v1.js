@@ -118,7 +118,7 @@
     });
   }
 
-  function createUploadDispatch(socket, legacyMessage, staged) {
+  function createUploadDispatch(legacyMessage, staged) {
     const source = staged.info;
     const createBody = {
       client_request_id: staged.requestId,
@@ -145,7 +145,13 @@
       if (!ready || ['ready', 'running', 'reconciling'].indexOf(ready.state) < 0) {
         throw new Error('job is not dispatchable after upload');
       }
-      nativeSend.call(socket, JSON.stringify({ type: 'PUSH_FILES', job_id: ready.job_id }));
+      if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) {
+        throw new Error('admin WebSocket is not connected');
+      }
+      nativeSend.call(currentAdminSocket, JSON.stringify({
+        type: 'PUSH_FILES',
+        job_id: ready.job_id,
+      }));
       appendLog('Dispatched job ' + ready.job_id.slice(0, 8) +
         ' after immutable artifact publication', 'success');
     }).catch(function (error) {
@@ -169,7 +175,7 @@
           const staged = requestId ? pendingUploads.get(requestId) : null;
           if (staged) {
             pendingUploads.delete(requestId);
-            createUploadDispatch(this, message, staged);
+            createUploadDispatch(message, staged);
             return;
           }
         }
@@ -448,8 +454,9 @@
       const selected = selectedAssignmentFor(deviceId);
       const renderedJobId = renderedAssignments.get(deviceId);
       if (selected) {
-        bridge.applyAssignment(assignmentView(selected, deviceId));
-        renderedAssignments.set(deviceId, selected.job.job_id);
+        if (bridge.applyAssignment(assignmentView(selected, deviceId))) {
+          renderedAssignments.set(deviceId, selected.job.job_id);
+        }
       } else {
         bridge.clearAssignment(deviceId, renderedJobId);
         renderedAssignments.delete(deviceId);

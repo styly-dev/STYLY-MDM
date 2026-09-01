@@ -113,7 +113,8 @@ async def test_fence_mutation_revisions_every_visible_job(manager):
     assert first['job_id'] in by_id
     assert second['job_id'] in by_id
     assert by_id[second['job_id']]['revision'] == before_second['revision'] + 1
-    assert by_id[second['job_id']]['devices']['D1']['device_fence'] is not None
+    assert by_id[first['job_id']]['devices']['D1']['device_fence'] is not None
+    assert by_id[second['job_id']]['devices']['D1']['device_fence'] is None
 
 
 @pytest.mark.asyncio
@@ -282,6 +283,34 @@ async def test_new_job_v1_process_safely_clears_legacy_fence(manager):
     assert cleared
     current = await manager.get_snapshot(queued['job_id'])
     assert current['devices']['D1']['device_fence'] is None
+
+
+@pytest.mark.asyncio
+async def test_new_job_v1_process_clears_offline_job_v1_fence(manager):
+    first = await ready(manager.store, request(), 'offline-owner')
+    second = await ready(manager.store, request(), 'next-job')
+    await manager.enable_dispatch(first['job_id'])
+    await manager.enable_dispatch(second['job_id'])
+    await manager.claim_next(['D1'])
+    await manager.prepare_dispatch(
+        first['job_id'], 'D1', protocol_mode=ProtocolMode.JOB_V1,
+        live_capabilities={'push_job_id_v1'}, accept_deadline=now_ms() + 1_000,
+    )
+    await manager.mark_reconciling(
+        first['job_id'], 'D1', expected={DeviceState.DISPATCHING},
+        reason='device_disconnect', deadline=now_ms(),
+    )
+    await manager.mark_unconfirmed(
+        first['job_id'], 'D1', None, 'device stayed offline past deadline',
+    )
+
+    assert await manager.claim_next(['D1']) is None
+    cleared = await manager.clear_fence_on_process_replacement(
+        'D1', str(uuid.uuid4()), True,
+    )
+    assert cleared
+    claimed = await manager.claim_next(['D1'])
+    assert claimed['job']['job_id'] == second['job_id']
 
 @pytest.mark.asyncio
 async def test_stale_reconciliation_deadline_cannot_mark_recovered_assignment(manager):

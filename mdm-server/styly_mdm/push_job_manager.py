@@ -749,13 +749,12 @@ class PushJobManager:
                     self.store._commit(conn)
                     return []
                 old_process = fence["blocking_process_instance_id"]
-                protocol = ProtocolMode(fence["protocol_mode"])
                 # A different recorded process proves replacement.  For a legacy fence
-                # no process UUID existed; a new job-v1 process is itself the safe
-                # migration evidence required by §19.3.
+                # or an offline timeout no process UUID existed; a new job-v1 process
+                # is itself the safe replacement evidence required by §19.3.
                 replaced = (
                     old_process is not None and old_process != process_instance_id
-                ) or (old_process is None and protocol is ProtocolMode.LEGACY)
+                ) or old_process is None
                 if not replaced:
                     self.store._commit(conn)
                     return []

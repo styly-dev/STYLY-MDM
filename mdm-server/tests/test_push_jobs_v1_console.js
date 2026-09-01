@@ -148,6 +148,9 @@ function loadAdapter(options = {}) {
   global.__stylyPushJobsV1Bridge = {
     applyAssignment(assignment) {
       applied.push(assignment);
+      if (options.applyAssignment && !options.applyAssignment(assignment)) {
+        return false;
+      }
       bridgeState.set(assignment.device_id, assignment);
       return true;
     },
@@ -197,6 +200,67 @@ test('failed job creation clears the matching optimistic request', async () => {
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.deepEqual(harness.clearedPendingRequests, [requestId]);
+});
+
+test('upload dispatch uses the replacement admin socket', async () => {
+  let finishUpload;
+  const uploadReady = new Promise((resolve) => { finishUpload = resolve; });
+  const harness = loadAdapter({
+    fetch: async (url) => {
+      if (url === '/api/push-jobs') {
+        return new Response(JSON.stringify({
+          job_id: '11111111-1111-4111-8111-111111111111',
+          state: 'created',
+          upload_url: '/api/push-jobs/upload',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (url === '/api/push-jobs/upload') {
+        await uploadReady;
+        return new Response(JSON.stringify({
+          job_id: '11111111-1111-4111-8111-111111111111',
+          state: 'ready',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      throw new Error('unexpected URL: ' + url);
+    },
+  });
+  const firstSocket = new window.WebSocket('ws://localhost/ws/admin');
+  const form = new FormData();
+  form.append('files', new File(['data'], 'content.txt'));
+  const staged = await window.fetch('/api/bundles', { method: 'POST', body: form });
+  const marker = await staged.json();
+
+  firstSocket.send(JSON.stringify({
+    type: 'PUSH_FILES',
+    target_devices: ['D1'],
+    bundle_url: marker.bundle_url,
+    dest_path: '/sdcard/job',
+    delete_extras: false,
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  const replacementSocket = new window.WebSocket('ws://localhost/ws/admin');
+  finishUpload();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(firstSocket.sent, []);
+  assert.deepEqual(replacementSocket.sent, [{
+    type: 'PUSH_FILES',
+    job_id: '11111111-1111-4111-8111-111111111111',
+  }]);
+  assert.deepEqual(harness.clearedPendingRequests, []);
+});
+
+test('a rejected canonical assignment is not recorded as rendered', () => {
+  const harness = loadAdapter({ applyAssignment: () => false });
+  const socket = new window.WebSocket('ws://localhost/ws/admin');
+  socket.emit({
+    type: 'PUSH_JOBS_SNAPSHOT',
+    jobs: [snapshot('active-job', 1, 'D1', 'downloading', 1)],
+  });
+  socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [] });
+
+  assert.equal(harness.applied.length, 1);
+  assert.deepEqual(harness.cleared, []);
 });
 
 test('full snapshots merge pre-snapshot updates and remove absent jobs', () => {

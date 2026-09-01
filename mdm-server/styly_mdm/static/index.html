@@ -1619,6 +1619,10 @@
             // Optimistic first paint only. The matching canonical job snapshot replaces
             // it after create/upload/dispatch; unrelated older jobs cannot claim it.
             online.forEach(function (id) {
+              const current = deviceTaskState[id];
+              if (current && current.owner === 'push-job-v1' && current.job_id) {
+                return;
+              }
               const pendingPrefix = 'push-job://pending/';
               const pendingRequestId = String(bundle.bundle_url || '').indexOf(pendingPrefix) === 0
                 ? String(bundle.bundle_url).slice(pendingPrefix.length) : null;

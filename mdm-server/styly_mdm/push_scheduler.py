@@ -445,7 +445,7 @@ class PushScheduler:
             except asyncio.CancelledError:
                 raise
             except StoreConflict:
-                continue
+                await asyncio.sleep(_RUN_RETRY_DELAY)
             except Exception:
                 log.exception(
                     "Could not recover Push dispatch ownership for %s/%s",

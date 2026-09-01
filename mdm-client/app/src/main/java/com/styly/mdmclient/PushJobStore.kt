@@ -7,6 +7,18 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
 
+internal fun normalizePushState(
+    state: PushProtocol.State,
+    cutoff: Long,
+    maxReceipts: Int,
+): PushProtocol.State {
+    val pending = state.pendingResults.takeLast(maxReceipts)
+    val completed = state.completedReceipts
+        .filter { it.result.completedAt <= 0L || it.result.completedAt >= cutoff }
+        .takeLast(maxReceipts)
+    return state.copy(pendingResults = pending, completedReceipts = completed)
+}
+
 /** Atomic persistence for active execution, terminal outbox, and dedupe receipts. */
 class PushJobStore(
     context: Context,
@@ -60,9 +72,6 @@ class PushJobStore(
 
     private fun trim(state: PushProtocol.State): PushProtocol.State {
         val cutoff = clock() - RECEIPT_RETENTION_MS
-        val retained = state.completedReceipts
-            .filter { it.result.completedAt <= 0L || it.result.completedAt >= cutoff }
-            .takeLast(MAX_RECEIPTS)
-        return state.copy(completedReceipts = retained)
+        return normalizePushState(state, cutoff, MAX_RECEIPTS)
     }
 }

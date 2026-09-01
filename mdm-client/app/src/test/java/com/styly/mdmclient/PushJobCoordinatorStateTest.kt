@@ -150,6 +150,21 @@ class PushJobCoordinatorStateTest {
         assertEquals(completed, found)
     }
 
+    @Test
+    fun `durable outbox and replay set are bounded with newest receipts retained`() {
+        val receipts = List(300) { receipt() }
+        val state = PushProtocol.State(
+            active = null,
+            pendingResults = receipts,
+            completedReceipts = receipts,
+        )
+
+        val normalized = normalizePushState(state, cutoff = 0, maxReceipts = 256)
+
+        assertEquals(receipts.takeLast(256), normalized.pendingResults)
+        assertEquals(receipts.takeLast(256), normalized.completedReceipts)
+    }
+
     private fun receipt(): PushProtocol.Receipt {
         val command = command()
         return PushProtocol.Receipt(

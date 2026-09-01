@@ -384,7 +384,25 @@ class PushJobStore:
         devices: dict[str, Any] = {}
         for row in device_rows:
             fence = conn.execute(
-                "SELECT * FROM push_device_fences WHERE device_id=?", (row["device_id"],)
+                """
+                SELECT * FROM push_device_fences f
+                WHERE f.device_id=?
+                  AND (
+                    f.blocking_job_id=?
+                    OR (
+                      f.blocking_job_id IS NULL
+                      AND ?=(
+                        SELECT j.job_id
+                        FROM push_job_devices d
+                        JOIN push_jobs j ON j.job_id=d.job_id
+                        WHERE d.device_id=f.device_id
+                        ORDER BY j.updated_at DESC, j.job_id DESC
+                        LIMIT 1
+                      )
+                    )
+                  )
+                """,
+                (row["device_id"], job_id, job_id),
             ).fetchone()
             fence_payload = None
             if fence is not None:

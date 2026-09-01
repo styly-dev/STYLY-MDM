@@ -62,6 +62,33 @@ async def test_scheduler_retries_after_unexpected_claim_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_recovery_backs_off_after_store_conflict(monkeypatch):
+    class Manager:
+        async def assignment(self, _job_id, _device_id):
+            raise push_scheduler.StoreConflict('persistent conflict')
+
+    scheduler = _scheduler(Manager())
+    scheduler._stopping = False
+    delays = []
+
+    async def observed_sleep(delay):
+        delays.append(delay)
+        scheduler._stopping = True
+
+    monkeypatch.setattr(push_scheduler.asyncio, 'sleep', observed_sleep)
+    await scheduler._recover_unexpected_dispatch_failure(
+        {
+            'job': {'job_id': 'job-1'},
+            'device_id': 'D1',
+            'attempt': 1,
+        },
+        RuntimeError('dispatch failed'),
+    )
+
+    assert delays == [push_scheduler._RUN_RETRY_DELAY]
+
+
+@pytest.mark.asyncio
 async def test_wake_restarts_a_finished_scheduler_runner():
     class Manager:
         def __init__(self):
