@@ -5,6 +5,10 @@ const test = require('node:test');
 const vm = require('node:vm');
 
 const nodeFetch = global.fetch;
+const indexSource = fs.readFileSync(
+  path.join(__dirname, '..', 'styly_mdm', 'static', 'index.html'),
+  'utf8',
+);
 
 class FakeElement {
   constructor(tagName) {
@@ -261,6 +265,28 @@ test('a rejected canonical assignment is not recorded as rendered', () => {
 
   assert.equal(harness.applied.length, 1);
   assert.deepEqual(harness.cleared, []);
+});
+
+test('optimistic paint preserves only active canonical Push assignments', () => {
+  const match = indexSource.match(
+    /function shouldPreserveCanonicalPushAssignment\(current\) \{[\s\S]*?\n        \}/,
+  );
+  assert.ok(match, 'the console exposes a testable optimistic-paint predicate');
+  const shouldPreserve = vm.runInNewContext('(' + match[0] + ')');
+
+  for (const status of ['queued', 'transferring', 'applying']) {
+    assert.equal(shouldPreserve({
+      owner: 'push-job-v1', job_id: 'active-job', status,
+    }), true, status);
+  }
+  for (const status of ['success', 'fail']) {
+    assert.equal(shouldPreserve({
+      owner: 'push-job-v1', job_id: 'terminal-job', status,
+    }), false, status);
+  }
+  assert.equal(shouldPreserve({
+    owner: 'push-job-v1', job_id: null, status: 'queued',
+  }), false);
 });
 
 test('full snapshots merge pre-snapshot updates and remove absent jobs', () => {

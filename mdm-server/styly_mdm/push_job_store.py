@@ -396,7 +396,7 @@ class PushJobStore:
                         FROM push_job_devices d
                         JOIN push_jobs j ON j.job_id=d.job_id
                         WHERE d.device_id=f.device_id
-                        ORDER BY j.updated_at DESC, j.job_id DESC
+                        ORDER BY d.enqueue_seq DESC
                         LIMIT 1
                       )
                     )

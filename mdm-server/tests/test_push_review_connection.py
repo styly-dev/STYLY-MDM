@@ -354,6 +354,66 @@ async def test_current_register_is_bound_to_legacy_owner():
 
 
 @pytest.mark.asyncio
+async def test_registration_active_report_preserves_offline_timeout_fence(tmp_path):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        active = await downloading_job(store, manager)
+        job_id = active["job_id"]
+        artifact_id = active["artifact"]["artifact_id"]
+        await manager.mark_reconciling(
+            job_id,
+            "D1",
+            expected={DeviceState.DOWNLOADING},
+            reason="device_disconnect",
+            deadline=now_ms(),
+        )
+        await manager.mark_unconfirmed(
+            job_id,
+            "D1",
+            None,
+            "device stayed offline past deadline",
+        )
+        next_job = await ready_job(store, manager)
+        await manager.enable_dispatch(next_job["job_id"])
+
+        ws = Ws()
+        runtime = object.__new__(PushRuntime)
+        runtime.legacy = types.SimpleNamespace(devices={"D1": {"ws": ws}})
+        runtime.manager = manager
+        runtime.sessions = {}
+        runtime.device_locks = {}
+        runtime.registration_candidates = {"D1": ws}
+        runtime.send_timeout = 1
+        runtime.scheduler = Scheduler()
+        runtime.publish = lambda _snapshot: asyncio.sleep(0)
+
+        await runtime.register_device(
+            ws,
+            {
+                "device_id": "D1",
+                "process_instance_id": str(uuid.uuid4()),
+                "capabilities": ["push_job_id_v1"],
+                "push_runtime": {
+                    "active": {
+                        "job_id": job_id,
+                        "attempt": 1,
+                        "artifact_id": artifact_id,
+                        "phase": "downloading",
+                    }
+                },
+            },
+            "http://server",
+        )
+
+        fenced = await manager.get_snapshot(job_id)
+        assert fenced["devices"]["D1"]["device_fence"] is not None
+        assert await manager.claim_next(["D1"]) is None
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_registration_candidate_reconciles_replaced_active_session(tmp_path):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)

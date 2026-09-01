@@ -72,6 +72,13 @@ class PushJobStore(
 
     private fun trim(state: PushProtocol.State): PushProtocol.State {
         val cutoff = clock() - RECEIPT_RETENTION_MS
+        if (state.pendingResults.size > MAX_RECEIPTS) {
+            Log.w(
+                TAG,
+                "Dropping ${state.pendingResults.size - MAX_RECEIPTS} oldest pending " +
+                    "Push/Sync result(s) to keep the durable outbox bounded",
+            )
+        }
         return normalizePushState(state, cutoff, MAX_RECEIPTS)
     }
 }

@@ -1620,7 +1620,7 @@
             // it after create/upload/dispatch; unrelated older jobs cannot claim it.
             online.forEach(function (id) {
               const current = deviceTaskState[id];
-              if (current && current.owner === 'push-job-v1' && current.job_id) {
+              if (shouldPreserveCanonicalPushAssignment(current)) {
                 return;
               }
               const pendingPrefix = 'push-job://pending/';
@@ -1637,6 +1637,11 @@
             // Force a fresh pick next time (LAN/non-secure context cannot detect a local change).
             reset();
           }).catch(function (err) { nameEl.textContent = 'Upload failed'; addLog(cfg.verb + ' files failed: ' + err.message, 'fail'); });
+        }
+
+        function shouldPreserveCanonicalPushAssignment(current) {
+          return !!(current && current.owner === 'push-job-v1' && current.job_id &&
+            ['queued', 'transferring', 'applying'].indexOf(current.status) >= 0);
         }
 
         function hasSelection() { return selectionFiles().length > 0; }

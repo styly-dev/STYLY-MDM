@@ -746,13 +746,6 @@ class PushRuntime:
                     except StoreConflict:
                         pass
 
-            snapshots.extend(
-                await self.manager.clear_fence_on_process_replacement(
-                    device_id,
-                    process_instance_id,
-                    CAP_PUSH_JOB_ID_V1 in capabilities,
-                )
-            )
             runtime = payload.get("push_runtime")
             active_report = (
                 runtime.get("active") if isinstance(runtime, dict) else None
@@ -764,6 +757,22 @@ class PushRuntime:
                     )
                 )
             else:
+                # A missing process UUID on an offline-timeout fence is safe to
+                # replace only when the new job-v1 process explicitly reports no
+                # active execution. An active or malformed report must keep the
+                # fence until exact reconciliation evidence settles it.
+                if (
+                    isinstance(runtime, dict)
+                    and "active" in runtime
+                    and active_report is None
+                ):
+                    snapshots.extend(
+                        await self.manager.clear_fence_on_process_replacement(
+                            device_id,
+                            process_instance_id,
+                            CAP_PUSH_JOB_ID_V1 in capabilities,
+                        )
+                    )
                 active = await self.manager.active_assignment_for_device(device_id)
                 needs_reconcile = bool(
                     active

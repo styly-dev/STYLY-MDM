@@ -209,7 +209,7 @@ class PushJobManager:
                           FROM push_job_devices d2
                           JOIN push_jobs j2 ON j2.job_id=d2.job_id
                           WHERE d2.device_id=f.device_id
-                          ORDER BY j2.updated_at DESC, j2.job_id DESC
+                          ORDER BY d2.enqueue_seq DESC
                           LIMIT 1
                       )
                     """
@@ -564,7 +564,7 @@ class PushJobManager:
                 FROM push_job_devices d
                 JOIN push_jobs j ON j.job_id=d.job_id
                 WHERE d.device_id=?
-                ORDER BY j.updated_at DESC, j.job_id DESC
+                ORDER BY d.enqueue_seq DESC
                 LIMIT 1
                 """,
                 (device_id,),

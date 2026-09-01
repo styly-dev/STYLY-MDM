@@ -81,7 +81,7 @@ A client process restart converts a persisted active record into an interrupted 
 - an elapsed accept deadline enters the short exact reconciliation probe even if its in-memory waiter was lost;
 - an elapsed reconciliation deadline becomes `unconfirmed` only if the callback's stored deadline still matches;
 - a matching late result or exact `absent|interrupted` clears the fence without rewriting the old terminal job;
-- a different job-v1 process UUID proves process replacement; a new job-v1 process also safely replaces a legacy fence that had no process UUID.
+- a different recorded job-v1 process UUID proves process replacement; a new job-v1 process that explicitly reports no active execution also safely replaces a legacy or offline-timeout fence that had no process UUID.
 
 An exact terminal result from the current owner settles any dispatched active phase even if an intermediate phase frame was lost during WebSocket replacement. Reconciliation can replay a matching completed receipt after its original result was already ACKed, allowing a server that missed that ACK boundary to converge without rerunning the worker.
 

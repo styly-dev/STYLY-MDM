@@ -118,6 +118,28 @@ async def test_fence_mutation_revisions_every_visible_job(manager):
 
 
 @pytest.mark.asyncio
+async def test_opaque_fence_is_attributed_only_to_latest_enqueued_job(manager):
+    first = await ready(manager.store, request(), 'opaque-first')
+    second = await ready(manager.store, request(), 'opaque-second')
+    before = {
+        item['job_id']: item['revision']
+        for item in (first, second)
+    }
+
+    snapshots = await manager.add_opaque_fence(
+        'D1', '{"token":"unknown-active-job"}', ProtocolMode.JOB_V1,
+        'process-a', 'unknown active job',
+    )
+    by_id = {item['job_id']: item for item in snapshots}
+
+    assert set(by_id) == set(before)
+    assert all(by_id[job_id]['revision'] == revision + 1
+               for job_id, revision in before.items())
+    assert by_id[first['job_id']]['devices']['D1']['device_fence'] is None
+    assert by_id[second['job_id']]['devices']['D1']['device_fence'] is not None
+
+
+@pytest.mark.asyncio
 async def test_preaccept_absent_requeues_same_attempt_only_once(manager):
     snapshot = await ready(manager.store, request(), 'replay')
     job_id = snapshot['job_id']
