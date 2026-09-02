@@ -207,7 +207,16 @@ class PushJobCoordinator(context: Context) {
     init {
         actor.execute {
             try {
-                val loaded = store.load()
+                val loaded = when (val result = store.load()) {
+                    is PushStateLoadResult.Valid -> result.state
+                    PushStateLoadResult.Missing -> store.emptyState()
+                    is PushStateLoadResult.Corrupt -> {
+                        // The in-memory state deliberately remains empty but unavailable.
+                        // Never overwrite unknown durable ownership with an empty snapshot.
+                        Log.e(TAG, "Could not parse durable Push/Sync state", result.error)
+                        return@execute
+                    }
+                }
                 val recovery = recover(loaded)
                 if (!persist(recovery.state)) return@execute
                 // Keep resumable job-v1 work after a process restart. An exact EXECUTE
@@ -307,7 +316,12 @@ class PushJobCoordinator(context: Context) {
             return
         }
         try {
-            val recovery = recover(store.load())
+            val loaded = when (val result = store.load()) {
+                is PushStateLoadResult.Valid -> result.state
+                PushStateLoadResult.Missing -> store.emptyState()
+                is PushStateLoadResult.Corrupt -> throw result.error
+            }
+            val recovery = recover(loaded)
             if (!persist(recovery.state)) {
                 sendPushStateRetryResult(
                     "failed",

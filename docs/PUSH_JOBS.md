@@ -93,7 +93,7 @@ artifact bytes.
 Push/Sync uses three independent ownership mechanisms:
 
 - **Device execution ownership** remains held through validation and apply until a terminal result.
-- **Global transfer slot** is released only by the matching `PUSH_TRANSFER_COMPLETE` or a bounded resource-recovery path.
+- **Global transfer slot** is independent of the device WebSocket and is released only by the matching `PUSH_TRANSFER_COMPLETE` or a bounded resource-recovery path.
 - **Persistent device fence** blocks later jobs after an `unconfirmed` outcome until exact evidence proves the old worker is gone.
 
 The transfer registry uses typed keys. A job-v1 slot is addressed by `(job_id, device_id, attempt=1)`; a stale result cannot release a different job's slot. Install and migration-only legacy Push use the same typed registry and the existing server-wide transfer semaphore.
@@ -113,7 +113,7 @@ New clients register:
 }
 ```
 
-`PushJobCoordinator` is owned by `MdmClientApplication`, not by a Service instance. It serializes commands on one actor, permits one active Push/Sync worker, persists active state before `PUSH_JOB_ACCEPTED`, and stores terminal results in an outbox until a matching `PUSH_RESULT_ACK` either accepts the result or marks its rejection as permanent with `retryable: false`. An older server that omits `retryable` is treated as retryable. Completed receipts retain the original command metadata for at most 256 entries and seven days. If durable state cannot be saved, the coordinator keeps the rest of the MDM client alive but rejects new work with `client_persistence_unavailable`; it never starts a worker, publishes a phase, releases an execution lease, or sends a terminal result whose required state was not persisted.
+`PushJobCoordinator` is owned by `MdmClientApplication`, not by a Service instance. It serializes commands on one actor, permits one active Push/Sync worker, persists active state before `PUSH_JOB_ACCEPTED`, and stores terminal results in an outbox until a matching `PUSH_RESULT_ACK` either accepts the result or marks its rejection as permanent with `retryable: false`. An older server that omits `retryable` is treated as retryable. Completed receipts retain the original command metadata for at most 256 entries and seven days. A missing state file is initialized as an empty state, while malformed JSON or malformed active/receipt entries are classified as corrupt, left untouched, and registered as unavailable rather than authoritative absence. If durable state cannot be loaded or saved, the coordinator keeps the rest of the MDM client alive but rejects new work with `client_persistence_unavailable`; it never starts a worker, publishes a phase, releases an execution lease, or sends a terminal result whose required state was not persisted.
 
 `push_state_retry_v1` is advertised even while durable Push state is unavailable. The
 console then exposes `Retry Push state` on that online device and a bulk action for all
@@ -143,7 +143,7 @@ The server coalesces pending publication by `job_id` and sends only the newest q
 
 The exact transfer waiter is registered before `waiting_transfer -> dispatching` commits and before the command is sent. Waiter cleanup is identity-checked, so a superseded dispatch task cannot cancel a replacement task's waiter. The durable `accept_deadline` is swept into short reconciliation only when no live dispatch task still owns the exact in-memory acceptance waiter. The local waiter owns the normal timeout; the durable sweep recovers process/background-task loss. Its transition compares the exact stored deadline in the same transaction, so a stale sweep cannot capture a later replay of the same attempt. After slot acquisition, the scheduler rechecks the live connection and capability. It then holds the same per-device owner lock used by REGISTER replacement and disconnect while performing the final session check and bounded `send_str`.
 
-Job-v1 messages from a device are also checked and settled under that owner lock. Disconnect removes the old owner and commits its canonical queue/reconciliation transition before a replacement REGISTER may acquire ownership. Once a replacement REGISTER owns the device, the superseded socket cannot settle an ACK, phase, transfer completion, result, or reconciliation report. Committed admin snapshots are queued for publication and sent after this correctness path returns; browser backpressure is not part of device ownership.
+Job-v1 messages from a device are also checked and settled under that owner lock. Disconnect removes the old owner and commits its canonical queue/reconciliation transition before a replacement REGISTER may acquire ownership, but it does not release an active Push transfer slot because the Android HTTP worker outlives the WebSocket. An exact active `downloading` report keeps the existing slot owner and also satisfies a still-live acceptance waiter. After a server restart, the same report reacquires and rebuilds the exact `(job_id, device_id, attempt)` slot owner before registration completes. Once a replacement REGISTER owns the device, the superseded socket cannot settle an ACK, phase, transfer completion, result, or reconciliation report. Committed admin snapshots are queued for publication and sent after this correctness path returns; browser backpressure is not part of device ownership.
 
 Artifact URLs in device commands are absolute HTTP(S) URLs derived from the accepted device connection's server authority. The canonical snapshot retains the relative `/artifacts/{artifact_id}` route for console/API use.
 
@@ -155,6 +155,7 @@ On server restart:
 - expired `created` jobs become `interrupted`;
 - `waiting_transfer` returns to `queued`;
 - dispatched phases become `reconciling`;
+- an exact active `downloading` report reacquires a transfer slot before the recovered session becomes available for new dispatch;
 - dispatch is paused and no command is automatically resent;
 - the operator re-enables an existing job by using the console's **Dispatch** or **Resume** action, which sends `PUSH_FILES {job_id}` again; this also covers an uploaded `ready` job whose original dispatch send was lost;
 - scheduler wake-up immediately follows the durable re-enable and does not wait for its direct admin acknowledgement.

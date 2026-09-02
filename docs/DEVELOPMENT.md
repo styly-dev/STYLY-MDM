@@ -287,7 +287,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 
 | Message type | Description |
 |---|---|
-| `REGISTER` | Sent on connect. In addition to device metadata, current clients always send `push_state_retry_v1`; when durable Push state is available they also send `push_job_id_v1` and `push_resume_v1`. `push_state.status` is `available` or `unavailable`, while `push_runtime.active` carries the exact active/interrupted identity, dispatch revision, phase, and validated offset, or `null`. Capability parsing is all-or-nothing and never inferred from a version number. |
+| `REGISTER` | Sent on connect. In addition to device metadata, current clients always send `push_state_retry_v1`; when durable Push state is available they also send `push_job_id_v1` and `push_resume_v1`. `push_state.status` is `available` or `unavailable`, while `push_runtime.active` carries the exact active/interrupted identity, dispatch revision, phase, and validated offset, or `null`. A missing durable file initializes empty; malformed JSON or malformed active/receipt entries remain untouched and report `unavailable`, so corruption is never authoritative absence. Capability parsing is all-or-nothing and never inferred from a version number. |
 | `BATTERY_UPDATE` | Battery telemetry. Fields: `device_id`, `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds) |
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
 | `DELETE_APP_RESULT` | Result of a remote app uninstall — exactly one per `EXECUTE_UNINSTALL`. The client survives it, so this always arrives (unlike `SELF_UNINSTALL_RESULT`). Fields: `status` (`success`/`fail`), `package_name`, `error` (optional), `result_code` (optional), `startup_app_cleared` (optional; reports what the device did — the server decides from its own record, see below). See [Remote App Uninstall](#remote-app-uninstall). |
@@ -486,7 +486,8 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > 2. The terminal result — `INSTALL_RESULT` or `PUSH_FILES_RESULT` (fallback — covers
 >    older clients that never emit `DOWNLOAD_COMPLETE`, and clients whose download
 >    failed outright).
-> 3. Device disconnect (frees every slot the device held, immediately).
+> 3. Device disconnect for Install (Push keeps its exact slot because the Android
+>    HTTP worker continues independently of the WebSocket).
 > 4. A per-device timeout (`MDM_TRANSFER_TIMEOUT` seconds, default **600**) so a
 >    silent/stuck device cannot block the queue. Lowering it recovers stuck slots
 >    sooner but risks releasing a slow-but-healthy transfer early, which only
@@ -495,7 +496,9 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > `pending_transfers` is keyed by **`(device_id, task)`**, not by device: an admin can
 > push files to a group that is already installing an APK, so one device may hold an
 > install slot and a push slot at once. Each terminal message frees only its own task's
-> slot; only a disconnect is task-agnostic.
+> slot. A disconnect still releases Install ownership, but an active Push lease is
+> retained across WebSocket replacement and rebuilt from an exact `downloading`
+> report after server restart.
 >
 > This is fully backward compatible in both directions. An older client that never
 > emits `DOWNLOAD_COMPLETE` for a push still frees its slot via `PUSH_FILES_RESULT` or

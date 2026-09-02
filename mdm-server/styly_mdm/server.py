@@ -1570,9 +1570,9 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
         if device_id and not is_current:
             log.info("Superseded device connection closed, ignoring: %s", device_id)
         if device_id and is_current:
-            # Free every transfer slot this device was holding — it may have been in
-            # an install and a push at once — so a disconnect mid-job does not stall
-            # the queue until the timeout fires.
+            # Install keeps the legacy disconnect release. Push is deliberately
+            # retained by the runtime adapter because its Android HTTP worker outlives
+            # this WebSocket and remains bounded by exact completion or timeout.
             release_transfer_slot(device_id, "disconnect")
             # The dispatch record only bridges dispatch -> SELF_UPDATE_STARTING; by a
             # disconnect that announcement has already copied what it needed, so drop

@@ -824,10 +824,6 @@ class PushRuntime:
                     job_id = active["job_id"]
                     attempt = active["attempt"]
                     state = DeviceState(active["state"])
-                    self.transfers.release_exact(
-                        TransferKey("push", device_id, job_id, attempt),
-                        "connection_replaced",
-                    )
                     try:
                         if state is DeviceState.WAITING_TRANSFER:
                             snapshots.append(
@@ -1082,6 +1078,12 @@ class PushRuntime:
                 phase,
                 None,
             )
+            if (
+                outcome == "active"
+                and phase == "downloading"
+                and self.scheduler is not None
+            ):
+                await self.scheduler.ensure_active_transfer_slot(job_id, device_id, 1)
             return snapshots if outcome == "active" else []
         except StoreConflict:
             return []
@@ -1106,9 +1108,6 @@ class PushRuntime:
             job_id = active["job_id"]
             attempt = active["attempt"]
             state = DeviceState(active["state"])
-            self.transfers.release_exact(
-                TransferKey("push", device_id, job_id, attempt), "device_disconnect"
-            )
             try:
                 if state is DeviceState.WAITING_TRANSFER:
                     snapshot = await self.manager.transition_device(
@@ -1867,6 +1866,12 @@ class PushRuntime:
             return
         for snapshot in snapshots:
             await self.publish(snapshot)
+        if (
+            outcome == "active"
+            and payload.get("phase") == "downloading"
+            and self.scheduler is not None
+        ):
+            await self.scheduler.ensure_active_transfer_slot(job_id, device_id, 1)
         if outcome in {"requeued", "interrupted"} or (
             outcome == "active" and payload.get("phase") in {"validating", "applying"}
         ):
@@ -2258,6 +2263,11 @@ def _release_transfer_slot(
     released = False
     for key in tuple(mapping):
         if key[0] != device_id:
+            continue
+        if reason == "disconnect" and key[1] == "push":
+            # The Android Push worker and its HTTP transfer outlive the WebSocket.
+            # Keep the exact lease until transfer completion, terminal evidence, or
+            # the bounded transfer timeout releases it.
             continue
         future = mapping.get(key)
         if future is not None and not future.done():

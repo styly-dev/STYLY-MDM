@@ -317,8 +317,8 @@ def test_release_transfer_slot_frees_only_the_named_task():
     asyncio.run(body())
 
 
-def test_disconnect_frees_every_slot_the_device_holds():
-    """A disconnect is task-agnostic: nothing the device was transferring survives it."""
+def test_disconnect_keeps_push_slot_but_releases_install_slot():
+    """A Push HTTP worker survives WebSocket loss; install keeps legacy behavior."""
     async def body():
         loop = asyncio.get_running_loop()
         futs = {
@@ -331,7 +331,9 @@ def test_disconnect_frees_every_slot_the_device_holds():
         server.pending_transfers[("b", server.TASK_INSTALL)] = other
 
         assert server.release_transfer_slot("a", "disconnect") is True
-        assert all(f.done() and f.result() == "disconnect" for f in futs.values())
+        assert futs[server.TASK_INSTALL].done()
+        assert futs[server.TASK_INSTALL].result() == "disconnect"
+        assert not futs[server.TASK_PUSH].done()
         assert not other.done()
 
     asyncio.run(body())
