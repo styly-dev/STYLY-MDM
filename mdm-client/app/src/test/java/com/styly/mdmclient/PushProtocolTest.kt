@@ -17,6 +17,7 @@ class PushProtocolTest {
         put("artifact_url", "http://server/artifacts/value")
         put("artifact_size", 42)
         put("artifact_sha256", "a".repeat(64))
+        put("revision", 1)
         put("dest_path", "/sdcard/STYLY/content")
     }
 
@@ -107,5 +108,25 @@ class PushProtocolTest {
         assertEquals(null, decoded.active)
         assertEquals(listOf(receipt), decoded.pendingResults)
         assertEquals(listOf(receipt), decoded.completedReceipts)
+    }
+
+    @Test
+    fun `interrupted retention timestamp survives state round trip`() {
+        val command = PushProtocol.parseCommand(payload())
+        val state = PushProtocol.State(
+            active = PushProtocol.Active(
+                command,
+                PushProtocol.PHASE_DOWNLOADING,
+                interrupted = true,
+                interruptedAt = 123456L,
+            ),
+            pendingResults = emptyList(),
+            completedReceipts = emptyList(),
+        )
+
+        val decoded = PushProtocol.stateFromJson(PushProtocol.stateToJson(state))
+
+        assertTrue(decoded.active?.interrupted == true)
+        assertEquals(123456L, decoded.active?.interruptedAt)
     }
 }
