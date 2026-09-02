@@ -15,6 +15,7 @@ from .push_job_store import StoreConflict, now_ms
 from .push_jobs import (
     ACTIVE_DEVICE_STATES,
     CAP_PUSH_JOB_ID_V1,
+    CAP_PUSH_RESUME_V1,
     DeviceState,
     ProtocolMode,
 )
@@ -38,6 +39,7 @@ class LiveSession:
     process_instance_id: str | None
     owner_lock: asyncio.Lock
     http_base: str
+    reported_push_runtime: dict[str, Any] | None = None
 
 
 class PushScheduler:
@@ -55,6 +57,7 @@ class PushScheduler:
         reconciliation_timeout: float,
         transfer_timeout: float,
         allow_legacy: bool,
+        resume_threshold_bytes: int = 64 * 1024 * 1024,
     ) -> None:
         self.manager = manager
         self.transfer_registry = transfer_registry
@@ -67,6 +70,7 @@ class PushScheduler:
         self.reconciliation_timeout = reconciliation_timeout
         self.transfer_timeout = transfer_timeout
         self.allow_legacy = allow_legacy
+        self.resume_threshold_bytes = max(0, resume_threshold_bytes)
         self._wake = asyncio.Event()
         self._runner: asyncio.Task[None] | None = None
         self._stopping = False
@@ -196,14 +200,21 @@ class PushScheduler:
                 )
                 return
 
-            protocol = self._protocol_for(session)
+            protocol = self._protocol_for(
+                session, int((job.get("artifact") or {}).get("byte_size") or 0)
+            )
             if protocol is None:
                 await self._fail_current(
                     job_id,
                     device_id,
                     {DeviceState.WAITING_TRANSFER},
                     "capability_changed_before_dispatch",
-                    "Live session no longer supports push_job_id_v1 and legacy fallback is disabled",
+                    (
+                        "Live session no longer supports push_resume_v1 for this large artifact"
+                        if int((job.get("artifact") or {}).get("byte_size") or 0)
+                        > self.resume_threshold_bytes
+                        else "Live session no longer supports push_job_id_v1 and legacy fallback is disabled"
+                    ),
                 )
                 return
 
@@ -454,10 +465,17 @@ class PushScheduler:
                 )
                 await asyncio.sleep(_RUN_RETRY_DELAY)
 
-    def _protocol_for(self, session: LiveSession) -> ProtocolMode | None:
+    def _protocol_for(
+        self, session: LiveSession, artifact_size: int = 0
+    ) -> ProtocolMode | None:
         if CAP_PUSH_JOB_ID_V1 in session.capabilities:
+            if (
+                artifact_size > self.resume_threshold_bytes
+                and CAP_PUSH_RESUME_V1 not in session.capabilities
+            ):
+                return None
             return ProtocolMode.JOB_V1
-        if self.allow_legacy:
+        if self.allow_legacy and artifact_size <= self.resume_threshold_bytes:
             return ProtocolMode.LEGACY
         return None
 
@@ -722,15 +740,24 @@ class PushScheduler:
             "delete_extras": snapshot["mode"] == "sync",
         }
         if protocol is ProtocolMode.JOB_V1:
+            device = snapshot["devices"][device_id]
+            assignment_revision = device.get("dispatch_revision")
+            if not isinstance(assignment_revision, int):
+                assignment_revision = snapshot["revision"]
             common.update(
                 {
                     "job_id": snapshot["job_id"],
-                    "attempt": snapshot["devices"][device_id]["attempt"],
-                    "revision": snapshot["revision"],
+                    "attempt": device["attempt"],
+                    # This is immutable for one (job, device, attempt) assignment;
+                    # aggregate job revisions may advance during restart recovery.
+                    "revision": assignment_revision,
                     "artifact_id": artifact["artifact_id"],
                     "artifact_url": artifact_url,
                     "artifact_size": artifact["byte_size"],
                     "artifact_sha256": artifact["sha256"],
+                    "artifact_etag": artifact.get(
+                        "etag", f'"{artifact["sha256"]}"'
+                    ),
                 }
             )
         return common

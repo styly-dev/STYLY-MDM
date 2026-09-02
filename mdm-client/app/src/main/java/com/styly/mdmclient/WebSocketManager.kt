@@ -552,6 +552,26 @@ class WebSocketManager internal constructor(
                 }
             }
         }
+        if (identity is DeviceIdentityState.Ready) {
+            pushCoordinator.registrationFields { pushFields ->
+                reconnectHandler.post {
+                    if (webSocket !== socket || registration.isSent(socket)) return@post
+                    sendRegistrationPayload(socket, identity, pushFields)
+                }
+            }
+        } else {
+            reconnectHandler.post {
+                if (webSocket !== socket) return@post
+                sendRegistrationPayload(socket, identity, null)
+            }
+        }
+    }
+
+    private fun sendRegistrationPayload(
+        socket: WebSocket,
+        identity: DeviceIdentityState,
+        pushFields: JSONObject?,
+    ) {
         val payload = JSONObject().apply {
             put("type", "REGISTER")
             put("identity_scheme", "styly_device_id_v1")
@@ -561,9 +581,9 @@ class WebSocketManager internal constructor(
             put("version_name", BuildConfig.VERSION_NAME)
             if (identity is DeviceIdentityState.Ready) {
                 put("device_id", identity.deviceId)
-                val pushFields = pushCoordinator.registrationFields()
-                put("process_instance_id", pushFields.getString("process_instance_id"))
+                put("process_instance_id", pushFields!!.getString("process_instance_id"))
                 put("capabilities", pushFields.getJSONArray("capabilities"))
+                put("push_state", pushFields.getJSONObject("push_state"))
                 put("push_runtime", pushFields.getJSONObject("push_runtime"))
                 val startupConfig = getStartupAppConfig()
                 if (startupConfig != null) {
@@ -584,12 +604,9 @@ class WebSocketManager internal constructor(
         }
         val text = payload.toString()
         Log.d(TAG, "Sending: $text")
-        // The reader may receive REGISTERED as soon as the send is queued.
         val canonical = identity is DeviceIdentityState.Ready
         if (canonical) registration.markSent(socket)
-        if (!socket.send(text) && canonical) {
-            registration.clearSent(socket)
-        }
+        if (!socket.send(text) && canonical) registration.clearSent(socket)
     }
 
     private fun commandContext(socket: WebSocket): CommandContext? {

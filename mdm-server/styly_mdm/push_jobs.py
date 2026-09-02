@@ -50,6 +50,7 @@ except ImportError:  # Python 3.10
 CAP_PUSH_JOB_ID_V1 = "push_job_id_v1"
 CAP_PUSH_PROGRESS_V1 = "push_progress_v1"
 CAP_PUSH_RESUME_V1 = "push_resume_v1"
+CAP_PUSH_STATE_RETRY_V1 = "push_state_retry_v1"
 
 
 class PushMode(StrEnum):
