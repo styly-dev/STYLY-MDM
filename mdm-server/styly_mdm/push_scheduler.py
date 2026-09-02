@@ -75,6 +75,7 @@ class PushScheduler:
         self._runner: asyncio.Task[None] | None = None
         self._stopping = False
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
+        self._recovered_transfer_tasks: set[asyncio.Task[None]] = set()
         self._accept_waiters: dict[
             tuple[str, str, int], asyncio.Future[tuple[str, dict[str, Any]]]
         ] = {}
@@ -98,12 +99,22 @@ class PushScheduler:
             self._runner.cancel()
         for task in tuple(self._dispatch_tasks):
             task.cancel()
+        for task in tuple(self._recovered_transfer_tasks):
+            task.cancel()
         await asyncio.gather(
-            *(task for task in ([self._runner] if self._runner else []) + list(self._dispatch_tasks)),
+            *(
+                task
+                for task in (
+                    ([self._runner] if self._runner else [])
+                    + list(self._dispatch_tasks)
+                    + list(self._recovered_transfer_tasks)
+                )
+            ),
             return_exceptions=True,
         )
         self._runner = None
         self._dispatch_tasks.clear()
+        self._recovered_transfer_tasks.clear()
         for future in self._accept_waiters.values():
             if not future.done():
                 future.cancel()
@@ -131,6 +142,71 @@ class PushScheduler:
             and accept_future is waiter
             for task, (key, _transfer_future, accept_future) in self._dispatch_waiters.items()
         )
+
+    async def ensure_active_transfer_slot(
+        self, job_id: str, device_id: str, attempt: int
+    ) -> None:
+        """Keep or rebuild transfer ownership for an exact active download."""
+
+        key = TransferKey("push", device_id, job_id, attempt)
+        accept_waiter = self._accept_waiters.get((job_id, device_id, attempt))
+        if accept_waiter is not None and not accept_waiter.done():
+            accept_waiter.set_result(("accepted", {}))
+
+        current = self.transfer_registry.get(key)
+        if current is not None and not current.done():
+            return
+
+        semaphore = self.transfer_slots()
+        await semaphore.acquire()
+        try:
+            current = self.transfer_registry.get(key)
+            if current is not None and not current.done():
+                semaphore.release()
+                return
+            if current is not None:
+                self.transfer_registry.remove_if_same(key, current)
+            future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+            self.transfer_registry.register(key, future)
+            task = asyncio.create_task(
+                self._hold_recovered_transfer(key, future, semaphore),
+                name=f"push-recovered-transfer-{job_id}-{device_id}",
+            )
+            self._recovered_transfer_tasks.add(task)
+            task.add_done_callback(self._recovered_transfer_done)
+        except BaseException:
+            semaphore.release()
+            raise
+
+    async def _hold_recovered_transfer(
+        self,
+        key: TransferKey,
+        future: asyncio.Future[str],
+        semaphore: asyncio.Semaphore,
+    ) -> None:
+        try:
+            await asyncio.wait_for(future, self.transfer_timeout)
+        except asyncio.TimeoutError:
+            log.warning(
+                "Recovered Push transfer slot timed out for %s/%s",
+                key.job_id,
+                key.device_id,
+            )
+        finally:
+            self.transfer_registry.remove_if_same(key, future)
+            semaphore.release()
+            self.wake()
+
+    def _recovered_transfer_done(self, task: asyncio.Task[None]) -> None:
+        self._recovered_transfer_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            log.error(
+                "Unexpected recovered Push transfer failure",
+                exc_info=(type(error), error, error.__traceback__),
+            )
 
     async def _run(self) -> None:
         while True:

@@ -7,6 +7,25 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
 
+internal sealed class PushStateLoadResult {
+    data class Valid(val state: PushProtocol.State) : PushStateLoadResult()
+    object Missing : PushStateLoadResult()
+    data class Corrupt(val error: Exception) : PushStateLoadResult()
+}
+
+internal fun loadPushState(
+    readText: () -> String,
+    normalize: (PushProtocol.State) -> PushProtocol.State,
+): PushStateLoadResult = try {
+    PushStateLoadResult.Valid(
+        normalize(PushProtocol.stateFromJsonStrict(JSONObject(readText()))),
+    )
+} catch (_: FileNotFoundException) {
+    PushStateLoadResult.Missing
+} catch (error: Exception) {
+    PushStateLoadResult.Corrupt(error)
+}
+
 internal fun normalizePushState(
     state: PushProtocol.State,
     cutoff: Long,
@@ -34,19 +53,12 @@ class PushJobStore(
     private val atomicFile = AtomicFile(File(directory, "state.json"))
 
     @Synchronized
-    fun load(): PushProtocol.State {
-        return try {
-            val text = atomicFile.openRead().bufferedReader(Charsets.UTF_8).use { it.readText() }
-            trim(PushProtocol.stateFromJson(JSONObject(text)))
-        } catch (_: FileNotFoundException) {
-            emptyState()
-        } catch (error: Exception) {
-            // A corrupt state file is serious, but crashing the foreground service would
-            // prevent registration and operational recovery. Keep the file for diagnosis.
-            Log.e(TAG, "Could not parse durable Push/Sync state", error)
-            emptyState()
-        }
-    }
+    internal fun load(): PushStateLoadResult = loadPushState(
+        readText = {
+            atomicFile.openRead().bufferedReader(Charsets.UTF_8).use { it.readText() }
+        },
+        normalize = ::trim,
+    )
 
     @Synchronized
     fun save(state: PushProtocol.State): PushProtocol.State {

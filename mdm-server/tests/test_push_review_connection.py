@@ -10,7 +10,7 @@ from styly_mdm.push_job_manager import PushJobManager
 from styly_mdm.push_job_store import PushJobStore, now_ms
 from styly_mdm.push_jobs import DeviceState, ProtocolMode, canonicalize_create_request
 from styly_mdm.push_runtime import PushRuntime
-from styly_mdm.push_scheduler import LiveSession
+from styly_mdm.push_scheduler import LiveSession, PushScheduler
 from styly_mdm.transfer_registry import TransferKey, TransferRegistry
 
 
@@ -92,12 +92,16 @@ class Scheduler:
     def __init__(self):
         self.wake_count = 0
         self.reconcile_calls = []
+        self.active_transfer_slots = []
 
     def wake(self):
         self.wake_count += 1
 
     async def send_reconcile(self, session, snapshot, device_id):
         self.reconcile_calls.append((session, snapshot, device_id))
+
+    async def ensure_active_transfer_slot(self, job_id, device_id, attempt):
+        self.active_transfer_slots.append((job_id, device_id, attempt))
 
 
 class RegistrationManager:
@@ -941,7 +945,8 @@ async def test_registration_candidate_reconciles_replaced_active_session(tmp_pat
         )
 
         assert runtime.sessions["D1"].ws is new
-        assert future.done()
+        assert not future.done()
+        assert runtime.scheduler.active_transfer_slots == [(job_id, "D1", 1)]
         current = await manager.assignment(job_id, "D1")
         assert current["state"] == DeviceState.DOWNLOADING.value
         assert any(
@@ -1024,6 +1029,81 @@ async def test_registration_active_artifact_conflict_fails_and_fences(tmp_path):
         assert current["devices"]["D1"]["device_fence"] is not None
         assert snapshots[-1]["revision"] == current["revision"]
     finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_server_restart_active_registration_reacquires_transfer_slot(tmp_path):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    scheduler = None
+    try:
+        active = await downloading_job(store, manager)
+        job_id = active["job_id"]
+        artifact_id = active["artifact"]["artifact_id"]
+        await manager.mark_reconciling(
+            job_id,
+            "D1",
+            expected={DeviceState.DOWNLOADING},
+            reason="server_restart_after_accept",
+            deadline=now_ms() + 60_000,
+        )
+        registry = TransferRegistry()
+        semaphore = asyncio.Semaphore(1)
+
+        async def publish(_snapshot):
+            return None
+
+        scheduler = PushScheduler(
+            manager=manager,
+            transfer_registry=registry,
+            transfer_slots=lambda: semaphore,
+            sessions=lambda: {},
+            publish=publish,
+            send_timeout=1,
+            accept_timeout=1,
+            accept_reconciliation_timeout=1,
+            reconciliation_timeout=1,
+            transfer_timeout=60,
+            allow_legacy=True,
+        )
+        runtime = object.__new__(PushRuntime)
+        runtime.manager = manager
+        runtime.scheduler = scheduler
+        runtime.transfers = registry
+        session = LiveSession(
+            device_id="D1",
+            session_id="new",
+            ws=Ws(),
+            capabilities=frozenset({"push_job_id_v1"}),
+            process_instance_id=str(uuid.uuid4()),
+            owner_lock=asyncio.Lock(),
+            http_base="http://server",
+        )
+
+        snapshots = await runtime._registration_active_snapshots(
+            "D1",
+            session,
+            {
+                "job_id": job_id,
+                "attempt": 1,
+                "artifact_id": artifact_id,
+                "phase": "downloading",
+            },
+        )
+
+        assert snapshots[-1]["devices"]["D1"]["state"] == "downloading"
+        blocked = asyncio.create_task(semaphore.acquire())
+        await asyncio.sleep(0)
+        assert not blocked.done()
+        key = TransferKey("push", "D1", job_id, 1)
+        assert registry.release_exact(key, "download_complete")
+        await asyncio.wait_for(blocked, timeout=0.5)
+        semaphore.release()
+        await asyncio.gather(*scheduler._recovered_transfer_tasks)
+    finally:
+        if scheduler is not None:
+            await scheduler.stop()
         store.close()
 
 
