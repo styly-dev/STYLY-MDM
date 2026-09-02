@@ -230,6 +230,8 @@ def _coerce_record(value) -> dict | None:
             "version_code": None,
             "version_name": "",
             "retired": False,
+            "push_state_retry_supported": False,
+            "push_state_status": None,
         }
     if isinstance(value, dict):
         label = value.get("label", "")
@@ -252,6 +254,10 @@ def _coerce_record(value) -> dict | None:
             "version_code": version_code,
             "version_name": version_name if isinstance(version_name, str) else "",
             "retired": value.get("retired") is True,
+            "push_state_retry_supported": value.get("push_state_retry_supported") is True,
+            "push_state_status": value.get("push_state_status")
+            if value.get("push_state_status") in {"available", "unavailable"}
+            else None,
         }
     return None
 
@@ -390,6 +396,8 @@ def build_device_list_msg() -> str:
             "last_seen": device_registry.get(d["device_id"], {}).get("last_seen"),
             "version_code": d.get("version_code"),
             "version_name": d.get("version_name", ""),
+            "push_state_retry_supported": d.get("push_state_retry_supported", False),
+            "push_state_status": d.get("push_state_status"),
         }
         for d in devices.values()
     ]
@@ -421,6 +429,8 @@ def build_device_list_msg() -> str:
             "last_seen": rec.get("last_seen"),
             "version_code": rec.get("version_code"),
             "version_name": rec.get("version_name", ""),
+            "push_state_retry_supported": rec.get("push_state_retry_supported", False),
+            "push_state_status": rec.get("push_state_status"),
         })
     device_list.sort(
         key=lambda e: (e["label"] == "", (e["label"] or e["device_id"]).lower())
@@ -1244,6 +1254,18 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     version_name = data.get("version_name")
                     if not isinstance(version_name, str):
                         version_name = ""
+                    capabilities = data.get("capabilities")
+                    retry_supported = (
+                        isinstance(capabilities, list)
+                        and "push_state_retry_v1" in capabilities
+                    )
+                    push_state = data.get("push_state")
+                    push_state_status = (
+                        push_state.get("status")
+                        if isinstance(push_state, dict)
+                        and push_state.get("status") in {"available", "unavailable"}
+                        else None
+                    )
                     prev = device_registry.get(device_id, {})
                     devices[device_id] = {
                         "ws": ws,
@@ -1255,6 +1277,8 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "battery": prev.get("battery"),
                         "version_code": version_code,
                         "version_name": version_name,
+                        "push_state_retry_supported": retry_supported,
+                        "push_state_status": push_state_status,
                     }
                     # Remember the device persistently so it stays in the list while
                     # offline; preserve any previously assigned label.
@@ -1267,6 +1291,8 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "battery": prev.get("battery"),
                         "version_code": version_code,
                         "version_name": version_name,
+                        "push_state_retry_supported": retry_supported,
+                        "push_state_status": push_state_status,
                     }
                     save_registry()
                     log.info(

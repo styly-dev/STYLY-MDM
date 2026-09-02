@@ -381,8 +381,7 @@ class WebSocketManager(
                             webSocket.send(text)
                         }
                     }
-                    sendRegistration()
-                    startBatteryTelemetry()
+                    sendRegistration(webSocket)
                 }
             }
 
@@ -442,32 +441,37 @@ class WebSocketManager(
         return Pair(pkg, extra)
     }
 
-    private fun sendRegistration() {
-        val registration = JSONObject().apply {
-            put("type", "REGISTER")
-            put("device_id", getDeviceSerialNumber())
-            put("model", Build.MODEL)
-            put("ip", getDeviceIpAddress())
-            // Lets the server confirm which build re-registered after a self-update (#39).
-            put("version_code", BuildConfig.VERSION_CODE)
-            put("version_name", BuildConfig.VERSION_NAME)
+    private fun sendRegistration(socket: WebSocket) {
+        pushCoordinator.registrationFields { pushFields ->
+            reconnectHandler.post {
+                if (webSocket !== socket) return@post
+                val registration = JSONObject().apply {
+                    put("type", "REGISTER")
+                    put("device_id", getDeviceSerialNumber())
+                    put("model", Build.MODEL)
+                    put("ip", getDeviceIpAddress())
+                    // Lets the server confirm which build re-registered after a self-update (#39).
+                    put("version_code", BuildConfig.VERSION_CODE)
+                    put("version_name", BuildConfig.VERSION_NAME)
+                    put("process_instance_id", pushFields.getString("process_instance_id"))
+                    put("capabilities", pushFields.getJSONArray("capabilities"))
+                    put("push_state", pushFields.getJSONObject("push_state"))
+                    put("push_runtime", pushFields.getJSONObject("push_runtime"))
 
-            val pushFields = pushCoordinator.registrationFields()
-            put("process_instance_id", pushFields.getString("process_instance_id"))
-            put("capabilities", pushFields.getJSONArray("capabilities"))
-            put("push_runtime", pushFields.getJSONObject("push_runtime"))
-
-            val startupConfig = getStartupAppConfig()
-            if (startupConfig != null) {
-                put("startup_app", JSONObject().apply {
-                    put("package_name", startupConfig.first)
-                    put("extra", startupConfig.second)
-                })
-            } else {
-                put("startup_app", JSONObject.NULL)
+                    val startupConfig = getStartupAppConfig()
+                    if (startupConfig != null) {
+                        put("startup_app", JSONObject().apply {
+                            put("package_name", startupConfig.first)
+                            put("extra", startupConfig.second)
+                        })
+                    } else {
+                        put("startup_app", JSONObject.NULL)
+                    }
+                }
+                sendMessage(registration)
+                startBatteryTelemetry()
             }
         }
-        sendMessage(registration)
     }
 
     private fun startBatteryTelemetry() {

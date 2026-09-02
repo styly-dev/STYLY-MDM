@@ -156,6 +156,8 @@
        body so a background DEVICE_LIST re-render (battery/heartbeat ticks) can't destroy
        the input mid-keystroke. */
     .dev-toolbar { display: flex; gap: 8px; padding: 10px 20px 4px; flex: 0 0 auto; }
+    .push-state-retry-all { margin-left: auto; white-space: nowrap; color: var(--warning); border-color: #665321; }
+    .push-state-retry-all:hover { color: var(--warning); border-color: var(--warning); background: rgba(251, 191, 36, .08); }
     .dev-search-input { flex: 1 1 auto; min-width: 0; padding: 8px 11px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 7px; color: var(--text-primary); font-size: 13px; font-family: inherit; }
     .dev-search-input:focus { outline: none; border-color: var(--accent); }
     /* Sort lives on the Device column header (spreadsheet-style): click to toggle
@@ -173,7 +175,7 @@
     .seg-btn:hover { color: var(--text-primary); }
     .seg-btn.active { background: var(--accent); color: #fff; }
     .dev-table { width: 100%; }
-    .dev-row { display: grid; grid-template-columns: 42px minmax(0, 2fr) minmax(76px, .7fr) minmax(96px, .85fr) minmax(92px, 1fr); align-items: center; padding: 10px 0; padding-left: 18px; border-top: 1px solid var(--border-soft); font-size: 13px; }
+    .dev-row { display: grid; grid-template-columns: 42px minmax(0, 1.7fr) minmax(76px, .65fr) minmax(76px, .65fr) minmax(96px, .8fr) minmax(112px, 1.15fr); align-items: center; padding: 10px 0; padding-left: 18px; border-top: 1px solid var(--border-soft); font-size: 13px; }
     .dev-head { padding-top: 9px; padding-bottom: 9px; border-top: none; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .5px; }
     .dev-row.offline { opacity: .55; }
     .dev-row.offline:hover { opacity: .75; }
@@ -190,13 +192,19 @@
     .dev-label-row { display: flex; align-items: center; gap: 6px; }
     .dev-label { font-weight: 600; font-size: 14px; }
     .dev-label.unlabeled { color: var(--text-secondary); font-weight: 400; }
-    /* Client build, pulled out of the grey sub-line and right-aligned so laggards are
-       scannable down the list after a rollout. Muted + "unknown" for pre-version clients. */
-    .dev-version { margin-left: auto; flex: 0 0 auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-weight: 600; color: var(--text-secondary); background: var(--bg-actions); border: 1px solid var(--border-soft); border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
+    .dev-client { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 5px; padding-right: 10px; }
+    /* A dedicated column keeps client builds aligned independently of device labels
+       and of the resizable Targets pane. Muted + "unknown" for pre-version clients. */
+    .dev-version { flex: 0 0 auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-weight: 600; color: var(--text-secondary); background: var(--bg-actions); border: 1px solid var(--border-soft); border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
     .dev-version.unknown { color: var(--text-muted); font-weight: 400; }
     .dev-version.mismatch { color: var(--danger); border-color: var(--danger); font-weight: 700; }
-    .btn-update { margin-left: 6px; flex: 0 0 auto; font: 600 11px/1 inherit; color: #fff; background: var(--accent); border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; white-space: nowrap; }
+    .btn-update { flex: 0 0 auto; font: 600 11px/1 inherit; color: #fff; background: var(--accent); border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; white-space: nowrap; }
     .btn-update:hover { background: var(--accent-hover); }
+    .push-state-warning { display: flex; align-items: center; flex-wrap: wrap; min-width: 0; gap: 4px 7px; color: var(--warning); line-height: 1.3; }
+    .push-state-warning-icon { flex: 0 0 auto; font-size: 11px; }
+    .push-state-warning-label { min-width: 0; overflow-wrap: anywhere; }
+    .btn-push-state-retry { flex: 0 0 auto; font: 600 11px/1 inherit; color: var(--warning); background: transparent; border: 1px solid #665321; border-radius: 4px; padding: 3px 8px; cursor: pointer; white-space: nowrap; }
+    .btn-push-state-retry:hover { border-color: var(--warning); background: rgba(251, 191, 36, .08); }
     .dev-sub { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .dev-status { font-size: 13px; }
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 6px; vertical-align: middle; }
@@ -402,6 +410,7 @@
               <button class="seg-btn" data-status="online" title="Show only devices that are online now">Online</button>
               <button class="seg-btn" data-status="offline" title="Show only devices that are not online">Offline</button>
             </div>
+            <button class="manage-btn push-state-retry-all" id="btnRetryAllPushStates" style="display:none" title="Retry durable Push state on every affected online device. This does not start a transfer.">↻ Retry affected</button>
           </div>
           <div class="targets-body" id="targetsBody"></div>
         </div>
@@ -648,6 +657,7 @@
       const devToolbar = document.getElementById('devToolbar');
       const devSearchInput = document.getElementById('devSearch');
       const devStatusFilter = document.getElementById('devStatusFilter');
+      const btnRetryAllPushStates = document.getElementById('btnRetryAllPushStates');
       const selCard = document.getElementById('selCard');
       const apkFile = document.getElementById('apkFile');
       const apkName = document.getElementById('apkName');
@@ -756,6 +766,11 @@
       // Command targets need a live WebSocket, which "updating" (mid self-update,
       // device rebooting) does not have — only strictly-online devices qualify.
       function getOnlineIds() { return devices.filter(function (d) { return d.status === 'online'; }).map(getDeviceId).filter(Boolean); }
+      function canRetryPushState(d) {
+        return !!(d && d.status === 'online' && d.push_state_retry_supported === true &&
+          d.push_state_status === 'unavailable');
+      }
+      function retryablePushStateDevices() { return devices.filter(canRetryPushState); }
       function knownIds() { return new Set(devices.map(getDeviceId).filter(Boolean)); }
       function labelFor(id) { if (!id) return '-'; const d = deviceById(id); return (d && d.label) ? d.label : id; }
       // Shared filter/sort for both the main Devices list and the Manage Groups picker
@@ -943,6 +958,13 @@
             break;
           }
           case 'PUSH_FILES_SENT': addLog((msg.delete_extras ? 'Sync' : 'Push') + ' job queued for ' + msg.target_count + ' device(s) → ' + (msg.dest_path || '-') + (msg.max_concurrent ? ' (max ' + msg.max_concurrent + ' concurrent transfer(s))' : ''), 'info'); break;
+          case 'PUSH_STATE_RETRY_SENT': addLog('Push state retry requested on ' + msg.sent_count + '/' + msg.target_count + ' device(s); no transfer was started', 'info'); break;
+          case 'PUSH_STATE_RETRY_RESULT': {
+            const ok = msg.status === 'success';
+            addLog('[' + (ok ? 'OK' : 'FAIL') + '] Push state retry on ' + labelFor(msg.device_id) +
+              (msg.detail ? ' - ' + msg.detail : '') + '; no transfer was started', ok ? 'success' : 'fail');
+            break;
+          }
           case 'PUSH_PROGRESS': showTransferProgress('push', msg); break;
           case 'PUSH_DEVICE_STATE': {
             // Per-device companion to PUSH_PROGRESS, mirroring INSTALL_DEVICE_STATE.
@@ -1067,6 +1089,9 @@
         devToolbar.style.display = showToolbar ? '' : 'none';
         if (showToolbar && devSearchInput.value !== deviceSearch) devSearchInput.value = deviceSearch;
         if (showToolbar) syncStatusFilterButtons();
+        const retryable = showToolbar ? retryablePushStateDevices() : [];
+        btnRetryAllPushStates.style.display = retryable.length ? '' : 'none';
+        btnRetryAllPushStates.textContent = '↻ Retry affected (' + retryable.length + ')';
         const hadFocus = labelInputFocused();
         targetsBody.innerHTML = targetTab === 'groups' ? renderGroupsHtml() : renderDevicesHtml();
         if (targetTab === 'devices') restoreLabelEditFocus(hadFocus);
@@ -1148,7 +1173,7 @@
         html += '<div class="dev-row dev-head">' +
           '<div class="selbox ' + selectAllState() + '" data-act="selectAll">' + selectAllGlyph() + '</div>' +
           '<div class="dev-sort-head" data-act="sortDevices" title="Sort by name">Device<span class="sort-arrow">' + sortArrowGlyph() + '</span></div>' +
-          '<div>Status</div><div>Battery</div><div>Progress</div></div>';
+          '<div>Client</div><div>Status</div><div>Battery</div><div>Progress</div></div>';
         html += '<div id="devRows">' + deviceRowsHtml() + '</div>';
         html += '</div>';
         return html;
@@ -1188,6 +1213,19 @@
         const off = !isOnline(d);
         const kept = keptBySelection(d);
         const startup = d.startup_app && d.startup_app.package_name;
+        // Client metadata has its own column so label editing, long labels, and pane
+        // resizing cannot move the version badge horizontally.
+        const verBehind = deviceVerBehind(d);
+        const verBadge = d.version_name
+          ? '<span class="dev-version' + (verBehind ? ' mismatch' : '') + '" title="' +
+              (verBehind ? 'Client v' + esc(d.version_name) + ' trails server ' + esc(serverVersion) + ' — needs updating' : 'Client build') +
+              '">v' + esc(d.version_name) + '</span>'
+          : '<span class="dev-version unknown" title="Client build unknown (device predates version reporting)">unknown</span>';
+        const canUpdate = canUpdateDevice(d);
+        const updateBtn = canUpdate
+          ? '<button class="btn-update" data-act="update" data-id="' + esc(id) + '" title="Install styly-mdm-client v' + esc(clientApk.version) + ' (the device reinstalls the MDM client and restarts)">Update</button>'
+          : '';
+        const clientCell = verBadge + updateBtn;
         let deviceCell;
         if (editingLabelId === id) {
           deviceCell = '<div class="dev-edit">' +
@@ -1195,27 +1233,10 @@
             '<button class="btn-mini btn-save" data-act="saveLabel" data-id="' + esc(id) + '">Save</button>' +
             '<button class="btn-mini btn-cancel" data-act="cancelLabel">Cancel</button></div>';
         } else {
-          // Client build, right-aligned in the label row so it reads as a column across
-          // rows; older clients that predate the version field show a muted "unknown".
-          // A stable-online client whose major.minor trails the server needs updating,
-          // so its badge is flagged red. A client *ahead* of the server is the server's
-          // problem, not the device's — that reddens the top-bar version instead.
-          const verBehind = deviceVerBehind(d);
-          const verBadge = d.version_name
-            ? '<span class="dev-version' + (verBehind ? ' mismatch' : '') + '" title="' +
-                (verBehind ? 'Client v' + esc(d.version_name) + ' trails server ' + esc(serverVersion) + ' — needs updating' : 'Client build') +
-                '">v' + esc(d.version_name) + '</span>'
-            : '<span class="dev-version unknown" title="Client build unknown (device predates version reporting)">unknown</span>';
-          const canUpdate = canUpdateDevice(d);
-          const updateBtn = canUpdate
-            ? '<button class="btn-update" data-act="update" data-id="' + esc(id) + '" title="Install styly-mdm-client v' + esc(clientApk.version) + ' (the device reinstalls the MDM client and restarts)">Update</button>'
-            : '';
           deviceCell = '<div class="dev-label-row">' +
             (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') +
             '<button class="ic-btn ' + (d.label ? '' : 'assign-btn') + '" data-act="editLabel" data-id="' + esc(id) + '" title="' + (d.label ? 'Edit label' : 'Assign label') + '">✏</button>' +
             (startup ? '<span class="badge-startup" title="' + esc(startup) + '">★</span>' : '') +
-            verBadge +
-            updateBtn +
             '</div>';
         }
         deviceCell += '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.ip || '-') + '</div>';
@@ -1242,9 +1263,10 @@
           ' data-row-id="' + esc(id) + '">' +
           '<div class="selbox ' + (checked ? 'on' : '') + '" data-act="toggleDevice" data-id="' + esc(id) + '">' + (checked ? '✓' : '') + '</div>' +
           '<div class="dev-cell">' + deviceCell + '</div>' +
+          '<div class="dev-client">' + clientCell + '</div>' +
           '<div class="dev-status">' + status + '</div>' +
           '<div class="dev-battery">' + batteryHtml(d) + '</div>' +
-          '<div class="dev-task" data-task-id="' + esc(id) + '">' + taskCellHtml(id) + '</div>' +
+          '<div class="dev-task" data-task-id="' + esc(id) + '">' + progressCellHtml(id) + '</div>' +
           '</div>';
       }
 
@@ -1332,12 +1354,23 @@
         return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
       }
 
+      function progressCellHtml(id) {
+        if (!canRetryPushState(deviceById(id))) return taskCellHtml(id);
+        return '<div class="push-state-warning">' +
+          '<span class="push-state-warning-icon" aria-hidden="true">⚠</span>' +
+          '<span class="push-state-warning-label">Push state unavailable</span>' +
+          '<button class="btn-push-state-retry" data-act="retryPushState" data-id="' + esc(id) + '" title="Reload durable Push state and refresh capabilities. This does not start a transfer.">Retry</button>' +
+          '</div>';
+      }
+
       function updateTaskCell(id) {
         // Refresh every matching install cell currently rendered: the Devices-tab
         // row and/or the expanded-group per-device rows on the Groups tab.
         if (view !== 'console') return;
         const sel = '[data-task-id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]';
-        targetsBody.querySelectorAll(sel).forEach(function (cell) { cell.innerHTML = taskCellHtml(id); });
+        targetsBody.querySelectorAll(sel).forEach(function (cell) {
+          cell.innerHTML = cell.classList.contains('dev-task') ? progressCellHtml(id) : taskCellHtml(id);
+        });
       }
 
       // The job-v1 adapter owns only task states carrying this marker. A later
@@ -1782,6 +1815,14 @@
         deviceTaskState[id] = { task: 'install', status: 'queued', filename: clientApk.filename, detail: '' };
         updateTaskCell(id);
         addLog('Updating ' + name + ' to client v' + clientApk.version, 'info');
+      }
+      function retryPushStates(ids) {
+        const eligible = new Set(retryablePushStateDevices().map(getDeviceId));
+        const targets = Array.from(new Set(ids)).filter(function (id) { return eligible.has(id); });
+        if (!targets.length) { addLog('No affected online devices can retry Push state', 'warn'); return; }
+        if (wsSend({ type: 'RETRY_PUSH_STATE', target_devices: targets }, 'retry Push state')) {
+          addLog('Requesting Push state reload on ' + targets.length + ' device(s); this will not start a transfer', 'info');
+        }
       }
       // Bulk sibling of sendClientUpdate: fan the server's own client APK out to every selected
       // device that is online and behind (canUpdateDevice), skipping already-current, offline,
@@ -2553,6 +2594,7 @@
         else if (act === 'cancelLabel') closeLabelEditor();
         else if (act === 'forget') sendForget(t.dataset.id);
         else if (act === 'update') sendClientUpdate(t.dataset.id);
+        else if (act === 'retryPushState') retryPushStates([t.dataset.id]);
       });
       // Targets label-edit keyboard
       targetsBody.addEventListener('keydown', function (e) {
@@ -2584,6 +2626,9 @@
         deviceStatusFilter = btn.getAttribute('data-status');
         syncStatusFilterButtons();
         refreshDeviceRows();
+      });
+      btnRetryAllPushStates.addEventListener('click', function () {
+        retryPushStates(retryablePushStateDevices().map(getDeviceId));
       });
 
       // Selection card delegation

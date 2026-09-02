@@ -30,6 +30,8 @@ from .push_job_store import (
 )
 from .push_jobs import (
     CAP_PUSH_JOB_ID_V1,
+    CAP_PUSH_RESUME_V1,
+    CAP_PUSH_STATE_RETRY_V1,
     DeviceState,
     JobState,
     ProtocolMode,
@@ -47,11 +49,20 @@ _ORIGINAL_CREATE_APP: Any = None
 _RUNTIME_BY_DATA_DIR: dict[Path, "PushRuntime"] = {}
 _BACKGROUND_LOOP_RETRY_DELAY = 1.0
 _RECONCILIATION_POLL_INTERVAL = 1.0
+_DEFAULT_RESUME_THRESHOLD_BYTES = 64 * 1024 * 1024
 
 
 def _env_seconds(name: str, default: float) -> float:
     value = float(os.environ.get(name, str(default)))
     return max(0.05, value)
+
+
+def _env_bytes(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(0, value)
 
 
 def _uuid_v4_or_none(value: Any) -> str | None:
@@ -227,6 +238,16 @@ class PushRuntime:
         self.pending_publications: dict[str, dict[str, Any]] = {}
         self.publication_revisions: dict[str, int] = {}
         self.publication_stopping = False
+        self.resume_threshold_bytes = _env_bytes(
+            "MDM_PUSH_RESUME_THRESHOLD_BYTES", _DEFAULT_RESUME_THRESHOLD_BYTES
+        )
+        self.artifact_retry_window = _env_seconds(
+            "MDM_PUSH_ARTIFACT_RETRY_WINDOW", 7 * 24 * 60 * 60
+        )
+        self.artifact_gc_interval = _env_seconds(
+            "MDM_PUSH_ARTIFACT_GC_INTERVAL", 60
+        )
+        self._next_artifact_gc_at = 0.0
         self.startup_snapshots, self.startup_cleanup = self.store.recover_startup_sync(
             accept_reconciliation_timeout_ms=int(
                 _env_seconds("MDM_PUSH_ACCEPT_RECONCILIATION_TIMEOUT", 60) * 1000
@@ -237,6 +258,9 @@ class PushRuntime:
         )
         self.startup_snapshots.extend(
             self.manager.reconcile_missing_artifacts_sync(self.artifacts.artifact_root)
+        )
+        self.manager.rebuild_artifact_retention_sync(
+            retry_window_ms=int(self.artifact_retry_window * 1000)
         )
         self.startup_orphan_artifacts = self.manager.orphan_artifacts_sync(
             self.artifacts.artifact_root
@@ -298,6 +322,11 @@ class PushRuntime:
             except (OSError, ValueError):
                 log.exception("Could not remove orphan Push artifact %s", storage_name)
         self.startup_orphan_artifacts.clear()
+        await asyncio.to_thread(
+            self.manager.gc_artifacts_sync,
+            self.artifacts.artifact_root,
+            retry_window_ms=int(self.artifact_retry_window * 1000),
+        )
         self.scheduler = PushScheduler(
             manager=self.manager,
             transfer_registry=self.transfers,
@@ -310,6 +339,7 @@ class PushRuntime:
             reconciliation_timeout=self.reconciliation_timeout,
             transfer_timeout=self.legacy.TRANSFER_TIMEOUT,
             allow_legacy=self.allow_legacy,
+            resume_threshold_bytes=self.resume_threshold_bytes,
         )
         self.scheduler.start()
         self.housekeeping_task = asyncio.create_task(
@@ -427,11 +457,22 @@ class PushRuntime:
                 if session is None:
                     raise PushJobError(f"target device is not online: {device_id}")
                 if CAP_PUSH_JOB_ID_V1 in session.capabilities:
+                    if (
+                        canonical.source.declared_total_bytes > self.resume_threshold_bytes
+                        and CAP_PUSH_RESUME_V1 not in session.capabilities
+                    ):
+                        raise PushJobError(
+                            f"target does not support push_resume_v1 for large artifact: {device_id}"
+                        )
                     protocols[device_id] = (
                         ProtocolMode.JOB_V1,
                         set(session.capabilities),
                     )
                 elif self.allow_legacy:
+                    if canonical.source.declared_total_bytes > self.resume_threshold_bytes:
+                        raise PushJobError(
+                            f"target does not support push_resume_v1 for large artifact: {device_id}"
+                        )
                     protocols[device_id] = (
                         ProtocolMode.LEGACY,
                         set(session.capabilities),
@@ -620,7 +661,7 @@ class PushRuntime:
 
     async def artifact_handler(self, request: aiohttp_web.Request) -> aiohttp_web.StreamResponse:
         record = await self.store.artifact_record(request.match_info["artifact_id"])
-        if record is None:
+        if record is None or record.get("retention_state") == "deleted":
             raise aiohttp_web.HTTPNotFound()
         try:
             path = self.artifacts.path_for_record(record)
@@ -628,29 +669,103 @@ class PushRuntime:
             raise aiohttp_web.HTTPNotFound()
         if not path.is_file():
             raise aiohttp_web.HTTPNotFound()
-        response = aiohttp_web.StreamResponse(
-            status=200,
-            headers={
-                "ETag": f'"{record["sha256"]}"',
-                "Content-Encoding": "identity",
-                "Cache-Control": "private, immutable",
-                "Content-Type": "application/zip",
-                "Content-Length": str(record["byte_size"]),
-            },
-        )
+        total = int(record["byte_size"])
+        etag = f'"{record["sha256"]}"'
+        headers = {
+            "ETag": etag,
+            "Accept-Ranges": "bytes",
+            "Content-Encoding": "identity",
+            "Cache-Control": "private, immutable",
+            "Content-Type": "application/zip",
+        }
+        if not self._if_match_satisfied(request.headers.get("If-Match"), etag):
+            headers["Content-Length"] = "0"
+            response = aiohttp_web.StreamResponse(status=412, headers=headers)
+            await response.prepare(request)
+            await response.write_eof()
+            return response
+
+        start, end = 0, total - 1
+        status = 200
+        range_header = request.headers.get("Range")
+        if range_header is not None:
+            try:
+                parsed = self._parse_range(range_header, total)
+            except ValueError:
+                # RFC 9110 requires invalid or unsupported Range syntax to be
+                # ignored, so serve the complete immutable representation.
+                pass
+            else:
+                if parsed is None:
+                    headers.update(
+                        {"Content-Range": f"bytes */{total}", "Content-Length": "0"}
+                    )
+                    response = aiohttp_web.StreamResponse(status=416, headers=headers)
+                    await response.prepare(request)
+                    await response.write_eof()
+                    return response
+                start, end = parsed
+                status = 206
+                headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        body_length = max(0, end - start + 1)
+        headers["Content-Length"] = str(body_length)
+        response = aiohttp_web.StreamResponse(status=status, headers=headers)
         await response.prepare(request)
         if request.method != "HEAD":
             handle = await asyncio.to_thread(path.open, "rb")
             try:
+                await asyncio.to_thread(handle.seek, start)
+                remaining = body_length
                 while True:
-                    chunk = await asyncio.to_thread(handle.read, 1024 * 1024)
+                    if remaining <= 0:
+                        break
+                    chunk = await asyncio.to_thread(
+                        handle.read, min(1024 * 1024, remaining)
+                    )
                     if not chunk:
                         break
                     await response.write(chunk)
+                    remaining -= len(chunk)
             finally:
                 await asyncio.to_thread(handle.close)
         await response.write_eof()
         return response
+
+    @staticmethod
+    def _if_match_satisfied(value: str | None, etag: str) -> bool:
+        if value is None:
+            return True
+        # If-Match uses strong comparison; weak tags deliberately do not match.
+        tags = [item.strip() for item in value.split(",")]
+        return "*" in tags or etag in tags
+
+    @staticmethod
+    def _parse_range(value: str, total: int) -> tuple[int, int] | None:
+        if not isinstance(value, str) or "," in value:
+            raise ValueError("unsupported Range syntax")
+        if total <= 0:
+            return None
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", value.strip())
+        if match is None:
+            raise ValueError("invalid Range syntax")
+        raw_start, raw_end = match.groups()
+        if not raw_start and not raw_end:
+            raise ValueError("invalid Range syntax")
+        try:
+            if not raw_start:
+                length = int(raw_end)
+                if length <= 0:
+                    return None
+                return max(0, total - length), total - 1
+            start = int(raw_start)
+            if start >= total:
+                return None
+            end = total - 1 if not raw_end else int(raw_end)
+        except ValueError:
+            return None
+        if end < start:
+            return None
+        return start, min(end, total - 1)
 
     async def register_device(
         self,
@@ -663,6 +778,13 @@ class PushRuntime:
             return
         capabilities = parse_capabilities(payload.get("capabilities"))
         process_instance_id = _uuid_v4_or_none(payload.get("process_instance_id"))
+        push_state = payload.get("push_state")
+        push_state_status = (
+            push_state.get("status")
+            if isinstance(push_state, dict)
+            and push_state.get("status") in {"available", "unavailable"}
+            else None
+        )
         if CAP_PUSH_JOB_ID_V1 in capabilities and process_instance_id is None:
             # Do not advertise safety guarantees the peer cannot fulfill.
             capabilities = frozenset(
@@ -681,6 +803,11 @@ class PushRuntime:
             process_instance_id=process_instance_id,
             owner_lock=lock,
             http_base=http_base,
+            reported_push_runtime=(
+                payload.get("push_runtime")
+                if isinstance(payload.get("push_runtime"), dict)
+                else None
+            ),
         )
         async with lock:
             if (
@@ -750,13 +877,18 @@ class PushRuntime:
             active_report = (
                 runtime.get("active") if isinstance(runtime, dict) else None
             )
-            if isinstance(active_report, dict):
+            # An unavailable durable store cannot authoritatively report absence:
+            # the in-memory coordinator intentionally starts empty until an explicit
+            # operator retry reloads the AtomicFile. Keep canonical reconciliation
+            # and fences untouched until that recovery succeeds.
+            runtime_authoritative = push_state_status != "unavailable"
+            if runtime_authoritative and isinstance(active_report, dict):
                 snapshots.extend(
                     await self._registration_active_snapshots(
                         device_id, session, active_report
                     )
                 )
-            else:
+            elif runtime_authoritative:
                 # A missing process UUID on an offline-timeout fence is safe to
                 # replace only when the new job-v1 process explicitly reports no
                 # active execution. An active or malformed report must keep the
@@ -832,13 +964,21 @@ class PushRuntime:
 
         assignment = await self.manager.assignment(job_id, device_id)
         if assignment is None:
-            return await self.manager.add_opaque_fence(
+            snapshots = await self.manager.add_opaque_fence(
                 device_id,
                 self.manager.opaque_identity_for_active(active_report),
                 ProtocolMode.JOB_V1,
                 session.process_instance_id,
                 "REGISTER reported an active Push/Sync job unknown to this server",
             )
+            if active_report.get("status") == "interrupted":
+                await self._send_resume_rejected(
+                    session,
+                    job_id=job_id,
+                    artifact_id=active_report.get("artifact_id"),
+                    revision=active_report.get("revision"),
+                )
+            return snapshots
 
         reported_artifact = active_report.get("artifact_id")
         if (
@@ -880,11 +1020,60 @@ class PushRuntime:
                     )
                 except StoreConflict:
                     pass
+            if active_report.get("status") == "interrupted":
+                await self._send_resume_rejected(
+                    session,
+                    job_id=job_id,
+                    artifact_id=reported_artifact,
+                    revision=active_report.get("revision"),
+                )
             return snapshots
 
         if assignment["state"] != DeviceState.RECONCILING.value:
+            if active_report.get("status") == "interrupted":
+                await self._send_resume_rejected(
+                    session,
+                    job_id=job_id,
+                    artifact_id=reported_artifact,
+                    revision=active_report.get("revision"),
+                )
             return []
         try:
+            if active_report.get("status") == "interrupted":
+                raw_revision = active_report.get("revision")
+                raw_offset = active_report.get("validated_offset")
+                if CAP_PUSH_RESUME_V1 in session.capabilities:
+                    resumed, snapshot = await self.manager.resume_interrupted(
+                        job_id,
+                        device_id,
+                        attempt=1,
+                        artifact_id=reported_artifact,
+                        dispatch_revision=(
+                            raw_revision
+                            if isinstance(raw_revision, int) and not isinstance(raw_revision, bool)
+                            else None
+                        ),
+                        validated_offset=(
+                            raw_offset
+                            if isinstance(raw_offset, int) and not isinstance(raw_offset, bool)
+                            else -1
+                        ),
+                    )
+                    if resumed:
+                        self.transfers.release_exact(
+                            TransferKey("push", device_id, job_id, 1), "resumable_replay"
+                        )
+                        return [snapshot]
+                # Interrupted work must never be restored as a live active phase.
+                # If exact resume authorization fails, retain reconciliation state
+                # and explicitly release only the exact client identity.
+                await self._send_resume_rejected(
+                    session,
+                    job_id=job_id,
+                    artifact_id=reported_artifact,
+                    revision=raw_revision,
+                )
+                return []
             outcome, snapshots = await self.manager.reconcile_report(
                 job_id,
                 device_id,
@@ -970,6 +1159,76 @@ class PushRuntime:
         message_type = payload.get("type")
         if not device_id:
             return False
+        if message_type == "PUSH_STATE_RETRY_RESULT":
+            lock = self._device_lock(device_id)
+            retry_snapshots: list[dict[str, Any]] = []
+            async with lock:
+                session = self.sessions.get(device_id)
+                if session is None or session.ws is not ws:
+                    return True
+                capabilities = parse_capabilities(payload.get("capabilities"))
+                if CAP_PUSH_STATE_RETRY_V1 not in capabilities:
+                    capabilities = frozenset(
+                        capability
+                        for capability in capabilities
+                        if capability not in {CAP_PUSH_JOB_ID_V1, CAP_PUSH_RESUME_V1}
+                    )
+                session.capabilities = capabilities
+                runtime = payload.get("push_runtime")
+                session.reported_push_runtime = runtime if isinstance(runtime, dict) else None
+                push_state = payload.get("push_state")
+                push_status = (
+                    push_state.get("status")
+                    if isinstance(push_state, dict)
+                    and push_state.get("status") in {"available", "unavailable"}
+                    else "unavailable"
+                )
+                active_report = (
+                    runtime.get("active") if isinstance(runtime, dict) else None
+                )
+                if push_status == "available" and isinstance(active_report, dict):
+                    retry_snapshots.extend(
+                        await self._registration_active_snapshots(
+                            device_id, session, active_report
+                        )
+                    )
+                entry = self.legacy.devices.get(device_id)
+                if entry is not None:
+                    entry["push_state_retry_supported"] = (
+                        CAP_PUSH_STATE_RETRY_V1 in capabilities
+                    )
+                    entry["push_state_status"] = push_status
+                registry = self.legacy.device_registry.get(device_id)
+                if registry is not None:
+                    registry["push_state_retry_supported"] = (
+                        CAP_PUSH_STATE_RETRY_V1 in capabilities
+                    )
+                    registry["push_state_status"] = push_status
+                    self.legacy.save_registry()
+            for snapshot in retry_snapshots:
+                await self.publish(snapshot)
+            if (
+                self.scheduler is not None
+                and any(snapshot["dispatch_enabled"] for snapshot in retry_snapshots)
+            ):
+                # The job was already explicitly resumed before this recovery.
+                # A paused restart job remains paused and receives no scheduler wake.
+                self.scheduler.wake()
+            await self.legacy.broadcast_device_list()
+            await self.legacy._broadcast_admin_message(json.dumps({
+                "type": "PUSH_STATE_RETRY_RESULT",
+                "device_id": device_id,
+                "status": payload.get("status")
+                if payload.get("status") in {"success", "failed"}
+                else "failed",
+                "reason": payload.get("reason")
+                if isinstance(payload.get("reason"), str)
+                else None,
+                "detail": payload.get("detail")
+                if isinstance(payload.get("detail"), str)
+                else None,
+            }, separators=(",", ":")))
+            return True
         job_id = payload.get("job_id")
         job_v1 = message_type in {
             "PUSH_JOB_ACCEPTED",
@@ -1128,7 +1387,7 @@ class PushRuntime:
             await self._handle_result(device_id, payload, session)
             return True
         if message_type == "PUSH_RECONCILE_REPORT" and isinstance(job_id, str):
-            await self._handle_reconcile_report(device_id, payload)
+            await self._handle_reconcile_report(session, device_id, payload)
             return True
         return False
 
@@ -1451,8 +1710,42 @@ class PushRuntime:
         except (ConnectionError, asyncio.TimeoutError):
             pass
 
+    async def _send_resume_rejected(
+        self,
+        session: LiveSession,
+        *,
+        job_id: str,
+        artifact_id: Any,
+        revision: Any,
+    ) -> None:
+        # Only an exact identity can authorize the client to discard durable work.
+        # Malformed reports remain fenced and are resolved by reconciliation timeout.
+        if (
+            not isinstance(artifact_id, str)
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+        ):
+            return
+        payload = {
+            "type": "PUSH_RESUME_REJECTED",
+            "job_id": job_id,
+            "attempt": 1,
+            "artifact_id": artifact_id,
+            "revision": revision,
+            "reason": "resume_not_authorized",
+            "retryable": False,
+            "detail": "Server could not authorize the interrupted assignment",
+        }
+        try:
+            await asyncio.wait_for(
+                session.ws.send_str(json.dumps(payload, separators=(",", ":"))),
+                self.send_timeout,
+            )
+        except (ConnectionError, asyncio.TimeoutError):
+            pass
+
     async def _handle_reconcile_report(
-        self, device_id: str, payload: dict[str, Any]
+        self, session: LiveSession, device_id: str, payload: dict[str, Any]
     ) -> None:
         job_id = payload.get("job_id")
         attempt = payload.get("attempt")
@@ -1463,29 +1756,97 @@ class PushRuntime:
             "interrupted",
         }:
             return
+        if status in {"absent", "interrupted"}:
+            matched, opaque_snapshots = await self.manager.clear_matching_opaque_fence(
+                device_id, job_id, 1
+            )
+            for opaque_snapshot in opaque_snapshots:
+                await self.publish(opaque_snapshot)
+            if matched and self.scheduler is not None:
+                self.scheduler.wake()
         assignment = await self.manager.assignment(job_id, device_id)
         if assignment is None:
-            if status in {"absent", "interrupted"}:
-                matched, snapshots = await self.manager.clear_matching_opaque_fence(
-                    device_id, job_id, 1
-                )
-                for snapshot in snapshots:
-                    await self.publish(snapshot)
-                if matched and self.scheduler is not None:
-                    self.scheduler.wake()
             return
-        if assignment["state"] == DeviceState.UNCONFIRMED.value and status in {
-            "absent",
-            "interrupted",
-        }:
+        if assignment["state"] == DeviceState.UNCONFIRMED.value and status == "absent":
             snapshots = await self.manager.clear_matching_fence(job_id, device_id, 1)
             for snapshot in snapshots:
                 await self.publish(snapshot)
             if snapshots and self.scheduler is not None:
                 self.scheduler.wake()
             return
-        if assignment["state"] != DeviceState.RECONCILING.value:
+        if assignment["state"] == DeviceState.UNCONFIRMED.value and status == "interrupted":
+            await self._send_resume_rejected(
+                session,
+                job_id=job_id,
+                artifact_id=payload.get("artifact_id"),
+                revision=payload.get("revision"),
+            )
             return
+        if assignment["state"] != DeviceState.RECONCILING.value:
+            if status == "interrupted":
+                await self._send_resume_rejected(
+                    session,
+                    job_id=job_id,
+                    artifact_id=payload.get("artifact_id"),
+                    revision=payload.get("revision"),
+                )
+            return
+        if status == "interrupted":
+            # A resumable peer must prove the exact immutable assignment before its
+            # durable partial is accepted.  A failed proof remains reconciling so a
+            # stale/malformed report cannot turn a live artifact into a terminal one.
+            try:
+                dispatch_capabilities = set(
+                    json.loads(assignment.get("dispatch_capability_snapshot_json") or "[]")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                dispatch_capabilities = set()
+            if CAP_PUSH_RESUME_V1 in dispatch_capabilities:
+                raw_revision = payload.get("revision")
+                raw_offset = payload.get("validated_offset")
+                artifact_id = payload.get("artifact_id")
+                if not isinstance(artifact_id, str):
+                    await self._send_resume_rejected(
+                        session,
+                        job_id=job_id,
+                        artifact_id=assignment.get("artifact_id"),
+                        revision=raw_revision,
+                    )
+                    return
+                try:
+                    resumed, snapshot = await self.manager.resume_interrupted(
+                        job_id,
+                        device_id,
+                        attempt=1,
+                        artifact_id=artifact_id,
+                        dispatch_revision=(
+                            raw_revision
+                            if isinstance(raw_revision, int) and not isinstance(raw_revision, bool)
+                            else None
+                        ),
+                        validated_offset=(
+                            raw_offset
+                            if isinstance(raw_offset, int) and not isinstance(raw_offset, bool)
+                            else -1
+                        ),
+                    )
+                except (StoreConflict, StoreNotFound):
+                    return
+                if resumed:
+                    await self.publish(snapshot)
+                    self.transfers.release_exact(
+                        TransferKey("push", device_id, job_id, 1), "resumable_replay"
+                    )
+                    if self.scheduler is not None:
+                        self.scheduler.wake()
+                else:
+                    await self._send_resume_rejected(
+                        session,
+                        job_id=job_id,
+                        artifact_id=artifact_id,
+                        revision=raw_revision,
+                    )
+                return
         try:
             outcome, snapshots = await self.manager.reconcile_report(
                 job_id,
@@ -1495,6 +1856,13 @@ class PushRuntime:
                 payload.get("phase") if isinstance(payload.get("phase"), str) else None,
                 payload.get("detail") if isinstance(payload.get("detail"), str) else None,
             )
+            if status == "interrupted":
+                await self._send_resume_rejected(
+                    session,
+                    job_id=job_id,
+                    artifact_id=payload.get("artifact_id"),
+                    revision=payload.get("revision"),
+                )
         except (StoreConflict, StoreNotFound):
             return
         for snapshot in snapshots:
@@ -1512,6 +1880,49 @@ class PushRuntime:
         self, ws: RuntimeWebSocketResponse, payload: dict[str, Any]
     ) -> bool:
         message_type = payload.get("type")
+        if message_type == "RETRY_PUSH_STATE":
+            raw_targets = payload.get("target_devices")
+            target_devices = (
+                raw_targets
+                if isinstance(raw_targets, list)
+                and all(isinstance(device_id, str) for device_id in raw_targets)
+                else []
+            )
+            unique_targets = list(dict.fromkeys(target_devices))
+            sent_count = 0
+            for device_id in unique_targets:
+                session = self.sessions.get(device_id)
+                entry = self.legacy.devices.get(device_id)
+                if (
+                    session is None
+                    or CAP_PUSH_STATE_RETRY_V1 not in session.capabilities
+                    or not isinstance(entry, dict)
+                    or entry.get("push_state_status") != "unavailable"
+                ):
+                    continue
+                try:
+                    async with session.owner_lock:
+                        if self.sessions.get(device_id) is not session:
+                            continue
+                        await asyncio.wait_for(
+                            session.ws.send_str(json.dumps(
+                                {"type": "RETRY_PUSH_STATE"},
+                                separators=(",", ":"),
+                            )),
+                            self.send_timeout,
+                        )
+                    sent_count += 1
+                except (ConnectionError, asyncio.TimeoutError):
+                    continue
+            await asyncio.wait_for(
+                ws.send_str(json.dumps({
+                    "type": "PUSH_STATE_RETRY_SENT",
+                    "sent_count": sent_count,
+                    "target_count": len(unique_targets),
+                }, separators=(",", ":"))),
+                self.admin_send_timeout,
+            )
+            return True
         if message_type == "PUSH_FILES" and isinstance(payload.get("job_id"), str):
             job_id = payload["job_id"]
             try:
@@ -1532,6 +1943,17 @@ class PushRuntime:
             if self.scheduler is not None:
                 self.scheduler.wake()
                 scheduler_woken = True
+            # Durable-state Retry only reloads and republishes client state. The
+            # operator's separate Resume action is the authority to reconcile and
+            # requeue recovered interrupted work.
+            live_device_entries = getattr(self.legacy, "devices", {})
+            reconciling_devices = [
+                device_id
+                for device_id, device in snapshot["devices"].items()
+                if device["state"] == DeviceState.RECONCILING.value
+                and live_device_entries.get(device_id, {}).get("push_state_status")
+                != "unavailable"
+            ]
             try:
                 if changed:
                     await self.publish(snapshot)
@@ -1559,6 +1981,21 @@ class PushRuntime:
             finally:
                 if self.scheduler is not None and not scheduler_woken:
                     self.scheduler.wake()
+            # Send the canonical admin acknowledgement before bounded device I/O.
+            # A repeated Resume still retries reconciliation when enable_dispatch
+            # was already committed by an earlier interrupted admin request.
+            if reconciling_devices:
+                results = await asyncio.gather(
+                    *(self.request_reconcile(device_id) for device_id in reconciling_devices),
+                    return_exceptions=True,
+                )
+                for device_id, result in zip(reconciling_devices, results, strict=True):
+                    if isinstance(result, BaseException):
+                        log.warning(
+                            "Could not request Push reconciliation for %s after Resume",
+                            device_id,
+                            exc_info=(type(result), result, result.__traceback__),
+                        )
             return True
         if message_type == "RECONCILE_PUSH_DEVICE":
             device_id = payload.get("device_id")
@@ -1684,6 +2121,27 @@ class PushRuntime:
             except Exception:
                 log.exception("Could not query expired Push deadlines")
                 continue
+            if (
+                hasattr(self.manager, "gc_artifacts_sync")
+                and timestamp / 1000 >= getattr(self, "_next_artifact_gc_at", 0.0)
+            ):
+                try:
+                    await asyncio.to_thread(
+                        self.manager.gc_artifacts_sync,
+                        self.artifacts.artifact_root,
+                        retry_window_ms=int(
+                            getattr(self, "artifact_retry_window", 7 * 24 * 60 * 60)
+                            * 1000
+                        ),
+                        timestamp=timestamp,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Could not GC expired Push artifacts")
+                self._next_artifact_gc_at = timestamp / 1000 + getattr(
+                    self, "artifact_gc_interval", 60
+                )
             for row in acceptance_rows:
                 if self.scheduler is not None and self.scheduler.has_live_acceptance_waiter(
                     row["job_id"], row["device_id"], row["attempt"]

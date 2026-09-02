@@ -46,6 +46,22 @@ def test_web_console_is_bundled():
     assert static_index.is_file(), "web console index.html must ship inside the package"
 
 
+def test_web_console_exposes_individual_and_bulk_push_state_retry_controls():
+    static_index = Path(server.__file__).parent / "static" / "index.html"
+    source = static_index.read_text(encoding="utf-8")
+
+    assert 'id="btnRetryAllPushStates"' in source
+    assert 'data-act="retryPushState"' in source
+    assert "Retry affected (' + retryable.length + ')" in source
+    assert "btnRetryAllPushStates.style.display = retryable.length ? '' : 'none';" in source
+    assert "Push state unavailable" in source
+    assert "progressCellHtml(id)" in source
+    assert '<div>Client</div><div>Status</div><div>Battery</div><div>Progress</div>' in source
+    assert '<div class="dev-client">' in source
+    assert "type: 'RETRY_PUSH_STATE', target_devices: targets" in source
+    assert "this will not start a transfer" in source
+
+
 @pytest.mark.parametrize(
     "raw, expected",
     [

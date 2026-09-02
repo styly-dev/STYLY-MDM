@@ -33,6 +33,13 @@ The authoritative implementation and protocol guide is
 dispatch, command acceptance, transfer completion, validation/apply, terminal result,
 ACK, restart recovery, and persistent device-fence reconciliation.
 
+Issue #94 registration is assembled only after the coordinator actor has loaded
+and persisted durable Push state; the main looper never blocks on that storage
+work. Interrupted ownership expires locally after 24 hours as `resume_expired`,
+which durably releases the client execution gate and removes only that exact
+job-owned partial. The server keeps canonical ownership until it receives the
+terminal replay or exact reconciliation evidence.
+
 ## Building the MDM Client
 
 ### Build from CLI
@@ -280,7 +287,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 
 | Message type | Description |
 |---|---|
-| `REGISTER` | Sent on connect. In addition to device metadata, job-v1 clients send `process_instance_id` (UUIDv4), `capabilities: ["push_job_id_v1"]`, and `push_runtime.active` (exact active identity/phase or `null`). Capability parsing is all-or-nothing and never inferred from a version number. |
+| `REGISTER` | Sent on connect. In addition to device metadata, current clients always send `push_state_retry_v1`; when durable Push state is available they also send `push_job_id_v1` and `push_resume_v1`. `push_state.status` is `available` or `unavailable`, while `push_runtime.active` carries the exact active/interrupted identity, dispatch revision, phase, and validated offset, or `null`. Capability parsing is all-or-nothing and never inferred from a version number. |
 | `BATTERY_UPDATE` | Battery telemetry. Fields: `device_id`, `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds) |
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
 | `DELETE_APP_RESULT` | Result of a remote app uninstall — exactly one per `EXECUTE_UNINSTALL`. The client survives it, so this always arrives (unlike `SELF_UNINSTALL_RESULT`). Fields: `status` (`success`/`fail`), `package_name`, `error` (optional), `result_code` (optional), `startup_app_cleared` (optional; reports what the device did — the server decides from its own record, see below). See [Remote App Uninstall](#remote-app-uninstall). |
@@ -288,10 +295,11 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
 | `DOWNLOAD_COMPLETE` | Install/legacy: the existing post-download signal. Job-v1 Push: an exact `job_id`, `attempt`, and `artifact_id` checkpoint emitted only after exact-size/basic ZIP/path validation; it **does not** release the network slot. |
 | `PUSH_JOB_ACCEPTED` / `PUSH_JOB_REJECTED` | Exact command acceptance after the client durably persists active state, or a duplicate-safe rejection (`device_busy`, `client_persistence_unavailable`, malformed identity, destination/artifact conflict). A persistence rejection keeps the MDM process alive but starts no worker. Fields include `job_id`, fixed `attempt=1`, and current phase/reason. |
-| `PUSH_TRANSFER_COMPLETE` | Job-v1 network EOF checkpoint. Fields: `job_id`, `attempt`, `artifact_id`, exact `received_size`. This matching message releases only that job's transfer slot. |
+| `PUSH_TRANSFER_COMPLETE` | Job-v1 verified network EOF checkpoint. Fields: `job_id`, `attempt`, `artifact_id`, cumulative exact `received_size` including a validated resume prefix. This matching message releases only that job's transfer slot. |
 | `PUSH_PHASE` | Job-v1 phase transition, currently `phase=applying`, carrying exact identity. |
-| `PUSH_RECONCILE_REPORT` | Exact `active`, `absent`, or `interrupted` answer to a server reconciliation request. `absent` is sent only in response to that request. |
+| `PUSH_RECONCILE_REPORT` | Exact `active`, `absent`, or `interrupted` answer to a server reconciliation request. A resumable interrupted report proves `artifact_id`, immutable dispatch `revision`, and local `validated_offset`; missing or mismatched identity is never requeued. `absent` is sent only in response to that request. |
 | `PUSH_FILES_RESULT` | Durable terminal result. Job-v1 fields: `job_id`, fixed `attempt=1`, `status`, `dest_path`, success counts or `failure_code` + `detail`. The client retains it until a matching accepted or permanent-rejection ACK and can replay the bounded completed receipt during exact reconciliation. |
+| `PUSH_STATE_RETRY_RESULT` | Response to an explicit console recovery request. Carries `success`/`failed`, refreshed capabilities, `push_state`, and `push_runtime`. The server updates device health only; it does not wake or dispatch the Push scheduler. |
 | `VERIFY_APK_RESULT` | Result of an APK integrity check. Fields: `package_name`, `found` (boolean), `size`, `cd_sha256`, `full_sha256`, `version_code`, `version_name`, `signer_sha256`, `error` (optional). Absent hash/version fields when `found` is false. |
 | `VERIFY_DIR_RESULT` | Result of a directory integrity check. Fields: `path`, `found` (boolean), `tree_hash`, `file_count`, `total_size`, `manifest` (optional array of `{relative_path, size, sha256}`, omitted above a cap), `error` (optional) |
 | `SELF_UPDATE_STARTING` | The client's last words before the silent installer kills its process for a self-update: tells the server to treat the coming disconnect as `updating`, not `offline`. Fields: `correlation_id`, `target_version_code`, `current_version_code`, `package_name`, `apk_filename`. See [Client Self-Update](#client-self-update). |
@@ -307,9 +315,11 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `EXECUTE_REBOOT` / `EXECUTE_POWER_OFF` | Reboot or power off the device immediately via the PICO advanced device-control API (`pbsControlSetDeviceAction`). No fields. See [Remote Power Control](#remote-power-control). |
 | `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename`, plus `full_sha256` + `cd_sha256` (reference hashes of the file being dispatched; present only when the APK is a local upload in `apks/`). The client verifies the download against `full_sha256` before installing; a **self**-update is refused outright when the hashes are absent. |
 | `REGISTERED` | Server acknowledgement after ownership/capability processing. Field: `session_id`. The client then replays its durable pending terminal outbox. |
-| `EXECUTE_PUSH_FILES` | Job-v1 fields: `job_id`, fixed `attempt=1`, observed `revision`, immutable `artifact_id`, absolute `artifact_url`, exact size/SHA-256 metadata, destination, and server-derived `delete_extras`. Legacy fields remain accepted during migration. Safety-critical fields require their exact JSON types. |
+| `EXECUTE_PUSH_FILES` | Issue #94 job-v1 fields: `job_id`, fixed `attempt=1`, immutable per-device dispatch `revision`, immutable `artifact_id`, absolute `artifact_url`, exact size/SHA-256/strong-ETag metadata, destination, and server-derived `delete_extras`. A resumed command keeps the original dispatch revision even when the aggregate job revision advanced. Issue #91 commands without `revision` remain executable as non-resumable work, and legacy fields remain accepted for small pushes during migration. Safety-critical fields that are present require their exact JSON types. |
 | `PUSH_RESULT_ACK` | Terminal-result disposition. Fields: exact identity, `accepted`, committed `revision` when a local canonical job exists, and on rejection `reason` plus `retryable`. The client retains retryable results; accepted or permanently rejected results leave the pending outbox while remaining in bounded dedupe receipts. |
 | `PUSH_RECONCILE_REQUEST` | Requests exact status for one or more `{job_id, attempt, artifact_id}` identities. It never directly clears a fence. |
+| `PUSH_RESUME_REJECTED` | Permanently rejects one exact interrupted resume identity (`job_id`, `attempt`, `artifact_id`, immutable dispatch `revision`). The client durably clears only that matching active record, removes its job-owned work, and replies with an `absent` reconciliation report. |
+| `RETRY_PUSH_STATE` | Explicitly rereads and republishes the client's durable Push state. It is sent only to a currently online, `push_state_retry_v1` client reporting unavailable state and cannot start a worker or transfer. |
 | `EXECUTE_VERIFY_APK` | Compute `size` + Central-Directory digest (plus diagnostics) for an installed package. Fields: `package_name` |
 | `EXECUTE_VERIFY_DIR` | Compute a manifest + tree hash for a device directory (shared storage only). Fields: `path` |
 | `EXECUTE_SELF_UNINSTALL` | Uninstall the guard, announce `SELF_UNINSTALL_STARTING`, then silently uninstall the client itself (venue handover). Fields: `correlation_id` (server-generated per device, echoed back by the announcement) |
@@ -323,6 +333,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `REBOOT_DEVICE` / `POWER_OFF_DEVICE` | Reboot or power off target devices (the console gates both behind a shared confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only). See [Remote Power Control](#remote-power-control). |
 | `INSTALL_APK` | Install an uploaded APK on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `apk_url`, `apk_filename` |
 | `PUSH_FILES` | New flow: `{job_id}` only; the server reads mode, destination, targets, and immutable artifact metadata from SQLite and enables/resumes that job's dispatch gate. The older bundle-shaped message remains migration-only compatibility. |
+| `RETRY_PUSH_STATE` | Explicit recovery for one or more affected online devices. Fields: `target_devices`. The server filters to sessions advertising `push_state_retry_v1` with `push_state.status=unavailable`; no offline request is queued and no Push scheduler wake occurs. |
 | `RECONCILE_PUSH_DEVICE` | Re-requests exact reconciliation for a fenced device. Field: `device_id`. It cannot force-clear state or a fence without matching client/process evidence. |
 | `VERIFY_APK` | Verify an installed package against a local reference on target devices. Fields: `target_devices`, `package_name`. The reference (`size` + CD digest) is computed and compared in the browser and is **never** sent to the server. |
 | `VERIFY_DIR` | Verify a device directory against a local reference on target devices. Fields: `target_devices`, `path` (absolute, within shared storage). |
@@ -342,7 +353,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `GET /apks/{filename}` | Serves uploaded APK files to devices on the LAN, and backs the console's top-bar client-APK download link (see the client-APK download note below). |
 | `POST /api/push-jobs` | Validate a canonical request and commit `job_id` + per-device rows before any upload bytes. `client_request_id` makes identical replay idempotent; conflicting reuse is 409. |
 | `POST /api/push-jobs/{job_id}/upload` | Job-owned multipart upload, measured limits, packaging, fsync + atomic immutable artifact publication, then `ready`. |
-| `GET /artifacts/{artifact_id}` | DB-resolved immutable ZIP with exact length, identity encoding, and SHA-256 strong ETag. |
+| `GET /artifacts/{artifact_id}` | DB-resolved immutable ZIP with identity encoding, `Accept-Ranges: bytes`, and a stable SHA-256 strong ETag. Supports full `200`, validated single-range `206`, strong `If-Match` failure `412`, and `416` with `Content-Range: bytes */T`; an expired tombstoned identity remains unavailable and is never reused. |
 | `POST /api/bundles` / `GET /bundles/{filename}` | Legacy compatibility only. The new console Push/Sync flow does not use these routes. |
 
 ### Server → Admin
@@ -351,7 +362,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 |---|---|
 | `SERVER_INFO` | Server identity, sent once on connect (before the first `DEVICE_LIST`). Fields: `version` (the `styly_mdm` package version; the console renders it next to the `STYLY-MDM` brand in the top bar. Its `major.minor` is the compatibility reference — and the top-bar value itself turns red when a live client is on a *newer* `major.minor` (i.e. the server is the one lagging). See the compatibility note below). |
 | `CLIENT_APK_INFO` | The newest styly-mdm-client APK the server holds, sent on connect (right after `SERVER_INFO`, before `DEVICE_LIST`) and re-broadcast after every APK upload. Field: `apk` = `{filename, url, version}` or `null`. Drives the per-device and bulk **Update** buttons and the top-bar client-APK download link (see the notes below). |
-| `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting; a *stable-online* client whose `version_name` trails the server on `major.minor` is flagged red as needing an update — the reverse case, a client *ahead* of the server, reddens the top-bar server version instead. `updating` and offline rows are exempt, and the check is skipped only when the server version is the `0.0.0` untagged/not-installed fallback), and may include optional `battery`: `{level, charging, last_seen}`) |
+| `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name`, `push_state_retry_supported`, and `push_state_status` (`available` / `unavailable` / `null`). The console shows individual and all-affected recovery controls only for supported online devices with unavailable state. Entries may also include optional `battery`: `{level, charging, last_seen}`. |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `DELETE_APP_SENT` | Confirmation that uninstall commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `REBOOT_SENT` / `POWER_OFF_SENT` | Confirmation that reboot/power-off commands were dispatched. Fields: `sent_count`, `target_count` |
@@ -361,6 +372,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `PUSH_JOBS_SNAPSHOT` | Sent after the normal initial admin metadata. Contains every non-terminal job, bounded recent terminal jobs, and fence-visible metadata as a complete replacement snapshot. Updates that race ahead of it on the same connection are buffered and revision-merged by the console. If this initial snapshot cannot be sent, the server closes that admin socket so the existing reconnect loop requests a fresh snapshot instead of buffering forever. |
 | `PUSH_JOB_UPDATED` | Canonical full snapshot after a committed mutation. A single server publisher coalesces pending revisions per `job_id`; console state merges only monotonically newer revisions. |
 | `PUSH_FILES_SENT` | Job dispatch/resume acknowledgement. Fields include `job_id`, committed `revision`, canonical state/gate, target count, and shared transfer limit. |
+| `PUSH_STATE_RETRY_SENT` / `PUSH_STATE_RETRY_RESULT` | Small-control acknowledgements for explicit durable-state recovery. They report target/sent counts and each device's success/failure; neither represents or initiates artifact transfer. |
 | `LAUNCH_RESULT` | Forwarded result from a device |
 | `DELETE_APP_RESULT` | Forwarded uninstall result from a device (adds `device_id`). A `success` is followed by a fresh `DEVICE_LIST` when the device's recorded startup app still named the removed package, since the server then drops that record. See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_RESULT` / `POWER_OFF_RESULT` | Forwarded power-command acknowledgement from a device (adds `device_id`). `accepted` = received and going down (confirm via the row dropping offline); `fail` = the SDK rejected it. See [Remote Power Control](#remote-power-control). |
