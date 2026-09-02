@@ -1,8 +1,9 @@
 import asyncio
 import json
+from dataclasses import replace
 
 from styly_mdm.push_jobs import ProtocolMode
-from styly_mdm.push_scheduler import PushScheduler
+from styly_mdm.push_scheduler import LiveSession, PushScheduler
 
 
 def test_job_v1_command_uses_absolute_artifact_url():
@@ -34,6 +35,28 @@ class _Ws:
 
     async def send_str(self, value):
         self.messages.append(json.loads(value))
+
+
+def test_protocol_admission_uses_the_configured_resume_threshold():
+    scheduler = object.__new__(PushScheduler)
+    scheduler.resume_threshold_bytes = 10
+    scheduler.allow_legacy = True
+    session = LiveSession(
+        device_id='D1',
+        session_id='session',
+        ws=_Ws(),
+        capabilities=frozenset({'push_job_id_v1'}),
+        process_instance_id='process',
+        owner_lock=asyncio.Lock(),
+        http_base='http://server',
+    )
+
+    assert scheduler._protocol_for(session, 10) is ProtocolMode.JOB_V1
+    assert scheduler._protocol_for(session, 11) is None
+    resumable = replace(
+        session, capabilities=frozenset({'push_job_id_v1', 'push_resume_v1'})
+    )
+    assert scheduler._protocol_for(resumable, 11) is ProtocolMode.JOB_V1
 
 
 def test_exact_reconcile_can_reuse_held_owner_lock():

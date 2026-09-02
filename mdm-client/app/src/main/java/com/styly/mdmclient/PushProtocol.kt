@@ -7,6 +7,8 @@ import java.util.UUID
 
 object PushProtocol {
     const val CAP_PUSH_JOB_ID_V1 = "push_job_id_v1"
+    const val CAP_PUSH_RESUME_V1 = "push_resume_v1"
+    const val CAP_PUSH_STATE_RETRY_V1 = "push_state_retry_v1"
     const val ATTEMPT_V1 = 1
     const val PHASE_DOWNLOADING = "downloading"
     const val PHASE_VALIDATING = "validating"
@@ -24,15 +26,21 @@ object PushProtocol {
         val bundleFilename: String,
         val destPath: String,
         val deleteExtras: Boolean,
+        /** Server revision of the immutable job assignment. Required for job-v1 wire commands. */
+        val revision: Long = 0L,
+        /** A strong HTTP ETag for the immutable artifact, when supplied by the server. */
+        val artifactEtag: String? = null,
     ) {
         val isJobV1: Boolean get() = jobId != null
         val identity: String get() = if (jobId != null) "$jobId:$attempt" else "legacy"
 
         fun sameExecution(other: Command): Boolean =
             jobId == other.jobId && attempt == other.attempt &&
-                artifactId == other.artifactId && artifactUrl == other.artifactUrl &&
+                artifactId == other.artifactId &&
                 artifactSize == other.artifactSize &&
                 artifactSha256.equals(other.artifactSha256, ignoreCase = true) &&
+                (revision == other.revision || revision == 0L || other.revision == 0L) &&
+                (artifactEtag == null || other.artifactEtag == null || artifactEtag == other.artifactEtag) &&
                 bundleFilename == other.bundleFilename && destPath == other.destPath &&
                 deleteExtras == other.deleteExtras
 
@@ -43,16 +51,27 @@ object PushProtocol {
             put("artifact_url", artifactUrl)
             if (artifactSize != null) put("artifact_size", artifactSize)
             if (artifactSha256 != null) put("artifact_sha256", artifactSha256)
+            if (jobId != null) put("revision", revision)
+            if (artifactEtag != null) put("artifact_etag", artifactEtag)
             put("bundle_filename", bundleFilename)
             put("dest_path", destPath)
             put("delete_extras", deleteExtras)
         }
     }
 
-    data class Active(val command: Command, val phase: String) {
+    data class Active(
+        val command: Command,
+        val phase: String,
+        /** True when the process restarted while the durable worker was active. */
+        val interrupted: Boolean = false,
+        /** First recovery time; bounds how long stale work can fence the device. */
+        val interruptedAt: Long? = null,
+    ) {
         fun toJson(): JSONObject = JSONObject().apply {
             put("command", command.toJson())
             put("phase", phase)
+            put("interrupted", interrupted)
+            if (interruptedAt != null) put("interrupted_at", interruptedAt)
         }
     }
 
@@ -158,6 +177,11 @@ object PushProtocol {
         if (jobId != null && (artifactSize == null || artifactSha256 == null)) {
             throw malformed("job-v1 artifact size and SHA-256 are required")
         }
+        // Issue #91 servers did not send revision. Such commands remain runnable
+        // but revision=0 is never eligible for restart resume.
+        val revision = if (jobId == null) 0L else optionalLong(payload, "revision") ?: 0L
+        if (revision < 0L) throw malformed("revision must be non-negative")
+        val artifactEtag = optionalString(payload, "artifact_etag")?.also { validateStrongEtag(it) }
         val bundleFilename = optionalString(payload, "bundle_filename")
             ?.takeIf { it.isNotBlank() } ?: "bundle.zip"
         return Command(
@@ -170,10 +194,18 @@ object PushProtocol {
             bundleFilename = bundleFilename,
             destPath = destPath,
             deleteExtras = strictBoolean(payload, "delete_extras", false),
+            revision = revision,
+            artifactEtag = artifactEtag,
         )
     }
 
-    fun commandFromJson(json: JSONObject): Command = parseCommand(json)
+    fun commandFromJson(json: JSONObject): Command {
+        // State written before issue #94 had no revision. Keep it readable; only
+        // newly received job-v1 wire commands require the field strictly.
+        val migrated = JSONObject(json.toString())
+        if (migrated.has("job_id") && !migrated.has("revision")) migrated.put("revision", 0L)
+        return parseCommand(migrated)
+    }
 
     fun parseResultAck(payload: JSONObject): ResultAck {
         val jobId = requiredString(payload, "job_id")
@@ -228,7 +260,12 @@ object PushProtocol {
     fun stateFromJson(json: JSONObject): State {
         val active = try {
             json.optJSONObject("active")?.let {
-                Active(commandFromJson(it.getJSONObject("command")), it.getString("phase"))
+                Active(
+                    commandFromJson(it.getJSONObject("command")),
+                    it.getString("phase"),
+                    it.optBoolean("interrupted", false),
+                    it.optLong("interrupted_at", 0L).takeIf { value -> value > 0L },
+                )
             }
         } catch (_: RuntimeException) {
             // A corrupt active record must not erase independently valid result receipts.
@@ -280,6 +317,25 @@ object PushProtocol {
             throw malformed("$field is outside the supported integer range")
         }
         return longValue.toInt()
+    }
+
+    private fun strictLong(payload: JSONObject, field: String): Long {
+        val value = when (val raw = payload.opt(field)) {
+            is Byte -> raw.toLong()
+            is Short -> raw.toLong()
+            is Int -> raw.toLong()
+            is Long -> raw
+            else -> throw malformed("$field must be a JSON integer")
+        }
+        return value
+    }
+
+    private fun validateStrongEtag(value: String) {
+        if (value.isBlank() || value.startsWith("W/") ||
+            !value.startsWith("\"") || !value.endsWith("\"") || value.length < 2
+        ) {
+            throw malformed("artifact_etag must be a strong quoted ETag")
+        }
     }
 
     private fun optionalLong(payload: JSONObject, field: String): Long? {
