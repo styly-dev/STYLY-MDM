@@ -644,7 +644,8 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > 2. The terminal result — `INSTALL_RESULT` or `PUSH_FILES_RESULT` (fallback — covers
 >    older clients that never emit `DOWNLOAD_COMPLETE`, and clients whose download
 >    failed outright).
-> 3. Device disconnect (frees every slot the device held, immediately).
+> 3. Device disconnect for Install (Push keeps its exact slot because the Android
+>    HTTP worker continues independently of the WebSocket).
 > 4. A per-device timeout (`MDM_TRANSFER_TIMEOUT` seconds, default **600**) so a
 >    silent/stuck device cannot block the queue. Lowering it recovers stuck slots
 >    sooner but risks releasing a slow-but-healthy transfer early, which only
@@ -653,7 +654,9 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > `pending_transfers` is keyed by **`(device_id, task)`**, not by device: an admin can
 > push files to a group that is already installing an APK, so one device may hold an
 > install slot and a push slot at once. Each terminal message frees only its own task's
-> slot; only a disconnect is task-agnostic.
+> slot. A disconnect still releases Install ownership, but an active Push lease is
+> retained across WebSocket replacement and rebuilt from an exact `downloading`
+> report after server restart.
 >
 > This is fully backward compatible in both directions. An older client that never
 > emits `DOWNLOAD_COMPLETE` for a push still frees its slot via `PUSH_FILES_RESULT` or
