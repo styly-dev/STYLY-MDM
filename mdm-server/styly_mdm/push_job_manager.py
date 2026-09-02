@@ -18,6 +18,7 @@ from typing import Any
 
 from .push_job_store import PushJobStore, StoreConflict, StoreNotFound, now_ms
 from .push_jobs import (
+    CAP_PUSH_RESUME_V1,
     DeviceState,
     JobState,
     ProtocolMode,
@@ -455,7 +456,7 @@ class PushJobManager:
             self.store._begin(conn)
             try:
                 row = conn.execute(
-                    "SELECT state, attempt FROM push_job_devices "
+                    "SELECT state, attempt, dispatch_revision FROM push_job_devices "
                     "WHERE job_id=? AND device_id=?",
                     (job_id, device_id),
                 ).fetchone()
@@ -484,6 +485,14 @@ class PushJobManager:
                 if result.rowcount != 1:
                     raise StoreConflict("assignment changed before dispatch")
                 self.store._increment_revision(conn, job_id, timestamp)
+                job_revision = conn.execute(
+                    "SELECT revision FROM push_jobs WHERE job_id=?", (job_id,)
+                ).fetchone()["revision"]
+                conn.execute(
+                    "UPDATE push_job_devices SET dispatch_revision=COALESCE(dispatch_revision, ?) "
+                    "WHERE job_id=? AND device_id=?",
+                    (job_revision, job_id, device_id),
+                )
                 self.store._rederive_job(conn, job_id, timestamp)
                 snapshot = self.store._snapshot(conn, job_id)
                 self.store._commit(conn)
@@ -507,6 +516,99 @@ class PushJobManager:
                 (job_id, device_id),
             ).fetchone()
             return None if row is None else dict(row)
+
+        return await self.store._call(op)
+
+    async def resume_interrupted(
+        self,
+        job_id: str,
+        device_id: str,
+        *,
+        attempt: int,
+        artifact_id: str | None,
+        dispatch_revision: int | None,
+        validated_offset: int,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Requeue an exact interrupted resumable assignment.
+
+        ``dispatch_revision`` is persisted on the device row at dispatch time; it
+        remains stable while the aggregate job revision advances through restart
+        reconciliation and phase updates.
+        """
+
+        def op(conn: sqlite3.Connection) -> tuple[bool, dict[str, Any]]:
+            self.store._begin(conn)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT d.*, j.dispatch_enabled, j.dispatch_paused_reason,
+                           j.artifact_id AS job_artifact_id,
+                           a.byte_size
+                    FROM push_job_devices d
+                    JOIN push_jobs j ON j.job_id=d.job_id
+                    LEFT JOIN push_artifacts a ON a.artifact_id=j.artifact_id
+                    WHERE d.job_id=? AND d.device_id=?
+                    """,
+                    (job_id, device_id),
+                ).fetchone()
+                if row is None:
+                    raise StoreNotFound(f"{job_id}/{device_id}")
+                capabilities = set(json.loads(row["dispatch_capability_snapshot_json"] or "[]"))
+                exact_artifact = artifact_id is not None and artifact_id == row["job_artifact_id"]
+                exact_revision = (
+                    dispatch_revision is not None
+                    and dispatch_revision == row["dispatch_revision"]
+                )
+                valid_offset = (
+                    isinstance(validated_offset, int)
+                    and not isinstance(validated_offset, bool)
+                    and 0 <= validated_offset <= int(row["byte_size"] or 0)
+                )
+                resumable = (
+                    row["state"] == DeviceState.RECONCILING.value
+                    and row["attempt"] == attempt == 1
+                    and row["protocol_mode"] == ProtocolMode.JOB_V1.value
+                    and CAP_PUSH_RESUME_V1 in capabilities
+                    and (
+                        bool(row["dispatch_enabled"])
+                        or row["dispatch_paused_reason"] == "server_restart"
+                    )
+                    and exact_artifact
+                    and exact_revision
+                    and valid_offset
+                )
+                if not resumable:
+                    snapshot = self.store._snapshot(conn, job_id)
+                    self.store._commit(conn)
+                    return False, snapshot
+                timestamp = now_ms()
+                validate_device_transition(DeviceState.RECONCILING, DeviceState.QUEUED)
+                conn.execute(
+                    """
+                    UPDATE push_job_devices SET state=?, queue_reason=?,
+                        validated_offset=?, accept_deadline=NULL,
+                        reconciliation_reason=NULL, reconciliation_deadline=NULL,
+                        failure_code=NULL, failure_detail=NULL, updated_at=?
+                    WHERE job_id=? AND device_id=? AND state=?
+                    """,
+                    (
+                        DeviceState.QUEUED.value,
+                        "resumable_replay",
+                        validated_offset,
+                        timestamp,
+                        job_id,
+                        device_id,
+                        DeviceState.RECONCILING.value,
+                    ),
+                )
+                self.store._increment_revision(conn, job_id, timestamp)
+                self.store._rederive_job(conn, job_id, timestamp)
+                snapshot = self.store._snapshot(conn, job_id)
+                self.store._commit(conn)
+                return True, snapshot
+            except BaseException:
+                self.store._rollback(conn)
+                raise
 
         return await self.store._call(op)
 
