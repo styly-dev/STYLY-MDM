@@ -15,6 +15,7 @@ class PushProtocolStrictTypesTest {
         put("artifact_url", "http://server/artifacts/value")
         put("artifact_size", 42L)
         put("artifact_sha256", "a".repeat(64))
+        put("revision", 1L)
         put("dest_path", "/sdcard/STYLY/content")
     }
 
@@ -44,6 +45,23 @@ class PushProtocolStrictTypesTest {
         assertThrows(IllegalArgumentException::class.java) {
             PushProtocol.parseCommand(payload().apply { put("artifact_size", 42.0) })
         }
+    }
+
+    @Test
+    fun `job-v1 accepts issue 91 missing revision but rejects wrong types and weak etag`() {
+        assertTrue(
+            PushProtocol.parseCommand(payload().apply { remove("revision") }).revision == 0L,
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            PushProtocol.parseCommand(payload().apply { put("revision", "1") })
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            PushProtocol.parseCommand(payload().apply { put("artifact_etag", "W/\"weak\"") })
+        }
+        assertTrue(
+            PushProtocol.parseCommand(payload().apply { put("artifact_etag", "\"strong\"") })
+                .artifactEtag == "\"strong\"",
+        )
     }
 
     @Test

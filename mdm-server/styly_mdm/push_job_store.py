@@ -20,6 +20,7 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, TypeVar
 
+from .push_artifacts import strong_etag
 from .push_jobs import (
     DeviceState,
     JobState,
@@ -176,7 +177,10 @@ class _DbWorker:
 
 
 class PushJobStore:
-    SCHEMA_VERSION = 1
+    # Version 2 records the retention state contract used by resumable downloads.
+    # The v1 schema already had this column, but old databases are upgraded below
+    # without dropping or rewriting any job rows.
+    SCHEMA_VERSION = 2
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -247,6 +251,7 @@ class PushJobStore:
                 protocol_mode TEXT NOT NULL CHECK (protocol_mode IN ('job_v1', 'legacy')),
                 create_capability_snapshot_json TEXT NOT NULL,
                 dispatch_capability_snapshot_json TEXT,
+                dispatch_revision INTEGER,
                 state TEXT NOT NULL,
                 queue_reason TEXT,
                 attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt = 1),
@@ -297,6 +302,39 @@ class PushJobStore:
             COMMIT;
             """
         )
+        # Issue #91 databases normally already contain retention_state.  Keep this
+        # defensive migration for databases created by an earlier development
+        # snapshot, where the artifact table predated retention tracking.
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(push_artifacts)").fetchall()
+        }
+        if "retention_state" not in columns:
+            conn.execute(
+                "ALTER TABLE push_artifacts ADD COLUMN retention_state TEXT NOT NULL DEFAULT 'retained'"
+            )
+        device_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(push_job_devices)").fetchall()
+        }
+        if "dispatch_revision" not in device_columns:
+            conn.execute(
+                "ALTER TABLE push_job_devices ADD COLUMN dispatch_revision INTEGER"
+            )
+        row = conn.execute(
+            "SELECT value FROM server_metadata WHERE key='schema_version'"
+        ).fetchone()
+        version = int(row["value"]) if row is not None else 1
+        if version > PushJobStore.SCHEMA_VERSION:
+            raise RuntimeError(
+                f"unsupported push job schema version {version}; expected <= {PushJobStore.SCHEMA_VERSION}"
+            )
+        if version != PushJobStore.SCHEMA_VERSION:
+            conn.execute(
+                "INSERT INTO server_metadata(key, value) VALUES ('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(PushJobStore.SCHEMA_VERSION),),
+            )
 
     @staticmethod
     def _begin(conn: sqlite3.Connection) -> None:
@@ -424,6 +462,7 @@ class PushJobStore:
                 "protocol_mode": row["protocol_mode"],
                 "attempt": row["attempt"],
                 "enqueue_seq": row["enqueue_seq"],
+                "dispatch_revision": row["dispatch_revision"],
                 "validated_offset": row["validated_offset"],
                 "accepted_at": row["accepted_at"],
                 "failure": failure,
@@ -446,6 +485,7 @@ class PushJobStore:
                 "display_filename": job["display_filename"],
                 "byte_size": job["byte_size"],
                 "sha256": job["sha256"],
+                "etag": strong_etag(job["sha256"]),
                 "entry_count": job["entry_count"],
                 "created_at": job["artifact_created_at"],
             }
@@ -772,6 +812,7 @@ class PushJobStore:
             "reconciliation_reason",
             "reconciliation_deadline",
             "dispatch_capability_snapshot_json",
+            "dispatch_revision",
         }
         unknown = set(fields) - allowed_columns
         if unknown:
@@ -810,6 +851,15 @@ class PushJobStore:
                     values,
                 )
                 self._increment_revision(conn, job_id, timestamp)
+                if target is DeviceState.DISPATCHING:
+                    job_revision = conn.execute(
+                        "SELECT revision FROM push_jobs WHERE job_id=?", (job_id,)
+                    ).fetchone()["revision"]
+                    conn.execute(
+                        "UPDATE push_job_devices SET dispatch_revision=COALESCE(dispatch_revision, ?) "
+                        "WHERE job_id=? AND device_id=?",
+                        (job_revision, job_id, device_id),
+                    )
                 self._rederive_job(conn, job_id, timestamp)
                 snapshot = self._snapshot(conn, job_id)
                 self._commit(conn)
@@ -1135,9 +1185,139 @@ class PushJobStore:
     async def artifact_record(self, artifact_id: str) -> dict[str, Any] | None:
         def op(conn: sqlite3.Connection) -> dict[str, Any] | None:
             row = conn.execute("SELECT * FROM push_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
-            return dict(row) if row else None
+            if row is None:
+                return None
+            record = dict(row)
+            record["etag"] = strong_etag(record["sha256"])
+            return record
 
         return await self._call(op)
+
+    def rebuild_artifact_retention_sync(
+        self, *, retry_window_ms: int, timestamp: int | None = None
+    ) -> None:
+        """Rebuild leases from durable job/device state after a restart.
+
+        A lease is intentionally derived, not held in process memory: queued and
+        active device assignments keep their artifact retained, while terminal
+        jobs become GC-eligible only after the configured retry window.
+        """
+
+        observed = now_ms() if timestamp is None else timestamp
+
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    UPDATE push_artifacts
+                    SET retention_state = CASE
+                        WHEN retention_state='deleted' THEN 'deleted'
+                        WHEN EXISTS (
+                            SELECT 1 FROM push_jobs j
+                            WHERE j.artifact_id=push_artifacts.artifact_id
+                              AND (
+                                  j.state NOT IN ('succeeded','completed_with_errors','failed','interrupted')
+                                  OR EXISTS (
+                                      SELECT 1 FROM push_job_devices d
+                                      WHERE d.job_id=j.job_id
+                                        AND d.state IN (
+                                            'queued','waiting_transfer','dispatching','downloading',
+                                            'validating','applying','reconciling'
+                                        )
+                                  )
+                              )
+                        ) THEN 'retained'
+                        WHEN EXISTS (
+                            SELECT 1 FROM push_jobs j
+                            WHERE j.artifact_id=push_artifacts.artifact_id
+                              AND COALESCE(j.terminal_at,j.updated_at) + ? <= ?
+                        ) THEN 'gc_eligible'
+                        ELSE 'retained'
+                    END
+                    WHERE retention_state <> 'deleted'
+                    """,
+                    (retry_window_ms, observed),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+
+        self._call_sync(op)
+
+    def gc_artifacts_sync(
+        self,
+        artifact_root: Path,
+        *,
+        retry_window_ms: int,
+        timestamp: int | None = None,
+    ) -> list[str]:
+        """Delete expired immutable bytes while retaining tombstone identities.
+
+        The artifact row is never deleted, so an old URL can only become a stable
+        404 and its UUID can never be reused.  Files are removed while the same
+        serialized DB transaction owns the eligibility decision.
+        """
+
+        observed = now_ms() if timestamp is None else timestamp
+        root = artifact_root.resolve()
+
+        def op(conn: sqlite3.Connection) -> list[str]:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT a.artifact_id, a.storage_name
+                    FROM push_artifacts a
+                    WHERE a.retention_state <> 'deleted'
+                      AND EXISTS (
+                          SELECT 1 FROM push_jobs j
+                          WHERE j.artifact_id=a.artifact_id
+                            AND j.state IN ('succeeded','completed_with_errors','failed','interrupted')
+                            AND COALESCE(j.terminal_at,j.updated_at) + ? <= ?
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM push_jobs j
+                          WHERE j.artifact_id=a.artifact_id
+                            AND j.state NOT IN ('succeeded','completed_with_errors','failed','interrupted')
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM push_job_devices d
+                          JOIN push_jobs j ON j.job_id=d.job_id
+                          WHERE j.artifact_id=a.artifact_id
+                            AND d.state IN (
+                                'queued','waiting_transfer','dispatching','downloading',
+                                'validating','applying','reconciling'
+                            )
+                      )
+                    """,
+                    (retry_window_ms, observed),
+                ).fetchall()
+                removed: list[str] = []
+                for row in rows:
+                    path = root / row["storage_name"]
+                    try:
+                        if path.resolve().parent != root:
+                            continue
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        logger.warning("Could not GC Push artifact %s", row["storage_name"], exc_info=True)
+                        continue
+                    conn.execute(
+                        "UPDATE push_artifacts SET retention_state='deleted' WHERE artifact_id=?",
+                        (row["artifact_id"],),
+                    )
+                    removed.append(row["artifact_id"])
+                conn.execute("COMMIT")
+                return removed
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+
+        return self._call_sync(op)
 
     async def _simple_job_transition(
         self,
