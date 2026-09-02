@@ -257,7 +257,18 @@ object PushProtocol {
         })
     }
 
-    fun stateFromJson(json: JSONObject): State {
+    fun stateFromJson(json: JSONObject): State = decodeState(json, failOnMalformedEntry = false)
+
+    internal fun stateFromJsonStrict(json: JSONObject): State =
+        decodeState(json, failOnMalformedEntry = true)
+
+    private fun decodeState(json: JSONObject, failOnMalformedEntry: Boolean): State {
+        if (
+            failOnMalformedEntry && json.has("active") && !json.isNull("active") &&
+            json.optJSONObject("active") == null
+        ) {
+            throw IllegalArgumentException("malformed durable active state")
+        }
         val active = try {
             json.optJSONObject("active")?.let {
                 Active(
@@ -267,20 +278,46 @@ object PushProtocol {
                     it.optLong("interrupted_at", 0L).takeIf { value -> value > 0L },
                 )
             }
-        } catch (_: RuntimeException) {
+        } catch (error: RuntimeException) {
+            if (failOnMalformedEntry) throw error
             // A corrupt active record must not erase independently valid result receipts.
             null
         }
         fun receipts(name: String): List<Receipt> {
-            val array = json.optJSONArray(name) ?: JSONArray()
+            val parsed = json.optJSONArray(name)
+            if (
+                failOnMalformedEntry && json.has(name) && !json.isNull(name) && parsed == null
+            ) {
+                throw IllegalArgumentException("malformed durable receipt collection: $name")
+            }
+            val array = parsed ?: JSONArray()
             return buildList {
                 for (index in 0 until array.length()) {
-                    val item = array.optJSONObject(index) ?: continue
-                    val command = item.optJSONObject("command") ?: continue
-                    val result = item.optJSONObject("result") ?: continue
+                    val item = array.optJSONObject(index)
+                    if (item == null) {
+                        if (failOnMalformedEntry) {
+                            throw IllegalArgumentException("malformed durable receipt")
+                        }
+                        continue
+                    }
+                    val command = item.optJSONObject("command")
+                    if (command == null) {
+                        if (failOnMalformedEntry) {
+                            throw IllegalArgumentException("malformed durable receipt command")
+                        }
+                        continue
+                    }
+                    val result = item.optJSONObject("result")
+                    if (result == null) {
+                        if (failOnMalformedEntry) {
+                            throw IllegalArgumentException("malformed durable receipt result")
+                        }
+                        continue
+                    }
                     try {
                         add(Receipt(commandFromJson(command), resultFromJson(result)))
-                    } catch (_: RuntimeException) {
+                    } catch (error: RuntimeException) {
+                        if (failOnMalformedEntry) throw error
                         // One corrupt receipt must not erase valid durable state.
                     }
                 }

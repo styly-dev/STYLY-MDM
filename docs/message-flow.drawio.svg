@@ -223,7 +223,7 @@
   <text x="500" y="1056" text-anchor="middle" font-size="10" fill="#888">artifact_id, cumulative verified bytes</text>
   <rect x="150" y="1030" width="120" height="40" rx="4" ry="4" fill="#d5e8d4" stroke="#82b366" stroke-width="1"/>
   <text x="210" y="1047" text-anchor="middle" font-size="10" fill="#555">Frees exact job slot</text>
-  <text x="210" y="1061" text-anchor="middle" font-size="10" fill="#555">after full verification</text>
+  <text x="210" y="1061" text-anchor="middle" font-size="10" fill="#555">WS-independent lease</text>
 
   <!-- Note: unzip + mirror runs off the critical path -->
   <rect x="645" y="1075" width="95" height="40" rx="4" ry="4" fill="#fff2cc" stroke="#d6b656" stroke-width="1"/>
