@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from styly_mdm.push_jobs import ProtocolMode
 from styly_mdm.push_scheduler import LiveSession, PushScheduler
+from styly_mdm.transfer_registry import TransferKey, TransferRegistry
 
 
 def test_job_v1_command_uses_absolute_artifact_url():
@@ -57,6 +58,53 @@ def test_protocol_admission_uses_the_configured_resume_threshold():
         session, capabilities=frozenset({'push_job_id_v1', 'push_resume_v1'})
     )
     assert scheduler._protocol_for(resumable, 11) is ProtocolMode.JOB_V1
+
+
+def test_active_reconnect_keeps_the_existing_transfer_slot():
+    async def scenario():
+        scheduler = object.__new__(PushScheduler)
+        scheduler.transfer_registry = TransferRegistry()
+        scheduler.transfer_slots = lambda: asyncio.Semaphore(0)
+        accept = asyncio.get_running_loop().create_future()
+        scheduler._accept_waiters = {("job", "D1", 1): accept}
+        key = TransferKey("push", "D1", "job", 1)
+        future = asyncio.get_running_loop().create_future()
+        scheduler.transfer_registry.register(key, future)
+
+        await asyncio.wait_for(
+            scheduler.ensure_active_transfer_slot("job", "D1", 1), timeout=0.5
+        )
+
+        assert scheduler.transfer_registry.get(key) is future
+        assert not future.done()
+        assert accept.result()[0] == "accepted"
+
+    asyncio.run(scenario())
+
+
+def test_server_restart_reacquires_slot_until_recovered_download_completes():
+    async def scenario():
+        semaphore = asyncio.Semaphore(1)
+        scheduler = object.__new__(PushScheduler)
+        scheduler.transfer_registry = TransferRegistry()
+        scheduler.transfer_slots = lambda: semaphore
+        scheduler.transfer_timeout = 10
+        scheduler._accept_waiters = {}
+        scheduler._recovered_transfer_tasks = set()
+        scheduler.wake = lambda: None
+        key = TransferKey("push", "D1", "job", 1)
+
+        await scheduler.ensure_active_transfer_slot("job", "D1", 1)
+        blocked = asyncio.create_task(semaphore.acquire())
+        await asyncio.sleep(0)
+        assert not blocked.done()
+
+        assert scheduler.transfer_registry.release_exact(key, "download_complete")
+        await asyncio.wait_for(blocked, timeout=0.5)
+        semaphore.release()
+        await asyncio.gather(*scheduler._recovered_transfer_tasks)
+
+    asyncio.run(scenario())
 
 
 def test_exact_reconcile_can_reuse_held_owner_lock():
