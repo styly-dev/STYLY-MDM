@@ -18,6 +18,21 @@ For end-user setup and usage, see the [README](../README.md).
 
 ![Message Flow](message-flow.drawio.svg)
 
+### Durable Push / Sync jobs
+
+Issue #91 gives **Push Files** and **Sync Folder** a server-owned UUID job identity,
+SQLite-backed lifecycle, immutable artifact identity, per-device queue, exact transfer
+ownership, restart reconciliation, and an Application-scoped single-active client
+worker. Exact-token durable accept deadlines recover lost in-memory waiters without
+competing with a live local waiter or capturing a later replay, and the console exposes
+undispatched `ready` jobs plus restart-paused jobs without allocating a replacement job.
+APK Install intentionally remains on its existing path.
+
+The authoritative implementation and protocol guide is
+[`PUSH_JOBS.md`](PUSH_JOBS.md). Its sequence diagram covers create-before-upload,
+dispatch, command acceptance, transfer completion, validation/apply, terminal result,
+ACK, restart recovery, and persistent device-fence reconciliation.
+
 ## Building the MDM Client
 
 ### Build from CLI
@@ -209,10 +224,18 @@ STYLY-MDM/
 │   ├── styly_mdm/           # Installable package
 │   │   ├── __init__.py      # Exports create_app / main
 │   │   ├── __main__.py      # `python -m styly_mdm` entrypoint
-│   │   ├── server.py        # WebSocket control server (aiohttp) + `styly-mdm hash` CLI
+│   │   ├── server.py        # Established HTTP/WebSocket handlers + CLI
+│   │   ├── push_jobs.py     # Push/Sync domain state, identity, transitions
+│   │   ├── push_job_store.py    # Dedicated SQLite worker + canonical snapshots
+│   │   ├── push_job_manager.py  # Transactional queue/fence/reconciliation policy
+│   │   ├── push_scheduler.py    # Per-device queue + exact transfer ownership
+│   │   ├── push_artifacts.py    # Job-owned work and immutable publication
+│   │   ├── push_runtime.py      # Issue #91 HTTP/WebSocket compatibility adapter
+│   │   ├── transfer_registry.py # Typed Install/Push transfer waiters
 │   │   ├── integrity.py     # APK CD-digest + directory tree-hash (integrity reference)
 │   │   └── static/
-│   │       └── index.html   # Web management console (bundled package data)
+│   │       ├── index.html          # Web management console
+│   │       └── push-jobs-v1.js     # Revisioned Push/Sync job console adapter
 │   └── tests/
 │       └── test_app.py      # Smoke tests
 └── mdm-client/
@@ -221,7 +244,12 @@ STYLY-MDM/
     │   └── java/com/styly/mdmclient/
     │       ├── MdmClientApplication.kt   # Application entry point
     │       ├── MdmClientService.kt       # Foreground service; executes launch commands
-    │       ├── WebSocketManager.kt       # WebSocket connection inside the bounded connection window
+    │       ├── WebSocketManager.kt       # WebSocket transport + capability registration
+    │       ├── PushProtocol.kt           # Strict job-v1 wire protocol and durable codec
+    │       ├── PushJobCoordinator.kt     # Application-scoped actor + single active worker
+    │       ├── PushJobStore.kt           # Atomic active/outbox/receipt persistence
+    │       ├── PushFilesWorker.kt        # Download, ZIP validation, extraction, apply
+    │       ├── PushExecutionGate.kt      # Duplicate/busy execution ownership
     │       ├── ConnectionScheduler.kt    # Connection-window state machine (host-JVM tested)
     │       ├── ConnectionAttemptPolicy.kt # Per-window manual/auto target policy (host-JVM tested)
     │       ├── ClientConfig.kt           # Window/retry tunables + config-file overrides (host-JVM tested)
@@ -252,14 +280,18 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 
 | Message type | Description |
 |---|---|
-| `REGISTER` | Sent on connect. Fields: `device_id`, `model`, `ip`, `version_code` (integer), `version_name`, `startup_app` (optional) |
+| `REGISTER` | Sent on connect. In addition to device metadata, job-v1 clients send `process_instance_id` (UUIDv4), `capabilities: ["push_job_id_v1"]`, and `push_runtime.active` (exact active identity/phase or `null`). Capability parsing is all-or-nothing and never inferred from a version number. |
 | `BATTERY_UPDATE` | Battery telemetry. Fields: `device_id`, `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds) |
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
 | `DELETE_APP_RESULT` | Result of a remote app uninstall — exactly one per `EXECUTE_UNINSTALL`. The client survives it, so this always arrives (unlike `SELF_UNINSTALL_RESULT`). Fields: `status` (`success`/`fail`), `package_name`, `error` (optional), `result_code` (optional), `startup_app_cleared` (optional; reports what the device did — the server decides from its own record, see below). See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_RESULT` / `POWER_OFF_RESULT` | Acknowledgement of a power command. `status` is `accepted` (the client received it and flushed this before invoking the SDK — a successful reboot/shutdown tears down the socket first, so no `success` is ever sent) or `fail` (the SDK rejected the call, so the device stayed up to report it). Fields: `status`, `error` (optional). See [Remote Power Control](#remote-power-control). |
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
-| `DOWNLOAD_COMPLETE` | Sent right after a download finishes, before the local work it feeds (the install, or the unzip + mirror). Frees the server's transfer slot so the next queued device can start downloading. Fields: `task` (`install` / `push`; absent means `install`), `apk_filename` (install), `dest_path` + `delete_extras` (push). Optional — see the transfer-throttling note below. |
-| `PUSH_FILES_RESULT` | Result of a push or sync. Fields: `status` (`success`/`fail`), `dest_path`, `added`, `updated`, `deleted` (counts; `deleted` is always 0 for a push), `error` (optional) |
+| `DOWNLOAD_COMPLETE` | Install/legacy: the existing post-download signal. Job-v1 Push: an exact `job_id`, `attempt`, and `artifact_id` checkpoint emitted only after exact-size/basic ZIP/path validation; it **does not** release the network slot. |
+| `PUSH_JOB_ACCEPTED` / `PUSH_JOB_REJECTED` | Exact command acceptance after the client durably persists active state, or a duplicate-safe rejection (`device_busy`, `client_persistence_unavailable`, malformed identity, destination/artifact conflict). A persistence rejection keeps the MDM process alive but starts no worker. Fields include `job_id`, fixed `attempt=1`, and current phase/reason. |
+| `PUSH_TRANSFER_COMPLETE` | Job-v1 network EOF checkpoint. Fields: `job_id`, `attempt`, `artifact_id`, exact `received_size`. This matching message releases only that job's transfer slot. |
+| `PUSH_PHASE` | Job-v1 phase transition, currently `phase=applying`, carrying exact identity. |
+| `PUSH_RECONCILE_REPORT` | Exact `active`, `absent`, or `interrupted` answer to a server reconciliation request. `absent` is sent only in response to that request. |
+| `PUSH_FILES_RESULT` | Durable terminal result. Job-v1 fields: `job_id`, fixed `attempt=1`, `status`, `dest_path`, success counts or `failure_code` + `detail`. The client retains it until a matching accepted or permanent-rejection ACK and can replay the bounded completed receipt during exact reconciliation. |
 | `VERIFY_APK_RESULT` | Result of an APK integrity check. Fields: `package_name`, `found` (boolean), `size`, `cd_sha256`, `full_sha256`, `version_code`, `version_name`, `signer_sha256`, `error` (optional). Absent hash/version fields when `found` is false. |
 | `VERIFY_DIR_RESULT` | Result of a directory integrity check. Fields: `path`, `found` (boolean), `tree_hash`, `file_count`, `total_size`, `manifest` (optional array of `{relative_path, size, sha256}`, omitted above a cap), `error` (optional) |
 | `SELF_UPDATE_STARTING` | The client's last words before the silent installer kills its process for a self-update: tells the server to treat the coming disconnect as `updating`, not `offline`. Fields: `correlation_id`, `target_version_code`, `current_version_code`, `package_name`, `apk_filename`. See [Client Self-Update](#client-self-update). |
@@ -274,7 +306,10 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `EXECUTE_UNINSTALL` | Silently uninstall an app (`pbsControlAPPManger` / `PACKAGE_SILENCE_UNINSTALL`). Fields: `package_name`. The client refuses its own and the guard's package, and clears the startup app first when the target is it. See [Remote App Uninstall](#remote-app-uninstall). |
 | `EXECUTE_REBOOT` / `EXECUTE_POWER_OFF` | Reboot or power off the device immediately via the PICO advanced device-control API (`pbsControlSetDeviceAction`). No fields. See [Remote Power Control](#remote-power-control). |
 | `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename`, plus `full_sha256` + `cd_sha256` (reference hashes of the file being dispatched; present only when the APK is a local upload in `apks/`). The client verifies the download against `full_sha256` before installing; a **self**-update is refused outright when the hashes are absent. |
-| `EXECUTE_PUSH_FILES` | Download a bundle and apply it to a directory. Fields: `bundle_url`, `bundle_filename`, `dest_path`, `delete_extras` (boolean; `false` = copy/overwrite only, `true` = full mirror. Read with a `false` default — a missing field must never delete) |
+| `REGISTERED` | Server acknowledgement after ownership/capability processing. Field: `session_id`. The client then replays its durable pending terminal outbox. |
+| `EXECUTE_PUSH_FILES` | Job-v1 fields: `job_id`, fixed `attempt=1`, observed `revision`, immutable `artifact_id`, absolute `artifact_url`, exact size/SHA-256 metadata, destination, and server-derived `delete_extras`. Legacy fields remain accepted during migration. Safety-critical fields require their exact JSON types. |
+| `PUSH_RESULT_ACK` | Terminal-result disposition. Fields: exact identity, `accepted`, committed `revision` when a local canonical job exists, and on rejection `reason` plus `retryable`. The client retains retryable results; accepted or permanently rejected results leave the pending outbox while remaining in bounded dedupe receipts. |
+| `PUSH_RECONCILE_REQUEST` | Requests exact status for one or more `{job_id, attempt, artifact_id}` identities. It never directly clears a fence. |
 | `EXECUTE_VERIFY_APK` | Compute `size` + Central-Directory digest (plus diagnostics) for an installed package. Fields: `package_name` |
 | `EXECUTE_VERIFY_DIR` | Compute a manifest + tree hash for a device directory (shared storage only). Fields: `path` |
 | `EXECUTE_SELF_UNINSTALL` | Uninstall the guard, announce `SELF_UNINSTALL_STARTING`, then silently uninstall the client itself (venue handover). Fields: `correlation_id` (server-generated per device, echoed back by the announcement) |
@@ -287,7 +322,8 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `DELETE_APP` | Uninstall an app from target devices (the console gates it behind a confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only), `package_name`. STYLY-MDM's own packages are rejected — `RETIRE_DEVICE` is the only sanctioned way to remove the client. See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_DEVICE` / `POWER_OFF_DEVICE` | Reboot or power off target devices (the console gates both behind a shared confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only). See [Remote Power Control](#remote-power-control). |
 | `INSTALL_APK` | Install an uploaded APK on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `apk_url`, `apk_filename` |
-| `PUSH_FILES` | Apply a bundle to a directory on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `bundle_url`, `bundle_filename`, `dest_path`, `delete_extras` (boolean, optional; only a literal `true` requests a full mirror) |
+| `PUSH_FILES` | New flow: `{job_id}` only; the server reads mode, destination, targets, and immutable artifact metadata from SQLite and enables/resumes that job's dispatch gate. The older bundle-shaped message remains migration-only compatibility. |
+| `RECONCILE_PUSH_DEVICE` | Re-requests exact reconciliation for a fenced device. Field: `device_id`. It cannot force-clear state or a fence without matching client/process evidence. |
 | `VERIFY_APK` | Verify an installed package against a local reference on target devices. Fields: `target_devices`, `package_name`. The reference (`size` + CD digest) is computed and compared in the browser and is **never** sent to the server. |
 | `VERIFY_DIR` | Verify a device directory against a local reference on target devices. Fields: `target_devices`, `path` (absolute, within shared storage). |
 | `GET_DEVICE_LIST` | Request the current device list |
@@ -304,8 +340,10 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 |---|---|
 | `POST /api/apks` | Multipart upload with field `apk`. Returns `apk_url`, `apk_filename`, and `size`. |
 | `GET /apks/{filename}` | Serves uploaded APK files to devices on the LAN, and backs the console's top-bar client-APK download link (see the client-APK download note below). |
-| `POST /api/bundles` | Multipart upload with repeated field `files`; each part's filename carries its folder-relative path. The server zips the reconstructed tree into a bundle, excluding OS metadata (`.DS_Store`, `._*`, `Thumbs.db`, …). Returns `bundle_url`, `bundle_filename`, `size`, `entry_count` (files in the bundle), and `skipped_count` (files excluded). 400 if every uploaded file was excluded. |
-| `GET /bundles/{filename}` | Serves generated file/folder bundles (zip) to devices on the LAN. |
+| `POST /api/push-jobs` | Validate a canonical request and commit `job_id` + per-device rows before any upload bytes. `client_request_id` makes identical replay idempotent; conflicting reuse is 409. |
+| `POST /api/push-jobs/{job_id}/upload` | Job-owned multipart upload, measured limits, packaging, fsync + atomic immutable artifact publication, then `ready`. |
+| `GET /artifacts/{artifact_id}` | DB-resolved immutable ZIP with exact length, identity encoding, and SHA-256 strong ETag. |
+| `POST /api/bundles` / `GET /bundles/{filename}` | Legacy compatibility only. The new console Push/Sync flow does not use these routes. |
 
 ### Server → Admin
 
@@ -320,10 +358,9 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
 | `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |
 | `INSTALL_DEVICE_STATE` | Per-device companion to `INSTALL_PROGRESS`: names the devices that just entered a state, so the console can label each row instead of showing the whole target set as installing. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `installing` / `updating` / `success` / `fail`; `updating` and its terminal `success`/`fail` are emitted only for a client self-update), `apk_filename`, `detail` (failure reason, may be empty) |
-| `PUSH_FILES_SENT` | Confirmation that a push/sync job was accepted (dispatch is throttled and runs in the background). Fields: `bundle_filename`, `dest_path`, `delete_extras`, `target_count`, `max_concurrent` |
-| `PUSH_PROGRESS` | The `INSTALL_PROGRESS` twin for a push/sync job. Fields: `bundle_filename`, `dest_path`, `delete_extras`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` |
-| `PUSH_DEVICE_STATE` | The `INSTALL_DEVICE_STATE` twin. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `applying` / `fail`), `dest_path`, `delete_extras` (so the console can name the action), `detail` |
-| `PUSH_FILES_RESULT` | Forwarded file/folder result from a device (adds `device_id`) |
+| `PUSH_JOBS_SNAPSHOT` | Sent after the normal initial admin metadata. Contains every non-terminal job, bounded recent terminal jobs, and fence-visible metadata as a complete replacement snapshot. Updates that race ahead of it on the same connection are buffered and revision-merged by the console. If this initial snapshot cannot be sent, the server closes that admin socket so the existing reconnect loop requests a fresh snapshot instead of buffering forever. |
+| `PUSH_JOB_UPDATED` | Canonical full snapshot after a committed mutation. A single server publisher coalesces pending revisions per `job_id`; console state merges only monotonically newer revisions. |
+| `PUSH_FILES_SENT` | Job dispatch/resume acknowledgement. Fields include `job_id`, committed `revision`, canonical state/gate, target count, and shared transfer limit. |
 | `LAUNCH_RESULT` | Forwarded result from a device |
 | `DELETE_APP_RESULT` | Forwarded uninstall result from a device (adds `device_id`). A `success` is followed by a fresh `DEVICE_LIST` when the device's recorded startup app still named the removed package, since the server then drops that record. See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_RESULT` / `POWER_OFF_RESULT` | Forwarded power-command acknowledgement from a device (adds `device_id`). `accepted` = received and going down (confirm via the row dropping offline); `fail` = the SDK rejected it. See [Remote Power Control](#remote-power-control). |
@@ -455,16 +492,15 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > an install release (pre-#44) — at worst that frees an install slot early, which only
 > relaxes throttling.
 >
-> Admins see aggregate progress via `INSTALL_PROGRESS` / `PUSH_PROGRESS` (queued /
-> transferring / transferred / failed counts).
+> Admins see install aggregate progress via `INSTALL_PROGRESS`. `PUSH_PROGRESS` is
+> retained only for the migration-only legacy Push path; the current job-v1 console
+> uses full `PUSH_JOB_UPDATED` snapshots instead.
 
-> **Per-device transfer state.** `INSTALL_PROGRESS` / `PUSH_PROGRESS` carry only
-> aggregate counts, which cannot be mapped back to rows, so the server also broadcasts
-> `INSTALL_DEVICE_STATE` / `PUSH_DEVICE_STATE` as each device moves. The console's
-> PROGRESS column shows `Waiting…` → `Transferring…` → `Installing…` / `Pushing…` /
-> `Syncing…` → `✓ installed` / `✓ pushed` / `✓ synced` / `✗ failed`, which is what
-> distinguishes a device queued behind a transfer slot from one that is genuinely
-> working.
+> **Per-device transfer state.** `INSTALL_PROGRESS` carries only aggregate counts, so
+> install also broadcasts `INSTALL_DEVICE_STATE`. The migration-only legacy Push path
+> retains its corresponding `PUSH_PROGRESS` / `PUSH_DEVICE_STATE`; job-v1 derives the
+> same `Waiting…` → `Transferring…` → `Pushing…` / `Syncing…` → terminal display from
+> canonical assignment states in each full job snapshot.
 >
 > Which side emits which state is deliberate:
 >
@@ -543,17 +579,14 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 >
 > Both actions reuse the per-device PROGRESS column, showing `Waiting…` →
 > `Transferring…` → `Pushing…` / `Syncing…` → `✓ pushed` / `✓ synced` (with the
-> `+added ~updated -deleted` summary) / `✗ failed`. Like install, these transitions are
-> server-driven (`PUSH_DEVICE_STATE`), because the bundle transfer draws on the same
-> server-wide slot pool and the server therefore knows where each device is. A device
-> that drops offline mid-job clears its cell on the next `DEVICE_LIST`.
-> `PUSH_FILES_RESULT` does not name the mode, so the console carries the verb over from
-> the `delete_extras` that rode along on the preceding `PUSH_DEVICE_STATE` (a page
-> reloaded mid-job falls back to "pushed"). The column holds one state per device, so a
-> push, an install and a verify targeting the same device overwrite each other's cell —
-> the last transition received wins, even though a push and an install hold independent
-> transfer slots. That state lives in `deviceTaskState[id] = {task, status, …}` and is
-> painted by `taskCellHtml()`; the log keeps the full history of every job regardless.
+> `+added ~updated -deleted` summary) / `✗ failed`. The current console derives these
+> states and the Push/Sync verb from each canonical `PUSH_JOBS_SNAPSHOT` /
+> `PUSH_JOB_UPDATED` assignment. The initial snapshot is a full replacement, so a
+> reconnect also removes jobs outside the server's retention window instead of leaving
+> stale rows. The column still holds one state per device: a later install or verify
+> replaces the Push/Sync cell, and older job snapshots cannot reclaim that non-push
+> state. The bridge stores its owned state in `deviceTaskState[id]` and `taskCellHtml()`
+> repaints it after `DEVICE_LIST` renders; the log keeps the retained canonical jobs.
 
 ## Integrity Verification
 

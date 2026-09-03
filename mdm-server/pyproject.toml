@@ -30,7 +30,7 @@ classifiers = [
 dependencies = ["aiohttp>=3.9,<4"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "pytest-asyncio>=0.23"]
 
 [project.urls]
 Homepage = "https://github.com/styly-dev/STYLY-MDM"
@@ -38,7 +38,7 @@ Repository = "https://github.com/styly-dev/STYLY-MDM"
 Issues = "https://github.com/styly-dev/STYLY-MDM/issues"
 
 [project.scripts]
-styly-mdm = "styly_mdm.server:main"
+styly-mdm = "styly_mdm:main"
 
 [tool.setuptools]
 packages = ["styly_mdm"]

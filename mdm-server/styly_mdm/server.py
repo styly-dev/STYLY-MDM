@@ -20,7 +20,7 @@ import uuid
 import zipfile
 from pathlib import Path
 from urllib.parse import unquote
-from aiohttp import web
+from aiohttp import WSCloseCode, web
 
 # Bundling and integrity references must agree on what counts as content, or a reference
 # built from a folder could never match the device that folder was pushed to.
@@ -71,6 +71,10 @@ MAX_CONCURRENT_TRANSFERS = max(1, int(os.environ.get("MDM_MAX_CONCURRENT_TRANSFE
 # recovers stuck slots sooner at the risk of releasing a slow-but-healthy transfer
 # early, which only relaxes throttling and never drops the job itself.
 TRANSFER_TIMEOUT = float(os.environ.get("MDM_TRANSFER_TIMEOUT", "600"))
+
+# A stalled browser must not serialize all server-side publications behind its
+# WebSocket. Each admin send is bounded independently in _broadcast_admin_message.
+ADMIN_SEND_TIMEOUT = max(0.1, float(os.environ.get("MDM_ADMIN_SEND_TIMEOUT", "5")))
 
 # The two kinds of byte-moving job. A device can be in one of each at the same time
 # (an admin can push files to a group already installing an APK), so both the slot
@@ -173,6 +177,12 @@ device_groups: dict[str, list[str]] = {}
 
 # Connected admin WebSocket sessions
 admin_connections: set[web.WebSocketResponse] = set()
+_admin_send_locks: dict[web.WebSocketResponse, asyncio.Lock] = {}
+
+# PushRuntime replaces only this server-local construction seam. Mutating
+# aiohttp.web.WebSocketResponse process-wide changes unrelated applications and
+# makes import order observable.
+_websocket_response_factory = web.WebSocketResponse
 
 # (device_id, task) -> Future for the transfer slot a device holds during a job.
 # Resolving the future releases the slot so the next queued device is dispatched
@@ -420,15 +430,7 @@ def build_device_list_msg() -> str:
 
 async def broadcast_device_list():
     """Send the current device list to every connected admin."""
-    msg = build_device_list_msg()
-    stale: list[web.WebSocketResponse] = []
-    for ws in admin_connections:
-        try:
-            await ws.send_str(msg)
-        except ConnectionResetError:
-            stale.append(ws)
-    for ws in stale:
-        admin_connections.discard(ws)
+    await _broadcast_admin_message(build_device_list_msg())
 
 
 def build_group_list_msg() -> str:
@@ -445,28 +447,56 @@ def build_group_list_msg() -> str:
 
 async def broadcast_group_list():
     """Send the current group list to every connected admin."""
-    msg = build_group_list_msg()
-    stale: list[web.WebSocketResponse] = []
-    for ws in admin_connections:
+    await _broadcast_admin_message(build_group_list_msg())
+
+
+async def _broadcast_admin_message(message: str) -> None:
+    """Best-effort admin fan-out; one stale socket must not stop server work."""
+    async def send_one(ws: web.WebSocketResponse) -> None:
+        lock = _admin_send_locks.setdefault(ws, asyncio.Lock())
         try:
-            await ws.send_str(msg)
-        except ConnectionResetError:
-            stale.append(ws)
-    for ws in stale:
-        admin_connections.discard(ws)
+            async with lock:
+                if ws not in admin_connections:
+                    return
+                await asyncio.wait_for(ws.send_str(message), ADMIN_SEND_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except (Exception, asyncio.TimeoutError):
+            log.warning("Could not send message to admin WebSocket", exc_info=True)
+            admin_connections.discard(ws)
+            _admin_send_locks.pop(ws, None)
+            try:
+                await asyncio.wait_for(
+                    ws.close(
+                        code=WSCloseCode.GOING_AWAY,
+                        message=b"admin send failed",
+                        drain=False,
+                    ),
+                    ADMIN_SEND_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except (Exception, asyncio.TimeoutError):
+                log.warning("Could not close failed admin WebSocket", exc_info=True)
+
+    connections = tuple(admin_connections)
+    if not connections:
+        return
+
+    fanout = asyncio.gather(*(send_one(ws) for ws in connections))
+    try:
+        await asyncio.shield(fanout)
+    except asyncio.CancelledError:
+        # aiohttp may cancel a device request handler while its finally block is
+        # broadcasting the disconnect. Keep the already-bounded admin sends alive
+        # so the console receives that terminal state before cancellation escapes.
+        await asyncio.shield(fanout)
+        raise
 
 
 async def forward_to_admins(payload: dict):
     """Forward a message (e.g. LAUNCH_RESULT) to all admin connections."""
-    msg = json.dumps(payload)
-    stale: list[web.WebSocketResponse] = []
-    for ws in admin_connections:
-        try:
-            await ws.send_str(msg)
-        except ConnectionResetError:
-            stale.append(ws)
-    for ws in stale:
-        admin_connections.discard(ws)
+    await _broadcast_admin_message(json.dumps(payload))
 
 
 def _client_apk_version(name: str) -> tuple[str, tuple[int, ...]] | None:
@@ -1172,7 +1202,7 @@ def _owns_device(device_id: str | None, ws: web.WebSocketResponse) -> bool:
 
 
 async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
-    ws = web.WebSocketResponse(heartbeat=30)
+    ws = _websocket_response_factory(heartbeat=30)
     await ws.prepare(request)
     log.info("Device WebSocket connected from %s", request.remote)
 
@@ -1571,7 +1601,7 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
     # nothing on this channel.
     # Keep compression enabled for the device channel, where messages can be
     # larger, but remove the extension from this browser-facing channel.
-    ws = web.WebSocketResponse(heartbeat=30, compress=False)
+    ws = _websocket_response_factory(heartbeat=30, compress=False)
     await ws.prepare(request)
     admin_connections.add(ws)
     log.info("Admin console connected from %s", request.remote)
@@ -1586,6 +1616,7 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
         await ws.send_str(build_group_list_msg())
     except ConnectionResetError:
         admin_connections.discard(ws)
+        _admin_send_locks.pop(ws, None)
         return ws
 
     try:
@@ -1663,6 +1694,7 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
                 log.error("Admin WS error: %s", ws.exception())
     finally:
         admin_connections.discard(ws)
+        _admin_send_locks.pop(ws, None)
         log.info("Admin console disconnected")
 
     return ws

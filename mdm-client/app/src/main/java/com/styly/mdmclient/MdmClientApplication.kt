@@ -7,18 +7,27 @@ import com.pvr.tobservice.ToBServiceHelper
 import java.io.File
 
 /**
- * Application class that initializes PICO Enterprise SDK (TobService).
- * Binds TobService and registers app keep-alive on startup.
+ * Application class that initializes PICO Enterprise SDK (TobService) and owns
+ * the process-wide Push/Sync coordinator.
  */
 class MdmClientApplication : Application() {
 
     companion object {
         private const val TAG = "MdmClientApplication"
+
+        @Volatile
+        private var coordinator: PushJobCoordinator? = null
+
+        fun pushJobCoordinator(): PushJobCoordinator =
+            coordinator ?: throw IllegalStateException("PushJobCoordinator is not initialized")
     }
 
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "Initializing STYLY-MDM Client")
+        // The coordinator is Application-scoped: Service recreation or a transient
+        // WebSocket reconnect cannot create a second Push/Sync worker.
+        coordinator = PushJobCoordinator(this)
         // The first thing the replacement process does after a self-update. Recording it
         // separates "the process was started" from "the service was started".
         UpdateJournal.record(

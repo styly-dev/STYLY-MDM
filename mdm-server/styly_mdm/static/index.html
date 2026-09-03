@@ -103,7 +103,7 @@
     .targets { border-right: 1px solid var(--border); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
     .actions { background: var(--bg-actions); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
     .targets-head, .subtabs { flex: 0 0 auto; }
-    .actions > .zone-label, .sel-card { flex: 0 0 auto; }
+    .actions > .zone-label, .sel-card, .push-attention { flex: 0 0 auto; }
 
     /* Drag handles */
     .v-gutter { cursor: col-resize; background: transparent; transition: background .15s; }
@@ -255,6 +255,14 @@
     .sel-clear:hover { color: var(--text-primary); }
     .sel-ctx { font-size: 12px; color: #9bb0d6; margin-top: 7px; }
 
+    .push-attention { margin: 0 18px 12px; padding: 11px 12px; max-height: 180px; overflow-y: auto; background: #2a2415; border: 1px solid #665321; border-radius: 8px; }
+    .push-attention-title { color: var(--warning); font-size: 11px; font-weight: 700; letter-spacing: .7px; text-transform: uppercase; margin-bottom: 7px; }
+    .push-attention-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-primary); }
+    .push-attention-item + .push-attention-item { margin-top: 7px; padding-top: 7px; border-top: 1px solid #55461f; }
+    .push-attention-job { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .push-resume { flex: 0 0 auto; border: none; border-radius: 5px; padding: 5px 10px; background: var(--warning); color: #17130a; font: 600 12px inherit; cursor: pointer; }
+    .push-resume:disabled { opacity: .55; cursor: wait; }
+
     .commands { padding: 0 18px 18px; display: flex; flex-direction: column; gap: 14px; flex: 1 1 0; min-height: 0; overflow-y: auto; }
     .cmd-divider { height: 1px; background: var(--border); }
     .cmd-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 8px; cursor: pointer; user-select: none; }
@@ -360,6 +368,7 @@
       .mg-sidebar { border-right: none; border-bottom: 1px solid var(--border); }
     }
   </style>
+  <script src="/static/push-jobs-v1.js"></script>
 </head>
 
 <body>
@@ -404,6 +413,7 @@
         <div class="actions">
           <div class="zone-label">② Actions</div>
           <div class="sel-card" id="selCard"></div>
+          <div class="push-attention" id="pushJobsAttention" style="display:none"></div>
           <div class="commands">
             <div class="cmd-section collapsed" data-cmd="install">
               <div class="cmd-head" data-act="toggleCmd"><span>Quick Install</span><span class="cmd-chevron">▾</span></div>
@@ -1305,7 +1315,7 @@
           return '<span class="ins-fail" title="' + esc(what + ': ' + (st.detail || 'mismatch')) + '">✗ mismatch</span>';
         }
         if (st.task === 'push') {
-          // `verb` comes from the server's `delete_extras`, so a synced device does not
+          // `verb` comes from the canonical job mode, so a synced device does not
           // report itself as "pushed".
           const verb = st.verb || 'Push';
           if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
@@ -1329,6 +1339,58 @@
         const sel = '[data-task-id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]';
         targetsBody.querySelectorAll(sel).forEach(function (cell) { cell.innerHTML = taskCellHtml(id); });
       }
+
+      // The job-v1 adapter owns only task states carrying this marker. A later
+      // install or verify result must not be replaced or cleared by an older Push
+      // snapshot that happens to arrive afterwards.
+      window.__stylyPushJobsV1Bridge = {
+        applyAssignment: function (assignment) {
+          if (!assignment || !assignment.device_id || !assignment.job_id) return false;
+          const current = deviceTaskState[assignment.device_id];
+          if (current && current.task !== 'push') return false;
+          if (current && current.owner === 'push-job-v1' &&
+              current.pending_request_id &&
+              current.pending_request_id !== assignment.client_request_id) {
+            return false;
+          }
+          deviceTaskState[assignment.device_id] = {
+            task: 'push',
+            status: assignment.status,
+            verb: assignment.verb,
+            filename: assignment.filename,
+            note: assignment.note,
+            detail: assignment.detail,
+            owner: 'push-job-v1',
+            job_id: assignment.job_id,
+            pending_request_id: null,
+            revision: assignment.revision,
+            enqueue_seq: assignment.enqueue_seq,
+          };
+          updateTaskCell(assignment.device_id);
+          return true;
+        },
+        clearAssignment: function (deviceId, jobId) {
+          const current = deviceTaskState[deviceId];
+          if (!current || current.owner !== 'push-job-v1' || current.job_id !== jobId) {
+            return false;
+          }
+          delete deviceTaskState[deviceId];
+          updateTaskCell(deviceId);
+          return true;
+        },
+        clearPendingRequest: function (requestId) {
+          let cleared = false;
+          Object.keys(deviceTaskState).forEach(function (deviceId) {
+            const current = deviceTaskState[deviceId];
+            if (!current || current.owner !== 'push-job-v1' ||
+                current.pending_request_id !== requestId) return;
+            delete deviceTaskState[deviceId];
+            updateTaskCell(deviceId);
+            cleared = true;
+          });
+          return cleared;
+        },
+      };
 
       function renderActions() {
         const online = new Set(getOnlineIds());
@@ -1554,13 +1616,32 @@
               bundle_filename: bundle.bundle_filename, dest_path: dest, delete_extras: cfg.deleteExtras,
             };
             if (!wsSend(msg, cfg.verb.toLowerCase() + ' files')) return;
-            // Optimistic first paint only: every target really does start out waiting for a
-            // transfer slot. The server's PUSH_DEVICE_STATE drives it from here.
-            online.forEach(function (id) { deviceTaskState[id] = { task: 'push', status: 'queued', verb: cfg.verb, filename: dest, note: '', detail: '' }; updateTaskCell(id); });
+            // Optimistic first paint only. The matching canonical job snapshot replaces
+            // it after create/upload/dispatch; unrelated older jobs cannot claim it.
+            online.forEach(function (id) {
+              const current = deviceTaskState[id];
+              if (shouldPreserveCanonicalPushAssignment(current)) {
+                return;
+              }
+              const pendingPrefix = 'push-job://pending/';
+              const pendingRequestId = String(bundle.bundle_url || '').indexOf(pendingPrefix) === 0
+                ? String(bundle.bundle_url).slice(pendingPrefix.length) : null;
+              deviceTaskState[id] = {
+                task: 'push', status: 'queued', verb: cfg.verb, filename: dest,
+                note: '', detail: '', owner: 'push-job-v1', job_id: null,
+                pending_request_id: pendingRequestId,
+              };
+              updateTaskCell(id);
+            });
             addLog(cfg.verb + 'ing ' + bundle.bundle_filename + ' → ' + dest + ' on ' + online.length + ' device(s)', 'info');
             // Force a fresh pick next time (LAN/non-secure context cannot detect a local change).
             reset();
           }).catch(function (err) { nameEl.textContent = 'Upload failed'; addLog(cfg.verb + ' files failed: ' + err.message, 'fail'); });
+        }
+
+        function shouldPreserveCanonicalPushAssignment(current) {
+          return !!(current && current.owner === 'push-job-v1' && current.job_id &&
+            ['queued', 'transferring', 'applying'].indexOf(current.status) >= 0);
         }
 
         function hasSelection() { return selectionFiles().length > 0; }
