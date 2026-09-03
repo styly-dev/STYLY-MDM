@@ -160,13 +160,6 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
             self._push_admin_snapshot_sent = True
             await self._push_runtime.send_initial_snapshot(self)
         while True:
-            # Returning REGISTER lets the established server finish its registry and
-            # owner update first. The next receive turn then finalizes Push-v1 and sends
-            # REGISTERED, preserving one authoritative ordering.
-            if self._push_pending_registration is not None and self._push_runtime is not None:
-                payload = self._push_pending_registration
-                self._push_pending_registration = None
-                await self._push_runtime.register_device(self, payload, self._push_http_base)
             message = await super().__anext__()
             if message.type is not WSMsgType.TEXT or self._push_runtime is None:
                 return message
@@ -178,13 +171,6 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
                 return message
             if self._push_path == "/ws/device":
                 if payload.get("type") == "REGISTER":
-                    device_id = payload.get("device_id")
-                    if isinstance(device_id, str) and device_id:
-                        self._push_runtime.note_registration_candidate(
-                            self, device_id
-                        )
-                        self._push_device_id = device_id
-                        self._push_pending_registration = payload
                     return message
                 if await self._push_runtime.handle_device_message(
                     self, self._push_device_id, payload
@@ -194,6 +180,28 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
                 if await self._push_runtime.handle_admin_message(self, payload):
                     continue
             return message
+
+    async def register_canonical_owner(
+        self,
+        device_id: str,
+        payload: dict[str, Any],
+        *,
+        idempotent: bool,
+    ) -> None:
+        if self._push_runtime is None:
+            await self.send_str(json.dumps({"type": "REGISTERED"}))
+            return
+        if idempotent:
+            await self._push_runtime.acknowledge_registration(self, device_id)
+            return
+        self._push_device_id = device_id
+        self._push_runtime.note_registration_candidate(self, device_id)
+        await self._push_runtime.register_device(
+            self,
+            payload,
+            self._push_http_base,
+            established_device_id=device_id,
+        )
 
     async def close(self, *args: Any, **kwargs: Any) -> bool:
         if (
@@ -216,6 +224,7 @@ class PushRuntime:
         self.transfers = TransferRegistry()
         self.legacy_transfers = _LegacyTransferAdapter(self.transfers)
         self.sessions: dict[str, LiveSession] = {}
+        self.ready_sessions: set[str] = set()
         self.device_locks: dict[str, asyncio.Lock] = {}
         self.registration_candidates: dict[str, RuntimeWebSocketResponse] = {}
         self.scheduler: PushScheduler | None = None
@@ -281,6 +290,10 @@ class PushRuntime:
             if (
                 self.registration_candidates.get(device_id) in {None, session.ws}
                 and self._legacy_owns_device(device_id, session.ws)
+                and (
+                    not hasattr(self, "ready_sessions")
+                    or device_id in self.ready_sessions
+                )
             )
         }
 
@@ -340,6 +353,8 @@ class PushRuntime:
         for device_id in tuple(self.sessions):
             self.transfers.release_all_for_device(device_id, "shutdown")
         self.sessions.clear()
+        if hasattr(self, "ready_sessions"):
+            self.ready_sessions.clear()
         self.registration_candidates.clear()
         self.store.close()
         _RUNTIME_BY_DATA_DIR.pop(self.data_dir.resolve(), None)
@@ -657,8 +672,9 @@ class PushRuntime:
         ws: RuntimeWebSocketResponse,
         payload: dict[str, Any],
         http_base: str,
+        established_device_id: str | None = None,
     ) -> None:
-        device_id = payload.get("device_id")
+        device_id = established_device_id or payload.get("device_id")
         if not isinstance(device_id, str) or not device_id:
             return
         capabilities = parse_capabilities(payload.get("capabilities"))
@@ -692,6 +708,8 @@ class PushRuntime:
             previous = self.sessions.get(device_id)
             if previous is not None and previous.ws is not ws:
                 self.sessions.pop(device_id, None)
+                if hasattr(self, "ready_sessions"):
+                    self.ready_sessions.discard(device_id)
                 active = await self.manager.active_assignment_for_device(device_id)
                 if active is not None:
                     job_id = active["job_id"]
@@ -798,7 +816,12 @@ class PushRuntime:
             except BaseException:
                 if self.sessions.get(device_id) is session:
                     self.sessions.pop(device_id, None)
+                    if hasattr(self, "ready_sessions"):
+                        self.ready_sessions.discard(device_id)
                 raise
+            if not hasattr(self, "ready_sessions"):
+                self.ready_sessions = set()
+            self.ready_sessions.add(device_id)
             if self.registration_candidates.get(device_id) is ws:
                 self.registration_candidates.pop(device_id, None)
             registered = True
@@ -811,6 +834,26 @@ class PushRuntime:
             await self.request_reconcile(device_id)
         if self.scheduler is not None:
             self.scheduler.wake()
+
+    async def acknowledge_registration(
+        self,
+        ws: RuntimeWebSocketResponse,
+        device_id: str,
+    ) -> None:
+        session = self.sessions.get(device_id)
+        if (
+            session is None
+            or session.ws is not ws
+            or (hasattr(self, "ready_sessions") and device_id not in self.ready_sessions)
+        ):
+            return
+        await asyncio.wait_for(
+            ws.send_str(json.dumps({
+                "type": "REGISTERED",
+                "session_id": session.session_id,
+            }, separators=(",", ":"))),
+            self.send_timeout,
+        )
 
     async def _registration_active_snapshots(
         self,
@@ -911,6 +954,8 @@ class PushRuntime:
             if session is None or session.ws is not ws:
                 return
             self.sessions.pop(device_id, None)
+            if hasattr(self, "ready_sessions"):
+                self.ready_sessions.discard(device_id)
             active = await self.manager.active_assignment_for_device(device_id)
             if active is None:
                 return

@@ -36,6 +36,7 @@ A command-line flag overrides the corresponding environment variable.
 | Data directory (uploaded APKs, pushed bundles, device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
 | Simultaneous device downloads, server-wide | `MDM_MAX_CONCURRENT_TRANSFERS` | `--max-concurrent-transfers` | `5` |
 | Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `600` |
+| Device registration policy | `MDM_DEVICE_IDENTITY_MODE` | — | `legacy-compatible` |
 
 The data directory holds everything the server persists: uploaded APKs
 (`<data-dir>/apks/`), pushed file bundles (`<data-dir>/bundles/`), and the device
@@ -46,6 +47,19 @@ devices or groups.
 Transfer throttling bounds how many devices download at once — one server-wide
 pool shared by every install and push/sync job; the rest queue until a slot
 frees.
+
+`MDM_DEVICE_IDENTITY_MODE=legacy-compatible` accepts both existing scheme-less
+serial clients and `styly_device_id_v1` clients during the rollout. After every
+client has been updated and identity-keyed state has been backed up and reset,
+restart with `MDM_DEVICE_IDENTITY_MODE=cutover-strict`; scheme-less registrations
+are then rejected before they can modify persistent state. Strict startup also
+fails without rewriting the registry if a non-canonical device record or group
+member ID remains.
+
+A client that succeeds in crossing from the legacy build to the GUID build registers
+as a new device. The server does not correlate or migrate the old serial record. If
+the old build reconnects under its serial, it remains targetable for another update;
+if it does not return, the old update is reported as an untracked identity handoff.
 
 Only one server may answer discovery on a given port: the server probes on
 startup and exits if another STYLY-MDM server already responds on its discovery

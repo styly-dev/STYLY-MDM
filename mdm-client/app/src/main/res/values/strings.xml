@@ -7,10 +7,15 @@
     <string name="save_and_connect">Save &amp; Connect</string>
     <string name="connection_status_label">Connection Status</string>
     <string name="status_unknown">Not connected</string>
+    <string name="device_identity_label">Device Identity</string>
+    <string name="device_identity_resolving">Resolving Device ID…</string>
+    <string name="device_identity_ready">Ready\n%1$s</string>
+    <string name="device_identity_unavailable">Unavailable (%1$s)\n%2$s</string>
+    <string name="retry_device_identity">Retry Device ID Lookup</string>
     <string name="storage_permission_label">All Files Access</string>
     <string name="grant_all_files_access">Grant All Files Access</string>
     <string name="storage_permission_granted">Granted</string>
-    <string name="storage_permission_not_granted">Not granted — required to install APKs</string>
+    <string name="storage_permission_not_granted">Not granted — required for APK operations and Device ID lookup</string>
     <string name="storage_permission_settings_unavailable">Could not open the All Files Access settings on this device</string>
     <string name="update_journal_label">Update Journal</string>
     <string name="update_journal_refresh">Refresh</string>

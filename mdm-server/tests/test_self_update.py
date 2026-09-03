@@ -462,6 +462,30 @@ def test_self_update_timeout_reports_and_falls_back_to_offline():
     asyncio.run(body())
 
 
+def test_legacy_identity_timeout_is_reported_as_untracked_handoff():
+    async def body():
+        server.SELF_UPDATE_TIMEOUT = 0.01
+        admin = add_admin()
+        server.device_registry["SERIAL-1"] = {
+            "label": "", "model": "M", "ip": "", "last_seen": 1.0,
+            "startup_app": None, "battery": None,
+            "version_code": 6, "version_name": "", "identity_kind": "legacy",
+        }
+        pending = make_pending("SERIAL-1")
+        pending["identity_kind"] = "legacy"
+
+        await server._self_update_timeout("SERIAL-1", "corr-1")
+
+        results = frames_of(admin, "SELF_UPDATE_RESULT")
+        assert results[0]["status"] == "untracked"
+        assert "registers as a new device" in results[0]["detail"]
+        states = frames_of(admin, "INSTALL_DEVICE_STATE")
+        assert states[-1]["state"] == "untracked"
+        assert frames_of(admin, "DEVICE_LIST")[-1]["devices"][0]["status"] == "offline"
+
+    asyncio.run(body())
+
+
 def test_stale_timeout_does_not_touch_a_replaced_pending():
     async def body():
         server.SELF_UPDATE_TIMEOUT = 0.01
@@ -780,7 +804,7 @@ def test_e2e_disconnect_mid_update_still_releases_transfer_slot(tmp_path):
     asyncio.run(body())
 
 
-def test_e2e_timeout_flips_updating_to_offline(tmp_path):
+def test_e2e_legacy_timeout_reports_untracked_and_flips_offline(tmp_path):
     async def body():
         server._apply_data_dir(str(tmp_path))
         server.SELF_UPDATE_TIMEOUT = 0.15
@@ -803,7 +827,7 @@ def test_e2e_timeout_flips_updating_to_offline(tmp_path):
                 assert dl["devices"][0]["status"] == "updating"
 
                 result = await _recv_type(admin, "SELF_UPDATE_RESULT")
-                assert result["status"] == "timeout"
+                assert result["status"] == "untracked"
                 dl = await _recv_type(admin, "DEVICE_LIST")
                 assert dl["devices"][0]["status"] == "offline"
 

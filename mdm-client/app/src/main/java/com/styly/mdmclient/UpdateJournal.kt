@@ -180,9 +180,6 @@ object UpdateJournal {
 
     /**
      * Closes out a self-update once the process comes back running the build it targeted.
-     * The journal keeps the correlation id and the target versionCode; only the "in flight"
-     * marker is retired, so the viewer stops claiming an update is still pending.
-     *
      * A marker left behind means the replacement never ran the new build — which is the
      * outcome worth seeing.
      *

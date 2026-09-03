@@ -160,11 +160,26 @@ PROTECTED_PACKAGES = {"com.styly.mdmclient", "com.styly.mdmguard"}
 REGISTRY_PATH = DATA_DIR / "device_registry.json"
 MAX_LABEL_LEN = 64
 MAX_GROUP_NAME_LEN = 64
+IDENTITY_SCHEME = "styly_device_id_v1"
+IDENTITY_MODE_LEGACY = "legacy-compatible"
+IDENTITY_MODE_STRICT = "cutover-strict"
+CANONICAL_DEVICE_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+PROVISIONAL_STATUSES = {"resolving", "access_denied", "io_error", "unsupported_api"}
+MAX_DEVICE_MODEL_LEN = 128
+MAX_DEVICE_IP_LEN = 64
+MAX_VERSION_NAME_LEN = 64
+MAX_IDENTITY_DIAGNOSTIC_LEN = 256
 
 # Connected devices: device_id -> {ws, device_id, model, ip, status, startup_app, battery}
 devices: dict[str, dict] = {}
 
-# serial -> last-known record {label, model, ip, last_seen, startup_app, battery}.
+# One entry per live, not-yet-identified socket. This collection is intentionally
+# absent from every persistence path and contains no addressable identifier.
+provisional_connections: dict[web.WebSocketResponse, dict] = {}
+
+# device_id -> last-known record {label, model, ip, last_seen, startup_app, battery}.
 # Remembers every device that has connected at least once so it stays listed
 # while offline. Survives restarts (persisted to REGISTRY_PATH).
 device_registry: dict[str, dict] = {}
@@ -230,6 +245,7 @@ def _coerce_record(value) -> dict | None:
             "version_code": None,
             "version_name": "",
             "retired": False,
+            "identity_kind": "legacy",
         }
     if isinstance(value, dict):
         label = value.get("label", "")
@@ -252,6 +268,11 @@ def _coerce_record(value) -> dict | None:
             "version_code": version_code,
             "version_name": version_name if isinstance(version_name, str) else "",
             "retired": value.get("retired") is True,
+            "identity_kind": (
+                value.get("identity_kind")
+                if value.get("identity_kind") in {"canonical", "legacy"}
+                else "legacy"
+            ),
         }
     return None
 
@@ -336,18 +357,43 @@ def load_registry() -> None:
         log.warning("Device registry is not an object; ignoring")
         return
 
+    loaded_groups: dict[str, list[str]] = {}
     if isinstance(raw.get("devices"), dict):
         devices_raw = raw["devices"]
-        device_groups.update(_coerce_groups(raw.get("groups")))
+        loaded_groups = _coerce_groups(raw.get("groups"))
     else:
         devices_raw = raw  # legacy flat shape: the whole object is serial -> value
 
+    loaded_devices: dict[str, dict] = {}
     for serial, value in devices_raw.items():
         if not isinstance(serial, str):
             continue
         record = _coerce_record(value)
         if record is not None:
-            device_registry[serial] = record
+            loaded_devices[serial] = record
+
+    if _identity_mode() == IDENTITY_MODE_STRICT:
+        invalid_devices = [
+            serial for serial, record in loaded_devices.items()
+            if record["identity_kind"] != "canonical"
+            or not CANONICAL_DEVICE_ID_RE.fullmatch(serial)
+        ]
+        invalid_group_members = [
+            member
+            for members in loaded_groups.values()
+            for member in members
+            if not CANONICAL_DEVICE_ID_RE.fullmatch(member)
+        ]
+        if invalid_devices or invalid_group_members:
+            raise RuntimeError(
+                "cutover-strict found pre-cutover identity state in "
+                f"{REGISTRY_PATH}: {len(invalid_devices)} non-canonical device record(s), "
+                f"{len(invalid_group_members)} invalid group membership(s). "
+                "Stop the server, back up the data directory, and complete the documented reset."
+            )
+
+    device_registry.update(loaded_devices)
+    device_groups.update(loaded_groups)
     log.info("Loaded %d device(s) and %d group(s) from registry",
              len(device_registry), len(device_groups))
 
@@ -421,6 +467,7 @@ def build_device_list_msg() -> str:
             "last_seen": rec.get("last_seen"),
             "version_code": rec.get("version_code"),
             "version_name": rec.get("version_name", ""),
+            "identity_kind": rec.get("identity_kind", "legacy"),
         })
     device_list.sort(
         key=lambda e: (e["label"] == "", (e["label"] or e["device_id"]).lower())
@@ -428,9 +475,31 @@ def build_device_list_msg() -> str:
     return json.dumps({"type": "DEVICE_LIST", "devices": device_list})
 
 
+def build_provisional_connection_list_msg() -> str:
+    connections = []
+    for entry in provisional_connections.values():
+        connections.append({
+            "model": entry["model"],
+            "ip": entry["ip"],
+            "version_code": entry["version_code"],
+            "version_name": entry["version_name"],
+            "identity_status": entry["identity_status"],
+            "diagnostic": entry["diagnostic"],
+            "mint_attempted": entry["mint_attempted"],
+            "connected_at": entry["connected_at"],
+            "last_status_at": entry["last_status_at"],
+        })
+    connections.sort(key=lambda entry: (entry["connected_at"], entry["model"], entry["ip"]))
+    return json.dumps({"type": "PROVISIONAL_CONNECTION_LIST", "connections": connections})
+
+
 async def broadcast_device_list():
     """Send the current device list to every connected admin."""
     await _broadcast_admin_message(build_device_list_msg())
+
+
+async def broadcast_provisional_connection_list() -> None:
+    await _broadcast_admin_message(build_provisional_connection_list_msg())
 
 
 def build_group_list_msg() -> str:
@@ -711,18 +780,28 @@ async def _self_update_timeout(device_id: str, correlation_id: str) -> None:
     ):
         return
     del pending_self_updates[device_id]
-    log.warning("Self-update timed out for %s (%s)", device_id, correlation_id)
+    identity_handoff_untracked = entry.get("identity_kind") == "legacy"
+    status = "untracked" if identity_handoff_untracked else "timeout"
+    detail = (
+        "legacy identity did not return; a successful replacement registers as a new device"
+        if identity_handoff_untracked
+        else f"device did not re-register within {int(SELF_UPDATE_TIMEOUT)}s"
+    )
+    log.warning("Self-update %s for %s (%s)", status, device_id, correlation_id)
     await forward_to_admins({
         "type": "SELF_UPDATE_RESULT",
         "device_id": device_id,
         "correlation_id": correlation_id,
-        "status": "timeout",
+        "status": status,
         "version_code": None,
         "target_version_code": entry["target_version_code"],
-        "detail": f"device did not re-register within {int(SELF_UPDATE_TIMEOUT)}s",
+        "detail": detail,
     })
     await broadcast_install_state(
-        [device_id], "fail", entry["apk_filename"], "self-update timed out",
+        [device_id],
+        "untracked" if identity_handoff_untracked else "fail",
+        entry["apk_filename"],
+        detail,
     )
     await broadcast_device_list()
 
@@ -1201,12 +1280,102 @@ def _owns_device(device_id: str | None, ws: web.WebSocketResponse) -> bool:
     return entry is not None and entry.get("ws") is ws
 
 
+def _identity_mode() -> str:
+    mode = os.environ.get("MDM_DEVICE_IDENTITY_MODE", IDENTITY_MODE_LEGACY)
+    if mode not in {IDENTITY_MODE_LEGACY, IDENTITY_MODE_STRICT}:
+        raise ValueError(
+            "MDM_DEVICE_IDENTITY_MODE must be legacy-compatible or cutover-strict"
+        )
+    return mode
+
+
+def _bounded_registration_text(value, fallback: str, limit: int) -> str:
+    return value[:limit] if isinstance(value, str) else fallback[:limit]
+
+
+def _parse_registration(data: dict, remote: str | None) -> tuple[str, dict] | tuple[None, str]:
+    scheme = data.get("identity_scheme")
+    device_id = data.get("device_id")
+    common = {
+        "model": _bounded_registration_text(data.get("model"), "unknown", MAX_DEVICE_MODEL_LEN),
+        "ip": _bounded_registration_text(data.get("ip"), remote or "unknown", MAX_DEVICE_IP_LEN),
+        "version_name": _bounded_registration_text(data.get("version_name"), "", MAX_VERSION_NAME_LEN),
+    }
+    version_code = data.get("version_code")
+    common["version_code"] = (
+        version_code if isinstance(version_code, int) and not isinstance(version_code, bool) else None
+    )
+
+    if scheme is None:
+        if _identity_mode() == IDENTITY_MODE_STRICT:
+            return None, "Legacy registration is disabled after the Device ID cutover"
+        if not isinstance(device_id, str) or not device_id or len(device_id) > 128:
+            return None, "Legacy REGISTER requires a bounded non-empty device_id"
+        return "legacy", {**common, "device_id": device_id, "startup_app": data.get("startup_app")}
+
+    if scheme != IDENTITY_SCHEME:
+        return None, "Unsupported identity_scheme"
+    if isinstance(device_id, str):
+        if not CANONICAL_DEVICE_ID_RE.fullmatch(device_id):
+            return None, "device_id must be a canonical lowercase GUID"
+        return "canonical", {**common, "device_id": device_id, "startup_app": data.get("startup_app")}
+    if device_id is not None:
+        return None, "device_id must be a canonical lowercase GUID or null"
+
+    identity = data.get("identity")
+    if not isinstance(identity, dict) or identity.get("state") != "provisional":
+        return None, "A null device_id requires a provisional identity object"
+    status = identity.get("status")
+    if status not in PROVISIONAL_STATUSES:
+        return None, "Unsupported provisional identity status"
+    diagnostic = identity.get("diagnostic", "")
+    if not isinstance(diagnostic, str):
+        return None, "Provisional diagnostic must be a string"
+    mint_attempted = identity.get("mint_attempted")
+    if not isinstance(mint_attempted, bool):
+        return None, "Provisional mint_attempted must be a boolean"
+    diagnostic = re.sub(r"[\r\n]+", " ", diagnostic).strip()[:MAX_IDENTITY_DIAGNOSTIC_LEN]
+    return "provisional", {
+        **common,
+        "identity_status": status,
+        "diagnostic": diagnostic,
+        "mint_attempted": mint_attempted,
+    }
+
+
+async def _close_protocol_error(ws: web.WebSocketResponse, message: str) -> None:
+    log.warning("Device registration protocol error: %s", message)
+    try:
+        await ws.send_str(json.dumps({"type": "ERROR", "message": message}))
+    finally:
+        await ws.close(code=WSCloseCode.PROTOCOL_ERROR, message=message.encode("utf-8")[:120])
+
+
+async def _complete_canonical_registration(
+    ws: web.WebSocketResponse,
+    device_id: str,
+    payload: dict,
+    *,
+    idempotent: bool,
+) -> None:
+    register = getattr(ws, "register_canonical_owner", None)
+    if callable(register):
+        await register(
+            device_id,
+            payload,
+            idempotent=idempotent,
+        )
+        return
+    await ws.send_str(json.dumps({"type": "REGISTERED"}))
+
+
 async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
     ws = _websocket_response_factory(heartbeat=30)
     await ws.prepare(request)
     log.info("Device WebSocket connected from %s", request.remote)
 
     device_id: str | None = None
+    socket_identity_kind: str | None = None
 
     try:
         async for raw_msg in ws:
@@ -1216,6 +1385,9 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                 except json.JSONDecodeError:
                     log.warning("Device sent invalid JSON: %s", raw_msg.data[:200])
                     continue
+                if not isinstance(data, dict):
+                    await _close_protocol_error(ws, "Device messages must be JSON objects")
+                    break
 
                 msg_type = data.get("type")
 
@@ -1229,25 +1401,67 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     log.info("Ignoring %s from superseded connection: %s",
                              msg_type, device_id)
                     continue
+                if msg_type != "REGISTER" and device_id is None:
+                    log.warning("Ignoring %s before canonical registration", msg_type)
+                    continue
 
                 if msg_type == "REGISTER":
-                    device_id = data.get("device_id")
-                    if not device_id:
-                        log.warning("REGISTER missing device_id")
+                    kind, registration = _parse_registration(data, request.remote)
+                    if kind is None:
+                        await _close_protocol_error(ws, registration)
+                        break
+
+                    if device_id is not None:
+                        requested_id = registration.get("device_id")
+                        if kind != socket_identity_kind or requested_id != device_id:
+                            await _close_protocol_error(
+                                ws,
+                                "A canonical socket cannot change its identity kind or device_id",
+                            )
+                            break
+                        await _complete_canonical_registration(
+                            ws,
+                            device_id,
+                            data,
+                            idempotent=True,
+                        )
                         continue
-                    model = data.get("model", "unknown")
-                    ip = data.get("ip", request.remote or "unknown")
-                    startup_app = data.get("startup_app")
-                    version_code = data.get("version_code")
-                    if isinstance(version_code, bool) or not isinstance(version_code, int):
-                        version_code = None
-                    version_name = data.get("version_name")
-                    if not isinstance(version_name, str):
-                        version_name = ""
-                    prev = device_registry.get(device_id, {})
+
+                    if kind == "provisional":
+                        now = time.time()
+                        previous = provisional_connections.get(ws)
+                        provisional_connections[ws] = {
+                            **registration,
+                            "connected_at": previous.get("connected_at", now) if previous else now,
+                            "last_status_at": now,
+                        }
+                        await ws.send_str(json.dumps({"type": "REGISTERED_PROVISIONAL"}))
+                        await broadcast_provisional_connection_list()
+                        continue
+
+                    if ws in provisional_connections and kind != "canonical":
+                        await _close_protocol_error(
+                            ws,
+                            "A provisional socket can only promote to canonical identity",
+                        )
+                        break
+
+                    new_device_id = registration["device_id"]
+                    model = registration["model"]
+                    ip = registration["ip"]
+                    startup_app = registration["startup_app"]
+                    version_code = registration["version_code"]
+                    version_name = registration["version_name"]
+                    prev = device_registry.get(new_device_id, {})
+                    # Promotion is one synchronous mutation: no task can observe this
+                    # socket in both the provisional and canonical collections.
+                    provisional_connections.pop(ws, None)
+                    device_id = new_device_id
+                    socket_identity_kind = kind
                     devices[device_id] = {
                         "ws": ws,
                         "device_id": device_id,
+                        "identity_kind": kind,
                         "model": model,
                         "ip": ip,
                         "status": "online",
@@ -1256,8 +1470,6 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "version_code": version_code,
                         "version_name": version_name,
                     }
-                    # Remember the device persistently so it stays in the list while
-                    # offline; preserve any previously assigned label.
                     device_registry[device_id] = {
                         "label": prev.get("label", ""),
                         "model": model,
@@ -1267,25 +1479,34 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "battery": prev.get("battery"),
                         "version_code": version_code,
                         "version_name": version_name,
+                        "identity_kind": kind,
                     }
                     save_registry()
+
                     log.info(
-                        "Device registered: %s (%s, client v%s)",
-                        device_id, model, version_code if version_code is not None else "?",
+                        "%s device registered: %s (%s, client v%s)",
+                        kind.capitalize(), device_id, model,
+                        version_code if version_code is not None else "?",
                     )
-                    # A registration during a pending retire is the retire's
-                    # failure signal. Independently, a retired device reporting
-                    # for duty means its client was reinstalled: the registry
-                    # rewrite above deliberately dropped the terminal retired
-                    # flag, re-adopting the device.
+                    had_pending_retire = device_id in pending_retires
+                    had_pending_self_update = device_id in pending_self_updates
+                    if kind == "legacy":
+                        # Preserve the established legacy timing during the rollout:
+                        # old test/clients do not wait for REGISTERED before an admin
+                        # connects, so publish their row before Push acknowledgement.
+                        await broadcast_device_list()
+                    await _complete_canonical_registration(
+                        ws, device_id, data, idempotent=False,
+                    )
                     if prev.get("retired"):
                         log.info("Retired device re-registered, re-adopting: %s", device_id)
                     await _resolve_pending_retire(device_id)
-                    # A re-registration is also how a self-updated client reports
-                    # back for duty: settle any pending update before the list
-                    # broadcast so admins see the result, then the row transition.
                     await _resolve_pending_self_update(device_id, ws, version_code)
-                    await broadcast_device_list()
+                    if kind == "canonical":
+                        await broadcast_provisional_connection_list()
+                        await broadcast_device_list()
+                    elif had_pending_retire or had_pending_self_update:
+                        await broadcast_device_list()
 
                 elif msg_type == "BATTERY_UPDATE":
                     if not device_id:
@@ -1403,6 +1624,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "expected_full_sha256": expected.get("full_sha256"),
                         "expected_cd_sha256": expected.get("cd_sha256"),
                         "started_at": time.time(),
+                        "identity_kind": socket_identity_kind,
                         # The entry holds the only strong reference to its task.
                         "timeout_task": None,
                     }
@@ -1488,7 +1710,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     "DELETE_APP_RESULT",
                 }:
                     if device_id:
-                        data.setdefault("device_id", device_id)
+                        data["device_id"] = device_id
                     # Fallback transfer-slot release: an older client that never
                     # emits DOWNLOAD_COMPLETE, or a client whose download failed and
                     # jumped straight to a terminal result, frees its slot here. A
@@ -1535,6 +1757,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
             elif raw_msg.type == web.WSMsgType.ERROR:
                 log.error("Device WS error: %s", ws.exception())
     finally:
+        was_provisional = provisional_connections.pop(ws, None) is not None
         # Every teardown step below belongs to the connection that currently owns
         # the device_id: a superseded socket must not free the live connection's
         # transfer slots, settle its pending state, or delete its registration —
@@ -1583,6 +1806,8 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                 save_registry()
             log.info("Device disconnected: %s", device_id)
             await broadcast_device_list()
+        if was_provisional:
+            await broadcast_provisional_connection_list()
 
     return ws
 
@@ -1613,6 +1838,7 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
         await ws.send_str(json.dumps({"type": "SERVER_INFO", "version": __version__}))
         await ws.send_str(build_client_apk_msg())
         await ws.send_str(build_device_list_msg())
+        await ws.send_str(build_provisional_connection_list_msg())
         await ws.send_str(build_group_list_msg())
     except ConnectionResetError:
         admin_connections.discard(ws)
@@ -3125,6 +3351,7 @@ def probe_existing_server(timeout: float = 1.0) -> str | None:
 
 def create_app() -> web.Application:
     # Ensure the writable data directory exists before loading/saving the registry.
+    _identity_mode()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     load_registry()
     app = web.Application(

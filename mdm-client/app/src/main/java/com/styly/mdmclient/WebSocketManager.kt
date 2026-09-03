@@ -13,8 +13,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
-import com.pvr.tobservice.ToBServiceHelper
-import com.pvr.tobservice.enums.PBS_SystemInfoEnum
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -47,7 +45,9 @@ import java.util.concurrent.TimeUnit
 class WebSocketManager(
     private val context: Context,
     private val onCommand: (type: String, payload: JSONObject) -> Unit,
-    private val onStatusChanged: (connected: Boolean, message: String) -> Unit
+    private val onStatusChanged: (connected: Boolean, message: String) -> Unit,
+    private val identityResolver: DeviceIdentityResolver =
+        MdmClientApplication.deviceIdentityResolver(),
 ) {
 
     companion object {
@@ -219,6 +219,19 @@ class WebSocketManager(
     // the loss of the network we currently consider active may close the window.
     private var activeNetwork: Network? = null
     private var networkCallbackRegistered = false
+    @Volatile private var socketOpen = false
+    @Volatile private var canonicalRegistrationSent = false
+    @Volatile private var canonicalRegistrationAcknowledged = false
+    @Volatile private var connectedServerAddress: String? = null
+    private val identityListener: (DeviceIdentityState) -> Unit = { state ->
+        reconnectHandler.post {
+            val current = webSocket
+            if (isRunning && socketOpen && current != null) {
+                sendRegistration(current, state)
+                publishConnectedStatus(state)
+            }
+        }
+    }
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             reconnectHandler.post {
@@ -244,6 +257,7 @@ class WebSocketManager(
 
     fun connect() {
         isRunning = true
+        identityResolver.addListener(identityListener)
         onStatusChanged(false, "Waiting for network...")
         // The connection window is anchored on network availability, not on
         // service start: the callback fires immediately when a network is
@@ -255,6 +269,7 @@ class WebSocketManager(
 
     fun disconnect() {
         isRunning = false
+        identityResolver.removeListener(identityListener)
         if (networkCallbackRegistered) {
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             cm.unregisterNetworkCallback(networkCallback)
@@ -265,6 +280,10 @@ class WebSocketManager(
         if (current != null) pushCoordinator.detachTransport(current)
         current?.close(1000, "Client disconnecting")
         webSocket = null
+        socketOpen = false
+        canonicalRegistrationSent = false
+        canonicalRegistrationAcknowledged = false
+        connectedServerAddress = null
     }
 
     fun sendMessage(json: JSONObject) {
@@ -373,16 +392,13 @@ class WebSocketManager(
                 reconnectHandler.post {
                     if (this@WebSocketManager.webSocket !== webSocket) return@post
                     dispatch(scheduler.onConnected())
-                    onStatusChanged(true, "Connected (${serverAddress(url)})")
-                    pushCoordinator.attachTransport(webSocket) { message ->
-                        if (this@WebSocketManager.webSocket === webSocket) {
-                            val text = message.toString()
-                            Log.d(TAG, "Sending: $text")
-                            webSocket.send(text)
-                        }
-                    }
-                    sendRegistration()
-                    startBatteryTelemetry()
+                    socketOpen = true
+                    canonicalRegistrationSent = false
+                    canonicalRegistrationAcknowledged = false
+                    connectedServerAddress = serverAddress(url)
+                    val identity = identityResolver.snapshot()
+                    sendRegistration(webSocket, identity)
+                    publishConnectedStatus(identity)
                 }
             }
 
@@ -395,7 +411,26 @@ class WebSocketManager(
                 try {
                     val json = JSONObject(text)
                     val type = json.optString("type", "")
-                    if (type.isNotEmpty() && !pushCoordinator.handleServerMessage(type, json)) {
+                    if (type == "REGISTERED") {
+                        if (!canonicalRegistrationSent) {
+                            Log.w(TAG, "Ignoring REGISTERED before canonical registration")
+                            return
+                        }
+                        canonicalRegistrationAcknowledged = true
+                        pushCoordinator.handleServerMessage(type, json)
+                        reconnectHandler.post {
+                            if (this@WebSocketManager.webSocket === webSocket &&
+                                canonicalRegistrationAcknowledged
+                            ) {
+                                startBatteryTelemetry()
+                                publishConnectedStatus(identityResolver.snapshot())
+                            }
+                        }
+                    } else if (type == "REGISTERED_PROVISIONAL") {
+                        publishConnectedStatus(identityResolver.snapshot())
+                    } else if (!canonicalRegistrationAcknowledged) {
+                        Log.w(TAG, "Ignoring $type before canonical registration acknowledgement")
+                    } else if (type.isNotEmpty() && !pushCoordinator.handleServerMessage(type, json)) {
                         onCommand(type, json)
                     }
                 } catch (e: Exception) {
@@ -426,6 +461,10 @@ class WebSocketManager(
             pushCoordinator.detachTransport(deadSocket)
             if (webSocket !== deadSocket) return@post
             webSocket = null
+            socketOpen = false
+            canonicalRegistrationSent = false
+            canonicalRegistrationAcknowledged = false
+            connectedServerAddress = null
             stopBatteryTelemetry()
             onStatusChanged(false, message)
             dispatch(scheduler.onSocketDisconnected(SystemClock.uptimeMillis()))
@@ -442,32 +481,76 @@ class WebSocketManager(
         return Pair(pkg, extra)
     }
 
-    private fun sendRegistration() {
-        val registration = JSONObject().apply {
-            put("type", "REGISTER")
-            put("device_id", getDeviceSerialNumber())
-            put("model", Build.MODEL)
-            put("ip", getDeviceIpAddress())
-            // Lets the server confirm which build re-registered after a self-update (#39).
-            put("version_code", BuildConfig.VERSION_CODE)
-            put("version_name", BuildConfig.VERSION_NAME)
-
-            val pushFields = pushCoordinator.registrationFields()
-            put("process_instance_id", pushFields.getString("process_instance_id"))
-            put("capabilities", pushFields.getJSONArray("capabilities"))
-            put("push_runtime", pushFields.getJSONObject("push_runtime"))
-
-            val startupConfig = getStartupAppConfig()
-            if (startupConfig != null) {
-                put("startup_app", JSONObject().apply {
-                    put("package_name", startupConfig.first)
-                    put("extra", startupConfig.second)
-                })
-            } else {
-                put("startup_app", JSONObject.NULL)
+    private fun sendRegistration(socket: WebSocket, identity: DeviceIdentityState) {
+        if (canonicalRegistrationSent) return
+        if (identity is DeviceIdentityState.Ready) {
+            pushCoordinator.attachTransport(socket) { message ->
+                if (this@WebSocketManager.webSocket === socket && canonicalRegistrationAcknowledged) {
+                    val text = message.toString()
+                    Log.d(TAG, "Sending: $text")
+                    socket.send(text)
+                }
             }
         }
-        sendMessage(registration)
+        val registration = JSONObject().apply {
+            put("type", "REGISTER")
+            put("identity_scheme", "styly_device_id_v1")
+            put("model", Build.MODEL)
+            put("ip", getDeviceIpAddress())
+            put("version_code", BuildConfig.VERSION_CODE)
+            put("version_name", BuildConfig.VERSION_NAME)
+            if (identity is DeviceIdentityState.Ready) {
+                put("device_id", identity.deviceId)
+                val pushFields = pushCoordinator.registrationFields()
+                put("process_instance_id", pushFields.getString("process_instance_id"))
+                put("capabilities", pushFields.getJSONArray("capabilities"))
+                put("push_state", JSONObject().put("status", "available"))
+                put("push_runtime", pushFields.getJSONObject("push_runtime"))
+                val startupConfig = getStartupAppConfig()
+                if (startupConfig != null) {
+                    put("startup_app", JSONObject().apply {
+                        put("package_name", startupConfig.first)
+                        put("extra", startupConfig.second)
+                    })
+                } else {
+                    put("startup_app", JSONObject.NULL)
+                }
+            } else {
+                put("device_id", JSONObject.NULL)
+                put("identity", provisionalIdentity(identity))
+            }
+        }
+        val text = registration.toString()
+        Log.d(TAG, "Sending: $text")
+        if (socket.send(text) && identity is DeviceIdentityState.Ready) {
+            canonicalRegistrationSent = true
+        }
+    }
+
+    private fun provisionalIdentity(identity: DeviceIdentityState): JSONObject {
+        return JSONObject().apply {
+            put("state", "provisional")
+            if (identity is DeviceIdentityState.Unavailable) {
+                put("status", identity.status.protocolValue)
+                put("diagnostic", identity.diagnostic)
+                put("mint_attempted", identity.mintAttempted)
+            } else {
+                put("status", "resolving")
+                put("diagnostic", "")
+                put("mint_attempted", false)
+            }
+        }
+    }
+
+    private fun publishConnectedStatus(identity: DeviceIdentityState) {
+        val suffix = when {
+            identity is DeviceIdentityState.Ready && canonicalRegistrationAcknowledged -> ""
+            identity is DeviceIdentityState.Ready -> " - Registering Device ID"
+            identity is DeviceIdentityState.Unavailable -> " - Device ID unavailable"
+            else -> " - Resolving Device ID"
+        }
+        val address = connectedServerAddress?.let { " ($it)" }.orEmpty()
+        onStatusChanged(true, "Connected$address$suffix")
     }
 
     private fun startBatteryTelemetry() {
@@ -482,7 +565,7 @@ class WebSocketManager(
 
     private fun scheduleNextBatteryUpdate() {
         reconnectHandler.postAtTime({
-            if (isRunning && webSocket != null) {
+            if (isRunning && webSocket != null && canonicalRegistrationAcknowledged) {
                 sendBatteryUpdate()
                 scheduleNextBatteryUpdate()
             }
@@ -497,7 +580,6 @@ class WebSocketManager(
         }
         val update = JSONObject().apply {
             put("type", "BATTERY_UPDATE")
-            put("device_id", getDeviceSerialNumber())
             put("level", snapshot.level)
             put("charging", snapshot.charging)
             put("timestamp", System.currentTimeMillis() / 1000)
@@ -518,16 +600,6 @@ class WebSocketManager(
         val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
             status == BatteryManager.BATTERY_STATUS_FULL
         return BatterySnapshot(percent, charging)
-    }
-
-    private fun getDeviceSerialNumber(): String {
-        return try {
-            val binder = ToBServiceHelper.getInstance().serviceBinder
-            binder?.pbsStateGetDeviceInfo(PBS_SystemInfoEnum.EQUIPMENT_SN, 0) ?: Build.SERIAL
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to get serial number from TobService", e)
-            Build.SERIAL
-        }
     }
 
     private fun getDeviceIpAddress(): String {

@@ -103,6 +103,18 @@
     .targets { border-right: 1px solid var(--border); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
     .actions { background: var(--bg-actions); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
     .targets-head, .subtabs { flex: 0 0 auto; }
+    .identity-health { margin: 10px 20px 4px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-actions); font-size: 12px; }
+    .identity-title { font-weight: 700; color: var(--text-primary); margin-bottom: 5px; }
+    .identity-counts { display: flex; gap: 18px; color: var(--text-secondary); }
+    .identity-counts strong { color: var(--text-primary); }
+    .provisional-list { margin-top: 8px; border-top: 1px solid var(--border-soft); }
+    .provisional-row { padding: 8px 0; display: grid; grid-template-columns: minmax(110px, 1fr) minmax(90px, .7fr) minmax(100px, .8fr); gap: 8px; border-top: 1px solid var(--border-soft); }
+    .provisional-row:first-child { border-top: none; }
+    .provisional-main { min-width: 0; }
+    .provisional-model { font-weight: 600; }
+    .provisional-meta, .provisional-time { color: var(--text-muted); font-size: 11px; }
+    .provisional-status { color: var(--warning); }
+    .provisional-diagnostic { color: var(--text-secondary); overflow-wrap: anywhere; }
     .actions > .zone-label, .sel-card, .push-attention { flex: 0 0 auto; }
 
     /* Drag handles */
@@ -390,6 +402,7 @@
             <span class="zone-label">① Targets</span>
             <button class="manage-btn" id="btnManageGroups">Manage Groups</button>
           </div>
+          <div class="identity-health" id="identityHealth"></div>
           <div class="subtabs">
             <button class="subtab active" id="tabGroups" data-tab="groups">Groups <span class="cnt" id="cntGroups">0</span></button>
             <button class="subtab" id="tabDevices" data-tab="devices">Devices <span class="cnt" id="cntDevices">0</span></button>
@@ -584,6 +597,7 @@
       // ---------------- State ----------------
       let ws = null;
       let devices = [];
+      let provisionalConnections = [];
       let serverVersion = null;        // STYLY-MDM server version, from SERVER_INFO
       let clientApk = null;            // newest styly-mdm-client APK on the server, from CLIENT_APK_INFO ({filename,url,version} or null)
       let groups = {};                 // name -> [serials]
@@ -645,6 +659,7 @@
       const cntGroups = document.getElementById('cntGroups');
       const cntDevices = document.getElementById('cntDevices');
       const targetsBody = document.getElementById('targetsBody');
+      const identityHealth = document.getElementById('identityHealth');
       const devToolbar = document.getElementById('devToolbar');
       const devSearchInput = document.getElementById('devSearch');
       const devStatusFilter = document.getElementById('devStatusFilter');
@@ -895,6 +910,11 @@
             render();
             break;
           }
+          case 'PROVISIONAL_CONNECTION_LIST': {
+            provisionalConnections = Array.isArray(msg.connections) ? msg.connections : [];
+            renderIdentityHealth();
+            break;
+          }
           case 'GROUP_LIST': {
             groups = msg.groups || {};
             if (pendingSelectGroup && (pendingSelectGroup in groups)) { selectManageGroup(pendingSelectGroup); pendingSelectGroup = null; }
@@ -1009,8 +1029,10 @@
           }
           case 'SELF_UPDATE_RESULT': {
             const ok = msg.status === 'success';
+            const untracked = msg.status === 'untracked';
             const ver = (msg.version_code != null) ? ' now v' + msg.version_code : '';
-            addLog('[' + (ok ? 'OK' : 'FAIL') + '] self-update on ' + labelFor(msg.device_id) + ver + (msg.detail ? ' - ' + msg.detail : ''), ok ? 'success' : 'fail');
+            const outcome = ok ? 'OK' : (untracked ? 'UNTRACKED' : 'FAIL');
+            addLog('[' + outcome + '] self-update on ' + labelFor(msg.device_id) + ver + (msg.detail ? ' - ' + msg.detail : ''), ok ? 'success' : (untracked ? 'info' : 'fail'));
             break;
           }
           case 'SELF_UPDATE_VERIFIED': {
@@ -1035,6 +1057,7 @@
         // The top-bar version's red state depends on the device list, so refresh it
         // on every render (device rows below carry the reverse, client-behind flag).
         updateServerVersionBadge();
+        renderIdentityHealth();
         if (view === 'manage') {
           manageView.style.display = '';
           consoleView.style.display = 'none';
@@ -1050,6 +1073,31 @@
           renderTargets();
           renderActions();
         }
+      }
+
+      function formatIdentityTime(value) {
+        if (typeof value !== 'number') return 'unknown';
+        return new Date(value * 1000).toLocaleString();
+      }
+
+      function renderIdentityHealth() {
+        const identified = devices.filter(function (d) { return d.status === 'online'; }).length;
+        let html = '<div class="identity-title">Device Identity</div>' +
+          '<div class="identity-counts"><span>Identified online <strong>' + identified + '</strong></span>' +
+          '<span>Device ID unavailable <strong>' + provisionalConnections.length + '</strong></span></div>';
+        if (provisionalConnections.length) {
+          html += '<div class="provisional-list">' + provisionalConnections.map(function (entry) {
+            const version = entry.version_name ? 'v' + entry.version_name : 'version unknown';
+            return '<div class="provisional-row">' +
+              '<div class="provisional-main"><div class="provisional-model">' + esc(entry.model || 'unknown') + '</div>' +
+              '<div class="provisional-meta">' + esc(entry.ip || 'unknown') + ' · ' + esc(version) + '</div></div>' +
+              '<div><div class="provisional-status">' + esc(entry.identity_status || 'unknown') + '</div>' +
+              '<div class="provisional-diagnostic">' + esc(entry.diagnostic || '') + '</div></div>' +
+              '<div class="provisional-time"><div>Connected ' + esc(formatIdentityTime(entry.connected_at)) + '</div>' +
+              '<div>Updated ' + esc(formatIdentityTime(entry.last_status_at)) + '</div></div></div>';
+          }).join('') + '</div>';
+        }
+        identityHealth.innerHTML = html;
       }
 
       function renderTabs() {
@@ -1328,6 +1376,7 @@
         if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
         if (st.status === 'installing') return '<span class="ins-installing"><span class="spinner">⟳</span> Installing…</span>';
         if (st.status === 'updating') return '<span class="ins-installing"><span class="spinner">⟳</span> Updating…</span>';
+        if (st.status === 'untracked') return '<span class="ins-none" title="' + esc(st.detail || '') + '">◇ identity handoff untracked</span>';
         if (st.status === 'success') return '<span class="ins-success">✓ installed</span>' + (st.filename ? ' <span class="ins-none">' + esc(st.filename) + '</span>' : '');
         return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
       }

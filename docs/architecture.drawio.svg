@@ -11,10 +11,10 @@
 &lt;mxCell id=&quot;2b&quot; value=&quot;Vanilla HTML / CSS / JS&quot; style=&quot;text;html=1;align=center;verticalAlign=middle;fontColor=#666666;fontSize=10;&quot; vertex=&quot;1&quot; parent=&quot;1&quot;&gt;&lt;mxGeometry x=&quot;60&quot; y=&quot;155&quot; width=&quot;160&quot; height=&quot;20&quot; as=&quot;geometry&quot;/&gt;&lt;/mxCell&gt;
 &lt;mxCell id=&quot;3&quot; value=&quot;&quot; style=&quot;rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;arcSize=10;&quot; vertex=&quot;1&quot; parent=&quot;1&quot;&gt;&lt;mxGeometry x=&quot;360&quot; y=&quot;80&quot; width=&quot;220&quot; height=&quot;100&quot; as=&quot;geometry&quot;/&gt;&lt;/mxCell&gt;
 &lt;mxCell id=&quot;3a&quot; value=&quot;&amp;lt;b&amp;gt;Control Server&amp;lt;/b&amp;gt;&amp;lt;br&amp;gt;(Python / aiohttp)&quot; style=&quot;text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;&quot; vertex=&quot;1&quot; parent=&quot;1&quot;&gt;&lt;mxGeometry x=&quot;405&quot; y=&quot;105&quot; width=&quot;130&quot; height=&quot;50&quot; as=&quot;geometry&quot;/&gt;&lt;/mxCell&gt;
-&lt;mxCell id=&quot;3b&quot; value=&quot;Python 3.10+&quot; style=&quot;text;html=1;align=center;verticalAlign=middle;fontColor=#666666;fontSize=10;&quot; vertex=&quot;1&quot; parent=&quot;1&quot;&gt;&lt;mxGeometry x=&quot;410&quot; y=&quot;155&quot; width=&quot;120&quot; height=&quot;20&quot; as=&quot;geometry&quot;/&gt;&lt;/mxCell&gt;
+&lt;mxCell id=&quot;3b&quot; value=&quot;Canonical + provisional identity&quot; style=&quot;text;html=1;align=center;verticalAlign=middle;fontColor=#666666;fontSize=10;&quot; vertex=&quot;1&quot; parent=&quot;1&quot;&gt;&lt;mxGeometry x=&quot;390&quot; y=&quot;155&quot; width=&quot;160&quot; height=&quot;20&quot; as=&quot;geometry&quot;/&gt;&lt;/mxCell&gt;
 &lt;mxCell id=&quot;4&quot; value=&quot;&quot; style=&quot;rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;arcSize=10;&quot; vertex=&quot;1&quot; parent=&quot;1&quot;&gt;&lt;mxGeometry x=&quot;700&quot; y=&quot;80&quot; width=&quot;200&quot; height=&quot;100&quot; as=&quot;geometry&quot;/&gt;&lt;/mxCell&gt;
 &lt;mxCell id=&quot;4a&quot; value=&quot;&amp;lt;b&amp;gt;MDM Client (on HMD)&amp;lt;/b&amp;gt;&amp;lt;br&amp;gt;(Android / Kotlin)&quot; style=&quot;text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;&quot; vertex=&quot;1&quot; parent=&quot;1&quot;&gt;&lt;mxGeometry x=&quot;740&quot; y=&quot;105&quot; width=&quot;120&quot; height=&quot;50&quot; as=&quot;geometry&quot;/&gt;&lt;/mxCell&gt;
-&lt;mxCell id=&quot;4b&quot; value=&quot;OkHttp, BatteryManager, PICO Business SDK&quot; style=&quot;text;html=1;align=center;verticalAlign=middle;fontColor=#666666;fontSize=10;&quot; vertex=&quot;1&quot; parent=&quot;1&quot;&gt;&lt;mxGeometry x=&quot;705&quot; y=&quot;155&quot; width=&quot;190&quot; height=&quot;20&quot; as=&quot;geometry&quot;/&gt;&lt;/mxCell&gt;
+&lt;mxCell id=&quot;4b&quot; value=&quot;OkHttp, Device-ID-Provider, PICO SDK&quot; style=&quot;text;html=1;align=center;verticalAlign=middle;fontColor=#666666;fontSize=10;&quot; vertex=&quot;1&quot; parent=&quot;1&quot;&gt;&lt;mxGeometry x=&quot;705&quot; y=&quot;155&quot; width=&quot;190&quot; height=&quot;20&quot; as=&quot;geometry&quot;/&gt;&lt;/mxCell&gt;
 &lt;mxCell id=&quot;5&quot; style=&quot;edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;containsPoints=1;endArrow=block;endFill=1;startArrow=block;startFill=1;strokeWidth=2;strokeColor=#6c8ebf;&quot; edge=&quot;1&quot; parent=&quot;1&quot; source=&quot;2&quot; target=&quot;3&quot;&gt;&lt;mxGeometry relative=&quot;1&quot; as=&quot;geometry&quot;/&gt;&lt;/mxCell&gt;
 &lt;mxCell id=&quot;5a&quot; value=&quot;WebSocket&amp;lt;br&amp;gt;&amp;lt;font style=&amp;quot;font-size:10px&amp;quot;&amp;gt;/ws/admin&amp;lt;/font&amp;gt;&quot; style=&quot;edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];&quot; vertex=&quot;1&quot; connectable=&quot;0&quot; parent=&quot;5&quot;&gt;&lt;mxGeometry x=&quot;-0.1&quot; relative=&quot;1&quot; as=&quot;geometry&quot;&gt;&lt;mxPoint as=&quot;offset&quot;/&gt;&lt;/mxGeometry&gt;&lt;/mxCell&gt;
 &lt;mxCell id=&quot;6&quot; style=&quot;edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;containsPoints=1;endArrow=block;endFill=1;startArrow=block;startFill=1;strokeWidth=2;strokeColor=#d6b656;&quot; edge=&quot;1&quot; parent=&quot;1&quot; source=&quot;3&quot; target=&quot;4&quot;&gt;&lt;mxGeometry relative=&quot;1&quot; as=&quot;geometry&quot;/&gt;&lt;/mxCell&gt;
@@ -37,13 +37,13 @@
   <rect x="365" y="60" width="210" height="110" rx="12" ry="12" fill="#d5e8d4" stroke="#82b366" stroke-width="2"/>
   <text x="470" y="100" text-anchor="middle" font-size="16" font-weight="bold" fill="#333">Control Server</text>
   <text x="470" y="122" text-anchor="middle" font-size="13" fill="#555">(Python / aiohttp)</text>
-  <text x="470" y="150" text-anchor="middle" font-size="11" fill="#888">Python 3.10+</text>
+  <text x="470" y="150" text-anchor="middle" font-size="11" fill="#888">Canonical + provisional identity</text>
 
   <!-- MDM Client box -->
   <rect x="690" y="60" width="210" height="110" rx="12" ry="12" fill="#fff2cc" stroke="#d6b656" stroke-width="2"/>
   <text x="795" y="100" text-anchor="middle" font-size="16" font-weight="bold" fill="#333">MDM Client (on HMD)</text>
   <text x="795" y="122" text-anchor="middle" font-size="13" fill="#555">(Android / Kotlin)</text>
-  <text x="795" y="150" text-anchor="middle" font-size="11" fill="#888">OkHttp, BatteryManager, PICO Business SDK</text>
+  <text x="795" y="150" text-anchor="middle" font-size="11" fill="#888">OkHttp, Device-ID-Provider, PICO SDK</text>
 
   <!-- Arrow markers -->
   <defs>

@@ -272,6 +272,70 @@ STYLY-MDM/
 
 ## WebSocket Protocol Reference
 
+### Device identity and provisional registration (Issue #65)
+
+Device identity is a protocol and persistence boundary. New clients use only the
+lowercase GUID returned by Device-ID-Provider and set
+`identity_scheme: "styly_device_id_v1"`. Hardware serials and `Build.SERIAL` are
+not fallback identities. The vendored Android AAR is Device-ID-Provider `0.3.1`
+from merge commit `60e9175`; `mdm-client/app/libs/device-id-provider.properties`
+pins its SHA-256 and the Android `preBuild` task verifies it before compiling.
+
+The Application-scoped resolver runs `DeviceIdProvider.getOrCreate()` on one
+dedicated executor. The first lookup and WebSocket connection start independently.
+A failure is not retried by timers, network reconnect, or a storage-state change;
+the Settings screen shows the result, reuses the All Files Access settings action,
+and provides the only in-process retry action. A successful GUID is frozen for the
+rest of the process.
+
+While the resolver is not ready, the socket sends a provisional `REGISTER` with a
+null `device_id` and a bounded `identity` status. The server stores that status only
+in `provisional_connections`, keyed by the live WebSocket. It is never written to
+`device_registry.json` or Push state and has no selection, group, label, command,
+startup-app, install, or Push affordance. Admins receive complete
+`PROVISIONAL_CONNECTION_LIST` snapshots. Disconnect removes the row.
+
+When the resolver becomes ready, the same socket sends a canonical `REGISTER`.
+The server removes its provisional entry and installs the canonical owner without
+an `await` between those mutations, preserving newest-registration-wins semantics.
+The server rejects a later GUID change or downgrade to provisional. All later
+device frames are attributed to the server-side socket owner; a payload-supplied
+`device_id` cannot replace it. The Push session becomes schedulable only after the
+server has sent `REGISTERED`, and the client ignores commands and does not start
+battery telemetry until that acknowledgement arrives.
+
+This is a breaking identity and wire-protocol change. The server must be deployed
+before the new client. `MDM_DEVICE_IDENTITY_MODE` controls the explicit rollout:
+
+1. Stop active Push jobs and deploy server plus console with
+   `MDM_DEVICE_IDENTITY_MODE=legacy-compatible` (the default).
+2. Use the existing self-update path to replace scheme-less serial clients. A
+   successful replacement registers its provider GUID as a new device; the server
+   does not correlate or migrate the old serial record to it.
+3. Confirm the expected canonical GUID clients are online. A legacy client that
+   returns with the old version is still targetable for retry; a legacy identity
+   that does not return is reported as an untracked handoff rather than a false
+   update failure.
+4. Stop the server. Resolve the configured data directory from `--data-dir`, then
+   `MDM_DATA_DIR`, otherwise the server process working directory. Back up that
+   exact directory before changing it.
+5. With the server stopped, reset `device_registry.json` and `push_jobs.sqlite3`
+   (including SQLite `-wal`/`-shm` siblings if present). This resets device/group
+   records, Push assignments/history, and fences. Keep `apks/`, `bundles/`, and
+   `push-artifacts/`; uploaded artifacts are not device identity.
+6. Restart with `MDM_DEVICE_IDENTITY_MODE=cutover-strict` and verify a scheme-less
+   registration is rejected without recreating a serial-keyed registry record.
+
+Strict startup refuses to load any non-canonical device record or non-canonical
+group member ID. This is a guard against accidentally starting the cutover before the
+backup and reset; it does not delete or rewrite the rejected registry file.
+
+Do not perform the reset against a running server. Rehearse the sequence first with
+an isolated non-production `--data-dir`. Completion still requires physical PICO
+checks for missing permission, explicit retry promotion, restart behavior, and a
+separate-UID MDM/Unity first-mint race; unit and loopback tests cannot prove those
+MediaStore and firmware behaviors.
+
 Transport note: `/ws/admin` intentionally does not negotiate per-message
 compression as a workaround for the Chrome-to-server reserved-bit failure
 documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
@@ -357,7 +421,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `REBOOT_SENT` / `POWER_OFF_SENT` | Confirmation that reboot/power-off commands were dispatched. Fields: `sent_count`, `target_count` |
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
 | `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |
-| `INSTALL_DEVICE_STATE` | Per-device companion to `INSTALL_PROGRESS`: names the devices that just entered a state, so the console can label each row instead of showing the whole target set as installing. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `installing` / `updating` / `success` / `fail`; `updating` and its terminal `success`/`fail` are emitted only for a client self-update), `apk_filename`, `detail` (failure reason, may be empty) |
+| `INSTALL_DEVICE_STATE` | Per-device companion to `INSTALL_PROGRESS`: names the devices that just entered a state, so the console can label each row instead of showing the whole target set as installing. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `installing` / `updating` / `success` / `fail` / `untracked`; `untracked` means a legacy identity did not return and any successful GUID replacement is intentionally treated as a new device), `apk_filename`, `detail` (failure reason or handoff note; may be empty) |
 | `PUSH_JOBS_SNAPSHOT` | Sent after the normal initial admin metadata. Contains every non-terminal job, bounded recent terminal jobs, and fence-visible metadata as a complete replacement snapshot. Updates that race ahead of it on the same connection are buffered and revision-merged by the console. If this initial snapshot cannot be sent, the server closes that admin socket so the existing reconnect loop requests a fresh snapshot instead of buffering forever. |
 | `PUSH_JOB_UPDATED` | Canonical full snapshot after a committed mutation. A single server publisher coalesces pending revisions per `job_id`; console state merges only monotonically newer revisions. |
 | `PUSH_FILES_SENT` | Job dispatch/resume acknowledgement. Fields include `job_id`, committed `revision`, canonical state/gate, target count, and shared transfer limit. |
@@ -368,7 +432,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `VERIFY_SENT` | Confirmation that verify-APK commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `VERIFY_DIR_SENT` | Confirmation that verify-directory commands were dispatched. Fields: `path`, `sent_count`, `target_count` |
 | `VERIFY_APK_RESULT` / `VERIFY_DIR_RESULT` | Forwarded integrity result from a device (stamped with `device_id`). The console compares it against the local reference. Exception: the `VERIFY_APK_RESULT` answering a self-update auto-verify is consumed by the server (which holds the reference) and surfaces as `SELF_UPDATE_VERIFIED` instead. |
-| `SELF_UPDATE_RESULT` | Outcome of a client self-update, settled when the device re-registers (or the window expires). Fields: `device_id`, `correlation_id`, `status` (`success` / `fail` / `timeout`), `version_code` (what the device came back with; `null` on timeout), `target_version_code`, `detail` |
+| `SELF_UPDATE_RESULT` | Outcome of a client self-update, settled when the same device identity re-registers (or the window expires). Fields: `device_id`, `correlation_id`, `status` (`success` / `fail` / `timeout` / `untracked`), `version_code`, `target_version_code`, `detail`. `untracked` is the terminal compatibility-rollout result for an old serial that did not return; a successful GUID replacement is a separate new device. |
 | `SELF_UPDATE_VERIFIED` | Outcome of the automatic post-update `EXECUTE_VERIFY_APK` the server runs against the client's own package. Fields: `device_id`, `correlation_id`, `status` (`verified` / `mismatch` / `skipped` / `error`), `detail` |
 | `RETIRE_SENT` | Confirmation that `EXECUTE_SELF_UNINSTALL` commands were dispatched. Fields: `sent_count`, `target_count` |
 | `RETIRE_RESULT` | Outcome of a device retire. Success is settled by *silence*: the device announced, disconnected, and stayed away for the retire window. Failure means it re-registered, reported the uninstall failed, or was still connected at the deadline. Fields: `device_id`, `correlation_id`, `status` (`success` / `fail`), `detail` |
@@ -790,9 +854,10 @@ The self-update flow:
    process dies; the install commits ~30 s later.
 4. **Server-side `updating`.** The server records the pending update; the disconnect
    renders the device as `updating` (not `offline`) in `DEVICE_LIST`, and the install cell
-   shows `Updating…` via `INSTALL_DEVICE_STATE`. If the device does not re-register within
-   `MDM_SELF_UPDATE_TIMEOUT` (default 480 s), the update is reported as `timeout` and the
-   row falls back to offline.
+   shows `Updating…` via `INSTALL_DEVICE_STATE`. If a canonical identity does not
+   re-register within `MDM_SELF_UPDATE_TIMEOUT` (default 480 s), the update is reported
+   as `timeout`. A legacy serial that does not return is instead reported as `untracked`,
+   because a successful replacement registers under an unrelated provider GUID.
 5. **Revival.** The guard's next watchdog tick finds the client down and starts the new
    build through TobService (measured on device: down for ~3 s, `SELF_UPDATE_VERIFIED`
    ~4 s after dispatch). The new build confirms the update marker and — on that
@@ -808,9 +873,10 @@ The self-update flow:
    starts the flag is retired anyway, so a past-due one-shot timer that can no longer be
    closed does not loop the recovery on every boot (`POWER_CYCLE_CLOSED` records
    `cleared` / `retry_pending` / `gave_up`).
-6. **Result + auto-verify.** The server settles the update by comparing the re-registered
-   `version_code` against the target (`SELF_UPDATE_RESULT`, carrying the correlation id),
-   then runs `EXECUTE_VERIFY_APK` against the client's own package and compares the
+6. **Result + auto-verify.** When the same identity returns, the server settles the update
+   by comparing the re-registered `version_code` against the target
+   (`SELF_UPDATE_RESULT`, carrying the correlation id), then runs `EXECUTE_VERIFY_APK`
+   against the client's own package and compares the
    reported hash with its reference, broadcasting `SELF_UPDATE_VERIFIED`. The reference is
    pinned to the hashes captured when `EXECUTE_INSTALL` was dispatched to that device
    (`last_install_dispatch`), not a re-hash of the client-echoed filename, so a same-name
@@ -854,6 +920,11 @@ installed, a dead client is started back up within one watchdog tick.
 - **A server restart mid-update loses only the reporting.** The pending state is in-memory;
   the device still recovers on its own (the power cycle is device-side) and re-registers as
   a normal client. The `updating` label and the `SELF_UPDATE_RESULT` are the only casualties.
+- **The compatibility cutover does not correlate identities.** If an old serial client
+  returns unchanged, its version comparison reports failure and it remains targetable for
+  retry. If the new build succeeds, its provider GUID is persisted as a completely new
+  device with no inherited label, groups, startup app, Push history, or update result. The
+  old serial row is removed only by the documented reset or an explicit Forget action.
 
 ### The update journal
 

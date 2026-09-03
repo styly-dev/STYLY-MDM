@@ -97,6 +97,30 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_marginTop="32dp"
+            android:layout_marginBottom="8dp"
+            android:text="@string/device_identity_label"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/device_identity_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/device_identity_resolving"
+            android:textIsSelectable="true"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/retry_device_identity_button"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/retry_device_identity" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
             android:text="@string/storage_permission_label"
             android:textSize="14sp"
             android:layout_marginTop="32dp"

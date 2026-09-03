@@ -29,6 +29,8 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var autoDiscoveryButton: Button
     private lateinit var storagePermissionStatus: TextView
     private lateinit var grantStorageButton: Button
+    private lateinit var deviceIdentityStatus: TextView
+    private lateinit var retryDeviceIdentityButton: Button
     private lateinit var journalText: TextView
     private lateinit var journalRefreshButton: Button
     private lateinit var journalClearButton: Button
@@ -39,6 +41,10 @@ class SettingsActivity : AppCompatActivity() {
             val message = intent.getStringExtra(MdmClientService.EXTRA_MESSAGE) ?: ""
             updateStatusDisplay(connected, message)
         }
+    }
+
+    private val identityListener: (DeviceIdentityState) -> Unit = { state ->
+        runOnUiThread { updateDeviceIdentityUi(state) }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -60,6 +66,8 @@ class SettingsActivity : AppCompatActivity() {
         autoDiscoveryButton = findViewById(R.id.use_auto_discovery_button)
         storagePermissionStatus = findViewById(R.id.storage_permission_status)
         grantStorageButton = findViewById(R.id.grant_storage_button)
+        deviceIdentityStatus = findViewById(R.id.device_identity_status)
+        retryDeviceIdentityButton = findViewById(R.id.retry_device_identity_button)
         journalText = findViewById(R.id.journal_text)
         journalRefreshButton = findViewById(R.id.journal_refresh_button)
         journalClearButton = findViewById(R.id.journal_clear_button)
@@ -76,6 +84,10 @@ class SettingsActivity : AppCompatActivity() {
 
         grantStorageButton.setOnClickListener {
             requestAllFilesAccess()
+        }
+
+        retryDeviceIdentityButton.setOnClickListener {
+            MdmClientApplication.deviceIdentityResolver().retry()
         }
 
         journalRefreshButton.setOnClickListener {
@@ -100,6 +112,7 @@ class SettingsActivity : AppCompatActivity() {
         registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         // Re-check here so returning from the system settings screen refreshes the UI.
         updateStoragePermissionUi()
+        MdmClientApplication.deviceIdentityResolver().addListener(identityListener)
         refreshJournal()
     }
 
@@ -110,6 +123,7 @@ class SettingsActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         unregisterReceiver(statusReceiver)
+        MdmClientApplication.deviceIdentityResolver().removeListener(identityListener)
     }
 
     private fun saveAndRestart() {
@@ -168,6 +182,34 @@ class SettingsActivity : AppCompatActivity() {
             storagePermissionStatus.setText(R.string.storage_permission_not_granted)
             storagePermissionStatus.setTextColor(0xFFFF5722.toInt())
             grantStorageButton.visibility = View.VISIBLE
+        }
+    }
+
+    private fun updateDeviceIdentityUi(state: DeviceIdentityState) {
+        when (state) {
+            DeviceIdentityState.Resolving -> {
+                deviceIdentityStatus.setText(R.string.device_identity_resolving)
+                deviceIdentityStatus.setTextColor(0xFFFFA000.toInt())
+                retryDeviceIdentityButton.isEnabled = false
+            }
+            is DeviceIdentityState.Ready -> {
+                deviceIdentityStatus.text = getString(
+                    R.string.device_identity_ready,
+                    state.deviceId,
+                )
+                deviceIdentityStatus.setTextColor(0xFF4CAF50.toInt())
+                retryDeviceIdentityButton.visibility = View.GONE
+            }
+            is DeviceIdentityState.Unavailable -> {
+                deviceIdentityStatus.text = getString(
+                    R.string.device_identity_unavailable,
+                    state.status.protocolValue,
+                    state.diagnostic,
+                )
+                deviceIdentityStatus.setTextColor(0xFFFF5722.toInt())
+                retryDeviceIdentityButton.visibility = View.VISIBLE
+                retryDeviceIdentityButton.isEnabled = true
+            }
         }
     }
 

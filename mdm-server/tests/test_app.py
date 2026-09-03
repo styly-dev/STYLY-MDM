@@ -46,6 +46,14 @@ def test_web_console_is_bundled():
     assert static_index.is_file(), "web console index.html must ship inside the package"
 
 
+def test_web_console_renders_provisional_identity_as_escaped_status_only():
+    html = (Path(server.__file__).parent / "static" / "index.html").read_text()
+    assert "PROVISIONAL_CONNECTION_LIST" in html
+    assert "Device ID unavailable" in html
+    assert "esc(entry.diagnostic" in html
+    assert "provisionalConnections.map" in html
+
+
 @pytest.mark.parametrize(
     "raw, expected",
     [
