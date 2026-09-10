@@ -379,8 +379,8 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 
 | Message type | Description |
 |---|---|
-| `REGISTER` | Sent on connect. In addition to device metadata, job-v1 clients send `process_instance_id` (UUIDv4), `capabilities: ["push_job_id_v1"]`, and `push_runtime.active` (exact active identity/phase or `null`). Capability parsing is all-or-nothing and never inferred from a version number. |
-| `BATTERY_UPDATE` | Battery telemetry. Fields: `device_id`, `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds) |
+| `REGISTER` | Sent on connect and again on the same socket when a provisional identity becomes Ready. New clients set `identity_scheme: "styly_device_id_v1"`; `device_id` is the lowercase Provider GUID when ready, or `null` with `identity: {state: "provisional", status, diagnostic, mint_attempted}` otherwise. `status` is `resolving`, `access_denied`, `io_error`, or `unsupported_api`; `diagnostic` is a single-line string bounded to 256 characters, and `mint_attempted` is a boolean indicating whether the provider attempted to create an ID (`false` while resolving). Scheme-less legacy clients send their serial as `device_id`. Canonical job-v1 registrations also send `process_instance_id` (UUIDv4), `capabilities: ["push_job_id_v1"]`, and `push_runtime.active` (exact active identity/phase or `null`). Capability parsing is all-or-nothing and never inferred from a version number. |
+| `BATTERY_UPDATE` | New clients send battery telemetry after canonical `REGISTERED`. Fields: `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds). The server attributes the message to the current socket owner; new clients do not send `device_id`. |
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
 | `DELETE_APP_RESULT` | Result of a remote app uninstall — exactly one per `EXECUTE_UNINSTALL`. The client survives it, so this always arrives (unlike `SELF_UNINSTALL_RESULT`). Fields: `status` (`success`/`fail`), `package_name`, `error` (optional), `result_code` (optional), `startup_app_cleared` (optional; reports what the device did — the server decides from its own record, see below). See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_RESULT` / `POWER_OFF_RESULT` | Acknowledgement of a power command. `status` is `accepted` (the client received it and flushed this before invoking the SDK — a successful reboot/shutdown tears down the socket first, so no `success` is ever sent) or `fail` (the SDK rejected the call, so the device stayed up to report it). Fields: `status`, `error` (optional). See [Remote Power Control](#remote-power-control). |
@@ -405,7 +405,8 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `EXECUTE_UNINSTALL` | Silently uninstall an app (`pbsControlAPPManger` / `PACKAGE_SILENCE_UNINSTALL`). Fields: `package_name`. The client refuses its own and the guard's package, and clears the startup app first when the target is it. See [Remote App Uninstall](#remote-app-uninstall). |
 | `EXECUTE_REBOOT` / `EXECUTE_POWER_OFF` | Reboot or power off the device immediately via the PICO advanced device-control API (`pbsControlSetDeviceAction`). No fields. See [Remote Power Control](#remote-power-control). |
 | `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename`, plus `full_sha256` + `cd_sha256` (reference hashes of the file being dispatched; present only when the APK is a local upload in `apks/`). The client verifies the download against `full_sha256` before installing; a **self**-update is refused outright when the hashes are absent. |
-| `REGISTERED` | Server acknowledgement after ownership/capability processing. Field: `session_id`. The client then replays its durable pending terminal outbox. |
+| `REGISTERED` | Server acknowledgement after ownership/capability processing. Field: `session_id`. The client then enables command handling, starts battery telemetry, and replays its durable pending terminal outbox. |
+| `REGISTERED_PROVISIONAL` | Acknowledges a provisional registration or status update. No additional fields. Does not enable commands, battery telemetry, or Push execution; the socket remains status-only until canonical registration completes. |
 | `EXECUTE_PUSH_FILES` | Job-v1 fields: `job_id`, fixed `attempt=1`, observed `revision`, immutable `artifact_id`, absolute `artifact_url`, exact size/SHA-256 metadata, destination, and server-derived `delete_extras`. Legacy fields remain accepted during migration. Safety-critical fields require their exact JSON types. |
 | `PUSH_RESULT_ACK` | Terminal-result disposition. Fields: exact identity, `accepted`, committed `revision` when a local canonical job exists, and on rejection `reason` plus `retryable`. The client retains retryable results; accepted or permanently rejected results leave the pending outbox while remaining in bounded dedupe receipts. |
 | `PUSH_RECONCILE_REQUEST` | Requests exact status for one or more `{job_id, attempt, artifact_id}` identities. It never directly clears a fence. |
@@ -430,7 +431,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `RENAME_GROUP` | Rename a group, preserving its members. Fields: `name`, `new_name` |
 | `DELETE_GROUP` | Delete a group (member devices are not affected). Fields: `name` |
 | `SET_DEVICE_GROUPS` | Set the exact set of groups a device belongs to. Fields: `device_id`, `groups` (list of existing group names) |
-| `SET_GROUP_MEMBERS` | Set the exact member list of an existing group (group-centric). Fields: `name`, `members` (list of serials; offline/unknown serials allowed) |
+| `SET_GROUP_MEMBERS` | Set the exact member list of an existing group (group-centric). Fields: `name`, `members` (list of device IDs; offline/unknown IDs allowed) |
 | `RETIRE_DEVICE` | Make target clients uninstall themselves (remotely irreversible — the console gates it behind its heaviest confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only). See [Device Retirement](#device-retirement). |
 
 ### Admin HTTP API
@@ -451,6 +452,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `SERVER_INFO` | Server identity, sent once on connect (before the first `DEVICE_LIST`). Fields: `version` (the `styly_mdm` package version; the console renders it next to the `STYLY-MDM` brand in the top bar. Its `major.minor` is the compatibility reference — and the top-bar value itself turns red when a live client is on a *newer* `major.minor` (i.e. the server is the one lagging). See the compatibility note below). |
 | `CLIENT_APK_INFO` | The newest styly-mdm-client APK the server holds, sent on connect (right after `SERVER_INFO`, before `DEVICE_LIST`) and re-broadcast after every APK upload. Field: `apk` = `{filename, url, version}` or `null`. Drives the per-device and bulk **Update** buttons and the top-bar client-APK download link (see the notes below). |
 | `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `identity_kind` (`canonical` for Provider GUID / `legacy` for serial ID) and `status` (`registering` before the registration acknowledgement / `online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting; a *stable-online* client whose `version_name` trails the server on `major.minor` is flagged red as needing an update — the reverse case, a client *ahead* of the server, reddens the top-bar server version instead. `updating` and offline rows are exempt, and the check is skipped only when the server version is the `0.0.0` untagged/not-installed fallback), and may include optional `battery`: `{level, charging, last_seen}`) |
+| `PROVISIONAL_CONNECTION_LIST` | Complete replacement snapshot of live unresolved connections, sent on admin connect and when provisional state changes. Field: `connections` (array of `{model, ip, version_code, version_name, identity_status, diagnostic, mint_attempted, connected_at, last_status_at}`). `identity_status` uses the provisional `REGISTER` status values; `mint_attempted` is a boolean, and both timestamps are epoch seconds. Entries have no `device_id`, are not persisted, and disappear on promotion or disconnect. |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `DELETE_APP_SENT` | Confirmation that uninstall commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `REBOOT_SENT` / `POWER_OFF_SENT` | Confirmation that reboot/power-off commands were dispatched. Fields: `sent_count`, `target_count` |
@@ -471,7 +473,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `SELF_UPDATE_VERIFIED` | Outcome of the automatic post-update `EXECUTE_VERIFY_APK` the server runs against the client's own package. Fields: `device_id`, `correlation_id`, `status` (`verified` / `mismatch` / `skipped` / `error`), `detail` |
 | `RETIRE_SENT` | Confirmation that `EXECUTE_SELF_UNINSTALL` commands were dispatched. Fields: `sent_count`, `target_count` |
 | `RETIRE_RESULT` | Outcome of a device retire. Success is settled by *silence*: the device announced, disconnected, and stayed away for the retire window. Failure means it re-registered, reported the uninstall failed, or was still connected at the deadline. Fields: `device_id`, `correlation_id`, `status` (`success` / `fail`), `detail` |
-| `GROUP_LIST` | Current device groups. Fields: `groups` (object mapping group name → array of member serials). The console derives each device's group membership from this; sent on connect and after any group change. |
+| `GROUP_LIST` | Current device groups. Fields: `groups` (object mapping group name → array of member device IDs). The console derives each device's group membership from this; sent on connect and after any group change. |
 | `GROUP_CREATED` / `GROUP_RENAMED` / `GROUP_DELETED` | Acknowledgements for group create / rename / delete. |
 | `DEVICE_GROUPS_SET` | Acknowledgement of a device's group membership change. Fields: `device_id`, `groups` |
 | `GROUP_MEMBERS_SET` | Acknowledgement of a group's member list change. Fields: `name`, `members` |
@@ -534,7 +536,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > means sideloading or hand-installing a client never requires reaching this
 > repository's GitHub Releases page — the console alone is enough.
 
-> **Device groups** are a many-to-many grouping keyed by device serial, persisted
+> **Device groups** are a many-to-many grouping keyed by `device_id`, persisted
 > server-side in `device_registry.json` (under a `groups` key). Selecting a group
 > in the console is a client-side convenience: it sets the device selection to that
 > group's members (devices not in the group are deselected), so commands still
@@ -543,8 +545,9 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 
 > **Battery telemetry** is optional for backwards compatibility. Older clients
 > that never send `BATTERY_UPDATE` remain valid; their device rows simply omit
-> `battery`. New clients send one update immediately after WebSocket connect and
-> then every 5 minutes while the foreground service is running. The server stores
+> `battery`. New clients send one update after canonical `REGISTERED` and then
+> every 5 minutes while the foreground service has an acknowledged connection.
+> Disconnect stops telemetry; provisional connections never send it. The server stores
 > the latest battery state in `device_registry.json`, so offline devices retain
 > their last-known battery percentage and charging state.
 

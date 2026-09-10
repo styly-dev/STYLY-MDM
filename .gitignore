@@ -41,7 +41,7 @@ mdm-server/device_registry.json.tmp
 # === Agent workflow scratch ===
 # Per-task scratch plan, rewritten every task. tasks/lessons.md is intentionally
 # NOT ignored: it accumulates persistent lessons meant to be shared via git.
-tasks/todo.md
+**/tasks/todo.md
 
 # === Misc ===
 nanobanana-output/*.png
