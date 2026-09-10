@@ -1263,7 +1263,7 @@
             updateBtn +
             '</div>';
         }
-        deviceCell += '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.ip || '-') + '</div>';
+        deviceCell += '<div class="dev-sub"><span title="' + esc(id) + '">' + esc(d.identity_kind === 'canonical' ? id.slice(0, 8) : id) + '</span> · ' + esc(d.ip || '-') + '</div>';
 
         let status;
         if (d.status === 'registering') {
@@ -1983,7 +1983,7 @@
             '<div class="selbox ' + (mem ? 'on' : '') + '">' + (mem ? '✓' : '') + '</div>' +
             '<div class="mg-dev-main">' +
             '<div>' + (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') + '</div>' +
-            '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') + '</div></div>' +
+            '<div class="dev-sub"><span title="' + esc(id) + '">' + esc(d.identity_kind === 'canonical' ? id.slice(0, 8) : id) + '</span> · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') + '</div></div>' +
             '<div class="mg-dev-status"><span class="dot ' + (off ? 'off' : '') + '"></span>' + (off ? 'Offline' : 'Online') + '</div>' +
             '</div>';
         }).join('');
