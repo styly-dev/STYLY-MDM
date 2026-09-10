@@ -280,6 +280,10 @@ class WebSocketManager(
         if (current != null) pushCoordinator.detachTransport(current)
         current?.close(1000, "Client disconnecting")
         webSocket = null
+        resetConnectionState()
+    }
+
+    private fun resetConnectionState() {
         socketOpen = false
         canonicalRegistrationSent = false
         canonicalRegistrationAcknowledged = false
@@ -376,6 +380,8 @@ class WebSocketManager(
         if (current != null) pushCoordinator.detachTransport(current)
         current?.cancel()
         webSocket = null
+        resetConnectionState()
+        stopBatteryTelemetry()
     }
 
     private fun doConnect(url: String) {
@@ -427,7 +433,11 @@ class WebSocketManager(
                             }
                         }
                     } else if (type == "REGISTERED_PROVISIONAL") {
-                        publishConnectedStatus(identityResolver.snapshot())
+                        reconnectHandler.post {
+                            if (this@WebSocketManager.webSocket === webSocket) {
+                                publishConnectedStatus(identityResolver.snapshot())
+                            }
+                        }
                     } else if (!canonicalRegistrationAcknowledged) {
                         Log.w(TAG, "Ignoring $type before canonical registration acknowledgement")
                     } else if (type.isNotEmpty() && !pushCoordinator.handleServerMessage(type, json)) {
@@ -461,10 +471,7 @@ class WebSocketManager(
             pushCoordinator.detachTransport(deadSocket)
             if (webSocket !== deadSocket) return@post
             webSocket = null
-            socketOpen = false
-            canonicalRegistrationSent = false
-            canonicalRegistrationAcknowledged = false
-            connectedServerAddress = null
+            resetConnectionState()
             stopBatteryTelemetry()
             onStatusChanged(false, message)
             dispatch(scheduler.onSocketDisconnected(SystemClock.uptimeMillis()))
@@ -504,7 +511,6 @@ class WebSocketManager(
                 val pushFields = pushCoordinator.registrationFields()
                 put("process_instance_id", pushFields.getString("process_instance_id"))
                 put("capabilities", pushFields.getJSONArray("capabilities"))
-                put("push_state", JSONObject().put("status", "available"))
                 put("push_runtime", pushFields.getJSONObject("push_runtime"))
                 val startupConfig = getStartupAppConfig()
                 if (startupConfig != null) {

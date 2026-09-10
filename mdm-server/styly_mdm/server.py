@@ -26,6 +26,7 @@ from aiohttp import WSCloseCode, web
 # built from a folder could never match the device that folder was pushed to.
 # The hash helpers compute the reference a client checks a downloaded APK against
 # before installing it (#39) — same algorithms as the #37 verify feature.
+from .device_policy import command_allowed
 from .integrity import apk_cd_digest, file_sha256, is_os_metadata
 
 logging.basicConfig(
@@ -161,8 +162,6 @@ REGISTRY_PATH = DATA_DIR / "device_registry.json"
 MAX_LABEL_LEN = 64
 MAX_GROUP_NAME_LEN = 64
 IDENTITY_SCHEME = "styly_device_id_v1"
-IDENTITY_MODE_LEGACY = "legacy-compatible"
-IDENTITY_MODE_STRICT = "cutover-strict"
 CANONICAL_DEVICE_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
@@ -372,26 +371,6 @@ def load_registry() -> None:
         if record is not None:
             loaded_devices[serial] = record
 
-    if _identity_mode() == IDENTITY_MODE_STRICT:
-        invalid_devices = [
-            serial for serial, record in loaded_devices.items()
-            if record["identity_kind"] != "canonical"
-            or not CANONICAL_DEVICE_ID_RE.fullmatch(serial)
-        ]
-        invalid_group_members = [
-            member
-            for members in loaded_groups.values()
-            for member in members
-            if not CANONICAL_DEVICE_ID_RE.fullmatch(member)
-        ]
-        if invalid_devices or invalid_group_members:
-            raise RuntimeError(
-                "cutover-strict found pre-cutover identity state in "
-                f"{REGISTRY_PATH}: {len(invalid_devices)} non-canonical device record(s), "
-                f"{len(invalid_group_members)} invalid group membership(s). "
-                "Stop the server, back up the data directory, and complete the documented reset."
-            )
-
     device_registry.update(loaded_devices)
     device_groups.update(loaded_groups)
     log.info("Loaded %d device(s) and %d group(s) from registry",
@@ -430,7 +409,8 @@ def build_device_list_msg() -> str:
             "label": device_registry.get(d["device_id"], {}).get("label", ""),
             "model": d["model"],
             "ip": d["ip"],
-            "status": "online",
+            "status": d.get("status", "online"),
+            "identity_kind": d.get("identity_kind", "legacy"),
             "startup_app": d.get("startup_app"),
             "battery": d.get("battery"),
             "last_seen": device_registry.get(d["device_id"], {}).get("last_seen"),
@@ -874,7 +854,8 @@ async def _resolve_pending_self_update(
     if not success:
         del pending_self_updates[device_id]
         return
-    if entry.get("expected_full_sha256") and entry.get("package_name"):
+    if (entry.get("expected_full_sha256") and entry.get("package_name")
+            and command_allowed(devices.get(device_id))):
         entry["phase"] = "verifying"
         entry["timeout_task"] = None
         try:
@@ -904,7 +885,9 @@ async def _resolve_pending_self_update(
             "device_id": device_id,
             "correlation_id": entry["correlation_id"],
             "status": "skipped",
-            "detail": "no reference hashes for the installed APK",
+            "detail": ("legacy identity only supports APK installation/update"
+                       if entry.get("identity_kind") == "legacy"
+                       else "no reference hashes for the installed APK"),
         })
 
 
@@ -1042,11 +1025,10 @@ async def _resolve_pending_retire(device_id: str) -> None:
     })
 
 
-def resolve_target_ids(target_devices: list[str]) -> list[str]:
-    """Return online device IDs matching a target list, or all devices for ["*"]."""
-    if not target_devices or target_devices == ["*"]:
-        return list(devices.keys())
-    return [d for d in target_devices if d in devices]
+def resolve_target_ids(target_devices: list[str], *, allow_legacy: bool = False) -> list[str]:
+    """Return ready, permitted owners matching a target list or wildcard."""
+    targets = list(devices) if not target_devices or target_devices == ["*"] else target_devices
+    return [d for d in targets if command_allowed(devices.get(d), "EXECUTE_INSTALL" if allow_legacy else None)]
 
 
 def sanitize_apk_filename(filename: str | None) -> str | None:
@@ -1280,15 +1262,6 @@ def _owns_device(device_id: str | None, ws: web.WebSocketResponse) -> bool:
     return entry is not None and entry.get("ws") is ws
 
 
-def _identity_mode() -> str:
-    mode = os.environ.get("MDM_DEVICE_IDENTITY_MODE", IDENTITY_MODE_LEGACY)
-    if mode not in {IDENTITY_MODE_LEGACY, IDENTITY_MODE_STRICT}:
-        raise ValueError(
-            "MDM_DEVICE_IDENTITY_MODE must be legacy-compatible or cutover-strict"
-        )
-    return mode
-
-
 def _bounded_registration_text(value, fallback: str, limit: int) -> str:
     return value[:limit] if isinstance(value, str) else fallback[:limit]
 
@@ -1307,8 +1280,6 @@ def _parse_registration(data: dict, remote: str | None) -> tuple[str, dict] | tu
     )
 
     if scheme is None:
-        if _identity_mode() == IDENTITY_MODE_STRICT:
-            return None, "Legacy registration is disabled after the Device ID cutover"
         if not isinstance(device_id, str) or not device_id or len(device_id) > 128:
             return None, "Legacy REGISTER requires a bounded non-empty device_id"
         return "legacy", {**common, "device_id": device_id, "startup_app": data.get("startup_app")}
@@ -1347,11 +1318,13 @@ async def _close_protocol_error(ws: web.WebSocketResponse, message: str) -> None
     log.warning("Device registration protocol error: %s", message)
     try:
         await ws.send_str(json.dumps({"type": "ERROR", "message": message}))
+    except ConnectionResetError:
+        pass
     finally:
         await ws.close(code=WSCloseCode.PROTOCOL_ERROR, message=message.encode("utf-8")[:120])
 
 
-async def _complete_canonical_registration(
+async def _complete_device_registration(
     ws: web.WebSocketResponse,
     device_id: str,
     payload: dict,
@@ -1367,6 +1340,8 @@ async def _complete_canonical_registration(
         )
         return
     await ws.send_str(json.dumps({"type": "REGISTERED"}))
+    if _owns_device(device_id, ws):
+        devices[device_id]["registration_ready"] = True
 
 
 async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -1416,10 +1391,10 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         if kind != socket_identity_kind or requested_id != device_id:
                             await _close_protocol_error(
                                 ws,
-                                "A canonical socket cannot change its identity kind or device_id",
+                                "A registered socket cannot change its identity kind or device_id",
                             )
                             break
-                        await _complete_canonical_registration(
+                        await _complete_device_registration(
                             ws,
                             device_id,
                             data,
@@ -1462,9 +1437,10 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "ws": ws,
                         "device_id": device_id,
                         "identity_kind": kind,
+                        "registration_ready": False,
                         "model": model,
                         "ip": ip,
-                        "status": "online",
+                        "status": "registering",
                         "startup_app": startup_app,
                         "battery": prev.get("battery"),
                         "version_code": version_code,
@@ -1488,16 +1464,12 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         kind.capitalize(), device_id, model,
                         version_code if version_code is not None else "?",
                     )
-                    had_pending_retire = device_id in pending_retires
-                    had_pending_self_update = device_id in pending_self_updates
-                    if kind == "legacy":
-                        # Preserve the established legacy timing during the rollout:
-                        # old test/clients do not wait for REGISTERED before an admin
-                        # connects, so publish their row before Push acknowledgement.
-                        await broadcast_device_list()
-                    await _complete_canonical_registration(
+                    await _complete_device_registration(
                         ws, device_id, data, idempotent=False,
                     )
+                    if not _owns_device(device_id, ws):
+                        continue
+                    devices[device_id]["status"] = "online"
                     if prev.get("retired"):
                         log.info("Retired device re-registered, re-adopting: %s", device_id)
                     await _resolve_pending_retire(device_id)
@@ -1505,7 +1477,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     if kind == "canonical":
                         await broadcast_provisional_connection_list()
                         await broadcast_device_list()
-                    elif had_pending_retire or had_pending_self_update:
+                    else:
                         await broadcast_device_list()
 
                 elif msg_type == "BATTERY_UPDATE":
@@ -2481,7 +2453,7 @@ async def handle_install_apk(admin_ws: web.WebSocketResponse, data: dict):
         }))
         return
 
-    target_ids = resolve_target_ids(target_devices)
+    target_ids = resolve_target_ids(target_devices, allow_legacy=True)
 
     if not target_ids:
         await admin_ws.send_str(json.dumps({
@@ -2565,10 +2537,10 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
         async with sem:
             counts["queued"] -= 1
             entry = devices.get(device_id)
-            if entry is None:
+            if not command_allowed(entry, "EXECUTE_INSTALL"):
                 # Went offline (or never online) before its turn — do not hold a
                 # slot waiting for a device that cannot download.
-                await fail_one(device_id, "Device went offline before its turn")
+                await fail_one(device_id, "Device is offline or still registering")
                 return
             try:
                 await entry["ws"].send_str(execute_msg)
@@ -2767,8 +2739,8 @@ async def _run_push_job(
         async with sem:
             counts["queued"] -= 1
             entry = devices.get(device_id)
-            if entry is None:
-                await fail_one(device_id, "Device went offline before its turn")
+            if not command_allowed(entry, "EXECUTE_PUSH_FILES"):
+                await fail_one(device_id, "Device is no longer eligible for Push/Sync")
                 return
             try:
                 await entry["ws"].send_str(execute_msg)
@@ -3351,7 +3323,6 @@ def probe_existing_server(timeout: float = 1.0) -> str | None:
 
 def create_app() -> web.Application:
     # Ensure the writable data directory exists before loading/saving the registry.
-    _identity_mode()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     load_registry()
     app = web.Application(

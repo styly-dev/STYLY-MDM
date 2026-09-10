@@ -30,7 +30,6 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var storagePermissionStatus: TextView
     private lateinit var grantStorageButton: Button
     private lateinit var deviceIdentityStatus: TextView
-    private lateinit var retryDeviceIdentityButton: Button
     private lateinit var journalText: TextView
     private lateinit var journalRefreshButton: Button
     private lateinit var journalClearButton: Button
@@ -67,7 +66,6 @@ class SettingsActivity : AppCompatActivity() {
         storagePermissionStatus = findViewById(R.id.storage_permission_status)
         grantStorageButton = findViewById(R.id.grant_storage_button)
         deviceIdentityStatus = findViewById(R.id.device_identity_status)
-        retryDeviceIdentityButton = findViewById(R.id.retry_device_identity_button)
         journalText = findViewById(R.id.journal_text)
         journalRefreshButton = findViewById(R.id.journal_refresh_button)
         journalClearButton = findViewById(R.id.journal_clear_button)
@@ -84,10 +82,6 @@ class SettingsActivity : AppCompatActivity() {
 
         grantStorageButton.setOnClickListener {
             requestAllFilesAccess()
-        }
-
-        retryDeviceIdentityButton.setOnClickListener {
-            MdmClientApplication.deviceIdentityResolver().retry()
         }
 
         journalRefreshButton.setOnClickListener {
@@ -190,7 +184,6 @@ class SettingsActivity : AppCompatActivity() {
             DeviceIdentityState.Resolving -> {
                 deviceIdentityStatus.setText(R.string.device_identity_resolving)
                 deviceIdentityStatus.setTextColor(0xFFFFA000.toInt())
-                retryDeviceIdentityButton.isEnabled = false
             }
             is DeviceIdentityState.Ready -> {
                 deviceIdentityStatus.text = getString(
@@ -198,7 +191,6 @@ class SettingsActivity : AppCompatActivity() {
                     state.deviceId,
                 )
                 deviceIdentityStatus.setTextColor(0xFF4CAF50.toInt())
-                retryDeviceIdentityButton.visibility = View.GONE
             }
             is DeviceIdentityState.Unavailable -> {
                 deviceIdentityStatus.text = getString(
@@ -207,8 +199,6 @@ class SettingsActivity : AppCompatActivity() {
                     state.diagnostic,
                 )
                 deviceIdentityStatus.setTextColor(0xFFFF5722.toInt())
-                retryDeviceIdentityButton.visibility = View.VISIBLE
-                retryDeviceIdentityButton.isEnabled = true
             }
         }
     }

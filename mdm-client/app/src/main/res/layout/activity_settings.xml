@@ -107,16 +107,11 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/device_identity_resolving"
+            android:scrollHorizontally="false"
+            android:breakStrategy="simple"
             android:textIsSelectable="true"
             android:textSize="16sp"
             android:textStyle="bold" />
-
-        <Button
-            android:id="@+id/retry_device_identity_button"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="@string/retry_device_identity" />
 
         <TextView
             android:layout_width="match_parent"

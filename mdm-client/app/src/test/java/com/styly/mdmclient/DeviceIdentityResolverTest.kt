@@ -18,7 +18,6 @@ class DeviceIdentityResolverTest {
             DeviceIdentityLookupResult(
                 DeviceIdStatus.SUCCESS,
                 "64B19041-0B8C-4EF4-82FD-000000000000",
-                2,
                 true,
                 "",
             )
@@ -28,24 +27,21 @@ class DeviceIdentityResolverTest {
         assertEquals(
             DeviceIdentityState.Ready(
                 "64b19041-0b8c-4ef4-82fd-000000000000",
-                2,
-                true,
             ),
             resolver.snapshot(),
         )
-        assertFalse(resolver.retry())
+        assertFalse(resolver.startInitialLookup())
         assertEquals(1, calls)
     }
 
     @Test
-    fun unavailableResultRetriesOnlyWhenExplicitlyRequested() {
+    fun unavailableResultDoesNotRetryInTheSameProcess() {
         var calls = 0
         val resolver = DeviceIdentityResolver(directExecutor) {
             calls += 1
             DeviceIdentityLookupResult(
                 DeviceIdStatus.ACCESS_DENIED,
                 null,
-                0,
                 false,
                 "permission\nrequired",
             )
@@ -61,37 +57,37 @@ class DeviceIdentityResolverTest {
             ),
             resolver.snapshot(),
         )
-        assertTrue(resolver.retry())
-        assertEquals(2, calls)
+        assertFalse(resolver.startInitialLookup())
+        assertEquals(1, calls)
     }
 
     @Test
-    fun overlappingRetryIsSingleFlight() {
+    fun overlappingLookupIsSingleFlight() {
         val queued = mutableListOf<Runnable>()
         val resolver = DeviceIdentityResolver(Executor { queued += it }) {
-            DeviceIdentityLookupResult(DeviceIdStatus.IO_ERROR, null, 0, false, "failed")
+            DeviceIdentityLookupResult(DeviceIdStatus.IO_ERROR, null, false, "failed")
         }
 
         assertTrue(resolver.startInitialLookup())
-        assertFalse(resolver.retry())
+        assertFalse(resolver.startInitialLookup())
         assertEquals(1, queued.size)
         queued.single().run()
-        assertTrue(resolver.retry())
-        assertEquals(2, queued.size)
+        assertFalse(resolver.startInitialLookup())
+        assertEquals(1, queued.size)
     }
 
     @Test
-    fun completionListenerCannotStartRetryBeforeCompletionFinishesPublishing() {
+    fun completionListenerCannotRestartLookup() {
         var calls = 0
         val retryResults = mutableListOf<Boolean>()
         lateinit var resolver: DeviceIdentityResolver
         resolver = DeviceIdentityResolver(directExecutor) {
             calls += 1
-            DeviceIdentityLookupResult(DeviceIdStatus.IO_ERROR, null, 0, false, "failed")
+            DeviceIdentityLookupResult(DeviceIdStatus.IO_ERROR, null, false, "failed")
         }
         resolver.addListener { state ->
             if (state is DeviceIdentityState.Unavailable && retryResults.isEmpty()) {
-                retryResults += resolver.retry()
+                retryResults += resolver.startInitialLookup()
             }
         }
 
@@ -99,7 +95,54 @@ class DeviceIdentityResolverTest {
 
         assertEquals(listOf(false), retryResults)
         assertEquals(1, calls)
-        assertTrue(resolver.retry())
-        assertEquals(2, calls)
+        assertFalse(resolver.startInitialLookup())
+        assertEquals(1, calls)
+    }
+
+    @Test
+    fun invalidGuidFromSuccessfulProviderIsReportedWithoutRetry() {
+        var calls = 0
+        val resolver = DeviceIdentityResolver(directExecutor) {
+            calls += 1
+            DeviceIdentityLookupResult(
+                DeviceIdStatus.SUCCESS,
+                "not-a-canonical-guid",
+                true,
+                "provider returned success",
+            )
+        }
+
+        assertTrue(resolver.startInitialLookup())
+        assertEquals(
+            DeviceIdentityState.Unavailable(
+                DeviceIdentityStatus.IO_ERROR,
+                "Device ID provider returned an invalid canonical GUID",
+                true,
+            ),
+            resolver.snapshot(),
+        )
+        assertFalse(resolver.startInitialLookup())
+        assertEquals(1, calls)
+    }
+
+    @Test
+    fun providerExceptionIsReportedWithoutRetry() {
+        var calls = 0
+        val resolver = DeviceIdentityResolver(directExecutor) {
+            calls += 1
+            error("provider\nexception")
+        }
+
+        assertTrue(resolver.startInitialLookup())
+        assertEquals(
+            DeviceIdentityState.Unavailable(
+                DeviceIdentityStatus.IO_ERROR,
+                "provider exception",
+                false,
+            ),
+            resolver.snapshot(),
+        )
+        assertFalse(resolver.startInitialLookup())
+        assertEquals(1, calls)
     }
 }

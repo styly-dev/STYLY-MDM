@@ -317,7 +317,7 @@ class PushFilesWorkerTest {
     fun `destination validation accepts an ordinary shared storage child`() {
         val root = tmp.newFolder("ordinary-shared")
         val target = PushFilesWorker().validateDestinationAgainstRoot(
-            "${root.canonicalPath}/safe/content",
+            "/sdcard/safe/content",
             root,
         )
         assertEquals(File(root, "safe/content").canonicalFile, target)

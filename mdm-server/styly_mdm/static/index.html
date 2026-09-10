@@ -103,18 +103,14 @@
     .targets { border-right: 1px solid var(--border); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
     .actions { background: var(--bg-actions); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
     .targets-head, .subtabs { flex: 0 0 auto; }
-    .identity-health { margin: 10px 20px 4px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-actions); font-size: 12px; }
-    .identity-title { font-weight: 700; color: var(--text-primary); margin-bottom: 5px; }
-    .identity-counts { display: flex; gap: 18px; color: var(--text-secondary); }
-    .identity-counts strong { color: var(--text-primary); }
-    .provisional-list { margin-top: 8px; border-top: 1px solid var(--border-soft); }
-    .provisional-row { padding: 8px 0; display: grid; grid-template-columns: minmax(110px, 1fr) minmax(90px, .7fr) minmax(100px, .8fr); gap: 8px; border-top: 1px solid var(--border-soft); }
-    .provisional-row:first-child { border-top: none; }
-    .provisional-main { min-width: 0; }
-    .provisional-model { font-weight: 600; }
-    .provisional-meta, .provisional-time { color: var(--text-muted); font-size: 11px; }
-    .provisional-status { color: var(--warning); }
-    .provisional-diagnostic { color: var(--text-secondary); overflow-wrap: anywhere; }
+    .attention-list { padding: 14px 20px; }
+    .attention-row { display: grid; grid-template-columns: minmax(150px, .8fr) minmax(0, 1.6fr); gap: 16px; padding: 12px 0; border-top: 1px solid var(--border-soft); }
+    .attention-row:first-child { border-top: none; }
+    .attention-device, .attention-detail { min-width: 0; }
+    .attention-model { color: var(--text-primary); font-weight: 600; overflow-wrap: anywhere; }
+    .attention-meta { margin-top: 3px; color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; }
+    .attention-status { color: var(--warning); font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+    .attention-diagnostic { margin-top: 3px; color: var(--text-secondary); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; word-break: break-word; }
     .actions > .zone-label, .sel-card, .push-attention { flex: 0 0 auto; }
 
     /* Drag handles */
@@ -124,13 +120,14 @@
     .h-gutter:hover, .h-gutter.dragging { background: var(--accent); opacity: .5; }
 
     /* Sub-tabs */
-    .subtabs { display: flex; align-items: center; padding: 8px 20px 0; }
+    .subtabs { display: flex; align-items: center; padding: 8px 20px 0; overflow-x: auto; }
     .subtab {
-      padding: 11px 16px; font-size: 14px; font-weight: 600; color: var(--text-secondary);
+      padding: 11px 16px; font-size: 14px; font-weight: 600; color: var(--text-secondary); white-space: nowrap;
       border: none; background: none; font-family: inherit; cursor: pointer;
       border-bottom: 2px solid transparent;
     }
     .subtab .cnt { color: var(--text-secondary); font-weight: 400; }
+    #tabAttention.has-items .cnt { color: var(--warning); }
     .subtab.active { color: var(--text-primary); border-bottom-color: var(--accent); }
     .subtab.active .cnt { color: var(--text-secondary); }
     .subtabs-fill { flex: 1; border-bottom: 1px solid var(--border); align-self: stretch; }
@@ -376,6 +373,8 @@
       .v-gutter, .h-gutter { display: none; }
       .logzone { height: auto; }
       .log-body { flex: 0 0 auto; max-height: 220px; }
+      .attention-row { grid-template-columns: 1fr; gap: 4px; }
+      .subtab { padding-left: 10px; padding-right: 10px; }
       .manage-grid { grid-template-columns: 1fr; }
       .mg-sidebar { border-right: none; border-bottom: 1px solid var(--border); }
     }
@@ -402,10 +401,10 @@
             <span class="zone-label">① Targets</span>
             <button class="manage-btn" id="btnManageGroups">Manage Groups</button>
           </div>
-          <div class="identity-health" id="identityHealth"></div>
           <div class="subtabs">
             <button class="subtab active" id="tabGroups" data-tab="groups">Groups <span class="cnt" id="cntGroups">0</span></button>
             <button class="subtab" id="tabDevices" data-tab="devices">Devices <span class="cnt" id="cntDevices">0</span></button>
+            <button class="subtab" id="tabAttention" data-tab="attention">Needs attention <span class="cnt" id="cntAttention">0</span></button>
             <div class="subtabs-fill"></div>
           </div>
           <div class="dev-toolbar" id="devToolbar" style="display:none">
@@ -603,7 +602,7 @@
       let groups = {};                 // name -> [serials]
       let selectedIds = new Set();
       let activeGroup = null;          // group name driving the selection, or null
-      let targetTab = 'groups';        // 'groups' | 'devices'
+      let targetTab = 'groups';        // 'groups' | 'devices' | 'attention'
       let userPickedTab = false;       // true once the user clicks a sub-tab (stops auto-default)
       let expandedGroups = new Set();  // group names expanded to show per-device status
       let view = 'console';            // 'console' | 'manage'
@@ -655,11 +654,12 @@
       const connText = document.getElementById('connText');
       const tabGroups = document.getElementById('tabGroups');
       const tabDevices = document.getElementById('tabDevices');
+      const tabAttention = document.getElementById('tabAttention');
       const btnManageGroups = document.getElementById('btnManageGroups');
       const cntGroups = document.getElementById('cntGroups');
       const cntDevices = document.getElementById('cntDevices');
+      const cntAttention = document.getElementById('cntAttention');
       const targetsBody = document.getElementById('targetsBody');
-      const identityHealth = document.getElementById('identityHealth');
       const devToolbar = document.getElementById('devToolbar');
       const devSearchInput = document.getElementById('devSearch');
       const devStatusFilter = document.getElementById('devStatusFilter');
@@ -912,7 +912,12 @@
           }
           case 'PROVISIONAL_CONNECTION_LIST': {
             provisionalConnections = Array.isArray(msg.connections) ? msg.connections : [];
-            renderIdentityHealth();
+            // Keep the normal device table and any active label editor intact while
+            // the status-only attention list updates in the background.
+            if (view === 'console') {
+              renderTabs();
+              if (targetTab === 'attention') renderTargets();
+            }
             break;
           }
           case 'GROUP_LIST': {
@@ -1057,7 +1062,6 @@
         // The top-bar version's red state depends on the device list, so refresh it
         // on every render (device rows below carry the reverse, client-behind flag).
         updateServerVersionBadge();
-        renderIdentityHealth();
         if (view === 'manage') {
           manageView.style.display = '';
           consoleView.style.display = 'none';
@@ -1075,36 +1079,14 @@
         }
       }
 
-      function formatIdentityTime(value) {
-        if (typeof value !== 'number') return 'unknown';
-        return new Date(value * 1000).toLocaleString();
-      }
-
-      function renderIdentityHealth() {
-        const identified = devices.filter(function (d) { return d.status === 'online'; }).length;
-        let html = '<div class="identity-title">Device Identity</div>' +
-          '<div class="identity-counts"><span>Identified online <strong>' + identified + '</strong></span>' +
-          '<span>Device ID unavailable <strong>' + provisionalConnections.length + '</strong></span></div>';
-        if (provisionalConnections.length) {
-          html += '<div class="provisional-list">' + provisionalConnections.map(function (entry) {
-            const version = entry.version_name ? 'v' + entry.version_name : 'version unknown';
-            return '<div class="provisional-row">' +
-              '<div class="provisional-main"><div class="provisional-model">' + esc(entry.model || 'unknown') + '</div>' +
-              '<div class="provisional-meta">' + esc(entry.ip || 'unknown') + ' · ' + esc(version) + '</div></div>' +
-              '<div><div class="provisional-status">' + esc(entry.identity_status || 'unknown') + '</div>' +
-              '<div class="provisional-diagnostic">' + esc(entry.diagnostic || '') + '</div></div>' +
-              '<div class="provisional-time"><div>Connected ' + esc(formatIdentityTime(entry.connected_at)) + '</div>' +
-              '<div>Updated ' + esc(formatIdentityTime(entry.last_status_at)) + '</div></div></div>';
-          }).join('') + '</div>';
-        }
-        identityHealth.innerHTML = html;
-      }
-
       function renderTabs() {
         cntGroups.textContent = groupNames().length;
         cntDevices.textContent = devices.length;
+        cntAttention.textContent = provisionalConnections.length;
+        tabAttention.classList.toggle('has-items', provisionalConnections.length > 0);
         tabGroups.classList.toggle('active', targetTab === 'groups');
         tabDevices.classList.toggle('active', targetTab === 'devices');
+        tabAttention.classList.toggle('active', targetTab === 'attention');
       }
 
       function renderTargets() {
@@ -1116,8 +1098,23 @@
         if (showToolbar && devSearchInput.value !== deviceSearch) devSearchInput.value = deviceSearch;
         if (showToolbar) syncStatusFilterButtons();
         const hadFocus = labelInputFocused();
-        targetsBody.innerHTML = targetTab === 'groups' ? renderGroupsHtml() : renderDevicesHtml();
+        targetsBody.innerHTML = targetTab === 'groups'
+          ? renderGroupsHtml()
+          : (targetTab === 'devices' ? renderDevicesHtml() : renderAttentionHtml());
         if (targetTab === 'devices') restoreLabelEditFocus(hadFocus);
+      }
+
+      function renderAttentionHtml() {
+        if (!provisionalConnections.length) return '<div class="empty">No devices need attention</div>';
+        return '<div class="attention-list">' + provisionalConnections.map(function (entry) {
+          const version = entry.version_name ? 'v' + entry.version_name : 'version unknown';
+          return '<div class="attention-row">' +
+            '<div class="attention-device"><div class="attention-model">' + esc(entry.model || 'Unknown device') + '</div>' +
+            '<div class="attention-meta">' + esc(entry.ip || 'unknown') + ' · ' + esc(version) + '</div></div>' +
+            '<div class="attention-detail"><div class="attention-status">' + esc(entry.identity_status || 'unknown') + '</div>' +
+            '<div class="attention-diagnostic">' + esc(entry.diagnostic || 'No diagnostic available') + '</div></div>' +
+            '</div>';
+        }).join('') + '</div>';
       }
 
       function labelInputFocused() {
@@ -1269,7 +1266,9 @@
         deviceCell += '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.ip || '-') + '</div>';
 
         let status;
-        if (d.status === 'updating') {
+        if (d.status === 'registering') {
+          status = '<span class="dot updating"></span>Registering…';
+        } else if (d.status === 'updating') {
           status = '<span class="dot updating"></span>Updating…';
         } else if (d.status === 'retiring') {
           status = '<span class="dot retiring"></span>Retiring…';
@@ -1450,6 +1449,7 @@
         if (n === 0) ctx = 'Select devices or a group to act on';
         else if (activeGroup) ctx = 'via group "' + esc(activeGroup) + '" · ' + on + ' online' + (off ? ' · ' + off + ' offline skipped' : '');
         else ctx = on + ' online' + (off ? ' · ' + off + ' offline skipped' : '') + ' · add or remove individually';
+        if (Array.from(selectedIds).some(function (id) { return (deviceById(id) || {}).identity_kind === 'legacy'; })) ctx += ' · Legacy devices: APK installation/update only';
         selCard.innerHTML =
           '<div class="sel-head">' +
           '<span class="sel-badge ' + (n ? '' : 'zero') + '">' + n + '</span>' +
@@ -1462,8 +1462,9 @@
 
 
       function updateButtons() {
-        const has = selectedIds.size > 0;
-        btnInstall.disabled = uploadInProgress || apkFile.files.length === 0 || !has;
+        const has = Array.from(selectedIds).some(function (id) { const d = deviceById(id); return d && isOnline(d) && d.identity_kind !== 'legacy'; });
+        const hasInstall = Array.from(selectedIds).some(function (id) { return isOnline(deviceById(id)); });
+        btnInstall.disabled = uploadInProgress || apkFile.files.length === 0 || !hasInstall;
         btnLaunch.disabled = launchPkg.value.trim() === '' || !has;
         btnUninstall.disabled = !uninstallConfirm.checked || uninstallPkg.value.trim() === '' || !has;
         btnStartupSet.disabled = startupPkg.value.trim() === '' || !has;
@@ -1521,12 +1522,14 @@
       function clearSelection() { selectedIds.clear(); activeGroup = null; render(); }
 
       // Split into online/offline; warn about skipped offline; return reachable subset.
-      function onlineTargets(ids) {
+      function onlineTargets(ids, allowLegacy = false) {
         const online = new Set(getOnlineIds());
         const reach = ids.filter(function (id) { return online.has(id); });
         const skip = ids.filter(function (id) { return !online.has(id); });
         if (skip.length) addLog('Skipping ' + skip.length + ' offline device(s): ' + skip.map(labelFor).join(', '), 'warn');
-        return reach;
+        const permitted = reach.filter(function (id) { return allowLegacy || (deviceById(id) || {}).identity_kind !== "legacy"; });
+        if (permitted.length !== reach.length) addLog("Skipping legacy devices: APK installation/update only", "warn");
+        return permitted;
       }
 
       // ---------------- Commands ----------------
@@ -1571,7 +1574,7 @@
 
       function sendInstall() {
         if (uploadInProgress) return;
-        const online = onlineTargets(Array.from(selectedIds));
+        const online = onlineTargets(Array.from(selectedIds), true);
         if (!online.length) { addLog('No online devices selected to install', 'warn'); return; }
         ensureUploaded().then(function (apk) {
           if (!wsSend({ type: 'INSTALL_APK', target_devices: online, apk_url: apk.apk_url, apk_filename: apk.apk_filename }, 'install')) return;
@@ -2576,6 +2579,7 @@
       // Sub-tabs
       tabGroups.addEventListener('click', function () { targetTab = 'groups'; userPickedTab = true; render(); });
       tabDevices.addEventListener('click', function () { targetTab = 'devices'; userPickedTab = true; render(); });
+      tabAttention.addEventListener('click', function () { targetTab = 'attention'; userPickedTab = true; render(); });
       btnManageGroups.addEventListener('click', function () {
         openManage(null);
         const inp = mgSidebar.querySelector('[data-mg-new]');

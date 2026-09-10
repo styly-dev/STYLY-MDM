@@ -64,7 +64,7 @@ def reset_state():
 
 def add_device(device_id: str) -> FakeWS:
     ws = FakeWS()
-    server.devices[device_id] = {
+    server.devices[device_id] = {"registration_ready": True, "identity_kind": "canonical",
         "ws": ws, "device_id": device_id, "model": "M",
         "ip": "1.1.1.1", "status": "online", "startup_app": None, "battery": None,
     }
@@ -396,7 +396,8 @@ async def _wait_online(admin, expected: set[str], timeout: float = 2.0) -> None:
 
 async def _register(session, base: str, device_id: str):
     ws = await session.ws_connect(base + "/ws/device")
-    await ws.send_json({"type": "REGISTER", "device_id": device_id, "model": "M", "ip": "1.1.1.2"})
+    await ws.send_json({"type": "REGISTER", "identity_scheme": server.IDENTITY_SCHEME, "device_id": device_id, "model": "M", "ip": "1.1.1.2"})
+    await _recv(ws, "REGISTERED")
     return ws
 
 
@@ -419,13 +420,13 @@ def test_e2e_push_download_complete_and_result_release(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                d0 = await _register(session, base, "dev0")
-                d1 = await _register(session, base, "dev1")
-                d2 = await _register(session, base, "dev2")
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
+                d1 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000001")
+                d2 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000002")
                 admin = await session.ws_connect(base + "/ws/admin")
-                await _wait_online(admin, {"dev0", "dev1", "dev2"})
+                await _wait_online(admin, {"64b19041-0b8c-4ef4-82fd-000000000000", "64b19041-0b8c-4ef4-82fd-000000000001", "64b19041-0b8c-4ef4-82fd-000000000002"})
 
-                await _send_push(admin, ["dev0", "dev1", "dev2"], base)
+                await _send_push(admin, ["64b19041-0b8c-4ef4-82fd-000000000000", "64b19041-0b8c-4ef4-82fd-000000000001", "64b19041-0b8c-4ef4-82fd-000000000002"], base)
 
                 # N == 1: only dev0 downloads the bundle; dev1/dev2 are gated.
                 assert await _recv(d0, "EXECUTE_PUSH_FILES") is not None
@@ -467,12 +468,12 @@ def test_e2e_install_result_does_not_free_a_push_slot(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                d0 = await _register(session, base, "dev0")
-                d1 = await _register(session, base, "dev1")
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
+                d1 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000001")
                 admin = await session.ws_connect(base + "/ws/admin")
-                await _wait_online(admin, {"dev0", "dev1"})
+                await _wait_online(admin, {"64b19041-0b8c-4ef4-82fd-000000000000", "64b19041-0b8c-4ef4-82fd-000000000001"})
 
-                await _send_push(admin, ["dev0", "dev1"], base)
+                await _send_push(admin, ["64b19041-0b8c-4ef4-82fd-000000000000", "64b19041-0b8c-4ef4-82fd-000000000001"], base)
                 assert await _recv(d0, "EXECUTE_PUSH_FILES") is not None
                 assert await _recv(d1, "EXECUTE_PUSH_FILES", timeout=0.3) is None
 
@@ -512,11 +513,11 @@ def test_e2e_applying_state_arrives_before_the_terminal_result(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                d0 = await _register(session, base, "dev0")
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
-                await _wait_online(admin, {"dev0"})
+                await _wait_online(admin, {"64b19041-0b8c-4ef4-82fd-000000000000"})
 
-                await _send_push(admin, ["dev0"], base)
+                await _send_push(admin, ["64b19041-0b8c-4ef4-82fd-000000000000"], base)
                 assert await _recv(d0, "EXECUTE_PUSH_FILES") is not None
 
                 await d0.send_json({"type": "DOWNLOAD_COMPLETE", "task": "push", "dest_path": DEST})
@@ -560,13 +561,13 @@ def test_e2e_older_client_download_complete_still_frees_an_install_slot(tmp_path
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                d0 = await _register(session, base, "dev0")
-                d1 = await _register(session, base, "dev1")
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
+                d1 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000001")
                 admin = await session.ws_connect(base + "/ws/admin")
-                await _wait_online(admin, {"dev0", "dev1"})
+                await _wait_online(admin, {"64b19041-0b8c-4ef4-82fd-000000000000", "64b19041-0b8c-4ef4-82fd-000000000001"})
 
                 await admin.send_json({
-                    "type": "INSTALL_APK", "target_devices": ["dev0", "dev1"],
+                    "type": "INSTALL_APK", "target_devices": ["64b19041-0b8c-4ef4-82fd-000000000000", "64b19041-0b8c-4ef4-82fd-000000000001"],
                     "apk_url": base + "/apks/x.apk", "apk_filename": "x.apk",
                 })
                 assert await _recv(d0, "EXECUTE_INSTALL") is not None
@@ -595,12 +596,12 @@ def test_e2e_disconnect_frees_the_push_slot(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                d0 = await _register(session, base, "dev0")
-                d1 = await _register(session, base, "dev1")
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
+                d1 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000001")
                 admin = await session.ws_connect(base + "/ws/admin")
-                await _wait_online(admin, {"dev0", "dev1"})
+                await _wait_online(admin, {"64b19041-0b8c-4ef4-82fd-000000000000", "64b19041-0b8c-4ef4-82fd-000000000001"})
 
-                await _send_push(admin, ["dev0", "dev1"], base)
+                await _send_push(admin, ["64b19041-0b8c-4ef4-82fd-000000000000", "64b19041-0b8c-4ef4-82fd-000000000001"], base)
                 assert await _recv(d0, "EXECUTE_PUSH_FILES") is not None
                 assert await _recv(d1, "EXECUTE_PUSH_FILES", timeout=0.3) is None
 

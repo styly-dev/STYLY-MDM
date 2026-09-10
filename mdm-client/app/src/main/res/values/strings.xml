@@ -11,7 +11,6 @@
     <string name="device_identity_resolving">Resolving Device ID…</string>
     <string name="device_identity_ready">Ready\n%1$s</string>
     <string name="device_identity_unavailable">Unavailable (%1$s)\n%2$s</string>
-    <string name="retry_device_identity">Retry Device ID Lookup</string>
     <string name="storage_permission_label">All Files Access</string>
     <string name="grant_all_files_access">Grant All Files Access</string>
     <string name="storage_permission_granted">Granted</string>

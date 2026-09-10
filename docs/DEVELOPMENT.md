@@ -282,11 +282,26 @@ from merge commit `60e9175`; `mdm-client/app/libs/device-id-provider.properties`
 pins its SHA-256 and the Android `preBuild` task verifies it before compiling.
 
 The Application-scoped resolver runs `DeviceIdProvider.getOrCreate()` on one
-dedicated executor. The first lookup and WebSocket connection start independently.
-A failure is not retried by timers, network reconnect, or a storage-state change;
-the Settings screen shows the result, reuses the All Files Access settings action,
-and provides the only in-process retry action. A successful GUID is frozen for the
-rest of the process.
+dedicated thread that exits after the lookup. The first lookup and WebSocket connection start independently.
+A failure remains status-only for the rest of the process: there is no retry API,
+button, timer, or reconnect-triggered lookup. The Settings screen shows the result.
+A successful GUID is also frozen for the rest of the process.
+
+If the initial lookup fails, grant the required image access (or All Files access)
+and wait until shared storage is available, then restart the **MDM application
+process** and launch it again. Settings **Save & Connect** only restarts the service;
+it does not reset the Application-scoped resolver. Reconnecting the WebSocket or
+returning to Settings also does not retry the lookup. Check that the original GUID
+is Ready and canonical registration completes before sending commands. A reboot
+alone is not a reliable recovery step because the initial lookup may race storage
+initialization again. There is intentionally no retry button or automatic retry.
+
+To update Device-ID-Provider: copy the new released AAR into `mdm-client/app/libs/`,
+update `aar`, `version`, `source_commit`, and `sha256` in
+`libs/device-id-provider.properties`, then remove the superseded AAR. Compute the
+lowercase hash with `(Get-FileHash <new-aar> -Algorithm SHA256).Hash.ToLowerInvariant()`. Run
+`./gradlew :app:verifyDeviceIdProviderAar :app:testDevDebugUnitTest :app:assembleDevDebug`
+from `mdm-client` (use `gradlew.bat` on Windows) and commit the AAR and metadata together.
 
 While the resolver is not ready, the socket sends a provisional `REGISTER` with a
 null `device_id` and a bounded `identity` status. The server stores that status only
@@ -304,37 +319,57 @@ device frames are attributed to the server-side socket owner; a payload-supplied
 server has sent `REGISTERED`, and the client ignores commands and does not start
 battery telemetry until that acknowledgement arrives.
 
-This is a breaking identity and wire-protocol change. The server must be deployed
-before the new client. `MDM_DEVICE_IDENTITY_MODE` controls the explicit rollout:
+This is a breaking identity and command-policy change. Deploy the server before
+new clients. Both scheme-less serial clients and GUID clients are always accepted;
+there is no registration mode or mandatory database reset. Legacy serial clients
+can only receive APK installation/update commands (including MDM self-update).
+Launch, power, uninstall, startup-app, verification, and Push/Sync commands require
+a registered GUID client. Automatic post-update verification is also skipped for
+legacy identities. Mixed selections skip legacy devices for normal commands;
+Push job creation rejects legacy targets. Provisional sockets remain status-only
+and cannot receive APK updates.
 
-1. Stop active Push jobs and deploy server plus console with
-   `MDM_DEVICE_IDENTITY_MODE=legacy-compatible` (the default).
-2. Use the existing self-update path to replace scheme-less serial clients. A
-   successful replacement registers its provider GUID as a new device; the server
-   does not correlate or migrate the old serial record to it.
-3. Confirm the expected canonical GUID clients are online. A legacy client that
-   returns with the old version is still targetable for retry; a legacy identity
-   that does not return is reported as an untracked handoff rather than a false
-   update failure.
-4. Stop the server. Resolve the configured data directory from `--data-dir`, then
-   `MDM_DATA_DIR`, otherwise the server process working directory. Back up that
-   exact directory before changing it.
-5. With the server stopped, reset `device_registry.json` and `push_jobs.sqlite3`
-   (including SQLite `-wal`/`-shm` siblings if present). This resets device/group
-   records, Push assignments/history, and fences. Keep `apks/`, `bundles/`, and
-   `push-artifacts/`; uploaded artifacts are not device identity.
-6. Restart with `MDM_DEVICE_IDENTITY_MODE=cutover-strict` and verify a scheme-less
-   registration is rejected without recreating a serial-keyed registry record.
+Use the existing APK update action to replace old clients. A successful replacement
+registers its GUID as a new device; labels, groups, and Push history are not migrated.
+The new client reports any startup-app setting retained locally. The old serial row
+remains until explicitly forgotten. An old identity that does not return is reported
+as `untracked`, not proof of update success. Back up the data directory before any
+optional cleanup; no reset is needed for normal operation.
 
-Strict startup refuses to load any non-canonical device record or non-canonical
-group member ID. This is a guard against accidentally starting the cutover before the
-backup and reset; it does not delete or rewrite the rejected registry file.
+Before upgrading the server, finish pending Push/Sync jobs targeting serial IDs
+with the previous server. After upgrading, those assignments cannot resume on
+serial clients or transfer to a new GUID. Existing queued assignments may remain
+pending; retain them as old records and create a new job for the registered GUID
+if the files still need delivery. Do not treat the old job as completed or reset
+the database merely to upgrade a client.
 
-Do not perform the reset against a running server. Rehearse the sequence first with
-an isolated non-production `--data-dir`. Completion still requires physical PICO
-checks for missing permission, explicit retry promotion, restart behavior, and a
-separate-UID MDM/Unity first-mint race; unit and loopback tests cannot prove those
-MediaStore and firmware behaviors.
+The live device record owns the single `registration_ready` flag: the registration
+path sets it only after sending `REGISTERED` to the current owner, and disconnect
+clears it. Push dispatch and normal commands share `device_policy.command_allowed`;
+missing fields deny access. Socket ownership is checked again at the final send.
+The resolver uses one start-once guard and publishes one terminal result; a
+successful result carries only the GUID. Registration acknowledgement checks the
+current registered owner directly, independently of APK command permissions.
+
+Network-loss cancellation resets the client connection state and stops battery
+telemetry. Provisional acknowledgement status is published on the connection
+handler only if its socket still owns the connection. The console keeps unresolved
+identities out of the normal device list: `Needs attention` shows their count, and
+the selected tab shows each status and diagnostic with wrapping for long text.
+Registering devices display `Registering…` without a Forget action and remain
+ineligible for commands until registration completes. Launch, Uninstall, and
+Startup controls require at least one selected online canonical device. Selecting
+only offline or legacy devices disables those controls instead of sending an
+operation that only logs skipped targets; APK installation remains available to
+eligible online legacy devices.
+
+All command sends verify the current acknowledged owner. Registering sockets are
+not actionable. Existing legacy registry records and group members remain loadable,
+including after admin metadata edits and a server restart.
+
+Physical PICO checks remain necessary for missing permission, restart behavior,
+and a separate-UID MDM/Unity first-mint race; host tests cannot prove those MediaStore
+and firmware behaviors.
 
 Transport note: `/ws/admin` intentionally does not negotiate per-message
 compression as a workaround for the Chrome-to-server reserved-bit failure
@@ -415,7 +450,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 |---|---|
 | `SERVER_INFO` | Server identity, sent once on connect (before the first `DEVICE_LIST`). Fields: `version` (the `styly_mdm` package version; the console renders it next to the `STYLY-MDM` brand in the top bar. Its `major.minor` is the compatibility reference — and the top-bar value itself turns red when a live client is on a *newer* `major.minor` (i.e. the server is the one lagging). See the compatibility note below). |
 | `CLIENT_APK_INFO` | The newest styly-mdm-client APK the server holds, sent on connect (right after `SERVER_INFO`, before `DEVICE_LIST`) and re-broadcast after every APK upload. Field: `apk` = `{filename, url, version}` or `null`. Drives the per-device and bulk **Update** buttons and the top-bar client-APK download link (see the notes below). |
-| `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting; a *stable-online* client whose `version_name` trails the server on `major.minor` is flagged red as needing an update — the reverse case, a client *ahead* of the server, reddens the top-bar server version instead. `updating` and offline rows are exempt, and the check is skipped only when the server version is the `0.0.0` untagged/not-installed fallback), and may include optional `battery`: `{level, charging, last_seen}`) |
+| `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `identity_kind` (`canonical` for Provider GUID / `legacy` for serial ID) and `status` (`registering` before the registration acknowledgement / `online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting; a *stable-online* client whose `version_name` trails the server on `major.minor` is flagged red as needing an update — the reverse case, a client *ahead* of the server, reddens the top-bar server version instead. `updating` and offline rows are exempt, and the check is skipped only when the server version is the `0.0.0` untagged/not-installed fallback), and may include optional `battery`: `{level, charging, last_seen}`) |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `DELETE_APP_SENT` | Confirmation that uninstall commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `REBOOT_SENT` / `POWER_OFF_SENT` | Confirmation that reboot/power-off commands were dispatched. Fields: `sent_count`, `target_count` |
@@ -923,8 +958,8 @@ installed, a dead client is started back up within one watchdog tick.
 - **The compatibility cutover does not correlate identities.** If an old serial client
   returns unchanged, its version comparison reports failure and it remains targetable for
   retry. If the new build succeeds, its provider GUID is persisted as a completely new
-  device with no inherited label, groups, startup app, Push history, or update result. The
-  old serial row is removed only by the documented reset or an explicit Forget action.
+  device with no inherited label, groups, Push history, or update result. Locally retained startup-app settings are reported again during registration. The
+  old serial row is removed only by an explicit Forget action.
 
 ### The update journal
 

@@ -16,7 +16,6 @@ GUID = "64b19041-0b8c-4ef4-82fd-000000000000"
 
 @pytest.fixture(autouse=True)
 def reset_state(monkeypatch):
-    monkeypatch.setenv("MDM_DEVICE_IDENTITY_MODE", "legacy-compatible")
     for collection in (
         server.devices,
         server.device_registry,
@@ -189,25 +188,6 @@ def test_canonical_socket_rejects_identity_change(tmp_path):
     asyncio.run(body())
 
 
-def test_strict_mode_rejects_scheme_less_registration(tmp_path, monkeypatch):
-    async def body():
-        monkeypatch.setenv("MDM_DEVICE_IDENTITY_MODE", "cutover-strict")
-        server._apply_data_dir(str(tmp_path))
-        test_server = TestServer(server.create_app())
-        await test_server.start_server()
-        base = f"http://{test_server.host}:{test_server.port}"
-        try:
-            async with aiohttp.ClientSession() as session:
-                device = await session.ws_connect(base + "/ws/device")
-                await device.send_json({"type": "REGISTER", "device_id": "SERIAL-1"})
-                error = await recv_type(device, "ERROR")
-                assert "disabled" in error["message"]
-                assert server.device_registry == {}
-        finally:
-            await test_server.close()
-
-    asyncio.run(body())
-
 
 def test_canonical_registration_is_new_device_and_does_not_settle_legacy_update(tmp_path):
     async def body():
@@ -290,59 +270,8 @@ def test_provisional_socket_rejects_legacy_registration(tmp_path):
     asyncio.run(body())
 
 
-def test_invalid_identity_mode_fails_startup(tmp_path, monkeypatch):
-    monkeypatch.setenv("MDM_DEVICE_IDENTITY_MODE", "strict-ish")
-    server._apply_data_dir(str(tmp_path))
-    with pytest.raises(ValueError, match="MDM_DEVICE_IDENTITY_MODE"):
-        server.create_app()
 
 
-def test_strict_mode_does_not_reclassify_guid_shaped_legacy_record(tmp_path, monkeypatch):
-    monkeypatch.setenv("MDM_DEVICE_IDENTITY_MODE", "cutover-strict")
-    server._apply_data_dir(str(tmp_path))
-    server.REGISTRY_PATH.write_text(json.dumps({
-        "devices": {GUID: {"model": "old client", "identity_kind": "legacy"}},
-        "groups": {"old": [GUID]},
-    }))
-
-    original = server.REGISTRY_PATH.read_text()
-    with pytest.raises(RuntimeError, match="complete the documented reset"):
-        server.load_registry()
-
-    assert server.device_registry == {}
-    assert server.device_groups == {}
-    assert server.REGISTRY_PATH.read_text() == original
-
-
-def test_strict_mode_rejects_noncanonical_group_member_without_rewriting(tmp_path, monkeypatch):
-    monkeypatch.setenv("MDM_DEVICE_IDENTITY_MODE", "cutover-strict")
-    server._apply_data_dir(str(tmp_path))
-    server.REGISTRY_PATH.write_text(json.dumps({
-        "devices": {},
-        "groups": {"old": ["SERIAL-1"]},
-    }))
-
-    original = server.REGISTRY_PATH.read_text()
-    with pytest.raises(RuntimeError, match="invalid group membership"):
-        server.load_registry()
-
-    assert server.device_registry == {}
-    assert server.device_groups == {}
-    assert server.REGISTRY_PATH.read_text() == original
-
-
-def test_strict_mode_preserves_canonical_group_member_not_yet_registered(tmp_path, monkeypatch):
-    monkeypatch.setenv("MDM_DEVICE_IDENTITY_MODE", "cutover-strict")
-    server._apply_data_dir(str(tmp_path))
-    server.REGISTRY_PATH.write_text(json.dumps({
-        "devices": {},
-        "groups": {"reserved": [GUID]},
-    }))
-
-    server.load_registry()
-
-    assert server.device_registry == {}
-    assert server.device_groups == {"reserved": [GUID]}
 
 
 def test_push_session_is_not_dispatchable_before_registration_acknowledgement():
@@ -350,9 +279,228 @@ def test_push_session_is_not_dispatchable_before_registration_acknowledgement():
     ws = object()
     runtime.sessions = {GUID: SimpleNamespace(ws=ws)}
     runtime.registration_candidates = {}
-    runtime.ready_sessions = set()
+    runtime.legacy = SimpleNamespace(devices={GUID: {"ws": ws, "identity_kind": "canonical", "registration_ready": False}})
     runtime._legacy_owns_device = lambda device_id, owner: device_id == GUID and owner is ws
 
     assert runtime._dispatch_sessions() == {}
-    runtime.ready_sessions.add(GUID)
+    runtime.legacy.devices[GUID]["registration_ready"] = True
     assert list(runtime._dispatch_sessions()) == [GUID]
+
+
+@pytest.mark.parametrize("identity_kind", ["canonical", "legacy"])
+def test_registration_wait_does_not_dispatch_commands(tmp_path, identity_kind):
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        app = server.create_app()
+        runtime = app["push_runtime"]
+        async with TestServer(app) as ts, aiohttp.ClientSession() as client:
+            admin = await client.ws_connect(ts.make_url("/ws/admin"))
+            await recv_type(admin, "GROUP_LIST")
+            device = await client.ws_connect(ts.make_url("/ws/device"))
+            lock = runtime._device_lock(GUID)
+            await lock.acquire()
+            try:
+                payload = canonical()
+                if identity_kind == "legacy":
+                    payload.pop("identity_scheme")
+                await device.send_json(payload)
+                async def await_owner():
+                    while GUID not in server.devices:
+                        await asyncio.sleep(0)
+                await asyncio.wait_for(await_owner(), 2)
+                row = json.loads(server.build_device_list_msg())["devices"][0]
+                assert row["status"] == "registering"
+                assert row["identity_kind"] == identity_kind
+                assert server.resolve_target_ids([GUID], allow_legacy=True) == []
+                await admin.send_json({"type": "INSTALL_APK", "target_devices": [GUID],
+                                       "apk_url": "http://example.invalid/test.apk"})
+                assert "No matching" in (await recv_type(admin, "ERROR"))["message"]
+            finally:
+                lock.release()
+            # No command may precede the acknowledgement.
+            assert (await device.receive_json())["type"] == "REGISTERED"
+            await device.send_json(payload)
+            await recv_type(device, "REGISTERED")
+            assert server.resolve_target_ids([GUID], allow_legacy=True) == [GUID]
+            assert server.resolve_target_ids([GUID]) == ([GUID] if identity_kind == "canonical" else [])
+            await device.close()
+            await admin.close()
+    asyncio.run(body())
+
+
+def test_admin_label_and_group_survive_reload_without_mode(tmp_path, monkeypatch):
+    async def body():
+        # A stale deployment environment must no longer change registration policy.
+        monkeypatch.setenv("MDM_DEVICE_IDENTITY_MODE", "cutover-strict")
+        server._apply_data_dir(str(tmp_path))
+        app = server.create_app()
+        async with TestServer(app) as ts, aiohttp.ClientSession() as client:
+            admin = await client.ws_connect(ts.make_url("/ws/admin"))
+            await recv_type(admin, "GROUP_LIST")
+            await admin.send_json({"type": "SET_DEVICE_LABEL", "device_id": GUID, "label": "Reserved"})
+            await recv_type(admin, "DEVICE_LABEL_SET")
+            await admin.send_json({"type": "CREATE_GROUP", "name": "Old"})
+            await recv_type(admin, "GROUP_CREATED")
+            await admin.send_json({"type": "SET_GROUP_MEMBERS", "name": "Old", "members": ["SERIAL-1", GUID]})
+            await recv_type(admin, "GROUP_MEMBERS_SET")
+            server.load_registry()
+            assert server.device_registry[GUID]["label"] == "Reserved"
+            assert server.device_groups["Old"] == ["SERIAL-1", GUID]
+            device = await client.ws_connect(ts.make_url("/ws/device"))
+            await device.send_json({"type": "REGISTER", "device_id": "SERIAL-1"})
+            await recv_type(device, "REGISTERED")
+            assert server.device_registry["SERIAL-1"]["identity_kind"] == "legacy"
+            await device.close()
+            await admin.close()
+    asyncio.run(body())
+
+
+def test_legacy_commands_are_blocked_but_apk_install_is_sent(tmp_path):
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        app = server.create_app()
+        runtime = app["push_runtime"]
+        async with TestServer(app) as ts, aiohttp.ClientSession() as client:
+            admin = await client.ws_connect(ts.make_url("/ws/admin"))
+            await recv_type(admin, "GROUP_LIST")
+            device = await client.ws_connect(ts.make_url("/ws/device"))
+            await device.send_json({"type": "REGISTER", "device_id": "SERIAL-1",
+                                    "capabilities": ["push_job_id_v1"],
+                                    "process_instance_id": "64b19041-0b8c-4ef4-82fd-000000000001"})
+            await recv_type(device, "REGISTERED")
+            assert "SERIAL-1" not in runtime._dispatch_sessions()
+            response = await client.post(ts.make_url("/api/push-jobs"), json={
+                "client_request_id": "64b19041-0b8c-4ef4-82fd-000000000002",
+                "target_devices": ["SERIAL-1"], "mode": "push",
+                "dest_path": "/sdcard/STYLY/content",
+                "source": {"display_name": "content", "declared_file_count": 1,
+                           "declared_total_bytes": 1},
+            })
+            assert response.status == 422
+            assert "legacy device" in (await response.json())["error"]
+            owner = server.devices["SERIAL-1"]["ws"]
+            for command in ["EXECUTE_LAUNCH", "EXECUTE_REBOOT", "EXECUTE_POWER_OFF",
+                            "EXECUTE_UNINSTALL", "EXECUTE_PUSH_FILES", "EXECUTE_VERIFY_APK",
+                            "EXECUTE_VERIFY_DIR", "SET_STARTUP_APP", "CLEAR_STARTUP_APP", "PUSH_RECONCILE_REQUEST"]:
+                with pytest.raises(ConnectionResetError):
+                    await owner.send_str(json.dumps({"type": command}))
+            await admin.send_json({"type": "LAUNCH_APP", "target_devices": ["SERIAL-1"],
+                                   "package_name": "example.app"})
+            await recv_type(admin, "ERROR")
+            await admin.send_json({"type": "INSTALL_APK", "target_devices": ["SERIAL-1"],
+                                   "apk_url": "http://example.invalid/update.apk"})
+            sent = await recv_type(admin, "INSTALL_SENT")
+            assert sent["target_count"] == 1
+            assert (await device.receive_json())["type"] == "EXECUTE_INSTALL"
+            await device.send_json({"type": "INSTALL_RESULT", "status": "success"})
+            await recv_type(admin, "INSTALL_RESULT")
+            await device.close()
+            await admin.close()
+    asyncio.run(body())
+
+
+def test_mixed_selection_only_includes_legacy_for_install():
+    server.devices.update({
+        "new": {"identity_kind": "canonical", "registration_ready": True},
+        "old": {"identity_kind": "legacy", "registration_ready": True},
+        "waiting": {"identity_kind": "canonical", "registration_ready": False},
+    })
+    assert server.resolve_target_ids(["*"]) == ["new"]
+    assert server.resolve_target_ids(["*"], allow_legacy=True) == ["new", "old"]
+
+
+
+def test_replacement_does_not_reuse_previous_owners_ready_flag(tmp_path):
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        app = server.create_app()
+        runtime = app["push_runtime"]
+        async with TestServer(app) as ts, aiohttp.ClientSession() as client:
+            old = await client.ws_connect(ts.make_url("/ws/device"))
+            await old.send_json(canonical())
+            await recv_type(old, "REGISTERED")
+            new = await client.ws_connect(ts.make_url("/ws/device"))
+            old_owner = server.devices[GUID]["ws"]
+            async with runtime._device_lock(GUID):
+                await new.send_json(canonical())
+                async def await_replacement():
+                    while server.devices[GUID]["ws"] is old_owner:
+                        await asyncio.sleep(0)
+                await asyncio.wait_for(await_replacement(), 2)
+                assert server.devices[GUID]["registration_ready"] is False
+                new_owner = server.devices[GUID]["ws"]
+                for command in ["EXECUTE_INSTALL", "SET_STARTUP_APP", "CLEAR_STARTUP_APP"]:
+                    with pytest.raises(ConnectionResetError):
+                        await new_owner.send_str(json.dumps({"type": command}))
+            assert (await new.receive_json())["type"] == "REGISTERED"
+            await old.close()
+            await new.close()
+    asyncio.run(body())
+
+
+@pytest.mark.parametrize("entry", [None, {}, {"identity_kind": "canonical"},
+    {"registration_ready": True}, {"registration_ready": True, "identity_kind": "unknown"}])
+def test_incomplete_identity_never_grants_command_access(entry):
+    from styly_mdm.device_policy import command_allowed
+    assert not command_allowed(entry)
+    assert not command_allowed(entry, "EXECUTE_INSTALL")
+
+
+@pytest.mark.parametrize("kind", ["canonical", "legacy"])
+@pytest.mark.parametrize("ready,current", [(True, True), (False, True), (True, False)])
+def test_registration_ack_requires_current_ready_owner(kind, ready, current):
+    async def body():
+        sent = []
+        class Socket:
+            async def send_str(self, message):
+                sent.append(json.loads(message))
+        ws = Socket()
+        runtime = object.__new__(push_runtime.PushRuntime)
+        runtime.sessions = {GUID: SimpleNamespace(ws=ws, session_id="session")}
+        runtime.legacy = SimpleNamespace(devices={GUID: {
+            "ws": ws if current else object(),
+            "identity_kind": kind,
+            "registration_ready": ready,
+        }})
+        runtime.send_timeout = 1
+        await runtime.acknowledge_registration(ws, GUID)
+        assert sent == ([{"type": "REGISTERED", "session_id": "session"}]
+                        if ready and current else [])
+    asyncio.run(body())
+
+
+def test_offline_legacy_push_reports_apk_only_policy(tmp_path):
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        app = server.create_app()
+        async with TestServer(app) as ts, aiohttp.ClientSession() as client:
+            server.device_registry["SERIAL-OFFLINE"] = {"identity_kind": "legacy"}
+            response = await client.post(ts.make_url("/api/push-jobs"), json={
+                "client_request_id": "64b19041-0b8c-4ef4-82fd-000000000003",
+                "target_devices": ["SERIAL-OFFLINE"], "mode": "push",
+                "dest_path": "/sdcard/STYLY/content",
+                "source": {"display_name": "content", "declared_file_count": 1,
+                           "declared_total_bytes": 1},
+            })
+            assert response.status == 422
+            assert "legacy device only supports APK" in (await response.json())["error"]
+    asyncio.run(body())
+
+
+@pytest.mark.parametrize("failure", [ConnectionResetError("peer closed"), ValueError("unexpected")])
+def test_protocol_error_closes_socket_without_hiding_unexpected_errors(failure):
+    async def body():
+        closed = []
+        class Socket:
+            async def send_str(self, message):
+                raise failure
+            async def close(self, **kwargs):
+                closed.append(kwargs)
+        if isinstance(failure, ConnectionResetError):
+            await server._close_protocol_error(Socket(), "invalid registration")
+        else:
+            with pytest.raises(ValueError, match="unexpected"):
+                await server._close_protocol_error(Socket(), "invalid registration")
+        assert len(closed) == 1
+        assert closed[0]["code"] == server.WSCloseCode.PROTOCOL_ERROR
+    asyncio.run(body())

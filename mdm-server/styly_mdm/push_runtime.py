@@ -19,6 +19,7 @@ from typing import Any
 
 from aiohttp import WSCloseCode, WSMsgType, web as aiohttp_web
 
+from .device_policy import command_allowed
 from .push_artifacts import ArtifactStore
 from .push_job_manager import PushJobManager
 from .push_job_store import (
@@ -137,6 +138,19 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
 
     async def send_str(self, data: str, compress: int | None = None) -> None:
         async with self._push_send_lock:
+            if self._push_path == "/ws/device" and self._push_runtime is not None:
+                payload = json.loads(data)
+                message_type = payload.get("type", "")
+                if message_type.startswith("EXECUTE_") or message_type in {
+                    "SET_STARTUP_APP", "CLEAR_STARTUP_APP", "PUSH_RECONCILE_REQUEST",
+                }:
+                    server = self._push_runtime.legacy
+                    entry = server.devices.get(self._push_device_id)
+                    session = self._push_runtime.sessions.get(self._push_device_id)
+                    if (entry is None or entry.get("ws") is not self
+                            or session is None or session.ws is not self
+                            or not command_allowed(entry, message_type)):
+                        raise ConnectionResetError("Device is not ready or command is not allowed")
             await super().send_str(data, compress=compress)
 
     async def prepare(self, request: aiohttp_web.Request) -> Any:
@@ -224,7 +238,6 @@ class PushRuntime:
         self.transfers = TransferRegistry()
         self.legacy_transfers = _LegacyTransferAdapter(self.transfers)
         self.sessions: dict[str, LiveSession] = {}
-        self.ready_sessions: set[str] = set()
         self.device_locks: dict[str, asyncio.Lock] = {}
         self.registration_candidates: dict[str, RuntimeWebSocketResponse] = {}
         self.scheduler: PushScheduler | None = None
@@ -290,10 +303,7 @@ class PushRuntime:
             if (
                 self.registration_candidates.get(device_id) in {None, session.ws}
                 and self._legacy_owns_device(device_id, session.ws)
-                and (
-                    not hasattr(self, "ready_sessions")
-                    or device_id in self.ready_sessions
-                )
+                and command_allowed(self.legacy.devices[device_id])
             )
         }
 
@@ -353,8 +363,6 @@ class PushRuntime:
         for device_id in tuple(self.sessions):
             self.transfers.release_all_for_device(device_id, "shutdown")
         self.sessions.clear()
-        if hasattr(self, "ready_sessions"):
-            self.ready_sessions.clear()
         self.registration_candidates.clear()
         self.store.close()
         _RUNTIME_BY_DATA_DIR.pop(self.data_dir.resolve(), None)
@@ -434,11 +442,15 @@ class PushRuntime:
                 raise PushJobError("declared total bytes exceed the server limit")
 
             protocols: dict[str, tuple[ProtocolMode, set[str]]] = {}
+            dispatch_sessions = self._dispatch_sessions()
             for device_id in canonical.target_devices:
                 record = self.legacy.device_registry.get(device_id)
                 if record and record.get("retired") is True:
                     raise PushJobError(f"target device is retired: {device_id}")
-                session = self.sessions.get(device_id)
+                entry = self.legacy.devices.get(device_id)
+                if (entry or record or {}).get("identity_kind") == "legacy":
+                    raise PushJobError(f"legacy device only supports APK installation/update: {device_id}")
+                session = dispatch_sessions.get(device_id)
                 if session is None:
                     raise PushJobError(f"target device is not online: {device_id}")
                 if CAP_PUSH_JOB_ID_V1 in session.capabilities:
@@ -708,8 +720,6 @@ class PushRuntime:
             previous = self.sessions.get(device_id)
             if previous is not None and previous.ws is not ws:
                 self.sessions.pop(device_id, None)
-                if hasattr(self, "ready_sessions"):
-                    self.ready_sessions.discard(device_id)
                 active = await self.manager.active_assignment_for_device(device_id)
                 if active is not None:
                     job_id = active["job_id"]
@@ -816,12 +826,10 @@ class PushRuntime:
             except BaseException:
                 if self.sessions.get(device_id) is session:
                     self.sessions.pop(device_id, None)
-                    if hasattr(self, "ready_sessions"):
-                        self.ready_sessions.discard(device_id)
                 raise
-            if not hasattr(self, "ready_sessions"):
-                self.ready_sessions = set()
-            self.ready_sessions.add(device_id)
+            if not self._legacy_owns_device(device_id, ws):
+                return
+            self.legacy.devices[device_id]["registration_ready"] = True
             if self.registration_candidates.get(device_id) is ws:
                 self.registration_candidates.pop(device_id, None)
             registered = True
@@ -830,7 +838,7 @@ class PushRuntime:
             await self.publish(snapshot)
         if not registered:
             return
-        if needs_reconcile:
+        if needs_reconcile and command_allowed(self.legacy.devices.get(device_id)):
             await self.request_reconcile(device_id)
         if self.scheduler is not None:
             self.scheduler.wake()
@@ -841,10 +849,13 @@ class PushRuntime:
         device_id: str,
     ) -> None:
         session = self.sessions.get(device_id)
+        entry = self.legacy.devices.get(device_id)
         if (
             session is None
             or session.ws is not ws
-            or (hasattr(self, "ready_sessions") and device_id not in self.ready_sessions)
+            or entry is None
+            or entry.get("ws") is not ws
+            or entry.get("registration_ready") is not True
         ):
             return
         await asyncio.wait_for(
@@ -954,8 +965,8 @@ class PushRuntime:
             if session is None or session.ws is not ws:
                 return
             self.sessions.pop(device_id, None)
-            if hasattr(self, "ready_sessions"):
-                self.ready_sessions.discard(device_id)
+            if self._legacy_owns_device(device_id, ws):
+                self.legacy.devices[device_id]["registration_ready"] = False
             active = await self.manager.active_assignment_for_device(device_id)
             if active is None:
                 return

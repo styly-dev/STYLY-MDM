@@ -62,9 +62,10 @@ async def _recv_type(ws, msg_type: str, timeout: float = 2.0) -> dict | None:
 async def _register(session, base: str, device_id: str):
     ws = await session.ws_connect(base + "/ws/device")
     await ws.send_json({
-        "type": "REGISTER", "device_id": device_id, "model": "M",
+        "type": "REGISTER", "identity_scheme": server.IDENTITY_SCHEME, "device_id": device_id, "model": "M",
         "ip": "1.1.1.2", "version_code": 7, "version_name": "t",
     })
+    await _recv_type(ws, "REGISTERED")
     return ws
 
 
@@ -82,30 +83,30 @@ def test_e2e_stale_connection_teardown_keeps_the_live_device_online(tmp_path):
         try:
             async with aiohttp.ClientSession() as session:
                 # The pre-reboot connection, still open server-side.
-                stale = await _register(session, base, "dev0")
+                stale = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
                 dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "dev0")["status"] == "online"
+                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "online"
 
                 # The rebooted client reconnects and re-registers.
-                live = await _register(session, base, "dev0")
+                live = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "dev0")["status"] == "online"
+                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "online"
 
                 # The stale socket finally dies. The device is still connected,
                 # so it must stay online.
                 await stale.close()
                 await asyncio.sleep(0.1)
-                assert "dev0" in server.devices
-                assert server.devices["dev0"]["ws"] is not None
+                assert "64b19041-0b8c-4ef4-82fd-000000000000" in server.devices
+                assert server.devices["64b19041-0b8c-4ef4-82fd-000000000000"]["ws"] is not None
 
                 # And the live connection still works end to end.
                 await live.send_json({
                     "type": "BATTERY_UPDATE", "level": 55, "charging": False,
                 })
                 dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "dev0")["status"] == "online"
-                assert _row(dl, "dev0")["battery"]["level"] == 55
+                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "online"
+                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["battery"]["level"] == 55
                 assert not live.closed
 
                 await live.close()
@@ -125,8 +126,8 @@ def test_e2e_battery_update_on_a_superseded_socket_is_ignored(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                stale = await _register(session, base, "dev0")
-                live = await _register(session, base, "dev0")
+                stale = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
+                live = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
@@ -135,14 +136,14 @@ def test_e2e_battery_update_on_a_superseded_socket_is_ignored(tmp_path):
                     "type": "BATTERY_UPDATE", "level": 11, "charging": False,
                 })
                 await asyncio.sleep(0.1)
-                assert server.devices["dev0"].get("battery") is None
+                assert server.devices["64b19041-0b8c-4ef4-82fd-000000000000"].get("battery") is None
 
                 # The live connection is untouched and still owns the device.
                 await live.send_json({
                     "type": "BATTERY_UPDATE", "level": 66, "charging": True,
                 })
                 dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "dev0")["battery"]["level"] == 66
+                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["battery"]["level"] == 66
                 assert not live.closed
 
                 await stale.close()
@@ -163,16 +164,16 @@ def test_e2e_single_connection_disconnect_still_goes_offline(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                only = await _register(session, base, "dev0")
+                only = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
                 dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "dev0")["status"] == "online"
+                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "online"
 
                 await only.close()
                 dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "dev0")["status"] == "offline"
-                assert "dev0" not in server.devices
-                assert server.device_registry["dev0"]["last_seen"] > 0
+                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "offline"
+                assert "64b19041-0b8c-4ef4-82fd-000000000000" not in server.devices
+                assert server.device_registry["64b19041-0b8c-4ef4-82fd-000000000000"]["last_seen"] > 0
 
                 await admin.close()
         finally:
@@ -194,14 +195,14 @@ def test_e2e_download_complete_on_a_superseded_socket_does_not_release_the_slot(
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                stale = await _register(session, base, "dev0")
-                live = await _register(session, base, "dev0")
+                stale = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
+                live = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
                 await asyncio.sleep(0.1)
 
                 slot = asyncio.get_running_loop().create_future()
-                server.pending_transfers[("dev0", server.TASK_INSTALL)] = slot
+                server.pending_transfers[("64b19041-0b8c-4ef4-82fd-000000000000", server.TASK_INSTALL)] = slot
 
                 await stale.send_json({
                     "type": "DOWNLOAD_COMPLETE", "task": server.TASK_INSTALL,
@@ -237,21 +238,21 @@ def test_e2e_terminal_result_on_a_superseded_socket_is_not_forwarded(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                stale = await _register(session, base, "dev0")
-                live = await _register(session, base, "dev0")
+                stale = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
+                live = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
                 await asyncio.sleep(0.1)
 
                 await stale.send_json({
-                    "type": "INSTALL_RESULT", "device_id": "dev0",
+                    "type": "INSTALL_RESULT", "device_id": "64b19041-0b8c-4ef4-82fd-000000000000",
                     "status": "fail", "detail": "from the stale socket",
                 })
                 assert await _recv_type(admin, "INSTALL_RESULT", timeout=0.3) is None
 
                 # The owning connection's result still reaches the console.
                 await live.send_json({
-                    "type": "INSTALL_RESULT", "device_id": "dev0",
+                    "type": "INSTALL_RESULT", "device_id": "64b19041-0b8c-4ef4-82fd-000000000000",
                     "status": "success", "detail": "",
                 })
                 forwarded = await _recv_type(admin, "INSTALL_RESULT")
@@ -275,12 +276,12 @@ def test_e2e_stale_teardown_does_not_free_the_live_transfer_slot(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                stale = await _register(session, base, "dev0")
-                live = await _register(session, base, "dev0")
+                stale = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
+                live = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 await asyncio.sleep(0.1)
 
                 slot = asyncio.get_running_loop().create_future()
-                server.pending_transfers[("dev0", server.TASK_INSTALL)] = slot
+                server.pending_transfers[("64b19041-0b8c-4ef4-82fd-000000000000", server.TASK_INSTALL)] = slot
 
                 await stale.close()
                 await asyncio.sleep(0.1)

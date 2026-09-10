@@ -74,7 +74,7 @@ def reset_state():
 
 def add_device(device_id: str) -> FakeWS:
     ws = FakeWS()
-    server.devices[device_id] = {
+    server.devices[device_id] = {"registration_ready": True, "identity_kind": "canonical",
         "ws": ws, "device_id": device_id, "model": "M", "ip": "1.1.1.1",
         "status": "online", "startup_app": None, "battery": None,
         "version_code": 6, "version_name": "0.2.3",
@@ -557,8 +557,10 @@ async def _register(session, base: str, device_id: str, version_code: int):
     ws = await session.ws_connect(base + "/ws/device")
     await ws.send_json({
         "type": "REGISTER", "device_id": device_id, "model": "M",
+        **({"identity_scheme": server.IDENTITY_SCHEME} if device_id.startswith("64b19041-") else {}),
         "ip": "1.1.1.2", "version_code": version_code, "version_name": "t",
     })
+    await _recv_type(ws, "REGISTERED")
     return ws
 
 
@@ -573,12 +575,12 @@ def test_e2e_self_update_happy_path(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                d0 = await _register(session, base, "dev0", version_code=6)
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000", version_code=6)
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
                 await admin.send_json({
-                    "type": "INSTALL_APK", "target_devices": ["dev0"],
+                    "type": "INSTALL_APK", "target_devices": ["64b19041-0b8c-4ef4-82fd-000000000000"],
                     "apk_url": base + "/apks/x.apk", "apk_filename": "x.apk",
                 })
                 execute = await _recv_type(d0, "EXECUTE_INSTALL")
@@ -600,11 +602,11 @@ def test_e2e_self_update_happy_path(tmp_path):
 
                 # The disconnect renders the row as updating, not offline.
                 dl = await _recv_type(admin, "DEVICE_LIST")
-                row = next(d for d in dl["devices"] if d["device_id"] == "dev0")
+                row = next(d for d in dl["devices"] if d["device_id"] == "64b19041-0b8c-4ef4-82fd-000000000000")
                 assert row["status"] == "updating"
 
                 # The new build re-registers with the target versionCode.
-                d0b = await _register(session, base, "dev0", version_code=7)
+                d0b = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000", version_code=7)
                 seen = []
                 result = await _recv_type_recording(admin, "SELF_UPDATE_RESULT", seen)
                 assert result["status"] == "success"
@@ -626,7 +628,7 @@ def test_e2e_self_update_happy_path(tmp_path):
                 # The row is back online with the new version.
                 row = next(
                     d for d in [f for f in seen if f.get("type") == "DEVICE_LIST"][-1]["devices"]
-                    if d["device_id"] == "dev0"
+                    if d["device_id"] == "64b19041-0b8c-4ef4-82fd-000000000000"
                 )
                 assert row["status"] == "online"
                 assert row["version_code"] == 7
@@ -656,12 +658,12 @@ def test_e2e_self_update_verifies_against_dispatched_bytes_not_a_same_name_reupl
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                d0 = await _register(session, base, "dev0", version_code=6)
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000", version_code=6)
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
                 await admin.send_json({
-                    "type": "INSTALL_APK", "target_devices": ["dev0"],
+                    "type": "INSTALL_APK", "target_devices": ["64b19041-0b8c-4ef4-82fd-000000000000"],
                     "apk_url": base + "/apks/x.apk", "apk_filename": "x.apk",
                 })
                 execute = await _recv_type(d0, "EXECUTE_INSTALL")
@@ -678,8 +680,8 @@ def test_e2e_self_update_verifies_against_dispatched_bytes_not_a_same_name_reupl
                     "target_version_code": 7, "current_version_code": 6,
                     "package_name": CLIENT_PKG, "apk_filename": "x.apk",
                 })
-                await wait_until(lambda: "dev0" in server.pending_self_updates)
-                pend = server.pending_self_updates["dev0"]
+                await wait_until(lambda: "64b19041-0b8c-4ef4-82fd-000000000000" in server.pending_self_updates)
+                pend = server.pending_self_updates["64b19041-0b8c-4ef4-82fd-000000000000"]
                 # Pinned to the dispatched bytes, not the re-uploaded same-name file.
                 assert pend["expected_full_sha256"] == dispatched["full_sha256"]
                 assert pend["expected_full_sha256"] != reupload["full_sha256"]
@@ -692,7 +694,7 @@ def test_e2e_self_update_verifies_against_dispatched_bytes_not_a_same_name_reupl
 
                 # The device reports the dispatched bytes it actually installed, so
                 # auto-verify passes — it would have failed against the re-upload.
-                d0b = await _register(session, base, "dev0", version_code=7)
+                d0b = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000", version_code=7)
                 assert (await _recv_type(admin, "SELF_UPDATE_RESULT"))["status"] == "success"
                 assert await _recv_type(d0b, "EXECUTE_VERIFY_APK") is not None
                 await d0b.send_json({

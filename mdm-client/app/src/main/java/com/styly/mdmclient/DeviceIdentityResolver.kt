@@ -6,15 +6,12 @@ import com.styly.deviceid.DeviceIdStatus
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.Executor
-import java.util.concurrent.Executors
 
 sealed interface DeviceIdentityState {
     data object Resolving : DeviceIdentityState
 
     data class Ready(
         val deviceId: String,
-        val candidateCount: Int,
-        val wasMinted: Boolean,
     ) : DeviceIdentityState
 
     data class Unavailable(
@@ -33,7 +30,6 @@ enum class DeviceIdentityStatus(val protocolValue: String) {
 internal data class DeviceIdentityLookupResult(
     val status: DeviceIdStatus,
     val deviceId: String?,
-    val candidateCount: Int,
     val mintAttempted: Boolean,
     val diagnostic: String,
 )
@@ -52,15 +48,14 @@ class DeviceIdentityResolver internal constructor(
         fun create(context: Context): DeviceIdentityResolver {
             val appContext = context.applicationContext
             return DeviceIdentityResolver(
-                Executors.newSingleThreadExecutor { runnable ->
-                    Thread(runnable, "device-identity-resolver")
+                Executor { runnable ->
+                    Thread(runnable, "device-identity-resolver").start()
                 }
             ) {
                 val result = DeviceIdProvider.getOrCreate(appContext)
                 DeviceIdentityLookupResult(
                     status = result.status,
                     deviceId = result.deviceId,
-                    candidateCount = result.candidateCount,
                     mintAttempted = result.wasMintAttempted(),
                     diagnostic = result.diagnosticMessage,
                 )
@@ -78,7 +73,6 @@ class DeviceIdentityResolver internal constructor(
     @Volatile
     private var visibleState: DeviceIdentityState = DeviceIdentityState.Resolving
     private var lookupStarted = false
-    private var lookupInFlight = false
 
     fun snapshot(): DeviceIdentityState = visibleState
 
@@ -91,18 +85,11 @@ class DeviceIdentityResolver internal constructor(
         listeners.remove(listener)
     }
 
-    fun startInitialLookup(): Boolean = startLookup(isRetry = false)
-
-    fun retry(): Boolean = startLookup(isRetry = true)
-
-    private fun startLookup(isRetry: Boolean): Boolean {
+    fun startInitialLookup(): Boolean {
         synchronized(lock) {
-            if (visibleState is DeviceIdentityState.Ready || lookupInFlight) return false
-            if (!isRetry && lookupStarted) return false
+            if (lookupStarted) return false
             lookupStarted = true
-            lookupInFlight = true
         }
-        publish(DeviceIdentityState.Resolving)
         executor.execute {
             val next = try {
                 mapResult(lookup())
@@ -113,23 +100,7 @@ class DeviceIdentityResolver internal constructor(
                     false,
                 )
             }
-            val shouldPublish = synchronized(lock) {
-                if (visibleState is DeviceIdentityState.Ready) {
-                    lookupInFlight = false
-                    false
-                } else {
-                    visibleState = next
-                    true
-                }
-            }
-            if (!shouldPublish) return@execute
-            try {
-                listeners.forEach { it(next) }
-            } finally {
-                synchronized(lock) {
-                    lookupInFlight = false
-                }
-            }
+            publish(next)
         }
         return true
     }
@@ -138,11 +109,7 @@ class DeviceIdentityResolver internal constructor(
         if (result.status == DeviceIdStatus.SUCCESS) {
             val canonical = result.deviceId?.lowercase(Locale.ROOT)
             if (canonical != null && CANONICAL_GUID.matches(canonical)) {
-                return DeviceIdentityState.Ready(
-                    canonical,
-                    result.candidateCount.coerceAtLeast(1),
-                    result.mintAttempted,
-                )
+                return DeviceIdentityState.Ready(canonical)
             }
             return DeviceIdentityState.Unavailable(
                 DeviceIdentityStatus.IO_ERROR,
