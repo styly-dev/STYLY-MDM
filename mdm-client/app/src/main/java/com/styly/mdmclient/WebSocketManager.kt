@@ -528,8 +528,11 @@ class WebSocketManager(
         }
         val text = registration.toString()
         Log.d(TAG, "Sending: $text")
-        if (socket.send(text) && identity is DeviceIdentityState.Ready) {
-            canonicalRegistrationSent = true
+        // The reader may receive REGISTERED as soon as the send is queued.
+        val canonical = identity is DeviceIdentityState.Ready
+        if (canonical) canonicalRegistrationSent = true
+        if (!socket.send(text) && canonical) {
+            canonicalRegistrationSent = false
         }
     }
 
