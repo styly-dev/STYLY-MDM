@@ -371,6 +371,11 @@ is published on the connection handler only if its socket still owns the connect
 identities out of the normal device list: `Needs attention` shows their count, and
 the selected tab shows each status and diagnostic with wrapping for long text,
 plus whether Device ID creation was attempted when reported by the provider.
+Device IDs in the console and group editor can be clicked to copy the full ID.
+Canonical GUIDs remain shortened to eight characters; legacy serials remain full.
+The copy control reports success or failure without changing device selection or
+group membership. LAN HTTP uses a clipboard fallback; if copying is blocked, a
+prompt exposes the full ID for manual copying.
 Registering devices display `Registering…` without a Forget action and remain
 ineligible for commands until registration completes. Launch, power, Uninstall,
 Retire, Startup, verification, and Push/Sync controls require at least one selected

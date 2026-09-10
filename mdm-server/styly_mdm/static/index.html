@@ -206,6 +206,10 @@
     .dev-version.mismatch { color: var(--danger); border-color: var(--danger); font-weight: 700; }
     .btn-update { margin-left: 6px; flex: 0 0 auto; font: 600 11px/1 inherit; color: #fff; background: var(--accent); border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; white-space: nowrap; }
     .btn-update:hover { background: var(--accent-hover); }
+    .copy-device-id { background: none; border: 0; padding: 0; color: inherit; font: inherit; cursor: pointer; }
+    .copy-device-id:hover { text-decoration: underline; }
+    .copy-device-id:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+    .copy-id-status:not(:empty) { margin-left: 6px; }
     .dev-sub { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .dev-status { font-size: 13px; }
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 6px; vertical-align: middle; }
@@ -705,6 +709,39 @@
       // string carrying a double quote would otherwise escape the attribute.
       function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML.replace(/"/g, '&quot;'); }
       function getDeviceId(d) { return d.device_id || d.serial_number || ''; }
+      function deviceIdHtml(d, id) {
+        return '<button type="button" class="copy-device-id" data-act="copyDeviceId" data-id="' + esc(id) +
+          '" title="' + esc(id) + '" aria-label="Copy full device ID ' + esc(id) + '">' +
+          esc(d.identity_kind === 'canonical' ? id.slice(0, 8) : id) + '</button><span class="copy-id-status" role="status"></span>';
+      }
+      async function copyDeviceId(button) {
+        const id = button.dataset.id;
+        try {
+          if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(id);
+          } else {
+            // LAN HTTP does not expose the async Clipboard API.
+            const input = document.createElement('textarea');
+            input.value = id;
+            input.readOnly = true;
+            input.style.cssText = 'position:fixed;left:-9999px;top:0';
+            const focused = document.activeElement;
+            document.body.appendChild(input);
+            try {
+              input.select();
+              if (!document.execCommand('copy')) throw new Error('Copy unavailable');
+            } finally {
+              input.remove();
+              if (focused) focused.focus({ preventScroll: true });
+            }
+          }
+          button.nextElementSibling.textContent = 'Copied';
+        } catch (error) {
+          button.nextElementSibling.textContent = 'Copy failed';
+          window.prompt('Copy the full device ID:', id);
+        }
+      }
+
       // Allowlist, not a "!== 'offline'" denylist: a new server-side status (e.g.
       // retiring/retired) must default to the dimmed, not-a-command-target styling.
       function isOnline(d) { return d.status === 'online' || d.status === 'updating'; }
@@ -1264,7 +1301,7 @@
             updateBtn +
             '</div>';
         }
-        deviceCell += '<div class="dev-sub"><span title="' + esc(id) + '">' + esc(d.identity_kind === 'canonical' ? id.slice(0, 8) : id) + '</span> · ' + esc(d.ip || '-') + '</div>';
+        deviceCell += '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.ip || '-') + '</div>';
 
         let status;
         if (d.status === 'registering') {
@@ -1984,7 +2021,7 @@
             '<div class="selbox ' + (mem ? 'on' : '') + '">' + (mem ? '✓' : '') + '</div>' +
             '<div class="mg-dev-main">' +
             '<div>' + (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') + '</div>' +
-            '<div class="dev-sub"><span title="' + esc(id) + '">' + esc(d.identity_kind === 'canonical' ? id.slice(0, 8) : id) + '</span> · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') + '</div></div>' +
+            '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') + '</div></div>' +
             '<div class="mg-dev-status"><span class="dot ' + (off ? 'off' : '') + '"></span>' + (off ? 'Offline' : 'Online') + '</div>' +
             '</div>';
         }).join('');
@@ -2592,7 +2629,8 @@
         const t = e.target.closest('[data-act]');
         if (!t) return;
         const act = t.dataset.act;
-        if (act === 'selectGroup') selectGroupAsTarget(t.dataset.group);
+        if (act === 'copyDeviceId') { e.stopPropagation(); copyDeviceId(t); }
+        else if (act === 'selectGroup') selectGroupAsTarget(t.dataset.group);
         else if (act === 'toggleExpand') {
           const g = t.dataset.group;
           if (expandedGroups.has(g)) expandedGroups.delete(g); else expandedGroups.add(g);
@@ -2699,7 +2737,8 @@
         const t = e.target.closest('[data-act]');
         if (!t) return;
         const act = t.dataset.act;
-        if (act === 'back') backToConsole();
+        if (act === 'copyDeviceId') { e.stopPropagation(); copyDeviceId(t); }
+        else if (act === 'back') backToConsole();
         else if (act === 'sortManage') {
           // Toggle sort direction and refresh only the list (keeps search focus/scroll).
           manageSort = manageSort === 'label-asc' ? 'label-desc' : 'label-asc';
