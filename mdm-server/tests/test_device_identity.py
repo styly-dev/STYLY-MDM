@@ -504,3 +504,22 @@ def test_protocol_error_closes_socket_without_hiding_unexpected_errors(failure):
         assert len(closed) == 1
         assert closed[0]["code"] == server.WSCloseCode.PROTOCOL_ERROR
     asyncio.run(body())
+
+
+def test_final_dispatch_policy_denial_has_distinct_exception():
+    from styly_mdm.device_policy import CommandNotAllowedError
+
+    async def body():
+        ws = push_runtime.RuntimeWebSocketResponse()
+        ws._push_path = "/ws/device"
+        ws._push_device_id = GUID
+        ws._push_runtime = SimpleNamespace(
+            legacy=SimpleNamespace(devices={GUID: {
+                "ws": ws, "identity_kind": "canonical", "registration_ready": False,
+            }}),
+            sessions={GUID: SimpleNamespace(ws=ws)},
+        )
+        with pytest.raises(CommandNotAllowedError, match="not ready"):
+            await ws.send_str(json.dumps({"type": "EXECUTE_REBOOT"}))
+
+    asyncio.run(body())

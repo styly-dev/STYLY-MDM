@@ -124,6 +124,20 @@ The MDM client connects to the server, registers the device (Device-ID-Provider 
 
 **Upgrading from serial IDs to GUIDs:** Deploy the server first. Older serial-ID clients can receive APK installation/update commands only. After the client is updated, its Provider GUID registers as a new device; labels, groups, and Push history are not inherited. Reassign labels and groups to the new GUID, and explicitly forget the old serial record when it is no longer needed. An old serial that does not return is reported as `untracked`, which does not confirm update success. See [device identity and registration](docs/DEVELOPMENT.md#device-identity-and-provisional-registration-issue-65) for recovery steps and pending Push/Sync jobs.
 
+Before upgrading an API 29 device, arrange ADB access to grant
+`android.permission.READ_EXTERNAL_STORAGE` to the MDM package. Grant it before
+starting the new client when possible. If the old build does not declare this
+permission, install the new APK through ADB, grant it, then restart the MDM
+application process. Provision the required storage access on newer Android
+versions as well. An unresolved client
+cannot receive commands, including another self-update. If identity lookup has
+exhausted its retries, grant access and restart the **MDM application process**;
+Save & Connect only restarts the service and does not reset the retry budget.
+
+The GUID is stored as a PNG in `Pictures/Device-ID-Provider/`. Preserve this folder
+during photo cleanup: deleting the ID image or resetting the device can cause a
+new GUID to be created on a later lookup, which MDM treats as a new device.
+
 ### Client standby behavior (and how to tune it)
 
 The mdm-server does not have to run permanently: at an installed venue it may be

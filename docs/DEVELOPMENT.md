@@ -293,7 +293,10 @@ canonical registration, then freezes the GUID for the rest of the process.
 Provision the required permissions through ADB before starting the MDM process.
 API 29 requires `READ_EXTERNAL_STORAGE`; API 30+ supports All Files access, or
 the image-read permission appropriate to the OS version. The client does not
-request runtime image permissions. Retries do not grant permissions.
+request runtime image permissions. Retries do not grant permissions. If an old
+client does not declare the required permission, install the new APK through ADB,
+grant access, and restart the MDM application process before relying on remote
+commands.
 
 After all attempts fail, the resolver remains unavailable until the **MDM
 application process** restarts. Settings **Save & Connect** only restarts the
@@ -307,7 +310,8 @@ There is no retry button.
 To update Device-ID-Provider: copy the new released AAR into `mdm-client/app/libs/`,
 update `aar`, `version`, `source_commit`, and `sha256` in
 `libs/device-id-provider.properties`, then remove the superseded AAR. Compute the
-lowercase hash with `(Get-FileHash <new-aar> -Algorithm SHA256).Hash.ToLowerInvariant()`. Run
+lowercase hash with `(Get-FileHash <new-aar> -Algorithm SHA256).Hash.ToLowerInvariant()`
+on Windows, or `shasum -a 256 <new-aar>` on macOS (use the first output field). Run
 `./gradlew :app:verifyDeviceIdProviderAar :app:testDevDebugUnitTest :app:assembleDevDebug`
 from `mdm-client` (use `gradlew.bat` on Windows) and commit the AAR and metadata together.
 
@@ -360,14 +364,17 @@ successful result carries only the GUID. Registration acknowledgement checks the
 current registered owner directly, independently of APK command permissions.
 
 Network-loss cancellation resets the client connection state and stops battery
-telemetry. Provisional acknowledgement status is published on the connection
-handler only if its socket still owns the connection. The console keeps unresolved
+telemetry. Registration flags are bound to the socket under one lock, so a delayed
+ACK cannot acknowledge its replacement. Push result replay also checks the socket
+token on the coordinator actor before starting. Provisional acknowledgement status
+is published on the connection handler only if its socket still owns the connection. The console keeps unresolved
 identities out of the normal device list: `Needs attention` shows their count, and
-the selected tab shows each status and diagnostic with wrapping for long text.
+the selected tab shows each status and diagnostic with wrapping for long text,
+plus whether Device ID creation was attempted when reported by the provider.
 Registering devices display `Registering…` without a Forget action and remain
-ineligible for commands until registration completes. Launch, Uninstall, and
-Startup controls require at least one selected online canonical device. Selecting
-only offline or legacy devices disables those controls instead of sending an
+ineligible for commands until registration completes. Launch, power, Uninstall,
+Retire, Startup, verification, and Push/Sync controls require at least one selected
+online canonical device. Selecting only offline or legacy devices disables those controls instead of sending an
 operation that only logs skipped targets; APK installation remains available to
 eligible online legacy devices.
 

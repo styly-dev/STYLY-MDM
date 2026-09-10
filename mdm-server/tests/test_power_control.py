@@ -208,3 +208,22 @@ def test_e2e_reboot_result_is_forwarded_to_admin_stamped(tmp_path):
             await ts.close()
 
     asyncio.run(body())
+
+
+def test_power_policy_denial_is_not_logged_as_disconnect(caplog):
+    from styly_mdm.device_policy import CommandNotAllowedError
+
+    async def body():
+        admin = add_admin()
+        device = add_device("dev0")
+
+        async def deny(_message):
+            raise CommandNotAllowedError("registration changed before send")
+
+        device.send_str = deny
+        await server.handle_reboot_device(admin, {"target_devices": ["dev0"]})
+        assert frames_of(admin, "REBOOT_SENT")[0]["sent_count"] == 0
+
+    asyncio.run(body())
+    assert "command denied: registration changed before send" in caplog.text
+    assert "(disconnected)" not in caplog.text

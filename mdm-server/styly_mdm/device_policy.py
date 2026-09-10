@@ -1,6 +1,10 @@
 """Command policy shared by target selection and final socket dispatch."""
 
 
+class CommandNotAllowedError(ConnectionResetError):
+    """The socket is connected but no longer eligible for this command."""
+
+
 def command_allowed(entry: dict | None, command: str | None = None) -> bool:
     """Missing registration fields never grant access; legacy owners get APKs only."""
     return bool(

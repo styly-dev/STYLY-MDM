@@ -1112,7 +1112,8 @@
             '<div class="attention-device"><div class="attention-model">' + esc(entry.model || 'Unknown device') + '</div>' +
             '<div class="attention-meta">' + esc(entry.ip || 'unknown') + ' · ' + esc(version) + '</div></div>' +
             '<div class="attention-detail"><div class="attention-status">' + esc(entry.identity_status || 'unknown') + '</div>' +
-            '<div class="attention-diagnostic">' + esc(entry.diagnostic || 'No diagnostic available') + '</div></div>' +
+            '<div class="attention-diagnostic">' + esc(entry.diagnostic || 'No diagnostic available') + '</div>' +
+            (entry.mint_attempted === true ? '<div class="attention-meta">Device ID creation was attempted</div>' : '') + '</div>' +
             '</div>';
         }).join('') + '</div>';
       }

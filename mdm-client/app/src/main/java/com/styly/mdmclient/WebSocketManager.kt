@@ -220,8 +220,7 @@ class WebSocketManager(
     private var activeNetwork: Network? = null
     private var networkCallbackRegistered = false
     @Volatile private var socketOpen = false
-    @Volatile private var canonicalRegistrationSent = false
-    @Volatile private var canonicalRegistrationAcknowledged = false
+    private val registration = ConnectionRegistration<WebSocket>()
     @Volatile private var connectedServerAddress: String? = null
     private val identityListener: (DeviceIdentityState) -> Unit = { state ->
         reconnectHandler.post {
@@ -285,8 +284,7 @@ class WebSocketManager(
 
     private fun resetConnectionState() {
         socketOpen = false
-        canonicalRegistrationSent = false
-        canonicalRegistrationAcknowledged = false
+        registration.clear()
         connectedServerAddress = null
     }
 
@@ -399,8 +397,7 @@ class WebSocketManager(
                     if (this@WebSocketManager.webSocket !== webSocket) return@post
                     dispatch(scheduler.onConnected())
                     socketOpen = true
-                    canonicalRegistrationSent = false
-                    canonicalRegistrationAcknowledged = false
+                    registration.open(webSocket)
                     connectedServerAddress = serverAddress(url)
                     val identity = identityResolver.snapshot()
                     sendRegistration(webSocket, identity)
@@ -418,15 +415,14 @@ class WebSocketManager(
                     val json = JSONObject(text)
                     val type = json.optString("type", "")
                     if (type == "REGISTERED") {
-                        if (!canonicalRegistrationSent) {
-                            Log.w(TAG, "Ignoring REGISTERED before canonical registration")
+                        if (!registration.acknowledge(webSocket)) {
+                            Log.w(TAG, "Ignoring REGISTERED for an unregistered or superseded WebSocket")
                             return
                         }
-                        canonicalRegistrationAcknowledged = true
-                        pushCoordinator.handleServerMessage(type, json)
+                        pushCoordinator.onRegistered(webSocket)
                         reconnectHandler.post {
                             if (this@WebSocketManager.webSocket === webSocket &&
-                                canonicalRegistrationAcknowledged
+                                registration.isAcknowledged(webSocket)
                             ) {
                                 startBatteryTelemetry()
                                 publishConnectedStatus(identityResolver.snapshot())
@@ -438,7 +434,7 @@ class WebSocketManager(
                                 publishConnectedStatus(identityResolver.snapshot())
                             }
                         }
-                    } else if (!canonicalRegistrationAcknowledged) {
+                    } else if (!registration.isAcknowledged(webSocket)) {
                         Log.w(TAG, "Ignoring $type before canonical registration acknowledgement")
                     } else if (type.isNotEmpty() && !pushCoordinator.handleServerMessage(type, json)) {
                         onCommand(type, json)
@@ -489,17 +485,17 @@ class WebSocketManager(
     }
 
     private fun sendRegistration(socket: WebSocket, identity: DeviceIdentityState) {
-        if (canonicalRegistrationSent) return
+        if (registration.isSent(socket)) return
         if (identity is DeviceIdentityState.Ready) {
             pushCoordinator.attachTransport(socket) { message ->
-                if (this@WebSocketManager.webSocket === socket && canonicalRegistrationAcknowledged) {
+                if (this@WebSocketManager.webSocket === socket && registration.isAcknowledged(socket)) {
                     val text = message.toString()
                     Log.d(TAG, "Sending: $text")
                     socket.send(text)
                 }
             }
         }
-        val registration = JSONObject().apply {
+        val payload = JSONObject().apply {
             put("type", "REGISTER")
             put("identity_scheme", "styly_device_id_v1")
             put("model", Build.MODEL)
@@ -526,13 +522,13 @@ class WebSocketManager(
                 put("identity", provisionalIdentity(identity))
             }
         }
-        val text = registration.toString()
+        val text = payload.toString()
         Log.d(TAG, "Sending: $text")
         // The reader may receive REGISTERED as soon as the send is queued.
         val canonical = identity is DeviceIdentityState.Ready
-        if (canonical) canonicalRegistrationSent = true
+        if (canonical) registration.markSent(socket)
         if (!socket.send(text) && canonical) {
-            canonicalRegistrationSent = false
+            registration.clearSent(socket)
         }
     }
 
@@ -553,7 +549,7 @@ class WebSocketManager(
 
     private fun publishConnectedStatus(identity: DeviceIdentityState) {
         val suffix = when {
-            identity is DeviceIdentityState.Ready && canonicalRegistrationAcknowledged -> ""
+            identity is DeviceIdentityState.Ready && registration.isAcknowledged(webSocket) -> ""
             identity is DeviceIdentityState.Ready -> " - Registering Device ID"
             identity is DeviceIdentityState.Unavailable -> " - Device ID unavailable"
             else -> " - Resolving Device ID"
@@ -574,7 +570,7 @@ class WebSocketManager(
 
     private fun scheduleNextBatteryUpdate() {
         reconnectHandler.postAtTime({
-            if (isRunning && webSocket != null && canonicalRegistrationAcknowledged) {
+            if (isRunning && webSocket != null && registration.isAcknowledged(webSocket)) {
                 sendBatteryUpdate()
                 scheduleNextBatteryUpdate()
             }

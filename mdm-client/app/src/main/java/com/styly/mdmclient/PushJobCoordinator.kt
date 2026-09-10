@@ -148,14 +148,16 @@ class PushJobCoordinator(context: Context) {
         }
     }
 
+    fun onRegistered(token: Any) {
+        actor.execute {
+            if (transportToken === token) replayPendingResults()
+        }
+    }
+
     /** Returns true when the Application-scoped coordinator owns this message. */
     fun handleServerMessage(type: String, payload: JSONObject): Boolean = when (type) {
         "EXECUTE_PUSH_FILES" -> {
             actor.execute { handleCommand(payload) }
-            true
-        }
-        "REGISTERED" -> {
-            actor.execute { replayPendingResults() }
             true
         }
         "PUSH_RESULT_ACK" -> {

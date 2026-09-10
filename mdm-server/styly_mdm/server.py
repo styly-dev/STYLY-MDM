@@ -26,7 +26,7 @@ from aiohttp import WSCloseCode, web
 # built from a folder could never match the device that folder was pushed to.
 # The hash helpers compute the reference a client checks a downloaded APK against
 # before installing it (#39) — same algorithms as the #37 verify feature.
-from .device_policy import command_allowed
+from .device_policy import CommandNotAllowedError, command_allowed
 from .integrity import apk_cd_digest, file_sha256, is_os_metadata
 
 logging.basicConfig(
@@ -1476,9 +1476,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     await _resolve_pending_self_update(device_id, ws, version_code)
                     if kind == "canonical":
                         await broadcast_provisional_connection_list()
-                        await broadcast_device_list()
-                    else:
-                        await broadcast_device_list()
+                    await broadcast_device_list()
 
                 elif msg_type == "BATTERY_UPDATE":
                     if not device_id:
@@ -2227,6 +2225,8 @@ async def handle_launch_app(admin_ws: web.WebSocketResponse, data: dict):
             try:
                 await entry["ws"].send_str(execute_msg)
                 sent_count += 1
+            except CommandNotAllowedError as error:
+                log.warning("Failed to send EXECUTE_LAUNCH to %s (command denied: %s)", did, error)
             except ConnectionResetError:
                 log.warning("Failed to send EXECUTE_LAUNCH to %s (disconnected)", did)
 
@@ -2309,6 +2309,8 @@ async def handle_delete_app(admin_ws: web.WebSocketResponse, data: dict):
             try:
                 await entry["ws"].send_str(execute_msg)
                 sent_count += 1
+            except CommandNotAllowedError as error:
+                log.warning("Failed to send EXECUTE_UNINSTALL to %s (command denied: %s)", did, error)
             except ConnectionResetError:
                 log.warning("Failed to send EXECUTE_UNINSTALL to %s (disconnected)", did)
 
@@ -2378,6 +2380,8 @@ async def _dispatch_power_command(
             try:
                 await entry["ws"].send_str(execute_msg)
                 sent_count += 1
+            except CommandNotAllowedError as error:
+                log.warning("Failed to send %s to %s (command denied: %s)", execute_type, did, error)
             except ConnectionResetError:
                 log.warning("Failed to send %s to %s (disconnected)", execute_type, did)
 
@@ -2420,6 +2424,8 @@ async def handle_retire_device(admin_ws: web.WebSocketResponse, data: dict):
                     "correlation_id": uuid.uuid4().hex,
                 }))
                 sent_count += 1
+            except CommandNotAllowedError as error:
+                log.warning("Failed to send EXECUTE_SELF_UNINSTALL to %s (command denied: %s)", did, error)
             except ConnectionResetError:
                 log.warning("Failed to send EXECUTE_SELF_UNINSTALL to %s (disconnected)", did)
 
@@ -2836,6 +2842,8 @@ async def _fanout_execute(
             try:
                 await entry["ws"].send_str(execute_msg)
                 sent_count += 1
+            except CommandNotAllowedError as error:
+                log.warning("Failed to send %s to %s (command denied: %s)", verb, did, error)
             except ConnectionResetError:
                 log.warning("Failed to send %s to %s (disconnected)", verb, did)
 
@@ -3139,6 +3147,8 @@ async def handle_set_startup_app(admin_ws: web.WebSocketResponse, data: dict):
                 rec = device_registry.get(did)
                 if rec is not None:
                     rec["startup_app"] = entry["startup_app"]
+            except CommandNotAllowedError as error:
+                log.warning("Failed to send SET_STARTUP_APP to %s (command denied: %s)", did, error)
             except ConnectionResetError:
                 log.warning("Failed to send SET_STARTUP_APP to %s (disconnected)", did)
 
@@ -3181,6 +3191,8 @@ async def handle_clear_startup_app(admin_ws: web.WebSocketResponse, data: dict):
                 rec = device_registry.get(did)
                 if rec is not None:
                     rec["startup_app"] = None
+            except CommandNotAllowedError as error:
+                log.warning("Failed to send CLEAR_STARTUP_APP to %s (command denied: %s)", did, error)
             except ConnectionResetError:
                 log.warning("Failed to send CLEAR_STARTUP_APP to %s (disconnected)", did)
 

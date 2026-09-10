@@ -19,7 +19,7 @@ from typing import Any
 
 from aiohttp import WSCloseCode, WSMsgType, web as aiohttp_web
 
-from .device_policy import command_allowed
+from .device_policy import CommandNotAllowedError, command_allowed
 from .push_artifacts import ArtifactStore
 from .push_job_manager import PushJobManager
 from .push_job_store import (
@@ -150,7 +150,7 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
                     if (entry is None or entry.get("ws") is not self
                             or session is None or session.ws is not self
                             or not command_allowed(entry, message_type)):
-                        raise ConnectionResetError("Device is not ready or command is not allowed")
+                        raise CommandNotAllowedError("Device is not ready or command is not allowed")
             await super().send_str(data, compress=compress)
 
     async def prepare(self, request: aiohttp_web.Request) -> Any:
