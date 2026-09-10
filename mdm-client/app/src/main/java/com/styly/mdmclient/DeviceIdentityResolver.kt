@@ -1,6 +1,8 @@
 package com.styly.mdmclient
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import com.styly.deviceid.DeviceIdProvider
 import com.styly.deviceid.DeviceIdStatus
 import java.util.Locale
@@ -37,20 +39,28 @@ internal data class DeviceIdentityLookupResult(
 /** Process-wide, single-flight owner of the canonical MediaStore identity lookup. */
 class DeviceIdentityResolver internal constructor(
     private val executor: Executor,
+    private val scheduleRetry: (Runnable, Long) -> Unit,
     private val lookup: () -> DeviceIdentityLookupResult,
 ) {
     companion object {
         private const val MAX_DIAGNOSTIC_LENGTH = 256
+        private const val MAX_RETRIES = 3
+        private const val RETRY_DELAY_MS = 60_000L
         private val CANONICAL_GUID = Regex(
             "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
         )
 
         fun create(context: Context): DeviceIdentityResolver {
             val appContext = context.applicationContext
+            val handler = Handler(Looper.getMainLooper())
             return DeviceIdentityResolver(
                 Executor { runnable ->
                     Thread(runnable, "device-identity-resolver").start()
-                }
+                },
+                { runnable, delayMs ->
+                    handler.postDelayed(runnable, delayMs)
+                    Unit
+                },
             ) {
                 val result = DeviceIdProvider.getOrCreate(appContext)
                 DeviceIdentityLookupResult(
@@ -90,6 +100,11 @@ class DeviceIdentityResolver internal constructor(
             if (lookupStarted) return false
             lookupStarted = true
         }
+        runLookup(0)
+        return true
+    }
+
+    private fun runLookup(retriesUsed: Int) {
         executor.execute {
             val next = try {
                 mapResult(lookup())
@@ -101,8 +116,10 @@ class DeviceIdentityResolver internal constructor(
                 )
             }
             publish(next)
+            if (next is DeviceIdentityState.Unavailable && retriesUsed < MAX_RETRIES) {
+                scheduleRetry(Runnable { runLookup(retriesUsed + 1) }, RETRY_DELAY_MS)
+            }
         }
-        return true
     }
 
     private fun mapResult(result: DeviceIdentityLookupResult): DeviceIdentityState {

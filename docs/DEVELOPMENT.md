@@ -281,20 +281,28 @@ not fallback identities. The vendored Android AAR is Device-ID-Provider `0.3.1`
 from merge commit `60e9175`; `mdm-client/app/libs/device-id-provider.properties`
 pins its SHA-256 and the Android `preBuild` task verifies it before compiling.
 
-The Application-scoped resolver runs `DeviceIdProvider.getOrCreate()` on one
-dedicated thread that exits after the lookup. The first lookup and WebSocket connection start independently.
-A failure remains status-only for the rest of the process: there is no retry API,
-button, timer, or reconnect-triggered lookup. The Settings screen shows the result.
-A successful GUID is also frozen for the rest of the process.
+The Application-scoped resolver runs `DeviceIdProvider.getOrCreate()` on a
+background thread. The first lookup and WebSocket connection start independently.
+After a failed lookup, it schedules another attempt 60 seconds after completion,
+up to three retries (four attempts total per process). Only one lookup runs at a
+time. A main-thread Handler schedules each retry; no worker thread waits between
+attempts. Failure diagnostics remain visible and the socket stays provisional
+while waiting. Success notifies listeners so the same socket can promote to
+canonical registration, then freezes the GUID for the rest of the process.
 
-If the initial lookup fails, grant the required image access (or All Files access)
-and wait until shared storage is available, then restart the **MDM application
-process** and launch it again. Settings **Save & Connect** only restarts the service;
-it does not reset the Application-scoped resolver. Reconnecting the WebSocket or
-returning to Settings also does not retry the lookup. Check that the original GUID
-is Ready and canonical registration completes before sending commands. A reboot
-alone is not a reliable recovery step because the initial lookup may race storage
-initialization again. There is intentionally no retry button or automatic retry.
+Provision the required permissions through ADB before starting the MDM process.
+API 29 requires `READ_EXTERNAL_STORAGE`; API 30+ supports All Files access, or
+the image-read permission appropriate to the OS version. The client does not
+request runtime image permissions. Retries do not grant permissions.
+
+After all attempts fail, the resolver remains unavailable until the **MDM
+application process** restarts. Settings **Save & Connect** only restarts the
+service; it does not reset the retry budget. WebSocket reconnection and returning
+to Settings also do not reset it. Grant missing access and wait for shared storage
+to become available before restarting the process. Check that the original GUID
+is Ready and canonical registration completes before sending commands. These
+bounded retries cover transient startup failures, not indefinite storage outages.
+There is no retry button.
 
 To update Device-ID-Provider: copy the new released AAR into `mdm-client/app/libs/`,
 update `aar`, `version`, `source_commit`, and `sha256` in
