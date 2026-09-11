@@ -9,6 +9,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.View
 import android.widget.Button
@@ -42,8 +44,24 @@ class SettingsActivity : AppCompatActivity() {
         }
     }
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var permissionRecoveryPending = false
+
     private val identityListener: (DeviceIdentityState) -> Unit = { state ->
-        runOnUiThread { updateDeviceIdentityUi(state) }
+        runOnUiThread {
+            updateDeviceIdentityUi(state)
+            if (state is DeviceIdentityState.Unavailable &&
+                state.status == DeviceIdentityStatus.ACCESS_DENIED
+            ) {
+                // Defer until the current result has reached every listener.
+                mainHandler.post {
+                    if (permissionRecoveryPending && hasAllFilesAccess()) {
+                        permissionRecoveryPending = false
+                        MdmClientApplication.deviceIdentityResolver().retryAfterPermissionGranted()
+                    }
+                }
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -106,6 +124,7 @@ class SettingsActivity : AppCompatActivity() {
         registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         // Re-check here so returning from the system settings screen refreshes the UI.
         updateStoragePermissionUi()
+        permissionRecoveryPending = hasAllFilesAccess()
         MdmClientApplication.deviceIdentityResolver().addListener(identityListener)
         refreshJournal()
     }
@@ -116,6 +135,7 @@ class SettingsActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        permissionRecoveryPending = false
         unregisterReceiver(statusReceiver)
         MdmClientApplication.deviceIdentityResolver().removeListener(identityListener)
     }

@@ -10,7 +10,7 @@
     <string name="device_identity_label">Device Identity</string>
     <string name="device_identity_resolving">Resolving Device ID…</string>
     <string name="device_identity_ready">Ready\n%1$s</string>
-    <string name="device_identity_unavailable">Unavailable (%1$s)\n%2$s</string>
+    <string name="device_identity_unavailable">Unavailable (%1$s)\n%2$s\nGrant file access if needed and return to this screen. If the error remains, force-stop MDM in system settings and open it again.</string>
     <string name="storage_permission_label">All Files Access</string>
     <string name="grant_all_files_access">Grant All Files Access</string>
     <string name="storage_permission_granted">Granted</string>

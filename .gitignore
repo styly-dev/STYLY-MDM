@@ -37,6 +37,9 @@ mdm-client/local.properties
 # === Server runtime data ===
 mdm-server/device_registry.json
 mdm-server/device_registry.json.tmp
+mdm-server/push_jobs.sqlite3*
+mdm-server/bundles/
+mdm-server/push-artifacts/
 
 # === Agent workflow scratch ===
 # Per-task scratch plan, rewritten every task. tasks/lessons.md is intentionally

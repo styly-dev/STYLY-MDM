@@ -277,38 +277,61 @@ STYLY-MDM/
 Device identity is a protocol and persistence boundary. New clients use only the
 lowercase GUID returned by Device-ID-Provider and set
 `identity_scheme: "styly_device_id_v1"`. Hardware serials and `Build.SERIAL` are
-not fallback identities. The vendored Android AAR is Device-ID-Provider `0.3.1`
-from merge commit `60e9175`; `mdm-client/app/libs/device-id-provider.properties`
-pins its SHA-256 and the Android `preBuild` task verifies it before compiling.
+not fallback identities. The vendored Android AAR is an unreleased async snapshot
+based on Device-ID-Provider `0.4.0`, pinned to commit `a4f723f`.
+`mdm-client/app/libs/device-id-provider.properties` pins its SHA-256 and the Android
+`preBuild` task verifies it before compiling.
 
-The Application-scoped resolver runs `DeviceIdProvider.getOrCreate()` on a
-background thread. The first lookup and WebSocket connection start independently.
-After a failed lookup, it schedules another attempt 60 seconds after completion,
-up to three retries (four attempts total per process). Only one lookup runs at a
-time. A main-thread Handler schedules each retry; no worker thread waits between
-attempts. Failure diagnostics remain visible and the socket stays provisional
-while waiting. Success notifies listeners so the same socket can promote to
-canonical registration, then freezes the GUID for the rest of the process.
+The Application-scoped resolver initially starts one
+`DeviceIdProvider.getOrCreateAsync(context, 30_000, 250)` request. The first lookup
+and WebSocket connection start independently. The Provider polls primary-storage
+and MediaStore readiness every 250 ms until its 30-second deadline. MDM does not
+register mount observers, schedule retries, or add a waiting worker thread.
+While the request is pending, identity remains `Resolving` and the socket stays
+provisional. Only the final result is published. Success validates and freezes the
+canonical GUID for the rest of the process, then notifies listeners so the same
+socket can promote to canonical registration. A Provider failure or exceptional
+completion becomes `Unavailable`; timeout and readiness-cause diagnostics are
+retained, sanitized and capped at 256 characters. Timeout uses the existing
+`io_error` protocol status and does not introduce a new wire value.
 
-Provision the required permissions through ADB before starting the MDM process.
+The Provider returns the existing synchronous lookup result after its readiness
+probe succeeds. Terminal results are not polled again by MDM. The permission
+recovery below permits a new request only for `ACCESS_DENIED` without a mint
+attempt. A timed-out in-flight lookup may still create an ID. An exceptional
+completion has no Provider result, so `mint_attempted=false` means no mint attempt
+was reported, not proof that no write occurred. The timeout diagnostic states this
+limitation. Service teardown does not cancel the Application-scoped identity request.
+
+Grant All Files access from the Settings screen, or provision permissions through ADB.
 API 29 requires `READ_EXTERNAL_STORAGE`; API 30+ supports All Files access, or
 the image-read permission appropriate to the OS version. The client does not
 request runtime image permissions. Retries do not grant permissions. If an old
 client does not declare the required permission, install the new APK through ADB,
-grant access, and restart the MDM application process before relying on remote
-commands.
+then grant access before relying on remote commands.
 
-After all attempts fail, the resolver remains unavailable until the **MDM
-application process** restarts. Settings **Save & Connect** only restarts the
-service; it does not reset the retry budget. WebSocket reconnection and returning
-to Settings also do not reset it. Grant missing access and wait for shared storage
-to become available before restarting the process. Check that the original GUID
-is Ready and canonical registration completes before sending commands. These
-bounded retries cover transient startup failures, not indefinite storage outages.
-There is no retry button.
+When Settings resumes with All Files access granted, a prior `ACCESS_DENIED`
+without a mint attempt is retried once automatically. If the initial request is
+still pending, its eventual permission failure triggers that recovery. The UI
+consumes this opportunity before retrying, so another permission failure cannot
+create a retry loop. Leaving Settings clears the pending opportunity. Recovery
+publishes `Resolving`, reuses the same async Provider deadline, and promotes the
+existing socket on success. Requests in flight and a successful GUID are never
+restarted.
 
-To update Device-ID-Provider: copy the new released AAR into `mdm-client/app/libs/`,
-update `aar`, `version`, `source_commit`, and `sha256` in
+Other failures and timeouts remain unavailable until the **MDM application
+process** restarts. Settings **Save & Connect** only restarts the service;
+WebSocket reconnection does not restart identity lookup. There is no retry button.
+
+Provider completions are queued on the main thread, which also owns permission
+recovery and listener subscription. A result reaches all listeners before the
+queued permission retry can publish a newer state. Synchronous dependency linkage
+failures are reported as `io_error`. The Settings error message explains granting
+access and force-stopping/reopening MDM if the error remains. Startup timing
+instrumentation and its external trace file export are not included in the client.
+
+To update Device-ID-Provider: copy the released or explicitly pinned snapshot AAR
+into `mdm-client/app/libs/`, update `aar`, `version`, `source_commit`, and `sha256` in
 `libs/device-id-provider.properties`, then remove the superseded AAR. Compute the
 lowercase hash with `(Get-FileHash <new-aar> -Algorithm SHA256).Hash.ToLowerInvariant()`
 on Windows, or `shasum -a 256 <new-aar>` on macOS (use the first output field). Run
