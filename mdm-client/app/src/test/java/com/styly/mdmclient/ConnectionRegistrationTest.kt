@@ -5,6 +5,18 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ConnectionRegistrationTest {
+    @Test fun provisionalAckCannotDowngradeCanonicalRegistration() {
+        val state = ConnectionRegistration<Any>()
+        val socket = Any()
+        state.open(socket)
+        state.markSent(socket)
+        assertTrue(state.acknowledge(socket))
+        assertFalse(state.acknowledgeProvisional(socket, "late-connection"))
+        assertTrue(state.isCanonicalAcknowledged(socket))
+        assertFalse(state.isProvisional(socket))
+        assertTrue(state.provisionalConnectionId(socket) == null)
+    }
+
     @Test fun staleAckCannotAcknowledgeReplacementEvenAfterItSendsRegister() {
         val state = ConnectionRegistration<Any>()
         val old = Any()
@@ -49,5 +61,39 @@ class ConnectionRegistrationTest {
         state.clearSent(current)
         assertFalse(state.isSent(current))
         assertFalse(state.isAcknowledged(current))
+    }
+
+    @Test fun provisionalAckBindsConnectionIdAndCanonicalPromotionClearsIt() {
+        val state = ConnectionRegistration<Any>()
+        val socket = Any()
+
+        state.open(socket)
+        assertTrue(state.acknowledgeProvisional(socket, "connection-1"))
+        assertTrue(state.isAcknowledged(socket))
+        assertTrue(state.isProvisional(socket))
+        assertFalse(state.isCanonicalAcknowledged(socket))
+        assertTrue(state.provisionalConnectionId(socket) == "connection-1")
+
+        state.markSent(socket)
+        assertTrue(state.acknowledge(socket))
+        assertTrue(state.isCanonicalAcknowledged(socket))
+        assertFalse(state.isProvisional(socket))
+        assertTrue(state.provisionalConnectionId(socket) == null)
+    }
+
+    @Test fun provisionalAckRejectsBlankOrStaleConnectionIds() {
+        val state = ConnectionRegistration<Any>()
+        val old = Any()
+        val current = Any()
+
+        state.open(old)
+        assertFalse(state.acknowledgeProvisional(old, ""))
+        state.clear()
+        state.open(current)
+        assertFalse(state.acknowledgeProvisional(old, "connection-1"))
+        assertFalse(state.isAcknowledged(current))
+        assertTrue(state.acknowledgeProvisional(current, "connection-1"))
+        assertFalse(state.acknowledgeProvisional(current, ""))
+        assertTrue(state.provisionalConnectionId(current) == "connection-1")
     }
 }

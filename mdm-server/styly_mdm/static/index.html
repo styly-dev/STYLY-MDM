@@ -104,13 +104,18 @@
     .actions { background: var(--bg-actions); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
     .targets-head, .subtabs { flex: 0 0 auto; }
     .attention-list { padding: 14px 20px; }
-    .attention-row { display: grid; grid-template-columns: minmax(150px, .8fr) minmax(0, 1.6fr); gap: 16px; padding: 12px 0; border-top: 1px solid var(--border-soft); }
+    .attention-row { display: grid; grid-template-columns: 42px minmax(150px, .8fr) minmax(0, 1.6fr); gap: 16px; align-items: center; padding: 12px 0; border-top: 1px solid var(--border-soft); }
+    .attention-head { display: grid; grid-template-columns: 42px minmax(150px, .8fr) minmax(0, 1.6fr); gap: 16px; padding: 0 0 8px; color: var(--text-secondary); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; }
     .attention-row:first-child { border-top: none; }
     .attention-device, .attention-detail { min-width: 0; }
     .attention-model { color: var(--text-primary); font-weight: 600; overflow-wrap: anywhere; }
     .attention-meta { margin-top: 3px; color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; }
+    .attention-id { color: var(--text-secondary); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
     .attention-status { color: var(--warning); font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+    .attention-update { color: var(--danger); font-size: 12px; font-weight: 600; }
     .attention-diagnostic { margin-top: 3px; color: var(--text-secondary); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; word-break: break-word; }
+    .attention-row.unsupported { opacity: .62; }
+    .attention-row.unsupported .selbox { cursor: not-allowed; }
     .actions > .zone-label, .sel-card, .push-attention { flex: 0 0 auto; }
 
     /* Drag handles */
@@ -243,6 +248,7 @@
     /* Select boxes */
     .selbox { width: 16px; height: 16px; border-radius: 4px; border: 1.5px solid #41475f; display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; color: #fff; font-size: 11px; font-weight: 800; }
     .selbox.on, .selbox.mixed { background: var(--accent); border-color: var(--accent); }
+    .selbox.disabled { cursor: not-allowed; opacity: .55; }
 
     .ic-btn { background: none; border: none; cursor: pointer; color: var(--text-secondary); font-size: 12px; line-height: 1; padding: 2px 4px; border-radius: 4px; }
     .ic-btn:hover { color: var(--accent); background: var(--bg-tertiary); }
@@ -377,7 +383,9 @@
       .v-gutter, .h-gutter { display: none; }
       .logzone { height: auto; }
       .log-body { flex: 0 0 auto; max-height: 220px; }
-      .attention-row { grid-template-columns: 1fr; gap: 4px; }
+      .attention-head { display: none; }
+      .attention-row { grid-template-columns: 42px 1fr; gap: 4px 10px; }
+      .attention-row .attention-detail { grid-column: 2; }
       .subtab { padding-left: 10px; padding-right: 10px; }
       .manage-grid { grid-template-columns: 1fr; }
       .mg-sidebar { border-right: none; border-bottom: 1px solid var(--border); }
@@ -605,6 +613,7 @@
       let clientApk = null;            // newest styly-mdm-client APK on the server, from CLIENT_APK_INFO ({filename,url,version} or null)
       let groups = {};                 // name -> [serials]
       let selectedIds = new Set();
+      let selectedConnectionIds = new Set();
       let activeGroup = null;          // group name driving the selection, or null
       let targetTab = 'groups';        // 'groups' | 'devices' | 'attention'
       let userPickedTab = false;       // true once the user clicks a sub-tab (stops auto-default)
@@ -805,6 +814,16 @@
         el.classList.add('shown');
       }
       function deviceById(id) { return devices.find(function (d) { return getDeviceId(d) === id; }); }
+      function connectionById(id) { return provisionalConnections.find(function (c) { return c.connection_id === id; }); }
+      function shortConnectionId(id) { return id ? String(id).slice(0, 8) : '-'; }
+      function attentionPowerSupported(entry) {
+        return !!(entry && entry.power_control_supported === true);
+      }
+      function attentionLabelFor(id) {
+        const entry = connectionById(id);
+        if (!entry) return shortConnectionId(id);
+        return (entry.model || 'Unknown device') + ' (' + (entry.ip || 'unknown') + ', ' + shortConnectionId(id) + ')';
+      }
       // Command targets need a live WebSocket, which "updating" (mid self-update,
       // device rebooting) does not have — only strictly-online devices qualify.
       function getOnlineIds() { return devices.filter(function (d) { return d.status === 'online'; }).map(getDeviceId).filter(Boolean); }
@@ -936,8 +955,10 @@
           }
           case 'DEVICE_LIST': {
             devices = msg.devices || [];
+            const selectedBefore = selectedIds.size;
             const cur = knownIds();
             selectedIds.forEach(function (id) { if (!cur.has(id)) selectedIds.delete(id); });
+            if (selectedIds.size !== selectedBefore) powerConfirm.checked = false;
             // Purge task cells only for devices that went fully offline. Broader than
             // getOnlineIds() on purpose: a device mid self-update ("updating") has no
             // live socket but its Updating… cell must survive the list refresh.
@@ -949,11 +970,14 @@
           }
           case 'PROVISIONAL_CONNECTION_LIST': {
             provisionalConnections = Array.isArray(msg.connections) ? msg.connections : [];
+            const removedSelection = pruneAttentionSelection();
+            if (removedSelection) powerConfirm.checked = false;
             // Keep the normal device table and any active label editor intact while
             // the status-only attention list updates in the background.
             if (view === 'console') {
               renderTabs();
               if (targetTab === 'attention') renderTargets();
+              renderActions();
             }
             break;
           }
@@ -1143,12 +1167,23 @@
 
       function renderAttentionHtml() {
         if (!provisionalConnections.length) return '<div class="empty">No devices need attention</div>';
-        return '<div class="attention-list">' + provisionalConnections.map(function (entry) {
+        return '<div class="attention-list"><div class="attention-head">' +
+          '<div class="selbox ' + attentionSelectAllState() + (attentionSelectableCount() ? '' : ' disabled') + '" data-act="selectAllAttention">' + attentionSelectAllGlyph() + '</div>' +
+          '<div>Connection</div><div>Status</div></div>' +
+          provisionalConnections.map(function (entry) {
+          const connectionId = entry.connection_id || '';
+          const supported = attentionPowerSupported(entry);
+          const checked = selectedConnectionIds.has(connectionId);
           const version = entry.version_name ? 'v' + entry.version_name : 'version unknown';
-          return '<div class="attention-row">' +
+          return '<div class="attention-row' + (supported ? '' : ' unsupported') + '">' +
+            '<div class="selbox ' + (checked ? 'on' : '') + (supported ? '' : ' disabled') + '"' +
+              (supported ? ' data-act="toggleAttention" data-id="' + esc(connectionId) + '"' : ' aria-disabled="true"') + '>' + (checked ? '✓' : '') + '</div>' +
             '<div class="attention-device"><div class="attention-model">' + esc(entry.model || 'Unknown device') + '</div>' +
-            '<div class="attention-meta">' + esc(entry.ip || 'unknown') + ' · ' + esc(version) + '</div></div>' +
-            '<div class="attention-detail"><div class="attention-status">' + esc(entry.identity_status || 'unknown') + '</div>' +
+            '<div class="attention-meta">' + esc(entry.ip || 'unknown') + ' · ' + esc(version) + '</div>' +
+            '<div class="attention-id" title="' + esc(connectionId) + '">' + esc(shortConnectionId(connectionId)) + '</div></div>' +
+            '<div class="attention-detail">' + (supported
+              ? '<div class="attention-status">' + esc(entry.identity_status || 'unknown') + '</div>'
+              : '<div class="attention-update">Client update required</div>') +
             '<div class="attention-diagnostic">' + esc(entry.diagnostic || 'No diagnostic available') + '</div>' +
             (entry.mint_attempted === true ? '<div class="attention-meta">Device ID creation was attempted</div>' : '') + '</div>' +
             '</div>';
@@ -1479,15 +1514,17 @@
       };
 
       function renderActions() {
+        const attentionMode = targetTab === 'attention';
         const online = new Set(getOnlineIds());
         let on = 0, off = 0;
         selectedIds.forEach(function (id) { if (online.has(id)) on++; else off++; });
-        const n = selectedIds.size;
+        const n = attentionMode ? selectedConnectionIds.size : selectedIds.size;
         let ctx;
         if (n === 0) ctx = 'Select devices or a group to act on';
+        else if (attentionMode) ctx = n + ' Need attention connection(s) selected · power control only';
         else if (activeGroup) ctx = 'via group "' + esc(activeGroup) + '" · ' + on + ' online' + (off ? ' · ' + off + ' offline skipped' : '');
         else ctx = on + ' online' + (off ? ' · ' + off + ' offline skipped' : '') + ' · add or remove individually';
-        if (Array.from(selectedIds).some(function (id) { return (deviceById(id) || {}).identity_kind === 'legacy'; })) ctx += ' · Legacy devices: APK installation/update only';
+        if (!attentionMode && Array.from(selectedIds).some(function (id) { return (deviceById(id) || {}).identity_kind === 'legacy'; })) ctx += ' · Legacy devices: APK installation/update only';
         selCard.innerHTML =
           '<div class="sel-head">' +
           '<span class="sel-badge ' + (n ? '' : 'zero') + '">' + n + '</span>' +
@@ -1500,8 +1537,12 @@
 
 
       function updateButtons() {
-        const has = Array.from(selectedIds).some(function (id) { const d = deviceById(id); return d && isOnline(d) && d.identity_kind !== 'legacy'; });
-        const hasInstall = Array.from(selectedIds).some(function (id) { return isOnline(deviceById(id)); });
+        const attentionMode = targetTab === 'attention';
+        const hasAttentionPower = attentionMode && Array.from(selectedConnectionIds).some(function (id) {
+          return attentionPowerSupported(connectionById(id));
+        });
+        const has = !attentionMode && Array.from(selectedIds).some(function (id) { const d = deviceById(id); return d && isOnline(d) && d.identity_kind !== 'legacy'; });
+        const hasInstall = !attentionMode && Array.from(selectedIds).some(function (id) { return isOnline(deviceById(id)); });
         btnInstall.disabled = uploadInProgress || apkFile.files.length === 0 || !hasInstall;
         btnLaunch.disabled = launchPkg.value.trim() === '' || !has;
         btnUninstall.disabled = !uninstallConfirm.checked || uninstallPkg.value.trim() === '' || !has;
@@ -1511,8 +1552,8 @@
         syncPanel.refreshButton(has);
         btnVerifyApk.disabled = !verifyApkRef || verifyApkPkg.value.trim() === '' || !has;
         btnVerifyDir.disabled = !verifyDirRef || verifyDirPath.value.trim() === '' || !has;
-        btnReboot.disabled = !powerConfirm.checked || !has;
-        btnPowerOff.disabled = !powerConfirm.checked || !has;
+        btnReboot.disabled = !powerConfirm.checked || !(has || hasAttentionPower);
+        btnPowerOff.disabled = !powerConfirm.checked || !(has || hasAttentionPower);
         btnRetire.disabled = !retireConfirm.checked || !has;
         // Enabled only when at least one selected device is actually behind and updatable; the
         // count tells the operator how many of the selection this one click will update.
@@ -1523,7 +1564,59 @@
       }
 
       // ---------------- Selection actions ----------------
+      function pruneAttentionSelection() {
+        let changed = false;
+        selectedConnectionIds.forEach(function (id) {
+          if (!attentionPowerSupported(connectionById(id))) {
+            selectedConnectionIds.delete(id);
+            changed = true;
+          }
+        });
+        return changed;
+      }
+      function attentionSelectableEntries() {
+        return provisionalConnections.filter(attentionPowerSupported);
+      }
+      function attentionSelectableCount() { return attentionSelectableEntries().length; }
+      function attentionSelectAllState() {
+        const selectable = attentionSelectableEntries();
+        if (!selectable.length || !selectedConnectionIds.size) return '';
+        return selectable.every(function (entry) { return selectedConnectionIds.has(entry.connection_id); }) ? 'on' : 'mixed';
+      }
+      function attentionSelectAllGlyph() {
+        const state = attentionSelectAllState();
+        return state === 'on' ? '✓' : state === 'mixed' ? '–' : '';
+      }
+      function toggleAttention(id) {
+        const entry = connectionById(id);
+        if (!attentionPowerSupported(entry)) return;
+        if (selectedConnectionIds.has(id)) selectedConnectionIds.delete(id);
+        else selectedConnectionIds.add(id);
+        render();
+      }
+      function toggleSelectAllAttention() {
+        const selectable = attentionSelectableEntries();
+        const all = selectable.length > 0 && selectable.every(function (entry) {
+          return selectedConnectionIds.has(entry.connection_id);
+        });
+        if (all) selectable.forEach(function (entry) { selectedConnectionIds.delete(entry.connection_id); });
+        else selectable.forEach(function (entry) { selectedConnectionIds.add(entry.connection_id); });
+        render();
+      }
+      function switchTargetTab(tab) {
+        if (targetTab === tab) return;
+        const crossesAttention = targetTab === 'attention' || tab === 'attention';
+        targetTab = tab;
+        if (crossesAttention) {
+          selectedIds.clear();
+          selectedConnectionIds.clear();
+          activeGroup = null;
+          powerConfirm.checked = false;
+        }
+        render();
+      }
       function selectGroupAsTarget(name) {
+        selectedConnectionIds.clear();
         const known = knownIds();
         selectedIds = new Set((groups[name] || []).filter(function (s) { return known.has(s); }));
         activeGroup = name;
@@ -1557,7 +1650,13 @@
         activeGroup = null;
         render();
       }
-      function clearSelection() { selectedIds.clear(); activeGroup = null; render(); }
+      function clearSelection() {
+        selectedIds.clear();
+        selectedConnectionIds.clear();
+        activeGroup = null;
+        powerConfirm.checked = false;
+        render();
+      }
 
       // Split into online/offline; warn about skipped offline; return reachable subset.
       function onlineTargets(ids, allowLegacy = false) {
@@ -1806,15 +1905,29 @@
         const isReboot = kind === 'reboot';
         const verb = isReboot ? 'Reboot' : 'Power off';
         const type = isReboot ? 'REBOOT_DEVICE' : 'POWER_OFF_DEVICE';
-        const online = onlineTargets(Array.from(selectedIds));
-        if (!online.length) { addLog('No online devices selected to ' + verb.toLowerCase(), 'warn'); return; }
-        const names = online.map(labelFor).join(', ');
+        const attentionMode = targetTab === 'attention';
+        let targets;
+        let names;
+        if (attentionMode) {
+          targets = Array.from(selectedConnectionIds).filter(function (id) {
+            return attentionPowerSupported(connectionById(id));
+          });
+          if (!targets.length) { addLog('No eligible Need attention connections selected to ' + verb.toLowerCase(), 'warn'); return; }
+          names = targets.map(attentionLabelFor).join(', ');
+        } else {
+          targets = onlineTargets(Array.from(selectedIds));
+          if (!targets.length) { addLog('No online devices selected to ' + verb.toLowerCase(), 'warn'); return; }
+          names = targets.map(labelFor).join(', ');
+        }
         const extra = isReboot
           ? 'These devices will restart and reconnect on their own.'
           : 'These devices will power off and CANNOT be turned back on remotely.';
-        if (!confirm(verb + ' ' + online.length + ' device(s)?\n' + names + '\n\n' + extra)) return;
-        if (wsSend({ type: type, target_devices: online }, verb.toLowerCase() + ' devices')) {
-          addLog(verb + ' command sent to ' + online.length + ' device(s)…', 'info');
+        if (!confirm(verb + ' ' + targets.length + ' device(s)?\n' + names + '\n\n' + extra)) return;
+        const message = attentionMode
+          ? { type: type, target_connections: targets }
+          : { type: type, target_devices: targets };
+        if (wsSend(message, verb.toLowerCase() + ' devices')) {
+          addLog(verb + ' request accepted for ' + targets.length + ' device(s)…', 'info');
           powerConfirm.checked = false;
           updateButtons();
         }
@@ -1824,11 +1937,12 @@
       // dropping offline); 'fail' = the SDK rejected it and the device stayed up.
       // A 'success' status is never expected — the reboot takes the socket first.
       function logPowerResult(verb, msg) {
+        const target = msg.connection_id ? attentionLabelFor(msg.connection_id) : labelFor(msg.device_id);
         if (msg.status === 'accepted') {
-          addLog('[OK] ' + verb + ' accepted on ' + labelFor(msg.device_id) + ' — watch for it to go offline', 'success');
+          addLog('[ACCEPTED] ' + verb + ' request accepted on ' + target + ' — this is not proof of execution; watch the connection state', 'info');
         } else {
           const detail = msg.error || msg.message || '';
-          addLog('[FAIL] ' + verb + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), 'fail');
+          addLog('[FAIL] ' + verb + ' on ' + target + (detail ? ' - ' + detail : ''), 'fail');
         }
       }
 
@@ -2615,9 +2729,9 @@
 
       // ---------------- Event wiring ----------------
       // Sub-tabs
-      tabGroups.addEventListener('click', function () { targetTab = 'groups'; userPickedTab = true; render(); });
-      tabDevices.addEventListener('click', function () { targetTab = 'devices'; userPickedTab = true; render(); });
-      tabAttention.addEventListener('click', function () { targetTab = 'attention'; userPickedTab = true; render(); });
+      tabGroups.addEventListener('click', function () { userPickedTab = true; switchTargetTab('groups'); });
+      tabDevices.addEventListener('click', function () { userPickedTab = true; switchTargetTab('devices'); });
+      tabAttention.addEventListener('click', function () { userPickedTab = true; switchTargetTab('attention'); });
       btnManageGroups.addEventListener('click', function () {
         openManage(null);
         const inp = mgSidebar.querySelector('[data-mg-new]');
@@ -2630,6 +2744,8 @@
         if (!t) return;
         const act = t.dataset.act;
         if (act === 'copyDeviceId') { e.stopPropagation(); copyDeviceId(t); }
+        else if (act === 'toggleAttention') toggleAttention(t.dataset.id);
+        else if (act === 'selectAllAttention') toggleSelectAllAttention();
         else if (act === 'selectGroup') selectGroupAsTarget(t.dataset.group);
         else if (act === 'toggleExpand') {
           const g = t.dataset.group;

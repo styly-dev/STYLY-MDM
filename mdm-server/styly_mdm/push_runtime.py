@@ -19,7 +19,11 @@ from typing import Any
 
 from aiohttp import WSCloseCode, WSMsgType, web as aiohttp_web
 
-from .device_policy import CommandNotAllowedError, command_allowed
+from .device_policy import (
+    CommandNotAllowedError,
+    PROVISIONAL_POWER_COMMANDS,
+    command_allowed,
+)
 from .push_artifacts import ArtifactStore
 from .push_job_manager import PushJobManager
 from .push_job_store import (
@@ -141,16 +145,35 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
             if self._push_path == "/ws/device" and self._push_runtime is not None:
                 payload = json.loads(data)
                 message_type = payload.get("type", "")
-                if message_type.startswith("EXECUTE_") or message_type in {
+                server = self._push_runtime.legacy
+                provisional = server.provisional_connections.get(self)
+                if provisional is not None:
+                    if message_type in {"REGISTERED", "REGISTERED_PROVISIONAL", "ERROR"}:
+                        pass
+                    elif (
+                        message_type not in PROVISIONAL_POWER_COMMANDS
+                        or payload.get("connection_id") != provisional.get("connection_id")
+                        or not command_allowed(provisional, message_type)
+                    ):
+                        raise CommandNotAllowedError(
+                            "Provisional connection is not ready for this command"
+                        )
+                elif message_type.startswith("EXECUTE_") or message_type in {
                     "SET_STARTUP_APP", "CLEAR_STARTUP_APP", "PUSH_RECONCILE_REQUEST",
                 }:
-                    server = self._push_runtime.legacy
                     entry = server.devices.get(self._push_device_id)
                     session = self._push_runtime.sessions.get(self._push_device_id)
-                    if (entry is None or entry.get("ws") is not self
-                            or session is None or session.ws is not self
-                            or not command_allowed(entry, message_type)):
-                        raise CommandNotAllowedError("Device is not ready or command is not allowed")
+                    if (
+                        entry is None
+                        or entry.get("ws") is not self
+                        or session is None
+                        or session.ws is not self
+                        or payload.get("connection_id") is not None
+                        or not command_allowed(entry, message_type)
+                    ):
+                        raise CommandNotAllowedError(
+                            "Device is not ready or command is not allowed"
+                        )
             await super().send_str(data, compress=compress)
 
     async def prepare(self, request: aiohttp_web.Request) -> Any:
@@ -1568,6 +1591,15 @@ class PushRuntime:
         self, ws: RuntimeWebSocketResponse, payload: dict[str, Any]
     ) -> bool:
         message_type = payload.get("type")
+        if (
+            "target_connections" in payload
+            and message_type not in {"REBOOT_DEVICE", "POWER_OFF_DEVICE"}
+        ):
+            await ws.send_str(json.dumps({
+                "type": "ERROR",
+                "message": "target_connections is only supported for power control",
+            }))
+            return True
         if message_type == "PUSH_FILES" and isinstance(payload.get("job_id"), str):
             job_id = payload["job_id"]
             try:

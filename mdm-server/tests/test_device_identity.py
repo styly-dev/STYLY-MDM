@@ -9,6 +9,7 @@ import pytest
 from aiohttp.test_utils import TestServer
 
 from styly_mdm import push_runtime, server
+from styly_mdm.device_policy import CommandNotAllowedError
 
 
 GUID = "64b19041-0b8c-4ef4-82fd-000000000000"
@@ -50,6 +51,7 @@ def provisional(status: str = "access_denied", diagnostic: str = "permission req
         "ip": "192.168.1.20",
         "version_code": 10,
         "version_name": "0.6.0",
+        "capabilities": ["provisional_power_control_v1"],
         "identity": {
             "state": "provisional",
             "status": status,
@@ -91,6 +93,9 @@ def test_provisional_registration_promotes_without_persistence(tmp_path):
                 snapshot = await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
                 assert len(snapshot["connections"]) == 1
                 assert snapshot["connections"][0]["diagnostic"] == "line one line two<script>"
+                connection_id = snapshot["connections"][0]["connection_id"]
+                assert connection_id
+                assert snapshot["connections"][0]["power_control_supported"] is True
                 assert server.device_registry == {}
 
                 await device.send_json(canonical())
@@ -101,6 +106,16 @@ def test_provisional_registration_promotes_without_persistence(tmp_path):
                 assert [row["device_id"] for row in listed["devices"]] == [GUID]
                 assert GUID in server.device_registry
                 assert not server.provisional_connections
+
+                # A queued provisional result cannot cross the promotion boundary
+                # and be reclassified as a canonical result.
+                await device.send_json({
+                    "type": "REBOOT_RESULT",
+                    "status": "accepted",
+                    "connection_id": connection_id,
+                })
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(admin.receive(), 0.1)
 
                 await device.close()
                 await admin.close()
@@ -124,6 +139,8 @@ def test_repeated_provisional_updates_one_entry_and_disconnect_removes_it(tmp_pa
                 await device.send_json(provisional(status="resolving", diagnostic="first"))
                 await recv_type(device, "REGISTERED_PROVISIONAL")
                 first = await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
+                first_id = first["connections"][0]["connection_id"]
+                assert first_id
 
                 await device.send_json(provisional(status="io_error", diagnostic="second"))
                 await recv_type(device, "REGISTERED_PROVISIONAL")
@@ -132,10 +149,140 @@ def test_repeated_provisional_updates_one_entry_and_disconnect_removes_it(tmp_pa
                 assert second["connections"][0]["identity_status"] == "io_error"
                 assert second["connections"][0]["diagnostic"] == "second"
                 assert second["connections"][0]["connected_at"] == first["connections"][0]["connected_at"]
+                assert second["connections"][0]["connection_id"] == first_id
 
                 await device.close()
                 disconnected = await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
                 assert disconnected["connections"] == []
+
+                replacement = await session.ws_connect(base + "/ws/device")
+                await replacement.send_json(provisional(status="resolving"))
+                replacement_ack = await recv_type(replacement, "REGISTERED_PROVISIONAL")
+                replacement_list = await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
+                assert replacement_ack["connection_id"] == replacement_list["connections"][0]["connection_id"]
+                assert replacement_ack["connection_id"] != first_id
+                await replacement.close()
+                await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
+                await admin.close()
+        finally:
+            await test_server.close()
+
+    asyncio.run(body())
+
+
+def test_provisional_power_targets_are_strict_and_results_keep_connection_id(tmp_path):
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        test_server = TestServer(server.create_app())
+        await test_server.start_server()
+        base = f"http://{test_server.host}:{test_server.port}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                admin = await session.ws_connect(base + "/ws/admin")
+                await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
+                device = await session.ws_connect(base + "/ws/device")
+                await device.send_json(provisional())
+                provisional_ack = await recv_type(device, "REGISTERED_PROVISIONAL")
+                connection_id = provisional_ack["connection_id"]
+                await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
+                device_server_ws = next(iter(server.provisional_connections))
+                with pytest.raises(CommandNotAllowedError):
+                    await device_server_ws.send_str(json.dumps({
+                        "type": "PUSH_RESULT_ACK",
+                        "connection_id": connection_id,
+                    }))
+
+                await admin.send_json({
+                    "type": "REBOOT_DEVICE",
+                    "target_connections": [connection_id],
+                })
+                sent = await recv_type(admin, "REBOOT_SENT")
+                assert sent["sent_count"] == 1
+                assert sent["target_connections"] == [connection_id]
+                command = await recv_type(device, "EXECUTE_REBOOT")
+                assert command["connection_id"] == connection_id
+
+                await device.send_json({
+                    "type": "REBOOT_RESULT",
+                    "status": "accepted",
+                    "connection_id": connection_id,
+                    "device_id": "must-not-cross-boundary",
+                })
+                result = await recv_type(admin, "REBOOT_RESULT")
+                assert result["connection_id"] == connection_id
+                assert "device_id" not in result
+
+                # The dedicated field cannot be combined with the normal target
+                # field, and an empty list never means "all devices".
+                for payload, message in [
+                    ({"target_connections": []}, "non-empty"),
+                    ({"target_connections": ["*"]}, "wildcards"),
+                    ({"target_connections": [connection_id], "target_devices": ["*"]}, "combined"),
+                ]:
+                    await admin.send_json({"type": "POWER_OFF_DEVICE", **payload})
+                    error = await recv_type(admin, "ERROR")
+                    assert message in error["message"]
+
+                # A stale connection ID is never resolved through the ordinary
+                # target_devices fallback and does not reach the device.
+                await device.close()
+                await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
+                await admin.send_json({
+                    "type": "REBOOT_DEVICE",
+                    "target_connections": [connection_id],
+                })
+                error = await recv_type(admin, "ERROR")
+                assert "provisional" in error["message"]
+
+                await admin.send_json({
+                    "type": "LAUNCH_APP",
+                    "target_connections": [connection_id],
+                    "package_name": "example.app",
+                })
+                error = await recv_type(admin, "ERROR")
+                assert "only supported for power control" in error["message"]
+                await admin.close()
+        finally:
+            await test_server.close()
+
+    asyncio.run(body())
+
+
+def test_old_provisional_client_is_visible_but_cannot_receive_power_command(tmp_path):
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        test_server = TestServer(server.create_app())
+        await test_server.start_server()
+        base = f"http://{test_server.host}:{test_server.port}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                admin = await session.ws_connect(base + "/ws/admin")
+                await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
+                device = await session.ws_connect(base + "/ws/device")
+                old_payload = provisional()
+                old_payload.pop("capabilities")
+                await device.send_json(old_payload)
+                await recv_type(device, "REGISTERED_PROVISIONAL")
+                snapshot = await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
+                connection = snapshot["connections"][0]
+                assert connection["power_control_supported"] is False
+
+                await admin.send_json({
+                    "type": "POWER_OFF_DEVICE",
+                    "target_connections": [connection["connection_id"]],
+                })
+                error = await recv_type(admin, "ERROR")
+                assert "eligible provisional" in error["message"]
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(device.receive(), 0.1)
+                await device.send_json({
+                    "type": "REBOOT_RESULT",
+                    "status": "accepted",
+                    "connection_id": connection["connection_id"],
+                })
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(admin.receive(), 0.1)
+                await device.close()
                 await admin.close()
         finally:
             await test_server.close()
@@ -446,6 +593,22 @@ def test_incomplete_identity_never_grants_command_access(entry):
     assert not command_allowed(entry, "EXECUTE_INSTALL")
 
 
+def test_provisional_policy_allows_only_capability_gated_power_commands():
+    from styly_mdm.device_policy import command_allowed
+
+    entry = {
+        "identity_kind": "provisional",
+        "registration_ready": True,
+        "capabilities": ["provisional_power_control_v1"],
+    }
+    assert command_allowed(entry, "EXECUTE_REBOOT")
+    assert command_allowed(entry, "EXECUTE_POWER_OFF")
+    assert not command_allowed(entry, "EXECUTE_LAUNCH")
+    assert not command_allowed(entry, "EXECUTE_INSTALL")
+    entry["capabilities"] = []
+    assert not command_allowed(entry, "EXECUTE_REBOOT")
+
+
 @pytest.mark.parametrize("kind", ["canonical", "legacy"])
 @pytest.mark.parametrize("ready,current", [(True, True), (False, True), (True, False)])
 def test_registration_ack_requires_current_ready_owner(kind, ready, current):
@@ -516,10 +679,70 @@ def test_final_dispatch_policy_denial_has_distinct_exception():
         ws._push_runtime = SimpleNamespace(
             legacy=SimpleNamespace(devices={GUID: {
                 "ws": ws, "identity_kind": "canonical", "registration_ready": False,
-            }}),
+            }}, provisional_connections={}),
             sessions={GUID: SimpleNamespace(ws=ws)},
         )
         with pytest.raises(CommandNotAllowedError, match="not ready"):
             await ws.send_str(json.dumps({"type": "EXECUTE_REBOOT"}))
+
+    asyncio.run(body())
+
+
+@pytest.mark.parametrize("repeated", [False, True])
+def test_provisional_ack_wait_preserves_only_existing_readiness(tmp_path, monkeypatch, repeated):
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original = push_runtime.RuntimeWebSocketResponse.send_str
+        ack_count = 0
+
+        async def delayed_ack(ws, data, compress=None):
+            nonlocal ack_count
+            if json.loads(data).get("type") == "REGISTERED_PROVISIONAL":
+                ack_count += 1
+                if ack_count == (2 if repeated else 1):
+                    entered.set()
+                    await release.wait()
+            return await original(ws, data, compress=compress)
+
+        monkeypatch.setattr(push_runtime.RuntimeWebSocketResponse, "send_str", delayed_ack)
+        test_server = TestServer(server.create_app())
+        await test_server.start_server()
+        try:
+            async with aiohttp.ClientSession() as session:
+                admin = await session.ws_connect(test_server.make_url("/ws/admin"))
+                await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
+                device = await session.ws_connect(test_server.make_url("/ws/device"))
+                await device.send_json(provisional(status="resolving"))
+                if repeated:
+                    ack = await recv_type(device, "REGISTERED_PROVISIONAL")
+                    await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
+                    await device.send_json(provisional(status="io_error"))
+                await asyncio.wait_for(entered.wait(), 2)
+                entry = next(iter(server.provisional_connections.values()))
+                connection_id = entry["connection_id"]
+                assert entry["registration_ready"] is repeated
+                if repeated:
+                    assert connection_id == ack["connection_id"]
+                await admin.send_json({
+                    "type": "REBOOT_DEVICE", "target_connections": [connection_id],
+                })
+                if repeated:
+                    sent = await recv_type(admin, "REBOOT_SENT")
+                    assert sent["sent_count"] == 1
+                    command = await recv_type(device, "EXECUTE_REBOOT")
+                    assert command["connection_id"] == connection_id
+                else:
+                    error = await recv_type(admin, "ERROR")
+                    assert "eligible provisional" in error["message"]
+                release.set()
+                await recv_type(device, "REGISTERED_PROVISIONAL")
+                await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
+                await device.close()
+                await admin.close()
+        finally:
+            release.set()
+            await test_server.close()
 
     asyncio.run(body())

@@ -26,7 +26,10 @@ from aiohttp import WSCloseCode, web
 # built from a folder could never match the device that folder was pushed to.
 # The hash helpers compute the reference a client checks a downloaded APK against
 # before installing it (#39) — same algorithms as the #37 verify feature.
-from .device_policy import CommandNotAllowedError, command_allowed
+from .device_policy import (
+    CommandNotAllowedError,
+    command_allowed,
+)
 from .integrity import apk_cd_digest, file_sha256, is_os_metadata
 
 logging.basicConfig(
@@ -166,16 +169,24 @@ CANONICAL_DEVICE_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 PROVISIONAL_STATUSES = {"resolving", "access_denied", "io_error", "unsupported_api"}
+PROVISIONAL_RESULT_TYPES = {"REBOOT_RESULT", "POWER_OFF_RESULT"}
+PROVISIONAL_RESULT_COMMANDS = {
+    "REBOOT_RESULT": "EXECUTE_REBOOT",
+    "POWER_OFF_RESULT": "EXECUTE_POWER_OFF",
+}
 MAX_DEVICE_MODEL_LEN = 128
 MAX_DEVICE_IP_LEN = 64
 MAX_VERSION_NAME_LEN = 64
 MAX_IDENTITY_DIAGNOSTIC_LEN = 256
+MAX_CAPABILITIES = 32
+MAX_CAPABILITY_LEN = 128
 
 # Connected devices: device_id -> {ws, device_id, model, ip, status, startup_app, battery}
 devices: dict[str, dict] = {}
 
 # One entry per live, not-yet-identified socket. This collection is intentionally
-# absent from every persistence path and contains no addressable identifier.
+# absent from every persistence path; its connection_id is live-connection scoped
+# and is invalidated when the socket disconnects or promotes to a device identity.
 provisional_connections: dict[web.WebSocketResponse, dict] = {}
 
 # device_id -> last-known record {label, model, ip, last_seen, startup_app, battery}.
@@ -459,6 +470,7 @@ def build_provisional_connection_list_msg() -> str:
     connections = []
     for entry in provisional_connections.values():
         connections.append({
+            "connection_id": entry["connection_id"],
             "model": entry["model"],
             "ip": entry["ip"],
             "version_code": entry["version_code"],
@@ -466,6 +478,8 @@ def build_provisional_connection_list_msg() -> str:
             "identity_status": entry["identity_status"],
             "diagnostic": entry["diagnostic"],
             "mint_attempted": entry["mint_attempted"],
+            "capabilities": list(entry.get("capabilities", [])),
+            "power_control_supported": command_allowed(entry, "EXECUTE_REBOOT"),
             "connected_at": entry["connected_at"],
             "last_status_at": entry["last_status_at"],
         })
@@ -1031,6 +1045,31 @@ def resolve_target_ids(target_devices: list[str], *, allow_legacy: bool = False)
     return [d for d in targets if command_allowed(devices.get(d), "EXECUTE_INSTALL" if allow_legacy else None)]
 
 
+def _provisional_entry_for_id(connection_id: str, command: str) -> tuple[web.WebSocketResponse, dict] | None:
+    for ws, entry in provisional_connections.items():
+        if entry.get("connection_id") == connection_id and command_allowed(entry, command):
+            return ws, entry
+    return None
+
+
+def _parse_target_connections(data: dict) -> tuple[list[str] | None, str | None]:
+    """Validate the dedicated provisional-connection target field without fallback."""
+    if "target_connections" not in data:
+        return None, None
+    if "target_devices" in data:
+        return None, "target_connections cannot be combined with target_devices"
+    raw = data.get("target_connections")
+    if not isinstance(raw, list) or not raw:
+        return None, "target_connections must be a non-empty array"
+    if any(not isinstance(value, str) or not value for value in raw):
+        return None, "target_connections must contain non-empty connection IDs"
+    if "*" in raw:
+        return None, "target_connections does not support wildcards"
+    if len(set(raw)) != len(raw):
+        return None, "target_connections must not contain duplicates"
+    return raw, None
+
+
 def sanitize_apk_filename(filename: str | None) -> str | None:
     """Return a filesystem-safe APK filename, or None if invalid."""
     if not filename:
@@ -1266,6 +1305,21 @@ def _bounded_registration_text(value, fallback: str, limit: int) -> str:
     return value[:limit] if isinstance(value, str) else fallback[:limit]
 
 
+def _bounded_capabilities(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    capabilities: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        capability = item.strip()[:MAX_CAPABILITY_LEN]
+        if capability and capability not in capabilities:
+            capabilities.append(capability)
+        if len(capabilities) >= MAX_CAPABILITIES:
+            break
+    return capabilities
+
+
 def _parse_registration(data: dict, remote: str | None) -> tuple[str, dict] | tuple[None, str]:
     scheme = data.get("identity_scheme")
     device_id = data.get("device_id")
@@ -1273,6 +1327,7 @@ def _parse_registration(data: dict, remote: str | None) -> tuple[str, dict] | tu
         "model": _bounded_registration_text(data.get("model"), "unknown", MAX_DEVICE_MODEL_LEN),
         "ip": _bounded_registration_text(data.get("ip"), remote or "unknown", MAX_DEVICE_IP_LEN),
         "version_name": _bounded_registration_text(data.get("version_name"), "", MAX_VERSION_NAME_LEN),
+        "capabilities": _bounded_capabilities(data.get("capabilities")),
     }
     version_code = data.get("version_code")
     common["version_code"] = (
@@ -1377,8 +1432,21 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                              msg_type, device_id)
                     continue
                 if msg_type != "REGISTER" and device_id is None:
-                    log.warning("Ignoring %s before canonical registration", msg_type)
-                    continue
+                    provisional = provisional_connections.get(ws)
+                    if (
+                        socket_identity_kind != "provisional"
+                        or provisional is None
+                        or provisional.get("registration_ready") is not True
+                        or msg_type not in PROVISIONAL_RESULT_TYPES
+                        or not command_allowed(
+                            provisional, PROVISIONAL_RESULT_COMMANDS[msg_type]
+                        )
+                    ):
+                        log.warning("Ignoring %s before an eligible registration", msg_type)
+                        continue
+                    if data.get("connection_id") != provisional.get("connection_id"):
+                        log.warning("Ignoring %s with an invalid provisional connection_id", msg_type)
+                        continue
 
                 if msg_type == "REGISTER":
                     kind, registration = _parse_registration(data, request.remote)
@@ -1405,12 +1473,27 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     if kind == "provisional":
                         now = time.time()
                         previous = provisional_connections.get(ws)
+                        socket_identity_kind = "provisional"
                         provisional_connections[ws] = {
                             **registration,
+                            "identity_kind": "provisional",
+                            "registration_ready": previous is not None and previous.get("registration_ready") is True,
+                            "connection_id": (
+                                previous.get("connection_id")
+                                if previous is not None
+                                else uuid.uuid4().hex
+                            ),
                             "connected_at": previous.get("connected_at", now) if previous else now,
                             "last_status_at": now,
                         }
-                        await ws.send_str(json.dumps({"type": "REGISTERED_PROVISIONAL"}))
+                        connection_id = provisional_connections[ws]["connection_id"]
+                        await ws.send_str(json.dumps({
+                            "type": "REGISTERED_PROVISIONAL",
+                            "connection_id": connection_id,
+                        }))
+                        current = provisional_connections.get(ws)
+                        if current is not None and current.get("connection_id") == connection_id:
+                            current["registration_ready"] = True
                         await broadcast_provisional_connection_list()
                         continue
 
@@ -1679,7 +1762,26 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     "VERIFY_DIR_RESULT",
                     "DELETE_APP_RESULT",
                 }:
-                    if device_id:
+                    if socket_identity_kind == "provisional":
+                        provisional = provisional_connections.get(ws)
+                        if (
+                            msg_type not in PROVISIONAL_RESULT_TYPES
+                            or provisional is None
+                            or provisional.get("registration_ready") is not True
+                            or not command_allowed(
+                                provisional, PROVISIONAL_RESULT_COMMANDS[msg_type]
+                            )
+                            or data.get("connection_id") != provisional.get("connection_id")
+                        ):
+                            log.warning("Ignoring ineligible provisional result from socket")
+                            continue
+                        data.pop("device_id", None)
+                        data["connection_id"] = provisional["connection_id"]
+                    elif device_id:
+                        if msg_type in PROVISIONAL_RESULT_TYPES and "connection_id" in data:
+                            log.warning("Ignoring provisional power result after canonical promotion")
+                            continue
+                        data.pop("connection_id", None)
                         data["device_id"] = device_id
                     # Fallback transfer-slot release: an older client that never
                     # emits DOWNLOAD_COMPLETE, or a client whose download failed and
@@ -1825,6 +1927,16 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     continue
 
                 msg_type = data.get("type")
+
+                if (
+                    "target_connections" in data
+                    and msg_type not in {"REBOOT_DEVICE", "POWER_OFF_DEVICE"}
+                ):
+                    await ws.send_str(json.dumps({
+                        "type": "ERROR",
+                        "message": "target_connections is only supported for power control",
+                    }))
+                    continue
 
                 if msg_type == "LAUNCH_APP":
                     await handle_launch_app(ws, data)
@@ -2361,37 +2473,77 @@ async def _dispatch_power_command(
     success frame could flush, so the real success signal is the device going
     offline (and, for reboot, reconnecting), tracked by the connection status.
     """
-    target_devices: list[str] = data.get("target_devices", [])
-    target_ids = resolve_target_ids(target_devices)
+    target_connections, target_error = _parse_target_connections(data)
+    if target_error is not None:
+        await admin_ws.send_str(json.dumps({"type": "ERROR", "message": target_error}))
+        return
 
-    if not target_ids:
+    provisional_mode = target_connections is not None
+    if provisional_mode:
+        target_count = len(target_connections)
+        no_target_message = "No matching eligible provisional connections found"
+    else:
+        target_devices: list[str] = data.get("target_devices", [])
+        target_ids = resolve_target_ids(target_devices)
+        target_count = len(target_ids)
+        no_target_message = "No matching online devices found"
+
+    if not provisional_mode and not target_ids:
         await admin_ws.send_str(json.dumps({
             "type": "ERROR",
-            "message": "No matching online devices found",
+            "message": no_target_message,
         }))
         return
 
-    execute_msg = json.dumps({"type": execute_type})
-
     sent_count = 0
-    for did in target_ids:
-        entry = devices.get(did)
-        if entry:
+    if provisional_mode:
+        for connection_id in target_connections:
+            current = _provisional_entry_for_id(connection_id, execute_type)
+            if current is None:
+                log.warning("Skipped stale provisional connection %s for %s", connection_id, execute_type)
+                continue
+            ws, _entry = current
             try:
-                await entry["ws"].send_str(execute_msg)
+                await ws.send_str(json.dumps({
+                    "type": execute_type,
+                    "connection_id": connection_id,
+                }))
                 sent_count += 1
             except CommandNotAllowedError as error:
-                log.warning("Failed to send %s to %s (command denied: %s)", execute_type, did, error)
+                log.warning("Failed to send %s to provisional %s (command denied: %s)", execute_type, connection_id, error)
             except ConnectionResetError:
-                log.warning("Failed to send %s to %s (disconnected)", execute_type, did)
+                log.warning("Failed to send %s to provisional %s (disconnected)", execute_type, connection_id)
+    else:
+        execute_msg = json.dumps({"type": execute_type})
+        for did in target_ids:
+            entry = devices.get(did)
+            if entry:
+                try:
+                    await entry["ws"].send_str(execute_msg)
+                    sent_count += 1
+                except CommandNotAllowedError as error:
+                    log.warning("Failed to send %s to %s (command denied: %s)", execute_type, did, error)
+                except ConnectionResetError:
+                    log.warning("Failed to send %s to %s (disconnected)", execute_type, did)
 
-    log.info("%s: sent to %d/%d devices", label, sent_count, len(target_ids))
+    if provisional_mode and sent_count == 0:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": no_target_message,
+        }))
+        return
 
-    await admin_ws.send_str(json.dumps({
+    log.info("%s: sent to %d/%d %s", label, sent_count, target_count,
+             "provisional connections" if provisional_mode else "devices")
+
+    response = {
         "type": sent_type,
         "sent_count": sent_count,
-        "target_count": len(target_ids),
-    }))
+        "target_count": target_count,
+    }
+    if provisional_mode:
+        response["target_connections"] = target_connections
+    await admin_ws.send_str(json.dumps(response))
 
 
 async def handle_retire_device(admin_ws: web.WebSocketResponse, data: dict):

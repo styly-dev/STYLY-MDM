@@ -54,6 +54,10 @@ def test_web_console_renders_provisional_identity_in_attention_tab():
     assert "renderAttentionHtml" in html
     assert "esc(entry.diagnostic" in html
     assert "provisionalConnections.map" in html
+    assert "selectedConnectionIds" in html
+    assert "target_connections" in html
+    assert "Client update required" in html
+    assert "switchTargetTab" in html
     assert "identityHealth" not in html
 
 

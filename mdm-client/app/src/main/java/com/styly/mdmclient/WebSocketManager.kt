@@ -18,6 +18,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.Inet4Address
@@ -42,13 +43,37 @@ import java.util.concurrent.TimeUnit
  * Push/Sync protocol messages are routed to the Application-scoped
  * [PushJobCoordinator]; established commands continue to [onCommand].
  */
-class WebSocketManager(
+class WebSocketManager internal constructor(
     private val context: Context,
-    private val onCommand: (type: String, payload: JSONObject) -> Unit,
+    private val onCommand: (type: String, payload: JSONObject, commandContext: CommandContext?) -> Unit,
     private val onStatusChanged: (connected: Boolean, message: String) -> Unit,
     private val identityResolver: DeviceIdentityResolver =
         MdmClientApplication.deviceIdentityResolver(),
 ) {
+
+    internal class CommandContext internal constructor(
+        internal val socket: WebSocket,
+        internal val provisionalConnectionId: String?,
+        private val registration: ConnectionRegistration<WebSocket>,
+        private val currentSocket: () -> WebSocket?,
+    ) {
+        internal fun isActive(): Boolean =
+            currentSocket() === socket && registration.isAcknowledged(socket) &&
+                provisionalConnectionId == registration.provisionalConnectionId(socket)
+
+        internal fun sendMessage(text: String): Boolean = isActive() && socket.send(text)
+
+        /** Wait best-effort for this socket only; timeout does not invalidate it. */
+        internal fun awaitOutboundFlush(timeoutMillis: Long): Boolean {
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+            while (System.nanoTime() < deadline) {
+                if (!isActive()) return false
+                if (socket.queueSize() == 0L) return true
+                Thread.sleep(50)
+            }
+            return isActive()
+        }
+    }
 
     companion object {
         private const val TAG = "WebSocketManager"
@@ -70,6 +95,8 @@ class WebSocketManager(
 
         const val PREF_STARTUP_APP_PACKAGE = "startup_app_package"
         const val PREF_STARTUP_APP_EXTRA = "startup_app_extra"
+        const val PROVISIONAL_POWER_CONTROL_CAPABILITY = "provisional_power_control_v1"
+        private val PROVISIONAL_POWER_COMMANDS = setOf("EXECUTE_REBOOT", "EXECUTE_POWER_OFF")
 
         internal fun saveManualServerUrl(context: Context, url: String): Boolean {
             val normalized = normalizeManualServerUrl(url) ?: return false
@@ -294,6 +321,13 @@ class WebSocketManager(
         webSocket?.send(text)
     }
 
+    /** Send a power result only while the command's original registration is still active. */
+    internal fun sendMessageForCommand(commandContext: CommandContext, json: JSONObject): Boolean {
+        val sent = commandContext.sendMessage(json.toString())
+        if (!sent) Log.w(TAG, "Command result was not sent on its original connection")
+        return sent
+    }
+
     /**
      * Best-effort wait for the outbound queue to drain. OkHttp's send() only
      * enqueues; a self-updating client is about to be killed by the installer,
@@ -308,6 +342,16 @@ class WebSocketManager(
             Thread.sleep(50)
         }
     }
+
+    /**
+     * Give the command result a bounded chance to drain on its original socket.
+     * A flush timeout is best-effort; only an invalidated registration cancels
+     * the command. Queue drain does not prove receipt by the server.
+     */
+    internal fun awaitOutboundFlushForCommand(
+        commandContext: CommandContext,
+        timeoutMillis: Long,
+    ): Boolean = commandContext.awaitOutboundFlush(timeoutMillis)
 
     /** Executes the side effects the scheduler decided on. Main looper only. */
     private fun dispatch(actions: List<ConnectionScheduler.Action>) {
@@ -422,13 +466,18 @@ class WebSocketManager(
                         pushCoordinator.onRegistered(webSocket)
                         reconnectHandler.post {
                             if (this@WebSocketManager.webSocket === webSocket &&
-                                registration.isAcknowledged(webSocket)
+                                registration.isCanonicalAcknowledged(webSocket)
                             ) {
                                 startBatteryTelemetry()
                                 publishConnectedStatus(identityResolver.snapshot())
                             }
                         }
                     } else if (type == "REGISTERED_PROVISIONAL") {
+                        val connectionId = json.optString("connection_id", "")
+                        if (!registration.acknowledgeProvisional(webSocket, connectionId)) {
+                            Log.w(TAG, "Ignoring provisional ACK for an unregistered WebSocket")
+                            return
+                        }
                         reconnectHandler.post {
                             if (this@WebSocketManager.webSocket === webSocket) {
                                 publishConnectedStatus(identityResolver.snapshot())
@@ -436,8 +485,16 @@ class WebSocketManager(
                         }
                     } else if (!registration.isAcknowledged(webSocket)) {
                         Log.w(TAG, "Ignoring $type before canonical registration acknowledgement")
+                    } else if (registration.isProvisional(webSocket) &&
+                        type !in PROVISIONAL_POWER_COMMANDS
+                    ) {
+                        Log.w(TAG, "Ignoring $type on a provisional connection")
+                    } else if (registration.isProvisional(webSocket) &&
+                        json.optString("connection_id", "") != registration.provisionalConnectionId(webSocket)
+                    ) {
+                        Log.w(TAG, "Ignoring $type for a different provisional connection")
                     } else if (type.isNotEmpty() && !pushCoordinator.handleServerMessage(type, json)) {
-                        onCommand(type, json)
+                        onCommand(type, json, commandContext(webSocket))
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to parse message", e)
@@ -488,7 +545,7 @@ class WebSocketManager(
         if (registration.isSent(socket)) return
         if (identity is DeviceIdentityState.Ready) {
             pushCoordinator.attachTransport(socket) { message ->
-                if (this@WebSocketManager.webSocket === socket && registration.isAcknowledged(socket)) {
+                if (this@WebSocketManager.webSocket === socket && registration.isCanonicalAcknowledged(socket)) {
                     val text = message.toString()
                     Log.d(TAG, "Sending: $text")
                     socket.send(text)
@@ -520,6 +577,9 @@ class WebSocketManager(
             } else {
                 put("device_id", JSONObject.NULL)
                 put("identity", provisionalIdentity(identity))
+                put("capabilities", JSONArray().apply {
+                    put(PROVISIONAL_POWER_CONTROL_CAPABILITY)
+                })
             }
         }
         val text = payload.toString()
@@ -530,6 +590,11 @@ class WebSocketManager(
         if (!socket.send(text) && canonical) {
             registration.clearSent(socket)
         }
+    }
+
+    private fun commandContext(socket: WebSocket): CommandContext? {
+        if (!registration.isAcknowledged(socket)) return null
+        return CommandContext(socket, registration.provisionalConnectionId(socket), registration) { webSocket }
     }
 
     private fun provisionalIdentity(identity: DeviceIdentityState): JSONObject {
@@ -549,7 +614,7 @@ class WebSocketManager(
 
     private fun publishConnectedStatus(identity: DeviceIdentityState) {
         val suffix = when {
-            identity is DeviceIdentityState.Ready && registration.isAcknowledged(webSocket) -> ""
+            identity is DeviceIdentityState.Ready && registration.isCanonicalAcknowledged(webSocket) -> ""
             identity is DeviceIdentityState.Ready -> " - Registering Device ID"
             identity is DeviceIdentityState.Unavailable -> " - Device ID unavailable"
             else -> " - Resolving Device ID"
@@ -570,7 +635,7 @@ class WebSocketManager(
 
     private fun scheduleNextBatteryUpdate() {
         reconnectHandler.postAtTime({
-            if (isRunning && webSocket != null && registration.isAcknowledged(webSocket)) {
+            if (isRunning && webSocket != null && registration.isCanonicalAcknowledged(webSocket)) {
                 sendBatteryUpdate()
                 scheduleNextBatteryUpdate()
             }
