@@ -166,7 +166,7 @@ MAX_LABEL_LEN = 64
 MAX_GROUP_NAME_LEN = 64
 IDENTITY_SCHEME = "styly_device_id_v1"
 CANONICAL_DEVICE_ID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 PROVISIONAL_STATUSES = {"resolving", "access_denied", "io_error", "unsupported_api"}
 PROVISIONAL_RESULT_TYPES = {"REBOOT_RESULT", "POWER_OFF_RESULT"}

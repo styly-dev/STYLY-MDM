@@ -41,6 +41,25 @@ class DeviceIdentityResolverTest {
     }
 
     @Test
+    fun acceptsProviderGuidsWithoutUuidVersionOrVariantRestrictions() {
+        for (guid in listOf(
+            "00000000-0000-0000-0000-000000000000",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            "64b19041-0b8c-7ef4-82fd-000000000000",
+            "64b19041-0b8c-4ef4-02fd-000000000000",
+        )) {
+            val resolver = DeviceIdentityResolver {
+                CompletableFuture.completedFuture(DeviceIdentityLookupResult(
+                    DeviceIdStatus.SUCCESS, guid.uppercase(), false, "",
+                ))
+            }
+            resolver.startInitialLookup()
+
+            assertEquals(DeviceIdentityState.Ready(guid), resolver.snapshot())
+        }
+    }
+
+    @Test
     fun permissionAndIoFailuresAreTerminalWithoutMdmRetries() {
         for ((providerStatus, status) in listOf(
             DeviceIdStatus.ACCESS_DENIED to DeviceIdentityStatus.ACCESS_DENIED,
@@ -84,18 +103,27 @@ class DeviceIdentityResolverTest {
 
     @Test
     fun invalidCanonicalGuidIsRejected() {
-        val resolver = DeviceIdentityResolver {
-            CompletableFuture.completedFuture(DeviceIdentityLookupResult(
-                DeviceIdStatus.SUCCESS, "not-a-canonical-guid", true, "provider returned success",
-            ))
-        }
-        resolver.startInitialLookup()
+        for (guid in listOf(
+            "not-a-canonical-guid",
+            "64b19041-0b8c-4ef4-82fd-00000000000g",
+            "64b19041-0b8c-4ef4-82fd-00000000000",
+            "64b19041-0b8c-4ef4-82fd-0000000000000",
+            canonical.replace("-", ""),
+            canonical + "\n",
+        )) {
+            val resolver = DeviceIdentityResolver {
+                CompletableFuture.completedFuture(DeviceIdentityLookupResult(
+                    DeviceIdStatus.SUCCESS, guid, true, "provider returned success",
+                ))
+            }
+            resolver.startInitialLookup()
 
-        assertEquals(DeviceIdentityState.Unavailable(
-            DeviceIdentityStatus.IO_ERROR,
-            "Device ID provider returned an invalid canonical GUID", true,
-        ), resolver.snapshot())
-        assertFalse(resolver.startInitialLookup())
+            assertEquals(DeviceIdentityState.Unavailable(
+                DeviceIdentityStatus.IO_ERROR,
+                "Device ID provider returned an invalid canonical GUID", true,
+            ), resolver.snapshot())
+            assertFalse(resolver.startInitialLookup())
+        }
     }
 
     @Test

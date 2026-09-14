@@ -49,7 +49,7 @@ class DeviceIdentityResolver internal constructor(
         private const val LOOKUP_TIMEOUT_MS = 30_000L
         private const val RETRY_DELAY_MS = 250L
         private val CANONICAL_GUID = Regex(
-            "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
         )
 
         fun create(context: Context): DeviceIdentityResolver {

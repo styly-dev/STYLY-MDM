@@ -76,7 +76,28 @@ def canonical(device_id: str = GUID) -> dict:
     }
 
 
-def test_provisional_registration_promotes_without_persistence(tmp_path):
+@pytest.mark.parametrize("device_id", [
+    "64b19041-0b8c-4ef4-82fd-00000000000g",
+    "64b19041-0b8c-4ef4-82fd-00000000000",
+    "64b19041-0b8c-4ef4-82fd-0000000000000",
+    "64b190410b8c4ef482fd000000000000",
+    GUID.upper(),
+    GUID + "\n",
+])
+def test_malformed_canonical_guid_is_rejected(device_id):
+    kind, error = server._parse_registration(canonical(device_id), None)
+    assert kind is None
+    assert error == "device_id must be a canonical lowercase GUID"
+
+
+@pytest.mark.parametrize("device_id", [
+    GUID,
+    "00000000-0000-0000-0000-000000000000",
+    "ffffffff-ffff-ffff-ffff-ffffffffffff",
+    "64b19041-0b8c-7ef4-82fd-000000000000",
+    "64b19041-0b8c-4ef4-02fd-000000000000",
+])
+def test_provisional_registration_promotes_without_persistence(tmp_path, device_id):
     async def body():
         server._apply_data_dir(str(tmp_path))
         test_server = TestServer(server.create_app())
@@ -98,13 +119,13 @@ def test_provisional_registration_promotes_without_persistence(tmp_path):
                 assert snapshot["connections"][0]["power_control_supported"] is True
                 assert server.device_registry == {}
 
-                await device.send_json(canonical())
+                await device.send_json(canonical(device_id))
                 await recv_type(device, "REGISTERED")
                 snapshot = await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
                 assert snapshot["connections"] == []
                 listed = await recv_type(admin, "DEVICE_LIST")
-                assert [row["device_id"] for row in listed["devices"]] == [GUID]
-                assert GUID in server.device_registry
+                assert [row["device_id"] for row in listed["devices"]] == [device_id]
+                assert device_id in server.device_registry
                 assert not server.provisional_connections
 
                 # A queued provisional result cannot cross the promotion boundary

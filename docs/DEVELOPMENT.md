@@ -277,8 +277,14 @@ STYLY-MDM/
 Device identity is a protocol and persistence boundary. New clients use only the
 lowercase GUID returned by Device-ID-Provider and set
 `identity_scheme: "styly_device_id_v1"`. Hardware serials and `Build.SERIAL` are
-not fallback identities. The vendored Android AAR is an unreleased async snapshot
-based on Device-ID-Provider `0.4.0`, pinned to commit `a4f723f`.
+not fallback identities. Client and server accept the Provider's `8-4-4-4-12`
+hexadecimal GUID format without imposing UUID version or variant restrictions.
+The client normalizes Provider output to lowercase; the wire format remains lowercase.
+Previously accepted IDs remain valid, and no stored ID migration is required.
+Update the server before clients that may report IDs rejected by the old validation.
+The vendored Android AAR comes from the Unity package in the official
+[Device-ID-Provider `v0.4.1` release](https://github.com/styly-dev/Device-ID-Provider/releases/tag/v0.4.1),
+pinned to commit `cacb0d22a1ce46ceb44c9e40abefa619243ac0dd`.
 `mdm-client/app/libs/device-id-provider.properties` pins its SHA-256 and the Android
 `preBuild` task verifies it before compiling.
 
