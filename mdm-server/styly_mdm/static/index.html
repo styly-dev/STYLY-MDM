@@ -110,7 +110,6 @@
     .attention-device, .attention-detail { min-width: 0; }
     .attention-model { color: var(--text-primary); font-weight: 600; overflow-wrap: anywhere; }
     .attention-meta { margin-top: 3px; color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; }
-    .attention-id { color: var(--text-secondary); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
     .attention-status { color: var(--warning); font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
     .attention-update { color: var(--danger); font-size: 12px; font-weight: 600; }
     .attention-diagnostic { margin-top: 3px; color: var(--text-secondary); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; word-break: break-word; }
@@ -1179,8 +1178,7 @@
             '<div class="selbox ' + (checked ? 'on' : '') + (supported ? '' : ' disabled') + '"' +
               (supported ? ' data-act="toggleAttention" data-id="' + esc(connectionId) + '"' : ' aria-disabled="true"') + '>' + (checked ? '✓' : '') + '</div>' +
             '<div class="attention-device"><div class="attention-model">' + esc(entry.model || 'Unknown device') + '</div>' +
-            '<div class="attention-meta">' + esc(entry.ip || 'unknown') + ' · ' + esc(version) + '</div>' +
-            '<div class="attention-id" title="' + esc(connectionId) + '">' + esc(shortConnectionId(connectionId)) + '</div></div>' +
+            '<div class="attention-meta">' + esc(entry.ip || 'unknown') + ' · ' + esc(version) + '</div></div>' +
             '<div class="attention-detail">' + (supported
               ? '<div class="attention-status">' + esc(entry.identity_status || 'unknown') + '</div>'
               : '<div class="attention-update">Client update required</div>') +
