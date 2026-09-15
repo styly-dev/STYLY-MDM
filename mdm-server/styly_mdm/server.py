@@ -31,6 +31,7 @@ from .device_policy import (
     command_allowed,
 )
 from .integrity import apk_cd_digest, file_sha256, is_os_metadata
+from .push_jobs import parse_capabilities
 
 logging.basicConfig(
     level=logging.INFO,
@@ -178,8 +179,6 @@ MAX_DEVICE_MODEL_LEN = 128
 MAX_DEVICE_IP_LEN = 64
 MAX_VERSION_NAME_LEN = 64
 MAX_IDENTITY_DIAGNOSTIC_LEN = 256
-MAX_CAPABILITIES = 32
-MAX_CAPABILITY_LEN = 128
 
 # Connected devices: device_id -> {ws, device_id, model, ip, status, startup_app, battery}
 devices: dict[str, dict] = {}
@@ -1315,21 +1314,6 @@ def _bounded_registration_text(value, fallback: str, limit: int) -> str:
     return value[:limit] if isinstance(value, str) else fallback[:limit]
 
 
-def _bounded_capabilities(value) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    capabilities: list[str] = []
-    for item in value:
-        if not isinstance(item, str):
-            continue
-        capability = item.strip()[:MAX_CAPABILITY_LEN]
-        if capability and capability not in capabilities:
-            capabilities.append(capability)
-        if len(capabilities) >= MAX_CAPABILITIES:
-            break
-    return capabilities
-
-
 def _parse_registration(data: dict, remote: str | None) -> tuple[str, dict] | tuple[None, str]:
     scheme = data.get("identity_scheme")
     device_id = data.get("device_id")
@@ -1337,7 +1321,7 @@ def _parse_registration(data: dict, remote: str | None) -> tuple[str, dict] | tu
         "model": _bounded_registration_text(data.get("model"), "unknown", MAX_DEVICE_MODEL_LEN),
         "ip": _bounded_registration_text(data.get("ip"), remote or "unknown", MAX_DEVICE_IP_LEN),
         "version_name": _bounded_registration_text(data.get("version_name"), "", MAX_VERSION_NAME_LEN),
-        "capabilities": _bounded_capabilities(data.get("capabilities")),
+        "capabilities": sorted(parse_capabilities(data.get("capabilities"))),
     }
     version_code = data.get("version_code")
     common["version_code"] = (
