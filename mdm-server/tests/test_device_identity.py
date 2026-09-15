@@ -523,6 +523,61 @@ def test_admin_label_and_group_survive_reload_without_mode(tmp_path, monkeypatch
     asyncio.run(body())
 
 
+@pytest.mark.parametrize("capabilities, expected", [
+    (["push_job_id_v1", ""], set()),
+    (["push_job_id_v1", 1], set()),
+    (["push_job_id_v1", "x" * 129], set()),
+    ([" push_job_id_v1 "], {" push_job_id_v1 "}),
+    (["push_job_id_v1", "push_job_id_v1"], {"push_job_id_v1"}),
+    ([f"cap_{i}" for i in range(31)] + ["push_job_id_v1"],
+     {f"cap_{i}" for i in range(31)} | {"push_job_id_v1"}),
+    ([f"cap_{i}" for i in range(32)] + ["push_job_id_v1"], set()),
+    (["push_job_id_v1"] * 33, set()),
+])
+def test_registered_capabilities_match_push_session(tmp_path, capabilities, expected):
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        app = server.create_app()
+        runtime = push_runtime.runtime_for_current_server()
+        async with TestServer(app) as ts, aiohttp.ClientSession() as client:
+            device = await client.ws_connect(ts.make_url("/ws/device"))
+            payload = canonical()
+            payload["capabilities"] = capabilities
+            payload["process_instance_id"] = "64b19041-0b8c-4ef4-82fd-000000000001"
+            await device.send_json(payload)
+            await recv_type(device, "REGISTERED")
+            kind, registration = server._parse_registration(payload, None)
+            assert kind == "canonical"
+            assert set(registration["capabilities"]) == expected
+            assert runtime.sessions.get(GUID).capabilities == expected
+            await device.close()
+    asyncio.run(body())
+
+
+@pytest.mark.parametrize("count", [32, 33, 30000])
+def test_provisional_capabilities_are_bounded_in_admin_snapshot(tmp_path, count):
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        async with TestServer(server.create_app()) as ts, aiohttp.ClientSession() as client:
+            admin = await client.ws_connect(ts.make_url("/ws/admin"))
+            await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
+            device = await client.ws_connect(ts.make_url("/ws/device"))
+            payload = provisional()
+            payload["capabilities"] += [f"{i:05d}" + "x" * 123 for i in range(count - 1)]
+            await device.send_json(payload)
+            await recv_type(device, "REGISTERED_PROVISIONAL")
+            snapshot = await recv_type(admin, "PROVISIONAL_CONNECTION_LIST")
+            entry = snapshot["connections"][0]
+            expected = set(payload["capabilities"]) if count <= 32 else set()
+            assert set(entry["capabilities"]) == expected
+            assert entry["power_control_supported"] is (count <= 32)
+            if count > 32:
+                assert len(json.dumps(snapshot)) < 1024
+            await device.close()
+            await admin.close()
+    asyncio.run(body())
+
+
 def test_legacy_commands_are_blocked_but_apk_install_is_sent(tmp_path):
     async def body():
         server._apply_data_dir(str(tmp_path))
