@@ -47,6 +47,15 @@ Transfer throttling bounds how many devices download at once — one server-wide
 pool shared by every install and push/sync job; the rest queue until a slot
 frees.
 
+The server always accepts both scheme-less serial clients and GUID clients; no
+identity-mode setting or database reset is required. Serial clients are limited to
+APK installation/update (including MDM self-update); other device commands and
+Push/Sync require a GUID client. Provisional connections are status-only.
+
+After updating, a GUID client registers as a new device without automatic label,
+group, or history migration. Old serial records remain until explicitly forgotten.
+An old serial that does not return reports an `untracked` update, not confirmed success.
+
 Only one server may answer discovery on a given port: the server probes on
 startup and exits if another STYLY-MDM server already responds on its discovery
 port. Run a second server alongside the first by giving it a different

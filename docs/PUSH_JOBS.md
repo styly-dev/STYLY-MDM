@@ -40,7 +40,13 @@ New clients register:
 
 The worker validates destination paths on the device as well as the server. It accepts only a shared-storage subdirectory, rejects protected top-level media/app directories, does not traverse destination symlinks, bounds ZIP entry count and expanded bytes, rejects duplicate or conflicting archive paths, and validates the exact job-v1 artifact size and SHA-256 before publishing the downloaded ZIP or touching the destination. Destination validation completes before the client reports `applying`.
 
-Legacy commands remain supported through the same client execution gate. Legacy downloads may lack `artifact_size` and therefore cannot receive job-v1 exact-size guarantees. Consistent with pre-job-v1 behavior, the 2 GiB bundle limit applies to the uploaded source bytes and the extracted content, not to the ZIP artifact itself; ZIP container overhead may make the downloaded artifact slightly larger.
+The legacy Push wire format remains supported through the same client execution gate for registered GUID clients. This protocol compatibility does not permit Push/Sync to legacy serial-ID clients, which can only receive APK installation/update commands. Legacy-format downloads may lack `artifact_size` and therefore cannot receive job-v1 exact-size guarantees. Consistent with pre-job-v1 behavior, the 2 GiB bundle limit applies to the uploaded source bytes and the extracted content, not to the ZIP artifact itself; ZIP container overhead may make the downloaded artifact slightly larger.
+
+Finish pending serial-ID Push/Sync jobs with the previous server before upgrading
+to GUID identity. Old assignments are not migrated or resumed on serial clients;
+queued assignments may remain pending. Retain those records and create a new job
+for the registered GUID if delivery is still needed. A database reset is not
+required, and an old pending record is not evidence of successful delivery.
 
 ## State and revision
 

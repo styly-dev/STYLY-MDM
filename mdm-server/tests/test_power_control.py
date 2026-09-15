@@ -49,7 +49,7 @@ def reset_state():
 
 def add_device(device_id: str) -> FakeWS:
     ws = FakeWS()
-    server.devices[device_id] = {
+    server.devices[device_id] = {"registration_ready": True, "identity_kind": "canonical",
         "ws": ws, "device_id": device_id, "model": "M", "ip": "1.1.1.1",
         "status": "online", "startup_app": None, "battery": None,
         "version_code": 8, "version_name": "0.4.0",
@@ -171,9 +171,10 @@ async def _recv_type(ws, msg_type: str, timeout: float = 2.0) -> dict | None:
 async def _register(session, base: str, device_id: str):
     ws = await session.ws_connect(base + "/ws/device")
     await ws.send_json({
-        "type": "REGISTER", "device_id": device_id, "model": "M",
+        "type": "REGISTER", "identity_scheme": server.IDENTITY_SCHEME, "device_id": device_id, "model": "M",
         "ip": "1.1.1.2", "version_code": 8, "version_name": "0.4.0",
     })
+    await _recv_type(ws, "REGISTERED")
     return ws
 
 
@@ -185,11 +186,11 @@ def test_e2e_reboot_result_is_forwarded_to_admin_stamped(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                d0 = await _register(session, base, "dev0")
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
-                await admin.send_json({"type": "REBOOT_DEVICE", "target_devices": ["dev0"]})
+                await admin.send_json({"type": "REBOOT_DEVICE", "target_devices": ["64b19041-0b8c-4ef4-82fd-000000000000"]})
                 assert (await _recv_type(admin, "REBOOT_SENT"))["sent_count"] == 1
                 assert await _recv_type(d0, "EXECUTE_REBOOT") is not None
 
@@ -199,7 +200,7 @@ def test_e2e_reboot_result_is_forwarded_to_admin_stamped(tmp_path):
                 fwd = await _recv_type(admin, "REBOOT_RESULT")
                 assert fwd is not None
                 assert fwd["status"] == "accepted"
-                assert fwd["device_id"] == "dev0"
+                assert fwd["device_id"] == "64b19041-0b8c-4ef4-82fd-000000000000"
 
                 await d0.close()
                 await admin.close()
@@ -207,3 +208,22 @@ def test_e2e_reboot_result_is_forwarded_to_admin_stamped(tmp_path):
             await ts.close()
 
     asyncio.run(body())
+
+
+def test_power_policy_denial_is_not_logged_as_disconnect(caplog):
+    from styly_mdm.device_policy import CommandNotAllowedError
+
+    async def body():
+        admin = add_admin()
+        device = add_device("dev0")
+
+        async def deny(_message):
+            raise CommandNotAllowedError("registration changed before send")
+
+        device.send_str = deny
+        await server.handle_reboot_device(admin, {"target_devices": ["dev0"]})
+        assert frames_of(admin, "REBOOT_SENT")[0]["sent_count"] == 0
+
+    asyncio.run(body())
+    assert "command denied: registration changed before send" in caplog.text
+    assert "(disconnected)" not in caplog.text

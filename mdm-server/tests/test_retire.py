@@ -69,7 +69,7 @@ def reset_state():
 
 def add_device(device_id: str) -> FakeWS:
     ws = FakeWS()
-    server.devices[device_id] = {
+    server.devices[device_id] = {"registration_ready": True, "identity_kind": "canonical",
         "ws": ws, "device_id": device_id, "model": "M", "ip": "1.1.1.1",
         "status": "online", "startup_app": None, "battery": None,
         "version_code": 6, "version_name": "0.2.3",
@@ -314,9 +314,10 @@ async def _recv_type(ws, msg_type: str, timeout: float = 2.0) -> dict | None:
 async def _register(session, base: str, device_id: str, version_code: int = 6):
     ws = await session.ws_connect(base + "/ws/device")
     await ws.send_json({
-        "type": "REGISTER", "device_id": device_id, "model": "M",
+        "type": "REGISTER", "identity_scheme": server.IDENTITY_SCHEME, "device_id": device_id, "model": "M",
         "ip": "1.1.1.2", "version_code": version_code, "version_name": "t",
     })
+    await _recv_type(ws, "REGISTERED")
     return ws
 
 
@@ -333,11 +334,11 @@ def test_e2e_retire_happy_path(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                d0 = await _register(session, base, "dev0")
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
-                await admin.send_json({"type": "RETIRE_DEVICE", "target_devices": ["dev0"]})
+                await admin.send_json({"type": "RETIRE_DEVICE", "target_devices": ["64b19041-0b8c-4ef4-82fd-000000000000"]})
                 ack = await _recv_type(admin, "RETIRE_SENT")
                 assert ack["sent_count"] == 1 and ack["target_count"] == 1
                 cmd = await _recv_type(d0, "EXECUTE_SELF_UNINSTALL")
@@ -353,7 +354,7 @@ def test_e2e_retire_happy_path(tmp_path):
 
                 # The disconnect renders the row as retiring, not offline.
                 dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "dev0")["status"] == "retiring"
+                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "retiring"
 
                 # Silence past the window settles the retire as a success and the
                 # row lands in the terminal, persisted state.
@@ -361,12 +362,12 @@ def test_e2e_retire_happy_path(tmp_path):
                 assert result["status"] == "success"
                 assert result["correlation_id"] == cmd["correlation_id"]
                 dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "dev0")["status"] == "retired"
+                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "retired"
 
                 # A retired row is offline, so the existing forget path removes it.
-                await admin.send_json({"type": "FORGET_DEVICE", "device_id": "dev0"})
+                await admin.send_json({"type": "FORGET_DEVICE", "device_id": "64b19041-0b8c-4ef4-82fd-000000000000"})
                 forgotten = await _recv_type(admin, "DEVICE_FORGOTTEN")
-                assert forgotten["device_id"] == "dev0"
+                assert forgotten["device_id"] == "64b19041-0b8c-4ef4-82fd-000000000000"
 
                 await admin.close()
         finally:
@@ -384,11 +385,11 @@ def test_e2e_reregister_within_timeout_is_failure_and_unretires(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                d0 = await _register(session, base, "dev0")
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
-                await admin.send_json({"type": "RETIRE_DEVICE", "target_devices": ["dev0"]})
+                await admin.send_json({"type": "RETIRE_DEVICE", "target_devices": ["64b19041-0b8c-4ef4-82fd-000000000000"]})
                 cmd = await _recv_type(d0, "EXECUTE_SELF_UNINSTALL")
                 await d0.send_json({
                     "type": "SELF_UNINSTALL_STARTING",
@@ -397,17 +398,17 @@ def test_e2e_reregister_within_timeout_is_failure_and_unretires(tmp_path):
                 })
                 await d0.close()
                 dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "dev0")["status"] == "retiring"
+                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "retiring"
 
                 # The keep-alive restarted the merely-killed client: the retire
                 # failed, and the device is back to plain online.
-                d0b = await _register(session, base, "dev0")
+                d0b = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 result = await _recv_type(admin, "RETIRE_RESULT")
                 assert result["status"] == "fail"
                 assert "re-registered" in result["detail"]
                 dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "dev0")["status"] == "online"
-                assert server.device_registry["dev0"].get("retired") is not True
+                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "online"
+                assert server.device_registry["64b19041-0b8c-4ef4-82fd-000000000000"].get("retired") is not True
 
                 await d0b.close()
                 await admin.close()
@@ -426,11 +427,11 @@ def test_e2e_client_reported_failure_without_disconnect(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                d0 = await _register(session, base, "dev0")
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
-                await admin.send_json({"type": "RETIRE_DEVICE", "target_devices": ["dev0"]})
+                await admin.send_json({"type": "RETIRE_DEVICE", "target_devices": ["64b19041-0b8c-4ef4-82fd-000000000000"]})
                 cmd = await _recv_type(d0, "EXECUTE_SELF_UNINSTALL")
                 await d0.send_json({
                     "type": "SELF_UNINSTALL_STARTING",
@@ -449,8 +450,8 @@ def test_e2e_client_reported_failure_without_disconnect(tmp_path):
                 result = await _recv_type(admin, "RETIRE_RESULT")
                 assert result["status"] == "fail"
                 assert "Unauthorized" in result["detail"]
-                assert "dev0" not in server.pending_retires
-                assert server.device_registry["dev0"].get("retired") is not True
+                assert "64b19041-0b8c-4ef4-82fd-000000000000" not in server.pending_retires
+                assert server.device_registry["64b19041-0b8c-4ef4-82fd-000000000000"].get("retired") is not True
 
                 await d0.close()
                 await admin.close()
@@ -470,7 +471,7 @@ def test_e2e_retire_announce_supersedes_pending_self_update(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                d0 = await _register(session, base, "dev0")
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
@@ -481,19 +482,19 @@ def test_e2e_retire_announce_supersedes_pending_self_update(tmp_path):
                     "package_name": CLIENT_PKG, "apk_filename": "x.apk",
                 })
                 assert await _recv_type(admin, "INSTALL_DEVICE_STATE") is not None
-                assert "dev0" in server.pending_self_updates
+                assert "64b19041-0b8c-4ef4-82fd-000000000000" in server.pending_self_updates
 
                 # ...and a retire supersedes it: the self-update entry (and its
                 # timeout) must go, or it would later fire a spurious result.
-                update_timeout = server.pending_self_updates["dev0"]["timeout_task"]
+                update_timeout = server.pending_self_updates["64b19041-0b8c-4ef4-82fd-000000000000"]["timeout_task"]
                 await d0.send_json({
                     "type": "SELF_UNINSTALL_STARTING", "correlation_id": "c-ret",
                     "package_name": CLIENT_PKG, "version_code": 6,
                 })
                 await d0.close()
                 dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "dev0")["status"] == "retiring"
-                assert "dev0" not in server.pending_self_updates
+                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "retiring"
+                assert "64b19041-0b8c-4ef4-82fd-000000000000" not in server.pending_self_updates
                 assert update_timeout.cancelled()
 
                 await admin.close()

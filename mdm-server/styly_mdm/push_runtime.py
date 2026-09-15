@@ -19,6 +19,11 @@ from typing import Any
 
 from aiohttp import WSCloseCode, WSMsgType, web as aiohttp_web
 
+from .device_policy import (
+    CommandNotAllowedError,
+    PROVISIONAL_POWER_COMMANDS,
+    command_allowed,
+)
 from .push_artifacts import ArtifactStore
 from .push_job_manager import PushJobManager
 from .push_job_store import (
@@ -137,6 +142,38 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
 
     async def send_str(self, data: str, compress: int | None = None) -> None:
         async with self._push_send_lock:
+            if self._push_path == "/ws/device" and self._push_runtime is not None:
+                payload = json.loads(data)
+                message_type = payload.get("type", "")
+                server = self._push_runtime.legacy
+                provisional = server.provisional_connections.get(self)
+                if provisional is not None:
+                    if message_type in {"REGISTERED", "REGISTERED_PROVISIONAL", "ERROR"}:
+                        pass
+                    elif (
+                        message_type not in PROVISIONAL_POWER_COMMANDS
+                        or payload.get("connection_id") != provisional.get("connection_id")
+                        or not command_allowed(provisional, message_type)
+                    ):
+                        raise CommandNotAllowedError(
+                            "Provisional connection is not ready for this command"
+                        )
+                elif message_type not in {
+                    "REGISTERED", "REGISTERED_PROVISIONAL", "ERROR",
+                }:
+                    entry = server.devices.get(self._push_device_id)
+                    session = self._push_runtime.sessions.get(self._push_device_id)
+                    if (
+                        entry is None
+                        or entry.get("ws") is not self
+                        or session is None
+                        or session.ws is not self
+                        or payload.get("connection_id") is not None
+                        or not command_allowed(entry, message_type)
+                    ):
+                        raise CommandNotAllowedError(
+                            "Device is not ready or command is not allowed"
+                        )
             await super().send_str(data, compress=compress)
 
     async def prepare(self, request: aiohttp_web.Request) -> Any:
@@ -160,13 +197,6 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
             self._push_admin_snapshot_sent = True
             await self._push_runtime.send_initial_snapshot(self)
         while True:
-            # Returning REGISTER lets the established server finish its registry and
-            # owner update first. The next receive turn then finalizes Push-v1 and sends
-            # REGISTERED, preserving one authoritative ordering.
-            if self._push_pending_registration is not None and self._push_runtime is not None:
-                payload = self._push_pending_registration
-                self._push_pending_registration = None
-                await self._push_runtime.register_device(self, payload, self._push_http_base)
             message = await super().__anext__()
             if message.type is not WSMsgType.TEXT or self._push_runtime is None:
                 return message
@@ -178,13 +208,6 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
                 return message
             if self._push_path == "/ws/device":
                 if payload.get("type") == "REGISTER":
-                    device_id = payload.get("device_id")
-                    if isinstance(device_id, str) and device_id:
-                        self._push_runtime.note_registration_candidate(
-                            self, device_id
-                        )
-                        self._push_device_id = device_id
-                        self._push_pending_registration = payload
                     return message
                 if await self._push_runtime.handle_device_message(
                     self, self._push_device_id, payload
@@ -194,6 +217,28 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
                 if await self._push_runtime.handle_admin_message(self, payload):
                     continue
             return message
+
+    async def register_canonical_owner(
+        self,
+        device_id: str,
+        payload: dict[str, Any],
+        *,
+        idempotent: bool,
+    ) -> None:
+        if self._push_runtime is None:
+            await self.send_str(json.dumps({"type": "REGISTERED"}))
+            return
+        if idempotent:
+            await self._push_runtime.acknowledge_registration(self, device_id)
+            return
+        self._push_device_id = device_id
+        self._push_runtime.note_registration_candidate(self, device_id)
+        await self._push_runtime.register_device(
+            self,
+            payload,
+            self._push_http_base,
+            established_device_id=device_id,
+        )
 
     async def close(self, *args: Any, **kwargs: Any) -> bool:
         if (
@@ -281,6 +326,7 @@ class PushRuntime:
             if (
                 self.registration_candidates.get(device_id) in {None, session.ws}
                 and self._legacy_owns_device(device_id, session.ws)
+                and command_allowed(self.legacy.devices[device_id])
             )
         }
 
@@ -419,11 +465,15 @@ class PushRuntime:
                 raise PushJobError("declared total bytes exceed the server limit")
 
             protocols: dict[str, tuple[ProtocolMode, set[str]]] = {}
+            dispatch_sessions = self._dispatch_sessions()
             for device_id in canonical.target_devices:
                 record = self.legacy.device_registry.get(device_id)
                 if record and record.get("retired") is True:
                     raise PushJobError(f"target device is retired: {device_id}")
-                session = self.sessions.get(device_id)
+                entry = self.legacy.devices.get(device_id)
+                if (entry or record or {}).get("identity_kind") == "legacy":
+                    raise PushJobError(f"legacy device only supports APK installation/update: {device_id}")
+                session = dispatch_sessions.get(device_id)
                 if session is None:
                     raise PushJobError(f"target device is not online: {device_id}")
                 if CAP_PUSH_JOB_ID_V1 in session.capabilities:
@@ -657,8 +707,9 @@ class PushRuntime:
         ws: RuntimeWebSocketResponse,
         payload: dict[str, Any],
         http_base: str,
+        established_device_id: str | None = None,
     ) -> None:
-        device_id = payload.get("device_id")
+        device_id = established_device_id or payload.get("device_id")
         if not isinstance(device_id, str) or not device_id:
             return
         capabilities = parse_capabilities(payload.get("capabilities"))
@@ -799,6 +850,9 @@ class PushRuntime:
                 if self.sessions.get(device_id) is session:
                     self.sessions.pop(device_id, None)
                 raise
+            if not self._legacy_owns_device(device_id, ws):
+                return
+            self.legacy.devices[device_id]["registration_ready"] = True
             if self.registration_candidates.get(device_id) is ws:
                 self.registration_candidates.pop(device_id, None)
             registered = True
@@ -807,10 +861,33 @@ class PushRuntime:
             await self.publish(snapshot)
         if not registered:
             return
-        if needs_reconcile:
+        if needs_reconcile and command_allowed(self.legacy.devices.get(device_id)):
             await self.request_reconcile(device_id)
         if self.scheduler is not None:
             self.scheduler.wake()
+
+    async def acknowledge_registration(
+        self,
+        ws: RuntimeWebSocketResponse,
+        device_id: str,
+    ) -> None:
+        session = self.sessions.get(device_id)
+        entry = self.legacy.devices.get(device_id)
+        if (
+            session is None
+            or session.ws is not ws
+            or entry is None
+            or entry.get("ws") is not ws
+            or entry.get("registration_ready") is not True
+        ):
+            return
+        await asyncio.wait_for(
+            ws.send_str(json.dumps({
+                "type": "REGISTERED",
+                "session_id": session.session_id,
+            }, separators=(",", ":"))),
+            self.send_timeout,
+        )
 
     async def _registration_active_snapshots(
         self,
@@ -911,6 +988,8 @@ class PushRuntime:
             if session is None or session.ws is not ws:
                 return
             self.sessions.pop(device_id, None)
+            if self._legacy_owns_device(device_id, ws):
+                self.legacy.devices[device_id]["registration_ready"] = False
             active = await self.manager.active_assignment_for_device(device_id)
             if active is None:
                 return
@@ -1512,6 +1591,15 @@ class PushRuntime:
         self, ws: RuntimeWebSocketResponse, payload: dict[str, Any]
     ) -> bool:
         message_type = payload.get("type")
+        if (
+            "target_connections" in payload
+            and message_type not in {"REBOOT_DEVICE", "POWER_OFF_DEVICE"}
+        ):
+            await ws.send_str(json.dumps({
+                "type": "ERROR",
+                "message": "target_connections is only supported for power control",
+            }))
+            return True
         if message_type == "PUSH_FILES" and isinstance(payload.get("job_id"), str):
             job_id = payload["job_id"]
             try:

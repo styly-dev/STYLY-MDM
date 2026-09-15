@@ -483,3 +483,31 @@ test('dispatch attention ignores terminal and nondispatchable jobs', () => {
   assert.equal(harness.pushJobsAttention.style.display, 'none');
   assert.equal(harness.pushJobsAttention.children.length, 0);
 });
+
+test('target tabs preserve normal selection and clear it across Need attention', () => {
+  const match = indexSource.match(/function switchTargetTab\(tab\) \{[\s\S]*?\n      \}/);
+  assert.ok(match);
+  for (const [from, to, cleared] of [
+    ['groups', 'devices', false], ['devices', 'groups', false],
+    ['groups', 'attention', true], ['devices', 'attention', true],
+    ['attention', 'groups', true], ['attention', 'devices', true],
+    ['attention', 'attention', false],
+  ]) {
+    const context = vm.createContext({
+      targetTab: from,
+      selectedIds: new Set(['device-1', 'device-2']),
+      selectedConnectionIds: new Set(['connection-1']),
+      activeGroup: 'Room A',
+      powerConfirm: { checked: true },
+      render() {},
+    });
+    vm.runInContext(match[0], context);
+    context.switchTargetTab(to);
+    const label = from + ' -> ' + to;
+    assert.equal(context.targetTab, to, label);
+    assert.deepEqual([...context.selectedIds], cleared ? [] : ['device-1', 'device-2'], label);
+    assert.deepEqual([...context.selectedConnectionIds], cleared ? [] : ['connection-1'], label);
+    assert.equal(context.activeGroup, cleared ? null : 'Room A', label);
+    assert.equal(context.powerConfirm.checked, !cleared, label);
+  }
+});

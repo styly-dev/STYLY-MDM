@@ -118,7 +118,18 @@ android.applicationVariants.all { variant ->
     }
 }
 
+def deviceIdProviderMetadataFile = file("libs/device-id-provider.properties")
+if (!deviceIdProviderMetadataFile.isFile()) {
+    throw new GradleException(
+        "Missing Device-ID-Provider metadata: ${deviceIdProviderMetadataFile}"
+    )
+}
+def deviceIdProviderMetadata = new Properties()
+deviceIdProviderMetadataFile.withInputStream { deviceIdProviderMetadata.load(it) }
+def deviceIdProviderAar = file("libs/${deviceIdProviderMetadata.getProperty('aar')}")
+
 dependencies {
+    implementation files(deviceIdProviderAar)
     implementation 'androidx.core:core-ktx:1.10.1'
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.squareup.okhttp3:okhttp:4.11.0'
@@ -136,3 +147,32 @@ dependencies {
     // needs the real implementation to be testable under plain JUnit.
     testImplementation 'org.json:json:20240303'
 }
+
+tasks.register("verifyDeviceIdProviderAar") {
+    inputs.file(deviceIdProviderMetadataFile)
+    inputs.file(deviceIdProviderAar)
+    doLast {
+        if (!deviceIdProviderAar.isFile()) {
+            throw new GradleException(
+                "Missing pinned Device-ID-Provider AAR: ${deviceIdProviderAar}"
+            )
+        }
+        def digest = java.security.MessageDigest.getInstance("SHA-256")
+        deviceIdProviderAar.withInputStream { stream ->
+            byte[] buffer = new byte[8192]
+            int read
+            while ((read = stream.read(buffer)) != -1) {
+                digest.update(buffer, 0, read)
+            }
+        }
+        def actual = digest.digest().encodeHex().toString()
+        def expected = deviceIdProviderMetadata.getProperty("sha256")
+        if (actual != expected) {
+            throw new GradleException(
+                "Device-ID-Provider AAR checksum mismatch: expected ${expected}, got ${actual}"
+            )
+        }
+    }
+}
+
+tasks.named("preBuild").configure { dependsOn("verifyDeviceIdProviderAar") }

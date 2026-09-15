@@ -103,6 +103,18 @@
     .targets { border-right: 1px solid var(--border); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
     .actions { background: var(--bg-actions); min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
     .targets-head, .subtabs { flex: 0 0 auto; }
+    .attention-list { padding: 14px 20px; }
+    .attention-row { display: grid; grid-template-columns: 42px minmax(150px, .8fr) minmax(0, 1.6fr); gap: 16px; align-items: center; padding: 12px 0; border-top: 1px solid var(--border-soft); }
+    .attention-head { display: grid; grid-template-columns: 42px minmax(150px, .8fr) minmax(0, 1.6fr); gap: 16px; padding: 0 0 8px; color: var(--text-secondary); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; }
+    .attention-row:first-child { border-top: none; }
+    .attention-device, .attention-detail { min-width: 0; }
+    .attention-model { color: var(--text-primary); font-weight: 600; overflow-wrap: anywhere; }
+    .attention-meta { margin-top: 3px; color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; }
+    .attention-status { color: var(--warning); font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+    .attention-update { color: var(--danger); font-size: 12px; font-weight: 600; }
+    .attention-diagnostic { margin-top: 3px; color: var(--text-secondary); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; word-break: break-word; }
+    .attention-row.unsupported { opacity: .62; }
+    .attention-row.unsupported .selbox { cursor: not-allowed; }
     .actions > .zone-label, .sel-card, .push-attention { flex: 0 0 auto; }
 
     /* Drag handles */
@@ -112,13 +124,14 @@
     .h-gutter:hover, .h-gutter.dragging { background: var(--accent); opacity: .5; }
 
     /* Sub-tabs */
-    .subtabs { display: flex; align-items: center; padding: 8px 20px 0; }
+    .subtabs { display: flex; align-items: center; padding: 8px 20px 0; overflow-x: auto; }
     .subtab {
-      padding: 11px 16px; font-size: 14px; font-weight: 600; color: var(--text-secondary);
+      padding: 11px 16px; font-size: 14px; font-weight: 600; color: var(--text-secondary); white-space: nowrap;
       border: none; background: none; font-family: inherit; cursor: pointer;
       border-bottom: 2px solid transparent;
     }
     .subtab .cnt { color: var(--text-secondary); font-weight: 400; }
+    #tabAttention.has-items .cnt { color: var(--warning); }
     .subtab.active { color: var(--text-primary); border-bottom-color: var(--accent); }
     .subtab.active .cnt { color: var(--text-secondary); }
     .subtabs-fill { flex: 1; border-bottom: 1px solid var(--border); align-self: stretch; }
@@ -197,6 +210,10 @@
     .dev-version.mismatch { color: var(--danger); border-color: var(--danger); font-weight: 700; }
     .btn-update { margin-left: 6px; flex: 0 0 auto; font: 600 11px/1 inherit; color: #fff; background: var(--accent); border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; white-space: nowrap; }
     .btn-update:hover { background: var(--accent-hover); }
+    .copy-device-id { background: none; border: 0; padding: 0; color: inherit; font: inherit; cursor: pointer; }
+    .copy-device-id:hover { text-decoration: underline; }
+    .copy-device-id:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+    .copy-id-status:not(:empty) { margin-left: 6px; }
     .dev-sub { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .dev-status { font-size: 13px; }
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 6px; vertical-align: middle; }
@@ -230,6 +247,7 @@
     /* Select boxes */
     .selbox { width: 16px; height: 16px; border-radius: 4px; border: 1.5px solid #41475f; display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; color: #fff; font-size: 11px; font-weight: 800; }
     .selbox.on, .selbox.mixed { background: var(--accent); border-color: var(--accent); }
+    .selbox.disabled { cursor: not-allowed; opacity: .55; }
 
     .ic-btn { background: none; border: none; cursor: pointer; color: var(--text-secondary); font-size: 12px; line-height: 1; padding: 2px 4px; border-radius: 4px; }
     .ic-btn:hover { color: var(--accent); background: var(--bg-tertiary); }
@@ -364,6 +382,10 @@
       .v-gutter, .h-gutter { display: none; }
       .logzone { height: auto; }
       .log-body { flex: 0 0 auto; max-height: 220px; }
+      .attention-head { display: none; }
+      .attention-row { grid-template-columns: 42px 1fr; gap: 4px 10px; }
+      .attention-row .attention-detail { grid-column: 2; }
+      .subtab { padding-left: 10px; padding-right: 10px; }
       .manage-grid { grid-template-columns: 1fr; }
       .mg-sidebar { border-right: none; border-bottom: 1px solid var(--border); }
     }
@@ -393,6 +415,7 @@
           <div class="subtabs">
             <button class="subtab active" id="tabGroups" data-tab="groups">Groups <span class="cnt" id="cntGroups">0</span></button>
             <button class="subtab" id="tabDevices" data-tab="devices">Devices <span class="cnt" id="cntDevices">0</span></button>
+            <button class="subtab" id="tabAttention" data-tab="attention">Needs attention <span class="cnt" id="cntAttention">0</span></button>
             <div class="subtabs-fill"></div>
           </div>
           <div class="dev-toolbar" id="devToolbar" style="display:none">
@@ -584,12 +607,14 @@
       // ---------------- State ----------------
       let ws = null;
       let devices = [];
+      let provisionalConnections = [];
       let serverVersion = null;        // STYLY-MDM server version, from SERVER_INFO
       let clientApk = null;            // newest styly-mdm-client APK on the server, from CLIENT_APK_INFO ({filename,url,version} or null)
       let groups = {};                 // name -> [serials]
       let selectedIds = new Set();
+      let selectedConnectionIds = new Set();
       let activeGroup = null;          // group name driving the selection, or null
-      let targetTab = 'groups';        // 'groups' | 'devices'
+      let targetTab = 'groups';        // 'groups' | 'devices' | 'attention'
       let userPickedTab = false;       // true once the user clicks a sub-tab (stops auto-default)
       let expandedGroups = new Set();  // group names expanded to show per-device status
       let view = 'console';            // 'console' | 'manage'
@@ -641,9 +666,11 @@
       const connText = document.getElementById('connText');
       const tabGroups = document.getElementById('tabGroups');
       const tabDevices = document.getElementById('tabDevices');
+      const tabAttention = document.getElementById('tabAttention');
       const btnManageGroups = document.getElementById('btnManageGroups');
       const cntGroups = document.getElementById('cntGroups');
       const cntDevices = document.getElementById('cntDevices');
+      const cntAttention = document.getElementById('cntAttention');
       const targetsBody = document.getElementById('targetsBody');
       const devToolbar = document.getElementById('devToolbar');
       const devSearchInput = document.getElementById('devSearch');
@@ -690,6 +717,39 @@
       // string carrying a double quote would otherwise escape the attribute.
       function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML.replace(/"/g, '&quot;'); }
       function getDeviceId(d) { return d.device_id || d.serial_number || ''; }
+      function deviceIdHtml(d, id) {
+        return '<button type="button" class="copy-device-id" data-act="copyDeviceId" data-id="' + esc(id) +
+          '" title="' + esc(id) + '" aria-label="Copy full device ID ' + esc(id) + '">' +
+          esc(d.identity_kind === 'canonical' ? id.slice(0, 8) : id) + '</button><span class="copy-id-status" role="status"></span>';
+      }
+      async function copyDeviceId(button) {
+        const id = button.dataset.id;
+        try {
+          if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(id);
+          } else {
+            // LAN HTTP does not expose the async Clipboard API.
+            const input = document.createElement('textarea');
+            input.value = id;
+            input.readOnly = true;
+            input.style.cssText = 'position:fixed;left:-9999px;top:0';
+            const focused = document.activeElement;
+            document.body.appendChild(input);
+            try {
+              input.select();
+              if (!document.execCommand('copy')) throw new Error('Copy unavailable');
+            } finally {
+              input.remove();
+              if (focused) focused.focus({ preventScroll: true });
+            }
+          }
+          button.nextElementSibling.textContent = 'Copied';
+        } catch (error) {
+          button.nextElementSibling.textContent = 'Copy failed';
+          window.prompt('Copy the full device ID:', id);
+        }
+      }
+
       // Allowlist, not a "!== 'offline'" denylist: a new server-side status (e.g.
       // retiring/retired) must default to the dimmed, not-a-command-target styling.
       function isOnline(d) { return d.status === 'online' || d.status === 'updating'; }
@@ -753,6 +813,16 @@
         el.classList.add('shown');
       }
       function deviceById(id) { return devices.find(function (d) { return getDeviceId(d) === id; }); }
+      function connectionById(id) { return provisionalConnections.find(function (c) { return c.connection_id === id; }); }
+      function shortConnectionId(id) { return id ? String(id).slice(0, 8) : '-'; }
+      function attentionPowerSupported(entry) {
+        return !!(entry && entry.power_control_supported === true);
+      }
+      function attentionLabelFor(id) {
+        const entry = connectionById(id);
+        if (!entry) return shortConnectionId(id);
+        return (entry.model || 'Unknown device') + ' (' + (entry.ip || 'unknown') + ', ' + shortConnectionId(id) + ')';
+      }
       // Command targets need a live WebSocket, which "updating" (mid self-update,
       // device rebooting) does not have — only strictly-online devices qualify.
       function getOnlineIds() { return devices.filter(function (d) { return d.status === 'online'; }).map(getDeviceId).filter(Boolean); }
@@ -884,8 +954,10 @@
           }
           case 'DEVICE_LIST': {
             devices = msg.devices || [];
+            const selectedBefore = selectedIds.size;
             const cur = knownIds();
             selectedIds.forEach(function (id) { if (!cur.has(id)) selectedIds.delete(id); });
+            if (selectedIds.size !== selectedBefore) powerConfirm.checked = false;
             // Purge task cells only for devices that went fully offline. Broader than
             // getOnlineIds() on purpose: a device mid self-update ("updating") has no
             // live socket but its Updating… cell must survive the list refresh.
@@ -893,6 +965,19 @@
             Object.keys(deviceTaskState).forEach(function (id) { if (!keepTask.has(id)) delete deviceTaskState[id]; });
             syncActiveGroupSelection();
             render();
+            break;
+          }
+          case 'PROVISIONAL_CONNECTION_LIST': {
+            provisionalConnections = Array.isArray(msg.connections) ? msg.connections : [];
+            const removedSelection = pruneAttentionSelection();
+            if (removedSelection) powerConfirm.checked = false;
+            // Keep the normal device table and any active label editor intact while
+            // the status-only attention list updates in the background.
+            if (view === 'console') {
+              renderTabs();
+              if (targetTab === 'attention') renderTargets();
+              renderActions();
+            }
             break;
           }
           case 'GROUP_LIST': {
@@ -1009,8 +1094,10 @@
           }
           case 'SELF_UPDATE_RESULT': {
             const ok = msg.status === 'success';
+            const untracked = msg.status === 'untracked';
             const ver = (msg.version_code != null) ? ' now v' + msg.version_code : '';
-            addLog('[' + (ok ? 'OK' : 'FAIL') + '] self-update on ' + labelFor(msg.device_id) + ver + (msg.detail ? ' - ' + msg.detail : ''), ok ? 'success' : 'fail');
+            const outcome = ok ? 'OK' : (untracked ? 'UNTRACKED' : 'FAIL');
+            addLog('[' + outcome + '] self-update on ' + labelFor(msg.device_id) + ver + (msg.detail ? ' - ' + msg.detail : ''), ok ? 'success' : (untracked ? 'info' : 'fail'));
             break;
           }
           case 'SELF_UPDATE_VERIFIED': {
@@ -1055,8 +1142,11 @@
       function renderTabs() {
         cntGroups.textContent = groupNames().length;
         cntDevices.textContent = devices.length;
+        cntAttention.textContent = provisionalConnections.length;
+        tabAttention.classList.toggle('has-items', provisionalConnections.length > 0);
         tabGroups.classList.toggle('active', targetTab === 'groups');
         tabDevices.classList.toggle('active', targetTab === 'devices');
+        tabAttention.classList.toggle('active', targetTab === 'attention');
       }
 
       function renderTargets() {
@@ -1068,8 +1158,34 @@
         if (showToolbar && devSearchInput.value !== deviceSearch) devSearchInput.value = deviceSearch;
         if (showToolbar) syncStatusFilterButtons();
         const hadFocus = labelInputFocused();
-        targetsBody.innerHTML = targetTab === 'groups' ? renderGroupsHtml() : renderDevicesHtml();
+        targetsBody.innerHTML = targetTab === 'groups'
+          ? renderGroupsHtml()
+          : (targetTab === 'devices' ? renderDevicesHtml() : renderAttentionHtml());
         if (targetTab === 'devices') restoreLabelEditFocus(hadFocus);
+      }
+
+      function renderAttentionHtml() {
+        if (!provisionalConnections.length) return '<div class="empty">No devices need attention</div>';
+        return '<div class="attention-list"><div class="attention-head">' +
+          '<div class="selbox ' + attentionSelectAllState() + (attentionSelectableCount() ? '' : ' disabled') + '" data-act="selectAllAttention">' + attentionSelectAllGlyph() + '</div>' +
+          '<div>Connection</div><div>Status</div></div>' +
+          provisionalConnections.map(function (entry) {
+          const connectionId = entry.connection_id || '';
+          const supported = attentionPowerSupported(entry);
+          const checked = selectedConnectionIds.has(connectionId);
+          const version = entry.version_name ? 'v' + entry.version_name : 'version unknown';
+          return '<div class="attention-row' + (supported ? '' : ' unsupported') + '">' +
+            '<div class="selbox ' + (checked ? 'on' : '') + (supported ? '' : ' disabled') + '"' +
+              (supported ? ' data-act="toggleAttention" data-id="' + esc(connectionId) + '"' : ' aria-disabled="true"') + '>' + (checked ? '✓' : '') + '</div>' +
+            '<div class="attention-device"><div class="attention-model">' + esc(entry.model || 'Unknown device') + '</div>' +
+            '<div class="attention-meta">' + esc(entry.ip || 'unknown') + ' · ' + esc(version) + '</div></div>' +
+            '<div class="attention-detail">' + (supported
+              ? '<div class="attention-status">' + esc(entry.identity_status || 'unknown') + '</div>'
+              : '<div class="attention-update">Client update required</div>') +
+            '<div class="attention-diagnostic">' + esc(entry.diagnostic || 'No diagnostic available') + '</div>' +
+            (entry.mint_attempted === true ? '<div class="attention-meta">Device ID creation was attempted</div>' : '') + '</div>' +
+            '</div>';
+        }).join('') + '</div>';
       }
 
       function labelInputFocused() {
@@ -1218,10 +1334,12 @@
             updateBtn +
             '</div>';
         }
-        deviceCell += '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.ip || '-') + '</div>';
+        deviceCell += '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.ip || '-') + '</div>';
 
         let status;
-        if (d.status === 'updating') {
+        if (d.status === 'registering') {
+          status = '<span class="dot updating"></span>Registering…';
+        } else if (d.status === 'updating') {
           status = '<span class="dot updating"></span>Updating…';
         } else if (d.status === 'retiring') {
           status = '<span class="dot retiring"></span>Retiring…';
@@ -1328,6 +1446,7 @@
         if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
         if (st.status === 'installing') return '<span class="ins-installing"><span class="spinner">⟳</span> Installing…</span>';
         if (st.status === 'updating') return '<span class="ins-installing"><span class="spinner">⟳</span> Updating…</span>';
+        if (st.status === 'untracked') return '<span class="ins-none" title="' + esc(st.detail || '') + '">◇ identity handoff untracked</span>';
         if (st.status === 'success') return '<span class="ins-success">✓ installed</span>' + (st.filename ? ' <span class="ins-none">' + esc(st.filename) + '</span>' : '');
         return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
       }
@@ -1393,14 +1512,17 @@
       };
 
       function renderActions() {
+        const attentionMode = targetTab === 'attention';
         const online = new Set(getOnlineIds());
         let on = 0, off = 0;
         selectedIds.forEach(function (id) { if (online.has(id)) on++; else off++; });
-        const n = selectedIds.size;
+        const n = attentionMode ? selectedConnectionIds.size : selectedIds.size;
         let ctx;
         if (n === 0) ctx = 'Select devices or a group to act on';
+        else if (attentionMode) ctx = n + ' Need attention connection(s) selected · power control only';
         else if (activeGroup) ctx = 'via group "' + esc(activeGroup) + '" · ' + on + ' online' + (off ? ' · ' + off + ' offline skipped' : '');
         else ctx = on + ' online' + (off ? ' · ' + off + ' offline skipped' : '') + ' · add or remove individually';
+        if (!attentionMode && Array.from(selectedIds).some(function (id) { return (deviceById(id) || {}).identity_kind === 'legacy'; })) ctx += ' · Legacy devices: APK installation/update only';
         selCard.innerHTML =
           '<div class="sel-head">' +
           '<span class="sel-badge ' + (n ? '' : 'zero') + '">' + n + '</span>' +
@@ -1413,8 +1535,13 @@
 
 
       function updateButtons() {
-        const has = selectedIds.size > 0;
-        btnInstall.disabled = uploadInProgress || apkFile.files.length === 0 || !has;
+        const attentionMode = targetTab === 'attention';
+        const hasAttentionPower = attentionMode && Array.from(selectedConnectionIds).some(function (id) {
+          return attentionPowerSupported(connectionById(id));
+        });
+        const has = !attentionMode && Array.from(selectedIds).some(function (id) { const d = deviceById(id); return d && isOnline(d) && d.identity_kind !== 'legacy'; });
+        const hasInstall = !attentionMode && Array.from(selectedIds).some(function (id) { return isOnline(deviceById(id)); });
+        btnInstall.disabled = uploadInProgress || apkFile.files.length === 0 || !hasInstall;
         btnLaunch.disabled = launchPkg.value.trim() === '' || !has;
         btnUninstall.disabled = !uninstallConfirm.checked || uninstallPkg.value.trim() === '' || !has;
         btnStartupSet.disabled = startupPkg.value.trim() === '' || !has;
@@ -1423,8 +1550,8 @@
         syncPanel.refreshButton(has);
         btnVerifyApk.disabled = !verifyApkRef || verifyApkPkg.value.trim() === '' || !has;
         btnVerifyDir.disabled = !verifyDirRef || verifyDirPath.value.trim() === '' || !has;
-        btnReboot.disabled = !powerConfirm.checked || !has;
-        btnPowerOff.disabled = !powerConfirm.checked || !has;
+        btnReboot.disabled = !powerConfirm.checked || !(has || hasAttentionPower);
+        btnPowerOff.disabled = !powerConfirm.checked || !(has || hasAttentionPower);
         btnRetire.disabled = !retireConfirm.checked || !has;
         // Enabled only when at least one selected device is actually behind and updatable; the
         // count tells the operator how many of the selection this one click will update.
@@ -1435,7 +1562,59 @@
       }
 
       // ---------------- Selection actions ----------------
+      function pruneAttentionSelection() {
+        let changed = false;
+        selectedConnectionIds.forEach(function (id) {
+          if (!attentionPowerSupported(connectionById(id))) {
+            selectedConnectionIds.delete(id);
+            changed = true;
+          }
+        });
+        return changed;
+      }
+      function attentionSelectableEntries() {
+        return provisionalConnections.filter(attentionPowerSupported);
+      }
+      function attentionSelectableCount() { return attentionSelectableEntries().length; }
+      function attentionSelectAllState() {
+        const selectable = attentionSelectableEntries();
+        if (!selectable.length || !selectedConnectionIds.size) return '';
+        return selectable.every(function (entry) { return selectedConnectionIds.has(entry.connection_id); }) ? 'on' : 'mixed';
+      }
+      function attentionSelectAllGlyph() {
+        const state = attentionSelectAllState();
+        return state === 'on' ? '✓' : state === 'mixed' ? '–' : '';
+      }
+      function toggleAttention(id) {
+        const entry = connectionById(id);
+        if (!attentionPowerSupported(entry)) return;
+        if (selectedConnectionIds.has(id)) selectedConnectionIds.delete(id);
+        else selectedConnectionIds.add(id);
+        render();
+      }
+      function toggleSelectAllAttention() {
+        const selectable = attentionSelectableEntries();
+        const all = selectable.length > 0 && selectable.every(function (entry) {
+          return selectedConnectionIds.has(entry.connection_id);
+        });
+        if (all) selectable.forEach(function (entry) { selectedConnectionIds.delete(entry.connection_id); });
+        else selectable.forEach(function (entry) { selectedConnectionIds.add(entry.connection_id); });
+        render();
+      }
+      function switchTargetTab(tab) {
+        if (targetTab === tab) return;
+        const crossesAttention = targetTab === 'attention' || tab === 'attention';
+        targetTab = tab;
+        if (crossesAttention) {
+          selectedIds.clear();
+          selectedConnectionIds.clear();
+          activeGroup = null;
+          powerConfirm.checked = false;
+        }
+        render();
+      }
       function selectGroupAsTarget(name) {
+        selectedConnectionIds.clear();
         const known = knownIds();
         selectedIds = new Set((groups[name] || []).filter(function (s) { return known.has(s); }));
         activeGroup = name;
@@ -1469,15 +1648,23 @@
         activeGroup = null;
         render();
       }
-      function clearSelection() { selectedIds.clear(); activeGroup = null; render(); }
+      function clearSelection() {
+        selectedIds.clear();
+        selectedConnectionIds.clear();
+        activeGroup = null;
+        powerConfirm.checked = false;
+        render();
+      }
 
       // Split into online/offline; warn about skipped offline; return reachable subset.
-      function onlineTargets(ids) {
+      function onlineTargets(ids, allowLegacy = false) {
         const online = new Set(getOnlineIds());
         const reach = ids.filter(function (id) { return online.has(id); });
         const skip = ids.filter(function (id) { return !online.has(id); });
         if (skip.length) addLog('Skipping ' + skip.length + ' offline device(s): ' + skip.map(labelFor).join(', '), 'warn');
-        return reach;
+        const permitted = reach.filter(function (id) { return allowLegacy || (deviceById(id) || {}).identity_kind !== "legacy"; });
+        if (permitted.length !== reach.length) addLog("Skipping legacy devices: APK installation/update only", "warn");
+        return permitted;
       }
 
       // ---------------- Commands ----------------
@@ -1522,7 +1709,7 @@
 
       function sendInstall() {
         if (uploadInProgress) return;
-        const online = onlineTargets(Array.from(selectedIds));
+        const online = onlineTargets(Array.from(selectedIds), true);
         if (!online.length) { addLog('No online devices selected to install', 'warn'); return; }
         ensureUploaded().then(function (apk) {
           if (!wsSend({ type: 'INSTALL_APK', target_devices: online, apk_url: apk.apk_url, apk_filename: apk.apk_filename }, 'install')) return;
@@ -1716,15 +1903,29 @@
         const isReboot = kind === 'reboot';
         const verb = isReboot ? 'Reboot' : 'Power off';
         const type = isReboot ? 'REBOOT_DEVICE' : 'POWER_OFF_DEVICE';
-        const online = onlineTargets(Array.from(selectedIds));
-        if (!online.length) { addLog('No online devices selected to ' + verb.toLowerCase(), 'warn'); return; }
-        const names = online.map(labelFor).join(', ');
+        const attentionMode = targetTab === 'attention';
+        let targets;
+        let names;
+        if (attentionMode) {
+          targets = Array.from(selectedConnectionIds).filter(function (id) {
+            return attentionPowerSupported(connectionById(id));
+          });
+          if (!targets.length) { addLog('No eligible Need attention connections selected to ' + verb.toLowerCase(), 'warn'); return; }
+          names = targets.map(attentionLabelFor).join(', ');
+        } else {
+          targets = onlineTargets(Array.from(selectedIds));
+          if (!targets.length) { addLog('No online devices selected to ' + verb.toLowerCase(), 'warn'); return; }
+          names = targets.map(labelFor).join(', ');
+        }
         const extra = isReboot
           ? 'These devices will restart and reconnect on their own.'
           : 'These devices will power off and CANNOT be turned back on remotely.';
-        if (!confirm(verb + ' ' + online.length + ' device(s)?\n' + names + '\n\n' + extra)) return;
-        if (wsSend({ type: type, target_devices: online }, verb.toLowerCase() + ' devices')) {
-          addLog(verb + ' command sent to ' + online.length + ' device(s)…', 'info');
+        if (!confirm(verb + ' ' + targets.length + ' device(s)?\n' + names + '\n\n' + extra)) return;
+        const message = attentionMode
+          ? { type: type, target_connections: targets }
+          : { type: type, target_devices: targets };
+        if (wsSend(message, verb.toLowerCase() + ' devices')) {
+          addLog(verb + ' request accepted for ' + targets.length + ' device(s)…', 'info');
           powerConfirm.checked = false;
           updateButtons();
         }
@@ -1734,11 +1935,12 @@
       // dropping offline); 'fail' = the SDK rejected it and the device stayed up.
       // A 'success' status is never expected — the reboot takes the socket first.
       function logPowerResult(verb, msg) {
+        const target = msg.connection_id ? attentionLabelFor(msg.connection_id) : labelFor(msg.device_id);
         if (msg.status === 'accepted') {
-          addLog('[OK] ' + verb + ' accepted on ' + labelFor(msg.device_id) + ' — watch for it to go offline', 'success');
+          addLog('[ACCEPTED] ' + verb + ' request accepted on ' + target + ' — this is not proof of execution; watch the connection state', 'info');
         } else {
           const detail = msg.error || msg.message || '';
-          addLog('[FAIL] ' + verb + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), 'fail');
+          addLog('[FAIL] ' + verb + ' on ' + target + (detail ? ' - ' + detail : ''), 'fail');
         }
       }
 
@@ -1931,7 +2133,7 @@
             '<div class="selbox ' + (mem ? 'on' : '') + '">' + (mem ? '✓' : '') + '</div>' +
             '<div class="mg-dev-main">' +
             '<div>' + (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') + '</div>' +
-            '<div class="dev-sub">' + esc(id) + ' · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') + '</div></div>' +
+            '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') + '</div></div>' +
             '<div class="mg-dev-status"><span class="dot ' + (off ? 'off' : '') + '"></span>' + (off ? 'Offline' : 'Online') + '</div>' +
             '</div>';
         }).join('');
@@ -2525,8 +2727,9 @@
 
       // ---------------- Event wiring ----------------
       // Sub-tabs
-      tabGroups.addEventListener('click', function () { targetTab = 'groups'; userPickedTab = true; render(); });
-      tabDevices.addEventListener('click', function () { targetTab = 'devices'; userPickedTab = true; render(); });
+      tabGroups.addEventListener('click', function () { userPickedTab = true; switchTargetTab('groups'); });
+      tabDevices.addEventListener('click', function () { userPickedTab = true; switchTargetTab('devices'); });
+      tabAttention.addEventListener('click', function () { userPickedTab = true; switchTargetTab('attention'); });
       btnManageGroups.addEventListener('click', function () {
         openManage(null);
         const inp = mgSidebar.querySelector('[data-mg-new]');
@@ -2538,7 +2741,10 @@
         const t = e.target.closest('[data-act]');
         if (!t) return;
         const act = t.dataset.act;
-        if (act === 'selectGroup') selectGroupAsTarget(t.dataset.group);
+        if (act === 'copyDeviceId') { e.stopPropagation(); copyDeviceId(t); }
+        else if (act === 'toggleAttention') toggleAttention(t.dataset.id);
+        else if (act === 'selectAllAttention') toggleSelectAllAttention();
+        else if (act === 'selectGroup') selectGroupAsTarget(t.dataset.group);
         else if (act === 'toggleExpand') {
           const g = t.dataset.group;
           if (expandedGroups.has(g)) expandedGroups.delete(g); else expandedGroups.add(g);
@@ -2645,7 +2851,8 @@
         const t = e.target.closest('[data-act]');
         if (!t) return;
         const act = t.dataset.act;
-        if (act === 'back') backToConsole();
+        if (act === 'copyDeviceId') { e.stopPropagation(); copyDeviceId(t); }
+        else if (act === 'back') backToConsole();
         else if (act === 'sortManage') {
           // Toggle sort direction and refresh only the list (keeps search focus/scroll).
           manageSort = manageSort === 'label-asc' ? 'label-desc' : 'label-asc';
