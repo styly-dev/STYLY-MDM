@@ -169,8 +169,8 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
                         raise CommandNotAllowedError(
                             "Provisional connection is not ready for this command"
                         )
-                elif message_type.startswith("EXECUTE_") or message_type in {
-                    "SET_STARTUP_APP", "CLEAR_STARTUP_APP", "PUSH_RECONCILE_REQUEST",
+                elif message_type not in {
+                    "REGISTERED", "REGISTERED_PROVISIONAL", "ERROR",
                 }:
                     entry = server.devices.get(self._push_device_id)
                     session = self._push_runtime.sessions.get(self._push_device_id)
