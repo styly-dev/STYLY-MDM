@@ -336,6 +336,9 @@
       label.className = 'push-attention-job';
       label.textContent = (job.mode === 'sync' ? 'Sync' : 'Push') + ' #' +
         job.job_id.slice(0, 8) + ' → ' + job.dest_path;
+      if (job.dispatch_paused_reason === 'download_retry_exhausted') {
+        label.textContent += ' — Download interrupted; partial retained. Resume to retry.';
+      }
       const resume = document.createElement('button');
       resume.type = 'button';
       resume.className = 'push-resume';

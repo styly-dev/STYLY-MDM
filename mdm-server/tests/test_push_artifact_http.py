@@ -47,6 +47,10 @@ async def test_artifact_http_range_etag_and_head(artifact_runtime):
     try:
         async with aiohttp.ClientSession() as client:
             url = f"http://{server.host}:{server.port}/artifacts/{artifact_id}"
+            response = await client.get(url, headers={"Accept-Encoding": "identity"})
+            assert response.status == 200
+            assert "Content-Encoding" not in response.headers
+            assert await response.read() == payload
             response = await client.get(url, headers={"Range": "bytes=2-5"})
             assert response.status == 206
             assert await response.read() == payload[2:6]
@@ -54,7 +58,7 @@ async def test_artifact_http_range_etag_and_head(artifact_runtime):
             assert response.headers["Content-Length"] == "4"
             assert response.headers["Accept-Ranges"] == "bytes"
             assert response.headers["ETag"] == f'"{digest}"'
-            assert response.headers["Content-Encoding"] == "identity"
+            assert "Content-Encoding" not in response.headers
 
             response = await client.get(url, headers={"If-Match": '"wrong"'})
             assert response.status == 412
@@ -197,7 +201,7 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
                 attempt=1,
                 **rejected,
             )
-            assert resumed is False
+            assert resumed == "rejected"
             assert rejected_snapshot["devices"]["D1"]["state"] == "reconciling"
         store._call_sync(
             lambda conn: (
@@ -217,7 +221,7 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
             dispatch_revision=immutable_revision,
             validated_offset=3,
         )
-        assert resumed is True
+        assert resumed == "requeued"
         assert snapshot["dispatch_enabled"] is False
         assert snapshot["dispatch_paused_reason"] == "server_restart"
         assert await manager.claim_next(["D1"]) is None
