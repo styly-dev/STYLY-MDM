@@ -117,6 +117,240 @@ class RegistrationManager:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("report_path", ["registration", "reconcile"])
+@pytest.mark.parametrize("reason", [None, "download_retry_exhausted"])
+async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
+    tmp_path, report_path, reason
+):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    capabilities = frozenset({"push_job_id_v1", "push_resume_v1"})
+    try:
+        snapshot = await downloading_job(store, manager, capabilities)
+        job_id = snapshot["job_id"]
+        if reason is None:
+            store.recover_startup_sync(
+                accept_reconciliation_timeout_ms=60_000,
+                reconciliation_timeout_ms=1_800_000,
+            )
+        runtime = object.__new__(PushRuntime)
+        runtime.manager = manager
+        runtime.transfers = TransferRegistry()
+        runtime.scheduler = Scheduler()
+        runtime.send_timeout = 1
+        published = []
+
+        async def publish(value):
+            published.append(value)
+
+        runtime.publish = publish
+        ws = Ws()
+        session = LiveSession(
+            "D1", "session", ws, capabilities, str(uuid.uuid4()),
+            asyncio.Lock(), "http://server",
+        )
+        report = {
+            "job_id": job_id, "attempt": 1,
+            "artifact_id": snapshot["artifact"]["artifact_id"],
+            "revision": snapshot["devices"]["D1"]["dispatch_revision"],
+            "validated_offset": 1, "phase": "downloading", "status": "interrupted",
+        }
+        if reason is not None:
+            report["reason"] = reason
+
+        async def send_report():
+            if report_path == "registration":
+                published.extend(await runtime._registration_active_snapshots("D1", session, report))
+            else:
+                await runtime._handle_reconcile_report(session, "D1", report)
+
+        key = TransferKey("push", "D1", job_id, 1)
+        old_transfer = asyncio.get_running_loop().create_future()
+        runtime.transfers.register(key, old_transfer)
+        await send_report()
+        assert old_transfer.result() == "resumable_replay"
+        paused = await manager.get_snapshot(job_id)
+        assert paused["devices"]["D1"]["state"] == "queued"
+        assert paused["devices"]["D1"]["validated_offset"] == 1
+        assert paused["dispatch_enabled"] is False
+        assert paused["dispatch_paused_reason"] == (reason or "server_restart")
+        assert await manager.claim_next(["D1"]) is None
+        # Disconnect does not rewrite queued state: repeated REGISTER/reconcile
+        # must retain it without a rejection or a revision change.
+        assert await manager.active_assignment_for_device("D1") is None
+        await send_report()
+        await send_report()
+        assert await manager.get_snapshot(job_id) == paused
+        assert runtime.scheduler.wake_count == 0
+
+        await manager.enable_dispatch(job_id)
+        await send_report()  # Do not re-pause after the operator authorizes Resume.
+        assert (await manager.get_snapshot(job_id))["dispatch_enabled"] is True
+        assert await manager.claim_next(["D1"]) is not None
+        replacement = asyncio.get_running_loop().create_future()
+        runtime.transfers.register(key, replacement)
+        for state in ("waiting_transfer", "dispatching"):
+            if state == "dispatching":
+                await manager.prepare_dispatch(
+                    job_id, "D1", protocol_mode=ProtocolMode.JOB_V1,
+                    live_capabilities=capabilities, accept_deadline=now_ms() + 60_000,
+                )
+            before = await manager.get_snapshot(job_id)
+            await send_report()
+            assert await manager.get_snapshot(job_id) == before
+            assert not replacement.done()
+            assert runtime.transfers.get(key) is replacement
+        command = PushScheduler._command(before, "D1", ProtocolMode.JOB_V1, "http://server")
+        assert command["revision"] == report["revision"]
+        assert command["artifact_id"] == report["artifact_id"]
+        assert ws.messages == []
+        assert len(published) == 1
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["revision", "artifact_id", "validated_offset"])
+async def test_retry_exhaustion_requires_exact_evidence_before_pausing(tmp_path, mismatch):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        snapshot = await downloading_job(store, manager, {"push_job_id_v1", "push_resume_v1"})
+        evidence = {
+            "dispatch_revision": snapshot["devices"]["D1"]["dispatch_revision"],
+            "artifact_id": snapshot["artifact"]["artifact_id"],
+            "validated_offset": 1,
+        }
+        if mismatch == "revision":
+            evidence["dispatch_revision"] += 1
+        elif mismatch == "artifact_id":
+            evidence["artifact_id"] = str(uuid.uuid4())
+        else:
+            evidence["validated_offset"] = 2
+        outcome, unchanged = await manager.resume_interrupted(
+            snapshot["job_id"], "D1", attempt=1,
+            reason="download_retry_exhausted", **evidence,
+        )
+        assert outcome == "rejected"
+        assert unchanged == snapshot
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_paused_resume_can_expire_without_another_dispatch(tmp_path):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        snapshot = await downloading_job(store, manager, {"push_job_id_v1", "push_resume_v1"})
+        job_id = snapshot["job_id"]
+        await manager.resume_interrupted(
+            job_id, "D1", attempt=1, reason="download_retry_exhausted",
+            artifact_id=snapshot["artifact"]["artifact_id"],
+            dispatch_revision=snapshot["devices"]["D1"]["dispatch_revision"],
+            validated_offset=1,
+        )
+        accepted, _, _ = await store.settle_result(job_id, "D1", 1, "success")
+        assert not accepted  # A queued row still cannot report arbitrary success.
+        accepted, _, expired = await store.settle_result(
+            job_id, "D1", 1, "fail", failure_code="resume_expired",
+        )
+        assert accepted
+        assert expired["devices"]["D1"]["state"] == "failed"
+        assert (await manager.assignment(job_id, "D1"))["failure_code"] == "resume_expired"
+        assert await manager.active_assignment_for_device("D1") is None
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_non_resumable_interruption_keeps_terminal_reconciliation(tmp_path):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        snapshot = await downloading_job(store, manager)
+        job_id = snapshot["job_id"]
+        await manager.mark_reconciling(
+            job_id, "D1", expected={DeviceState.DOWNLOADING},
+            reason="device_disconnect", deadline=now_ms() + 60_000,
+        )
+        runtime = object.__new__(PushRuntime)
+        runtime.manager = manager
+        runtime.transfers = TransferRegistry()
+        runtime.scheduler = None
+        runtime.send_timeout = 1
+        runtime.publish = lambda _snapshot: asyncio.sleep(0)
+        session = LiveSession(
+            "D1", "session", Ws(), frozenset({"push_job_id_v1"}),
+            str(uuid.uuid4()), asyncio.Lock(), "http://server",
+        )
+        await runtime._handle_reconcile_report(session, "D1", {
+            "job_id": job_id, "attempt": 1, "status": "interrupted",
+            "artifact_id": snapshot["artifact"]["artifact_id"], "phase": "downloading",
+        })
+        assert (await manager.assignment(job_id, "D1"))["state"] == "interrupted"
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_pause_stops_another_device_already_waiting_for_a_slot(tmp_path):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    capabilities = frozenset({"push_job_id_v1", "push_resume_v1"})
+    try:
+        snapshot = await downloading_job(store, manager, capabilities)
+        job_id = snapshot["job_id"]
+        # Add a second target to the fixture before it is claimed, as a multi-target
+        # job does at creation. D1 owns the only network slot.
+        store._call_sync(lambda conn: conn.execute(
+            "INSERT INTO push_job_devices(job_id, device_id, enqueue_seq, target_ordinal, "
+            "protocol_mode, create_capability_snapshot_json, state, updated_at) "
+            "VALUES (?, 'D2', 2, 1, 'job_v1', ?, 'queued', ?)",
+            (job_id, json.dumps(sorted(capabilities)), now_ms()),
+        ))
+        waiting = await manager.claim_next(["D2"])
+        assert waiting is not None
+        session = LiveSession(
+            "D2", "session", Ws(), capabilities, str(uuid.uuid4()),
+            asyncio.Lock(), "http://server",
+        )
+        slots = asyncio.Semaphore(0)
+        registry = TransferRegistry()
+        scheduler = PushScheduler(
+            manager=manager, transfer_registry=registry,
+            transfer_slots=lambda: slots, sessions=lambda: {"D2": session},
+            publish=lambda _snapshot: asyncio.sleep(0), send_timeout=1,
+            accept_timeout=1, accept_reconciliation_timeout=1,
+            reconciliation_timeout=1, transfer_timeout=1, allow_legacy=False,
+        )
+        task = asyncio.create_task(scheduler._dispatch_assignment(waiting))
+        try:
+            await asyncio.sleep(0)
+            assert not task.done()
+            await manager.resume_interrupted(
+                job_id, "D1", attempt=1, reason="download_retry_exhausted",
+                artifact_id=snapshot["artifact"]["artifact_id"],
+                dispatch_revision=snapshot["devices"]["D1"]["dispatch_revision"],
+                validated_offset=1,
+            )
+            slots.release()
+            await asyncio.wait_for(task, timeout=1)
+            assert session.ws.messages == []
+            assert len(registry) == 0
+            assert not scheduler._accept_waiters
+            assert (await manager.assignment(job_id, "D2"))["state"] == "queued"
+            assert await manager.claim_next(["D2"]) is None
+            await manager.enable_dispatch(job_id)
+            assert await manager.claim_next(["D2"]) is not None
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_resume_rejection_carries_exact_cleanup_authority():
     runtime = object.__new__(PushRuntime)
     runtime.send_timeout = 1
@@ -194,10 +428,11 @@ async def test_failed_interrupted_reconciliation_returns_permanent_disposition()
             }
 
         async def resume_interrupted(self, *_args, **_kwargs):
-            return False, {"job_id": "job-1"}
+            return "rejected", {"job_id": "job-1"}
 
     runtime = object.__new__(PushRuntime)
     runtime.manager = Manager()
+    runtime.transfers = TransferRegistry()
     runtime.send_timeout = 1
     runtime.scheduler = None
     runtime.publish = lambda _snapshot: asyncio.sleep(0)
@@ -254,10 +489,11 @@ async def test_interrupted_reconciliation_without_artifact_never_resumes():
 
         async def resume_interrupted(self, *_args, **_kwargs):
             self.resume_calls += 1
-            return True, {"job_id": "job-1"}
+            return "requeued", {"job_id": "job-1"}
 
     runtime = object.__new__(PushRuntime)
     runtime.manager = Manager()
+    runtime.transfers = TransferRegistry()
     runtime.send_timeout = 1
     runtime.scheduler = None
     runtime.publish = lambda _snapshot: asyncio.sleep(0)

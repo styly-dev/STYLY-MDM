@@ -403,6 +403,23 @@ test('restart-paused jobs expose the existing operator resume command', () => {
   assert.equal(resume.textContent, 'Resuming…');
 });
 
+test('download retry exhaustion explains that Resume retains the partial', () => {
+  const harness = loadAdapter();
+  const socket = new window.WebSocket('ws://localhost/ws/admin');
+  socket.emit({
+    type: 'PUSH_JOBS_SNAPSHOT',
+    jobs: [snapshot('paused-job', 4, 'D1', 'queued', 1, {
+      dispatchEnabled: false,
+      dispatchPausedReason: 'download_retry_exhausted',
+    })],
+  });
+
+  const item = harness.pushJobsAttention.children[1];
+  assert.match(item.children[0].textContent,
+    /Download interrupted; partial retained\. Resume to retry\./);
+  assert.equal(item.children[1].textContent, 'Resume');
+});
+
 test('resume attention hides once the canonical job is enabled', () => {
   const harness = loadAdapter();
   const socket = new window.WebSocket('ws://localhost/ws/admin');

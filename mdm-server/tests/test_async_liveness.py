@@ -303,7 +303,7 @@ class _DispatchManager:
                 "byte_size": 1,
                 "sha256": "a" * 64,
             },
-            "devices": {"D1": {"attempt": 1}},
+            "devices": {"D1": {"attempt": 1, "state": "dispatching"}},
         }
 
     async def claim_next(self, _online_device_ids):

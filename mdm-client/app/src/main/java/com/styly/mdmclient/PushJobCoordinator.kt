@@ -64,6 +64,9 @@ internal fun buildActivePushReconcileReport(
     put("phase", active.phase)
     put("revision", active.command.revision)
     put("validated_offset", validatedOffset)
+    if (active.interrupted && active.interruptionReason != null) {
+        put("reason", active.interruptionReason)
+    }
 }
 
 internal fun applyPushResumeRejectionToState(
@@ -167,6 +170,9 @@ internal fun buildPushRegistrationFields(
                 put("status", if (active.interrupted) "interrupted" else "active")
                 put("revision", active.command.revision)
                 put("validated_offset", validatedOffset(active.command))
+                if (active.interrupted && active.interruptionReason != null) {
+                    put("reason", active.interruptionReason)
+                }
             })
         }
     })
@@ -385,6 +391,11 @@ class PushJobCoordinator(context: Context) {
             return
         }
 
+        // A delayed scheduler must not let an already-expired retry pause restart
+        // simply because its exact command arrived first. A successful expiry still
+        // lets an unrelated incoming command proceed against the new terminal state.
+        if (settleExpiredInterruptedOwnership() == ExpiredOwnership.PersistenceFailed) return
+
         val terminal = state.pendingResults.firstOrNull { sameIdentity(it.command, command) }
             ?: state.completedReceipts.firstOrNull { sameIdentity(it.command, command) }
         if (terminal != null) {
@@ -430,8 +441,15 @@ class PushJobCoordinator(context: Context) {
     }
 
     private fun accept(command: PushProtocol.Command) {
+        val interruptedAt = state.active
+            ?.takeIf { it.interrupted && it.command.identity == command.identity }
+            ?.interruptedAt
         val nextState = state.copy(
-            active = PushProtocol.Active(command, PushProtocol.PHASE_DOWNLOADING),
+            active = PushProtocol.Active(
+                command,
+                PushProtocol.PHASE_DOWNLOADING,
+                interruptedAt = interruptedAt,
+            ),
         )
         if (!persist(nextState)) { // durability before acceptance and before worker start
             gate.release(command)
@@ -628,6 +646,33 @@ class PushJobCoordinator(context: Context) {
             cleanupExecution(execution)
             return
         }
+        if (execution.interrupted) {
+            val active = state.active ?: return
+            val nextState = state.copy(
+                active = active.copy(
+                    interrupted = true,
+                    interruptedAt = active.interruptedAt ?: System.currentTimeMillis(),
+                    interruptionReason = execution.interruptionReason,
+                ),
+            )
+            // Preserve work. The durable interrupted state fences other jobs; release
+            // the in-memory gate as recovery does, then require exact reauthorization.
+            if (!persist(nextState, afterPublish = { gate.release(command) })) return
+            scheduleInterruptedExpiry(state.active)
+            if (command.isJobV1) {
+                val identity = PushProtocol.ReconcileIdentity(
+                    requireNotNull(command.jobId),
+                    command.attempt,
+                    command.artifactId,
+                )
+                send(buildActivePushReconcileReport(
+                    identity,
+                    requireNotNull(state.active),
+                    validatedOffset(command),
+                ))
+            }
+            return
+        }
         val receipt = PushProtocol.Receipt(command, execution.result)
         val pending = if (command.isJobV1) state.pendingResults + receipt else state.pendingResults
         val completed = (state.completedReceipts + receipt).takeLast(MAX_RECEIPTS)
@@ -784,36 +829,38 @@ class PushJobCoordinator(context: Context) {
         actor.schedule({ expireInterruptedOwnership() }, delay, TimeUnit.MILLISECONDS)
     }
 
+    private enum class ExpiredOwnership { NotDue, Settled, PersistenceFailed }
+
     private fun expireInterruptedOwnership() {
+        when (settleExpiredInterruptedOwnership()) {
+            ExpiredOwnership.NotDue -> scheduleInterruptedExpiry(state.active)
+            ExpiredOwnership.PersistenceFailed ->
+                actor.schedule({ expireInterruptedOwnership() }, 60_000L, TimeUnit.MILLISECONDS)
+            ExpiredOwnership.Settled -> Unit
+        }
+    }
+
+    /** Settles only an already-expired interrupted ownership; never schedules work. */
+    private fun settleExpiredInterruptedOwnership(): ExpiredOwnership {
         val settled = expireInterruptedPushState(
             state,
             System.currentTimeMillis(),
             PushFilesWorker.PARTIAL_RETENTION_MS,
             MAX_RECEIPTS,
         )
-        if (settled == null) {
-            // ScheduledExecutorService advances monotonically while the retention
-            // predicate uses wall time. Re-arm after RTC/NTP moves the clock back.
-            scheduleInterruptedExpiry(state.active)
-            return
-        }
+        if (settled == null) return ExpiredOwnership.NotDue
         val (nextState, receipt) = settled
         val command = receipt.command
         if (!persist(nextState, afterPublish = { gate.release(command) })) {
-            actor.schedule({ expireInterruptedOwnership() }, 60_000L, TimeUnit.MILLISECONDS)
-            return
+            return ExpiredOwnership.PersistenceFailed
         }
         cleanupExecution(PushFilesWorker.Execution(receipt.result, attemptDirectory(command)))
         if (transportRegistered) send(receipt.result.toJson())
+        return ExpiredOwnership.Settled
     }
 
     private fun attemptDirectory(command: PushProtocol.Command) =
-        java.io.File(
-            android.os.Environment.getExternalStoragePublicDirectory(
-                android.os.Environment.DIRECTORY_DOWNLOADS,
-            ),
-            "styly-mdm/.push-tmp/jobs/${command.jobId?.let { UUID.fromString(it).toString() } ?: "legacy"}/${command.attempt}",
-        )
+        PushFilesWorker.defaultAttemptDirectory(command)
 
     private fun persist(
         nextState: PushProtocol.State,
@@ -834,9 +881,7 @@ class PushJobCoordinator(context: Context) {
     }
 
     private fun validatedOffset(command: PushProtocol.Command): Long {
-        if (!command.isJobV1) return 0L
-        val file = java.io.File(attemptDirectory(command), "artifact.part")
-        return file.takeIf { it.isFile }?.length() ?: 0L
+        return worker.validatedResumeOffset(command)
     }
 
     private fun send(message: JSONObject) {
