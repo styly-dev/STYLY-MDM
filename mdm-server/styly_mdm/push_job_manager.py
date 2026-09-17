@@ -14,7 +14,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .push_job_store import PushJobStore, StoreConflict, StoreNotFound, now_ms
 from .push_jobs import (
@@ -456,8 +456,9 @@ class PushJobManager:
             self.store._begin(conn)
             try:
                 row = conn.execute(
-                    "SELECT state, attempt, dispatch_revision FROM push_job_devices "
-                    "WHERE job_id=? AND device_id=?",
+                    "SELECT d.state, d.attempt, d.dispatch_revision, j.dispatch_enabled "
+                    "FROM push_job_devices d JOIN push_jobs j ON j.job_id=d.job_id "
+                    "WHERE d.job_id=? AND d.device_id=?",
                     (job_id, device_id),
                 ).fetchone()
                 if row is None:
@@ -467,6 +468,19 @@ class PushJobManager:
                 current = DeviceState(row["state"])
                 validate_device_transition(current, DeviceState.DISPATCHING)
                 timestamp = now_ms()
+                if not row["dispatch_enabled"]:
+                    # A different device may pause the job while this assignment
+                    # waits for a shared slot. It has not been dispatched yet.
+                    conn.execute(
+                        "UPDATE push_job_devices SET state=?, queue_reason=?, updated_at=? "
+                        "WHERE job_id=? AND device_id=?",
+                        (DeviceState.QUEUED.value, "awaiting_dispatch", timestamp, job_id, device_id),
+                    )
+                    self.store._increment_revision(conn, job_id, timestamp)
+                    self.store._rederive_job(conn, job_id, timestamp)
+                    snapshot = self.store._snapshot(conn, job_id)
+                    self.store._commit(conn)
+                    return snapshot
                 result = conn.execute(
                     "UPDATE push_job_devices SET state=?, protocol_mode=?, "
                     "dispatch_capability_snapshot_json=?, accept_deadline=?, "
@@ -528,7 +542,8 @@ class PushJobManager:
         artifact_id: str | None,
         dispatch_revision: int | None,
         validated_offset: int,
-    ) -> tuple[bool, dict[str, Any]]:
+        reason: str | None = None,
+    ) -> tuple[Literal["requeued", "retained", "rejected"], dict[str, Any]]:
         """Requeue an exact interrupted resumable assignment.
 
         ``dispatch_revision`` is persisted on the device row at dispatch time; it
@@ -536,7 +551,7 @@ class PushJobManager:
         reconciliation and phase updates.
         """
 
-        def op(conn: sqlite3.Connection) -> tuple[bool, dict[str, Any]]:
+        def op(conn: sqlite3.Connection) -> tuple[Literal["requeued", "retained", "rejected"], dict[str, Any]]:
             self.store._begin(conn)
             try:
                 row = conn.execute(
@@ -564,14 +579,17 @@ class PushJobManager:
                     and not isinstance(validated_offset, bool)
                     and 0 <= validated_offset <= int(row["byte_size"] or 0)
                 )
+                current = DeviceState(row["state"])
+                retry_exhausted = reason == "download_retry_exhausted"
                 resumable = (
-                    row["state"] == DeviceState.RECONCILING.value
-                    and row["attempt"] == attempt == 1
+                    row["attempt"] == attempt == 1
                     and row["protocol_mode"] == ProtocolMode.JOB_V1.value
                     and CAP_PUSH_RESUME_V1 in capabilities
                     and (
                         bool(row["dispatch_enabled"])
-                        or row["dispatch_paused_reason"] == "server_restart"
+                        or row["dispatch_paused_reason"] in {
+                            "server_restart", "download_retry_exhausted"
+                        }
                     )
                     and exact_artifact
                     and exact_revision
@@ -580,9 +598,33 @@ class PushJobManager:
                 if not resumable:
                     snapshot = self.store._snapshot(conn, job_id)
                     self.store._commit(conn)
-                    return False, snapshot
+                    return "rejected", snapshot
+                # Repeated evidence while waiting for authorization must not revoke
+                # local work, reset the pause, or release a replacement transfer slot.
+                if current in {
+                    DeviceState.QUEUED, DeviceState.WAITING_TRANSFER, DeviceState.DISPATCHING
+                }:
+                    snapshot = self.store._snapshot(conn, job_id)
+                    self.store._commit(conn)
+                    return "retained", snapshot
+                if current is not DeviceState.RECONCILING and not (
+                    retry_exhausted and current is DeviceState.DOWNLOADING
+                ):
+                    snapshot = self.store._snapshot(conn, job_id)
+                    self.store._commit(conn)
+                    return "rejected", snapshot
                 timestamp = now_ms()
+                if current is DeviceState.DOWNLOADING:
+                    validate_device_transition(current, DeviceState.RECONCILING)
                 validate_device_transition(DeviceState.RECONCILING, DeviceState.QUEUED)
+                if retry_exhausted:
+                    # Use the existing job-level Resume gate. Other workers already
+                    # running for this job continue; no new downloads start until Resume.
+                    conn.execute(
+                        "UPDATE push_jobs SET dispatch_enabled=0, "
+                        "dispatch_paused_reason='download_retry_exhausted' WHERE job_id=?",
+                        (job_id,),
+                    )
                 conn.execute(
                     """
                     UPDATE push_job_devices SET state=?, queue_reason=?,
@@ -598,14 +640,14 @@ class PushJobManager:
                         timestamp,
                         job_id,
                         device_id,
-                        DeviceState.RECONCILING.value,
+                        current.value,
                     ),
                 )
                 self.store._increment_revision(conn, job_id, timestamp)
                 self.store._rederive_job(conn, job_id, timestamp)
                 snapshot = self.store._snapshot(conn, job_id)
                 self.store._commit(conn)
-                return True, snapshot
+                return "requeued", snapshot
             except BaseException:
                 self.store._rollback(conn)
                 raise

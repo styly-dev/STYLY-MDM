@@ -724,7 +724,6 @@ class PushRuntime:
         headers = {
             "ETag": etag,
             "Accept-Ranges": "bytes",
-            "Content-Encoding": "identity",
             "Cache-Control": "private, immutable",
             "Content-Type": "application/zip",
         }
@@ -1102,51 +1101,13 @@ class PushRuntime:
                 )
             return snapshots
 
+        if active_report.get("status") == "interrupted":
+            return await self._resume_interrupted_report(
+                session, device_id, active_report, assignment
+            )
         if assignment["state"] != DeviceState.RECONCILING.value:
-            if active_report.get("status") == "interrupted":
-                await self._send_resume_rejected(
-                    session,
-                    job_id=job_id,
-                    artifact_id=reported_artifact,
-                    revision=active_report.get("revision"),
-                )
             return []
         try:
-            if active_report.get("status") == "interrupted":
-                raw_revision = active_report.get("revision")
-                raw_offset = active_report.get("validated_offset")
-                if CAP_PUSH_RESUME_V1 in session.capabilities:
-                    resumed, snapshot = await self.manager.resume_interrupted(
-                        job_id,
-                        device_id,
-                        attempt=1,
-                        artifact_id=reported_artifact,
-                        dispatch_revision=(
-                            raw_revision
-                            if isinstance(raw_revision, int) and not isinstance(raw_revision, bool)
-                            else None
-                        ),
-                        validated_offset=(
-                            raw_offset
-                            if isinstance(raw_offset, int) and not isinstance(raw_offset, bool)
-                            else -1
-                        ),
-                    )
-                    if resumed:
-                        self.transfers.release_exact(
-                            TransferKey("push", device_id, job_id, 1), "resumable_replay"
-                        )
-                        return [snapshot]
-                # Interrupted work must never be restored as a live active phase.
-                # If exact resume authorization fails, retain reconciliation state
-                # and explicitly release only the exact client identity.
-                await self._send_resume_rejected(
-                    session,
-                    job_id=job_id,
-                    artifact_id=reported_artifact,
-                    revision=raw_revision,
-                )
-                return []
             outcome, snapshots = await self.manager.reconcile_report(
                 job_id,
                 device_id,
@@ -1822,6 +1783,52 @@ class PushRuntime:
         except (ConnectionError, asyncio.TimeoutError):
             pass
 
+    async def _resume_interrupted_report(
+        self,
+        session: LiveSession,
+        device_id: str,
+        payload: dict[str, Any],
+        assignment: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Resolve exact interruption evidence identically on REGISTER and reconciliation."""
+        job_id = payload["job_id"]
+        artifact_id = payload.get("artifact_id")
+        revision = payload.get("revision")
+        offset = payload.get("validated_offset")
+        if CAP_PUSH_RESUME_V1 in session.capabilities and isinstance(artifact_id, str):
+            key = TransferKey("push", device_id, job_id, 1)
+            previous_transfer = self.transfers.get(key)
+            try:
+                outcome, snapshot = await self.manager.resume_interrupted(
+                    job_id,
+                    device_id,
+                    attempt=1,
+                    artifact_id=artifact_id,
+                    dispatch_revision=(
+                        revision if isinstance(revision, int) and not isinstance(revision, bool)
+                        else None
+                    ),
+                    validated_offset=(
+                        offset if isinstance(offset, int) and not isinstance(offset, bool) else -1
+                    ),
+                    reason=payload.get("reason"),
+                )
+            except (StoreConflict, StoreNotFound):
+                return []
+            if outcome == "retained":
+                return []
+            if outcome == "requeued":
+                if previous_transfer is not None and self.transfers.get(key) is previous_transfer:
+                    self.transfers.release_exact(key, "resumable_replay")
+                return [snapshot]
+        await self._send_resume_rejected(
+            session,
+            job_id=job_id,
+            artifact_id=artifact_id if isinstance(artifact_id, str) else assignment.get("artifact_id"),
+            revision=revision,
+        )
+        return []
+
     async def _handle_reconcile_report(
         self, session: LiveSession, device_id: str, payload: dict[str, Any]
     ) -> None:
@@ -1852,79 +1859,29 @@ class PushRuntime:
             if snapshots and self.scheduler is not None:
                 self.scheduler.wake()
             return
-        if assignment["state"] == DeviceState.UNCONFIRMED.value and status == "interrupted":
-            await self._send_resume_rejected(
-                session,
-                job_id=job_id,
-                artifact_id=payload.get("artifact_id"),
-                revision=payload.get("revision"),
-            )
-            return
-        if assignment["state"] != DeviceState.RECONCILING.value:
-            if status == "interrupted":
-                await self._send_resume_rejected(
-                    session,
-                    job_id=job_id,
-                    artifact_id=payload.get("artifact_id"),
-                    revision=payload.get("revision"),
-                )
-            return
         if status == "interrupted":
-            # A resumable peer must prove the exact immutable assignment before its
-            # durable partial is accepted.  A failed proof remains reconciling so a
-            # stale/malformed report cannot turn a live artifact into a terminal one.
             try:
                 dispatch_capabilities = set(
                     json.loads(assignment.get("dispatch_capability_snapshot_json") or "[]")
                 )
-            except (TypeError, ValueError, json.JSONDecodeError):
+            except (TypeError, ValueError):
                 dispatch_capabilities = set()
             if CAP_PUSH_RESUME_V1 in dispatch_capabilities:
-                raw_revision = payload.get("revision")
-                raw_offset = payload.get("validated_offset")
-                artifact_id = payload.get("artifact_id")
-                if not isinstance(artifact_id, str):
-                    await self._send_resume_rejected(
-                        session,
-                        job_id=job_id,
-                        artifact_id=assignment.get("artifact_id"),
-                        revision=raw_revision,
-                    )
-                    return
-                try:
-                    resumed, snapshot = await self.manager.resume_interrupted(
-                        job_id,
-                        device_id,
-                        attempt=1,
-                        artifact_id=artifact_id,
-                        dispatch_revision=(
-                            raw_revision
-                            if isinstance(raw_revision, int) and not isinstance(raw_revision, bool)
-                            else None
-                        ),
-                        validated_offset=(
-                            raw_offset
-                            if isinstance(raw_offset, int) and not isinstance(raw_offset, bool)
-                            else -1
-                        ),
-                    )
-                except (StoreConflict, StoreNotFound):
-                    return
-                if resumed:
+                snapshots = await self._resume_interrupted_report(
+                    session, device_id, payload, assignment
+                )
+                for snapshot in snapshots:
                     await self.publish(snapshot)
-                    self.transfers.release_exact(
-                        TransferKey("push", device_id, job_id, 1), "resumable_replay"
-                    )
-                    if self.scheduler is not None:
+                    if snapshot["dispatch_enabled"] and self.scheduler is not None:
                         self.scheduler.wake()
-                else:
-                    await self._send_resume_rejected(
-                        session,
-                        job_id=job_id,
-                        artifact_id=artifact_id,
-                        revision=raw_revision,
-                    )
                 return
+        if assignment["state"] != DeviceState.RECONCILING.value:
+            if status == "interrupted":
+                await self._send_resume_rejected(
+                    session, job_id=job_id, artifact_id=payload.get("artifact_id"),
+                    revision=payload.get("revision"),
+                )
+            return
         try:
             outcome, snapshots = await self.manager.reconcile_report(
                 job_id,
@@ -1936,9 +1893,7 @@ class PushRuntime:
             )
             if status == "interrupted":
                 await self._send_resume_rejected(
-                    session,
-                    job_id=job_id,
-                    artifact_id=payload.get("artifact_id"),
+                    session, job_id=job_id, artifact_id=payload.get("artifact_id"),
                     revision=payload.get("revision"),
                 )
         except (StoreConflict, StoreNotFound):

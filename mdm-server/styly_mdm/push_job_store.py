@@ -929,7 +929,13 @@ class PushJobStore:
                     DeviceState.APPLYING,
                     DeviceState.RECONCILING,
                 }
-                if current not in allowed:
+                expired_resume = (
+                    status == "fail"
+                    and failure_code == "resume_expired"
+                    and row["dispatch_revision"] is not None
+                    and current in {DeviceState.QUEUED, DeviceState.WAITING_TRANSFER}
+                )
+                if current not in allowed and not expired_resume:
                     snapshot = self._snapshot(conn, job_id)
                     self._commit(conn)
                     return False, "unexpected_result_state", snapshot

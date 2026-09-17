@@ -40,6 +40,17 @@ which durably releases the client execution gate and removes only that exact
 job-owned partial. The server keeps canonical ownership until it receives the
 terminal replay or exact reconciliation evidence.
 
+Exhausted transient download retries also retain interrupted ownership and partial
+bytes. The client reports `reason: download_retry_exhausted`; the server atomically
+requeues that exact assignment and pauses the job until the operator selects Resume.
+Pending devices in the same job wait, while existing workers continue. Duplicate
+interrupted reports while waiting/dispatching preserve both local work and any new
+transfer slot. Resume does not extend the original 24-hour interruption deadline.
+Deploy the server before this client change: older servers may reject a live
+retry-exhaustion report. The optional local `interruption_reason` field is backward
+compatible and requires no database migration. See the updated message-flow diagram
+and [`PUSH_JOBS.md`](PUSH_JOBS.md) for response validation and recovery details.
+
 ## Building the MDM Client
 
 ### Build from CLI

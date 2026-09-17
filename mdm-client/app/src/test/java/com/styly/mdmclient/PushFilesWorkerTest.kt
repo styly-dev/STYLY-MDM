@@ -109,6 +109,63 @@ class PushFilesWorkerTest {
         )
     }
 
+    @Test
+    fun `validated resume offset accepts an exact partial and a refreshed locator`() {
+        val work = File(tmp.root, "validated-offset-work")
+        val command = command(artifactSize = 100).copy(artifactEtag = "\"v1\"")
+        seedResume(work, command, ByteArray(40))
+        val worker = PushFilesWorker(
+            hasExternalStorageAccess = { true },
+            attemptDirectoryProvider = { work },
+        )
+
+        assertEquals(40L, worker.validatedResumeOffset(command))
+        assertEquals(
+            40L,
+            worker.validatedResumeOffset(command.copy(artifactUrl = "http://new-server/artifact.zip")),
+        )
+    }
+
+    @Test
+    fun `validated resume offset rejects untrusted partial metadata and lengths`() {
+        val work = File(tmp.root, "invalid-offset-work")
+        val command = command(artifactSize = 100).copy(revision = 7L, artifactEtag = "\"v1\"")
+        val worker = PushFilesWorker(
+            hasExternalStorageAccess = { true },
+            attemptDirectoryProvider = { work },
+        )
+
+        fun offsetAfter(change: (JSONObject) -> Unit): Long {
+            seedResume(work, command, ByteArray(40))
+            val metadataFile = File(work, "metadata.json")
+            val metadata = JSONObject(metadataFile.readText())
+            change(metadata)
+            metadataFile.writeText(metadata.toString())
+            return worker.validatedResumeOffset(command)
+        }
+
+        assertEquals(0L, offsetAfter { it.put("job_id", UUID.randomUUID().toString()) })
+        assertEquals(0L, offsetAfter { it.put("attempt", 2) })
+        assertEquals(0L, offsetAfter { it.put("revision", 8L) })
+        assertEquals(0L, offsetAfter { it.put("artifact_id", UUID.randomUUID().toString()) })
+        assertEquals(0L, offsetAfter { it.put("artifact_size", 101L) })
+        assertEquals(0L, offsetAfter { it.put("artifact_sha256", "b".repeat(64)) })
+        assertEquals(0L, offsetAfter { it.put("artifact_etag", "\"v2\"") })
+        assertEquals(0L, offsetAfter { it.remove("artifact_etag") })
+        assertEquals(0L, offsetAfter { it.put("artifact_etag", "W/\"v1\"") })
+        assertEquals(0L, offsetAfter { it.put("job_id", JSONObject.NULL) })
+
+        seedResume(work, command.copy(artifactEtag = null), ByteArray(40), etag = "")
+        assertEquals(0L, worker.validatedResumeOffset(command.copy(artifactEtag = null)))
+        File(work, "metadata.json").writeText("not-json")
+        assertEquals(0L, worker.validatedResumeOffset(command))
+        File(work, "metadata.json").delete()
+        assertEquals(0L, worker.validatedResumeOffset(command))
+
+        seedResume(work, command, ByteArray(101))
+        assertEquals(0L, worker.validatedResumeOffset(command))
+    }
+
     private class ArtifactServer(private val content: ByteArray) : AutoCloseable {
         private val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
         val url = "http://127.0.0.1:${server.localPort}/artifact.zip"
@@ -370,6 +427,99 @@ class PushFilesWorkerTest {
     }
 
     @Test
+    fun `expired metadata deadline does not discard an exactly authorized partial`() {
+        val archive = zip("content.txt" to "coordinator-authorized").readBytes()
+        val split = archive.size / 2
+        val destination = tmp.newFolder("expired-metadata-destination")
+        val work = File(tmp.root, "expired-metadata-work")
+        val remaining = archive.copyOfRange(split, archive.size)
+        OneShotServer(
+            status = 206,
+            headers = "ETag: \"v1\"\r\nContent-Range: bytes $split-${archive.lastIndex}/${archive.size}\r\nContent-Length: ${remaining.size}",
+            body = remaining,
+        ).use { server ->
+            val command = command(
+                artifactUrl = server.url,
+                artifactSize = archive.size.toLong(),
+                artifactSha256 = sha256(archive),
+            ).copy(revision = 7L)
+            seedResume(work, command, archive.copyOfRange(0, split))
+            val metadata = JSONObject(File(work, "metadata.json").readText())
+            metadata.put("retention_deadline", System.currentTimeMillis() - 1)
+            File(work, "metadata.json").writeText(metadata.toString())
+
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+                destinationProvider = { destination },
+            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+
+            assertEquals("success", execution.result.status)
+            assertTrue(server.request.contains("Range: bytes=$split-"))
+            assertEquals("coordinator-authorized", File(destination, "content.txt").readText())
+        }
+    }
+
+    @Test
+    fun `retry budget exhaustion retains a partial for later exact range authorization`() {
+        val archive = zip("content.txt" to "resumed-after-outage").readBytes()
+        val split = archive.size / 2
+        val destination = tmp.newFolder("retry-exhausted-destination")
+        val work = File(tmp.root, "retry-exhausted-work")
+        val delays = mutableListOf<Long>()
+
+        RetryServer(archive, transientFailures = 6).use { unavailable ->
+            val command = command(
+                artifactUrl = unavailable.url,
+                artifactSize = archive.size.toLong(),
+                artifactSha256 = sha256(archive),
+            ).copy(revision = 7L)
+            seedResume(work, command, archive.copyOfRange(0, split))
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+                destinationProvider = { destination },
+                retryDelay = { index -> delays += PushFilesWorker.retryDelayMillis(index) },
+            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+
+            assertEquals("fail", execution.result.status)
+            assertEquals("download_failed", execution.result.failureCode)
+            assertTrue(execution.interrupted)
+            assertEquals("download_retry_exhausted", execution.interruptionReason)
+            assertEquals(split.toLong(), File(work, "artifact.part").length())
+            assertEquals(listOf(1_000L, 2_000L, 4_000L, 8_000L, 8_000L), delays)
+        }
+
+        val remaining = archive.copyOfRange(split, archive.size)
+        OneShotServer(
+            status = 206,
+            headers = "ETag: \"v1\"\r\nContent-Range: bytes $split-${archive.lastIndex}/${archive.size}\r\nContent-Length: ${remaining.size}",
+            body = remaining,
+        ).use { resumed ->
+            val resumedCommand = command(
+                artifactUrl = resumed.url,
+                artifactSize = archive.size.toLong(),
+                artifactSha256 = sha256(archive),
+            ).copy(revision = 7L)
+            // Keep the exact durable identity while refreshing only its locator.
+            val original = JSONObject(File(work, "metadata.json").readText())
+            resumedCommand.copy(
+                jobId = original.getString("job_id"),
+                artifactId = original.getString("artifact_id"),
+            ).also { exact ->
+                val execution = PushFilesWorker(
+                    hasExternalStorageAccess = { true },
+                    attemptDirectoryProvider = { work },
+                    destinationProvider = { destination },
+                ).execute(exact, PushFilesWorker.Callbacks({}, {}, {}))
+                assertEquals("success", execution.result.status)
+            }
+            assertTrue(resumed.request.contains("Range: bytes=$split-"))
+            assertEquals("resumed-after-outage", File(destination, "content.txt").readText())
+        }
+    }
+
+    @Test
     fun `complete 416 response finalizes an exact local artifact`() {
         val archive = zip("content.txt" to "complete-416").readBytes()
         val destination = tmp.newFolder("complete-416-destination")
@@ -549,6 +699,63 @@ class PushFilesWorkerTest {
             ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
 
             assertEquals("fail", execution.result.status)
+            assertEquals("artifact_identity_mismatch", execution.result.failureCode)
+            assertFalse(File(work, "artifact.part").exists())
+        }
+    }
+
+    @Test
+    fun `content range ending at or beyond total is rejected before append`() {
+        val archive = zip("content.txt" to "range-end-overflow").readBytes()
+        val split = archive.size / 2
+        val remaining = archive.copyOfRange(split, archive.size)
+        val malformedBody = remaining + byteArrayOf(0)
+        val work = File(tmp.root, "range-end-overflow-work")
+        val progress = mutableListOf<Long>()
+        val retryDelays = mutableListOf<Int>()
+        OneShotServer(
+            status = 206,
+            headers = "ETag: \"v1\"\r\nContent-Range: bytes $split-${archive.size}/${archive.size}\r\nContent-Length: ${malformedBody.size}",
+            body = malformedBody,
+        ).use { server ->
+            val command = command(
+                artifactUrl = server.url,
+                artifactSize = archive.size.toLong(),
+                artifactSha256 = sha256(archive),
+            )
+            seedResume(work, command, archive.copyOfRange(0, split))
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+                retryDelay = { index -> retryDelays += index },
+            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}, { received -> progress += received }))
+
+            assertEquals("artifact_identity_mismatch", execution.result.failureCode)
+            assertFalse(File(work, "artifact.part").exists())
+            assertTrue(progress.isEmpty())
+            assertTrue(retryDelays.isEmpty())
+        }
+    }
+
+    @Test
+    fun `non identity content encoding is rejected before downloading`() {
+        val archive = zip("content.txt" to "encoded").readBytes()
+        val work = File(tmp.root, "encoded-response-work")
+        OneShotServer(
+            status = 200,
+            headers = "ETag: \"v1\"\r\nContent-Encoding: gzip\r\nContent-Length: ${archive.size}",
+            body = archive,
+        ).use { server ->
+            val command = command(
+                artifactUrl = server.url,
+                artifactSize = archive.size.toLong(),
+                artifactSha256 = sha256(archive),
+            )
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+
             assertEquals("artifact_identity_mismatch", execution.result.failureCode)
             assertFalse(File(work, "artifact.part").exists())
         }

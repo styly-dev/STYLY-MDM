@@ -36,6 +36,11 @@ both `push_job_id_v1` and `push_resume_v1`. The exact artifact size is checked
 again at dispatch, so ZIP container overhead cannot bypass capability admission.
 Legacy clients retain the existing small-push path.
 
+Creation checks the declared source size, while dispatch checks the final artifact
+size including ZIP overhead. If that final size requires resumable capabilities
+the target lacks, dispatch fails with `artifact_requires_push_resume_v1` rather
+than reporting an unrelated capability change.
+
 The client keeps job-owned state below
 `Downloads/styly-mdm/.push-tmp/jobs/{job_id}/{attempt}/`:
 
@@ -46,13 +51,28 @@ The client keeps job-owned state below
   authorization, so a server authority change does not invalidate the artifact;
 - `artifact.zip` appears only after exact-size and SHA-256 verification.
 
-Unknown, malformed, expired, or mismatched metadata is never appended to. A
+Unknown, malformed, or mismatched metadata is never appended to. Expired
+interrupted ownership is rejected by the coordinator before starting a worker. A
 validated partial of `N > 0` bytes is requested with `Range: bytes=N-`,
-`If-Match: <strong-etag>`, and `Accept-Encoding: identity`. Response handling is
-fail-closed:
+`If-Match: <strong-etag>`, and `Accept-Encoding: identity`.
+
+Registration and reconciliation report a nonzero `validated_offset` only when
+the same worker metadata checks accept the partial identity, a strong ETag is
+available, and its length is within the expected artifact size. This is a resume
+offset, not a completed SHA-256 verification. The server sends unencoded bytes
+without a `Content-Encoding` header; the client still accepts older servers that
+explicitly send `Content-Encoding: identity`.
+
+`validated_offset` is reconciliation state, not live console byte progress. Wiring
+the worker's progress callback and maintaining monotonic displayed progress across
+an ignored-Range full restart remain part of Issue #85.
+
+Response handling is fail-closed:
 
 - `206` is appended only when ETag, `Content-Range`, total size, and
-  `Content-Length` all describe exactly the requested suffix;
+  `Content-Length` describe a range starting at the requested offset, with its
+  inclusive end strictly below the total size. A shorter valid range may be
+  continued; a non-identity content encoding is rejected before writing;
 - `200` is never appended; with the same validator it replaces the partial from
   byte zero;
 - `412` is an artifact-identity failure;
@@ -61,6 +81,22 @@ fail-closed:
 - `404` and `410` are explicit artifact-unavailable failures;
 - transient I/O, `408`, `429`, and 5xx failures keep validated partial bytes and
   use six attempts with bounded 1/2/4/8/8-second backoff.
+
+If that retry budget is exhausted, a resumable client persists interrupted
+ownership with `reason: download_retry_exhausted` instead of creating a terminal
+receipt or deleting the partial. It includes that reason in reconciliation and
+registration reports. The server validates the exact assignment, atomically
+requeues it and pauses the job with `dispatch_paused_reason: download_retry_exhausted`.
+The console shows the reason beside the existing **Resume** action. The pause
+also holds other pending devices in this job; already running workers continue.
+Resume authorizes another bounded retry batch with the same identity and offset.
+Repeated reports while queued, waiting for a slot, or dispatching are no-ops:
+they neither re-pause the job nor release the replacement transfer slot.
+
+Deploy this server update before the matching client update. Older servers do
+not recognize retry exhaustion during a live download and may reject the retained
+work. Older clients remain supported; the new local `interruption_reason` field
+is optional, and no SQLite migration or new message type is required.
 
 Extraction and destination apply start only after size and SHA-256 verification
 and an atomic local rename. A hash mismatch removes the untrusted partial.
@@ -78,11 +114,17 @@ identity, removes its owned work, and confirms `absent`. A verified
 transfer. Issue #91 commands without a dispatch revision remain executable but
 are never treated as resumable.
 
-Partial metadata and interrupted client ownership use a local deadline whose
-default is 24 hours. At expiry the client durably records `resume_expired`,
+Interrupted client ownership uses a local deadline whose default is 24 hours,
+measured from the first interruption rather than the start of a long download.
+The coordinator's `interruptedAt` is the only expiration authority; the older
+metadata `retention_deadline` remains for file-format compatibility but cannot
+discard a freshly authorized partial. Reauthorization does not reset the first interruption time.
+At expiry the client durably records `resume_expired`,
 releases its local execution gate, removes the exact job-owned work, and replays
 the terminal result when registered. The server remains authoritative for its
 canonical assignment until that exact result or later reconciliation is received.
+An expired resumed assignment can settle while still queued; it does not require
+another download dispatch to release server ownership.
 General startup/periodic removal of unreferenced files belongs to Issue #92.
 Server restart rebuilds artifact leases from durable job/device rows before
 cleanup, so queued, active, reconciling, and resumable assignments keep their
@@ -238,6 +280,16 @@ sequenceDiagram
     D->>D: persist active command
     D-->>S: PUSH_JOB_ACCEPTED
     S->>DB: downloading
+    opt Transient retry budget exhausted
+        D->>D: persist interruption reason; retain partial and original expiry
+        D-->>S: PUSH_RECONCILE_REPORT interrupted + exact identity + offset
+        S->>DB: atomically requeue and pause job dispatch
+        S-->>B: snapshot: download_retry_exhausted
+        Note over S,D: Repeated waiting reports retain work and replacement slots
+        B->>S: Resume existing job
+        S->>D: EXECUTE_PUSH_FILES with same assignment revision
+        D->>S: HTTP Range + If-Match + identity encoding
+    end
     D-->>S: PUSH_TRANSFER_COMPLETE
     S->>DB: validating; release exact transfer slot
     D-->>S: DOWNLOAD_COMPLETE
