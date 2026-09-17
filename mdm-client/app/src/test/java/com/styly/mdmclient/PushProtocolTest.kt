@@ -119,6 +119,7 @@ class PushProtocolTest {
                 PushProtocol.PHASE_DOWNLOADING,
                 interrupted = true,
                 interruptedAt = 123456L,
+                interruptionReason = "download_retry_exhausted",
             ),
             pendingResults = emptyList(),
             completedReceipts = emptyList(),
@@ -128,5 +129,6 @@ class PushProtocolTest {
 
         assertTrue(decoded.active?.interrupted == true)
         assertEquals(123456L, decoded.active?.interruptedAt)
+        assertEquals("download_retry_exhausted", decoded.active?.interruptionReason)
     }
 }

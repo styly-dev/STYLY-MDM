@@ -49,7 +49,7 @@ class PushFilesWorker internal constructor(
             "documents", "alarms", "notifications", "podcasts", "ringtones",
         )
 
-        private fun defaultAttemptDirectory(command: PushProtocol.Command): File {
+        internal fun defaultAttemptDirectory(command: PushProtocol.Command): File {
             val key = command.jobId?.let { UUID.fromString(it).toString() } ?: "legacy"
             val downloads =
                 Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
@@ -76,6 +76,9 @@ class PushFilesWorker internal constructor(
     data class Execution(
         val result: PushProtocol.Result,
         val workDirectory: File,
+        /** A retryable job-v1 transfer exhausted its short in-process retry budget. */
+        val interrupted: Boolean = false,
+        val interruptionReason: String? = null,
     )
 
     fun execute(command: PushProtocol.Command, callbacks: Callbacks): Execution {
@@ -95,6 +98,8 @@ class PushFilesWorker internal constructor(
             return execution
         }
         val work = attemptDirectoryProvider(command)
+        var interrupted = false
+        var interruptionReason: String? = null
         val result = try {
             if (command.isJobV1) prepareResumableDirectory(command, work) else recreateDirectory(work)
             val bundle = download(command, work, callbacks.onTransferProgress)
@@ -119,6 +124,9 @@ class PushFilesWorker internal constructor(
             )
         } catch (error: Throwable) {
             val failure = error as? PushWorkerException
+            interrupted = command.isJobV1 && command.revision > 0L &&
+                failure?.code == "download_failed" && failure.retryable
+            if (interrupted) interruptionReason = "download_retry_exhausted"
             PushProtocol.Result(
                 jobId = command.jobId,
                 attempt = command.attempt,
@@ -131,14 +139,33 @@ class PushFilesWorker internal constructor(
                 detail = error.message ?: error.javaClass.simpleName,
             )
         }
-        // The coordinator persists this terminal result before invoking cleanup().
-        return Execution(result, work)
+        // The coordinator persists this execution outcome before terminal cleanup;
+        // retry-budget exhaustion instead becomes an interrupted durable state.
+        return Execution(result, work, interrupted, interruptionReason)
     }
 
     fun cleanup(execution: Execution) {
         execution.workDirectory.deleteRecursively()
         val jobDirectory = execution.workDirectory.parentFile
         if (jobDirectory?.listFiles()?.isEmpty() == true) jobDirectory.delete()
+    }
+
+    /**
+     * Returns a resumable byte offset only when the on-disk partial is still bound to
+     * this exact authorization. This is intentionally metadata-only: the final SHA-256
+     * remains a worker-thread validation before extraction or apply.
+     */
+    internal fun validatedResumeOffset(command: PushProtocol.Command): Long {
+        if (!command.isJobV1) return 0L
+        val work = attemptDirectoryProvider(command)
+        val metadata = readMetadata(File(work, "metadata.json")) ?: return 0L
+        if (!metadata.matches(command)) return 0L
+        val partial = File(work, "artifact.part")
+        if (!partial.isFile) return 0L
+        val offset = partial.length()
+        if (offset > metadata.artifactSize) return 0L
+        if (offset > 0L && metadata.artifactEtag == null) return 0L
+        return offset
     }
 
     internal fun validateDestination(destPath: String): File =
@@ -266,7 +293,9 @@ class PushFilesWorker internal constructor(
             throw PushWorkerException("download_failed", "could not create resumable work directory")
         }
         val metadata = readMetadata(File(work, "metadata.json"))
-        if (metadata == null || !metadata.matches(command) || metadata.retentionDeadline < System.currentTimeMillis()) {
+        // PushJobCoordinator owns interruption expiry. This retained field is advisory
+        // metadata compatibility only; it must not shorten a coordinator-authorized resume.
+        if (metadata == null || !metadata.matches(command)) {
             work.listFiles()?.forEach { if (!it.deleteRecursively()) throw PushWorkerException("download_failed", "could not reset stale resumable work") }
             writeMetadata(newMetadata(command, null), work)
         } else if (metadata.artifactUrl != command.artifactUrl) {
@@ -425,6 +454,15 @@ class PushFilesWorker internal constructor(
             if (status == 408 || status == 429 || status >= 500) {
                 throw PushWorkerException("download_failed", "artifact download returned HTTP $status", retryable = true)
             }
+            val contentEncoding = connection.getHeaderField("Content-Encoding")
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+            if (contentEncoding != null && !contentEncoding.equals("identity", ignoreCase = true)) {
+                throw PushWorkerException(
+                    "artifact_identity_mismatch",
+                    "artifact response used non-identity Content-Encoding",
+                )
+            }
 
             if (offset == 0L) {
                 if (status != HttpURLConnection.HTTP_OK) {
@@ -444,7 +482,9 @@ class PushFilesWorker internal constructor(
                 HttpURLConnection.HTTP_PARTIAL -> {
                     val range = parseContentRange(connection.getHeaderField("Content-Range"))
                         ?: throw PushWorkerException("artifact_identity_mismatch", "missing or malformed Content-Range")
-                    if (range.first != offset || range.third != expectedSize || range.second < range.first) {
+                    if (range.first != offset || range.third != expectedSize ||
+                        range.second < range.first || range.second >= range.third
+                    ) {
                         throw PushWorkerException("artifact_identity_mismatch", "Content-Range does not match the requested offset or expected size")
                     }
                     val rangeLength = range.second - range.first + 1L
@@ -455,7 +495,6 @@ class PushFilesWorker internal constructor(
                 }
                 HttpURLConnection.HTTP_OK -> {
                     // A server that ignored Range must never be appended to a partial file.
-                    partial.outputStream().use { }
                     writeResponse(connection, partial, append = false, expectedLength = expectedSize, onProgress = onProgress)
                 }
                 416 -> {

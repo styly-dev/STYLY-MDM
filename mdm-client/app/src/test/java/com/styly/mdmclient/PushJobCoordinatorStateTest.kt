@@ -159,6 +159,7 @@ class PushJobCoordinatorStateTest {
                 PushProtocol.PHASE_DOWNLOADING,
                 interrupted = true,
                 interruptedAt = 123L,
+                interruptionReason = "download_retry_exhausted",
             ),
             pendingResults = emptyList(),
             completedReceipts = emptyList(),
@@ -214,6 +215,7 @@ class PushJobCoordinatorStateTest {
             PushProtocol.PHASE_DOWNLOADING,
             interrupted = true,
             interruptedAt = 123L,
+            interruptionReason = "download_retry_exhausted",
         )
         val report = buildActivePushReconcileReport(
             PushProtocol.ReconcileIdentity(
@@ -230,6 +232,7 @@ class PushJobCoordinatorStateTest {
         assertEquals(command.revision, report.getLong("revision"))
         assertEquals("interrupted", report.getString("status"))
         assertEquals(41L, report.getLong("validated_offset"))
+        assertEquals("download_retry_exhausted", report.getString("reason"))
     }
 
     @Test
@@ -241,6 +244,7 @@ class PushJobCoordinatorStateTest {
                 PushProtocol.PHASE_DOWNLOADING,
                 interrupted = true,
                 interruptedAt = 1_000L,
+                interruptionReason = "download_retry_exhausted",
             ),
             pendingResults = emptyList(),
             completedReceipts = emptyList(),
@@ -266,6 +270,7 @@ class PushJobCoordinatorStateTest {
                 PushProtocol.PHASE_DOWNLOADING,
                 interrupted = true,
                 interruptedAt = 1_000L,
+                interruptionReason = "download_retry_exhausted",
             ),
             pendingResults = emptyList(),
             completedReceipts = emptyList(),
@@ -339,6 +344,7 @@ class PushJobCoordinatorStateTest {
             PushProtocol.PHASE_DOWNLOADING,
             interrupted = true,
             interruptedAt = 1_000L,
+            interruptionReason = "download_retry_exhausted",
         )
         val fields = buildPushRegistrationFields(
             PushProtocol.State(interrupted, emptyList(), emptyList()),
@@ -353,6 +359,7 @@ class PushJobCoordinatorStateTest {
         assertEquals("available", fields.getJSONObject("push_state").getString("status"))
         assertEquals("interrupted", active.getString("status"))
         assertEquals(12L, active.getLong("validated_offset"))
+        assertEquals("download_retry_exhausted", active.getString("reason"))
     }
 
     @Test

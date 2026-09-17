@@ -276,19 +276,19 @@ class PushScheduler:
                 )
                 return
 
-            protocol = self._protocol_for(
-                session, int((job.get("artifact") or {}).get("byte_size") or 0)
-            )
+            artifact_size = int((job.get("artifact") or {}).get("byte_size") or 0)
+            protocol = self._protocol_for(session, artifact_size)
             if protocol is None:
+                requires_resume = artifact_size > self.resume_threshold_bytes
                 await self._fail_current(
                     job_id,
                     device_id,
                     {DeviceState.WAITING_TRANSFER},
-                    "capability_changed_before_dispatch",
+                    "artifact_requires_push_resume_v1" if requires_resume
+                    else "capability_changed_before_dispatch",
                     (
-                        "Live session no longer supports push_resume_v1 for this large artifact"
-                        if int((job.get("artifact") or {}).get("byte_size") or 0)
-                        > self.resume_threshold_bytes
+                        "Published artifact requires push_job_id_v1 and push_resume_v1"
+                        if requires_resume
                         else "Live session no longer supports push_job_id_v1 and legacy fallback is disabled"
                     ),
                 )
@@ -330,6 +330,9 @@ class PushScheduler:
                 self._clear_dispatch_waiters(key, transfer_future, accept_future)
                 raise
 
+            if snapshot["devices"][device_id]["state"] != DeviceState.DISPATCHING.value:
+                self._clear_dispatch_waiters(key, transfer_future, accept_future)
+                return
             command = self._command(snapshot, device_id, protocol, session.http_base)
             try:
                 # REGISTER replacement, disconnect, final owner check, and send all

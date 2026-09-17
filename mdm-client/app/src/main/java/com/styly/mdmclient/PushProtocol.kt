@@ -66,12 +66,15 @@ object PushProtocol {
         val interrupted: Boolean = false,
         /** First recovery time; bounds how long stale work can fence the device. */
         val interruptedAt: Long? = null,
+        /** Why the worker paused; retained only while [interrupted] is true. */
+        val interruptionReason: String? = null,
     ) {
         fun toJson(): JSONObject = JSONObject().apply {
             put("command", command.toJson())
             put("phase", phase)
             put("interrupted", interrupted)
             if (interruptedAt != null) put("interrupted_at", interruptedAt)
+            if (interruptionReason != null) put("interruption_reason", interruptionReason)
         }
     }
 
@@ -276,6 +279,7 @@ object PushProtocol {
                     it.getString("phase"),
                     it.optBoolean("interrupted", false),
                     it.optLong("interrupted_at", 0L).takeIf { value -> value > 0L },
+                    optionalString(it, "interruption_reason")?.ifBlank { null },
                 )
             }
         } catch (error: RuntimeException) {
