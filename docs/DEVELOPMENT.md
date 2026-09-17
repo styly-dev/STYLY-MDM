@@ -272,6 +272,161 @@ STYLY-MDM/
 
 ## WebSocket Protocol Reference
 
+### Device identity and provisional registration (Issue #65)
+
+Device identity is a protocol and persistence boundary. New clients use only the
+lowercase GUID returned by Device-ID-Provider and set
+`identity_scheme: "styly_device_id_v1"`. Hardware serials and `Build.SERIAL` are
+not fallback identities. Client and server accept the Provider's `8-4-4-4-12`
+hexadecimal GUID format without imposing UUID version or variant restrictions.
+The client normalizes Provider output to lowercase; the wire format remains lowercase.
+Previously accepted IDs remain valid, and no stored ID migration is required.
+Update the server before clients that may report IDs rejected by the old validation.
+The vendored Android AAR comes from the Unity package in the official
+[Device-ID-Provider `v0.4.1` release](https://github.com/styly-dev/Device-ID-Provider/releases/tag/v0.4.1),
+pinned to commit `cacb0d22a1ce46ceb44c9e40abefa619243ac0dd`.
+`mdm-client/app/libs/device-id-provider.properties` pins its SHA-256 and the Android
+`preBuild` task verifies it before compiling.
+
+The Application-scoped resolver initially starts one
+`DeviceIdProvider.getOrCreateAsync(context, 30_000, 250)` request. The first lookup
+and WebSocket connection start independently. The Provider polls primary-storage
+and MediaStore readiness every 250 ms until its 30-second deadline. MDM does not
+register mount observers, schedule retries, or add a waiting worker thread.
+While the request is pending, identity remains `Resolving` and the socket stays
+provisional. Only the final result is published. Success validates and freezes the
+canonical GUID for the rest of the process, then notifies listeners so the same
+socket can promote to canonical registration. A Provider failure or exceptional
+completion becomes `Unavailable`; timeout and readiness-cause diagnostics are
+retained, sanitized and capped at 256 characters. Timeout uses the existing
+`io_error` protocol status and does not introduce a new wire value.
+
+The Provider returns the existing synchronous lookup result after its readiness
+probe succeeds. Terminal results are not polled again by MDM. The permission
+recovery below permits a new request only for `ACCESS_DENIED` without a mint
+attempt. A timed-out in-flight lookup may still create an ID. An exceptional
+completion has no Provider result, so `mint_attempted=false` means no mint attempt
+was reported, not proof that no write occurred. The timeout diagnostic states this
+limitation. Service teardown does not cancel the Application-scoped identity request.
+
+Grant All Files access from the Settings screen, or provision permissions through ADB.
+API 29 requires `READ_EXTERNAL_STORAGE`; API 30+ supports All Files access, or
+the image-read permission appropriate to the OS version. The client does not
+request runtime image permissions. Retries do not grant permissions. If an old
+client does not declare the required permission, install the new APK through ADB,
+then grant access before relying on remote commands.
+
+When Settings resumes with All Files access granted, a prior `ACCESS_DENIED`
+without a mint attempt is retried once automatically. If the initial request is
+still pending, its eventual permission failure triggers that recovery. The UI
+consumes this opportunity before retrying, so another permission failure cannot
+create a retry loop. Leaving Settings clears the pending opportunity. Recovery
+publishes `Resolving`, reuses the same async Provider deadline, and promotes the
+existing socket on success. Requests in flight and a successful GUID are never
+restarted.
+
+Other failures and timeouts remain unavailable until the **MDM application
+process** restarts. Settings **Save & Connect** only restarts the service;
+WebSocket reconnection does not restart identity lookup. There is no retry button.
+
+Provider completions are queued on the main thread, which also owns permission
+recovery and listener subscription. A result reaches all listeners before the
+queued permission retry can publish a newer state. Synchronous dependency linkage
+failures are reported as `io_error`. The Settings error message explains granting
+access and force-stopping/reopening MDM if the error remains. Startup timing
+instrumentation and its external trace file export are not included in the client.
+
+To update Device-ID-Provider: copy the released or explicitly pinned snapshot AAR
+into `mdm-client/app/libs/`, update `aar`, `version`, `source_commit`, and `sha256` in
+`libs/device-id-provider.properties`, then remove the superseded AAR. Compute the
+lowercase hash with `(Get-FileHash <new-aar> -Algorithm SHA256).Hash.ToLowerInvariant()`
+on Windows, or `shasum -a 256 <new-aar>` on macOS (use the first output field). Run
+`./gradlew :app:verifyDeviceIdProviderAar :app:testDevDebugUnitTest :app:assembleDevDebug`
+from `mdm-client` (use `gradlew.bat` on Windows) and commit the AAR and metadata together.
+
+While the resolver is not ready, the socket sends a provisional `REGISTER` with a
+null `device_id`, a bounded `identity` status, and the
+`provisional_power_control_v1` capability when the client supports this feature. The
+server stores that status only in `provisional_connections`, keyed by the live
+WebSocket, and issues a random `connection_id` for that live socket. It is never
+written to `device_registry.json` or Push state and has no normal device, group,
+label, startup-app, install, or Push affordance. The console exposes supported
+entries only in the dedicated **Need attention** tab, where the connection can be
+selected for Reboot or Power off. Admins receive complete
+`PROVISIONAL_CONNECTION_LIST` snapshots. Disconnect removes the row and invalidates
+the connection ID.
+
+When the resolver becomes ready, the same socket sends a canonical `REGISTER`.
+The server removes its provisional entry and installs the canonical owner without
+an `await` between those mutations, preserving newest-registration-wins semantics.
+The server rejects a later GUID change or downgrade to provisional. All later
+device frames are attributed to the server-side socket owner; a payload-supplied
+`device_id` cannot replace it. The Push session becomes schedulable only after the
+server has sent `REGISTERED`, and the client ignores commands and does not start
+battery telemetry until that acknowledgement arrives.
+
+This is a breaking identity and command-policy change. Deploy the server before
+new clients. Both scheme-less serial clients and GUID clients are always accepted;
+there is no registration mode or mandatory database reset. Legacy serial clients
+can only receive APK installation/update commands (including MDM self-update).
+Launch, power, uninstall, startup-app, verification, and Push/Sync commands require
+a registered GUID client. Automatic post-update verification is also skipped for
+legacy identities. Mixed selections skip legacy devices for normal commands;
+Push job creation rejects legacy targets. Provisional sockets remain status-only
+except for capability-gated Reboot and Power off. They cannot receive APK updates or
+any other command, and an older client without the provisional power capability is
+shown as requiring a client update and cannot be selected.
+
+Use the existing APK update action to replace old clients. A successful replacement
+registers its GUID as a new device; labels, groups, and Push history are not migrated.
+The new client reports any startup-app setting retained locally. The old serial row
+remains until explicitly forgotten. An old identity that does not return is reported
+as `untracked`, not proof of update success. Back up the data directory before any
+optional cleanup; no reset is needed for normal operation.
+
+Before upgrading the server, finish pending Push/Sync jobs targeting serial IDs
+with the previous server. After upgrading, those assignments cannot resume on
+serial clients or transfer to a new GUID. Existing queued assignments may remain
+pending; retain them as old records and create a new job for the registered GUID
+if the files still need delivery. Do not treat the old job as completed or reset
+the database merely to upgrade a client.
+
+The live device record owns the single `registration_ready` flag: the registration
+path sets it only after sending `REGISTERED` to the current owner, and disconnect
+clears it. Push dispatch and normal commands share `device_policy.command_allowed`;
+missing fields deny access. Socket ownership is checked again at the final send.
+The resolver uses one start-once guard and publishes one terminal result; a
+successful result carries only the GUID. Registration acknowledgement checks the
+current registered owner directly, independently of APK command permissions.
+
+Network-loss cancellation resets the client connection state and stops battery
+telemetry. Registration flags are bound to the socket under one lock, so a delayed
+ACK cannot acknowledge its replacement. Push result replay also checks the socket
+token on the coordinator actor before starting. Provisional acknowledgement status
+is published on the connection handler only if its socket still owns the connection. The console keeps unresolved
+identities out of the normal device list: `Needs attention` shows their count, and
+the selected tab shows each status and diagnostic with wrapping for long text,
+plus whether Device ID creation was attempted when reported by the provider.
+Device IDs in the console and group editor can be clicked to copy the full ID.
+Canonical GUIDs remain shortened to eight characters; legacy serials remain full.
+The copy control reports success or failure without changing device selection or
+group membership. LAN HTTP uses a clipboard fallback; if copying is blocked, a
+prompt exposes the full ID for manual copying.
+Registering devices display `Registering…` without a Forget action and remain
+ineligible for commands until registration completes. Launch, power, Uninstall,
+Retire, Startup, verification, and Push/Sync controls require at least one selected
+online canonical device. Selecting only offline or legacy devices disables those controls instead of sending an
+operation that only logs skipped targets; APK installation remains available to
+eligible online legacy devices.
+
+All command sends verify the current acknowledged owner. Registering sockets are
+not actionable. Existing legacy registry records and group members remain loadable,
+including after admin metadata edits and a server restart.
+
+Physical PICO checks remain necessary for missing permission, restart behavior,
+and a separate-UID MDM/Unity first-mint race; host tests cannot prove those MediaStore
+and firmware behaviors.
+
 Transport note: `/ws/admin` intentionally does not negotiate per-message
 compression as a workaround for the Chrome-to-server reserved-bit failure
 documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
@@ -280,11 +435,11 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 
 | Message type | Description |
 |---|---|
-| `REGISTER` | Sent on connect. In addition to device metadata, job-v1 clients send `process_instance_id` (UUIDv4), `capabilities: ["push_job_id_v1"]`, and `push_runtime.active` (exact active identity/phase or `null`). Capability parsing is all-or-nothing and never inferred from a version number. |
-| `BATTERY_UPDATE` | Battery telemetry. Fields: `device_id`, `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds) |
+| `REGISTER` | Sent on connect and again on the same socket when a provisional identity becomes Ready. New clients set `identity_scheme: "styly_device_id_v1"`; `device_id` is the lowercase Provider GUID when ready, or `null` with `identity: {state: "provisional", status, diagnostic, mint_attempted}` otherwise. A client that supports Need attention power control also sends `capabilities: ["provisional_power_control_v1"]` on the provisional registration. `status` is `resolving`, `access_denied`, `io_error`, or `unsupported_api`; `diagnostic` is a single-line string bounded to 256 characters, and `mint_attempted` is a boolean indicating whether the provider attempted to create an ID (`false` while resolving). Scheme-less legacy clients send their serial as `device_id`. Canonical job-v1 registrations also send `process_instance_id` (UUIDv4), `capabilities: ["push_job_id_v1"]`, and `push_runtime.active` (exact active identity/phase or `null`). Capability parsing is all-or-nothing: lists exceeding 32 entries or containing an invalid entry produce no capabilities. Capabilities are never inferred from a version number. |
+| `BATTERY_UPDATE` | New clients send battery telemetry after canonical `REGISTERED`. Fields: `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds). The server attributes the message to the current socket owner; new clients do not send `device_id`. |
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
 | `DELETE_APP_RESULT` | Result of a remote app uninstall — exactly one per `EXECUTE_UNINSTALL`. The client survives it, so this always arrives (unlike `SELF_UNINSTALL_RESULT`). Fields: `status` (`success`/`fail`), `package_name`, `error` (optional), `result_code` (optional), `startup_app_cleared` (optional; reports what the device did — the server decides from its own record, see below). See [Remote App Uninstall](#remote-app-uninstall). |
-| `REBOOT_RESULT` / `POWER_OFF_RESULT` | Acknowledgement of a power command. `status` is `accepted` (the client received it and flushed this before invoking the SDK — a successful reboot/shutdown tears down the socket first, so no `success` is ever sent) or `fail` (the SDK rejected the call, so the device stayed up to report it). Fields: `status`, `error` (optional). See [Remote Power Control](#remote-power-control). |
+| `REBOOT_RESULT` / `POWER_OFF_RESULT` | Acknowledgement of a power command. `status` is `accepted` (the client received it and flushed this before invoking the SDK — a successful reboot/shutdown tears down the socket first, so no `success` is ever sent) or `fail` (the SDK rejected the call, so the device stayed up to report it). Fields: `status`, `error` (optional), and `connection_id` for a provisional socket. Provisional results never carry `device_id`; the server forwards them only while that exact connection remains live. See [Remote Power Control](#remote-power-control). |
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
 | `DOWNLOAD_COMPLETE` | Install/legacy: the existing post-download signal. Job-v1 Push: an exact `job_id`, `attempt`, and `artifact_id` checkpoint emitted only after exact-size/basic ZIP/path validation; it **does not** release the network slot. |
 | `PUSH_JOB_ACCEPTED` / `PUSH_JOB_REJECTED` | Exact command acceptance after the client durably persists active state, or a duplicate-safe rejection (`device_busy`, `client_persistence_unavailable`, malformed identity, destination/artifact conflict). A persistence rejection keeps the MDM process alive but starts no worker. Fields include `job_id`, fixed `attempt=1`, and current phase/reason. |
@@ -304,9 +459,10 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 |---|---|
 | `EXECUTE_LAUNCH` | Launch an app. Fields: `package_name`, `extra` |
 | `EXECUTE_UNINSTALL` | Silently uninstall an app (`pbsControlAPPManger` / `PACKAGE_SILENCE_UNINSTALL`). Fields: `package_name`. The client refuses its own and the guard's package, and clears the startup app first when the target is it. See [Remote App Uninstall](#remote-app-uninstall). |
-| `EXECUTE_REBOOT` / `EXECUTE_POWER_OFF` | Reboot or power off the device immediately via the PICO advanced device-control API (`pbsControlSetDeviceAction`). No fields. See [Remote Power Control](#remote-power-control). |
+| `EXECUTE_REBOOT` / `EXECUTE_POWER_OFF` | Reboot or power off the device immediately via the PICO advanced device-control API (`pbsControlSetDeviceAction`). Canonical targets receive no fields; provisional targets receive their exact `connection_id` and only a capability-gated client may accept the command. See [Remote Power Control](#remote-power-control). |
 | `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename`, plus `full_sha256` + `cd_sha256` (reference hashes of the file being dispatched; present only when the APK is a local upload in `apks/`). The client verifies the download against `full_sha256` before installing; a **self**-update is refused outright when the hashes are absent. |
-| `REGISTERED` | Server acknowledgement after ownership/capability processing. Field: `session_id`. The client then replays its durable pending terminal outbox. |
+| `REGISTERED` | Server acknowledgement after ownership/capability processing. Field: `session_id`. The client then enables command handling, starts battery telemetry, and replays its durable pending terminal outbox. |
+| `REGISTERED_PROVISIONAL` | Acknowledges a provisional registration or status update. Fields: server-issued `connection_id`. After this ACK, a client with `provisional_power_control_v1` may accept only `EXECUTE_REBOOT` and `EXECUTE_POWER_OFF` carrying the same ID; battery telemetry, Push, and all other commands remain disabled until canonical registration completes. |
 | `EXECUTE_PUSH_FILES` | Job-v1 fields: `job_id`, fixed `attempt=1`, observed `revision`, immutable `artifact_id`, absolute `artifact_url`, exact size/SHA-256 metadata, destination, and server-derived `delete_extras`. Legacy fields remain accepted during migration. Safety-critical fields require their exact JSON types. |
 | `PUSH_RESULT_ACK` | Terminal-result disposition. Fields: exact identity, `accepted`, committed `revision` when a local canonical job exists, and on rejection `reason` plus `retryable`. The client retains retryable results; accepted or permanently rejected results leave the pending outbox while remaining in bounded dedupe receipts. |
 | `PUSH_RECONCILE_REQUEST` | Requests exact status for one or more `{job_id, attempt, artifact_id}` identities. It never directly clears a fence. |
@@ -320,7 +476,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 |---|---|
 | `LAUNCH_APP` | Launch an app on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `package_name`, `extra_data` |
 | `DELETE_APP` | Uninstall an app from target devices (the console gates it behind a confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only), `package_name`. STYLY-MDM's own packages are rejected — `RETIRE_DEVICE` is the only sanctioned way to remove the client. See [Remote App Uninstall](#remote-app-uninstall). |
-| `REBOOT_DEVICE` / `POWER_OFF_DEVICE` | Reboot or power off target devices (the console gates both behind a shared confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only). See [Remote Power Control](#remote-power-control). |
+| `REBOOT_DEVICE` / `POWER_OFF_DEVICE` | Reboot or power off target devices (the console gates both behind a shared confirmation). Normal targets use `target_devices` (list of device IDs or `["*"]`; online devices only). Need attention targets use `target_connections` (a non-empty list of server-issued connection IDs) instead. The two fields cannot be combined; `target_connections` rejects empty arrays, duplicates, and wildcards, and never falls back to normal-device resolution. Only these two message types may contain `target_connections`. See [Remote Power Control](#remote-power-control). |
 | `INSTALL_APK` | Install an uploaded APK on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `apk_url`, `apk_filename` |
 | `PUSH_FILES` | New flow: `{job_id}` only; the server reads mode, destination, targets, and immutable artifact metadata from SQLite and enables/resumes that job's dispatch gate. The older bundle-shaped message remains migration-only compatibility. |
 | `RECONCILE_PUSH_DEVICE` | Re-requests exact reconciliation for a fenced device. Field: `device_id`. It cannot force-clear state or a fence without matching client/process evidence. |
@@ -331,7 +487,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `RENAME_GROUP` | Rename a group, preserving its members. Fields: `name`, `new_name` |
 | `DELETE_GROUP` | Delete a group (member devices are not affected). Fields: `name` |
 | `SET_DEVICE_GROUPS` | Set the exact set of groups a device belongs to. Fields: `device_id`, `groups` (list of existing group names) |
-| `SET_GROUP_MEMBERS` | Set the exact member list of an existing group (group-centric). Fields: `name`, `members` (list of serials; offline/unknown serials allowed) |
+| `SET_GROUP_MEMBERS` | Set the exact member list of an existing group (group-centric). Fields: `name`, `members` (list of device IDs; offline/unknown IDs allowed) |
 | `RETIRE_DEVICE` | Make target clients uninstall themselves (remotely irreversible — the console gates it behind its heaviest confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only). See [Device Retirement](#device-retirement). |
 
 ### Admin HTTP API
@@ -351,28 +507,29 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 |---|---|
 | `SERVER_INFO` | Server identity, sent once on connect (before the first `DEVICE_LIST`). Fields: `version` (the `styly_mdm` package version; the console renders it next to the `STYLY-MDM` brand in the top bar. Its `major.minor` is the compatibility reference — and the top-bar value itself turns red when a live client is on a *newer* `major.minor` (i.e. the server is the one lagging). See the compatibility note below). |
 | `CLIENT_APK_INFO` | The newest styly-mdm-client APK the server holds, sent on connect (right after `SERVER_INFO`, before `DEVICE_LIST`) and re-broadcast after every APK upload. Field: `apk` = `{filename, url, version}` or `null`. Drives the per-device and bulk **Update** buttons and the top-bar client-APK download link (see the notes below). |
-| `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `status` (`online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting; a *stable-online* client whose `version_name` trails the server on `major.minor` is flagged red as needing an update — the reverse case, a client *ahead* of the server, reddens the top-bar server version instead. `updating` and offline rows are exempt, and the check is skipped only when the server version is the `0.0.0` untagged/not-installed fallback), and may include optional `battery`: `{level, charging, last_seen}`) |
+| `DEVICE_LIST` | Current list of known devices. Fields: `devices` (array; each entry carries `identity_kind` (`canonical` for Provider GUID / `legacy` for serial ID) and `status` (`registering` before the registration acknowledgement / `online` / `offline` / `updating` — while a self-update's recovery is in flight — / `retiring` — announced a self-uninstall, awaiting the retire window — / `retired` — terminal, persisted after a successful retire), `version_code` / `version_name` (the client build, when known — the console renders it as a right-aligned badge per row, or `unknown` for clients that predate version reporting; a *stable-online* client whose `version_name` trails the server on `major.minor` is flagged red as needing an update — the reverse case, a client *ahead* of the server, reddens the top-bar server version instead. `updating` and offline rows are exempt, and the check is skipped only when the server version is the `0.0.0` untagged/not-installed fallback), and may include optional `battery`: `{level, charging, last_seen}`) |
+| `PROVISIONAL_CONNECTION_LIST` | Complete replacement snapshot of live unresolved connections, sent on admin connect and when provisional state changes. Field: `connections` (array of `{connection_id, model, ip, version_code, version_name, identity_status, diagnostic, mint_attempted, capabilities, power_control_supported, connected_at, last_status_at}`). `identity_status` uses the provisional `REGISTER` status values; `mint_attempted` is a boolean, and both timestamps are epoch seconds. `connection_id` identifies only the current live socket; it is not a device ID, IP, or row number, is not persisted or grouped, and disappears on promotion or disconnect. `power_control_supported` is false for clients that need an update. |
 | `LAUNCH_SENT` | Confirmation that commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `DELETE_APP_SENT` | Confirmation that uninstall commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
-| `REBOOT_SENT` / `POWER_OFF_SENT` | Confirmation that reboot/power-off commands were dispatched. Fields: `sent_count`, `target_count` |
+| `REBOOT_SENT` / `POWER_OFF_SENT` | Confirmation that reboot/power-off commands were dispatched. Fields: `sent_count`, `target_count`, and `target_connections` when the request used provisional connections. |
 | `INSTALL_SENT` | Confirmation that an install job was accepted (dispatch is throttled and runs in the background). Fields: `apk_filename`, `apk_url`, `target_count`, `max_concurrent` |
 | `INSTALL_PROGRESS` | Live progress of a throttled install job, broadcast on each transfer-slot transition. Fields: `apk_filename`, `apk_url`, `total`, `queued`, `transferring`, `transferred`, `failed`, `done` (boolean, `true` on the final update) |
-| `INSTALL_DEVICE_STATE` | Per-device companion to `INSTALL_PROGRESS`: names the devices that just entered a state, so the console can label each row instead of showing the whole target set as installing. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `installing` / `updating` / `success` / `fail`; `updating` and its terminal `success`/`fail` are emitted only for a client self-update), `apk_filename`, `detail` (failure reason, may be empty) |
+| `INSTALL_DEVICE_STATE` | Per-device companion to `INSTALL_PROGRESS`: names the devices that just entered a state, so the console can label each row instead of showing the whole target set as installing. Fields: `device_ids` (array), `state` (`queued` / `transferring` / `installing` / `updating` / `success` / `fail` / `untracked`; `untracked` means a legacy identity did not return and any successful GUID replacement is intentionally treated as a new device), `apk_filename`, `detail` (failure reason or handoff note; may be empty) |
 | `PUSH_JOBS_SNAPSHOT` | Sent after the normal initial admin metadata. Contains every non-terminal job, bounded recent terminal jobs, and fence-visible metadata as a complete replacement snapshot. Updates that race ahead of it on the same connection are buffered and revision-merged by the console. If this initial snapshot cannot be sent, the server closes that admin socket so the existing reconnect loop requests a fresh snapshot instead of buffering forever. |
 | `PUSH_JOB_UPDATED` | Canonical full snapshot after a committed mutation. A single server publisher coalesces pending revisions per `job_id`; console state merges only monotonically newer revisions. |
 | `PUSH_FILES_SENT` | Job dispatch/resume acknowledgement. Fields include `job_id`, committed `revision`, canonical state/gate, target count, and shared transfer limit. |
 | `LAUNCH_RESULT` | Forwarded result from a device |
 | `DELETE_APP_RESULT` | Forwarded uninstall result from a device (adds `device_id`). A `success` is followed by a fresh `DEVICE_LIST` when the device's recorded startup app still named the removed package, since the server then drops that record. See [Remote App Uninstall](#remote-app-uninstall). |
-| `REBOOT_RESULT` / `POWER_OFF_RESULT` | Forwarded power-command acknowledgement from a device (adds `device_id`). `accepted` = received and going down (confirm via the row dropping offline); `fail` = the SDK rejected it. See [Remote Power Control](#remote-power-control). |
+| `REBOOT_RESULT` / `POWER_OFF_RESULT` | Forwarded power-command acknowledgement from a device. Canonical results add `device_id`; provisional results retain `connection_id` and never acquire a device ID. `accepted` = the request was received and the client is invoking the action, not proof that reboot/power-off completed; `fail` = the SDK rejected it. Results are dropped after the original provisional connection is invalidated. See [Remote Power Control](#remote-power-control). |
 | `INSTALL_RESULT` | Forwarded install result from a device |
 | `VERIFY_SENT` | Confirmation that verify-APK commands were dispatched. Fields: `package_name`, `sent_count`, `target_count` |
 | `VERIFY_DIR_SENT` | Confirmation that verify-directory commands were dispatched. Fields: `path`, `sent_count`, `target_count` |
 | `VERIFY_APK_RESULT` / `VERIFY_DIR_RESULT` | Forwarded integrity result from a device (stamped with `device_id`). The console compares it against the local reference. Exception: the `VERIFY_APK_RESULT` answering a self-update auto-verify is consumed by the server (which holds the reference) and surfaces as `SELF_UPDATE_VERIFIED` instead. |
-| `SELF_UPDATE_RESULT` | Outcome of a client self-update, settled when the device re-registers (or the window expires). Fields: `device_id`, `correlation_id`, `status` (`success` / `fail` / `timeout`), `version_code` (what the device came back with; `null` on timeout), `target_version_code`, `detail` |
+| `SELF_UPDATE_RESULT` | Outcome of a client self-update, settled when the same device identity re-registers (or the window expires). Fields: `device_id`, `correlation_id`, `status` (`success` / `fail` / `timeout` / `untracked`), `version_code`, `target_version_code`, `detail`. `untracked` is the terminal compatibility-rollout result for an old serial that did not return; a successful GUID replacement is a separate new device. |
 | `SELF_UPDATE_VERIFIED` | Outcome of the automatic post-update `EXECUTE_VERIFY_APK` the server runs against the client's own package. Fields: `device_id`, `correlation_id`, `status` (`verified` / `mismatch` / `skipped` / `error`), `detail` |
 | `RETIRE_SENT` | Confirmation that `EXECUTE_SELF_UNINSTALL` commands were dispatched. Fields: `sent_count`, `target_count` |
 | `RETIRE_RESULT` | Outcome of a device retire. Success is settled by *silence*: the device announced, disconnected, and stayed away for the retire window. Failure means it re-registered, reported the uninstall failed, or was still connected at the deadline. Fields: `device_id`, `correlation_id`, `status` (`success` / `fail`), `detail` |
-| `GROUP_LIST` | Current device groups. Fields: `groups` (object mapping group name → array of member serials). The console derives each device's group membership from this; sent on connect and after any group change. |
+| `GROUP_LIST` | Current device groups. Fields: `groups` (object mapping group name → array of member device IDs). The console derives each device's group membership from this; sent on connect and after any group change. |
 | `GROUP_CREATED` / `GROUP_RENAMED` / `GROUP_DELETED` | Acknowledgements for group create / rename / delete. |
 | `DEVICE_GROUPS_SET` | Acknowledgement of a device's group membership change. Fields: `device_id`, `groups` |
 | `GROUP_MEMBERS_SET` | Acknowledgement of a group's member list change. Fields: `name`, `members` |
@@ -435,7 +592,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > means sideloading or hand-installing a client never requires reaching this
 > repository's GitHub Releases page — the console alone is enough.
 
-> **Device groups** are a many-to-many grouping keyed by device serial, persisted
+> **Device groups** are a many-to-many grouping keyed by `device_id`, persisted
 > server-side in `device_registry.json` (under a `groups` key). Selecting a group
 > in the console is a client-side convenience: it sets the device selection to that
 > group's members (devices not in the group are deselected), so commands still
@@ -444,8 +601,9 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 
 > **Battery telemetry** is optional for backwards compatibility. Older clients
 > that never send `BATTERY_UPDATE` remain valid; their device rows simply omit
-> `battery`. New clients send one update immediately after WebSocket connect and
-> then every 5 minutes while the foreground service is running. The server stores
+> `battery`. New clients send one update after canonical `REGISTERED` and then
+> every 5 minutes while the foreground service has an acknowledged connection.
+> Disconnect stops telemetry; provisional connections never send it. The server stores
 > the latest battery state in `device_registry.json`, so offline devices retain
 > their last-known battery percentage and charging state.
 
@@ -790,9 +948,10 @@ The self-update flow:
    process dies; the install commits ~30 s later.
 4. **Server-side `updating`.** The server records the pending update; the disconnect
    renders the device as `updating` (not `offline`) in `DEVICE_LIST`, and the install cell
-   shows `Updating…` via `INSTALL_DEVICE_STATE`. If the device does not re-register within
-   `MDM_SELF_UPDATE_TIMEOUT` (default 480 s), the update is reported as `timeout` and the
-   row falls back to offline.
+   shows `Updating…` via `INSTALL_DEVICE_STATE`. If a canonical identity does not
+   re-register within `MDM_SELF_UPDATE_TIMEOUT` (default 480 s), the update is reported
+   as `timeout`. A legacy serial that does not return is instead reported as `untracked`,
+   because a successful replacement registers under an unrelated provider GUID.
 5. **Revival.** The guard's next watchdog tick finds the client down and starts the new
    build through TobService (measured on device: down for ~3 s, `SELF_UPDATE_VERIFIED`
    ~4 s after dispatch). The new build confirms the update marker and — on that
@@ -808,9 +967,10 @@ The self-update flow:
    starts the flag is retired anyway, so a past-due one-shot timer that can no longer be
    closed does not loop the recovery on every boot (`POWER_CYCLE_CLOSED` records
    `cleared` / `retry_pending` / `gave_up`).
-6. **Result + auto-verify.** The server settles the update by comparing the re-registered
-   `version_code` against the target (`SELF_UPDATE_RESULT`, carrying the correlation id),
-   then runs `EXECUTE_VERIFY_APK` against the client's own package and compares the
+6. **Result + auto-verify.** When the same identity returns, the server settles the update
+   by comparing the re-registered `version_code` against the target
+   (`SELF_UPDATE_RESULT`, carrying the correlation id), then runs `EXECUTE_VERIFY_APK`
+   against the client's own package and compares the
    reported hash with its reference, broadcasting `SELF_UPDATE_VERIFIED`. The reference is
    pinned to the hashes captured when `EXECUTE_INSTALL` was dispatched to that device
    (`last_install_dispatch`), not a re-hash of the client-echoed filename, so a same-name
@@ -854,6 +1014,11 @@ installed, a dead client is started back up within one watchdog tick.
 - **A server restart mid-update loses only the reporting.** The pending state is in-memory;
   the device still recovers on its own (the power cycle is device-side) and re-registers as
   a normal client. The `updating` label and the `SELF_UPDATE_RESULT` are the only casualties.
+- **The compatibility cutover does not correlate identities.** If an old serial client
+  returns unchanged, its version comparison reports failure and it remains targetable for
+  retry. If the new build succeeds, its provider GUID is persisted as a completely new
+  device with no inherited label, groups, Push history, or update result. Locally retained startup-app settings are reported again during registration. The
+  old serial row is removed only by an explicit Forget action.
 
 ### The update journal
 
@@ -964,6 +1129,36 @@ gated by the `pico_advance_interface` manifest flag the client already declares.
 permission and no SDK addition were needed; shipping the two command handlers is what
 requires a client update + redeploy.
 
+**Need attention is a separate power-only target class.** A provisional socket is not
+registered as a device and is never written to the device registry or group state. The
+server issues a random `connection_id` for the live socket, preserves it across status
+updates on that socket, and invalidates it on disconnect or canonical promotion.
+Status updates preserve an already acknowledged connection's readiness; the first
+registration remains ineligible until its acknowledgement is sent. The
+console maintains Need attention selection separately from normal-device selection;
+entering or leaving Need attention clears both selections and the shared power
+confirmation checkbox. Switching between Groups and Devices preserves selection. The
+Need attention tab enables only Reboot and Power off for entries advertising
+`provisional_power_control_v1`; older clients show **Client update required** and cannot
+be selected. The confirmation dialog includes the model, IP, and shortened connection
+ID.
+
+Need attention requests use only `target_connections`. The server validates a non-empty
+list of unique, non-wildcard connection IDs, rejects a simultaneous `target_devices`,
+and resolves each target through a dedicated provisional branch. An empty or stale
+connection list is an error and never means all devices. The server checks the live
+connection, readiness, capability, and connection ID again immediately before the
+WebSocket send; the final WebSocket guard permits only `EXECUTE_REBOOT` and
+`EXECUTE_POWER_OFF` on that provisional socket. Any other admin command carrying
+`target_connections` is rejected before normal target resolution, including Push/Sync.
+
+The Android client accepts those two commands only after `REGISTERED_PROVISIONAL`,
+reuses `executePowerControl()`, and sends the accepted/fail result through the same
+socket and connection ID. A result from a replaced, disconnected, or promoted socket
+is dropped. The client gives the result up to two seconds to drain before the PICO API
+call. A flush timeout does not cancel the action while the command connection remains
+active. `accepted` is not proof of delivery, a reboot, power-off, or identity recovery.
+
 **Power off while charging.** The shutdown path invokes
 `DEVICE_CONTROL_SHUTDOWN` without changing the PICO device-wide *"power off with USB cable"*
 setting. This prevents a remote power-off from modifying a persistent system setting. On tested
@@ -972,11 +1167,15 @@ device firmware; behavior may vary by model and PUI version. If the device remai
 check that setting. If the SDK rejects the shutdown, the client reports `POWER_OFF_RESULT: fail`.
 Reboot does not touch this setting.
 
+For both canonical and provisional power commands, the client cancels execution if
+its original command connection is invalidated before the power call. Results never
+use a replacement socket. A flush timeout alone does not cancel an active command.
+
 **Outcome model — the success signal is the device going offline, not a RESULT.** A
 successful reboot/shutdown tears down the client process and the WebSocket before any
 `*_RESULT: success` could flush, so the client instead sends `REBOOT_RESULT` /
 `POWER_OFF_RESULT` with `status: accepted` **before** invoking the SDK call (flushing it
-to the wire on a worker thread via `awaitOutboundFlush`), and only ever sends
+with a best-effort wait on a worker thread via `awaitOutboundFlushForCommand`), and only ever sends
 `status: fail` when the SDK *rejects* the call — in which case the device stays up and the
 frame reaches the server. The real confirmation is therefore the row dropping **offline**
 (and, for a reboot, reconnecting after ~30–60s), read from the connection status. The

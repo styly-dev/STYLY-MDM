@@ -18,8 +18,14 @@ class MdmClientApplication : Application() {
         @Volatile
         private var coordinator: PushJobCoordinator? = null
 
+        @Volatile
+        private var identityResolver: DeviceIdentityResolver? = null
+
         fun pushJobCoordinator(): PushJobCoordinator =
             coordinator ?: throw IllegalStateException("PushJobCoordinator is not initialized")
+
+        fun deviceIdentityResolver(): DeviceIdentityResolver =
+            identityResolver ?: throw IllegalStateException("DeviceIdentityResolver is not initialized")
     }
 
     override fun onCreate() {
@@ -28,6 +34,9 @@ class MdmClientApplication : Application() {
         // The coordinator is Application-scoped: Service recreation or a transient
         // WebSocket reconnect cannot create a second Push/Sync worker.
         coordinator = PushJobCoordinator(this)
+        identityResolver = DeviceIdentityResolver.create(this).also {
+            it.startInitialLookup()
+        }
         // The first thing the replacement process does after a self-update. Recording it
         // separates "the process was started" from "the service was started".
         UpdateJournal.record(
