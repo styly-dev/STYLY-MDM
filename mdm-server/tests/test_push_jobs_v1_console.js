@@ -501,6 +501,33 @@ test('dispatch attention ignores terminal and nondispatchable jobs', () => {
   assert.equal(harness.pushJobsAttention.children.length, 0);
 });
 
+test('Push state recovery warning preserves an independent install progress', () => {
+  const match = indexSource.match(/function progressCellHtml\(id\) \{[\s\S]*?\n      \}/);
+  assert.ok(match, 'the console exposes a testable progress renderer');
+  const device = {
+    device_id: 'D1',
+    status: 'online',
+    push_state_retry_supported: true,
+    push_state_status: 'unavailable',
+  };
+  const context = vm.createContext({
+    deviceById(id) { return id === device.device_id ? device : null; },
+    canRetryPushState(candidate) {
+      return !!(candidate && candidate.status === 'online' &&
+        candidate.push_state_retry_supported === true &&
+        candidate.push_state_status === 'unavailable');
+    },
+    taskCellHtml() { return '<span class="ins-installing">Installing…</span>'; },
+    esc(value) { return String(value); },
+  });
+  vm.runInContext(match[0], context);
+
+  const html = context.progressCellHtml('D1');
+  assert.match(html, /Installing/);
+  assert.match(html, /Push state unavailable/);
+  assert.match(html, /retryPushState/);
+});
+
 test('target tabs preserve normal selection and clear it across Need attention', () => {
   const match = indexSource.match(/function switchTargetTab\(tab\) \{[\s\S]*?\n      \}/);
   assert.ok(match);
