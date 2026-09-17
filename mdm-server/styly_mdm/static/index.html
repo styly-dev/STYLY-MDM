@@ -1474,8 +1474,9 @@
       }
 
       function progressCellHtml(id) {
-        if (!canRetryPushState(deviceById(id))) return taskCellHtml(id);
-        return '<div class="push-state-warning">' +
+        const task = taskCellHtml(id);
+        if (!canRetryPushState(deviceById(id))) return task;
+        return task + '<div class="push-state-warning">' +
           '<span class="push-state-warning-icon" aria-hidden="true">⚠</span>' +
           '<span class="push-state-warning-label">Push state unavailable</span>' +
           '<button class="btn-push-state-retry" data-act="retryPushState" data-id="' + esc(id) + '" title="Reload durable Push state and refresh capabilities. This does not start a transfer.">Retry</button>' +
