@@ -11,6 +11,7 @@ from styly_mdm.push_job_store import PushJobStore, now_ms
 from styly_mdm.push_jobs import DeviceState, ProtocolMode, canonicalize_create_request
 from styly_mdm.push_runtime import PushRuntime
 from styly_mdm.push_scheduler import LiveSession, PushScheduler
+from styly_mdm.push_transfer_leases import PushTransferLeases
 from styly_mdm.transfer_registry import TransferKey, TransferRegistry
 
 
@@ -105,6 +106,9 @@ class Scheduler:
 
 
 class RegistrationManager:
+    async def pending_cancellations_for_device(self, device_id):
+        return []
+
     def __init__(self):
         self.clear_calls = 0
 
@@ -172,8 +176,9 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
         paused = await manager.get_snapshot(job_id)
         assert paused["devices"]["D1"]["state"] == "queued"
         assert paused["devices"]["D1"]["validated_offset"] == 1
-        assert paused["dispatch_enabled"] is False
-        assert paused["dispatch_paused_reason"] == (reason or "server_restart")
+        assert paused["dispatch_enabled"] is (reason is not None)
+        assert paused["dispatch_paused_reason"] == (None if reason else "server_restart")
+        assert paused["devices"]["D1"]["queue_reason"] == (reason or "resumable_replay")
         assert await manager.claim_next(["D1"]) is None
         # Disconnect does not rewrite queued state: repeated REGISTER/reconcile
         # must retain it without a rejection or a revision change.
@@ -181,7 +186,7 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
         await send_report()
         await send_report()
         assert await manager.get_snapshot(job_id) == paused
-        assert runtime.scheduler.wake_count == 0
+        assert runtime.scheduler.wake_count == int(reason is not None and report_path == "reconcile")
 
         await manager.enable_dispatch(job_id)
         await send_report()  # Do not re-pause after the operator authorizes Resume.
@@ -294,7 +299,7 @@ async def test_non_resumable_interruption_keeps_terminal_reconciliation(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_retry_pause_stops_another_device_already_waiting_for_a_slot(tmp_path):
+async def test_retry_exhaustion_allows_another_device_waiting_for_a_slot(tmp_path):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     capabilities = frozenset({"push_job_id_v1", "push_resume_v1"})
@@ -322,7 +327,7 @@ async def test_retry_pause_stops_another_device_already_waiting_for_a_slot(tmp_p
             transfer_slots=lambda: slots, sessions=lambda: {"D2": session},
             publish=lambda _snapshot: asyncio.sleep(0), send_timeout=1,
             accept_timeout=1, accept_reconciliation_timeout=1,
-            reconciliation_timeout=1, transfer_timeout=1, allow_legacy=False,
+            reconciliation_timeout=1, transfer_timeout=1,
         )
         task = asyncio.create_task(scheduler._dispatch_assignment(waiting))
         try:
@@ -335,14 +340,15 @@ async def test_retry_pause_stops_another_device_already_waiting_for_a_slot(tmp_p
                 validated_offset=1,
             )
             slots.release()
-            await asyncio.wait_for(task, timeout=1)
-            assert session.ws.messages == []
-            assert len(registry) == 0
-            assert not scheduler._accept_waiters
-            assert (await manager.assignment(job_id, "D2"))["state"] == "queued"
-            assert await manager.claim_next(["D2"]) is None
+            for _ in range(100):
+                if session.ws.messages:
+                    break
+                await asyncio.sleep(0.01)
+            assert session.ws.messages[0]["type"] == "EXECUTE_PUSH_FILES"
+            assert (await manager.assignment(job_id, "D2"))["state"] == "dispatching"
+            assert await manager.claim_next(["D1"]) is None
             await manager.enable_dispatch(job_id)
-            assert await manager.claim_next(["D2"]) is not None
+            assert await manager.claim_next(["D1"]) is not None
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -581,6 +587,7 @@ async def test_push_state_retry_targets_only_affected_online_devices_without_sch
 @pytest.mark.asyncio
 async def test_push_state_retry_result_refreshes_capability_without_dispatching():
     runtime = object.__new__(PushRuntime)
+    runtime.manager = RegistrationManager()
     runtime.scheduler = Scheduler()
     runtime.device_locks = {}
     ws = Ws()
@@ -1124,12 +1131,15 @@ async def test_registration_candidate_reconciles_replaced_active_session(tmp_pat
     try:
         active = await downloading_job(store, manager)
         job_id = active["job_id"]
+        artifact_id = active["artifact"]["artifact_id"]
         runtime = object.__new__(PushRuntime)
         runtime.manager = manager
         runtime.sessions = {}
         runtime.device_locks = {}
         runtime.registration_candidates = {}
         runtime.transfers = TransferRegistry()
+        runtime.leases = PushTransferLeases()
+        runtime.leases.issue(TransferKey("push", "D1", job_id, 1), artifact_id)
         runtime.accept_reconciliation_timeout = 0.1
         runtime.reconciliation_timeout = 1
         runtime.scheduler = Scheduler()
@@ -1161,7 +1171,6 @@ async def test_registration_candidate_reconciles_replaced_active_session(tmp_pat
         assert not future.done()
 
         runtime.legacy = types.SimpleNamespace(devices={"D1": {"ws": new}})
-        artifact_id = active["artifact"]["artifact_id"]
         await runtime.register_device(
             new,
             {
@@ -1269,7 +1278,7 @@ async def test_registration_active_artifact_conflict_fails_and_fences(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_server_restart_active_registration_reacquires_transfer_slot(tmp_path):
+async def test_server_restart_active_registration_does_not_reuse_revoked_http_lease(tmp_path):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     scheduler = None
@@ -1285,6 +1294,7 @@ async def test_server_restart_active_registration_reacquires_transfer_slot(tmp_p
             deadline=now_ms() + 60_000,
         )
         registry = TransferRegistry()
+        leases = PushTransferLeases()
         semaphore = asyncio.Semaphore(1)
 
         async def publish(_snapshot):
@@ -1301,12 +1311,13 @@ async def test_server_restart_active_registration_reacquires_transfer_slot(tmp_p
             accept_reconciliation_timeout=1,
             reconciliation_timeout=1,
             transfer_timeout=60,
-            allow_legacy=True,
+            leases=leases,
         )
         runtime = object.__new__(PushRuntime)
         runtime.manager = manager
         runtime.scheduler = scheduler
         runtime.transfers = registry
+        runtime.leases = leases
         session = LiveSession(
             device_id="D1",
             session_id="new",
@@ -1328,15 +1339,14 @@ async def test_server_restart_active_registration_reacquires_transfer_slot(tmp_p
             },
         )
 
-        assert snapshots[-1]["devices"]["D1"]["state"] == "downloading"
-        blocked = asyncio.create_task(semaphore.acquire())
-        await asyncio.sleep(0)
-        assert not blocked.done()
+        # The old process's URL carried an in-memory lease that no longer exists.
+        # Registration therefore cannot restore the old HTTP transfer or consume
+        # a new slot; the client must report interruption and be manually resumed.
+        assert snapshots == []
         key = TransferKey("push", "D1", job_id, 1)
-        assert registry.release_exact(key, "download_complete")
-        await asyncio.wait_for(blocked, timeout=0.5)
-        semaphore.release()
-        await asyncio.gather(*scheduler._recovered_transfer_tasks)
+        assert registry.get(key) is None
+        assert leases.token(key) is None
+        assert not semaphore.locked()
     finally:
         if scheduler is not None:
             await scheduler.stop()
@@ -1547,6 +1557,8 @@ async def test_disconnect_transition_finishes_before_replacement_register(tmp_pa
         runtime.device_locks = {}
         runtime.registration_candidates = {}
         runtime.transfers = TransferRegistry()
+        runtime.leases = PushTransferLeases()
+        runtime.leases.issue(TransferKey("push", "D1", job_id, 1), artifact_id)
         runtime.accept_reconciliation_timeout = 0.1
         runtime.reconciliation_timeout = 1
         runtime.scheduler = Scheduler()

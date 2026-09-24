@@ -40,16 +40,44 @@ which durably releases the client execution gate and removes only that exact
 job-owned partial. The server keeps canonical ownership until it receives the
 terminal replay or exact reconciliation evidence.
 
-Exhausted transient download retries also retain interrupted ownership and partial
-bytes. The client reports `reason: download_retry_exhausted`; the server atomically
-requeues that exact assignment and pauses the job until the operator selects Resume.
-Pending devices in the same job wait, while existing workers continue. Duplicate
-interrupted reports while waiting/dispatching preserve both local work and any new
-transfer slot. Resume does not extend the original 24-hour interruption deadline.
-Deploy the server before this client change: older servers may reject a live
-retry-exhaustion report. The optional local `interruption_reason` field is backward
-compatible and requires no database migration. See the updated message-flow diagram
-and [`PUSH_JOBS.md`](PUSH_JOBS.md) for response validation and recovery details.
+Push/Sync downloads recover automatically while less than 60 seconds pass without
+artifact bytes. Only data progress resets this monotonic window; reconnect and
+response headers do not. After expiry, the client retains its partial and requires
+manual Resume. Other devices continue. Management connection loss does not stop
+HTTP that is progressing, and validation/apply continue once download is complete.
+After all bytes arrive, the client sends `PUSH_PHASE validating` before hashing.
+The server releases that transfer slot and stops its HTTP-write watchdog; the
+verified `PUSH_TRANSFER_COMPLETE` follows SHA-256 verification.
+Local file write and sync failures do not refresh the download deadline or
+trigger another network request. When exact resumable metadata and partial bytes
+remain, `storage_write_failed` retains them for manual Resume after storage is
+repaired; failures without a valid partial are terminal.
+Application restart reports `client_restarted` and requires Resume. Server restart
+also invalidates the in-memory HTTP lease: a retry of the old URL is rejected as
+`server_lease_revoked`, retaining the partial until manual Resume issues a new URL.
+While the server remains up, a Range reconnect with the same live lease replaces
+an older HTTP handler that has not noticed the client disconnect yet.
+Resume never extends the first interruption's 24-hour retention deadline.
+
+Resume is online-only; Resume all skips offline devices. Cancel also works for
+unresolved offline assignments: a durable request suppresses future replay while
+revoking any live HTTP lease. Ownership is retained until exact client absence or
+terminal evidence. Pending
+cancellation stays visible in Devices but needs no further attention. The existing
+`PUSH_RESUME_REJECTED` cleans interrupted client state without an active-worker
+cancellation protocol. Files already applied are not rolled back.
+An offline client that has already received all bytes may finish local validation
+and apply before it can observe the cancellation request.
+
+Retry failed devices creates a new job with the same artifact. Retried targets are
+removed from the old job's actionable state; historical results and unresolved
+fences remain. Activity log is read-only, with controls in the job attention panel.
+Cancellation requires additive database schema 3; back up before deployment because
+older servers cannot open it. Deploy the server and matching client APK together;
+the rollout assumes the old APK has no active Push/Sync transfer because its
+unscoped job-v1 URL is intentionally no longer accepted. No new dependency is
+introduced.
+See [operator controls](PUSH_JOBS.md#operator-controls) for details.
 
 ## Building the MDM Client
 
@@ -461,9 +489,9 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
 | `DOWNLOAD_COMPLETE` | Install/legacy: the existing post-download signal. Job-v1 Push: an exact `job_id`, `attempt`, and `artifact_id` checkpoint emitted only after exact-size/basic ZIP/path validation; it **does not** release the network slot. |
 | `PUSH_JOB_ACCEPTED` / `PUSH_JOB_REJECTED` | Exact command acceptance after the client durably persists active state, or a duplicate-safe rejection (`device_busy`, `client_persistence_unavailable`, malformed identity, destination/artifact conflict). A persistence rejection keeps the MDM process alive but starts no worker. Fields include `job_id`, fixed `attempt=1`, and current phase/reason. |
-| `PUSH_TRANSFER_COMPLETE` | Job-v1 verified network EOF checkpoint. Fields: `job_id`, `attempt`, `artifact_id`, cumulative exact `received_size` including a validated resume prefix. This matching message releases only that job's transfer slot. |
-| `PUSH_PHASE` | Job-v1 phase transition, currently `phase=applying`, carrying exact identity. |
-| `PUSH_RECONCILE_REPORT` | Exact `active`, `absent`, or `interrupted` answer to a server reconciliation request. A resumable interrupted report proves `artifact_id`, immutable dispatch `revision`, and local `validated_offset`; missing or mismatched identity is never requeued. `absent` is sent only in response to that request. |
+| `PUSH_TRANSFER_COMPLETE` | Job-v1 post-SHA-256 checkpoint. Fields: `job_id`, `attempt`, `artifact_id`, cumulative exact `received_size` including a validated resume prefix. It follows `PUSH_PHASE validating` and accepts an exact reconciling assignment if that phase was lost. |
+| `PUSH_PHASE` | Job-v1 phase transition. `phase=validating` carries `artifact_id` and is sent after all bytes arrive but before SHA-256; it releases the HTTP slot and stops the 60-second write watchdog. `phase=applying` follows artifact and destination validation. Both carry `job_id` and `attempt`. |
+| `PUSH_RECONCILE_REPORT` | Exact `active`, `absent`, or `interrupted` answer to a server reconciliation request. A resumable interrupted report proves `artifact_id`, immutable dispatch `revision`, and local `validated_offset`; missing or mismatched identity is never requeued. `server_lease_revoked` maps to the existing per-device `download_retry_exhausted` Resume gate. `absent` is sent only in response to that request. |
 | `PUSH_FILES_RESULT` | Durable terminal result. Job-v1 fields: `job_id`, fixed `attempt=1`, `status`, `dest_path`, success counts or `failure_code` + `detail`. The client retains it until a matching accepted or permanent-rejection ACK and can replay the bounded completed receipt during exact reconciliation. |
 | `PUSH_STATE_RETRY_RESULT` | Response to an explicit console recovery request. Carries `success`/`failed`, refreshed capabilities, `push_state`, and `push_runtime`. The server updates device health only; it does not wake or dispatch the Push scheduler. |
 | `VERIFY_APK_RESULT` | Result of an APK integrity check. Fields: `package_name`, `found` (boolean), `size`, `cd_sha256`, `full_sha256`, `version_code`, `version_name`, `signer_sha256`, `error` (optional). Absent hash/version fields when `found` is false. |
@@ -482,7 +510,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename`, plus `full_sha256` + `cd_sha256` (reference hashes of the file being dispatched; present only when the APK is a local upload in `apks/`). The client verifies the download against `full_sha256` before installing; a **self**-update is refused outright when the hashes are absent. |
 | `REGISTERED` | Server acknowledgement after ownership/capability processing. Field: `session_id`. The client then enables command handling, starts battery telemetry, and replays its durable pending terminal outbox. |
 | `REGISTERED_PROVISIONAL` | Acknowledges a provisional registration or status update. Fields: server-issued `connection_id`. After this ACK, a client with `provisional_power_control_v1` may accept only `EXECUTE_REBOOT` and `EXECUTE_POWER_OFF` carrying the same ID; battery telemetry, Push, and all other commands remain disabled until canonical registration completes. |
-| `EXECUTE_PUSH_FILES` | Job-v1 fields: `job_id`, fixed `attempt=1`, immutable per-device dispatch `revision`, immutable `artifact_id`, absolute `artifact_url`, exact size/SHA-256/strong-ETag metadata, destination, and server-derived `delete_extras`. A resumed command keeps the original dispatch revision even when the aggregate job revision advanced. Issue #91 commands without `revision` remain executable as non-resumable work, and legacy fields remain accepted during migration. Safety-critical fields that are present require their exact JSON types. |
+| `EXECUTE_PUSH_FILES` | Push-job fields: `job_id`, fixed `attempt=1`, immutable per-device dispatch `revision`, immutable `artifact_id`, absolute `artifact_url` with an in-memory assignment `lease` token, exact size/SHA-256/strong-ETag metadata, destination, and server-derived `delete_extras`. Every job target must advertise `push_job_id_v1`; large artifacts also require `push_resume_v1`. A resumed command keeps the original dispatch revision and gets a new lease token. Commands without job-v1 identity are not admitted as job targets. The standalone `/api/bundles` Push flow still uses the separate legacy command format. Safety-critical fields that are present require their exact JSON types. |
 | `PUSH_RESULT_ACK` | Terminal-result disposition. Fields: exact identity, `accepted`, committed `revision` when a local canonical job exists, and on rejection `reason` plus `retryable`. The client retains retryable results; accepted or permanently rejected results leave the pending outbox while remaining in bounded dedupe receipts. |
 | `PUSH_RECONCILE_REQUEST` | Requests exact status for one or more `{job_id, attempt, artifact_id}` identities. It never directly clears a fence. |
 | `PUSH_RESUME_REJECTED` | Permanently rejects one exact interrupted resume identity (`job_id`, `attempt`, `artifact_id`, immutable dispatch `revision`). The client durably clears only that matching active record, removes its job-owned work, and replies with an `absent` reconciliation report. |
@@ -499,7 +527,9 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `DELETE_APP` | Uninstall an app from target devices (the console gates it behind a confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only), `package_name`. STYLY-MDM's own packages are rejected — `RETIRE_DEVICE` is the only sanctioned way to remove the client. See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_DEVICE` / `POWER_OFF_DEVICE` | Reboot or power off target devices (the console gates both behind a shared confirmation). Normal targets use `target_devices` (list of device IDs or `["*"]`; online devices only). Need attention targets use `target_connections` (a non-empty list of server-issued connection IDs) instead. The two fields cannot be combined; `target_connections` rejects empty arrays, duplicates, and wildcards, and never falls back to normal-device resolution. Only these two message types may contain `target_connections`. See [Remote Power Control](#remote-power-control). |
 | `INSTALL_APK` | Install an uploaded APK on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `apk_url`, `apk_filename` |
-| `PUSH_FILES` | New flow: `{job_id}` only; the server reads mode, destination, targets, and immutable artifact metadata from SQLite and enables/resumes that job's dispatch gate. The older bundle-shaped message remains migration-only compatibility. |
+| `PUSH_FILES` | Push-job flow: `job_id` and optional `target_devices` for scoped Resume; the server reads mode, destination, and immutable artifact metadata from SQLite. Every target must support `push_job_id_v1`; the legacy job fallback is disabled. The separate standalone `/api/bundles` Push flow still sends the older bundle-shaped message. |
+| `CANCEL_PUSH_JOB` | Persist cancellation for eligible interrupted or unresolved assignments. Fields: `job_id`, optional `target_devices`; missing targets means all applicable assignments. A live HTTP lease is revoked, while device ownership remains until exact cleanup or terminal evidence. |
+| `RETRY_FAILED_PUSH_JOB` | Create a new job for failed targets using the retained artifact. Fields: `job_id`, idempotent `client_request_id`. |
 | `RETRY_PUSH_STATE` | Explicit recovery for one or more affected online devices. Fields: `target_devices`. The server filters to sessions advertising `push_state_retry_v1` with `push_state.status=unavailable`; no offline request is queued and no Push scheduler wake occurs. |
 | `RECONCILE_PUSH_DEVICE` | Re-requests exact reconciliation for a fenced device. Field: `device_id`. It cannot force-clear state or a fence without matching client/process evidence. |
 | `VERIFY_APK` | Verify an installed package against a local reference on target devices. Fields: `target_devices`, `package_name`. The reference (`size` + CD digest) is computed and compared in the browser and is **never** sent to the server. |
@@ -520,7 +550,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `GET /apks/{filename}` | Serves uploaded APK files to devices on the LAN, and backs the console's top-bar client-APK download link (see the client-APK download note below). |
 | `POST /api/push-jobs` | Validate a canonical request and commit `job_id` + per-device rows before any upload bytes. `client_request_id` makes identical replay idempotent; conflicting reuse is 409. |
 | `POST /api/push-jobs/{job_id}/upload` | Job-owned multipart upload, measured limits, packaging, fsync + atomic immutable artifact publication, then `ready`. |
-| `GET /artifacts/{artifact_id}` | DB-resolved immutable ZIP with identity encoding, `Accept-Ranges: bytes`, and a stable SHA-256 strong ETag. Supports full `200`, validated single-range `206`, strong `If-Match` failure `412`, and `416` with `Content-Range: bytes */T`; an expired tombstoned identity remains unavailable and is never reused. |
+| `GET /artifacts/{artifact_id}?lease=...` | DB-resolved immutable job-v1 ZIP with identity encoding, `Accept-Ranges: bytes`, stable SHA-256 strong ETag, and an in-memory token scoped to the assignment's transfer slot. Supports full `200`, validated single-range `206`, strong `If-Match` failure `412`, and `416` with `Content-Range: bytes */T`. A missing or revoked job-v1 token returns `409` with `X-Push-Lease-Status: revoked`; server restart invalidates all such tokens. An expired tombstoned identity remains unavailable and is never reused. |
 | `POST /api/bundles` / `GET /bundles/{filename}` | Legacy compatibility only. The new console Push/Sync flow does not use these routes. |
 
 ### Server → Admin
@@ -540,6 +570,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `PUSH_JOBS_SNAPSHOT` | Sent after the normal initial admin metadata. Contains every non-terminal job, bounded recent terminal jobs, and fence-visible metadata as a complete replacement snapshot. Updates that race ahead of it on the same connection are buffered and revision-merged by the console. If this initial snapshot cannot be sent, the server closes that admin socket so the existing reconnect loop requests a fresh snapshot instead of buffering forever. |
 | `PUSH_JOB_UPDATED` | Canonical full snapshot after a committed mutation. A single server publisher coalesces pending revisions per `job_id`; console state merges only monotonically newer revisions. |
 | `PUSH_FILES_SENT` | Job dispatch/resume acknowledgement. Fields include `job_id`, committed `revision`, canonical state/gate, target count, and shared transfer limit. |
+| `PUSH_JOB_ACTION_SENT` | Acknowledges `CANCEL_PUSH_JOB` or `RETRY_FAILED_PUSH_JOB`. Fields: `job_id`, `action`; cancellation results remain pending until exact client evidence arrives. |
 | `PUSH_STATE_RETRY_SENT` / `PUSH_STATE_RETRY_RESULT` | Small-control acknowledgements for explicit durable-state recovery. They report target/sent counts and each device's success/failure; neither represents or initiates artifact transfer. |
 | `LAUNCH_RESULT` | Forwarded result from a device |
 | `DELETE_APP_RESULT` | Forwarded uninstall result from a device (adds `device_id`). A `success` is followed by a fresh `DEVICE_LIST` when the device's recorded startup app still named the removed package, since the server then drops that record. See [Remote App Uninstall](#remote-app-uninstall). |
@@ -647,41 +678,43 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > would strand the coroutines already parked on the old object and briefly allow twice
 > the cap.
 >
-> Slot-release triggers, in order of preference:
+> Slot-release behavior:
 >
-> 1. `DOWNLOAD_COMPLETE` from the client (primary — releases the moment the
->    network-heavy download ends, so the local install / unzip + mirror proceeds off
->    the critical path).
-> 2. The terminal result — `INSTALL_RESULT` or `PUSH_FILES_RESULT` (fallback — covers
->    older clients that never emit `DOWNLOAD_COMPLETE`, and clients whose download
->    failed outright).
-> 3. Device disconnect for Install (Push keeps its exact slot because the Android
->    HTTP worker continues independently of the WebSocket).
-> 4. A per-device timeout (`MDM_TRANSFER_TIMEOUT` seconds, default **600**) so a
->    silent/stuck device cannot block the queue. Lowering it recovers stuck slots
->    sooner but risks releasing a slow-but-healthy transfer early, which only
->    relaxes throttling and never drops the job itself.
+> 1. APK install and standalone `/api/bundles` Push keep their existing completion, terminal-result,
+>    disconnect, and `MDM_TRANSFER_TIMEOUT` (default **600 seconds**) behavior.
+> 2. Job-v1 Push releases its exact slot on `PUSH_PHASE validating` after all
+>    artifact bytes arrive and before SHA-256 (or on a matching terminal outcome).
+>    `PUSH_TRANSFER_COMPLETE` follows verification. Its artifact URL carries a random in-memory token
+>    scoped to `(job_id, device_id, attempt)`.
+> 3. If no HTTP response bytes are successfully written for 60 seconds, the server
+>    revokes that token, aborts and awaits the matching HTTP handler, then releases
+>    the slot. Successful writes renew the lease, so healthy large transfers can
+>    exceed 600 seconds without losing their slot.
+>    The accepted-work reconciliation deadline also defers while this exact HTTP
+>    lease is live; its watchdog owns the 60-second stalled-stream recovery.
 >
 > `pending_transfers` is keyed by **`(device_id, task)`**, not by device: an admin can
 > push files to a group that is already installing an APK, so one device may hold an
 > install slot and a push slot at once. Each terminal message frees only its own task's
-> slot. A disconnect still releases Install ownership, but an active Push lease is
-> retained across WebSocket replacement and rebuilt from an exact `downloading`
-> report after server restart.
+> slot. A disconnect still releases Install ownership; a healthy job-v1 Push HTTP transfer
+> remains bound to its exact token and slot even after WebSocket replacement. A server
+> restart discards these in-memory tokens. The old URL is rejected and a partial
+> download must be manually resumed to get a new token and slot. Old unscoped job-v1
+> URLs are intentionally unsupported after rollout, which is scheduled with no active
+> old-APK Push/Sync transfer. APK install and standalone `/api/bundles` Push remain
+> unchanged.
 >
-> This is fully backward compatible in both directions. An older client that never
-> emits `DOWNLOAD_COMPLETE` for a push still frees its slot via `PUSH_FILES_RESULT` or
-> the timeout, and one that omits the `task` field is read as `install`, exactly as
-> before. An older server simply logs the message as unknown (pre-#35) or treats it as
-> an install release (pre-#44) — at worst that frees an install slot early, which only
-> relaxes throttling.
+> The standalone `/api/bundles` Push path and APK-install protocol are unchanged. The
+> new assignment token applies to all Push-job artifact downloads; old unscoped job-v1
+> URLs are intentionally rejected after rollout, and the legacy job fallback is
+> disabled because it cannot carry an assignment token.
 >
 > Admins see install aggregate progress via `INSTALL_PROGRESS`. `PUSH_PROGRESS` is
-> retained only for the migration-only legacy Push path; the current job-v1 console
+> retained only for the standalone `/api/bundles` Push path; the current job-v1 console
 > uses full `PUSH_JOB_UPDATED` snapshots instead.
 
 > **Per-device transfer state.** `INSTALL_PROGRESS` carries only aggregate counts, so
-> install also broadcasts `INSTALL_DEVICE_STATE`. The migration-only legacy Push path
+> install also broadcasts `INSTALL_DEVICE_STATE`. The standalone `/api/bundles` Push path
 > retains its corresponding `PUSH_PROGRESS` / `PUSH_DEVICE_STATE`; job-v1 derives the
 > same `Waiting…` → `Transferring…` → `Pushing…` / `Syncing…` → terminal display from
 > canonical assignment states in each full job snapshot.
@@ -1543,3 +1576,7 @@ PY
 A clean run — `HTTP 200`, a discovery JSON reply advertising the WS port, and a
 freshly created `/tmp/styly-data/apks/` — confirms the published artifact installs and
 runs. Only then approve the `pypi` environment to promote the release to PyPI.
+
+Activity log is read-only history. Resume all, Cancel all, Retry failed devices,
+and Reconcile are shown in the Needs attention tab. Eligible devices also expose
+their own Resume and Cancel controls; there is no separate Dispatch button.

@@ -131,6 +131,104 @@ class PushJobManager:
 
         self.store._call_sync(op)
 
+    async def retry_failed(
+        self, job_id: str, client_request_id: str, *, artifact_root: Path
+    ) -> tuple[bool, dict[str, Any]]:
+        """Queue unsuccessful targets in a new job, retaining history and fences."""
+        from .push_jobs import require_uuid
+
+        job_id = require_uuid(job_id, "job_id")
+        client_request_id = require_uuid(client_request_id, "client_request_id")
+        fingerprint = "retry_failed:" + job_id
+        root = artifact_root.resolve()
+
+        def op(conn: sqlite3.Connection) -> tuple[bool, dict[str, Any]]:
+            self.store._begin(conn)
+            try:
+                existing = conn.execute(
+                    "SELECT job_id, request_fingerprint FROM push_jobs WHERE client_request_id=?",
+                    (client_request_id,),
+                ).fetchone()
+                if existing is not None:
+                    if existing["request_fingerprint"] != fingerprint:
+                        raise StoreConflict("client_request_id was already used for a different request")
+                    snapshot = self.store._snapshot(conn, existing["job_id"])
+                    self.store._commit(conn)
+                    return False, snapshot
+                original = conn.execute(
+                    "SELECT * FROM push_jobs WHERE job_id=?", (job_id,)
+                ).fetchone()
+                if original is None:
+                    raise StoreNotFound(job_id)
+                targets = conn.execute(
+                    "SELECT * FROM push_job_devices d WHERE job_id=? "
+                    "AND cancel_requested_at IS NULL "
+                    "AND NOT EXISTS (SELECT 1 FROM push_jobs r JOIN push_job_devices rd ON rd.job_id=r.job_id "
+                    "WHERE r.request_fingerprint=? AND rd.device_id=d.device_id) "
+                    "AND state IN ('failed','interrupted','unconfirmed') "
+                    "AND COALESCE(failure_code,'') <> 'cancelled' ORDER BY target_ordinal",
+                    (job_id, fingerprint),
+                ).fetchall()
+                if not targets:
+                    raise StoreConflict("job has no unsuccessful targets to retry")
+                artifact = conn.execute(
+                    "SELECT * FROM push_artifacts WHERE artifact_id=?",
+                    (original["artifact_id"],),
+                ).fetchone()
+                if artifact is None or artifact["retention_state"] == "deleted":
+                    raise StoreConflict("retry artifact is no longer available; upload a new job")
+                path = root / artifact["storage_name"]
+                if (path.resolve().parent != root or not path.is_file()
+                        or path.stat().st_size != artifact["byte_size"]):
+                    raise StoreConflict("retry artifact is missing or incomplete; upload a new job")
+                timestamp = now_ms()
+                retry_id = str(uuid.uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO push_jobs(
+                        job_id, client_request_id, request_fingerprint, revision, state,
+                        mode, dest_path, source_label, declared_file_count,
+                        declared_total_bytes, actual_file_count, actual_total_bytes,
+                        artifact_id, dispatch_enabled, created_at, create_expires_at,
+                        ready_at, updated_at
+                    ) VALUES (?, ?, ?, 1, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                    """,
+                    (retry_id, client_request_id, fingerprint, original["mode"],
+                     original["dest_path"], original["source_label"],
+                     original["declared_file_count"], original["declared_total_bytes"],
+                     original["actual_file_count"], original["actual_total_bytes"],
+                     artifact["artifact_id"], timestamp, timestamp, timestamp, timestamp),
+                )
+                start_seq = self.store._next_enqueue_seq(conn, len(targets))
+                for ordinal, target in enumerate(targets):
+                    conn.execute(
+                        """
+                        INSERT INTO push_job_devices(
+                            job_id, device_id, enqueue_seq, target_ordinal,
+                            protocol_mode, create_capability_snapshot_json,
+                            state, queue_reason, attempt, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'queued', 'awaiting_dispatch', 1, ?)
+                        """,
+                        (retry_id, target["device_id"], start_seq + ordinal, ordinal,
+                         target["protocol_mode"], target["create_capability_snapshot_json"],
+                         timestamp),
+                    )
+                # GC uses this same worker and transaction boundary. The new READY
+                # job is a durable lease before any collector can delete the bytes.
+                conn.execute(
+                    "UPDATE push_artifacts SET retention_state='retained' WHERE artifact_id=?",
+                    (artifact["artifact_id"],),
+                )
+                self.store._increment_revision(conn, job_id, timestamp)
+                snapshot = self.store._snapshot(conn, retry_id)
+                self.store._commit(conn)
+                return True, snapshot
+            except BaseException:
+                self.store._rollback(conn)
+                raise
+
+        return await self.store._call(op)
+
     async def find_idempotent_job(
         self, client_request_id: str, request_fingerprint: str
     ) -> dict[str, Any] | None:
@@ -362,6 +460,8 @@ class PushJobManager:
                     FROM push_job_devices d
                     JOIN push_jobs j ON j.job_id=d.job_id
                     WHERE d.state=?
+                      AND COALESCE(d.queue_reason, '') NOT IN ('download_retry_exhausted','client_restarted','dispatch_paused')
+                      AND d.cancel_requested_at IS NULL
                       AND d.device_id IN ({online_marks})
                       AND j.dispatch_enabled=1
                       AND j.state IN (?, ?)
@@ -456,7 +556,7 @@ class PushJobManager:
             self.store._begin(conn)
             try:
                 row = conn.execute(
-                    "SELECT d.state, d.attempt, d.dispatch_revision, j.dispatch_enabled "
+                    "SELECT d.state, d.attempt, d.dispatch_revision, d.queue_reason, d.cancel_requested_at, j.dispatch_enabled "
                     "FROM push_job_devices d JOIN push_jobs j ON j.job_id=d.job_id "
                     "WHERE d.job_id=? AND d.device_id=?",
                     (job_id, device_id),
@@ -468,13 +568,13 @@ class PushJobManager:
                 current = DeviceState(row["state"])
                 validate_device_transition(current, DeviceState.DISPATCHING)
                 timestamp = now_ms()
-                if not row["dispatch_enabled"]:
-                    # A different device may pause the job while this assignment
-                    # waits for a shared slot. It has not been dispatched yet.
+                if row["cancel_requested_at"] is not None or not row["dispatch_enabled"] or row["queue_reason"] in {"download_retry_exhausted", "client_restarted", "dispatch_paused"}:
+                    # Recheck authorization after waiting for a shared slot;
+                    # this assignment has not been dispatched yet.
                     conn.execute(
                         "UPDATE push_job_devices SET state=?, queue_reason=?, updated_at=? "
                         "WHERE job_id=? AND device_id=?",
-                        (DeviceState.QUEUED.value, "awaiting_dispatch", timestamp, job_id, device_id),
+                        (DeviceState.QUEUED.value, row["queue_reason"] or "dispatch_paused", timestamp, job_id, device_id),
                     )
                     self.store._increment_revision(conn, job_id, timestamp)
                     self.store._rederive_job(conn, job_id, timestamp)
@@ -482,7 +582,7 @@ class PushJobManager:
                     self.store._commit(conn)
                     return snapshot
                 result = conn.execute(
-                    "UPDATE push_job_devices SET state=?, protocol_mode=?, "
+                    "UPDATE push_job_devices SET state=?, protocol_mode=?, queue_reason=NULL, "
                     "dispatch_capability_snapshot_json=?, accept_deadline=?, "
                     "updated_at=? WHERE job_id=? AND device_id=? AND state=?",
                     (
@@ -580,9 +680,13 @@ class PushJobManager:
                     and 0 <= validated_offset <= int(row["byte_size"] or 0)
                 )
                 current = DeviceState(row["state"])
-                retry_exhausted = reason == "download_retry_exhausted"
+                retry_exhausted = reason in {
+                    "download_retry_exhausted", "server_lease_revoked", "storage_write_failed"
+                }
+                manual_restart = reason == "client_restarted" and row["queue_reason"] != "resumable_replay"
                 resumable = (
                     row["attempt"] == attempt == 1
+                    and row["cancel_requested_at"] is None
                     and row["protocol_mode"] == ProtocolMode.JOB_V1.value
                     and CAP_PUSH_RESUME_V1 in capabilities
                     and (
@@ -617,14 +721,6 @@ class PushJobManager:
                 if current is DeviceState.DOWNLOADING:
                     validate_device_transition(current, DeviceState.RECONCILING)
                 validate_device_transition(DeviceState.RECONCILING, DeviceState.QUEUED)
-                if retry_exhausted:
-                    # Use the existing job-level Resume gate. Other workers already
-                    # running for this job continue; no new downloads start until Resume.
-                    conn.execute(
-                        "UPDATE push_jobs SET dispatch_enabled=0, "
-                        "dispatch_paused_reason='download_retry_exhausted' WHERE job_id=?",
-                        (job_id,),
-                    )
                 conn.execute(
                     """
                     UPDATE push_job_devices SET state=?, queue_reason=?,
@@ -635,7 +731,9 @@ class PushJobManager:
                     """,
                     (
                         DeviceState.QUEUED.value,
-                        "resumable_replay",
+                        "download_retry_exhausted" if retry_exhausted else "client_restarted" if manual_restart else (
+                            "dispatch_paused" if row["queue_reason"] == "dispatch_paused" else "resumable_replay"
+                        ),
                         validated_offset,
                         timestamp,
                         job_id,
@@ -648,6 +746,170 @@ class PushJobManager:
                 snapshot = self.store._snapshot(conn, job_id)
                 self.store._commit(conn)
                 return "requeued", snapshot
+            except BaseException:
+                self.store._rollback(conn)
+                raise
+
+        return await self.store._call(op)
+
+    async def cancel_interrupted(self, job_id: str, device_id: str) -> dict[str, Any]:
+        """Persist cancellation; retain ownership until exact cleanup evidence."""
+        def op(conn: sqlite3.Connection) -> dict[str, Any]:
+            self.store._begin(conn)
+            try:
+                row = conn.execute("SELECT * FROM push_job_devices WHERE job_id=? AND device_id=?",
+                                   (job_id, device_id)).fetchone()
+                if row is None:
+                    raise StoreNotFound(f"{job_id}/{device_id}")
+                if row["cancel_requested_at"] is None and row["failure_code"] != "cancelled":
+                    capabilities = json.loads(row["dispatch_capability_snapshot_json"] or "[]")
+                    waiting = row["state"] == "queued" and row["queue_reason"] in {
+                        "download_retry_exhausted", "client_restarted", "dispatch_paused"}
+                    fenced = row["state"] == "unconfirmed" and conn.execute(
+                        "SELECT 1 FROM push_device_fences WHERE device_id=? AND blocking_job_id=? AND blocking_attempt=?",
+                        (device_id, job_id, row["attempt"])).fetchone() is not None
+                    if (not (waiting or row["state"] == "reconciling" or fenced)
+                            or CAP_PUSH_RESUME_V1 not in capabilities or row["dispatch_revision"] is None):
+                        raise StoreConflict("Only interrupted or unconfirmed transfers can be cancelled")
+                    timestamp = now_ms()
+                    conn.execute("UPDATE push_job_devices SET cancel_requested_at=?, updated_at=? WHERE job_id=? AND device_id=?",
+                                 (timestamp, timestamp, job_id, device_id))
+                    self.store._increment_revision(conn, job_id, timestamp)
+                snapshot = self.store._snapshot(conn, job_id)
+                self.store._commit(conn)
+                return snapshot
+            except BaseException:
+                self.store._rollback(conn)
+                raise
+        return await self.store._call(op)
+
+    async def pending_cancellations_for_device(self, device_id: str) -> list[dict[str, Any]]:
+        return await self.store._call(lambda conn: [dict(row) for row in conn.execute(
+            "SELECT d.*, j.artifact_id FROM push_job_devices d JOIN push_jobs j ON j.job_id=d.job_id "
+            "WHERE d.device_id=? AND d.cancel_requested_at IS NOT NULL "
+            "AND d.state NOT IN ('failed','succeeded','interrupted')", (device_id,)).fetchall()])
+
+    async def confirm_cancel(self, job_id: str, device_id: str) -> list[dict[str, Any]]:
+        """Caller must verify exact absent or terminal evidence from the live owner."""
+        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            self.store._begin(conn)
+            try:
+                row = conn.execute("SELECT * FROM push_job_devices WHERE job_id=? AND device_id=?",
+                                   (job_id, device_id)).fetchone()
+                if row is None or row["cancel_requested_at"] is None or row["state"] in {"failed", "succeeded", "interrupted"}:
+                    self.store._commit(conn)
+                    return []
+                timestamp = now_ms()
+                conn.execute("UPDATE push_job_devices SET state='failed', queue_reason=NULL, terminal_at=?, updated_at=?, "
+                             "failure_code='cancelled', failure_detail='Client confirmed cancelled work is absent', "
+                             "accept_deadline=NULL, reconciliation_reason=NULL, reconciliation_deadline=NULL "
+                             "WHERE job_id=? AND device_id=?", (timestamp, timestamp, job_id, device_id))
+                conn.execute("DELETE FROM push_device_fences WHERE device_id=? AND blocking_job_id=? AND blocking_attempt=?",
+                             (device_id, job_id, row["attempt"]))
+                ids = self._visible_job_ids(self.store, conn, device_id, job_id)
+                for affected in ids:
+                    self.store._increment_revision(conn, affected, timestamp)
+                self.store._rederive_job(conn, job_id, timestamp)
+                snapshots = [self.store._snapshot(conn, affected) for affected in ids]
+                self.store._commit(conn)
+                return snapshots
+            except BaseException:
+                self.store._rollback(conn)
+                raise
+        return await self.store._call(op)
+
+    async def settle_cancelled_late_result(
+        self,
+        job_id: str,
+        device_id: str,
+        attempt: int,
+        status: str,
+        *,
+        added: int = 0,
+        updated: int = 0,
+        deleted: int = 0,
+        failure_code: str | None = None,
+        failure_detail: str | None = None,
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        """Settle an exact terminal result for a cancelled, fenced assignment.
+
+        A success is stronger evidence than the earlier unconfirmed timeout and
+        must remain visible as a success. Other failures retain their exact terminal
+        details; only explicit cancellation-confirmation codes become ``cancelled``.
+        """
+        if (
+            isinstance(attempt, bool)
+            or attempt != 1
+            or not isinstance(status, str)
+            or status not in {"success", "fail"}
+        ):
+            return False, []
+
+        def op(conn: sqlite3.Connection) -> tuple[bool, list[dict[str, Any]]]:
+            self.store._begin(conn)
+            try:
+                assignment = conn.execute(
+                    "SELECT state, attempt, cancel_requested_at FROM push_job_devices "
+                    "WHERE job_id=? AND device_id=?",
+                    (job_id, device_id),
+                ).fetchone()
+                fence = conn.execute(
+                    "SELECT blocking_job_id, blocking_attempt FROM push_device_fences "
+                    "WHERE device_id=?",
+                    (device_id,),
+                ).fetchone()
+                if (
+                    assignment is None
+                    or assignment["state"] != DeviceState.UNCONFIRMED.value
+                    or assignment["attempt"] != attempt
+                    or assignment["cancel_requested_at"] is None
+                    or fence is None
+                    or fence["blocking_job_id"] != job_id
+                    or fence["blocking_attempt"] != attempt
+                ):
+                    self.store._commit(conn)
+                    return False, []
+
+                timestamp = now_ms()
+                succeeded = status == "success"
+                cancelled = not succeeded and failure_code in {
+                    "cancelled",
+                    "resume_not_authorized",
+                }
+                conn.execute(
+                    "UPDATE push_job_devices SET state=?, queue_reason=NULL, updated_at=?, "
+                    "terminal_at=?, failure_code=?, failure_detail=?, added=?, updated=?, deleted=?, "
+                    "accept_deadline=NULL, reconciliation_reason=NULL, reconciliation_deadline=NULL "
+                    "WHERE job_id=? AND device_id=?",
+                    (
+                        DeviceState.SUCCEEDED.value if succeeded else DeviceState.FAILED.value,
+                        timestamp,
+                        timestamp,
+                        None if succeeded else ("cancelled" if cancelled else failure_code),
+                        None if succeeded else (
+                            "Client confirmed cancelled work is absent"
+                            if cancelled
+                            else failure_detail
+                        ),
+                        added if not cancelled else 0,
+                        updated if not cancelled else 0,
+                        deleted if not cancelled else 0,
+                        job_id,
+                        device_id,
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM push_device_fences WHERE device_id=? AND blocking_job_id=? "
+                    "AND blocking_attempt=?",
+                    (device_id, job_id, attempt),
+                )
+                ids = self._visible_job_ids(self.store, conn, device_id, job_id)
+                for affected in ids:
+                    self.store._increment_revision(conn, affected, timestamp)
+                self.store._rederive_job(conn, job_id, timestamp)
+                snapshots = [self.store._snapshot(conn, affected) for affected in ids]
+                self.store._commit(conn)
+                return True, snapshots
             except BaseException:
                 self.store._rollback(conn)
                 raise
@@ -903,6 +1165,10 @@ class PushJobManager:
                     self.store._commit(conn)
                     return []
                 blocking_job_id = fence["blocking_job_id"]
+                if conn.execute("SELECT 1 FROM push_job_devices WHERE job_id=? AND device_id=? AND cancel_requested_at IS NOT NULL",
+                                (blocking_job_id, device_id)).fetchone():
+                    self.store._commit(conn)
+                    return []
                 ids = self._visible_job_ids(
                     self.store, conn, device_id, blocking_job_id
                 )
