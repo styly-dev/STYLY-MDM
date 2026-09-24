@@ -33,51 +33,9 @@ The authoritative implementation and protocol guide is
 dispatch, command acceptance, transfer completion, validation/apply, terminal result,
 ACK, restart recovery, and persistent device-fence reconciliation.
 
-Issue #94 registration is assembled only after the coordinator actor has loaded
-and persisted durable Push state; the main looper never blocks on that storage
-work. Interrupted ownership expires locally after 24 hours as `resume_expired`,
-which durably releases the client execution gate and removes only that exact
-job-owned partial. The server keeps canonical ownership until it receives the
-terminal replay or exact reconciliation evidence.
-
-Push/Sync downloads recover automatically while less than 60 seconds pass without
-artifact bytes. Only data progress resets this monotonic window; reconnect and
-response headers do not. After expiry, the client retains its partial and requires
-manual Resume. Other devices continue. Management connection loss does not stop
-HTTP that is progressing, and validation/apply continue once download is complete.
-After all bytes arrive, the client sends `PUSH_PHASE validating` before hashing.
-The server releases that transfer slot and stops its HTTP-write watchdog; the
-verified `PUSH_TRANSFER_COMPLETE` follows SHA-256 verification.
-Local file write and sync failures do not refresh the download deadline or
-trigger another network request. When exact resumable metadata and partial bytes
-remain, `storage_write_failed` retains them for manual Resume after storage is
-repaired; failures without a valid partial are terminal.
-Application restart reports `client_restarted` and requires Resume. Server restart
-also invalidates the in-memory HTTP lease: a retry of the old URL is rejected as
-`server_lease_revoked`, retaining the partial until manual Resume issues a new URL.
-While the server remains up, a Range reconnect with the same live lease replaces
-an older HTTP handler that has not noticed the client disconnect yet.
-Resume never extends the first interruption's 24-hour retention deadline.
-
-Resume is online-only; Resume all skips offline devices. Cancel also works for
-unresolved offline assignments: a durable request suppresses future replay while
-revoking any live HTTP lease. Ownership is retained until exact client absence or
-terminal evidence. Pending
-cancellation stays visible in Devices but needs no further attention. The existing
-`PUSH_RESUME_REJECTED` cleans interrupted client state without an active-worker
-cancellation protocol. Files already applied are not rolled back.
-An offline client that has already received all bytes may finish local validation
-and apply before it can observe the cancellation request.
-
-Retry failed devices creates a new job with the same artifact. Retried targets are
-removed from the old job's actionable state; historical results and unresolved
-fences remain. Activity log is read-only, with controls in the job attention panel.
-Cancellation requires additive database schema 3; back up before deployment because
-older servers cannot open it. Deploy the server and matching client APK together;
-the rollout assumes the old APK has no active Push/Sync transfer because its
-unscoped job-v1 URL is intentionally no longer accepted. No new dependency is
-introduced.
-See [operator controls](PUSH_JOBS.md#operator-controls) for details.
+Issue #94 adds resumable transfers, per-device Resume and Cancel controls, and
+retry of failed targets. See [Push / Sync jobs](PUSH_JOBS.md) for the recovery
+rules, protocol, operator controls, and schema-3 deployment requirements.
 
 ## Building the MDM Client
 

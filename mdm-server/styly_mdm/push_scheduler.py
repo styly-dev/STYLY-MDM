@@ -42,7 +42,6 @@ class LiveSession:
     process_instance_id: str | None
     owner_lock: asyncio.Lock
     http_base: str
-    reported_push_runtime: dict[str, Any] | None = None
 
 
 class PushScheduler:
@@ -952,9 +951,7 @@ class PushScheduler:
                     "artifact_url": artifact_url,
                     "artifact_size": artifact["byte_size"],
                     "artifact_sha256": artifact["sha256"],
-                    "artifact_etag": artifact.get(
-                        "etag", f'"{artifact["sha256"]}"'
-                    ),
+                    "artifact_etag": artifact["etag"],
                 }
             )
         return common

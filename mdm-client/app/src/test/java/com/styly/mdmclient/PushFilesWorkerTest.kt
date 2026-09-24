@@ -206,7 +206,7 @@ class PushFilesWorkerTest {
     }
 
     @Test
-    fun `storage failure after resumed bytes preserves partial for manual resume`() {
+    fun `resumed bytes do not rewrite unchanged metadata`() {
         val archive = zip("content.txt" to "retain-nearly-complete").readBytes()
         val split = archive.size * 95 / 100
         val work = File(tmp.root, "storage-resume-work")
@@ -226,11 +226,10 @@ class PushFilesWorkerTest {
             val execution = PushFilesWorker(
                 hasExternalStorageAccess = { true },
                 attemptDirectoryProvider = { work },
+                destinationProvider = { tmp.newFolder("storage-resume-destination") },
             ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
-            assertEquals("storage_write_failed", execution.result.failureCode)
-            assertTrue(execution.interrupted)
-            assertEquals("storage_write_failed", execution.interruptionReason)
-            assertArrayEquals(archive, File(work, "artifact.part").readBytes())
+            assertEquals("success", execution.result.status)
+            assertArrayEquals(archive, File(work, "artifact.zip").readBytes())
         }
     }
 

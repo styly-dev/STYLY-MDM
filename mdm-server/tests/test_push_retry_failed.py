@@ -120,12 +120,9 @@ async def test_shared_artifact_gc_uses_latest_reference_end(manager, tmp_path, t
         conn.execute('UPDATE push_jobs SET terminal_at=?, updated_at=200 WHERE job_id=?',
                      (terminal_at, retry['job_id']))
     await manager.store._call(finish)
-    manager.rebuild_artifact_retention_sync(retry_window_ms=100, timestamp=299)
     assert (await manager.artifact_record(artifact_id))['retention_state'] == 'retained'
     assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=100, timestamp=299) == []
     assert (tmp_path / (artifact_id + '.zip')).is_file()
-    manager.rebuild_artifact_retention_sync(retry_window_ms=100, timestamp=300)
-    assert (await manager.artifact_record(artifact_id))['retention_state'] == 'gc_eligible'
     assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=100, timestamp=300) == [artifact_id]
     assert not (tmp_path / (artifact_id + '.zip')).exists()
 

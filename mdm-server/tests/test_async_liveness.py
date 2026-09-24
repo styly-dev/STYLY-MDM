@@ -298,6 +298,7 @@ class _DispatchManager:
                 "display_filename": "content.zip",
                 "byte_size": 1,
                 "sha256": "a" * 64,
+                "etag": '"' + "a" * 64 + '"',
             },
             "devices": {"D1": {"attempt": 1, "state": "dispatching"}},
         }

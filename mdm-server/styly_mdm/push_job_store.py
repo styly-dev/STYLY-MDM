@@ -1297,61 +1297,6 @@ class PushJobStore:
 
         return await self._call(op)
 
-    def rebuild_artifact_retention_sync(
-        self, *, retry_window_ms: int, timestamp: int | None = None
-    ) -> None:
-        """Rebuild leases from durable job/device state after a restart.
-
-        A lease is intentionally derived, not held in process memory: queued and
-        active device assignments keep their artifact retained, while terminal
-        jobs become GC-eligible only after every referencing job has passed its
-        configured retry window.
-        """
-
-        observed = now_ms() if timestamp is None else timestamp
-
-        def op(conn: sqlite3.Connection) -> None:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                conn.execute(
-                    """
-                    UPDATE push_artifacts
-                    SET retention_state = CASE
-                        WHEN retention_state='deleted' THEN 'deleted'
-                        WHEN EXISTS (
-                            SELECT 1 FROM push_jobs j
-                            WHERE j.artifact_id=push_artifacts.artifact_id
-                              AND (
-                                  j.state NOT IN ('succeeded','completed_with_errors','failed','interrupted')
-                                  OR EXISTS (
-                                      SELECT 1 FROM push_job_devices d
-                                      WHERE d.job_id=j.job_id
-                                        AND (d.cancel_requested_at IS NOT NULL AND d.state='unconfirmed' OR d.state IN (
-                                            'queued','waiting_transfer','dispatching','downloading',
-                                            'validating','applying','reconciling'
-                                        ))
-                                  )
-                              )
-                        ) THEN 'retained'
-                        WHEN (
-                            SELECT MAX(COALESCE(j.terminal_at,j.updated_at))
-                            FROM push_jobs j
-                            WHERE j.artifact_id=push_artifacts.artifact_id
-                        ) + ? <= ? THEN 'gc_eligible'
-                        ELSE 'retained'
-                    END
-                    WHERE retention_state <> 'deleted'
-                    """,
-                    (retry_window_ms, observed),
-                )
-                conn.execute("COMMIT")
-            except BaseException:
-                if conn.in_transaction:
-                    conn.execute("ROLLBACK")
-                raise
-
-        self._call_sync(op)
-
     def gc_artifacts_sync(
         self,
         artifact_root: Path,
