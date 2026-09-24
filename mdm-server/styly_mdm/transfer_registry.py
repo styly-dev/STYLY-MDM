@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Callable, Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,8 +23,9 @@ class TransferKey:
 
 
 class TransferRegistry:
-    def __init__(self) -> None:
+    def __init__(self, before_release: Callable[[TransferKey], Any] | None = None) -> None:
         self._futures: dict[TransferKey, asyncio.Future[str]] = {}
+        self._before_release = before_release
 
     def register(self, key: TransferKey, future: asyncio.Future[str]) -> None:
         current = self._futures.get(key)
@@ -36,6 +37,8 @@ class TransferRegistry:
         future = self._futures.get(key)
         if future is None or future.done():
             return False
+        if self._before_release is not None:
+            self._before_release(key)
         future.set_result(reason)
         return True
 
@@ -43,6 +46,8 @@ class TransferRegistry:
         released: list[TransferKey] = []
         for key, future in tuple(self._futures.items()):
             if key.device_id == device_id and not future.done():
+                if self._before_release is not None:
+                    self._before_release(key)
                 future.set_result(reason)
                 released.append(key)
         return released
@@ -50,6 +55,8 @@ class TransferRegistry:
     def remove_if_same(self, key: TransferKey, future: asyncio.Future[str]) -> bool:
         if self._futures.get(key) is not future:
             return False
+        if self._before_release is not None:
+            self._before_release(key)
         del self._futures[key]
         return True
 

@@ -135,6 +135,24 @@
     .subtab.active { color: var(--text-primary); border-bottom-color: var(--accent); }
     .subtab.active .cnt { color: var(--text-secondary); }
     .subtabs-fill { flex: 1; border-bottom: 1px solid var(--border); align-self: stretch; }
+    .attention-tab-actions {
+      margin: 12px 20px 0; padding: 12px 14px;
+      background: #162033; border: 1px solid #25324a; border-radius: 8px;
+    }
+    .attention-tab-actions-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .attention-tab-actions-copy { min-width: 0; }
+    .attention-tab-actions-title { color: var(--text-primary); font-size: 13px; font-weight: 600; }
+    .attention-tab-actions-note { margin-top: 3px; color: var(--text-secondary); font-size: 11px; line-height: 1.4; }
+    .attention-tab-actions-buttons { display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+    .attention-tab-action[data-action="resume"] { background: var(--warning); border-color: var(--warning); color: #17130a; }
+    .attention-tab-action[data-action="resume"]:hover:not(:disabled) { background: #f5b91e; border-color: #f5b91e; color: #17130a; }
+    .attention-tab-action[data-action="cancel"] { color: var(--danger); border-color: rgba(248, 113, 113, .55); }
+    .attention-tab-action[data-action="cancel"]:hover:not(:disabled) { border-color: var(--danger); background: rgba(248, 113, 113, .08); }
+    .attention-tab-job-list { display: flex; flex-direction: column; gap: 7px; margin-top: 11px; padding-top: 10px; border-top: 1px solid var(--border-soft); }
+    .attention-tab-job { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12px; }
+    .attention-tab-job-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); }
+    .attention-tab-job-buttons { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+    .attention-tab-job-buttons .push-job-action { min-height: 26px; padding: 3px 8px; font-size: 11px; }
 
     .targets-body { padding: 0; flex: 1 1 0; min-height: 0; overflow-y: auto; }
 
@@ -240,6 +258,19 @@
     .battery-note { color: var(--text-muted); font-size: 11px; margin-left: 4px; }
     .battery-muted { color: var(--text-dim); }
     .dev-task { font-size: 12px; padding-right: 14px; }
+    .push-job-actions { display: inline-flex; align-items: center; gap: 6px; margin-left: 6px; vertical-align: middle; }
+    .push-job-action {
+      display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
+      min-height: 28px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px;
+      background: transparent; color: var(--text-secondary); font-family: inherit; font-size: 12px;
+      font-weight: 600; line-height: 1.2; white-space: nowrap; cursor: pointer;
+      transition: color .15s, border-color .15s, background .15s;
+    }
+    .push-job-action:hover:not(:disabled) { color: var(--text-primary); border-color: #394056; background: var(--bg-tertiary); }
+    .push-job-action[data-action="cancel"] { color: var(--danger); border-color: rgba(248, 113, 113, .55); }
+    .push-job-action[data-action="cancel"]:hover:not(:disabled) { border-color: var(--danger); background: rgba(248, 113, 113, .08); }
+    .push-job-action:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+    .push-job-action:disabled { opacity: .55; cursor: wait; }
     .ins-queued { color: var(--text-muted); }
     .ins-transferring { color: var(--info); }
     .ins-installing { color: var(--warning); }
@@ -283,6 +314,9 @@
 
     .push-attention { margin: 0 18px 12px; padding: 11px 12px; max-height: 180px; overflow-y: auto; background: #2a2415; border: 1px solid #665321; border-radius: 8px; }
     .push-attention-title { color: var(--warning); font-size: 11px; font-weight: 700; letter-spacing: .7px; text-transform: uppercase; margin-bottom: 7px; }
+    .push-attention-summary { display: flex; align-items: center; gap: 10px; }
+    .push-attention-message { min-width: 0; flex: 1 1 auto; color: var(--text-primary); font-size: 12px; line-height: 1.4; }
+    .push-attention-open { flex: 0 0 auto; }
     .push-attention-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-primary); }
     .push-attention-item + .push-attention-item { margin-top: 7px; padding-top: 7px; border-top: 1px solid #55461f; }
     .push-attention-job { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -426,6 +460,7 @@
             <button class="subtab" id="tabAttention" data-tab="attention">Needs attention <span class="cnt" id="cntAttention">0</span></button>
             <div class="subtabs-fill"></div>
           </div>
+          <div class="attention-tab-actions" id="pushJobsTabActions" style="display:none"></div>
           <div class="dev-toolbar" id="devToolbar" style="display:none">
             <input class="dev-search-input" id="devSearch" data-dev-search maxlength="64" placeholder="⌕ Filter devices by name…">
             <div class="seg" id="devStatusFilter" role="group" aria-label="Filter by connection status">
@@ -681,6 +716,7 @@
       const cntDevices = document.getElementById('cntDevices');
       const cntAttention = document.getElementById('cntAttention');
       const targetsBody = document.getElementById('targetsBody');
+      const pushJobsTabActions = document.getElementById('pushJobsTabActions');
       const devToolbar = document.getElementById('devToolbar');
       const devSearchInput = document.getElementById('devSearch');
       const devStatusFilter = document.getElementById('devStatusFilter');
@@ -831,7 +867,7 @@
       function attentionLabelFor(id) {
         const entry = connectionById(id);
         if (!entry) return shortConnectionId(id);
-        return (entry.model || 'Unknown device') + ' (' + (entry.ip || 'unknown') + ', ' + shortConnectionId(id) + ')';
+        return (entry.model || shortConnectionId(id)) + ' (' + (entry.ip || 'unknown') + ', ' + shortConnectionId(id) + ')';
       }
       // Command targets need a live WebSocket, which "updating" (mid self-update,
       // device rebooting) does not have — only strictly-online devices qualify.
@@ -977,8 +1013,14 @@
             // getOnlineIds() on purpose: a device mid self-update ("updating") has no
             // live socket but its Updating… cell must survive the list refresh.
             const keepTask = new Set(devices.filter(isOnline).map(getDeviceId));
-            Object.keys(deviceTaskState).forEach(function (id) { if (!keepTask.has(id)) delete deviceTaskState[id]; });
+            Object.keys(deviceTaskState).forEach(function (id) {
+              // Durable jobs survive disconnects; connectivity is rendered separately.
+              if (!keepTask.has(id) && deviceTaskState[id].owner !== 'push-job-v1') {
+                delete deviceTaskState[id];
+              }
+            });
             syncActiveGroupSelection();
+            if (window.__stylyPushJobsV1Actions) window.__stylyPushJobsV1Actions.refreshConnectivity();
             render();
             break;
           }
@@ -1164,11 +1206,13 @@
       function renderTabs() {
         cntGroups.textContent = groupNames().length;
         cntDevices.textContent = devices.length;
-        cntAttention.textContent = provisionalConnections.length;
-        tabAttention.classList.toggle('has-items', provisionalConnections.length > 0);
+        const attentionCount = provisionalConnections.length + pushAttentionDevices().length;
+        cntAttention.textContent = attentionCount;
+        tabAttention.classList.toggle('has-items', attentionCount > 0);
         tabGroups.classList.toggle('active', targetTab === 'groups');
         tabDevices.classList.toggle('active', targetTab === 'devices');
         tabAttention.classList.toggle('active', targetTab === 'attention');
+        pushJobsTabActions.style.display = targetTab === 'attention' && pushJobsTabActions.children.length ? '' : 'none';
       }
 
       function renderTargets() {
@@ -1176,6 +1220,7 @@
         // below never destroys its input. Just show it on the Devices tab and keep the
         // controls in sync with module state (they persist across re-renders).
         const showToolbar = targetTab === 'devices' && devices.length > 0;
+        pushJobsTabActions.style.display = targetTab === 'attention' && pushJobsTabActions.children.length ? '' : 'none';
         devToolbar.style.display = showToolbar ? '' : 'none';
         if (showToolbar && devSearchInput.value !== deviceSearch) devSearchInput.value = deviceSearch;
         if (showToolbar) syncStatusFilterButtons();
@@ -1189,9 +1234,31 @@
         if (targetTab === 'devices') restoreLabelEditFocus(hadFocus);
       }
 
+      function pushAssignmentFor(id) {
+        const actions = window.__stylyPushJobsV1Actions;
+        return actions ? actions.assignmentFor(id) : null;
+      }
+
+      function pushAttentionDevices() {
+        return devices.filter(function (device) {
+          const assignment = pushAssignmentFor(getDeviceId(device));
+          return assignment && assignment.needsAttention;
+        });
+      }
+
       function renderAttentionHtml() {
-        if (!provisionalConnections.length) return '<div class="empty">No devices need attention</div>';
-        return '<div class="attention-list"><div class="attention-head">' +
+        const canonical = pushAttentionDevices();
+        if (!provisionalConnections.length && !canonical.length) return '<div class="empty">No devices need attention</div>';
+        const jobs = canonical.length ? '<div class="attention-list"><div class="zone-label">Push / Sync jobs</div>' +
+          canonical.map(function (device) {
+            const id = getDeviceId(device);
+            return '<div class="attention-row"><div></div><div class="attention-device">' +
+              '<div class="attention-model">' + esc(labelFor(id)) + '</div>' +
+              '<div class="attention-meta">' + esc(device.status || 'unknown') + ' · ' + esc(device.ip || '-') + '</div></div>' +
+              '<div class="dev-task" data-task-id="' + esc(id) + '">' + progressCellHtml(id) + '</div></div>';
+          }).join('') + '</div>' : '';
+        if (!provisionalConnections.length) return jobs;
+        return jobs + '<div class="attention-list"><div class="zone-label">Device identity · connection power controls</div><div class="attention-head">' +
           '<div class="selbox ' + attentionSelectAllState() + (attentionSelectableCount() ? '' : ' disabled') + '" data-act="selectAllAttention">' + attentionSelectAllGlyph() + '</div>' +
           '<div>Connection</div><div>Status</div></div>' +
           provisionalConnections.map(function (entry) {
@@ -1202,7 +1269,7 @@
           return '<div class="attention-row' + (supported ? '' : ' unsupported') + '">' +
             '<div class="selbox ' + (checked ? 'on' : '') + (supported ? '' : ' disabled') + '"' +
               (supported ? ' data-act="toggleAttention" data-id="' + esc(connectionId) + '"' : ' aria-disabled="true"') + '>' + (checked ? '✓' : '') + '</div>' +
-            '<div class="attention-device"><div class="attention-model">' + esc(entry.model || 'Unknown device') + '</div>' +
+            '<div class="attention-device"><div class="attention-model">' + esc(entry.model || shortConnectionId(connectionId)) + '</div>' +
             '<div class="attention-meta">' + esc(entry.ip || 'unknown') + ' · ' + esc(version) + '</div></div>' +
             '<div class="attention-detail">' + (supported
               ? '<div class="attention-status">' + esc(entry.identity_status || 'unknown') + '</div>'
@@ -1278,7 +1345,7 @@
             '<span class="dot ' + (updating ? 'updating' : off ? 'off' : '') + '"></span>' +
             '<span class="group-dev-name">' + esc(label) + '</span>' +
             '<span class="group-dev-status">' + status + '</span>' +
-            '<span class="group-dev-task" data-task-id="' + esc(serial) + '">' + taskCellHtml(serial) + '</span>' +
+            '<span class="group-dev-task" data-task-id="' + esc(serial) + '">' + progressCellHtml(serial) + '</span>' +
             '</div>';
         }).join('');
       }
@@ -1458,6 +1525,20 @@
           // `verb` comes from the canonical job mode, so a synced device does not
           // report itself as "pushed".
           const verb = st.verb || 'Push';
+          const device = deviceById(id);
+          if (st.status === 'cancel_pending') return '<span class="ins-queued">Cancel pending' + ((!device || device.status !== 'online') ? ' · offline' : '') + '</span>';
+          if (st.status === 'cancelled') return '<span class="ins-none">Cancelled</span>';
+          if (st.status === 'reconciling') {
+            return '<span class="ins-queued" title="Waiting for the device to report whether the job is still running or has finished.">◦ Awaiting status confirmation' + ((!device || device.status !== 'online') ? ' · offline' : '') + '</span>';
+          }
+          if (['queued', 'transferring', 'applying'].indexOf(st.status) >= 0 &&
+              (!device || device.status !== 'online')) {
+            return '<span class="ins-queued" title="The device is disconnected. This job is unfinished; its current execution status is unknown.">◦ Job pending · offline</span>';
+          }
+          if (st.status === 'resume_required') return '<span class="ins-queued">◦ Resume required</span>';
+          if (st.status === 'unconfirmed') {
+            return '<span class="ins-queued" title="' + esc(st.detail || 'Waiting to confirm the device result') + '">◦ Status unknown</span>';
+          }
           if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
           if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
           if (st.status === 'applying') return '<span class="ins-installing"><span class="spinner">⟳</span> ' + esc(verb) + 'ing…</span>';
@@ -1474,7 +1555,18 @@
       }
 
       function progressCellHtml(id) {
-        const task = taskCellHtml(id);
+        let task = taskCellHtml(id);
+        const assignment = pushAssignmentFor(id);
+        if (assignment) {
+          const actions = [];
+          function button(action, label) {
+            return '<button class="push-job-action" data-act="pushDeviceAction" data-action="' + action +
+              '" data-id="' + esc(id) + '" data-job-id="' + esc(assignment.job_id) + '">' + label + '</button>';
+          }
+          if (assignment.canResume) actions.push(button('resume', 'Resume'));
+          if (assignment.canCancel) actions.push(button('cancel', 'Cancel'));
+          if (actions.length) task += '<span class="push-job-actions">' + actions.join('') + '</span>';
+        }
         if (!canRetryPushState(deviceById(id))) return task;
         return task + '<div class="push-state-warning">' +
           '<span class="push-state-warning-icon" aria-hidden="true">⚠</span>' +
@@ -1489,7 +1581,7 @@
         if (view !== 'console') return;
         const sel = '[data-task-id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]';
         targetsBody.querySelectorAll(sel).forEach(function (cell) {
-          cell.innerHTML = cell.classList.contains('dev-task') ? progressCellHtml(id) : taskCellHtml(id);
+          cell.innerHTML = progressCellHtml(id);
         });
       }
 
@@ -1497,6 +1589,12 @@
       // install or verify result must not be replaced or cleared by an older Push
       // snapshot that happens to arrive afterwards.
       window.__stylyPushJobsV1Bridge = {
+        isDeviceOnline: function (id) { const d = deviceById(id); return !!d && d.status === 'online'; },
+        refreshAttention: function () {
+          if (view !== 'console') return;
+          renderTabs();
+          if (targetTab === 'attention') renderTargets();
+        },
         applyAssignment: function (assignment) {
           if (!assignment || !assignment.device_id || !assignment.job_id) return false;
           const current = deviceTaskState[assignment.device_id];
@@ -1862,7 +1960,7 @@
 
         function shouldPreserveCanonicalPushAssignment(current) {
           return !!(current && current.owner === 'push-job-v1' && current.job_id &&
-            ['queued', 'transferring', 'applying'].indexOf(current.status) >= 0);
+            ['queued', 'transferring', 'applying', 'reconciling', 'unconfirmed', 'resume_required', 'cancel_pending'].indexOf(current.status) >= 0);
         }
 
         function hasSelection() { return selectionFiles().length > 0; }
@@ -2801,6 +2899,13 @@
         else if (act === 'cancelLabel') closeLabelEditor();
         else if (act === 'forget') sendForget(t.dataset.id);
         else if (act === 'update') sendClientUpdate(t.dataset.id);
+        else if (act === 'pushDeviceAction') {
+          const actions = window.__stylyPushJobsV1Actions;
+          if (actions && actions.sendDeviceAction(t.dataset.id, t.dataset.jobId, t.dataset.action)) {
+            t.disabled = true;
+            setTimeout(function () { if (t.isConnected) t.disabled = false; }, 5000);
+          }
+        }
         else if (act === 'retryPushState') retryPushStates([t.dataset.id]);
       });
       // Targets label-edit keyboard

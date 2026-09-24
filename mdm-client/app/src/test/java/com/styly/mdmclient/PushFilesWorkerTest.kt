@@ -1,6 +1,7 @@
 package com.styly.mdmclient
 
 import org.json.JSONObject
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
@@ -47,6 +48,269 @@ class PushFilesWorkerTest {
 
         assertEquals("fail", execution.result.status)
         assertEquals("download_failed", execution.result.failureCode)
+    }
+
+    @Test
+    fun `deadline refreshes only for bytes and cannot be revived at expiry`() {
+        var now = 0L
+        PushDownloadDeadline({ now }, 60_000L).use { deadline ->
+            now = 59_999L
+            assertEquals(1L, deadline.remaining())
+            deadline.receivedBytes()
+            now += 59_999L
+            assertEquals(1L, deadline.remaining())
+            now++
+            assertThrows(PushWorkerException::class.java) { deadline.receivedBytes() }
+            now = 0L
+            assertThrows(PushWorkerException::class.java) { deadline.remaining() }
+        }
+    }
+
+    @Test
+    fun `more than six transient failures can recover inside the idle window`() {
+        val archive = zip("content.txt" to "after-seven-retries").readBytes()
+        var now = 0L
+        RetryServer(archive, transientFailures = 7).use { server ->
+            val result = PushFilesWorker(
+                { true }, { File(tmp.root, "seven-work") }, { File(tmp.root, "seven-dest") },
+                retryDelay = { now += it }, monotonicMillis = { now },
+            ).execute(
+                command(artifactUrl = server.url, artifactSize = archive.size.toLong(), artifactSha256 = sha256(archive)),
+                PushFilesWorker.Callbacks({}, {}, {}),
+            )
+            assertEquals("success", result.result.status)
+            assertEquals(8, server.requestCount)
+            assertTrue(now < 60_000L)
+        }
+    }
+
+    @Test
+    fun `progress keeps a transfer alive beyond sixty seconds and validation is untimed`() {
+        val content = java.util.Random(4).let { random ->
+            CharArray(100_000) { (' '.code + random.nextInt(90)).toChar() }.concatToString()
+        }
+        val archive = zip("content.txt" to content).readBytes()
+        var now = 0L
+        ArtifactServer(archive).use { server ->
+            val result = PushFilesWorker(
+                { true }, { File(tmp.root, "long-work") }, { File(tmp.root, "long-dest") },
+                monotonicMillis = { now },
+            ).execute(
+                command(artifactUrl = server.url, artifactSize = archive.size.toLong(), artifactSha256 = sha256(archive)),
+                PushFilesWorker.Callbacks(
+                    onTransferComplete = { assertTrue(now > 60_000L); now += 600_000L },
+                    onValidated = {}, onApplying = {}, onTransferProgress = { now += 10_000L },
+                ),
+            )
+            assertEquals("success", result.result.status)
+            assertEquals(content, File(tmp.root, "long-dest/content.txt").readText())
+        }
+    }
+
+    @Test
+    fun `late bytes after idle expiry are not appended to the retained partial`() {
+        val content = java.util.Random(5).let { random ->
+            CharArray(100_000) { (' '.code + random.nextInt(90)).toChar() }.concatToString()
+        }
+        val archive = zip("content.txt" to content).readBytes()
+        var now = 0L
+        var acceptedBytes = 0L
+        val work = File(tmp.root, "late-work")
+        ArtifactServer(archive).use { server ->
+            val result = PushFilesWorker({ true }, { work }, monotonicMillis = { now }).execute(
+                command(artifactUrl = server.url, artifactSize = archive.size.toLong(), artifactSha256 = sha256(archive)).copy(revision = 1L),
+                PushFilesWorker.Callbacks({}, {}, {}, onTransferProgress = { acceptedBytes = it; now = 60_000L }),
+            )
+            assertTrue(result.interrupted)
+            assertEquals("download_retry_exhausted", result.interruptionReason)
+            assertTrue(acceptedBytes in 1 until archive.size.toLong())
+            assertEquals(acceptedBytes, File(work, "artifact.part").length())
+        }
+    }
+
+    @Test
+    fun `revoked transfer lease interrupts and preserves the exact partial without retry`() {
+        val archive = zip("content.txt" to "resume-after-lease").readBytes()
+        val split = archive.size / 2
+        val work = File(tmp.root, "revoked-lease-work")
+        val command = command(
+            artifactSize = archive.size.toLong(),
+            artifactSha256 = sha256(archive),
+        ).copy(revision = 7L)
+        val partial = archive.copyOfRange(0, split)
+        seedResume(work, command, partial)
+        var now = 0L
+        var retryCount = 0
+
+        OneShotServer(
+            status = 409,
+            headers = "X-Push-Lease-Status: revoked\r\nContent-Length: 0",
+        ).use { server ->
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+                retryDelay = { delay -> retryCount++; now += delay },
+                monotonicMillis = { now },
+                noProgressTimeoutMs = 60_000L,
+            ).execute(
+                command.copy(artifactUrl = server.url),
+                PushFilesWorker.Callbacks({}, {}, {}),
+            )
+
+            assertEquals("fail", execution.result.status)
+            assertEquals("push_lease_revoked", execution.result.failureCode)
+            assertTrue(execution.interrupted)
+            assertEquals("server_lease_revoked", execution.interruptionReason)
+            assertEquals(0, retryCount)
+            assertTrue(server.request.contains("Range: bytes=$split-"))
+            assertArrayEquals(partial, File(work, "artifact.part").readBytes())
+        }
+    }
+
+    @Test
+    fun `partial storage open failure is nonretryable`() {
+        val archive = zip("content.txt" to "storage-error").readBytes()
+        val work = File(tmp.root, "storage-error-work")
+        val command = command(
+            artifactSize = archive.size.toLong(),
+            artifactSha256 = sha256(archive),
+        ).copy(revision = 7L)
+        seedResume(work, command, byteArrayOf())
+        val partial = File(work, "artifact.part")
+        assertTrue(partial.delete())
+        assertTrue(partial.mkdir())
+        var now = 0L
+        var retryCount = 0
+
+        OneShotServer(
+            status = 200,
+            headers = "ETag: \"v1\"\r\nContent-Length: ${archive.size}",
+            body = archive,
+        ).use { server ->
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+                retryDelay = { delay -> retryCount++; now += delay },
+                monotonicMillis = { now },
+            ).execute(
+                command.copy(artifactUrl = server.url),
+                PushFilesWorker.Callbacks({}, {}, {}),
+            )
+
+            assertEquals("fail", execution.result.status)
+            assertEquals("storage_write_failed", execution.result.failureCode)
+            assertFalse(execution.interrupted)
+            assertEquals(0, retryCount)
+            assertFalse(partial.exists())
+        }
+    }
+
+    @Test
+    fun `storage failure after resumed bytes preserves partial for manual resume`() {
+        val archive = zip("content.txt" to "retain-nearly-complete").readBytes()
+        val split = archive.size * 95 / 100
+        val work = File(tmp.root, "storage-resume-work")
+        val remaining = archive.copyOfRange(split, archive.size)
+        OneShotServer(
+            status = 206,
+            headers = "ETag: \"v1\"\r\nContent-Range: bytes $split-${archive.lastIndex}/${archive.size}\r\nContent-Length: ${remaining.size}",
+            body = remaining,
+        ).use { server ->
+            val command = command(
+                artifactUrl = server.url,
+                artifactSize = archive.size.toLong(),
+                artifactSha256 = sha256(archive),
+            ).copy(revision = 7L)
+            seedResume(work, command, archive.copyOfRange(0, split))
+            assertTrue(File(work, "metadata.json.tmp").mkdir())
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+            assertEquals("storage_write_failed", execution.result.failureCode)
+            assertTrue(execution.interrupted)
+            assertEquals("storage_write_failed", execution.interruptionReason)
+            assertArrayEquals(archive, File(work, "artifact.part").readBytes())
+        }
+    }
+
+    @Test
+    fun `real progress extends watchdog and complete body does not wait for socket close`() {
+        val archive = zip("content.txt" to "slow but progressing").readBytes()
+        val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
+        val release = java.util.concurrent.CountDownLatch(1)
+        val thread = Thread {
+            server.accept().use { socket ->
+                val reader = socket.getInputStream().bufferedReader()
+                while (reader.readLine()?.isNotEmpty() == true) Unit
+                val output = socket.getOutputStream()
+                output.write(("HTTP/1.1 200 OK\r\nContent-Length: ${archive.size}\r\nETag: \"v1\"\r\n\r\n").toByteArray())
+                output.flush()
+                var offset = 0
+                while (offset < archive.size) {
+                    Thread.sleep(100L)
+                    val count = minOf((archive.size + 7) / 8, archive.size - offset)
+                    output.write(archive, offset, count)
+                    output.flush()
+                    offset += count
+                }
+                release.await(5, java.util.concurrent.TimeUnit.SECONDS)
+            }
+        }.apply { start() }
+        val started = System.nanoTime()
+        try {
+            val result = PushFilesWorker(
+                { true }, { File(tmp.root, "slow-work") }, { File(tmp.root, "slow-dest") },
+                noProgressTimeoutMs = 500L,
+            ).execute(command(artifactUrl = "http://127.0.0.1:${server.localPort}/artifact.zip",
+                artifactSize = archive.size.toLong(), artifactSha256 = sha256(archive)).copy(revision = 1L),
+                PushFilesWorker.Callbacks({}, {}, {}))
+            val elapsed = (System.nanoTime() - started) / 1_000_000L
+            assertEquals("success", result.result.status)
+            assertTrue("Progressing download took ${elapsed}ms", elapsed in 700L..3_000L)
+        } finally {
+            release.countDown()
+            server.close()
+            thread.join(5_000)
+        }
+    }
+
+    private fun stalledHttpResult(sendHeaders: Boolean): Pair<PushFilesWorker.Execution, Long> {
+        val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
+        val release = java.util.concurrent.CountDownLatch(1)
+        val thread = Thread {
+            server.accept().use { socket ->
+                val reader = socket.getInputStream().bufferedReader()
+                while (reader.readLine()?.isNotEmpty() == true) Unit
+                if (sendHeaders) {
+                    socket.getOutputStream().write(("HTTP/1.1 200 OK\r\nContent-Length: 42\r\nETag: \"v1\"\r\n\r\n").toByteArray())
+                    socket.getOutputStream().flush()
+                }
+                release.await(5, java.util.concurrent.TimeUnit.SECONDS)
+            }
+        }.apply { start() }
+        val started = System.nanoTime()
+        try {
+            val result = PushFilesWorker(
+                { true }, { File(tmp.root, "stalled-$sendHeaders") }, noProgressTimeoutMs = 250L,
+            ).execute(command(artifactUrl = "http://127.0.0.1:${server.localPort}/artifact.zip").copy(revision = 1L),
+                PushFilesWorker.Callbacks({}, {}, {}))
+            return result to (System.nanoTime() - started) / 1_000_000L
+        } finally {
+            release.countDown()
+            server.close()
+            thread.join(5_000)
+        }
+    }
+
+    @Test
+    fun `real stalled headers and stalled body are cancelled at the same deadline`() {
+        for (sendHeaders in listOf(false, true)) {
+            val (result, elapsed) = stalledHttpResult(sendHeaders)
+            assertTrue(result.interrupted)
+            assertEquals("download_retry_exhausted", result.interruptionReason)
+            assertTrue("Stalled HTTP took ${elapsed}ms", elapsed in 200L..2_000L)
+        }
     }
 
     private fun zip(vararg entries: Pair<String, String>): File {
@@ -124,6 +388,10 @@ class PushFilesWorkerTest {
             40L,
             worker.validatedResumeOffset(command.copy(artifactUrl = "http://new-server/artifact.zip")),
         )
+        assertTrue(File(work, "artifact.part").renameTo(File(work, "artifact.zip")))
+        assertEquals(0L, worker.validatedResumeOffset(command))
+        File(work, "artifact.zip").writeBytes(ByteArray(100))
+        assertEquals(100L, worker.validatedResumeOffset(command))
     }
 
     @Test
@@ -300,7 +568,7 @@ class PushFilesWorkerTest {
     }
 
     @Test
-    fun `matching artifact SHA is verified before callbacks and apply`() {
+    fun `validation starts before verified completion and apply`() {
         val archive = zip("content.txt" to "verified").readBytes()
         val destination = tmp.newFolder("sha-match-destination")
         val work = File(tmp.root, "sha-match-work")
@@ -321,12 +589,13 @@ class PushFilesWorkerTest {
                     onTransferComplete = { callbacks += "transfer" },
                     onValidated = { callbacks += "validated" },
                     onApplying = { callbacks += "applying" },
+                    onValidationStart = { callbacks += "validation_start" },
                 ),
             )
 
             assertEquals("success", execution.result.status)
         }
-        assertEquals(listOf("transfer", "validated", "applying"), callbacks)
+        assertEquals(listOf("validation_start", "transfer", "validated", "applying"), callbacks)
         assertEquals("verified", File(destination, "content.txt").readText())
     }
 
@@ -409,7 +678,7 @@ class PushFilesWorkerTest {
                 hasExternalStorageAccess = { true },
                 attemptDirectoryProvider = { work },
                 destinationProvider = { destination },
-                retryDelay = { index -> delays += PushFilesWorker.retryDelayMillis(index) },
+                retryDelay = { delay -> delays += delay },
             ).execute(
                 command(
                     artifactUrl = server.url,
@@ -467,8 +736,9 @@ class PushFilesWorkerTest {
         val destination = tmp.newFolder("retry-exhausted-destination")
         val work = File(tmp.root, "retry-exhausted-work")
         val delays = mutableListOf<Long>()
+        var now = 0L
 
-        RetryServer(archive, transientFailures = 6).use { unavailable ->
+        RetryServer(archive, transientFailures = 10).use { unavailable ->
             val command = command(
                 artifactUrl = unavailable.url,
                 artifactSize = archive.size.toLong(),
@@ -479,7 +749,8 @@ class PushFilesWorkerTest {
                 hasExternalStorageAccess = { true },
                 attemptDirectoryProvider = { work },
                 destinationProvider = { destination },
-                retryDelay = { index -> delays += PushFilesWorker.retryDelayMillis(index) },
+                retryDelay = { delay -> delays += delay; now += delay },
+                monotonicMillis = { now },
             ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
 
             assertEquals("fail", execution.result.status)
@@ -487,7 +758,7 @@ class PushFilesWorkerTest {
             assertTrue(execution.interrupted)
             assertEquals("download_retry_exhausted", execution.interruptionReason)
             assertEquals(split.toLong(), File(work, "artifact.part").length())
-            assertEquals(listOf(1_000L, 2_000L, 4_000L, 8_000L, 8_000L), delays)
+            assertEquals(listOf(1_000L, 2_000L, 4_000L, 8_000L, 8_000L, 8_000L, 8_000L, 8_000L, 8_000L, 5_000L), delays)
         }
 
         val remaining = archive.copyOfRange(split, archive.size)
@@ -712,7 +983,7 @@ class PushFilesWorkerTest {
         val malformedBody = remaining + byteArrayOf(0)
         val work = File(tmp.root, "range-end-overflow-work")
         val progress = mutableListOf<Long>()
-        val retryDelays = mutableListOf<Int>()
+        val retryDelays = mutableListOf<Long>()
         OneShotServer(
             status = 206,
             headers = "ETag: \"v1\"\r\nContent-Range: bytes $split-${archive.size}/${archive.size}\r\nContent-Length: ${malformedBody.size}",
@@ -807,13 +1078,14 @@ class PushFilesWorkerTest {
                     onTransferComplete = { callbacks += "transfer" },
                     onValidated = { callbacks += "validated" },
                     onApplying = { callbacks += "applying" },
+                    onValidationStart = { callbacks += "validation_start" },
                 ),
             )
 
             assertEquals("fail", execution.result.status)
             assertEquals("validation_failed", execution.result.failureCode)
         }
-        assertEquals(listOf("transfer"), callbacks)
+        assertEquals(listOf("validation_start", "transfer"), callbacks)
     }
 
     @Test
