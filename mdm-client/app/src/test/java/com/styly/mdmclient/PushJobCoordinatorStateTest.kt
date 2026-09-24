@@ -8,6 +8,21 @@ import org.junit.Test
 import java.util.UUID
 
 class PushJobCoordinatorStateTest {
+    @Test
+    fun `restart reports manual resume reason without renewing retention`() {
+        val active = PushProtocol.Active(command().copy(revision = 7L), PushProtocol.PHASE_DOWNLOADING)
+        val recovered = interruptPushAfterRestart(active, 1_000L)
+        val report = buildActivePushReconcileReport(
+            PushProtocol.ReconcileIdentity(requireNotNull(active.command.jobId), active.command.attempt, active.command.artifactId),
+            recovered, 0L,
+        )
+        assertEquals("interrupted", report.getString("status"))
+        assertEquals("client_restarted", report.getString("reason"))
+        assertEquals(1_000L, interruptPushAfterRestart(recovered, 10_000L).interruptedAt)
+        val timedOut = recovered.copy(interruptionReason = "download_retry_exhausted")
+        assertEquals("download_retry_exhausted", interruptPushAfterRestart(timedOut, 20_000L).interruptionReason)
+    }
+
     private fun command() = PushProtocol.Command(
         jobId = UUID.randomUUID().toString(),
         attempt = PushProtocol.ATTEMPT_V1,
