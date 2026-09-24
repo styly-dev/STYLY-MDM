@@ -59,4 +59,32 @@ class PushExecutionGateTest {
         assertTrue(gate.release(first))
         assertTrue(gate.current() == null)
     }
+
+    @Test
+    fun `restored resumable execution fences duplicates and other jobs`() {
+        val gate = PushExecutionGate()
+        val resumed = command().copy(revision = 7, artifactEtag = "\"etag\"")
+        gate.restore(resumed)
+
+        assertTrue(gate.offer(resumed.copy()) is PushExecutionGate.Decision.Duplicate)
+        assertTrue(gate.offer(command()) is PushExecutionGate.Decision.Busy)
+    }
+
+    @Test
+    fun `issue 91 revision and missing etag remain replay compatible`() {
+        val current = command().copy(revision = 0, artifactEtag = null)
+        val upgraded = current.copy(revision = 7, artifactEtag = "\"etag\"")
+
+        assertTrue(current.sameExecution(upgraded))
+        assertTrue(upgraded.sameExecution(current))
+    }
+
+    @Test
+    fun `fresh artifact locator preserves the same immutable execution`() {
+        val current = command().copy(revision = 7, artifactEtag = "\"etag\"")
+        val rediscovered = current.copy(artifactUrl = "http://new-server/artifact.zip")
+
+        assertTrue(current.sameExecution(rediscovered))
+        assertTrue(rediscovered.sameExecution(current))
+    }
 }

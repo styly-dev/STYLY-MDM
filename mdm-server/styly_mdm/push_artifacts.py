@@ -12,6 +12,15 @@ from pathlib import Path
 log = logging.getLogger("stylymdm.push.artifacts")
 
 
+def strong_etag(sha256: str) -> str:
+    """Return the wire representation of the artifact's strong validator."""
+
+    # The digest is calculated from the published bytes and therefore is a strong
+    # validator.  Keep the quotes here (rather than at each HTTP call site) so
+    # snapshots and commands cannot accidentally expose a weak/bare validator.
+    return f'"{sha256}"'
+
+
 class ArtifactStore:
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = Path(data_dir)
@@ -80,6 +89,7 @@ class ArtifactStore:
             "display_filename": display_filename,
             "byte_size": byte_size,
             "sha256": sha256,
+            "etag": strong_etag(sha256),
             "entry_count": entry_count,
             "path": destination,
         }

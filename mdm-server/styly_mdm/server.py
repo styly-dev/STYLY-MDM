@@ -255,6 +255,8 @@ def _coerce_record(value) -> dict | None:
             "version_name": "",
             "retired": False,
             "identity_kind": "legacy",
+            "push_state_retry_supported": False,
+            "push_state_status": None,
         }
     if isinstance(value, dict):
         label = value.get("label", "")
@@ -282,6 +284,10 @@ def _coerce_record(value) -> dict | None:
                 if value.get("identity_kind") in {"canonical", "legacy"}
                 else "legacy"
             ),
+            "push_state_retry_supported": value.get("push_state_retry_supported") is True,
+            "push_state_status": value.get("push_state_status")
+            if value.get("push_state_status") in {"available", "unavailable"}
+            else None,
         }
     return None
 
@@ -426,6 +432,8 @@ def build_device_list_msg() -> str:
             "last_seen": device_registry.get(d["device_id"], {}).get("last_seen"),
             "version_code": d.get("version_code"),
             "version_name": d.get("version_name", ""),
+            "push_state_retry_supported": d.get("push_state_retry_supported", False),
+            "push_state_status": d.get("push_state_status"),
         }
         for d in devices.values()
     ]
@@ -458,6 +466,8 @@ def build_device_list_msg() -> str:
             "version_code": rec.get("version_code"),
             "version_name": rec.get("version_name", ""),
             "identity_kind": rec.get("identity_kind", "legacy"),
+            "push_state_retry_supported": rec.get("push_state_retry_supported", False),
+            "push_state_status": rec.get("push_state_status"),
         })
     device_list.sort(
         key=lambda e: (e["label"] == "", (e["label"] or e["device_id"]).lower())
@@ -1453,7 +1463,6 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                             idempotent=True,
                         )
                         continue
-
                     if kind == "provisional":
                         now = time.time()
                         previous = provisional_connections.get(ws)
@@ -1500,6 +1509,21 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     provisional_connections.pop(ws, None)
                     device_id = new_device_id
                     socket_identity_kind = kind
+                    model = registration["model"]
+                    ip = registration["ip"]
+                    startup_app = registration["startup_app"]
+                    version_code = registration["version_code"]
+                    version_name = registration["version_name"]
+                    capabilities = registration["capabilities"]
+                    retry_supported = "push_state_retry_v1" in capabilities
+                    push_state = data.get("push_state")
+                    push_state_status = (
+                        push_state.get("status")
+                        if isinstance(push_state, dict)
+                        and push_state.get("status") in {"available", "unavailable"}
+                        else None
+                    )
+                    prev = device_registry.get(new_device_id, {})
                     devices[device_id] = {
                         "ws": ws,
                         "device_id": device_id,
@@ -1512,6 +1536,8 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "battery": prev.get("battery"),
                         "version_code": version_code,
                         "version_name": version_name,
+                        "push_state_retry_supported": retry_supported,
+                        "push_state_status": push_state_status,
                     }
                     device_registry[device_id] = {
                         "label": prev.get("label", ""),
@@ -1523,6 +1549,8 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "version_code": version_code,
                         "version_name": version_name,
                         "identity_kind": kind,
+                        "push_state_retry_supported": retry_supported,
+                        "push_state_status": push_state_status,
                     }
                     save_registry()
 
@@ -1823,9 +1851,9 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
         if device_id and not is_current:
             log.info("Superseded device connection closed, ignoring: %s", device_id)
         if device_id and is_current:
-            # Free every transfer slot this device was holding — it may have been in
-            # an install and a push at once — so a disconnect mid-job does not stall
-            # the queue until the timeout fires.
+            # Install keeps the legacy disconnect release. Push is deliberately
+            # retained by the runtime adapter because its Android HTTP worker outlives
+            # this WebSocket and remains bounded by exact completion or timeout.
             release_transfer_slot(device_id, "disconnect")
             # The dispatch record only bridges dispatch -> SELF_UPDATE_STARTING; by a
             # disconnect that announcement has already copied what it needed, so drop

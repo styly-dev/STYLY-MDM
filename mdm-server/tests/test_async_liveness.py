@@ -41,7 +41,6 @@ def _scheduler(manager):
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
         transfer_timeout=1,
-        allow_legacy=False,
     )
 
 
@@ -156,7 +155,6 @@ async def test_dispatch_exception_moves_uncertain_send_to_reconciliation(monkeyp
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
         transfer_timeout=1,
-        allow_legacy=False,
     )
     transfer_future = asyncio.get_running_loop().create_future()
     key = TransferKey("push", device_id, job_id, 1)
@@ -195,7 +193,6 @@ async def test_old_dispatch_cleanup_preserves_replacement_waiters():
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
         transfer_timeout=1,
-        allow_legacy=False,
     )
     scheduler.wake = lambda: None
     key = TransferKey("push", "D1", "job-1", 1)
@@ -249,7 +246,6 @@ async def test_accept_timeout_already_reconciled_keeps_exact_transfer_slot(monke
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
         transfer_timeout=1,
-        allow_legacy=False,
     )
     sent = []
 
@@ -302,8 +298,9 @@ class _DispatchManager:
                 "display_filename": "content.zip",
                 "byte_size": 1,
                 "sha256": "a" * 64,
+                "etag": '"' + "a" * 64 + '"',
             },
-            "devices": {"D1": {"attempt": 1}},
+            "devices": {"D1": {"attempt": 1, "state": "dispatching"}},
         }
 
     async def claim_next(self, _online_device_ids):
@@ -315,6 +312,9 @@ class _DispatchManager:
             "device_id": "D1",
             "attempt": 1,
         }
+
+    async def assignment(self, job_id, device_id):
+        return self.snapshot["devices"][device_id]
 
     async def prepare_dispatch(self, *_args, **_kwargs):
         return self.snapshot
@@ -359,7 +359,6 @@ def _dispatch_scheduler(manager, websocket):
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
         transfer_timeout=1,
-        allow_legacy=False,
     )
     return scheduler, registry
 
@@ -911,6 +910,7 @@ async def test_reconciliation_housekeeping_isolates_query_and_row_errors(monkeyp
     runtime.sessions = {}
     runtime.transfers = Transfers()
     runtime.scheduler = Scheduler()
+    runtime.leases = push_runtime.PushTransferLeases()
 
     async def publish(snapshot):
         if snapshot["job_id"] == "publish-fail-job":

@@ -5,16 +5,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from .push_job_manager import PushJobManager
 from .push_job_store import StoreConflict, now_ms
+from .push_transfer_leases import PushTransferLeases, TRANSFER_IDLE_SECONDS
 from .push_jobs import (
     ACTIVE_DEVICE_STATES,
     CAP_PUSH_JOB_ID_V1,
+    CAP_PUSH_RESUME_V1,
     DeviceState,
     ProtocolMode,
 )
@@ -23,6 +26,7 @@ from .transfer_registry import TransferKey, TransferRegistry
 log = logging.getLogger("stylymdm.push")
 
 _RUN_RETRY_DELAY = 1.0
+_TRANSFER_IDLE_POLL_INTERVAL = 1.0
 
 
 class ConnectionOwnerChanged(ConnectionError):
@@ -54,7 +58,8 @@ class PushScheduler:
         accept_reconciliation_timeout: float,
         reconciliation_timeout: float,
         transfer_timeout: float,
-        allow_legacy: bool,
+        resume_threshold_bytes: int = 64 * 1024 * 1024,
+        leases: PushTransferLeases | None = None,
     ) -> None:
         self.manager = manager
         self.transfer_registry = transfer_registry
@@ -66,7 +71,8 @@ class PushScheduler:
         self.accept_reconciliation_timeout = accept_reconciliation_timeout
         self.reconciliation_timeout = reconciliation_timeout
         self.transfer_timeout = transfer_timeout
-        self.allow_legacy = allow_legacy
+        self.resume_threshold_bytes = max(0, resume_threshold_bytes)
+        self.leases = leases
         self._wake = asyncio.Event()
         self._runner: asyncio.Task[None] | None = None
         self._stopping = False
@@ -95,7 +101,13 @@ class PushScheduler:
         for task in tuple(self._dispatch_tasks):
             task.cancel()
         await asyncio.gather(
-            *(task for task in ([self._runner] if self._runner else []) + list(self._dispatch_tasks)),
+            *(
+                task
+                for task in (
+                    ([self._runner] if self._runner else [])
+                    + list(self._dispatch_tasks)
+                )
+            ),
             return_exceptions=True,
         )
         self._runner = None
@@ -127,6 +139,22 @@ class PushScheduler:
             and accept_future is waiter
             for task, (key, _transfer_future, accept_future) in self._dispatch_waiters.items()
         )
+
+    async def ensure_active_transfer_slot(
+        self, job_id: str, device_id: str, attempt: int
+    ) -> None:
+        """Keep an existing live lease owner; never resurrect an old URL."""
+
+        key = TransferKey("push", device_id, job_id, attempt)
+        accept_waiter = self._accept_waiters.get((job_id, device_id, attempt))
+        if accept_waiter is not None and not accept_waiter.done():
+            accept_waiter.set_result(("accepted", {}))
+
+        current = self.transfer_registry.get(key)
+        if current is not None and not current.done():
+            return
+        if self.leases is not None:
+            self.leases.revoke_now(key)
 
     async def _run(self) -> None:
         while True:
@@ -196,14 +224,21 @@ class PushScheduler:
                 )
                 return
 
-            protocol = self._protocol_for(session)
+            artifact_size = int((job.get("artifact") or {}).get("byte_size") or 0)
+            protocol = self._protocol_for(session, artifact_size)
             if protocol is None:
+                requires_resume = artifact_size > self.resume_threshold_bytes
                 await self._fail_current(
                     job_id,
                     device_id,
                     {DeviceState.WAITING_TRANSFER},
-                    "capability_changed_before_dispatch",
-                    "Live session no longer supports push_job_id_v1 and legacy fallback is disabled",
+                    "artifact_requires_push_resume_v1" if requires_resume
+                    else "capability_changed_before_dispatch",
+                    (
+                        "Published artifact requires push_job_id_v1 and push_resume_v1"
+                        if requires_resume
+                        else "Live session no longer supports push_job_id_v1 and legacy fallback is disabled"
+                    ),
                 )
                 return
 
@@ -243,17 +278,39 @@ class PushScheduler:
                 self._clear_dispatch_waiters(key, transfer_future, accept_future)
                 raise
 
-            command = self._command(snapshot, device_id, protocol, session.http_base)
+            if snapshot["devices"][device_id]["state"] != DeviceState.DISPATCHING.value:
+                self._clear_dispatch_waiters(key, transfer_future, accept_future)
+                return
+            lease_token = None
             try:
                 # REGISTER replacement, disconnect, final owner check, and send all
-                # share this per-device lock. No other await occurs while it is held
-                # except the bounded send itself.
+                # share this per-device lock. The final assignment read and
+                # bounded send run while this owner is still current.
                 async with session.owner_lock:
                     current = self.sessions().get(device_id)
                     if current is not session or current.session_id != session.session_id:
                         raise ConnectionOwnerChanged(
                             "device WebSocket owner changed before command send"
                         )
+                    assignment_now = await self.manager.assignment(job_id, device_id)
+                    if assignment_now is None or assignment_now.get("cancel_requested_at") is not None:
+                        self._clear_dispatch_waiters(key, transfer_future, accept_future)
+                        return
+                    artifact = snapshot.get("artifact")
+                    if (
+                        protocol is ProtocolMode.JOB_V1
+                        and self.leases is not None
+                        and isinstance(artifact, dict)
+                        and isinstance(artifact.get("artifact_id"), str)
+                    ):
+                        lease_token = self.leases.issue(key, artifact["artifact_id"])
+                    command = self._command(
+                        snapshot,
+                        device_id,
+                        protocol,
+                        session.http_base,
+                        lease_token=lease_token,
+                    )
                     await asyncio.wait_for(
                         session.ws.send_str(json.dumps(command, separators=(",", ":"))),
                         self.send_timeout,
@@ -310,7 +367,43 @@ class PushScheduler:
                     return
 
             try:
-                await asyncio.wait_for(transfer_future, self.transfer_timeout)
+                if lease_token is not None and self.leases is not None:
+                    while not transfer_future.done():
+                        stalled = await self._wait_for_transfer_or_stall(
+                            key, transfer_future
+                        )
+                        if not stalled or transfer_future.done():
+                            break
+                        expired = await self._expire_stalled_transfer(
+                            key, transfer_future, lease_token
+                        )
+                        if expired or transfer_future.done():
+                            break
+                        current_token = self.leases.token(key)
+                        if (
+                            current_token is None
+                            and self.transfer_registry.get(key) is transfer_future
+                        ):
+                            # No handler can still claim this exact permit. Release
+                            # only its waiter; the before-release hook has no lease
+                            # left to revoke.
+                            self.transfer_registry.release_exact(
+                                key, "lease_missing"
+                            )
+                            break
+                        if current_token is not None and current_token != lease_token:
+                            # A different token must never be expired or released by
+                            # this waiter. Wait briefly for its exact future to settle
+                            # rather than spinning on the stale progress timestamp.
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.shield(transfer_future),
+                                    _TRANSFER_IDLE_POLL_INTERVAL,
+                                )
+                            except asyncio.TimeoutError:
+                                pass
+                else:
+                    await asyncio.wait_for(transfer_future, self.transfer_timeout)
             except asyncio.TimeoutError:
                 # This is resource recovery only. The device execution remains owned
                 # and moves to reconciliation rather than becoming terminal.
@@ -340,6 +433,113 @@ class PushScheduler:
                             pass
             finally:
                 self._clear_dispatch_waiters(key, transfer_future, accept_future)
+
+    async def _wait_for_transfer_or_stall(
+        self,
+        key: TransferKey,
+        future: asyncio.Future[str],
+    ) -> bool:
+        """Wait without an overall cap while server-side writes keep progressing."""
+
+        assert self.leases is not None
+        while not future.done():
+            last_progress = self.leases.last_progress(key)
+            if last_progress is None:
+                return True
+            remaining = TRANSFER_IDLE_SECONDS - (time.monotonic() - last_progress)
+            if remaining <= 0:
+                return not future.done()
+            timeout = min(remaining, _TRANSFER_IDLE_POLL_INTERVAL)
+            try:
+                await asyncio.wait_for(asyncio.shield(future), timeout)
+            except asyncio.TimeoutError:
+                continue
+        return False
+
+    def _transfer_is_stalled(self, key: TransferKey) -> bool:
+        assert self.leases is not None
+        last_progress = self.leases.last_progress(key)
+        return last_progress is None or (
+            time.monotonic() - last_progress >= TRANSFER_IDLE_SECONDS
+        )
+
+    async def _expire_stalled_transfer(
+        self,
+        key: TransferKey,
+        future: asyncio.Future[str],
+        token: str,
+    ) -> bool:
+        """Fence an idle job-v1 transfer, then stop its HTTP stream before release."""
+
+        if self.leases is None or self.transfer_registry.get(key) is not future:
+            return False
+        if future.done():
+            return True
+        current_token = self.leases.token(key)
+        if current_token is None:
+            self.transfer_registry.release_exact(key, "lease_missing")
+            return True
+        if current_token != token or not self._transfer_is_stalled(key):
+            return False
+        try:
+            active = await self.manager.active_assignment_for_device(key.device_id)
+            if (
+                self.leases.token(key) == token
+                and self.transfer_registry.get(key) is future
+                and not future.done()
+                and self._transfer_is_stalled(key)
+                and active is not None
+                and active.get("job_id") == key.job_id
+                and active.get("attempt") == key.attempt
+            ):
+                current = DeviceState(active["state"])
+                if current in {
+                    DeviceState.DISPATCHING,
+                    DeviceState.DOWNLOADING,
+                    DeviceState.VALIDATING,
+                    DeviceState.APPLYING,
+                    DeviceState.RECONCILING,
+                }:
+                    snapshot = await self.manager.mark_reconciling(
+                        key.job_id,
+                        key.device_id,
+                        expected={current},
+                        reason="transfer_stalled",
+                        deadline=now_ms() + int(self.reconciliation_timeout * 1000),
+                    )
+                    try:
+                        await self.publish(snapshot)
+                    except (ConnectionError, asyncio.TimeoutError):
+                        log.info(
+                            "Could not publish stalled Push transfer state for %s/%s",
+                            key.job_id,
+                            key.device_id,
+                        )
+        except StoreConflict:
+            pass
+        except Exception:
+            log.exception(
+                "Could not mark stalled Push transfer %s/%s for reconciliation",
+                key.job_id,
+                key.device_id,
+            )
+
+        # Keep the shared permit until the handler has stopped and released its
+        # response/file resources. The registry hook below is only a fallback for
+        # other terminal paths; it is intentionally after this awaited join.
+        if (
+            self.leases.token(key) != token
+            or self.transfer_registry.get(key) is not future
+            or future.done()
+            or not self._transfer_is_stalled(key)
+        ):
+            return future.done()
+        await self.leases.expire(key, token)
+        if self.leases.token(key) is not None:
+            return False
+        if self.transfer_registry.get(key) is future and not future.done():
+            self.transfer_registry.release_exact(key, "transfer_stalled")
+        return future.done()
 
     def _clear_dispatch_waiters(
         self,
@@ -454,11 +654,16 @@ class PushScheduler:
                 )
                 await asyncio.sleep(_RUN_RETRY_DELAY)
 
-    def _protocol_for(self, session: LiveSession) -> ProtocolMode | None:
+    def _protocol_for(
+        self, session: LiveSession, artifact_size: int = 0
+    ) -> ProtocolMode | None:
         if CAP_PUSH_JOB_ID_V1 in session.capabilities:
+            if (
+                artifact_size > self.resume_threshold_bytes
+                and CAP_PUSH_RESUME_V1 not in session.capabilities
+            ):
+                return None
             return ProtocolMode.JOB_V1
-        if self.allow_legacy:
-            return ProtocolMode.LEGACY
         return None
 
     async def _await_acceptance(
@@ -710,10 +915,19 @@ class PushScheduler:
         device_id: str,
         protocol: ProtocolMode,
         http_base: str,
+        *,
+        lease_token: str | None = None,
     ) -> dict[str, Any]:
         artifact = snapshot["artifact"]
         assert artifact is not None
         artifact_url = urljoin(http_base.rstrip("/") + "/", artifact["url"].lstrip("/"))
+        if lease_token is not None:
+            parts = urlsplit(artifact_url)
+            query = parse_qsl(parts.query, keep_blank_values=True)
+            query.append(("lease", lease_token))
+            artifact_url = urlunsplit(
+                (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+            )
         common: dict[str, Any] = {
             "type": "EXECUTE_PUSH_FILES",
             "bundle_url": artifact_url,
@@ -722,15 +936,22 @@ class PushScheduler:
             "delete_extras": snapshot["mode"] == "sync",
         }
         if protocol is ProtocolMode.JOB_V1:
+            device = snapshot["devices"][device_id]
+            assignment_revision = device.get("dispatch_revision")
+            if not isinstance(assignment_revision, int):
+                assignment_revision = snapshot["revision"]
             common.update(
                 {
                     "job_id": snapshot["job_id"],
-                    "attempt": snapshot["devices"][device_id]["attempt"],
-                    "revision": snapshot["revision"],
+                    "attempt": device["attempt"],
+                    # This is immutable for one (job, device, attempt) assignment;
+                    # aggregate job revisions may advance during restart recovery.
+                    "revision": assignment_revision,
                     "artifact_id": artifact["artifact_id"],
                     "artifact_url": artifact_url,
                     "artifact_size": artifact["byte_size"],
                     "artifact_sha256": artifact["sha256"],
+                    "artifact_etag": artifact["etag"],
                 }
             )
         return common

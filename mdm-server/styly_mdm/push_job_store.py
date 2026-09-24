@@ -20,7 +20,9 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, TypeVar
 
+from .push_artifacts import strong_etag
 from .push_jobs import (
+    CAP_PUSH_RESUME_V1,
     DeviceState,
     JobState,
     ProtocolMode,
@@ -176,7 +178,10 @@ class _DbWorker:
 
 
 class PushJobStore:
-    SCHEMA_VERSION = 1
+    # Version 2 introduced the artifact retention state contract; version 3 adds
+    # durable cancellation intent to device assignments. Older databases are
+    # upgraded below without dropping or rewriting any job rows.
+    SCHEMA_VERSION = 3
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -194,6 +199,18 @@ class PushJobStore:
 
     @staticmethod
     def _initialize(conn: sqlite3.Connection) -> None:
+        metadata_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='server_metadata'"
+        ).fetchone()
+        if metadata_exists:
+            row = conn.execute(
+                "SELECT value FROM server_metadata WHERE key='schema_version'"
+            ).fetchone()
+            version = int(row["value"]) if row is not None else 1
+            if version > PushJobStore.SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"unsupported push job schema version {version}; expected <= {PushJobStore.SCHEMA_VERSION}"
+                )
         conn.executescript(
             """
             BEGIN IMMEDIATE;
@@ -247,6 +264,7 @@ class PushJobStore:
                 protocol_mode TEXT NOT NULL CHECK (protocol_mode IN ('job_v1', 'legacy')),
                 create_capability_snapshot_json TEXT NOT NULL,
                 dispatch_capability_snapshot_json TEXT,
+                dispatch_revision INTEGER,
                 state TEXT NOT NULL,
                 queue_reason TEXT,
                 attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt = 1),
@@ -297,6 +315,41 @@ class PushJobStore:
             COMMIT;
             """
         )
+        # Issue #91 databases normally already contain retention_state.  Keep this
+        # defensive migration for databases created by an earlier development
+        # snapshot, where the artifact table predated retention tracking.
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(push_artifacts)").fetchall()
+        }
+        if "retention_state" not in columns:
+            conn.execute(
+                "ALTER TABLE push_artifacts ADD COLUMN retention_state TEXT NOT NULL DEFAULT 'retained'"
+            )
+        device_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(push_job_devices)").fetchall()
+        }
+        if "dispatch_revision" not in device_columns:
+            conn.execute(
+                "ALTER TABLE push_job_devices ADD COLUMN dispatch_revision INTEGER"
+            )
+        if "cancel_requested_at" not in device_columns:
+            conn.execute("ALTER TABLE push_job_devices ADD COLUMN cancel_requested_at INTEGER")
+        row = conn.execute(
+            "SELECT value FROM server_metadata WHERE key='schema_version'"
+        ).fetchone()
+        version = int(row["value"]) if row is not None else 1
+        if version > PushJobStore.SCHEMA_VERSION:
+            raise RuntimeError(
+                f"unsupported push job schema version {version}; expected <= {PushJobStore.SCHEMA_VERSION}"
+            )
+        if version != PushJobStore.SCHEMA_VERSION:
+            conn.execute(
+                "INSERT INTO server_metadata(key, value) VALUES ('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(PushJobStore.SCHEMA_VERSION),),
+            )
 
     @staticmethod
     def _begin(conn: sqlite3.Connection) -> None:
@@ -382,6 +435,12 @@ class PushJobStore:
         ).fetchall()
         aggregate = aggregate_device_states(row["state"] for row in device_rows)
         devices: dict[str, Any] = {}
+        retries: dict[str, str] = {}
+        for retry in conn.execute(
+            "SELECT d.device_id, j.job_id FROM push_jobs j JOIN push_job_devices d ON d.job_id=j.job_id "
+            "WHERE j.request_fingerprint=? ORDER BY j.created_at", ("retry_failed:" + job_id,),
+        ):
+            retries.setdefault(retry["device_id"], retry["job_id"])
         for row in device_rows:
             fence = conn.execute(
                 """
@@ -420,10 +479,17 @@ class PushJobStore:
                 failure = {"code": row["failure_code"], "detail": row["failure_detail"]}
             devices[row["device_id"]] = {
                 "state": row["state"],
+                "cancel_requested": row["cancel_requested_at"] is not None,
+                "retry_job_id": retries.get(row["device_id"]),
                 "queue_reason": row["queue_reason"],
                 "protocol_mode": row["protocol_mode"],
                 "attempt": row["attempt"],
                 "enqueue_seq": row["enqueue_seq"],
+                "dispatch_revision": row["dispatch_revision"],
+                # Mirrors the cancel_interrupted identity requirement for the console.
+                "resume_supported": row["dispatch_revision"] is not None
+                and CAP_PUSH_RESUME_V1
+                in json.loads(row["dispatch_capability_snapshot_json"] or "[]"),
                 "validated_offset": row["validated_offset"],
                 "accepted_at": row["accepted_at"],
                 "failure": failure,
@@ -446,6 +512,7 @@ class PushJobStore:
                 "display_filename": job["display_filename"],
                 "byte_size": job["byte_size"],
                 "sha256": job["sha256"],
+                "etag": strong_etag(job["sha256"]),
                 "entry_count": job["entry_count"],
                 "created_at": job["artifact_created_at"],
             }
@@ -475,6 +542,35 @@ class PushJobStore:
             "aggregate": aggregate,
             "devices": devices,
         }
+
+    async def devices_missing_resume_v1(self, job_id: str) -> list[str]:
+        """Return targets whose creation-time protocol snapshot lacks resume support."""
+
+        def op(conn: sqlite3.Connection) -> list[str]:
+            if conn.execute(
+                "SELECT 1 FROM push_jobs WHERE job_id=?", (job_id,)
+            ).fetchone() is None:
+                raise StoreNotFound(job_id)
+            rows = conn.execute(
+                "SELECT device_id, protocol_mode, create_capability_snapshot_json "
+                "FROM push_job_devices WHERE job_id=? ORDER BY target_ordinal",
+                (job_id,),
+            ).fetchall()
+            missing: list[str] = []
+            for row in rows:
+                try:
+                    capabilities = json.loads(row["create_capability_snapshot_json"])
+                except (TypeError, json.JSONDecodeError):
+                    capabilities = []
+                if (
+                    row["protocol_mode"] != ProtocolMode.JOB_V1.value
+                    or not isinstance(capabilities, list)
+                    or CAP_PUSH_RESUME_V1 not in capabilities
+                ):
+                    missing.append(row["device_id"])
+            return missing
+
+        return await self._call(op)
 
     async def create_job(
         self,
@@ -683,7 +779,7 @@ class PushJobStore:
 
         return await self._call(op)
 
-    async def enable_dispatch(self, job_id: str) -> tuple[bool, dict[str, Any]]:
+    async def enable_dispatch(self, job_id: str, target_devices: list[str] | None = None) -> tuple[bool, dict[str, Any]]:
         def op(conn: sqlite3.Connection) -> tuple[bool, dict[str, Any]]:
             self._begin(conn)
             try:
@@ -692,13 +788,42 @@ class PushJobStore:
                 ).fetchone()
                 if row is None:
                     raise StoreNotFound(job_id)
+                if target_devices is not None:
+                    known = {d["device_id"] for d in conn.execute(
+                        "SELECT device_id FROM push_job_devices WHERE job_id=?", (job_id,),
+                    )}
+                    if not target_devices or not set(target_devices) <= known:
+                        raise StoreConflict("Resume targets must belong to this job")
                 state = JobState(row["state"])
                 if state in {JobState.READY, JobState.RUNNING, JobState.RECONCILING}:
-                    if bool(row["dispatch_enabled"]):
+                    timestamp = now_ms()
+                    target_clause = ""
+                    target_args: tuple[str, ...] = ()
+                    if target_devices is not None:
+                        target_args = tuple(sorted(set(target_devices)))
+                        marks = ",".join("?" for _ in target_args)
+                        target_clause = f" AND device_id IN ({marks})"
+                        if not row["dispatch_enabled"]:
+                            # A single-device Resume must not also authorize other
+                            # interrupted or queued devices after server restart.
+                            conn.execute(
+                                "UPDATE push_job_devices SET queue_reason='dispatch_paused' "
+                                "WHERE job_id=? AND state IN ('queued','waiting_transfer','reconciling') "
+                                "AND COALESCE(queue_reason,'') != 'download_retry_exhausted' "
+                                f"AND device_id NOT IN ({marks})", (job_id, *target_args),
+                            )
+                    # Resume authorizes only currently interrupted assignments.
+                    # Reconnect reports cannot clear this per-device wait.
+                    resumed = conn.execute(
+                        "UPDATE push_job_devices SET queue_reason='resumable_replay', updated_at=? "
+                        "WHERE job_id=? AND cancel_requested_at IS NULL AND (queue_reason IN ('download_retry_exhausted','client_restarted','dispatch_paused') OR state='reconciling') "
+                        + target_clause,
+                        (timestamp, job_id, *target_args),
+                    ).rowcount
+                    if bool(row["dispatch_enabled"]) and not resumed:
                         snapshot = self._snapshot(conn, job_id)
                         self._commit(conn)
                         return False, snapshot
-                    timestamp = now_ms()
                     next_state = JobState.RUNNING if state is JobState.READY else state
                     conn.execute(
                         """
@@ -772,6 +897,7 @@ class PushJobStore:
             "reconciliation_reason",
             "reconciliation_deadline",
             "dispatch_capability_snapshot_json",
+            "dispatch_revision",
         }
         unknown = set(fields) - allowed_columns
         if unknown:
@@ -810,6 +936,15 @@ class PushJobStore:
                     values,
                 )
                 self._increment_revision(conn, job_id, timestamp)
+                if target is DeviceState.DISPATCHING:
+                    job_revision = conn.execute(
+                        "SELECT revision FROM push_jobs WHERE job_id=?", (job_id,)
+                    ).fetchone()["revision"]
+                    conn.execute(
+                        "UPDATE push_job_devices SET dispatch_revision=COALESCE(dispatch_revision, ?) "
+                        "WHERE job_id=? AND device_id=?",
+                        (job_revision, job_id, device_id),
+                    )
                 self._rederive_job(conn, job_id, timestamp)
                 snapshot = self._snapshot(conn, job_id)
                 self._commit(conn)
@@ -842,6 +977,11 @@ class PushJobStore:
         def op(conn: sqlite3.Connection) -> tuple[bool, str | None, dict[str, Any]]:
             self._begin(conn)
             try:
+                result_failure_code = failure_code
+                result_failure_detail = failure_detail
+                result_added = added
+                result_updated = updated
+                result_deleted = deleted
                 row = conn.execute(
                     "SELECT * FROM push_job_devices WHERE job_id=? AND device_id=?",
                     (job_id, device_id),
@@ -853,6 +993,18 @@ class PushJobStore:
                     self._commit(conn)
                     return False, "stale_attempt", snapshot
                 current = DeviceState(row["state"])
+                if (
+                    status == "fail"
+                    and result_failure_code in {"cancelled", "resume_not_authorized"}
+                    and row["cancel_requested_at"] is not None
+                ):
+                    # A client can replay the durable rejection receipt after its
+                    # follow-up `absent` report was lost. Under a matching pending
+                    # cancellation, that exact rejection means the rejected local
+                    # partial was discarded; expose the assignment as cancelled.
+                    result_failure_code = "cancelled"
+                    result_failure_detail = "Client confirmed cancelled work is absent"
+                    result_added = result_updated = result_deleted = 0
                 if current in TERMINAL_DEVICE_STATES:
                     same = current is target and (
                         row["failure_code"],
@@ -861,11 +1013,11 @@ class PushJobStore:
                         row["updated"],
                         row["deleted"],
                     ) == (
-                        failure_code,
-                        failure_detail,
-                        added,
-                        updated,
-                        deleted,
+                        result_failure_code,
+                        result_failure_detail,
+                        result_added,
+                        result_updated,
+                        result_deleted,
                     )
                     snapshot = self._snapshot(conn, job_id)
                     self._commit(conn)
@@ -879,7 +1031,13 @@ class PushJobStore:
                     DeviceState.APPLYING,
                     DeviceState.RECONCILING,
                 }
-                if current not in allowed:
+                expired_resume = (
+                    status == "fail"
+                    and (result_failure_code == "resume_expired" or row["cancel_requested_at"] is not None)
+                    and row["dispatch_revision"] is not None
+                    and current in {DeviceState.QUEUED, DeviceState.WAITING_TRANSFER}
+                )
+                if current not in allowed and not expired_resume:
                     snapshot = self._snapshot(conn, job_id)
                     self._commit(conn)
                     return False, "unexpected_result_state", snapshot
@@ -895,11 +1053,11 @@ class PushJobStore:
                         target.value,
                         timestamp,
                         timestamp,
-                        failure_code,
-                        failure_detail,
-                        added,
-                        updated,
-                        deleted,
+                        result_failure_code,
+                        result_failure_detail,
+                        result_added,
+                        result_updated,
+                        result_deleted,
                         job_id,
                         device_id,
                     ),
@@ -1135,9 +1293,84 @@ class PushJobStore:
     async def artifact_record(self, artifact_id: str) -> dict[str, Any] | None:
         def op(conn: sqlite3.Connection) -> dict[str, Any] | None:
             row = conn.execute("SELECT * FROM push_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
-            return dict(row) if row else None
+            if row is None:
+                return None
+            record = dict(row)
+            record["etag"] = strong_etag(record["sha256"])
+            return record
 
         return await self._call(op)
+
+    def gc_artifacts_sync(
+        self,
+        artifact_root: Path,
+        *,
+        retry_window_ms: int,
+        timestamp: int | None = None,
+    ) -> list[str]:
+        """Delete expired immutable bytes while retaining tombstone identities.
+
+        The artifact row is never deleted, so an old URL can only become a stable
+        404 and its UUID can never be reused.  Files are removed while the same
+        serialized DB transaction owns the eligibility decision.
+        """
+
+        observed = now_ms() if timestamp is None else timestamp
+        root = artifact_root.resolve()
+
+        def op(conn: sqlite3.Connection) -> list[str]:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT a.artifact_id, a.storage_name
+                    FROM push_artifacts a
+                    WHERE a.retention_state <> 'deleted'
+                      AND (
+                          SELECT MAX(COALESCE(j.terminal_at,j.updated_at))
+                          FROM push_jobs j
+                          WHERE j.artifact_id=a.artifact_id
+                      ) + ? <= ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM push_jobs j
+                          WHERE j.artifact_id=a.artifact_id
+                            AND j.state NOT IN ('succeeded','completed_with_errors','failed','interrupted')
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM push_job_devices d
+                          JOIN push_jobs j ON j.job_id=d.job_id
+                          WHERE j.artifact_id=a.artifact_id
+                            AND (d.cancel_requested_at IS NOT NULL AND d.state='unconfirmed' OR d.state IN (
+                                'queued','waiting_transfer','dispatching','downloading',
+                                'validating','applying','reconciling'
+                            ))
+                      )
+                    """,
+                    (retry_window_ms, observed),
+                ).fetchall()
+                removed: list[str] = []
+                for row in rows:
+                    path = root / row["storage_name"]
+                    try:
+                        if path.resolve().parent != root:
+                            continue
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        logger.warning("Could not GC Push artifact %s", row["storage_name"], exc_info=True)
+                        continue
+                    conn.execute(
+                        "UPDATE push_artifacts SET retention_state='deleted' WHERE artifact_id=?",
+                        (row["artifact_id"],),
+                    )
+                    removed.append(row["artifact_id"])
+                conn.execute("COMMIT")
+                return removed
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+
+        return self._call_sync(op)
 
     async def _simple_job_transition(
         self,
