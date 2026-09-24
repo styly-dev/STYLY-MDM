@@ -360,17 +360,6 @@ object PushProtocol {
         return longValue.toInt()
     }
 
-    private fun strictLong(payload: JSONObject, field: String): Long {
-        val value = when (val raw = payload.opt(field)) {
-            is Byte -> raw.toLong()
-            is Short -> raw.toLong()
-            is Int -> raw.toLong()
-            is Long -> raw
-            else -> throw malformed("$field must be a JSON integer")
-        }
-        return value
-    }
-
     private fun validateStrongEtag(value: String) {
         if (value.isBlank() || value.startsWith("W/") ||
             !value.startsWith("\"") || !value.endsWith("\"") || value.length < 2

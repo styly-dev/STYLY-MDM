@@ -310,9 +310,6 @@ class PushRuntime:
         self.startup_snapshots.extend(
             self.manager.reconcile_missing_artifacts_sync(self.artifacts.artifact_root)
         )
-        self.manager.rebuild_artifact_retention_sync(
-            retry_window_ms=int(self.artifact_retry_window * 1000)
-        )
         self.startup_orphan_artifacts = self.manager.orphan_artifacts_sync(
             self.artifacts.artifact_root
         )
@@ -902,11 +899,6 @@ class PushRuntime:
             process_instance_id=process_instance_id,
             owner_lock=lock,
             http_base=http_base,
-            reported_push_runtime=(
-                payload.get("push_runtime")
-                if isinstance(payload.get("push_runtime"), dict)
-                else None
-            ),
         )
         async with lock:
             if (
@@ -1284,7 +1276,6 @@ class PushRuntime:
                     )
                 session.capabilities = capabilities
                 runtime = payload.get("push_runtime")
-                session.reported_push_runtime = runtime if isinstance(runtime, dict) else None
                 push_state = payload.get("push_state")
                 push_status = (
                     push_state.get("status")

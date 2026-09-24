@@ -213,12 +213,7 @@ class PushJobManager:
                          target["protocol_mode"], target["create_capability_snapshot_json"],
                          timestamp),
                     )
-                # GC uses this same worker and transaction boundary. The new READY
-                # job is a durable lease before any collector can delete the bytes.
-                conn.execute(
-                    "UPDATE push_artifacts SET retention_state='retained' WHERE artifact_id=?",
-                    (artifact["artifact_id"],),
-                )
+                # GC reads the new job in this same serialized transaction.
                 self.store._increment_revision(conn, job_id, timestamp)
                 snapshot = self.store._snapshot(conn, retry_id)
                 self.store._commit(conn)
