@@ -486,6 +486,10 @@ class PushJobStore:
                 "attempt": row["attempt"],
                 "enqueue_seq": row["enqueue_seq"],
                 "dispatch_revision": row["dispatch_revision"],
+                # Mirrors the cancel_interrupted identity requirement for the console.
+                "resume_supported": row["dispatch_revision"] is not None
+                and CAP_PUSH_RESUME_V1
+                in json.loads(row["dispatch_capability_snapshot_json"] or "[]"),
                 "validated_offset": row["validated_offset"],
                 "accepted_at": row["accepted_at"],
                 "failure": failure,

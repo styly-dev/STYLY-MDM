@@ -101,7 +101,8 @@ Response handling is fail-closed:
   connection establishment and response headers do not. Blocked HTTP operations
   are cancelled when the window expires. Management WebSocket loss alone does not
   stop a download that is still making progress. Local file write or sync failures
-  terminate with `storage_write_failed` instead of retrying the network request.
+  never retry the network request: with a validated partial they end the attempt as
+  interrupted for manual Resume; without one they fail with `storage_write_failed`.
 
 The client deadline measures bytes received and saved on the device; the server
 measures bytes successfully written to the HTTP response. These clocks can differ
@@ -200,7 +201,8 @@ Resume before receiving a new token.
   are not rolled back. Work already received and validating on an offline device
   may finish before cancellation is observed. Individual **Cancel** and **Cancel all**
   ask for confirmation; the latter shows the number of affected devices. Only
-  previously dispatched `dispatch_paused` assignments can be cancelled.
+  assignments dispatched with `push_resume_v1` can be cancelled; the snapshot
+  exposes this as `resume_supported`.
 - **Retry failed devices** creates and dispatches a new job for `failed`,
   `interrupted`, and `unconfirmed` targets, excluding `failure_code: cancelled`.
   It reuses the immutable artifact without upload and leaves success records and
