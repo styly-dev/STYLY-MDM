@@ -117,6 +117,8 @@ function snapshot(jobId, revision, deviceId, state, enqueueSeq, options = {}) {
         state,
         enqueue_seq: enqueueSeq,
         dispatch_revision: options.dispatchRevision !== undefined ? options.dispatchRevision : 1,
+        resume_supported: options.resumeSupported !== undefined
+          ? options.resumeSupported : options.dispatchRevision !== null,
         result: options.result || null,
         failure: options.failure || null,
         reconciliation_reason: options.reconciliationReason || null,
@@ -736,6 +738,22 @@ test('never-dispatched paused device is excluded from Cancel and Cancel all', ()
   const api = window.__stylyPushJobsV1Actions;
   assert.equal(api.assignmentFor('D1').canCancel, false);
   assert.equal(api.sendDeviceAction('D1', job.job_id, 'cancel'), false);
+  assert.equal(findElementByText(h.pushJobsTabActions, 'Cancel all').disabled, true);
+  assert.equal(socket.sent.length, 0);
+});
+
+test('non-resumable dispatch never exposes Cancel', () => {
+  const h = loadAdapter();
+  const socket = new window.WebSocket('ws://localhost/ws/admin');
+  const offline = snapshot('non-resumable', 1, 'D1', 'reconciling', 1, { resumeSupported: false });
+  socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [offline] });
+  const api = window.__stylyPushJobsV1Actions;
+  assert.equal(api.assignmentFor('D1').canCancel, false);
+  const fenced = snapshot('non-resumable', 2, 'D1', 'unconfirmed', 1, { resumeSupported: false });
+  fenced.devices.D1.device_fence = { blocking_job_id: 'non-resumable', blocking_attempt: 1 };
+  socket.emit({ type: 'PUSH_JOB_UPDATED', job: fenced });
+  assert.equal(api.assignmentFor('D1').canCancel, false);
+  assert.equal(api.sendDeviceAction('D1', fenced.job_id, 'cancel'), false);
   assert.equal(findElementByText(h.pushJobsTabActions, 'Cancel all').disabled, true);
   assert.equal(socket.sent.length, 0);
 });
