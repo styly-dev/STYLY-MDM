@@ -6,6 +6,7 @@ import pytest
 
 from styly_mdm.push_job_manager import PushJobManager
 from styly_mdm.push_job_store import PushJobStore, StoreConflict
+from styly_mdm.push_jobs import DeviceState
 from styly_mdm.push_runtime import PushRuntime
 from styly_mdm.push_scheduler import LiveSession
 from styly_mdm.transfer_registry import TransferRegistry
@@ -64,6 +65,29 @@ async def test_timeout_cancel_is_terminal_idempotent_and_unblocks_next_job(manag
     assert await manager.claim_next(['D1']) is None
     await manager.confirm_cancel(first['job_id'], 'D1')
     assert (await manager.claim_next(['D1']))['job']['job_id'] == second['job_id']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('capabilities, expected', [
+    (CAPS, True),
+    (frozenset({'push_job_id_v1'}), False),
+])
+async def test_snapshot_resume_supported_mirrors_cancel_identity(manager, capabilities, expected):
+    active = await downloading_job(manager.store, manager, capabilities)
+    assert active['devices']['D1']['dispatch_revision'] is not None
+    assert active['devices']['D1']['resume_supported'] is expected
+    await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
+                                   reason='device_disconnect', deadline=1)
+    if expected:
+        await manager.cancel_interrupted(active['job_id'], 'D1')
+    else:
+        with pytest.raises(StoreConflict, match='Only interrupted'):
+            await manager.cancel_interrupted(active['job_id'], 'D1')
+
+
+@pytest.mark.asyncio
+async def test_undispatched_snapshot_is_not_resume_supported(manager):
+    assert (await ready_job(manager.store, manager))['devices']['D1']['resume_supported'] is False
 
 
 @pytest.mark.asyncio
