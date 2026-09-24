@@ -489,8 +489,7 @@ class PushFilesWorker internal constructor(
                         ?: throw PushWorkerException("artifact_identity_mismatch", "resumable metadata is missing")
                     val offset = partial.takeIf { it.isFile }?.length() ?: 0L
                     if (offset > expectedSize) throw PushWorkerException("artifact_identity_mismatch", "partial exceeds expected size")
-                    val nextMetadata = downloadOnce(command, work, metadata, offset, onProgress, deadline)
-                    if (nextMetadata != null) writeMetadata(nextMetadata, work)
+                    downloadOnce(command, work, metadata, offset, onProgress, deadline)
                     if (partial.length() == expectedSize) break
                     throw PushWorkerException("download_failed", "artifact response ended before declared size", retryable = true)
                 } catch (error: PushWorkerException) {
@@ -522,7 +521,7 @@ class PushFilesWorker internal constructor(
         val connection = openConnection(command)
         try {
             if (connection.responseCode !in 200..299) throw PushWorkerException("download_failed", "artifact download returned HTTP ${connection.responseCode}")
-            writeResponse(connection, partial, append = false, expectedLength = command.artifactSize, onProgress = onProgress)
+            writeResponse(connection, partial, command.artifactSize, onProgress)
             verifyLegacyAndFinalize(command, partial, completed)
             return completed
         } catch (error: IOException) {
@@ -532,23 +531,13 @@ class PushFilesWorker internal constructor(
         }
     }
 
-    private fun openConnection(
-        command: PushProtocol.Command,
-        offset: Long = 0L,
-        etag: String? = null,
-    ): HttpURLConnection =
+    private fun openConnection(command: PushProtocol.Command): HttpURLConnection =
         (URI(command.artifactUrl).toURL().openConnection() as HttpURLConnection).apply {
             connectTimeout = CONNECT_TIMEOUT_MS
             readTimeout = READ_TIMEOUT_MS
             requestMethod = "GET"
             instanceFollowRedirects = true
             setRequestProperty("Accept-Encoding", "identity")
-            if (offset > 0L) {
-                setRequestProperty("Range", "bytes=$offset-")
-                setRequestProperty("If-Match", requireNotNull(etag))
-            } else if (etag != null || command.artifactEtag != null) {
-                setRequestProperty("If-Match", etag ?: command.artifactEtag)
-            }
         }
 
     private val resumableHttpClient = OkHttpClient.Builder()
@@ -634,7 +623,7 @@ class PushFilesWorker internal constructor(
         offset: Long,
         onProgress: (Long) -> Unit,
         deadline: PushDownloadDeadline,
-    ): ResumeMetadata? {
+    ) {
         val expectedSize = requireNotNull(command.artifactSize)
         val partial = File(work, "artifact.part")
         val connection = openResumableResponse(command, offset, metadata.artifactEtag, deadline)
@@ -677,7 +666,7 @@ class PushFilesWorker internal constructor(
                 val etag = requireNotNull(responseEtag)
                 writeMetadata(metadata.copy(artifactEtag = etag, updatedAt = System.currentTimeMillis()), work)
                 writeResumableResponse(connection, deadline, partial, append = false, expectedLength = expectedSize, onProgress = onProgress)
-                return metadata.copy(artifactEtag = etag, updatedAt = System.currentTimeMillis())
+                return
             }
 
             val storedEtag = metadata.artifactEtag
@@ -708,11 +697,10 @@ class PushFilesWorker internal constructor(
                     if (total != expectedSize || offset != total) {
                         throw PushWorkerException("artifact_identity_mismatch", "416 range does not describe the complete expected artifact")
                     }
-                    return metadata
+                    return
                 }
                 else -> throw PushWorkerException("download_failed", "artifact download returned HTTP $status")
             }
-            return metadata.copy(updatedAt = System.currentTimeMillis())
         } finally {
             deadline.attach(null)
             connection.close()
@@ -745,18 +733,16 @@ class PushFilesWorker internal constructor(
     private fun writeResponse(
         connection: HttpURLConnection,
         partial: File,
-        append: Boolean,
         expectedLength: Long?,
-        onProgress: (Long) -> Unit = {},
+        onProgress: (Long) -> Unit,
     ) {
         val declared = connection.contentLengthLong
         if (expectedLength != null && declared >= 0L && declared != expectedLength) {
             throw PushWorkerException("artifact_identity_mismatch", "HTTP body length does not match the expected range")
         }
         var received = 0L
-        val initialLength = if (append) partial.length() else 0L
         connection.inputStream.use { input ->
-            val output = openStorageOutput(partial, append)
+            val output = openStorageOutput(partial, append = false)
             try {
                 val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
                 while (true) {
@@ -767,7 +753,7 @@ class PushFilesWorker internal constructor(
                         throw PushWorkerException("artifact_identity_mismatch", "HTTP body exceeded its declared range")
                     }
                     storageWrite { output.write(buffer, 0, read) }
-                    onProgress(safeAdd(initialLength, received))
+                    onProgress(received)
                 }
             } finally {
                 try {

@@ -625,7 +625,6 @@ async def test_push_state_retry_result_refreshes_capability_without_dispatching(
     assert session.capabilities == frozenset({
         "push_state_retry_v1", "push_job_id_v1", "push_resume_v1",
     })
-    assert session.reported_push_runtime == {"active": None}
     assert runtime.legacy.devices["D1"]["push_state_status"] == "available"
     assert broadcasts == ["devices"]
     assert admin_messages[0]["type"] == "PUSH_STATE_RETRY_RESULT"
@@ -754,7 +753,6 @@ async def test_operator_resume_reconciles_recovered_state_before_dispatch(tmp_pa
                 process_instance_id=str(uuid.uuid4()),
                 owner_lock=asyncio.Lock(),
                 http_base="http://server",
-                reported_push_runtime={"active": {"status": "interrupted"}},
             )
         }
         admin = Ws()
@@ -1059,7 +1057,6 @@ async def test_unavailable_push_state_does_not_report_absence_or_request_reconci
         "http://server",
     )
 
-    assert runtime.sessions["D1"].reported_push_runtime == {"active": None}
     assert manager.clear_calls == 0
     assert runtime.scheduler.reconcile_calls == []
 
