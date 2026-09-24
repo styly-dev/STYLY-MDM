@@ -586,7 +586,7 @@ def test_e2e_older_client_download_complete_still_frees_an_install_slot(tmp_path
     asyncio.run(body())
 
 
-def test_e2e_disconnect_frees_the_push_slot(tmp_path):
+def test_e2e_disconnect_retains_push_slot_until_download_complete(tmp_path):
     async def body():
         server._apply_data_dir(str(tmp_path))
         server.MAX_CONCURRENT_TRANSFERS = 1
@@ -605,8 +605,13 @@ def test_e2e_disconnect_frees_the_push_slot(tmp_path):
                 assert await _recv(d0, "EXECUTE_PUSH_FILES") is not None
                 assert await _recv(d1, "EXECUTE_PUSH_FILES", timeout=0.3) is None
 
-                # dev0 drops mid-transfer -> its slot must free so dev1 proceeds.
+                # Losing WebSocket does not prove the independent HTTP worker
+                # stopped. Only exact completion or bounded timeout frees its slot.
                 await d0.close()
+                assert await _recv(d1, "EXECUTE_PUSH_FILES", timeout=0.3) is None
+                server.release_transfer_slot(
+                    "64b19041-0b8c-4ef4-82fd-000000000000", "download_complete", task="push"
+                )
                 assert await _recv(d1, "EXECUTE_PUSH_FILES") is not None
 
                 await d1.send_json({"type": "DOWNLOAD_COMPLETE", "task": "push", "dest_path": DEST})

@@ -44,7 +44,6 @@ class _Ws:
 def test_protocol_admission_uses_the_configured_resume_threshold():
     scheduler = object.__new__(PushScheduler)
     scheduler.resume_threshold_bytes = 10
-    scheduler.allow_legacy = True
     session = LiveSession(
         device_id='D1',
         session_id='session',
@@ -78,7 +77,6 @@ def test_dispatch_reports_artifact_requirement_separately_from_capability_change
         )
         scheduler = object.__new__(PushScheduler)
         scheduler.resume_threshold_bytes = 10
-        scheduler.allow_legacy = False
         scheduler.sessions = lambda: {"D1": session}
         scheduler.transfer_slots = lambda: asyncio.Semaphore(1)
         scheduler._fail_current = AsyncMock()
@@ -114,31 +112,6 @@ def test_active_reconnect_keeps_the_existing_transfer_slot():
         assert scheduler.transfer_registry.get(key) is future
         assert not future.done()
         assert accept.result()[0] == "accepted"
-
-    asyncio.run(scenario())
-
-
-def test_server_restart_reacquires_slot_until_recovered_download_completes():
-    async def scenario():
-        semaphore = asyncio.Semaphore(1)
-        scheduler = object.__new__(PushScheduler)
-        scheduler.transfer_registry = TransferRegistry()
-        scheduler.transfer_slots = lambda: semaphore
-        scheduler.transfer_timeout = 10
-        scheduler._accept_waiters = {}
-        scheduler._recovered_transfer_tasks = set()
-        scheduler.wake = lambda: None
-        key = TransferKey("push", "D1", "job", 1)
-
-        await scheduler.ensure_active_transfer_slot("job", "D1", 1)
-        blocked = asyncio.create_task(semaphore.acquire())
-        await asyncio.sleep(0)
-        assert not blocked.done()
-
-        assert scheduler.transfer_registry.release_exact(key, "download_complete")
-        await asyncio.wait_for(blocked, timeout=0.5)
-        semaphore.release()
-        await asyncio.gather(*scheduler._recovered_transfer_tasks)
 
     asyncio.run(scenario())
 

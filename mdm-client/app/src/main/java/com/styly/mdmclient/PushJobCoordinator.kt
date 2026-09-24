@@ -140,6 +140,13 @@ internal fun interruptedExpiryDelayMillis(
     return (retentionMs - elapsed).coerceAtLeast(0L)
 }
 
+internal fun interruptPushAfterRestart(active: PushProtocol.Active, now: Long): PushProtocol.Active =
+    active.copy(
+        interrupted = true,
+        interruptedAt = active.interruptedAt ?: now,
+        interruptionReason = active.interruptionReason ?: "client_restarted",
+    )
+
 internal fun buildPushRegistrationFields(
     state: PushProtocol.State,
     durabilityAvailable: Boolean,
@@ -414,6 +421,9 @@ class PushJobCoordinator(context: Context) {
         if (interrupted != null) {
             if (sameIdentity(interrupted.command, command)) {
                 if (interrupted.command.sameExecution(command)) {
+                    // The artifact URL is a replaceable locator, not execution identity.
+                    // A manual resume may therefore carry a fresh server lease URL while
+                    // reusing the durable partial for this exact artifact and revision.
                     // Recovery deliberately leaves the gate empty while waiting
                     // for exact server authorization. Reacquire it before the
                     // worker starts so duplicate/other commands remain fenced.
@@ -466,6 +476,7 @@ class PushJobCoordinator(context: Context) {
                     },
                     onValidated = { actor.execute { onValidated(command) } },
                     onApplying = { actor.execute { onApplying(command) } },
+                    onValidationStart = { actor.execute { onValidationStart(command) } },
                 ),
             )
             actor.execute { onTerminal(command, execution) }
@@ -589,8 +600,21 @@ class PushJobCoordinator(context: Context) {
         })
     }
 
+    private fun onValidationStart(command: PushProtocol.Command) {
+        if (!command.isJobV1 || !setPhase(command, PushProtocol.PHASE_VALIDATING)) return
+        send(JSONObject().apply {
+            put("type", "PUSH_PHASE")
+            put("job_id", command.jobId)
+            put("attempt", command.attempt)
+            put("artifact_id", command.artifactId)
+            put("phase", PushProtocol.PHASE_VALIDATING)
+        })
+    }
+
     private fun onTransferComplete(command: PushProtocol.Command, received: Long) {
-        if (!setPhase(command, PushProtocol.PHASE_VALIDATING)) return
+        if (!command.isJobV1 && !setPhase(command, PushProtocol.PHASE_VALIDATING)) return
+        if (command.isJobV1 && (state.active?.command?.identity != command.identity ||
+            state.active?.phase != PushProtocol.PHASE_VALIDATING)) return
         if (command.isJobV1) {
             send(JSONObject().apply {
                 put("type", "PUSH_TRANSFER_COMPLETE")
@@ -768,6 +792,7 @@ class PushJobCoordinator(context: Context) {
                 put("type", "PUSH_RECONCILE_REPORT")
                 put("job_id", identity.jobId)
                 put("attempt", identity.attempt)
+                if (identity.artifactId != null) put("artifact_id", identity.artifactId)
                 put("status", "absent")
             })
         }
@@ -795,10 +820,7 @@ class PushJobCoordinator(context: Context) {
                 return Recovery(expired.first, active.command)
             }
             Log.w(TAG, "Recovered resumable Push/Sync ${active.command.identity}")
-            return Recovery(loaded.copy(active = active.copy(
-                interrupted = true,
-                interruptedAt = active.interruptedAt ?: System.currentTimeMillis(),
-            )))
+            return Recovery(loaded.copy(active = interruptPushAfterRestart(active, System.currentTimeMillis())))
         }
         val interrupted = PushProtocol.Result(
             jobId = active.command.jobId,
