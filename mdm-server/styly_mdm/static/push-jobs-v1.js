@@ -597,7 +597,8 @@
     const online = !!(bridge && bridge.isDeviceOnline && bridge.isDeviceOnline(deviceId));
     const canResume = resumeRequired && online;
     const canCancel = !assignment.cancel_requested && !assignment.retry_job_id &&
-      ((assignment.state === 'queued' && assignment.dispatch_revision != null &&
+      assignment.resume_supported === true &&
+      ((assignment.state === 'queued' &&
         ['download_retry_exhausted', 'dispatch_paused', 'client_restarted'].indexOf(assignment.queue_reason) >= 0) ||
        (!online && assignment.state === 'reconciling') ||
        (assignment.state === 'unconfirmed' && !!assignment.device_fence));
