@@ -220,12 +220,10 @@ Resume before receiving a new token.
   not leave stale entries. These registered devices are separate from provisional
   connection rows and never become provisional power-control targets.
 
-Cancellation adds nullable `cancel_requested_at` in schema 3 to preserve intent
-across restart. Back up the database before deployment; older servers reject this
-schema version. The 60-second deadline requires the matching Android APK; older
-clients retain their previous retry timing. Deploy the server and APK together.
-This rollout assumes the old APK has no active Push/Sync transfer; its unscoped
-job-v1 artifact URLs are intentionally rejected after cutover.
+The 60-second deadline requires the matching Android APK; older clients retain
+their previous retry timing. Deploy the server and APK together while the old APK
+has no active Push/Sync transfer: its unscoped job-v1 artifact URLs are rejected
+after cutover.
 `CANCEL_PUSH_JOB` remains an admin action; clients receive the existing exact-identity
 `PUSH_RESUME_REJECTED` only after they report interrupted work. Older job-v1 APKs
 omit `artifact_id` from an `absent` reconciliation report; the server accepts that

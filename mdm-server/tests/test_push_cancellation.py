@@ -109,7 +109,6 @@ async def test_offline_cancel_preserves_fence_and_artifact_until_exact_cleanup(m
                                    reason='device_disconnect', deadline=1)
     await manager.cancel_interrupted(active['job_id'], 'D1')
     await manager.mark_unconfirmed(active['job_id'], 'D1', None, 'timeout', observed_now=2)
-    manager.rebuild_artifact_retention_sync(retry_window_ms=0, timestamp=now_ms()+1000)
     assert (await manager.artifact_record(active['artifact']['artifact_id']))['retention_state'] == 'retained'
     assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms()+1000) == []
     next_job = await ready_job(manager.store, manager)

@@ -22,6 +22,7 @@ def test_job_v1_command_uses_absolute_artifact_url():
             'display_filename': 'content.zip',
             'byte_size': 123,
             'sha256': 'a' * 64,
+            'etag': '"' + 'a' * 64 + '"',
         },
         'devices': {'D1': {'attempt': 1}},
     }
