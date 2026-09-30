@@ -557,6 +557,26 @@ test('Push state recovery warning preserves an independent install progress', ()
   assert.match(html, /retryPushState/);
 });
 
+test('Needs attention includes devices with retryable Push state once', () => {
+  const match = indexSource.match(/function pushAttentionDevices\(\) \{[\s\S]*?\n      \}/);
+  assert.ok(match);
+  const devices = [
+    { device_id: 'job', status: 'online' },
+    { device_id: 'state', status: 'online' },
+    { device_id: 'both', status: 'online' },
+    { device_id: 'healthy', status: 'online' },
+  ];
+  const context = vm.createContext({
+    devices,
+    getDeviceId(device) { return device.device_id; },
+    pushAssignmentFor(id) { return { needsAttention: id === 'job' || id === 'both' }; },
+    canRetryPushState(device) { return device.device_id === 'state' || device.device_id === 'both'; },
+  });
+  vm.runInContext(match[0], context);
+  assert.deepEqual(Array.from(context.pushAttentionDevices(), device => device.device_id),
+    ['job', 'state', 'both']);
+});
+
 test('target tabs preserve normal selection and clear it across Need attention', () => {
   const match = indexSource.match(/function switchTargetTab\(tab\) \{[\s\S]*?\n      \}/);
   assert.ok(match);
@@ -1011,4 +1031,26 @@ test('unconfirmed pending cancellation remains visible ahead of queued work unti
   } });
   assert.equal(api.assignmentFor('D1').job_id, next.job_id);
   assert.equal(api.assignmentFor('D1').status, 'queued');
+});
+
+test('job action acknowledgements become readable log lines', () => {
+  const harness = loadAdapter();
+  const socket = new window.WebSocket('ws://localhost/ws/admin');
+  const cancel = socket.emit({
+    type: 'PUSH_JOB_ACTION_SENT',
+    job_id: 'aaaaaaaa-1111-4111-8111-111111111111',
+    action: 'CANCEL_PUSH_JOB',
+  });
+  const retry = socket.emit({
+    type: 'PUSH_JOB_ACTION_SENT',
+    job_id: 'bbbbbbbb-1111-4111-8111-111111111111',
+    action: 'RETRY_FAILED_PUSH_JOB',
+  });
+
+  // The legacy handler must not also print its raw "Received: TYPE" fallback.
+  assert.equal(cancel.stopped, true);
+  assert.equal(retry.stopped, true);
+  const lines = harness.logContainer.children.map((entry) => entry.children[1].textContent);
+  assert.match(lines[0], /^Cancel recorded for job #aaaaaaaa/);
+  assert.equal(lines[1], 'Created retry job #bbbbbbbb for unsuccessful devices');
 });
