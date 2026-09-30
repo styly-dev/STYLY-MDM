@@ -139,7 +139,11 @@ unchanged. Cancellation intent requires schema 3 as described below; no new devi
 WebSocket message type is required.
 
 Extraction and destination apply start only after size and SHA-256 verification
-and an atomic local rename. A hash mismatch removes the untrusted partial.
+and an atomic local rename. A hash mismatch removes the untrusted partial. The
+client hashes bytes as they are written, so an uninterrupted download is not read
+again for verification. A resume in a new execution never rereads its kept prefix
+before or during the HTTP transfer, because the server's 60-second lease idle timer
+is already running; it hashes the whole file once after `PUSH_PHASE validating`.
 
 On process or device restart, the client retains a valid interrupted Issue #94 job-v1
 record and reports its exact artifact, dispatch revision, attempt, and local
@@ -241,7 +245,7 @@ live eligible connection. Neither operation requires this Cancel action.
 Push/Sync uses three independent ownership mechanisms:
 
 - **Device execution ownership** remains held through validation and apply until a terminal result.
-- **Global transfer slot** is independent of the device WebSocket. A job-v1 slot is released when the client reports `PUSH_PHASE validating` after receiving all artifact bytes, or on a matching terminal result; `PUSH_TRANSFER_COMPLETE` remains the post-SHA-256 checkpoint. If HTTP writes stop for 60 seconds before validation starts, the server revokes the assignment URL, aborts and awaits that HTTP handler, then releases the slot. Healthy job-v1 HTTP transfers have no 600-second cap.
+- **Global transfer slot** is independent of the device WebSocket. A job-v1 slot is released when the client reports `PUSH_PHASE validating` after receiving all artifact bytes, on a matching terminal result, or when a reconnecting device registers an exact `validating`/`applying` phase after finishing the download offline; `PUSH_TRANSFER_COMPLETE` remains the post-SHA-256 checkpoint. If HTTP writes stop for 60 seconds before validation starts, the server revokes the assignment URL, aborts and awaits that HTTP handler, then releases the slot. Healthy job-v1 HTTP transfers have no 600-second cap.
 - **Persistent device fence** blocks later jobs after an `unconfirmed` outcome until exact evidence proves the old worker is gone.
 
 The transfer registry uses typed keys. A job-v1 slot is addressed by `(job_id, device_id, attempt=1)`; a stale result cannot release a different job's slot. Job-v1 uses the existing server-wide transfer semaphore. APK install and standalone `/api/bundles` Push remain on their separate legacy path and keep its existing slot handling. Job-v1 HTTP URLs carry an in-memory assignment token; server restart invalidates it, so manual Resume is required to issue a replacement.
@@ -267,7 +271,10 @@ New clients register:
 console then exposes `Retry Push state` on that online device and a bulk action for all
 affected online devices. These actions send only `RETRY_PUSH_STATE`: the coordinator
 rereads and republishes its durable state and answers with refreshed capability/state
-metadata. An unavailable registration is not authoritative absence evidence. On a
+metadata. Only a running worker makes the retry answer `push_state_busy`. When a
+worker finished but its terminal or interrupted outcome could not be saved, the retry
+saves that in-memory outcome instead of reloading disk, then releases the execution
+and sends the result; reloading would recover the finished execution as resumable. An unavailable registration is not authoritative absence evidence. On a
 successful retry, exact interrupted identity may be reconciled and requeued, but a
 restart-paused job remains paused: the retry path never starts a worker, downloads an
 artifact, or wakes the Push scheduler. A separate job `Dispatch` or `Resume` action

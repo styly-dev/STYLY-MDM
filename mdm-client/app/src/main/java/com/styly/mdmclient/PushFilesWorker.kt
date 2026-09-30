@@ -84,6 +84,66 @@ internal class PushDownloadDeadline(
     }
 }
 
+/**
+ * SHA-256 of exactly the bytes persisted in [file], updated as they are written.
+ *
+ * The file is never reread while a transfer is in progress, because the server's
+ * HTTP lease idle timer keeps running during that time. When the tracked bytes stop
+ * matching the file (a prefix kept from an earlier execution, or a write that
+ * failed after reaching disk), incremental hashing stops and [finishHex] hashes the
+ * whole file once during validation instead.
+ */
+internal class PartialFileDigest(private val file: File) {
+    private var digest = MessageDigest.getInstance("SHA-256")
+    private var length = 0L
+    private var tracking = true
+    /** Bytes reread from disk at validation; exposed for tests. */
+    var rehashedBytes = 0L
+        private set
+
+    /** Call right after opening [file] for writing, before the first [update]. */
+    fun beginWrite(append: Boolean) {
+        if (!append) {
+            // Opening without append truncated the file; restart from byte zero.
+            digest = MessageDigest.getInstance("SHA-256")
+            length = 0L
+            tracking = true
+        } else if (!tracking || file.length() != length) {
+            tracking = false
+        }
+    }
+
+    fun update(buffer: ByteArray, offset: Int, count: Int) {
+        if (!tracking) return
+        digest.update(buffer, offset, count)
+        length += count
+    }
+
+    /** Returns the lowercase hex digest of the file and resets this tracker. */
+    fun finishHex(): String {
+        val actual = if (file.isFile) file.length() else 0L
+        if (!tracking || actual != length) {
+            digest = MessageDigest.getInstance("SHA-256")
+            if (actual > 0L) {
+                file.inputStream().use { input ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        digest.update(buffer, 0, read)
+                    }
+                }
+            }
+            rehashedBytes += actual
+        }
+        val hex = digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        digest = MessageDigest.getInstance("SHA-256")
+        length = 0L
+        tracking = true
+        return hex
+    }
+}
+
 /** Blocking Push/Sync download, validation, extraction, and apply worker. */
 class PushFilesWorker internal constructor(
     private val hasExternalStorageAccess: () -> Boolean,
@@ -480,6 +540,9 @@ class PushFilesWorker internal constructor(
             completed.delete()
             throw PushWorkerException("artifact_identity_mismatch", "completed artifact SHA-256 did not match")
         }
+        // A prefix kept from an earlier execution is hashed during validation, not
+        // here: rereading it before the request would consume the HTTP lease window.
+        val digest = PartialFileDigest(partial)
         PushDownloadDeadline(monotonicMillis, noProgressTimeoutMs).use { deadline ->
             var retryIndex = 0
             while (true) {
@@ -489,7 +552,7 @@ class PushFilesWorker internal constructor(
                         ?: throw PushWorkerException("artifact_identity_mismatch", "resumable metadata is missing")
                     val offset = partial.takeIf { it.isFile }?.length() ?: 0L
                     if (offset > expectedSize) throw PushWorkerException("artifact_identity_mismatch", "partial exceeds expected size")
-                    downloadOnce(command, work, metadata, offset, onProgress, deadline)
+                    downloadOnce(command, work, metadata, offset, onProgress, deadline, digest)
                     if (partial.length() == expectedSize) break
                     throw PushWorkerException("download_failed", "artifact response ended before declared size", retryable = true)
                 } catch (error: PushWorkerException) {
@@ -511,7 +574,7 @@ class PushFilesWorker internal constructor(
         }
         // Validation is outside both the download deadline and the network retry loop.
         onValidationStart()
-        verifyAndFinalize(command, partial, completed)
+        verifyAndFinalize(command, partial, completed, digest)
         return completed
     }
 
@@ -521,8 +584,9 @@ class PushFilesWorker internal constructor(
         val connection = openConnection(command)
         try {
             if (connection.responseCode !in 200..299) throw PushWorkerException("download_failed", "artifact download returned HTTP ${connection.responseCode}")
-            writeResponse(connection, partial, command.artifactSize, onProgress)
-            verifyLegacyAndFinalize(command, partial, completed)
+            val digest = PartialFileDigest(partial)
+            writeResponse(connection, partial, command.artifactSize, onProgress, digest)
+            verifyLegacyAndFinalize(command, partial, completed, digest)
             return completed
         } catch (error: IOException) {
             throw PushWorkerException("download_failed", error.message ?: "I/O error", error, true)
@@ -575,6 +639,7 @@ class PushFilesWorker internal constructor(
         append: Boolean,
         expectedLength: Long,
         onProgress: (Long) -> Unit,
+        digest: PartialFileDigest,
     ) {
         val body = requireNotNull(response.body)
         val declared = body.contentLength()
@@ -586,6 +651,7 @@ class PushFilesWorker internal constructor(
         body.byteStream().use { input ->
             val output = openStorageOutput(partial, append)
             try {
+                digest.beginWrite(append)
                 val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
                 while (true) {
                     deadline.remaining()
@@ -595,6 +661,7 @@ class PushFilesWorker internal constructor(
                     received = safeAdd(received, read.toLong())
                     if (received > expectedLength) throw PushWorkerException("artifact_identity_mismatch", "HTTP body exceeded its declared range")
                     storageWrite { output.write(buffer, 0, read) }
+                    digest.update(buffer, 0, read)
                     deadline.receivedBytes()
                     onProgress(safeAdd(initialLength, received))
                 }
@@ -623,6 +690,7 @@ class PushFilesWorker internal constructor(
         offset: Long,
         onProgress: (Long) -> Unit,
         deadline: PushDownloadDeadline,
+        digest: PartialFileDigest,
     ) {
         val expectedSize = requireNotNull(command.artifactSize)
         val partial = File(work, "artifact.part")
@@ -665,7 +733,7 @@ class PushFilesWorker internal constructor(
                 validateResponseEtag(responseEtag, metadata.artifactEtag ?: command.artifactEtag)
                 val etag = requireNotNull(responseEtag)
                 writeMetadata(metadata.copy(artifactEtag = etag, updatedAt = System.currentTimeMillis()), work)
-                writeResumableResponse(connection, deadline, partial, append = false, expectedLength = expectedSize, onProgress = onProgress)
+                writeResumableResponse(connection, deadline, partial, append = false, expectedLength = expectedSize, onProgress = onProgress, digest = digest)
                 return
             }
 
@@ -685,11 +753,11 @@ class PushFilesWorker internal constructor(
                     if ((connection.body?.contentLength() ?: -1L) != rangeLength) {
                         throw PushWorkerException("artifact_identity_mismatch", "Content-Length does not match Content-Range")
                     }
-                    writeResumableResponse(connection, deadline, partial, append = true, expectedLength = rangeLength, onProgress = onProgress)
+                    writeResumableResponse(connection, deadline, partial, append = true, expectedLength = rangeLength, onProgress = onProgress, digest = digest)
                 }
                 HttpURLConnection.HTTP_OK -> {
                     // A server that ignored Range must never be appended to a partial file.
-                    writeResumableResponse(connection, deadline, partial, append = false, expectedLength = expectedSize, onProgress = onProgress)
+                    writeResumableResponse(connection, deadline, partial, append = false, expectedLength = expectedSize, onProgress = onProgress, digest = digest)
                 }
                 416 -> {
                     val total = parseUnsatisfiedContentRange(connection.header("Content-Range"))
@@ -735,6 +803,7 @@ class PushFilesWorker internal constructor(
         partial: File,
         expectedLength: Long?,
         onProgress: (Long) -> Unit,
+        digest: PartialFileDigest,
     ) {
         val declared = connection.contentLengthLong
         if (expectedLength != null && declared >= 0L && declared != expectedLength) {
@@ -744,6 +813,7 @@ class PushFilesWorker internal constructor(
         connection.inputStream.use { input ->
             val output = openStorageOutput(partial, append = false)
             try {
+                digest.beginWrite(append = false)
                 val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
                 while (true) {
                     val read = input.read(buffer)
@@ -753,6 +823,7 @@ class PushFilesWorker internal constructor(
                         throw PushWorkerException("artifact_identity_mismatch", "HTTP body exceeded its declared range")
                     }
                     storageWrite { output.write(buffer, 0, read) }
+                    digest.update(buffer, 0, read)
                     onProgress(received)
                 }
             } finally {
@@ -771,11 +842,16 @@ class PushFilesWorker internal constructor(
         }
     }
 
-    private fun verifyAndFinalize(command: PushProtocol.Command, partial: File, completed: File) {
+    private fun verifyAndFinalize(
+        command: PushProtocol.Command,
+        partial: File,
+        completed: File,
+        digest: PartialFileDigest,
+    ) {
         if (!partial.isFile || partial.length() != requireNotNull(command.artifactSize)) {
             throw PushWorkerException("artifact_identity_mismatch", "partial length does not match declared size")
         }
-        if (!matchesArtifactIdentity(command, partial)) {
+        if (!digest.finishHex().equals(command.artifactSha256, ignoreCase = true)) {
             partial.delete()
             File(partial.parentFile, "metadata.json").delete()
             throw PushWorkerException("artifact_identity_mismatch", "artifact SHA-256 did not match its declared identity")
@@ -798,22 +874,17 @@ class PushFilesWorker internal constructor(
         return actual.equals(command.artifactSha256, ignoreCase = true)
     }
 
-    private fun verifyLegacyAndFinalize(command: PushProtocol.Command, partial: File, completed: File) {
+    private fun verifyLegacyAndFinalize(
+        command: PushProtocol.Command,
+        partial: File,
+        completed: File,
+        digest: PartialFileDigest,
+    ) {
         if (command.artifactSize != null && partial.length() != command.artifactSize) {
             throw PushWorkerException("artifact_identity_mismatch", "received size did not match the declared size")
         }
         command.artifactSha256?.let { expected ->
-            val digest = MessageDigest.getInstance("SHA-256")
-            partial.inputStream().use { input ->
-                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                while (true) {
-                    val read = input.read(buffer)
-                    if (read < 0) break
-                    digest.update(buffer, 0, read)
-                }
-            }
-            val actual = digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
-            if (!actual.equals(expected, ignoreCase = true)) {
+            if (!digest.finishHex().equals(expected, ignoreCase = true)) {
                 partial.delete()
                 throw PushWorkerException("artifact_identity_mismatch", "artifact SHA-256 did not match its declared identity")
             }

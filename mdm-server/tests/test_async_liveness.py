@@ -768,6 +768,8 @@ async def test_housekeeping_recovers_expired_acceptance_waiter(monkeypatch):
             self.wake_count += 1
 
     runtime = object.__new__(PushRuntime)
+    # Artifact GC is covered separately; keep it out of this housekeeping loop.
+    runtime._next_artifact_gc_at = float("inf")
     runtime.manager = Manager()
     runtime.scheduler = Scheduler()
     runtime.accept_reconciliation_timeout = 60
@@ -830,6 +832,8 @@ async def test_housekeeping_leaves_live_acceptance_waiter_to_dispatch_task(monke
             raise AssertionError("a skipped live waiter must not wake the scheduler")
 
     runtime = object.__new__(PushRuntime)
+    # Artifact GC is covered separately; keep it out of this housekeeping loop.
+    runtime._next_artifact_gc_at = float("inf")
     runtime.manager = Manager()
     runtime.scheduler = Scheduler()
     runtime.accept_reconciliation_timeout = 60
@@ -906,6 +910,8 @@ async def test_reconciliation_housekeeping_isolates_query_and_row_errors(monkeyp
             self.wake_count += 1
 
     runtime = object.__new__(PushRuntime)
+    # Artifact GC is covered separately; keep it out of this housekeeping loop.
+    runtime._next_artifact_gc_at = float("inf")
     runtime.manager = Manager()
     runtime.sessions = {}
     runtime.transfers = Transfers()

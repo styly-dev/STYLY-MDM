@@ -29,7 +29,8 @@ def runtime_for(manager):
     runtime.store = manager.store
     runtime.manager = manager
     runtime.scheduler = Scheduler()
-    runtime.transfers = TransferRegistry()
+    runtime.leases = PushTransferLeases()
+    runtime.transfers = TransferRegistry(runtime.leases.revoke_now)
     runtime.send_timeout = 1
     runtime.legacy = LegacyEvents()
     runtime.pending_publications = {}

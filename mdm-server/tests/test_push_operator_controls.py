@@ -193,6 +193,9 @@ async def test_individual_action_leaves_other_interrupted_device_untouched(manag
     if action == "PUSH_FILES":
         assert current["devices"]["D1"]["queue_reason"] == "resumable_replay"
         assert (await manager.claim_next(["D1"]))["device_id"] == "D1"
+        sent = next(message for message in admin.messages if message["type"] == "PUSH_FILES_SENT")
+        assert sent["resume"] is True
+        assert sent["target_count"] == 1
     else:
         assert current["devices"]["D1"]["cancel_requested"]
         assert current["devices"]["D2"]["state"] == "queued"
