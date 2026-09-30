@@ -153,6 +153,7 @@
     .attention-tab-job-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); }
     .attention-tab-job-buttons { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
     .attention-tab-job-buttons .push-job-action { min-height: 26px; padding: 3px 8px; font-size: 11px; }
+    .attention-push-state-actions { display: flex; justify-content: flex-end; margin: 12px 20px 0; }
 
     .targets-body { padding: 0; flex: 1 1 0; min-height: 0; overflow-y: auto; }
 
@@ -187,7 +188,7 @@
        body so a background DEVICE_LIST re-render (battery/heartbeat ticks) can't destroy
        the input mid-keystroke. */
     .dev-toolbar { display: flex; gap: 8px; padding: 10px 20px 4px; flex: 0 0 auto; }
-    .push-state-retry-all { margin-left: auto; white-space: nowrap; color: var(--warning); border-color: #665321; }
+    .push-state-retry-all { white-space: nowrap; color: var(--warning); border-color: #665321; }
     .push-state-retry-all:hover { color: var(--warning); border-color: var(--warning); background: rgba(251, 191, 36, .08); }
     .dev-search-input { flex: 1 1 auto; min-width: 0; padding: 8px 11px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 7px; color: var(--text-primary); font-size: 13px; font-family: inherit; }
     .dev-search-input:focus { outline: none; border-color: var(--accent); }
@@ -461,6 +462,9 @@
             <div class="subtabs-fill"></div>
           </div>
           <div class="attention-tab-actions" id="pushJobsTabActions" style="display:none"></div>
+          <div class="attention-push-state-actions" id="pushStateTabActions" style="display:none">
+            <button class="manage-btn push-state-retry-all" id="btnRetryAllPushStates" title="Retry durable Push state on every affected online device. This does not start a transfer.">↻ Retry affected</button>
+          </div>
           <div class="dev-toolbar" id="devToolbar" style="display:none">
             <input class="dev-search-input" id="devSearch" data-dev-search maxlength="64" placeholder="⌕ Filter devices by name…">
             <div class="seg" id="devStatusFilter" role="group" aria-label="Filter by connection status">
@@ -468,7 +472,6 @@
               <button class="seg-btn" data-status="online" title="Show only devices that are online now">Online</button>
               <button class="seg-btn" data-status="offline" title="Show only devices that are not online">Offline</button>
             </div>
-            <button class="manage-btn push-state-retry-all" id="btnRetryAllPushStates" style="display:none" title="Retry durable Push state on every affected online device. This does not start a transfer.">↻ Retry affected</button>
           </div>
           <div class="targets-body" id="targetsBody"></div>
         </div>
@@ -717,6 +720,7 @@
       const cntAttention = document.getElementById('cntAttention');
       const targetsBody = document.getElementById('targetsBody');
       const pushJobsTabActions = document.getElementById('pushJobsTabActions');
+      const pushStateTabActions = document.getElementById('pushStateTabActions');
       const devToolbar = document.getElementById('devToolbar');
       const devSearchInput = document.getElementById('devSearch');
       const devStatusFilter = document.getElementById('devStatusFilter');
@@ -1084,7 +1088,7 @@
             addLog('[' + (msg.status === 'success' ? 'OK' : 'FAIL') + '] install ' + (msg.apk_filename || '-') + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), st);
             break;
           }
-          case 'PUSH_FILES_SENT': addLog((msg.delete_extras ? 'Sync' : 'Push') + ' job queued for ' + msg.target_count + ' device(s) → ' + (msg.dest_path || '-') + (msg.max_concurrent ? ' (max ' + msg.max_concurrent + ' concurrent transfer(s))' : ''), 'info'); break;
+          case 'PUSH_FILES_SENT': addLog((msg.delete_extras ? 'Sync' : 'Push') + (msg.resume ? ' resume requested for ' : ' job queued for ') + msg.target_count + ' device(s) → ' + (msg.dest_path || '-') + (msg.max_concurrent ? ' (max ' + msg.max_concurrent + ' concurrent transfer(s))' : ''), 'info'); break;
           case 'PUSH_STATE_RETRY_SENT': addLog('Push state retry requested on ' + msg.sent_count + '/' + msg.target_count + ' device(s); no transfer was started', 'info'); break;
           case 'PUSH_STATE_RETRY_RESULT': {
             const ok = msg.status === 'success';
@@ -1213,6 +1217,9 @@
         tabDevices.classList.toggle('active', targetTab === 'devices');
         tabAttention.classList.toggle('active', targetTab === 'attention');
         pushJobsTabActions.style.display = targetTab === 'attention' && pushJobsTabActions.children.length ? '' : 'none';
+        const retryable = retryablePushStateDevices();
+        pushStateTabActions.style.display = targetTab === 'attention' && retryable.length ? '' : 'none';
+        btnRetryAllPushStates.textContent = '↻ Retry affected (' + retryable.length + ')';
       }
 
       function renderTargets() {
@@ -1224,9 +1231,6 @@
         devToolbar.style.display = showToolbar ? '' : 'none';
         if (showToolbar && devSearchInput.value !== deviceSearch) devSearchInput.value = deviceSearch;
         if (showToolbar) syncStatusFilterButtons();
-        const retryable = showToolbar ? retryablePushStateDevices() : [];
-        btnRetryAllPushStates.style.display = retryable.length ? '' : 'none';
-        btnRetryAllPushStates.textContent = '↻ Retry affected (' + retryable.length + ')';
         const hadFocus = labelInputFocused();
         targetsBody.innerHTML = targetTab === 'groups'
           ? renderGroupsHtml()
@@ -1242,14 +1246,14 @@
       function pushAttentionDevices() {
         return devices.filter(function (device) {
           const assignment = pushAssignmentFor(getDeviceId(device));
-          return assignment && assignment.needsAttention;
+          return (assignment && assignment.needsAttention) || canRetryPushState(device);
         });
       }
 
       function renderAttentionHtml() {
         const canonical = pushAttentionDevices();
         if (!provisionalConnections.length && !canonical.length) return '<div class="empty">No devices need attention</div>';
-        const jobs = canonical.length ? '<div class="attention-list"><div class="zone-label">Push / Sync jobs</div>' +
+        const jobs = canonical.length ? '<div class="attention-list"><div class="zone-label">Push / Sync jobs and state</div>' +
           canonical.map(function (device) {
             const id = getDeviceId(device);
             return '<div class="attention-row"><div></div><div class="attention-device">' +
