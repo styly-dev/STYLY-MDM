@@ -1509,11 +1509,6 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     provisional_connections.pop(ws, None)
                     device_id = new_device_id
                     socket_identity_kind = kind
-                    model = registration["model"]
-                    ip = registration["ip"]
-                    startup_app = registration["startup_app"]
-                    version_code = registration["version_code"]
-                    version_name = registration["version_name"]
                     capabilities = registration["capabilities"]
                     retry_supported = "push_state_retry_v1" in capabilities
                     push_state = data.get("push_state")
@@ -1523,7 +1518,6 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         and push_state.get("status") in {"available", "unavailable"}
                         else None
                     )
-                    prev = device_registry.get(new_device_id, {})
                     devices[device_id] = {
                         "ws": ws,
                         "device_id": device_id,
