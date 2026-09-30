@@ -696,6 +696,17 @@
       if (socket !== currentAdminSocket) return;
       if (awaitingInitialSnapshot) bufferJob(message.job);
       else applyJob(message.job);
+    } else if (message.type === 'PUSH_JOB_ACTION_SENT') {
+      // Acknowledgement for job-level operator actions owned by this adapter.
+      event.stopImmediatePropagation();
+      if (socket !== currentAdminSocket) return;
+      const shortId = String(message.job_id || '').slice(0, 8);
+      if (message.action === 'CANCEL_PUSH_JOB') {
+        appendLog('Cancel recorded for job #' + shortId +
+          '; affected devices settle once they confirm the work is absent', 'info');
+      } else if (message.action === 'RETRY_FAILED_PUSH_JOB') {
+        appendLog('Created retry job #' + shortId + ' for unsuccessful devices', 'info');
+      }
     } else if (message.type === 'PUSH_PROGRESS' && message.job_id) {
       // Full revisioned snapshots already render concurrent jobs independently.
       event.stopImmediatePropagation();

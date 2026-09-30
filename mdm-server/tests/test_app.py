@@ -66,9 +66,11 @@ def test_web_console_exposes_individual_and_bulk_push_state_retry_controls():
     source = static_index.read_text(encoding="utf-8")
 
     assert 'id="btnRetryAllPushStates"' in source
+    assert 'id="pushStateTabActions"' in source
+    assert source.index('id="pushStateTabActions"') < source.index('id="devToolbar"')
     assert 'data-act="retryPushState"' in source
     assert "Retry affected (' + retryable.length + ')" in source
-    assert "btnRetryAllPushStates.style.display = retryable.length ? '' : 'none';" in source
+    assert "pushStateTabActions.style.display = targetTab === 'attention' && retryable.length ? '' : 'none';" in source
     assert "Push state unavailable" in source
     assert "progressCellHtml(id)" in source
     assert '<div>Client</div><div>Status</div><div>Battery</div><div>Progress</div>' in source
