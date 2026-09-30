@@ -1178,13 +1178,21 @@ class PushRuntime:
                 phase,
                 None,
             )
-            if (
-                outcome == "active"
-                and phase == "downloading"
-                and self.scheduler is not None
-            ):
-                await self.scheduler.ensure_active_transfer_slot(job_id, device_id, 1)
-            return snapshots if outcome == "active" else []
+            if outcome != "active":
+                return []
+            if phase == "downloading":
+                if self.scheduler is not None:
+                    await self.scheduler.ensure_active_transfer_slot(
+                        job_id, device_id, 1
+                    )
+            else:
+                # The download finished while offline, so the transfer slot and its
+                # HTTP lease are no longer needed. Holding them would let the idle
+                # watchdog move validation or apply back to reconciliation.
+                self.transfers.release_exact(
+                    TransferKey("push", device_id, job_id, 1), "transfer_complete"
+                )
+            return snapshots
         except StoreConflict:
             return []
 
@@ -2182,11 +2190,9 @@ class PushRuntime:
                                     raise StoreConflict("Wait for the connected device to report interruption before cancelling")
                                 snapshot = await self.manager.cancel_interrupted(job_id, device_id)
                                 key = TransferKey("push", device_id, job_id, 1)
-                                leases = getattr(self, "leases", None)
-                                if leases is not None:
-                                    token = leases.token(key)
-                                    if token is not None:
-                                        await leases.expire(key, token)
+                                token = self.leases.token(key)
+                                if token is not None:
+                                    await self.leases.expire(key, token)
                                 self.transfers.release_exact(key, "cancelled")
                                 assignment = await self.manager.assignment(job_id, device_id)
                                 if session and assignment and assignment["state"] == "queued":
@@ -2257,7 +2263,7 @@ class PushRuntime:
             # Durable-state Retry only reloads and republishes client state. The
             # operator's separate Resume action is the authority to reconcile and
             # requeue recovered interrupted work.
-            live_device_entries = getattr(self.legacy, "devices", {})
+            live_device_entries = self.legacy.devices
             reconciling_devices = [
                 device_id
                 for device_id, device in snapshot["devices"].items()
@@ -2277,7 +2283,12 @@ class PushRuntime:
                             "revision": snapshot["revision"],
                             "state": snapshot["state"],
                             "dispatch_enabled": snapshot["dispatch_enabled"],
-                            "target_count": snapshot["aggregate"]["total"],
+                            # A targeted Resume acts on the listed devices only.
+                            "target_count": (
+                                len(targets) if targets is not None
+                                else snapshot["aggregate"]["total"]
+                            ),
+                            "resume": targets is not None,
                             "max_concurrent": self.legacy.MAX_CONCURRENT_TRANSFERS,
                             "delete_extras": snapshot["mode"] == "sync",
                             "dest_path": snapshot["dest_path"],
@@ -2433,27 +2444,19 @@ class PushRuntime:
             except Exception:
                 log.exception("Could not query expired Push deadlines")
                 continue
-            if (
-                hasattr(self.manager, "gc_artifacts_sync")
-                and timestamp / 1000 >= getattr(self, "_next_artifact_gc_at", 0.0)
-            ):
+            if timestamp / 1000 >= self._next_artifact_gc_at:
                 try:
                     await asyncio.to_thread(
                         self.manager.gc_artifacts_sync,
                         self.artifacts.artifact_root,
-                        retry_window_ms=int(
-                            getattr(self, "artifact_retry_window", 7 * 24 * 60 * 60)
-                            * 1000
-                        ),
+                        retry_window_ms=int(self.artifact_retry_window * 1000),
                         timestamp=timestamp,
                     )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     log.exception("Could not GC expired Push artifacts")
-                self._next_artifact_gc_at = timestamp / 1000 + getattr(
-                    self, "artifact_gc_interval", 60
-                )
+                self._next_artifact_gc_at = timestamp / 1000 + self.artifact_gc_interval
             for row in acceptance_rows:
                 if self.scheduler is not None and self.scheduler.has_live_acceptance_waiter(
                     row["job_id"], row["device_id"], row["attempt"]
