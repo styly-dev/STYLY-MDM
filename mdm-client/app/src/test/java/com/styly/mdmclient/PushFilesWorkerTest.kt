@@ -695,6 +695,89 @@ class PushFilesWorkerTest {
     }
 
     @Test
+    fun `in-execution range retry keeps the incremental digest without rereading`() {
+        val content = java.util.Random(6).let { random ->
+            CharArray(100_000) { (' '.code + random.nextInt(90)).toChar() }.concatToString()
+        }
+        val archive = zip("content.txt" to content).readBytes()
+        val split = archive.size / 2
+        val destination = tmp.newFolder("digest-retry-destination")
+        val digests = mutableListOf<PartialFileDigest>()
+
+        TruncatingServer(archive, split).use { server ->
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { File(tmp.root, "digest-retry-work") },
+                destinationProvider = { destination },
+                retryDelay = {},
+                digestFactory = { file -> PartialFileDigest(file).also { digests += it } },
+            ).execute(
+                command(
+                    artifactUrl = server.url,
+                    artifactSize = archive.size.toLong(),
+                    artifactSha256 = sha256(archive),
+                ),
+                PushFilesWorker.Callbacks({}, {}, {}),
+            )
+
+            assertEquals("success", execution.result.status)
+            assertTrue(server.secondRequest.contains("Range: bytes=$split-"))
+            assertEquals(archive.size, server.responseBytesWritten)
+            assertEquals(1, digests.size)
+            assertEquals(0L, digests.single().rehashedBytes)
+            assertEquals(content, File(destination, "content.txt").readText())
+        }
+    }
+
+    /** Drops the first full response after [split] bytes, then serves the exact remainder. */
+    private class TruncatingServer(
+        private val content: ByteArray,
+        private val split: Int,
+    ) : AutoCloseable {
+        private val server = ServerSocket(0, 2, InetAddress.getLoopbackAddress())
+        val url = "http://127.0.0.1:${server.localPort}/artifact.zip"
+        @Volatile var secondRequest = ""
+        @Volatile var responseBytesWritten = 0
+        private val thread = Thread({
+            repeat(2) { index ->
+                server.accept().use { client ->
+                    val reader = client.getInputStream().bufferedReader(Charsets.US_ASCII)
+                    val request = buildList {
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            if (line.isEmpty()) break
+                            add(line)
+                        }
+                    }.joinToString("\n")
+                    val output = client.getOutputStream()
+                    if (index == 0) {
+                        output.write(("HTTP/1.1 200 OK\r\nETag: \"v1\"\r\n" +
+                            "Content-Length: ${content.size}\r\nConnection: close\r\n\r\n")
+                            .toByteArray(Charsets.US_ASCII))
+                        output.write(content, 0, split)
+                        responseBytesWritten += split
+                    } else {
+                        secondRequest = request
+                        val remaining = content.size - split
+                        output.write(("HTTP/1.1 206 Partial Content\r\nETag: \"v1\"\r\n" +
+                            "Content-Range: bytes $split-${content.lastIndex}/${content.size}\r\n" +
+                            "Content-Length: $remaining\r\nConnection: close\r\n\r\n")
+                            .toByteArray(Charsets.US_ASCII))
+                        output.write(content, split, remaining)
+                        responseBytesWritten += remaining
+                    }
+                    output.flush()
+                }
+            }
+        }, "push-worker-truncating-test-http").apply { start() }
+
+        override fun close() {
+            server.close()
+            thread.join(5_000)
+        }
+    }
+
+    @Test
     fun `expired metadata deadline does not discard an exactly authorized partial`() {
         val archive = zip("content.txt" to "coordinator-authorized").readBytes()
         val split = archive.size / 2

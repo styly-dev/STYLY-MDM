@@ -85,11 +85,12 @@ internal class PushDownloadDeadline(
 }
 
 /**
- * SHA-256 of exactly the bytes persisted in [file], updated as they are written.
+ * SHA-256 of received buffers after successful writes to [file]. This does not
+ * reread stored bytes to detect same-size changes after writing.
  *
  * The file is never reread while a transfer is in progress, because the server's
- * HTTP lease idle timer keeps running during that time. When the tracked bytes stop
- * matching the file (a prefix kept from an earlier execution, or a write that
+ * HTTP lease idle timer keeps running during that time. When the tracked length stops
+ * matching the file length (a prefix kept from an earlier execution, or a write that
  * failed after reaching disk), incremental hashing stops and [finishHex] hashes the
  * whole file once during validation instead.
  */
@@ -119,7 +120,7 @@ internal class PartialFileDigest(private val file: File) {
         length += count
     }
 
-    /** Returns the lowercase hex digest of the file and resets this tracker. */
+    /** Finalizes the tracked hash, rereading the file if tracking was lost, and resets. */
     fun finishHex(): String {
         val actual = if (file.isFile) file.length() else 0L
         if (!tracking || actual != length) {
@@ -153,6 +154,7 @@ class PushFilesWorker internal constructor(
     private val retryDelay: (Long) -> Unit = { Thread.sleep(it) },
     private val monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000L },
     private val noProgressTimeoutMs: Long = DOWNLOAD_NO_PROGRESS_TIMEOUT_MS,
+    private val digestFactory: (File) -> PartialFileDigest = ::PartialFileDigest,
 ) {
     constructor() : this(
         hasExternalStorageAccess = {
@@ -542,7 +544,7 @@ class PushFilesWorker internal constructor(
         }
         // A prefix kept from an earlier execution is hashed during validation, not
         // here: rereading it before the request would consume the HTTP lease window.
-        val digest = PartialFileDigest(partial)
+        val digest = digestFactory(partial)
         PushDownloadDeadline(monotonicMillis, noProgressTimeoutMs).use { deadline ->
             var retryIndex = 0
             while (true) {
