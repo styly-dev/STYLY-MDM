@@ -185,6 +185,22 @@ internal fun buildPushRegistrationFields(
     })
 }
 
+internal enum class PushStateRetryAction { Busy, SaveUnsavedTerminal, Reload }
+
+/**
+ * Chooses what `RETRY_PUSH_STATE` may do. Only a live worker makes the state busy; a
+ * terminal outcome that could not be saved must be saved as is, never reloaded from
+ * disk, because recovery would turn a finished execution into a resumable one.
+ */
+internal fun decidePushStateRetry(
+    workerRunning: Boolean,
+    hasUnsavedTerminal: Boolean,
+): PushStateRetryAction = when {
+    workerRunning -> PushStateRetryAction.Busy
+    hasUnsavedTerminal -> PushStateRetryAction.SaveUnsavedTerminal
+    else -> PushStateRetryAction.Reload
+}
+
 /**
  * Application-scoped single owner for every Push/Sync execution.
  *
@@ -216,6 +232,10 @@ class PushJobCoordinator(context: Context) {
     private var transportToken: Any? = null
     private var transportSend: ((JSONObject) -> Unit)? = null
     private var transportRegistered = false
+    /** The command whose worker execution has not reported its terminal outcome yet. */
+    private var runningWorker: PushProtocol.Command? = null
+    /** A worker's terminal outcome whose durable save failed; kept for Retry. */
+    private var unsavedTerminal: Pair<PushProtocol.Command, PushFilesWorker.Execution>? = null
 
     init {
         actor.execute {
@@ -322,13 +342,30 @@ class PushJobCoordinator(context: Context) {
     }
 
     private fun retryDurableState() {
-        if (state.active?.interrupted == false) {
-            sendPushStateRetryResult(
-                "failed",
-                "push_state_busy",
-                "Push/Sync is active; durable state cannot be reloaded",
-            )
-            return
+        when (decidePushStateRetry(runningWorker != null, unsavedTerminal != null)) {
+            PushStateRetryAction.Busy -> {
+                sendPushStateRetryResult(
+                    "failed",
+                    "push_state_busy",
+                    "Push/Sync is active; durable state cannot be reloaded",
+                )
+                return
+            }
+            PushStateRetryAction.SaveUnsavedTerminal -> {
+                val (command, execution) = requireNotNull(unsavedTerminal)
+                onTerminal(command, execution)
+                if (unsavedTerminal == null) {
+                    sendPushStateRetryResult("success", null, null)
+                } else {
+                    sendPushStateRetryResult(
+                        "failed",
+                        "client_persistence_unavailable",
+                        "Device could not save durable Push/Sync state",
+                    )
+                }
+                return
+            }
+            PushStateRetryAction.Reload -> Unit
         }
         try {
             val loaded = when (val result = store.load()) {
@@ -467,6 +504,7 @@ class PushJobCoordinator(context: Context) {
             return
         }
         if (command.isJobV1) sendAccepted(command, PushProtocol.PHASE_DOWNLOADING)
+        runningWorker = command
         workerExecutor.execute {
             val execution = worker.execute(
                 command,
@@ -666,6 +704,8 @@ class PushJobCoordinator(context: Context) {
         command: PushProtocol.Command,
         execution: PushFilesWorker.Execution,
     ) {
+        if (runningWorker?.identity == command.identity) runningWorker = null
+        unsavedTerminal = null
         if (!isCurrent(command)) {
             cleanupExecution(execution)
             return
@@ -681,7 +721,10 @@ class PushJobCoordinator(context: Context) {
             )
             // Preserve work. The durable interrupted state fences other jobs; release
             // the in-memory gate as recovery does, then require exact reauthorization.
-            if (!persist(nextState, afterPublish = { gate.release(command) })) return
+            if (!persist(nextState, afterPublish = { gate.release(command) })) {
+                unsavedTerminal = command to execution
+                return
+            }
             scheduleInterruptedExpiry(state.active)
             if (command.isJobV1) {
                 val identity = PushProtocol.ReconcileIdentity(
@@ -709,7 +752,10 @@ class PushJobCoordinator(context: Context) {
         if (!persist(
             nextState,
             afterPublish = { gate.release(command) },
-        )) return
+        )) {
+            unsavedTerminal = command to execution
+            return
+        }
         cleanupExecution(execution)
         send(execution.result.toJson())
     }

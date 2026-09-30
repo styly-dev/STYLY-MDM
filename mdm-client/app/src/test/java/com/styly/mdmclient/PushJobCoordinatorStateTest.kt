@@ -23,6 +23,19 @@ class PushJobCoordinatorStateTest {
         assertEquals("download_retry_exhausted", interruptPushAfterRestart(timedOut, 20_000L).interruptionReason)
     }
 
+    @Test
+    fun `retry is busy only while a worker runs and saves an unsaved terminal before reloading`() {
+        assertEquals(PushStateRetryAction.Busy, decidePushStateRetry(workerRunning = true, hasUnsavedTerminal = false))
+        assertEquals(PushStateRetryAction.Busy, decidePushStateRetry(workerRunning = true, hasUnsavedTerminal = true))
+        // A finished worker whose outcome was not saved must not stay busy, and must
+        // not be reloaded from disk where recovery would make it resumable again.
+        assertEquals(
+            PushStateRetryAction.SaveUnsavedTerminal,
+            decidePushStateRetry(workerRunning = false, hasUnsavedTerminal = true),
+        )
+        assertEquals(PushStateRetryAction.Reload, decidePushStateRetry(workerRunning = false, hasUnsavedTerminal = false))
+    }
+
     private fun command() = PushProtocol.Command(
         jobId = UUID.randomUUID().toString(),
         attempt = PushProtocol.ATTEMPT_V1,

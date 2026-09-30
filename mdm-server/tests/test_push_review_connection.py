@@ -857,7 +857,7 @@ async def test_ready_job_can_be_dispatched_with_existing_job_id(tmp_path):
         runtime.store = store
         runtime.scheduler = Scheduler()
         runtime.admin_send_timeout = 1
-        runtime.legacy = types.SimpleNamespace(MAX_CONCURRENT_TRANSFERS=5)
+        runtime.legacy = types.SimpleNamespace(MAX_CONCURRENT_TRANSFERS=5, devices={})
         published = []
 
         async def publish(snapshot):
@@ -905,6 +905,7 @@ async def test_dispatch_ack_timeout_still_wakes_scheduler_and_closes_admin(tmp_p
         ws = BlockingWs()
         runtime.legacy = types.SimpleNamespace(
             MAX_CONCURRENT_TRANSFERS=5,
+            devices={},
             admin_connections={ws},
             _admin_send_locks={ws: asyncio.Lock()},
         )
@@ -944,6 +945,7 @@ async def test_dispatch_error_timeout_closes_admin_without_waking_scheduler(tmp_
         ws = BlockingWs()
         runtime.legacy = types.SimpleNamespace(
             MAX_CONCURRENT_TRANSFERS=5,
+            devices={},
             admin_connections={ws},
             _admin_send_locks={ws: asyncio.Lock()},
         )
@@ -1351,6 +1353,67 @@ async def test_server_restart_active_registration_does_not_reuse_revoked_http_le
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["validating", "applying"])
+async def test_active_registration_after_offline_download_releases_transfer_slot(
+    tmp_path, phase
+):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        active = await downloading_job(store, manager)
+        job_id = active["job_id"]
+        artifact_id = active["artifact"]["artifact_id"]
+        await manager.mark_reconciling(
+            job_id,
+            "D1",
+            expected={DeviceState.DOWNLOADING},
+            reason="device_disconnect",
+            deadline=now_ms() + 60_000,
+        )
+        leases = PushTransferLeases()
+        registry = TransferRegistry(leases.revoke_now)
+        key = TransferKey("push", "D1", job_id, 1)
+        leases.issue(key, artifact_id)
+        transfer = asyncio.get_running_loop().create_future()
+        registry.register(key, transfer)
+        runtime = object.__new__(PushRuntime)
+        runtime.manager = manager
+        runtime.scheduler = Scheduler()
+        runtime.transfers = registry
+        runtime.leases = leases
+        session = LiveSession(
+            device_id="D1",
+            session_id="new",
+            ws=Ws(),
+            capabilities=frozenset({"push_job_id_v1"}),
+            process_instance_id=str(uuid.uuid4()),
+            owner_lock=asyncio.Lock(),
+            http_base="http://server",
+        )
+
+        snapshots = await runtime._registration_active_snapshots(
+            "D1",
+            session,
+            {
+                "job_id": job_id,
+                "attempt": 1,
+                "artifact_id": artifact_id,
+                "phase": phase,
+            },
+        )
+
+        assert snapshots[-1]["devices"]["D1"]["state"] == phase
+        # The download finished offline: the slot and HTTP lease must not wait for
+        # the idle watchdog, which would push validation back to reconciliation.
+        assert transfer.done()
+        assert transfer.result() == "transfer_complete"
+        assert leases.token(key) is None
+        assert runtime.scheduler.active_transfer_slots == []
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_interrupted_registration_without_resume_capability_stays_reconciling(
     tmp_path,
 ):
@@ -1410,6 +1473,7 @@ async def test_interrupted_registration_without_resume_capability_stays_reconcil
 class LegacyEvents:
     def __init__(self):
         self.events = []
+        self.devices = {}
 
     async def forward_to_admins(self, event):
         self.events.append(event)
