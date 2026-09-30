@@ -572,9 +572,7 @@
       return 'queued';
     }
     if (state === 'downloading') return 'transferring';
-    if (['validating', 'applying'].indexOf(state) >= 0) {
-      return 'applying';
-    }
+    if (state === 'validating' || state === 'applying') return state;
     if (state === 'reconciling' || state === 'unconfirmed') return state;
     if (state === 'succeeded') return 'success';
     return 'fail';

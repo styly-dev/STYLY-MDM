@@ -295,7 +295,7 @@ test('optimistic paint preserves only active canonical Push assignments', () => 
   assert.ok(match, 'the console exposes a testable optimistic-paint predicate');
   const shouldPreserve = vm.runInNewContext('(' + match[0] + ')');
 
-  for (const status of ['queued', 'transferring', 'applying', 'reconciling', 'unconfirmed', 'resume_required']) {
+  for (const status of ['queued', 'transferring', 'validating', 'applying', 'reconciling', 'unconfirmed', 'resume_required']) {
     assert.equal(shouldPreserve({
       owner: 'push-job-v1', job_id: 'active-job', status,
     }), true, status);
@@ -383,7 +383,7 @@ test('canonical assignment states map to the established task-cell states', () =
     ['waiting_transfer', 'queued'],
     ['dispatching', 'queued'],
     ['downloading', 'transferring'],
-    ['validating', 'applying'],
+    ['validating', 'validating'],
     ['applying', 'applying'],
     ['reconciling', 'reconciling'],
     ['succeeded', 'success'],
@@ -399,6 +399,36 @@ test('canonical assignment states map to the established task-cell states', () =
     });
     assert.equal(harness.bridgeState.get('D1').status, display, state);
   });
+});
+
+test('canonical validation renders separately from transfer and apply for Push and Sync', () => {
+  const harness = loadAdapter();
+  const socket = new window.WebSocket('ws://localhost/ws/admin');
+  socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [] });
+  const match = indexSource.match(/function taskCellHtml\(id\) \{[\s\S]*?\n      \}/);
+  assert.ok(match);
+  const device = { status: 'online' };
+  const context = vm.createContext({
+    deviceTaskState: {},
+    deviceById() { return device; },
+    esc(value) { return String(value); },
+  });
+  vm.runInContext(match[0], context);
+  let revision = 1;
+  for (const mode of ['push', 'sync']) {
+    for (const [state, label] of [
+      ['downloading', 'Transferring…'],
+      ['validating', 'Validating…'],
+      ['applying', mode === 'push' ? 'Pushing…' : 'Syncing…'],
+    ]) {
+      socket.emit({
+        type: 'PUSH_JOB_UPDATED',
+        job: snapshot('phase-job', revision++, 'D1', state, 1, { mode }),
+      });
+      context.deviceTaskState.D1 = { task: 'push', ...harness.bridgeState.get('D1') };
+      assert.match(context.taskCellHtml('D1'), new RegExp(label), mode + ': ' + state);
+    }
+  }
 });
 
 test('restart-paused jobs expose the existing operator resume command', () => {
@@ -618,11 +648,11 @@ test('offline push rows retain unfinished jobs without claiming current executio
   vm.runInContext(match[0], context);
   assert.match(context.taskCellHtml('D1'), /Pushing/);
   device.status = 'offline';
-  for (const status of ['queued', 'transferring', 'applying']) {
+  for (const status of ['queued', 'transferring', 'validating', 'applying']) {
     state.status = status;
     const html = context.taskCellHtml('D1');
     assert.match(html, /Job pending · offline/);
-    assert.doesNotMatch(html, /spinner|Pushing|Transferring|failed/);
+    assert.doesNotMatch(html, /spinner|Pushing|Transferring|Validating|failed/);
     assert.equal(state.status, status, 'rendering must not mutate canonical state');
   }
   device.status = 'online';

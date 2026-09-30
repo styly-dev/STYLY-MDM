@@ -753,8 +753,13 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > `Podcasts`, `Ringtones`) so a mistyped path cannot wipe unrelated user/media data.
 >
 > Both actions reuse the per-device PROGRESS column, showing `Waiting…` →
-> `Transferring…` → `Pushing…` / `Syncing…` → `✓ pushed` / `✓ synced` (with the
-> `+added ~updated -deleted` summary) / `✗ failed`. The current console derives these
+> `Transferring…` → `Validating…` → `Pushing…` / `Syncing…` → `✓ pushed` / `✓ synced`
+> (with the `+added ~updated -deleted` summary) / `✗ failed`. `Validating…` covers
+> SHA-256 verification, ZIP validation, and extraction; it has no percentage progress.
+> Download SHA-256 normally covers received buffers after successful writes, rather
+> than rereading stored bytes. A Resume in a new execution rehashes the complete
+> downloaded file during validation; hashing state is not persisted across executions.
+> The current console derives these
 > states and the Push/Sync verb from each canonical `PUSH_JOBS_SNAPSHOT` /
 > `PUSH_JOB_UPDATED` assignment. The initial snapshot is a full replacement, so a
 > reconnect also removes jobs outside the server's retention window instead of leaving

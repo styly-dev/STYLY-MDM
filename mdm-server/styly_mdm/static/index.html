@@ -1507,8 +1507,9 @@
       // Install and push are both throttled against the same server-wide pool of transfer
       // slots, so both walk the same live states, server-broadcast as the device moves: it
       // waits for a slot (queued), pulls the file (transferring), then does its local work
-      // off the critical path — installing the APK, or unzipping and mirroring the bundle
-      // (applying) — before reporting a terminal INSTALL_RESULT / PUSH_FILES_RESULT.
+      // off the critical path — installing the APK, or validating and unzipping the
+      // bundle (validating) before mirroring it (applying) — then reports a terminal
+      // INSTALL_RESULT / PUSH_FILES_RESULT.
       // A verify moves no bytes, so it takes no slot and has no such phases.
       function taskCellHtml(id) {
         const st = deviceTaskState[id];
@@ -1535,7 +1536,7 @@
           if (st.status === 'reconciling') {
             return '<span class="ins-queued" title="Waiting for the device to report whether the job is still running or has finished.">◦ Awaiting status confirmation' + ((!device || device.status !== 'online') ? ' · offline' : '') + '</span>';
           }
-          if (['queued', 'transferring', 'applying'].indexOf(st.status) >= 0 &&
+          if (['queued', 'transferring', 'validating', 'applying'].indexOf(st.status) >= 0 &&
               (!device || device.status !== 'online')) {
             return '<span class="ins-queued" title="The device is disconnected. This job is unfinished; its current execution status is unknown.">◦ Job pending · offline</span>';
           }
@@ -1545,6 +1546,7 @@
           }
           if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
           if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
+          if (st.status === 'validating') return '<span class="ins-installing" title="Checking artifact integrity and extracting the bundle"><span class="spinner">⟳</span> Validating…</span>';
           if (st.status === 'applying') return '<span class="ins-installing"><span class="spinner">⟳</span> ' + esc(verb) + 'ing…</span>';
           if (st.status === 'success') return '<span class="ins-success">✓ ' + esc(verb.toLowerCase()) + 'ed</span>' + (st.note ? ' <span class="ins-none">' + esc(st.note) + '</span>' : '');
           return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
@@ -1964,7 +1966,7 @@
 
         function shouldPreserveCanonicalPushAssignment(current) {
           return !!(current && current.owner === 'push-job-v1' && current.job_id &&
-            ['queued', 'transferring', 'applying', 'reconciling', 'unconfirmed', 'resume_required', 'cancel_pending'].indexOf(current.status) >= 0);
+            ['queued', 'transferring', 'validating', 'applying', 'reconciling', 'unconfirmed', 'resume_required', 'cancel_pending'].indexOf(current.status) >= 0);
         }
 
         function hasSelection() { return selectionFiles().length > 0; }
