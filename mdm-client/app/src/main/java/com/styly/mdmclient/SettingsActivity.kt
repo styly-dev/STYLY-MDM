@@ -9,6 +9,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.View
 import android.widget.Button
@@ -29,6 +31,7 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var autoDiscoveryButton: Button
     private lateinit var storagePermissionStatus: TextView
     private lateinit var grantStorageButton: Button
+    private lateinit var deviceIdentityStatus: TextView
     private lateinit var journalText: TextView
     private lateinit var journalRefreshButton: Button
     private lateinit var journalClearButton: Button
@@ -38,6 +41,26 @@ class SettingsActivity : AppCompatActivity() {
             val connected = intent.getBooleanExtra(MdmClientService.EXTRA_CONNECTED, false)
             val message = intent.getStringExtra(MdmClientService.EXTRA_MESSAGE) ?: ""
             updateStatusDisplay(connected, message)
+        }
+    }
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var permissionRecoveryPending = false
+
+    private val identityListener: (DeviceIdentityState) -> Unit = { state ->
+        runOnUiThread {
+            updateDeviceIdentityUi(state)
+            if (state is DeviceIdentityState.Unavailable &&
+                state.status == DeviceIdentityStatus.ACCESS_DENIED
+            ) {
+                // Defer until the current result has reached every listener.
+                mainHandler.post {
+                    if (permissionRecoveryPending && hasAllFilesAccess()) {
+                        permissionRecoveryPending = false
+                        MdmClientApplication.deviceIdentityResolver().retryAfterPermissionGranted()
+                    }
+                }
+            }
         }
     }
 
@@ -60,6 +83,7 @@ class SettingsActivity : AppCompatActivity() {
         autoDiscoveryButton = findViewById(R.id.use_auto_discovery_button)
         storagePermissionStatus = findViewById(R.id.storage_permission_status)
         grantStorageButton = findViewById(R.id.grant_storage_button)
+        deviceIdentityStatus = findViewById(R.id.device_identity_status)
         journalText = findViewById(R.id.journal_text)
         journalRefreshButton = findViewById(R.id.journal_refresh_button)
         journalClearButton = findViewById(R.id.journal_clear_button)
@@ -100,6 +124,8 @@ class SettingsActivity : AppCompatActivity() {
         registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         // Re-check here so returning from the system settings screen refreshes the UI.
         updateStoragePermissionUi()
+        permissionRecoveryPending = hasAllFilesAccess()
+        MdmClientApplication.deviceIdentityResolver().addListener(identityListener)
         refreshJournal()
     }
 
@@ -109,7 +135,9 @@ class SettingsActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        permissionRecoveryPending = false
         unregisterReceiver(statusReceiver)
+        MdmClientApplication.deviceIdentityResolver().removeListener(identityListener)
     }
 
     private fun saveAndRestart() {
@@ -168,6 +196,30 @@ class SettingsActivity : AppCompatActivity() {
             storagePermissionStatus.setText(R.string.storage_permission_not_granted)
             storagePermissionStatus.setTextColor(0xFFFF5722.toInt())
             grantStorageButton.visibility = View.VISIBLE
+        }
+    }
+
+    private fun updateDeviceIdentityUi(state: DeviceIdentityState) {
+        when (state) {
+            DeviceIdentityState.Resolving -> {
+                deviceIdentityStatus.setText(R.string.device_identity_resolving)
+                deviceIdentityStatus.setTextColor(0xFFFFA000.toInt())
+            }
+            is DeviceIdentityState.Ready -> {
+                deviceIdentityStatus.text = getString(
+                    R.string.device_identity_ready,
+                    state.deviceId,
+                )
+                deviceIdentityStatus.setTextColor(0xFF4CAF50.toInt())
+            }
+            is DeviceIdentityState.Unavailable -> {
+                deviceIdentityStatus.text = getString(
+                    R.string.device_identity_unavailable,
+                    state.status.protocolValue,
+                    state.diagnostic,
+                )
+                deviceIdentityStatus.setTextColor(0xFFFF5722.toInt())
+            }
         }
     }
 

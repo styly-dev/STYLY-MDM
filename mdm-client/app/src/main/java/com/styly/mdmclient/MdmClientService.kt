@@ -308,7 +308,11 @@ class MdmClientService : Service() {
         }
     }
 
-    private fun handleCommand(type: String, payload: JSONObject) {
+    private fun handleCommand(
+        type: String,
+        payload: JSONObject,
+        commandContext: WebSocketManager.CommandContext?
+    ) {
         Log.i(TAG, "Handling command: $type")
         when (type) {
             "EXECUTE_LAUNCH" -> executeLaunch(payload)
@@ -320,10 +324,10 @@ class MdmClientService : Service() {
             "CLEAR_STARTUP_APP" -> handleClearStartupApp()
             "EXECUTE_SELF_UNINSTALL" -> executeSelfUninstall(payload)
             "EXECUTE_REBOOT" -> executePowerControl(
-                PBS_DeviceControlEnum.DEVICE_CONTROL_REBOOT, "REBOOT_RESULT"
+                PBS_DeviceControlEnum.DEVICE_CONTROL_REBOOT, "REBOOT_RESULT", commandContext
             )
             "EXECUTE_POWER_OFF" -> executePowerControl(
-                PBS_DeviceControlEnum.DEVICE_CONTROL_SHUTDOWN, "POWER_OFF_RESULT"
+                PBS_DeviceControlEnum.DEVICE_CONTROL_SHUTDOWN, "POWER_OFF_RESULT", commandContext
             )
             else -> Log.w(TAG, "Unknown command type: $type")
         }
@@ -602,19 +606,30 @@ class MdmClientService : Service() {
      * rejects the call — the device stays up, so that frame does flush.
      *
      */
-    private fun executePowerControl(action: PBS_DeviceControlEnum, resultType: String) {
+    private fun executePowerControl(
+        action: PBS_DeviceControlEnum,
+        resultType: String,
+        commandContext: WebSocketManager.CommandContext?
+    ) {
         Thread {
+            val command = commandContext ?: run {
+                Log.w(TAG, "Dropping $resultType without the command connection context")
+                return@Thread
+            }
             try {
                 val binder = ToBServiceHelper.getInstance().serviceBinder
                 if (binder == null) {
                     Log.e(TAG, "TobService binder not available for $resultType")
-                    sendPowerResult(resultType, "fail", "TobService not available")
+                    sendPowerResult(resultType, "fail", "TobService not available", command)
                     return@Thread
                 }
                 // Acknowledge, then give the ack a bounded chance to reach the wire before
                 // the reboot/shutdown takes the connection down — sendMessage only enqueues.
-                sendPowerResult(resultType, "accepted", "")
-                webSocketManager.awaitOutboundFlush(2_000)
+                if (!sendPowerResult(resultType, "accepted", "", command)) return@Thread
+                if (!webSocketManager.awaitOutboundFlushForCommand(command, 2_000)) {
+                    Log.i(TAG, "Dropping $resultType because its command connection became inactive")
+                    return@Thread
+                }
                 Log.i(TAG, "Invoking pbsControlSetDeviceAction: $action")
                 binder.pbsControlSetDeviceAction(action, object : IIntCallback.Stub() {
                     override fun callback(result: Int) {
@@ -626,27 +641,38 @@ class MdmClientService : Service() {
                         if (result != 0) {
                             sendPowerResult(
                                 resultType, "fail",
-                                "pbsControlSetDeviceAction returned $result"
+                                "pbsControlSetDeviceAction returned $result",
+                                command
                             )
                         }
                     }
                 })
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to run $resultType", e)
-                sendPowerResult(resultType, "fail", e.message ?: "Unknown error")
+                sendPowerResult(resultType, "fail", e.message ?: "Unknown error", command)
             }
         }.start()
     }
 
-    private fun sendPowerResult(resultType: String, status: String, error: String) {
+    private fun sendPowerResult(
+        resultType: String,
+        status: String,
+        error: String,
+        commandContext: WebSocketManager.CommandContext
+    ): Boolean {
         val result = JSONObject().apply {
             put("type", resultType)
             put("status", status)
+            commandContext.provisionalConnectionId?.let { put("connection_id", it) }
             if (error.isNotEmpty()) {
                 put("error", error)
             }
         }
-        webSocketManager.sendMessage(result)
+        val sent = webSocketManager.sendMessageForCommand(commandContext, result)
+        if (!sent) {
+            Log.i(TAG, "Dropped $resultType because its command connection is no longer active")
+        }
+        return sent
     }
 
     private fun executeInstall(payload: JSONObject) {

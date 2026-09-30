@@ -46,6 +46,21 @@ def test_web_console_is_bundled():
     assert static_index.is_file(), "web console index.html must ship inside the package"
 
 
+def test_web_console_renders_provisional_identity_in_attention_tab():
+    html = (Path(server.__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+    assert "PROVISIONAL_CONNECTION_LIST" in html
+    assert 'id="tabAttention"' in html
+    assert "Needs attention" in html
+    assert "renderAttentionHtml" in html
+    assert "esc(entry.diagnostic" in html
+    assert "provisionalConnections.map" in html
+    assert "selectedConnectionIds" in html
+    assert "target_connections" in html
+    assert "Client update required" in html
+    assert "switchTargetTab" in html
+    assert "identityHealth" not in html
+
+
 @pytest.mark.parametrize(
     "raw, expected",
     [

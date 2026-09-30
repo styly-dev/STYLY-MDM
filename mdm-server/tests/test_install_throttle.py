@@ -63,6 +63,7 @@ def reset_state():
 def add_device(device_id: str) -> FakeWS:
     ws = FakeWS()
     server.devices[device_id] = {
+        "registration_ready": True, "identity_kind": "canonical",
         "ws": ws, "device_id": device_id, "model": "M",
         "ip": "1.1.1.1", "status": "online", "startup_app": None, "battery": None,
     }

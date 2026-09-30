@@ -53,7 +53,7 @@ def reset_state():
 
 def add_device(device_id: str) -> FakeWS:
     ws = FakeWS()
-    server.devices[device_id] = {
+    server.devices[device_id] = {"registration_ready": True, "identity_kind": "canonical",
         "ws": ws, "device_id": device_id, "model": "M", "ip": "1.1.1.1",
         "status": "online", "startup_app": None, "battery": None,
         "version_code": 8, "version_name": "0.4.0",
@@ -206,10 +206,11 @@ async def _recv_type(ws, msg_type: str, timeout: float = 2.0) -> dict | None:
 async def _register(session, base: str, device_id: str, startup_app: dict | None = None):
     ws = await session.ws_connect(base + "/ws/device")
     await ws.send_json({
-        "type": "REGISTER", "device_id": device_id, "model": "M",
+        "type": "REGISTER", "identity_scheme": server.IDENTITY_SCHEME, "device_id": device_id, "model": "M",
         "ip": "1.1.1.2", "version_code": 8, "version_name": "0.4.0",
         "startup_app": startup_app,
     })
+    await _recv_type(ws, "REGISTERED")
     return ws
 
 
@@ -221,13 +222,13 @@ def test_e2e_delete_app_result_is_forwarded_to_admin_stamped(tmp_path):
         base = f"http://{ts.host}:{ts.port}"
         try:
             async with aiohttp.ClientSession() as session:
-                d0 = await _register(session, base, "dev0")
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
                 await admin.send_json({
                     "type": "DELETE_APP",
-                    "target_devices": ["dev0"],
+                    "target_devices": ["64b19041-0b8c-4ef4-82fd-000000000000"],
                     "package_name": "com.example.app",
                 })
                 assert (await _recv_type(admin, "DELETE_APP_SENT"))["sent_count"] == 1
@@ -242,7 +243,7 @@ def test_e2e_delete_app_result_is_forwarded_to_admin_stamped(tmp_path):
                 fwd = await _recv_type(admin, "DELETE_APP_RESULT")
                 assert fwd is not None
                 assert fwd["status"] == "success"
-                assert fwd["device_id"] == "dev0"
+                assert fwd["device_id"] == "64b19041-0b8c-4ef4-82fd-000000000000"
 
                 await d0.close()
                 await admin.close()
@@ -261,10 +262,10 @@ def test_e2e_successful_uninstall_clears_the_recorded_startup_app(tmp_path):
         try:
             async with aiohttp.ClientSession() as session:
                 startup = {"package_name": "com.example.app", "extra": ""}
-                d0 = await _register(session, base, "dev0", startup_app=startup)
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000", startup_app=startup)
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
-                assert server.devices["dev0"]["startup_app"] == startup
+                assert server.devices["64b19041-0b8c-4ef4-82fd-000000000000"]["startup_app"] == startup
 
                 await d0.send_json({
                     "type": "DELETE_APP_RESULT",
@@ -276,8 +277,8 @@ def test_e2e_successful_uninstall_clears_the_recorded_startup_app(tmp_path):
                 # The console is told about the new state, not just the result.
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
-                assert server.devices["dev0"]["startup_app"] is None
-                assert server.device_registry["dev0"]["startup_app"] is None
+                assert server.devices["64b19041-0b8c-4ef4-82fd-000000000000"]["startup_app"] is None
+                assert server.device_registry["64b19041-0b8c-4ef4-82fd-000000000000"]["startup_app"] is None
 
                 await d0.close()
                 await admin.close()
@@ -302,7 +303,7 @@ def test_e2e_successful_uninstall_clears_a_stale_startup_app_without_the_flag(tm
         try:
             async with aiohttp.ClientSession() as session:
                 startup = {"package_name": "com.example.app", "extra": ""}
-                d0 = await _register(session, base, "dev0", startup_app=startup)
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000", startup_app=startup)
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
@@ -314,7 +315,7 @@ def test_e2e_successful_uninstall_clears_a_stale_startup_app_without_the_flag(tm
                 assert await _recv_type(admin, "DELETE_APP_RESULT") is not None
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
-                assert server.devices["dev0"]["startup_app"] is None
+                assert server.devices["64b19041-0b8c-4ef4-82fd-000000000000"]["startup_app"] is None
 
                 await d0.close()
                 await admin.close()
@@ -340,7 +341,7 @@ def test_e2e_a_newer_startup_app_survives_a_late_uninstall_result(tmp_path):
         try:
             async with aiohttp.ClientSession() as session:
                 old = {"package_name": "com.example.app", "extra": ""}
-                d0 = await _register(session, base, "dev0", startup_app=old)
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000", startup_app=old)
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
@@ -348,7 +349,7 @@ def test_e2e_a_newer_startup_app_survives_a_late_uninstall_result(tmp_path):
                 # the uninstall of the old one is still running.
                 await admin.send_json({
                     "type": "SET_STARTUP_APP",
-                    "target_devices": ["dev0"],
+                    "target_devices": ["64b19041-0b8c-4ef4-82fd-000000000000"],
                     "package_name": "com.example.newkiosk",
                 })
                 assert await _recv_type(admin, "SET_STARTUP_APP_SENT") is not None
@@ -361,7 +362,7 @@ def test_e2e_a_newer_startup_app_survives_a_late_uninstall_result(tmp_path):
                 })
                 assert await _recv_type(admin, "DELETE_APP_RESULT") is not None
 
-                startup = server.devices["dev0"]["startup_app"]
+                startup = server.devices["64b19041-0b8c-4ef4-82fd-000000000000"]["startup_app"]
                 assert startup is not None
                 assert startup["package_name"] == "com.example.newkiosk"
 
@@ -382,7 +383,7 @@ def test_e2e_uninstalling_another_package_leaves_the_startup_app_alone(tmp_path)
         try:
             async with aiohttp.ClientSession() as session:
                 startup = {"package_name": "com.example.kiosk", "extra": ""}
-                d0 = await _register(session, base, "dev0", startup_app=startup)
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000", startup_app=startup)
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
@@ -393,7 +394,7 @@ def test_e2e_uninstalling_another_package_leaves_the_startup_app_alone(tmp_path)
                 })
                 assert await _recv_type(admin, "DELETE_APP_RESULT") is not None
 
-                assert server.devices["dev0"]["startup_app"] == startup
+                assert server.devices["64b19041-0b8c-4ef4-82fd-000000000000"]["startup_app"] == startup
 
                 await d0.close()
                 await admin.close()
@@ -417,7 +418,7 @@ def test_e2e_failed_uninstall_keeps_the_recorded_startup_app(tmp_path):
         try:
             async with aiohttp.ClientSession() as session:
                 startup = {"package_name": "com.example.app", "extra": ""}
-                d0 = await _register(session, base, "dev0", startup_app=startup)
+                d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000", startup_app=startup)
                 admin = await session.ws_connect(base + "/ws/admin")
                 assert await _recv_type(admin, "DEVICE_LIST") is not None
 
@@ -430,7 +431,7 @@ def test_e2e_failed_uninstall_keeps_the_recorded_startup_app(tmp_path):
                 })
                 assert await _recv_type(admin, "DELETE_APP_RESULT") is not None
 
-                assert server.devices["dev0"]["startup_app"] == startup
+                assert server.devices["64b19041-0b8c-4ef4-82fd-000000000000"]["startup_app"] == startup
 
                 await d0.close()
                 await admin.close()

@@ -120,7 +120,23 @@ Install the MDM client APK on the HMD (see the [Developer Guide](docs/DEVELOPMEN
 > **Note:** On first launch with no manual address, the client automatically attempts
 > server discovery before falling back to the last discovered or default URL.
 
-The MDM client connects to the server, registers the device (serial number, model, IP address), and runs as a foreground service in the background.
+The MDM client connects to the server, registers the device (Device-ID-Provider GUID, model, IP address), and runs as a foreground service in the background. Older clients without an `identity_scheme` still register using their serial number.
+
+**Upgrading from serial IDs to GUIDs:** Deploy the server first. Older serial-ID clients can receive APK installation/update commands only. After the client is updated, its Provider GUID registers as a new device; labels, groups, and Push history are not inherited. Reassign labels and groups to the new GUID, and explicitly forget the old serial record when it is no longer needed. An old serial that does not return is reported as `untracked`, which does not confirm update success. See [device identity and registration](docs/DEVELOPMENT.md#device-identity-and-provisional-registration-issue-65) for recovery steps and pending Push/Sync jobs.
+
+Before upgrading an API 29 device, arrange ADB access to grant
+`android.permission.READ_EXTERNAL_STORAGE` to the MDM package. Grant it before
+starting the new client when possible. If the old build does not declare this
+permission, install the new APK through ADB, grant it, then restart the MDM
+application process. Provision the required storage access on newer Android
+versions as well. An unresolved client
+cannot receive commands, including another self-update. If identity lookup has
+exhausted its retries, grant access and restart the **MDM application process**;
+Save & Connect only restarts the service and does not reset the retry budget.
+
+The GUID is stored as a PNG in `Pictures/Device-ID-Provider/`. Preserve this folder
+during photo cleanup: deleting the ID image or resetting the device can cause a
+new GUID to be created on a later lookup, which MDM treats as a new device.
 
 ### Client standby behavior (and how to tune it)
 
@@ -210,8 +226,10 @@ standby (see [Client standby behavior](#client-standby-behavior-and-how-to-tune-
 and a standby client does not notice the new server. Once the new server is running,
 toggle Wi-Fi off/on or reboot each headset — the fresh connection window rediscovers
 the new server over UDP and reconnects. The `ip` and `last_seen` fields refresh on
-reconnect, and group membership is keyed by serial number, so devices that are offline
-during the move keep their groups.
+reconnect, and group membership is keyed by `device_id`, so devices that retain the
+same ID keep their groups even if they are offline during the server move. This
+does not migrate groups from a legacy serial ID to a new Provider GUID when the
+client is upgraded.
 
 Uploaded APKs (`<data-dir>/apks/`) and pushed file bundles (`<data-dir>/bundles/`) are not part of the registry. Copy those directories separately with `rsync` or `scp` if the new server needs them — a single APK can be up to 2 GiB, so they are not worth moving through a browser.
 

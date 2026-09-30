@@ -33,7 +33,10 @@ def clean_devices():
 
 def _add_device(device_id):
     ws = FakeWS()
-    server.devices[device_id] = {"ws": ws, "device_id": device_id}
+    server.devices[device_id] = {
+        "registration_ready": True, "identity_kind": "canonical",
+        "ws": ws, "device_id": device_id,
+    }
     return ws
 
 

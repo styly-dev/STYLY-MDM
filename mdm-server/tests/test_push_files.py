@@ -303,6 +303,7 @@ def _register_online_device(did):
     server.devices[did] = {
         "ws": ws, "device_id": did, "model": "PICO 4E",
         "ip": "192.168.1.10", "status": "online", "startup_app": None, "battery": None,
+        "identity_kind": "canonical", "registration_ready": True,
     }
     return ws
 
@@ -427,5 +428,41 @@ def test_handle_push_files_requires_bundle_url(tmp_path):
         })
         assert admin.sent[-1]["type"] == "ERROR"
         assert not server._transfer_tasks
+
+    asyncio.run(body())
+
+
+@pytest.mark.parametrize("replacement", [
+    None,
+    {"identity_kind": "canonical", "registration_ready": False},
+    {"identity_kind": "legacy", "registration_ready": True},
+])
+def test_queued_push_rechecks_command_policy_before_send(monkeypatch, replacement):
+    async def body():
+        original_ws = _register_online_device("queued-device")
+        replacement_ws = FakeWS()
+        gate = asyncio.Semaphore(1)
+        await gate.acquire()
+        monkeypatch.setattr(server, "transfer_slots", lambda: gate)
+        task = asyncio.create_task(server._run_push_job(
+            "http://host/bundles/b.zip", "b.zip", "/sdcard/STYLY/content",
+            False, ["queued-device"],
+        ))
+        try:
+            await asyncio.sleep(0)
+            assert not task.done()
+            if replacement is None:
+                server.devices.pop("queued-device")
+            else:
+                server.devices["queued-device"] = {**replacement, "ws": replacement_ws}
+            gate.release()
+            await asyncio.wait_for(task, 1)
+            assert original_ws.sent == []
+            assert replacement_ws.sent == []
+            assert not server.pending_transfers
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(body())

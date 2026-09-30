@@ -330,11 +330,14 @@ def canonicalize_create_request(data: Mapping[str, Any]) -> CanonicalCreateReque
     )
 
 
+MAX_CAPABILITIES = 32
+
+
 def parse_capabilities(value: Any) -> frozenset[str]:
     """Parse REGISTER capabilities with the issue #91 all-or-nothing malformed rule."""
     if value is None:
         return frozenset()
-    if not isinstance(value, list):
+    if not isinstance(value, list) or len(value) > MAX_CAPABILITIES:
         return frozenset()
     parsed: list[str] = []
     for item in value:

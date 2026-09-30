@@ -1,0 +1,3 @@
+# Keep documentation line endings consistent across platforms.
+*.md text eol=lf
+*.svg text eol=lf
