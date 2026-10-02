@@ -34,6 +34,15 @@ object PushProtocol {
         val isJobV1: Boolean get() = jobId != null
         val identity: String get() = if (jobId != null) "$jobId:$attempt" else "legacy"
 
+        /**
+         * Exact execution fingerprint, excluding the replaceable artifact URL. A zero
+         * revision or missing ETag comes only from an Issue #91 server or from durable
+         * state migrated by [commandFromJson]; the server assigns a dispatch revision
+         * when it first redispatches such an assignment. Treating those two fields as
+         * unknown lets a replay settle from the existing receipt or active execution
+         * instead of being rejected as a conflict. Resume never relies on this: it
+         * requires revision > 0 and an exact resume metadata match in the worker.
+         */
         fun sameExecution(other: Command): Boolean =
             jobId == other.jobId && attempt == other.attempt &&
                 artifactId == other.artifactId &&
