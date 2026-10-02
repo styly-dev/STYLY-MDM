@@ -215,13 +215,15 @@ class PushScheduler:
         async with self.transfer_slots():
             session = self.sessions().get(device_id)
             if session is None:
-                await self._fail_current(
-                    job_id,
-                    device_id,
-                    {DeviceState.WAITING_TRANSFER},
-                    "device_offline_before_dispatch",
-                    "Device went offline before its queue turn",
-                )
+                # Same rule as a disconnect: never-started work fails, while a
+                # pending resume returns to a manual Resume wait.
+                try:
+                    for snapshot in await self.manager.settle_offline_before_dispatch(
+                        device_id, job_id
+                    ):
+                        await self.publish(snapshot)
+                finally:
+                    self.wake()
                 return
 
             if not PUSH_JOB_CAPABILITIES <= session.capabilities:

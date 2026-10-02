@@ -105,6 +105,7 @@ async def test_retry_job_is_linked_by_indexed_column(tmp_path):
         original = await _ready_job(manager, tmp_path, {'D1': 'failed', 'D2': 'succeeded'})
         _, retry = await manager.retry_failed(
             original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path,
+            online_devices={'D1', 'D2'},
         )
         linked = await store._call(lambda conn: conn.execute(
             'SELECT retry_of_job_id FROM push_jobs WHERE job_id=?', (retry['job_id'],),
@@ -205,7 +206,9 @@ async def test_retried_target_is_not_cancellable_in_snapshot_or_store(tmp_path):
             (job_id,),
         ))
         assert (await manager.get_snapshot(job_id))['devices']['D1']['cancellable'] is True
-        await manager.retry_failed(job_id, str(uuid.uuid4()), artifact_root=tmp_path)
+        await manager.retry_failed(
+            job_id, str(uuid.uuid4()), artifact_root=tmp_path, online_devices={'D1'},
+        )
         assert (await manager.get_snapshot(job_id))['devices']['D1']['cancellable'] is False
         with pytest.raises(StoreConflict):
             await manager.cancel_interrupted(job_id, 'D1')
