@@ -1,6 +1,7 @@
 package com.styly.mdmclient
 
 import java.io.FileNotFoundException
+import java.io.IOException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -15,6 +16,18 @@ class PushJobStoreLoadTest {
         )
 
         assertSame(PushStateLoadResult.Missing, result)
+    }
+
+    @Test
+    fun readErrorIsUnreadableNotCorrupt() {
+        val failure = IOException("EIO")
+        val result = loadPushState(
+            readText = { throw failure },
+            normalize = { it },
+        )
+
+        assertTrue(result is PushStateLoadResult.Unreadable)
+        assertSame(failure, (result as PushStateLoadResult.Unreadable).error)
     }
 
     @Test

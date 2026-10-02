@@ -61,22 +61,20 @@ def test_web_console_renders_provisional_identity_in_attention_tab():
     assert "identityHealth" not in html
 
 
-def test_web_console_exposes_individual_and_bulk_push_state_retry_controls():
+def test_web_console_shows_unavailable_push_state_without_retry_controls():
     static_index = Path(server.__file__).parent / "static" / "index.html"
     source = static_index.read_text(encoding="utf-8")
 
-    assert 'id="btnRetryAllPushStates"' in source
-    assert 'id="pushStateTabActions"' in source
-    assert source.index('id="pushStateTabActions"') < source.index('id="devToolbar"')
-    assert 'data-act="retryPushState"' in source
-    assert "Retry affected (' + retryable.length + ')" in source
-    assert "pushStateTabActions.style.display = targetTab === 'attention' && retryable.length ? '' : 'none';" in source
+    # Clients recover durable Push state by themselves (bounded retries, then the
+    # next app start); the console only explains the state and the remedy.
     assert "Push state unavailable" in source
+    assert "free storage, then Reboot" in source
+    assert "case 'PUSH_STATE_RESET':" in source
     assert "progressCellHtml(id)" in source
     assert '<div>Client</div><div>Status</div><div>Battery</div><div>Progress</div>' in source
     assert '<div class="dev-client">' in source
-    assert "type: 'RETRY_PUSH_STATE', target_devices: targets" in source
-    assert "this will not start a transfer" in source
+    for removed in ("RETRY_PUSH_STATE", "btnRetryAllPushStates", "retryPushState", "push_state_retry"):
+        assert removed not in source
 
 
 @pytest.mark.parametrize(

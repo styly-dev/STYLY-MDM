@@ -6,10 +6,14 @@ import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
+import java.io.IOException
 
 internal sealed class PushStateLoadResult {
     data class Valid(val state: PushProtocol.State) : PushStateLoadResult()
     object Missing : PushStateLoadResult()
+    /** The file could not be read (I/O error); its content is unknown, so retry later. */
+    data class Unreadable(val error: IOException) : PushStateLoadResult()
+    /** The file was read but its content is not a valid durable state. */
     data class Corrupt(val error: Exception) : PushStateLoadResult()
 }
 
@@ -22,6 +26,8 @@ internal fun loadPushState(
     )
 } catch (_: FileNotFoundException) {
     PushStateLoadResult.Missing
+} catch (error: IOException) {
+    PushStateLoadResult.Unreadable(error)
 } catch (error: Exception) {
     PushStateLoadResult.Corrupt(error)
 }
@@ -59,6 +65,12 @@ class PushJobStore(
         },
         normalize = ::trim,
     )
+
+    /** Deletes the durable state file and its backup. */
+    @Synchronized
+    internal fun discard() {
+        atomicFile.delete()
+    }
 
     @Synchronized
     fun save(state: PushProtocol.State): PushProtocol.State {

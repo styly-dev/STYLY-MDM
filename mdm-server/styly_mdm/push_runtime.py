@@ -37,7 +37,6 @@ from .push_jobs import (
     PUSH_JOB_CAPABILITIES,
     CAP_PUSH_JOB_ID_V1,
     CAP_PUSH_RESUME_V1,
-    CAP_PUSH_STATE_RETRY_V1,
     DeviceState,
     JobState,
     ProtocolMode,
@@ -46,7 +45,7 @@ from .push_jobs import (
     parse_capabilities,
 )
 from .push_scheduler import LiveSession, PushScheduler
-from .server import parse_push_state_status
+from .server import parse_push_state_reset, parse_push_state_status
 from .transfer_registry import TransferKey, TransferRegistry
 from .push_transfer_leases import PushTransferLeases
 
@@ -495,6 +494,13 @@ class PushRuntime:
                     raise PushJobError(f"target device is not online: {device_id}")
                 # Every Push job is resumable; an older APK must self-update first.
                 missing = sorted(PUSH_JOB_CAPABILITIES - session.capabilities)
+                if missing and (entry or {}).get("push_state_status") == "unavailable":
+                    # The client withholds its Push capabilities while its durable
+                    # state cannot be read or saved; say so instead of blaming its APK.
+                    raise PushJobError(
+                        "target device cannot store Push state right now "
+                        f"(free device storage and reboot it if this persists): {device_id}"
+                    )
                 if missing:
                     raise PushJobError(
                         f"target does not support {', '.join(missing)}: {device_id}"
@@ -982,6 +988,18 @@ class PushRuntime:
             await self.publish(snapshot)
         if not registered:
             return
+        reset = parse_push_state_reset(payload.get("push_state"))
+        if reset is not None:
+            # The client deleted an unreadable state file and started empty. Its
+            # unfinished work settles through normal reconciliation as absent.
+            log.warning(
+                "Device %s reset unreadable durable Push state (%s): %s",
+                device_id, reset["reason"], reset["detail"],
+            )
+            await self.legacy._broadcast_admin_message(json.dumps(
+                {"type": "PUSH_STATE_RESET", "device_id": device_id, **reset},
+                separators=(",", ":"),
+            ))
         if push_state_status != "unavailable":
             await self._send_pending_cancellations(session)
         if needs_reconcile and command_allowed(self.legacy.devices.get(device_id)):
@@ -1222,73 +1240,6 @@ class PushRuntime:
         message_type = payload.get("type")
         if not device_id:
             return False
-        if message_type == "PUSH_STATE_RETRY_RESULT":
-            lock = self._device_lock(device_id)
-            retry_snapshots: list[dict[str, Any]] = []
-            async with lock:
-                session = self.sessions.get(device_id)
-                if session is None or session.ws is not ws:
-                    return True
-                capabilities = parse_capabilities(payload.get("capabilities"))
-                if CAP_PUSH_STATE_RETRY_V1 not in capabilities:
-                    capabilities = frozenset(
-                        capability
-                        for capability in capabilities
-                        if capability not in {CAP_PUSH_JOB_ID_V1, CAP_PUSH_RESUME_V1}
-                    )
-                session.capabilities = capabilities
-                runtime = payload.get("push_runtime")
-                push_status = (
-                    parse_push_state_status(payload.get("push_state")) or "unavailable"
-                )
-                active_report = (
-                    runtime.get("active") if isinstance(runtime, dict) else None
-                )
-                if push_status == "available" and isinstance(active_report, dict):
-                    retry_snapshots.extend(
-                        await self._registration_active_snapshots(
-                            device_id, session, active_report
-                        )
-                    )
-                entry = self.legacy.devices.get(device_id)
-                if entry is not None:
-                    entry["push_state_retry_supported"] = (
-                        CAP_PUSH_STATE_RETRY_V1 in capabilities
-                    )
-                    entry["push_state_status"] = push_status
-                registry = self.legacy.device_registry.get(device_id)
-                if registry is not None:
-                    registry["push_state_retry_supported"] = (
-                        CAP_PUSH_STATE_RETRY_V1 in capabilities
-                    )
-                    registry["push_state_status"] = push_status
-                    self.legacy.save_registry()
-            for snapshot in retry_snapshots:
-                await self.publish(snapshot)
-            if push_status == "available":
-                await self._send_pending_cancellations(session)
-            if (
-                self.scheduler is not None
-                and any(snapshot["dispatch_enabled"] for snapshot in retry_snapshots)
-            ):
-                # The job was already explicitly resumed before this recovery.
-                # A paused restart job remains paused and receives no scheduler wake.
-                self.scheduler.wake()
-            await self.legacy.broadcast_device_list()
-            await self.legacy._broadcast_admin_message(json.dumps({
-                "type": "PUSH_STATE_RETRY_RESULT",
-                "device_id": device_id,
-                "status": payload.get("status")
-                if payload.get("status") in {"success", "failed"}
-                else "failed",
-                "reason": payload.get("reason")
-                if isinstance(payload.get("reason"), str)
-                else None,
-                "detail": payload.get("detail")
-                if isinstance(payload.get("detail"), str)
-                else None,
-            }, separators=(",", ":")))
-            return True
         job_id = payload.get("job_id")
         job_v1 = message_type in {
             "PUSH_JOB_ACCEPTED",
@@ -2043,49 +1994,6 @@ class PushRuntime:
         self, ws: RuntimeWebSocketResponse, payload: dict[str, Any]
     ) -> bool:
         message_type = payload.get("type")
-        if message_type == "RETRY_PUSH_STATE":
-            raw_targets = payload.get("target_devices")
-            target_devices = (
-                raw_targets
-                if isinstance(raw_targets, list)
-                and all(isinstance(device_id, str) for device_id in raw_targets)
-                else []
-            )
-            unique_targets = list(dict.fromkeys(target_devices))
-            sent_count = 0
-            for device_id in unique_targets:
-                session = self.sessions.get(device_id)
-                entry = self.legacy.devices.get(device_id)
-                if (
-                    session is None
-                    or CAP_PUSH_STATE_RETRY_V1 not in session.capabilities
-                    or not isinstance(entry, dict)
-                    or entry.get("push_state_status") != "unavailable"
-                ):
-                    continue
-                try:
-                    async with session.owner_lock:
-                        if self.sessions.get(device_id) is not session:
-                            continue
-                        await asyncio.wait_for(
-                            session.ws.send_str(json.dumps(
-                                {"type": "RETRY_PUSH_STATE"},
-                                separators=(",", ":"),
-                            )),
-                            self.send_timeout,
-                        )
-                    sent_count += 1
-                except (ConnectionError, asyncio.TimeoutError):
-                    continue
-            await asyncio.wait_for(
-                ws.send_str(json.dumps({
-                    "type": "PUSH_STATE_RETRY_SENT",
-                    "sent_count": sent_count,
-                    "target_count": len(unique_targets),
-                }, separators=(",", ":"))),
-                self.admin_send_timeout,
-            )
-            return True
 
         if (
             "target_connections" in payload

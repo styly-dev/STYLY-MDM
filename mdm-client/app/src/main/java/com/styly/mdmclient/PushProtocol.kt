@@ -8,7 +8,6 @@ import java.util.UUID
 object PushProtocol {
     const val CAP_PUSH_JOB_ID_V1 = "push_job_id_v1"
     const val CAP_PUSH_RESUME_V1 = "push_resume_v1"
-    const val CAP_PUSH_STATE_RETRY_V1 = "push_state_retry_v1"
     const val ATTEMPT_V1 = 1
     const val PHASE_DOWNLOADING = "downloading"
     const val PHASE_VALIDATING = "validating"

@@ -592,20 +592,18 @@ test('dispatch attention ignores terminal and nondispatchable jobs', () => {
   assert.equal(harness.pushJobsAttention.children.length, 0);
 });
 
-test('Push state recovery warning preserves an independent install progress', () => {
+test('Push state unavailable warning preserves an independent install progress', () => {
   const match = indexSource.match(/function progressCellHtml\(id\) \{[\s\S]*?\n      \}/);
   assert.ok(match, 'the console exposes a testable progress renderer');
   const device = {
     device_id: 'D1',
     status: 'online',
-    push_state_retry_supported: true,
     push_state_status: 'unavailable',
   };
   const context = vm.createContext({
     deviceById(id) { return id === device.device_id ? device : null; },
-    canRetryPushState(candidate) {
+    pushStateUnavailable(candidate) {
       return !!(candidate && candidate.status === 'online' &&
-        candidate.push_state_retry_supported === true &&
         candidate.push_state_status === 'unavailable');
     },
     taskCellHtml() { return '<span class="ins-installing">Installing…</span>'; },
@@ -617,10 +615,12 @@ test('Push state recovery warning preserves an independent install progress', ()
   const html = context.progressCellHtml('D1');
   assert.match(html, /Installing/);
   assert.match(html, /Push state unavailable/);
-  assert.match(html, /retryPushState/);
+  assert.match(html, /free storage, then Reboot/);
+  // The device recovers by itself; the console offers no retry command.
+  assert.doesNotMatch(html, /<button/);
 });
 
-test('Needs attention includes devices with retryable Push state once', () => {
+test('Needs attention includes devices with unavailable Push state once', () => {
   const match = indexSource.match(/function pushAttentionDevices\(\) \{[\s\S]*?\n      \}/);
   assert.ok(match);
   const devices = [
@@ -633,7 +633,7 @@ test('Needs attention includes devices with retryable Push state once', () => {
     devices,
     getDeviceId(device) { return device.device_id; },
     pushAssignmentFor(id) { return { needsAttention: id === 'job' || id === 'both' }; },
-    canRetryPushState(device) { return device.device_id === 'state' || device.device_id === 'both'; },
+    pushStateUnavailable(device) { return device.device_id === 'state' || device.device_id === 'both'; },
   });
   vm.runInContext(match[0], context);
   assert.deepEqual(Array.from(context.pushAttentionDevices(), device => device.device_id),
@@ -911,7 +911,7 @@ test('device progress exposes escaped inline action identities', () => {
   const context = vm.createContext({
     taskCellHtml() { return 'Resume required'; },
     pushAssignmentFor() { return { job_id: 'job"x', canResume: true, canCancel: true }; },
-    canRetryPushState() { return false; }, deviceById() { return {}; },
+    pushStateUnavailable() { return false; }, deviceById() { return {}; },
     esc(value) { return String(value).replace(/"/g, '&quot;'); },
   });
   vm.runInContext(render[0], context);
