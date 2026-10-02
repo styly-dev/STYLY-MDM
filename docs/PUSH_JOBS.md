@@ -192,9 +192,14 @@ Resume before receiving a new token.
   `device_offline_before_dispatch` (the operator can Retry it), while an assignment
   that was already dispatched and waits to resume returns to a manual
   `device_offline` wait (**Resume required**), keeping its identity and the device's
-  validated partial. Existing manual waits and pending cancellations are
-  unchanged. Work the device has already accepted (downloading, validating,
-  applying) is not stopped by a management WebSocket disconnect.
+  validated partial. The same disconnect also withdraws authority that applied
+  only while the device stayed connected: a pending Resume on a reconciling
+  assignment returns to the `device_offline` wait, and a lost acceptance is no
+  longer replayable. Interrupted evidence reported later never authorizes dispatch
+  by itself; only a Resume that is still pending does. Existing manual waits and
+  pending cancellations are unchanged. Work the device has already accepted
+  (downloading, validating, applying) is not stopped by a management WebSocket
+  disconnect.
 - **Resume** is available only for online devices. **Resume all** excludes offline
   devices, preserving their manual wait and Needs attention entry. Offline timed-out
   devices support **Cancel** only; reconnect alone never grants resume permission.
@@ -353,7 +358,9 @@ because they cannot prove safe resume identity. Reconciliation accepts only
 exact identity evidence:
 
 - a matching active report restores the reported phase;
-- an explicit pre-accept `absent` report requeues the same attempt at most once;
+- an explicit pre-accept `absent` report requeues the same attempt at most once, and
+  only while the device stayed connected after the command; after a disconnect it
+  becomes `interrupted` instead of starting on reconnect;
 - restart-origin `absent` becomes `interrupted` and is never automatically requeued;
 - an elapsed accept deadline enters the short exact reconciliation probe even if its in-memory waiter was lost;
 - an elapsed reconciliation deadline becomes `unconfirmed` only if the callback's stored deadline still matches and no live HTTP lease exists. A live lease defers reconciliation expiry; its watchdog owns the 60-second no-write timeout and refreshes the reconciliation deadline before revoking the lease;
