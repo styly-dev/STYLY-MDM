@@ -22,6 +22,7 @@ class FakeElement {
     this.scrollHeight = 0;
     this.scrollTop = 0;
     this.listeners = new Map();
+    this.classList = { toggle() {} };
   }
 
   appendChild(child) {
@@ -75,51 +76,13 @@ class FakeWebSocket {
 
   emit(message) {
     const event = {
-      data: JSON.stringify(withServerActionFlags(message)),
+      data: JSON.stringify(message),
       stopped: false,
       stopImmediatePropagation() { this.stopped = true; },
     };
     (this.listeners.get('message') || []).forEach((listener) => listener(event));
     return event;
   }
-}
-
-// Fixture stand-in for the server's per-assignment action flags. The rules are
-// owned by push_jobs.assignment_actions and covered by the Python tests; a
-// fixture may still set a flag explicitly to model a specific server answer.
-const MANUAL_WAIT_REASONS = ['download_retry_exhausted', 'client_restarted', 'dispatch_paused', 'device_offline'];
-
-function withServerActionFlags(original) {
-  // Work on a copy: tests mutate and re-emit the same fixture objects.
-  const message = JSON.parse(JSON.stringify(original));
-  const jobs = message.jobs || (message.job ? [message.job] : []);
-  jobs.forEach((job) => {
-    Object.values(job.devices || {}).forEach((device) => {
-      const manualWait = ['queued', 'reconciling'].includes(device.state) &&
-        MANUAL_WAIT_REASONS.includes(device.queue_reason);
-      const open = !device.cancel_requested && !device.retry_job_id;
-      const terminal = ['succeeded', 'failed', 'interrupted', 'unconfirmed'].includes(device.state);
-      const fence = device.device_fence;
-      const blockingFence = !!fence && fence.blocking_job_id === job.job_id &&
-        (fence.blocking_attempt || 1) === (device.attempt || 1);
-      if (device.manual_wait === undefined) device.manual_wait = manualWait;
-      if (device.resume_required === undefined) {
-        device.resume_required = open && !terminal && (manualWait ||
-          (job.dispatch_enabled === false && ['ready', 'running', 'reconciling'].includes(job.state)));
-      }
-      if (device.cancellable === undefined) {
-        device.cancellable = open && device.resume_supported === true && (
-          (device.state === 'queued' && MANUAL_WAIT_REASONS.includes(device.queue_reason)) ||
-          device.state === 'reconciling' || (device.state === 'unconfirmed' && blockingFence));
-      }
-      if (device.retryable === undefined) {
-        // Omits the superseded-by-a-later-job rule; such fixtures set retryable: false.
-        device.retryable = open && ['failed', 'interrupted', 'unconfirmed'].includes(device.state) &&
-          (!device.failure || device.failure.code !== 'cancelled');
-      }
-    });
-  });
-  return message;
 }
 
 function snapshot(jobId, revision, deviceId, state, enqueueSeq, options = {}) {
@@ -157,6 +120,10 @@ function snapshot(jobId, revision, deviceId, state, enqueueSeq, options = {}) {
         dispatch_revision: options.dispatchRevision !== undefined ? options.dispatchRevision : 1,
         resume_supported: options.resumeSupported !== undefined
           ? options.resumeSupported : options.dispatchRevision !== null,
+        manual_wait: options.manualWait === true,
+        resume_required: options.resumeRequired === true,
+        cancellable: options.cancellable === true,
+        retryable: options.retryable === true,
         result: options.result || null,
         failure: options.failure || null,
         reconciliation_reason: options.reconciliationReason || null,
@@ -174,12 +141,40 @@ function loadAdapter(options = {}) {
   const pushJobsAttention = new FakeElement('div');
   const pushJobsTabActions = new FakeElement('div');
   const tabAttention = new FakeElement('button');
+  const tabGroups = new FakeElement('button');
+  const tabDevices = new FakeElement('button');
+  const cntGroups = new FakeElement('span');
+  const cntDevices = new FakeElement('span');
+  const cntAttention = new FakeElement('span');
   const bridgeState = new Map();
   const applied = [];
   const cleared = [];
   const clearedPendingRequests = [];
 
   global.window = global;
+  global.view = 'console';
+  global.devices = [];
+  global.provisionalConnections = [];
+  global.targetTab = 'attention';
+  global.groupNames = () => [];
+  global.pushAttentionDevices = () => [];
+  global.tabGroups = tabGroups;
+  global.tabDevices = tabDevices;
+  global.tabAttention = tabAttention;
+  global.cntGroups = cntGroups;
+  global.cntDevices = cntDevices;
+  global.cntAttention = cntAttention;
+  global.pushJobsTabActions = pushJobsTabActions;
+  const renderTabs = indexSource.match(/function renderTabs\(\) \{[\s\S]*?\n      \}/);
+  assert.ok(renderTabs, 'the console exposes its tab visibility renderer');
+  vm.runInThisContext(renderTabs[0], { filename: 'index.html#renderTabs' });
+  const refreshAttention = indexSource.match(/refreshAttention: function \(\) \{[\s\S]*?\n        \}/);
+  assert.ok(refreshAttention, 'the console bridge refreshes attention UI from the adapter');
+  global.renderTargets = () => {};
+  vm.runInThisContext(
+    'global.refreshPushJobAttention = (' + refreshAttention[0].replace(/^refreshAttention:\s*/, '') + ');',
+    { filename: 'index.html#refreshAttention' },
+  );
   global.confirm = options.confirm || (() => true);
   global.WebSocket = FakeWebSocket;
   global.fetch = options.fetch || nodeFetch;
@@ -197,6 +192,7 @@ function loadAdapter(options = {}) {
   };
   global.__stylyPushJobsV1Bridge = {
     isDeviceOnline: options.isDeviceOnline || (() => true),
+    refreshAttention() { global.refreshPushJobAttention(); },
     applyAssignment(assignment) {
       applied.push(assignment);
       if (options.applyAssignment && !options.applyAssignment(assignment)) {
@@ -224,6 +220,7 @@ function loadAdapter(options = {}) {
   return {
     logContainer, pushJobsAttention, pushJobsTabActions, tabAttention, bridgeState, applied, cleared,
     clearedPendingRequests,
+    setTargetTab(tab) { global.targetTab = tab; global.renderTabs(); },
   };
 }
 
@@ -477,6 +474,7 @@ test('restart-paused jobs expose the existing operator resume command', () => {
     jobs: [snapshot('paused-job', 4, 'D1', 'queued', 1, {
       dispatchEnabled: false,
       dispatchPausedReason: 'server_restart',
+      resumeRequired: true,
     })],
   });
 
@@ -508,6 +506,7 @@ test('download retry exhaustion explains that Resume retains the partial', () =>
     jobs: [snapshot('paused-job', 4, 'D1', 'queued', 1, {
       dispatchEnabled: false,
       dispatchPausedReason: 'download_retry_exhausted',
+      resumeRequired: true,
     })],
   });
 
@@ -524,6 +523,7 @@ test('resume attention hides once the canonical job is enabled', () => {
     jobs: [snapshot('paused-job', 4, 'D1', 'queued', 1, {
       dispatchEnabled: false,
       dispatchPausedReason: 'server_restart',
+      resumeRequired: true,
     })],
   });
   socket.emit({
@@ -545,6 +545,7 @@ test('dispatch attention includes durable ready jobs without a pause reason', ()
     jobs: [snapshot('ready-job', 4, 'D1', 'queued', 1, {
       dispatchEnabled: false,
       jobState: 'ready',
+      resumeRequired: true,
     })],
   });
 
@@ -564,6 +565,7 @@ test('dispatch action becomes retryable when WebSocket send throws', () => {
     jobs: [snapshot('ready-job', 4, 'D1', 'queued', 1, {
       dispatchEnabled: false,
       jobState: 'ready',
+      resumeRequired: true,
     })],
   });
   socket.sendError = new Error('socket closed');
@@ -739,6 +741,7 @@ test('retry-exhausted queued assignment stays visibly paused across reconnection
   const socket = new window.WebSocket('ws://localhost/ws/admin');
   const job = snapshot('paused-device', 1, 'D1', 'queued', 1);
   job.devices.D1.queue_reason = 'download_retry_exhausted';
+  job.devices.D1.resume_required = true;
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
   assert.equal(harness.bridgeState.get('D1').status, 'resume_required');
   const match = indexSource.match(/function taskCellHtml\(id\) \{[\s\S]*?\n      \}/);
@@ -757,7 +760,9 @@ test('retry-exhausted queued assignment stays visibly paused across reconnection
 test('per-device Resume remains available while other devices may dispatch', () => {
   const h = loadAdapter();
   const socket = new window.WebSocket('ws://localhost/ws/admin');
-  const job = snapshot('partial-job', 4, 'D1', 'queued', 1, { dispatchEnabled: true });
+  const job = snapshot('partial-job', 4, 'D1', 'queued', 1, {
+    dispatchEnabled: true, resumeRequired: true, cancellable: true,
+  });
   job.devices.D1.queue_reason = 'download_retry_exhausted';
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
   assert.equal(h.bridgeState.get('D1').status, 'resume_required');
@@ -770,7 +775,7 @@ test('job controls omit active cancellation and retry failures with a stable req
   const h = loadAdapter();
   const socket = new window.WebSocket('ws://localhost/ws/admin');
   const running = snapshot('active-job', 4, 'D1', 'downloading', 1);
-  const failed = snapshot('failed-job', 5, 'D2', 'failed', 2);
+  const failed = snapshot('failed-job', 5, 'D2', 'failed', 2, { retryable: true });
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [running, failed] });
   const retry = findElementByText(h.pushJobsTabActions, 'Retry failed devices');
   for (const entry of h.logContainer.children) {
@@ -790,10 +795,40 @@ test('job controls omit active cancellation and retry failures with a stable req
   assert.equal(h.bridgeState.get('D2').status, 'cancelled');
 });
 
+test('retry request IDs remain stable per revision and are pruned after updates or full snapshots', () => {
+  const h = loadAdapter();
+  const socket = new window.WebSocket('ws://localhost/ws/admin');
+  const job = revision => snapshot('retry-request-lifecycle', revision, 'D1', 'failed', 1, { retryable: true });
+  socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job(1)] });
+  findElementByText(h.pushJobsTabActions, 'Retry failed devices').click();
+  const firstId = socket.sent.at(-1).client_request_id;
+  findElementByText(h.pushJobsTabActions, 'Retry failed devices').click();
+  assert.equal(socket.sent.at(-1).client_request_id, firstId);
+
+  socket.emit({ type: 'PUSH_JOB_UPDATED', job: job(2) });
+  findElementByText(h.pushJobsTabActions, 'Retry failed devices').click();
+  const secondId = socket.sent.at(-1).client_request_id;
+  assert.notEqual(secondId, firstId);
+
+  const reconnect = new window.WebSocket('ws://localhost/ws/admin');
+  reconnect.emit({ type: 'PUSH_JOB_UPDATED', job: job(2) });
+  reconnect.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job(1)] });
+  findElementByText(h.pushJobsTabActions, 'Retry failed devices').click();
+  assert.equal(reconnect.sent.at(-1).client_request_id, secondId,
+    'the buffered latest revision keeps its existing idempotency key');
+
+  reconnect.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [] });
+  reconnect.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job(2)] });
+  findElementByText(h.pushJobsTabActions, 'Retry failed devices').click();
+  assert.notEqual(reconnect.sent.at(-1).client_request_id, secondId);
+});
+
 test('inline actions send only the selected device while Resume all targets eligible online devices', () => {
   const harness = loadAdapter();
   const socket = new window.WebSocket('ws://localhost/ws/admin');
-  const job = snapshot('per-device-job', 1, 'D1', 'queued', 1);
+  const job = snapshot('per-device-job', 1, 'D1', 'queued', 1, {
+    resumeRequired: true, cancellable: true,
+  });
   job.devices.D1.queue_reason = 'download_retry_exhausted';
   job.devices.D2 = { ...job.devices.D1, enqueue_seq: 2 };
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
@@ -820,7 +855,9 @@ test('inline actions send only the selected device while Resume all targets elig
 test('never-dispatched paused device is excluded from Cancel and Cancel all', () => {
   const h = loadAdapter();
   const socket = new window.WebSocket('ws://localhost/ws/admin');
-  const job = snapshot('never-dispatched', 1, 'D1', 'queued', 1, { dispatchRevision: null });
+  const job = snapshot('never-dispatched', 1, 'D1', 'queued', 1, {
+    dispatchRevision: null, resumeRequired: true,
+  });
   job.devices.D1.queue_reason = 'dispatch_paused';
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
   const api = window.__stylyPushJobsV1Actions;
@@ -850,7 +887,7 @@ test('individual Cancel requires confirmation', () => {
   let prompt = '';
   const h = loadAdapter({ confirm: message => { prompt = message; return false; } });
   const socket = new window.WebSocket('ws://localhost/ws/admin');
-  const job = snapshot('confirm-cancel', 1, 'D1', 'queued', 1);
+  const job = snapshot('confirm-cancel', 1, 'D1', 'queued', 1, { cancellable: true });
   job.devices.D1.queue_reason = 'download_retry_exhausted';
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
   assert.equal(window.__stylyPushJobsV1Actions.sendDeviceAction('D1', job.job_id, 'cancel'), false);
@@ -862,7 +899,7 @@ test('individual Cancel requires confirmation', () => {
 test('attention derives latest canonical assignment and clears after resume, retry, or confirmed stop', () => {
   loadAdapter();
   const socket = new window.WebSocket('ws://localhost/ws/admin');
-  const job = snapshot('attention-job', 1, 'D1', 'queued', 1);
+  const job = snapshot('attention-job', 1, 'D1', 'queued', 1, { resumeRequired: true });
   job.devices.D1.queue_reason = 'dispatch_paused';
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
   const api = window.__stylyPushJobsV1Actions;
@@ -873,7 +910,7 @@ test('attention derives latest canonical assignment and clears after resume, ret
   assert.equal(api.assignmentFor('D1').needsAttention, false);
   assert.equal(api.assignmentFor('D1').canResume, false);
   assert.equal(api.assignmentFor('D1').canCancel, false);
-  const failed = snapshot(job.job_id, 3, 'D1', 'failed', 1);
+  const failed = snapshot(job.job_id, 3, 'D1', 'failed', 1, { retryable: true });
   socket.emit({ type: 'PUSH_JOB_UPDATED', job: failed });
   assert.equal(api.assignmentFor('D1').needsAttention, true);
   socket.emit({ type: 'PUSH_JOB_UPDATED', job: snapshot('retry-job', 1, 'D1', 'queued', 2) });
@@ -928,23 +965,56 @@ test('device progress exposes escaped inline action identities', () => {
   assert.match(html, /data-job-id="job&quot;x"/);
 });
 
-test('inline Push/Sync actions share compact sizing and a danger treatment for Cancel', () => {
-  assert.match(indexSource, /\.push-job-actions\s*\{[^}]*display:\s*inline-flex/);
-  assert.match(indexSource, /\.push-job-action\s*\{[\s\S]*min-height:\s*28px/);
-  assert.match(indexSource, /\.push-job-action\[data-action="cancel"\]\s*\{[\s\S]*color:\s*var\(--danger\)/);
+test('Cancel action keeps a danger treatment', () => {
+  const cancelRule = indexSource.match(/\.push-job-action\[data-action="cancel"\]\s*\{([^}]*)\}/);
+  assert.ok(cancelRule, 'Cancel has a dedicated style rule');
+  assert.match(cancelRule[1], /(?:^|;)\s*color:\s*var\(--danger\)\s*(?:;|$)/);
+});
+
+test('Push job action visibility follows the console tab renderer', () => {
+  const harness = loadAdapter();
+  const socket = new window.WebSocket('ws://localhost/ws/admin');
+  socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [snapshot('tab-visibility', 1, 'D1', 'failed', 1, { retryable: true })] });
+  assert.equal(harness.pushJobsTabActions.style.display, '');
+  harness.setTargetTab('devices');
+  assert.equal(harness.pushJobsTabActions.style.display, 'none');
+  harness.setTargetTab('attention');
+  assert.equal(harness.pushJobsTabActions.style.display, '');
+});
+
+test('PUSH_STATE_RESET is received and logged with the device and recovery detail', () => {
+  const handler = indexSource.match(/function handleMessage\(msg\) \{[\s\S]*?\n      \}/);
+  assert.ok(handler, 'the console exposes its WebSocket message handler');
+  const logs = [];
+  const context = vm.createContext({
+    addLog(message, level) { logs.push({ message, level }); },
+    labelFor(id) { return id === 'D1' ? 'Headset 1' : id; },
+  });
+  vm.runInContext(handler[0], context);
+  context.handleMessage({ type: 'PUSH_STATE_RESET', device_id: 'D1', detail: 'invalid JSON' });
+  assert.deepEqual(logs, [{
+    message: 'Push state on Headset 1 was unreadable and has been reset - invalid JSON; unfinished Push/Sync status on it may show as interrupted',
+    level: 'warn',
+  }]);
 });
 
 test('Resume all remains for nonselected paused devices and hides once all are finished', () => {
   const harness = loadAdapter();
   const socket = new window.WebSocket('ws://localhost/ws/admin');
   const job = snapshot('partial-resume-job', 1, 'D1', 'downloading', 1);
-  job.devices.D2 = { ...job.devices.D1, state: 'reconciling', queue_reason: 'dispatch_paused', enqueue_seq: 2 };
+  job.devices.D2 = {
+    ...job.devices.D1, state: 'reconciling', queue_reason: 'dispatch_paused',
+    resume_required: true, enqueue_seq: 2,
+  };
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
   assert.equal(harness.pushJobsAttention.style.display, '');
   assert.equal(findElementByText(harness.pushJobsTabActions, 'Resume all').textContent, 'Resume all');
   socket.emit({ type: 'PUSH_JOB_UPDATED', job: {
     ...job, revision: 2, dispatch_enabled: false,
-    devices: Object.fromEntries(Object.entries(job.devices).map(([id, d]) => [id, { ...d, state: 'failed', failure: { code: 'cancelled' } }])),
+    devices: Object.fromEntries(Object.entries(job.devices).map(([id, d]) => [id, {
+      ...d, state: 'failed', failure: { code: 'cancelled' },
+      resume_required: false, retryable: false,
+    }])),
   } });
   assert.equal(harness.pushJobsAttention.style.display, 'none');
 });
@@ -960,7 +1030,7 @@ test('only a timed-out queued assignment exposes or sends Cancel', () => {
     assert.equal(window.__stylyPushJobsV1Actions.assignmentFor('D1').canCancel, false, state);
     assert.equal(window.__stylyPushJobsV1Actions.sendDeviceAction('D1', job.job_id, 'cancel'), false, state);
   }
-  const paused = snapshot('cancel-scope', ++revision, 'D1', 'queued', 1);
+  const paused = snapshot('cancel-scope', ++revision, 'D1', 'queued', 1, { cancellable: true });
   paused.devices.D1.queue_reason = 'download_retry_exhausted';
   socket.emit({ type: 'PUSH_JOB_UPDATED', job: paused });
   assert.equal(window.__stylyPushJobsV1Actions.assignmentFor('D1').canCancel, true);
@@ -999,7 +1069,9 @@ test('offline timeout keeps attention and Cancel but excludes Resume and refresh
   const online = new Set(['D2']);
   const h = loadAdapter({ isDeviceOnline: id => online.has(id) });
   const socket = new window.WebSocket('ws://localhost/ws/admin');
-  const job = snapshot('offline-resume', 1, 'D1', 'queued', 1);
+  const job = snapshot('offline-resume', 1, 'D1', 'queued', 1, {
+    resumeRequired: true, cancellable: true,
+  });
   job.devices.D1.queue_reason = 'download_retry_exhausted';
   job.devices.D2 = { ...job.devices.D1, enqueue_seq: 2 };
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
@@ -1037,13 +1109,14 @@ test('Reconcile stays in job controls and never appears inside Activity log', ()
 test('offline reconciling cancel becomes pending without human attention or repeat controls', () => {
   const h = loadAdapter({ isDeviceOnline: () => false });
   const socket = new window.WebSocket('ws://localhost/ws/admin');
-  const job = snapshot('offline-cancel', 1, 'D1', 'reconciling', 1);
+  const job = snapshot('offline-cancel', 1, 'D1', 'reconciling', 1, { cancellable: true });
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
   const api = window.__stylyPushJobsV1Actions;
   assert.equal(api.assignmentFor('D1').canCancel, true);
   assert.equal(api.assignmentFor('D1').canResume, false);
   assert.equal(api.sendDeviceAction('D1', job.job_id, 'cancel'), true);
   job.devices.D1.cancel_requested = true;
+  job.devices.D1.cancellable = false;
   socket.emit({ type: 'PUSH_JOB_UPDATED', job: { ...job, revision: 2 } });
   const view = api.assignmentFor('D1');
   assert.equal(view.status, 'cancel_pending');
@@ -1056,12 +1129,13 @@ test('offline reconciling cancel becomes pending without human attention or repe
 test('retried targets leave old attention and retry controls while a new failure stays actionable', () => {
   const h = loadAdapter();
   const socket = new window.WebSocket('ws://localhost/ws/admin');
-  const old = snapshot('original-failure', 1, 'D1', 'failed', 1);
+  const old = snapshot('original-failure', 1, 'D1', 'failed', 1, { retryable: true });
   old.devices.D1.retry_job_id = 'new-retry';
+  old.devices.D1.retryable = false;
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [old] });
   assert.equal(window.__stylyPushJobsV1Actions.assignmentFor('D1').needsAttention, false);
   assert.equal(h.pushJobsAttention.style.display, 'none');
-  socket.emit({ type: 'PUSH_JOB_UPDATED', job: snapshot('new-retry', 1, 'D1', 'failed', 2) });
+  socket.emit({ type: 'PUSH_JOB_UPDATED', job: snapshot('new-retry', 1, 'D1', 'failed', 2, { retryable: true }) });
   assert.equal(window.__stylyPushJobsV1Actions.assignmentFor('D1').needsAttention, true);
   assert.equal(h.pushJobsAttention.style.display, '');
   assert.equal(h.pushJobsAttention.children.length, 2, 'only new failed job needs attention');
@@ -1119,7 +1193,7 @@ test('Retry is disabled while every retryable target is offline', () => {
   const online = new Set();
   const h = loadAdapter({ isDeviceOnline: id => online.has(id) });
   const socket = new window.WebSocket('ws://localhost/ws/admin');
-  const job = snapshot('offline-failure', 1, 'D1', 'failed', 1);
+  const job = snapshot('offline-failure', 1, 'D1', 'failed', 1, { retryable: true });
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
   assert.equal(h.pushJobsAttention.children[1].children[0].textContent,
     '1 Push / Sync job(s) need review in the Needs attention tab.');
@@ -1139,7 +1213,7 @@ test('dispatch-disabled ready job shows Resume required instead of Waiting', () 
   const h = loadAdapter();
   const socket = new window.WebSocket('ws://localhost/ws/admin');
   const job = snapshot('awaiting-dispatch', 1, 'D1', 'queued', 1, {
-    dispatchEnabled: false, jobState: 'ready',
+    dispatchEnabled: false, jobState: 'ready', resumeRequired: true,
   });
   job.devices.D1.queue_reason = 'awaiting_dispatch';
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
@@ -1166,9 +1240,13 @@ test('Cancel all confirmation states devices and jobs', () => {
   let prompt = '';
   const h = loadAdapter({ confirm: message => { prompt = message; return false; } });
   const socket = new window.WebSocket('ws://localhost/ws/admin');
-  const first = snapshot('cancel-scope-a', 1, 'D1', 'queued', 1);
+  const first = snapshot('cancel-scope-a', 1, 'D1', 'queued', 1, {
+    cancellable: true, resumeRequired: true,
+  });
   first.devices.D1.queue_reason = 'download_retry_exhausted';
-  const second = snapshot('cancel-scope-b', 1, 'D2', 'queued', 2);
+  const second = snapshot('cancel-scope-b', 1, 'D2', 'queued', 2, {
+    cancellable: true, resumeRequired: true,
+  });
   second.devices.D2.queue_reason = 'download_retry_exhausted';
   second.devices.D3 = { ...second.devices.D2, enqueue_seq: 3 };
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [first, second] });
@@ -1180,7 +1258,9 @@ test('Cancel all confirmation states devices and jobs', () => {
 test('client restart requires operator Resume and allows Cancel', () => {
   loadAdapter();
   const socket = new window.WebSocket('ws://localhost/ws/admin');
-  const job = snapshot('restart-manual', 1, 'D1', 'queued', 1);
+  const job = snapshot('restart-manual', 1, 'D1', 'queued', 1, {
+    resumeRequired: true, cancellable: true,
+  });
   job.devices.D1.queue_reason = 'client_restarted';
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
   const view = window.__stylyPushJobsV1Actions.assignmentFor('D1');

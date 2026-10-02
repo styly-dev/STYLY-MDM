@@ -640,36 +640,18 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > would strand the coroutines already parked on the old object and briefly allow twice
 > the cap.
 >
-> Slot-release behavior:
->
-> 1. APK install and standalone `/api/bundles` Push keep their existing completion, terminal-result,
->    disconnect, and `MDM_TRANSFER_TIMEOUT` (default **600 seconds**) behavior.
-> 2. Job-v1 Push releases its exact slot on `PUSH_PHASE validating` after all
->    artifact bytes arrive and before SHA-256 (or on a matching terminal outcome).
->    `PUSH_TRANSFER_COMPLETE` follows verification. Its artifact URL carries a random in-memory token
->    scoped to `(job_id, device_id, attempt)`.
-> 3. If no HTTP response bytes are successfully written for 60 seconds, the server
->    revokes that token, aborts and awaits the matching HTTP handler, then releases
->    the slot. Successful writes renew the lease, so healthy large transfers can
->    exceed 600 seconds without losing their slot.
->    The accepted-work reconciliation deadline also defers while this exact HTTP
->    lease is live; its watchdog owns the 60-second stalled-stream recovery.
+> APK install and standalone `/api/bundles` Push retain their existing completion
+> and `MDM_TRANSFER_TIMEOUT` (default **600 seconds**) handling. Every job-v1 Push
+> download requires an assignment-scoped HTTP lease. Its transfer slot ends before
+> validation or when the HTTP watchdog stops a stalled transfer; WebSocket loss
+> alone does not release it. See [Push ownership](PUSH_JOBS.md#ownership-model) and
+> [resumable artifact transfer](PUSH_JOBS.md#resumable-artifact-transfer) for the
+> release conditions, idle deadline, and coordinated rollout requirements.
 >
 > `pending_transfers` is keyed by **`(device_id, task)`**, not by device: an admin can
 > push files to a group that is already installing an APK, so one device may hold an
 > install slot and a push slot at once. Each terminal message frees only its own task's
-> slot. A disconnect still releases Install ownership; a healthy job-v1 Push HTTP transfer
-> remains bound to its exact token and slot even after WebSocket replacement. A server
-> restart discards these in-memory tokens. The old URL is rejected and a partial
-> download must be manually resumed to get a new token and slot. Old unscoped job-v1
-> URLs are intentionally unsupported after rollout, which is scheduled with no active
-> old-APK Push/Sync transfer. APK install and standalone `/api/bundles` Push remain
-> unchanged.
->
-> The standalone `/api/bundles` Push path and APK-install protocol are unchanged. The
-> new assignment token applies to all Push-job artifact downloads; old unscoped job-v1
-> URLs are intentionally rejected after rollout, and the legacy job fallback is
-> disabled because it cannot carry an assignment token.
+> slot. A disconnect still releases Install ownership.
 >
 > Admins see install aggregate progress via `INSTALL_PROGRESS`. `PUSH_PROGRESS` is
 > retained only for the standalone `/api/bundles` Push path; the current job-v1 console

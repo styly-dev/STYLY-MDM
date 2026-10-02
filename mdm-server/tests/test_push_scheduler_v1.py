@@ -27,9 +27,9 @@ def test_job_v1_command_uses_absolute_artifact_url():
         'devices': {'D1': {'attempt': 1}},
     }
     command = PushScheduler._command(
-        snapshot, 'D1', 'http://10.0.0.2:7070',
+        snapshot, 'D1', 'http://10.0.0.2:7070', lease_token='test-lease',
     )
-    assert command['artifact_url'] == 'http://10.0.0.2:7070/artifacts/artifact'
+    assert command['artifact_url'] == 'http://10.0.0.2:7070/artifacts/artifact?lease=test-lease'
     assert command['bundle_url'] == command['artifact_url']
     assert command['delete_extras'] is True
 

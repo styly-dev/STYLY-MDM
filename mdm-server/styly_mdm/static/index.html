@@ -314,12 +314,6 @@
     .push-attention-summary { display: flex; align-items: center; gap: 10px; }
     .push-attention-message { min-width: 0; flex: 1 1 auto; color: var(--text-primary); font-size: 12px; line-height: 1.4; }
     .push-attention-open { flex: 0 0 auto; }
-    .push-attention-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-primary); }
-    .push-attention-item + .push-attention-item { margin-top: 7px; padding-top: 7px; border-top: 1px solid #55461f; }
-    .push-attention-job { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .push-resume { flex: 0 0 auto; border: none; border-radius: 5px; padding: 5px 10px; background: var(--warning); color: #17130a; font: 600 12px inherit; cursor: pointer; }
-    .push-resume:disabled { opacity: .55; cursor: wait; }
-
     .commands { padding: 0 18px 18px; display: flex; flex-direction: column; gap: 14px; flex: 1 1 0; min-height: 0; overflow-y: auto; }
     .cmd-divider { height: 1px; background: var(--border); }
     .cmd-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 8px; cursor: pointer; user-select: none; }
@@ -1225,7 +1219,6 @@
         // below never destroys its input. Just show it on the Devices tab and keep the
         // controls in sync with module state (they persist across re-renders).
         const showToolbar = targetTab === 'devices' && devices.length > 0;
-        pushJobsTabActions.style.display = targetTab === 'attention' && pushJobsTabActions.children.length ? '' : 'none';
         devToolbar.style.display = showToolbar ? '' : 'none';
         if (showToolbar && devSearchInput.value !== deviceSearch) devSearchInput.value = deviceSearch;
         if (showToolbar) syncStatusFilterButtons();

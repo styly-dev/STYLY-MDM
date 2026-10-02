@@ -91,7 +91,7 @@ class PushFilesWorkerTest {
         }
         val archive = zip("content.txt" to content).readBytes()
         var now = 0L
-        ArtifactServer(archive).use { server ->
+        artifactServer(archive).use { server ->
             val result = PushFilesWorker(
                 { true }, { File(tmp.root, "long-work") }, { File(tmp.root, "long-dest") },
                 monotonicMillis = { now },
@@ -116,7 +116,7 @@ class PushFilesWorkerTest {
         var now = 0L
         var acceptedBytes = 0L
         val work = File(tmp.root, "late-work")
-        ArtifactServer(archive).use { server ->
+        artifactServer(archive).use { server ->
             val result = PushFilesWorker({ true }, { work }, monotonicMillis = { now }).execute(
                 command(artifactUrl = server.url, artifactSize = archive.size.toLong(), artifactSha256 = sha256(archive)).copy(revision = 1L),
                 PushFilesWorker.Callbacks({}, {}, {}, onTransferProgress = { acceptedBytes = it; now = 60_000L }),
@@ -594,32 +594,11 @@ class PushFilesWorkerTest {
         assertEquals(0L, worker.validatedResumeOffset(command))
     }
 
-    private class ArtifactServer(private val content: ByteArray) : AutoCloseable {
-        private val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
-        val url = "http://127.0.0.1:${server.localPort}/artifact.zip"
-        private val thread = Thread({
-            server.accept().use { client ->
-                val reader = client.getInputStream().bufferedReader(Charsets.US_ASCII)
-                while (reader.readLine()?.isNotEmpty() == true) Unit
-                client.getOutputStream().use { output ->
-                    output.write(
-                            ("HTTP/1.1 200 OK\r\n" +
-                                "Content-Length: ${content.size}\r\n" +
-                                "ETag: \"test-artifact\"\r\n" +
-                                "Connection: close\r\n\r\n")
-                            .toByteArray(Charsets.US_ASCII),
-                    )
-                    output.write(content)
-                    output.flush()
-                }
-            }
-        }, "push-worker-test-http").apply { start() }
-
-        override fun close() {
-            server.close()
-            thread.join(5_000)
-        }
-    }
+    private fun artifactServer(content: ByteArray) = OneShotServer(
+        status = 200,
+        headers = "Content-Length: ${content.size}\r\nETag: \"test-artifact\"",
+        body = content,
+    )
 
     private class OneShotServer(
         private val status: Int,
@@ -734,7 +713,7 @@ class PushFilesWorkerTest {
         val work = File(tmp.root, "sha-match-work")
         val callbacks = mutableListOf<String>()
 
-        ArtifactServer(archive).use { server ->
+        artifactServer(archive).use { server ->
             val execution = PushFilesWorker(
                 hasExternalStorageAccess = { true },
                 attemptDirectoryProvider = { work },
@@ -1305,7 +1284,7 @@ class PushFilesWorkerTest {
         val archive = zip("content.txt" to "larger-than-extracted-limit").readBytes()
         val callbacks = mutableListOf<String>()
 
-        ArtifactServer(archive).use { server ->
+        artifactServer(archive).use { server ->
             val execution = PushFilesWorker(
                 hasExternalStorageAccess = { true },
                 attemptDirectoryProvider = { File(tmp.root, "artifact-over-extracted-limit") },
@@ -1336,7 +1315,7 @@ class PushFilesWorkerTest {
         val archive = zip("content.txt" to "legacy").readBytes()
         val destination = tmp.newFolder("legacy-no-sha-destination")
 
-        ArtifactServer(archive).use { server ->
+        artifactServer(archive).use { server ->
             val execution = PushFilesWorker(
                 hasExternalStorageAccess = { true },
                 attemptDirectoryProvider = { File(tmp.root, "legacy-no-sha-work") },
@@ -1365,7 +1344,7 @@ class PushFilesWorkerTest {
         val work = File(tmp.root, "sha-mismatch-work")
         var callbackInvoked = false
 
-        ArtifactServer(archive).use { server ->
+        artifactServer(archive).use { server ->
             val execution = PushFilesWorker(
                 hasExternalStorageAccess = { true },
                 attemptDirectoryProvider = { work },
@@ -1399,7 +1378,7 @@ class PushFilesWorkerTest {
         val sentinel = File(destination, "existing.txt").apply { writeText("unchanged") }
         val callbacks = mutableListOf<String>()
 
-        ArtifactServer(archive).use { server ->
+        artifactServer(archive).use { server ->
             val execution = PushFilesWorker(
                 hasExternalStorageAccess = { true },
                 attemptDirectoryProvider = { File(tmp.root, "invalid-destination-work") },

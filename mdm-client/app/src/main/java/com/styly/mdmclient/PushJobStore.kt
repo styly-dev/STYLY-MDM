@@ -27,7 +27,7 @@ internal fun loadPushState(
     fileExists: () -> Boolean,
 ): PushStateLoadResult = try {
     PushStateLoadResult.Valid(
-        normalize(PushProtocol.stateFromJsonStrict(JSONObject(readText()))),
+        normalize(PushProtocol.stateFromJson(JSONObject(readText()))),
     )
 } catch (error: FileNotFoundException) {
     if (fileExists()) PushStateLoadResult.Unreadable(error) else PushStateLoadResult.Missing

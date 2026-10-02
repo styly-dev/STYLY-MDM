@@ -296,9 +296,9 @@ class PushFilesWorker internal constructor(
         return Execution(result, work, interrupted, interruptionReason)
     }
 
-    fun cleanup(execution: Execution) {
-        execution.workDirectory.deleteRecursively()
-        val jobDirectory = execution.workDirectory.parentFile
+    fun cleanup(workDirectory: File) {
+        workDirectory.deleteRecursively()
+        val jobDirectory = workDirectory.parentFile
         if (jobDirectory?.listFiles()?.isEmpty() == true) jobDirectory.delete()
     }
 
@@ -488,7 +488,7 @@ class PushFilesWorker internal constructor(
         return try {
             val json = org.json.JSONObject(file.readText(Charsets.UTF_8))
             val etag = json.optString("artifact_etag", "").ifBlank { null }
-            if (etag != null && (etag.startsWith("W/") || !etag.startsWith("\"") || !etag.endsWith("\""))) return null
+            if (etag != null && !PushProtocol.isStrongEtag(etag)) return null
             ResumeMetadata(
                 json.getString("job_id"), json.getInt("attempt"), json.getLong("revision"),
                 json.getString("artifact_id"), json.getString("artifact_url"), json.getLong("artifact_size"),
@@ -820,9 +820,9 @@ class PushFilesWorker internal constructor(
     }
 
     private fun validateResponseEtag(response: String?, expected: String?) {
-        if (response.isNullOrBlank() || response.startsWith("W/") ||
-            !response.startsWith("\"") || !response.endsWith("\"")
-        ) throw PushWorkerException("artifact_identity_mismatch", "response did not provide a strong ETag")
+        if (response == null || !PushProtocol.isStrongEtag(response)) {
+            throw PushWorkerException("artifact_identity_mismatch", "response did not provide a strong ETag")
+        }
         if (expected != null && response != expected) {
             throw PushWorkerException("artifact_identity_mismatch", "artifact ETag changed while resuming")
         }

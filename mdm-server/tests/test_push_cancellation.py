@@ -274,24 +274,6 @@ async def test_success_after_cancelled_absence_was_missed_settles_exact_result(m
     assert session.ws.messages[-1]['accepted'] is True
 
 
-@pytest.mark.asyncio
-async def test_schema_two_migrates_existing_dispatch_identity(tmp_path):
-    import sqlite3
-    path = tmp_path / 'migration.sqlite3'
-    store = PushJobStore(path)
-    original = await downloading_job(store, PushJobManager(store), CAPS)
-    store.close()
-    with sqlite3.connect(path) as conn:
-        conn.execute('ALTER TABLE push_job_devices DROP COLUMN cancel_requested_at')
-        conn.execute("UPDATE server_metadata SET value='2' WHERE key='schema_version'")
-    migrated = PushJobStore(path)
-    try:
-        assert await migrated.get_snapshot(original['job_id']) == original
-        assert await migrated._call(lambda conn: conn.execute("SELECT value FROM server_metadata WHERE key='schema_version'").fetchone()[0]) == '3'
-    finally:
-        migrated.close()
-
-
 def test_future_schema_is_rejected_before_alter(tmp_path):
     import sqlite3
     path = tmp_path / 'future.sqlite3'

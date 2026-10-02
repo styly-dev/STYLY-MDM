@@ -404,7 +404,9 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
             accept_deadline=now_ms() + 1000,
         )
         replayed = await manager.get_snapshot(job_id)
-        command = PushScheduler._command(replayed, "D1", "http://server")
+        command = PushScheduler._command(
+            replayed, "D1", "http://server", lease_token="test-lease"
+        )
         assert command["revision"] == immutable_revision
         assert replayed["revision"] > immutable_revision
         assert replayed["devices"]["D1"]["validated_offset"] == 3

@@ -9,6 +9,7 @@ from aiohttp.test_utils import TestServer
 from styly_mdm import push_runtime, push_scheduler, server
 from styly_mdm.push_runtime import PushRuntime
 from styly_mdm.push_scheduler import LiveSession, PushScheduler
+from styly_mdm.push_transfer_leases import PushTransferLeases
 from styly_mdm.transfer_registry import TransferKey, TransferRegistry
 
 
@@ -36,11 +37,11 @@ def _scheduler(manager):
         transfer_slots=lambda: None,
         sessions=lambda: {},
         publish=_publish,
+        leases=PushTransferLeases(),
         send_timeout=1,
         accept_timeout=1,
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
-        transfer_timeout=1,
     )
 
 
@@ -144,17 +145,18 @@ async def test_dispatch_exception_moves_uncertain_send_to_reconciliation(monkeyp
             }
 
     registry = TransferRegistry()
+    leases = PushTransferLeases()
     scheduler = PushScheduler(
         manager=Manager(),
         transfer_registry=registry,
         transfer_slots=lambda: None,
         sessions=lambda: {},
         publish=lambda snapshot: _record(published, snapshot),
+        leases=leases,
         send_timeout=1,
         accept_timeout=1,
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
-        transfer_timeout=1,
     )
     transfer_future = asyncio.get_running_loop().create_future()
     key = TransferKey("push", device_id, job_id, 1)
@@ -188,11 +190,11 @@ async def test_old_dispatch_cleanup_preserves_replacement_waiters():
         transfer_slots=lambda: asyncio.Semaphore(1),
         sessions=lambda: {},
         publish=lambda _snapshot: None,
+        leases=PushTransferLeases(),
         send_timeout=1,
         accept_timeout=1,
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
-        transfer_timeout=1,
     )
     scheduler.wake = lambda: None
     key = TransferKey("push", "D1", "job-1", 1)
@@ -235,17 +237,18 @@ async def test_accept_timeout_already_reconciled_keeps_exact_transfer_slot(monke
             }
 
     registry = TransferRegistry()
+    leases = PushTransferLeases()
     scheduler = PushScheduler(
         manager=Manager(),
         transfer_registry=registry,
         transfer_slots=lambda: asyncio.Semaphore(1),
         sessions=lambda: {},
         publish=_publish,
+        leases=leases,
         send_timeout=1,
         accept_timeout=0,
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
-        transfer_timeout=1,
     )
     sent = []
 
@@ -254,6 +257,7 @@ async def test_accept_timeout_already_reconciled_keeps_exact_transfer_slot(monke
 
     monkeypatch.setattr(scheduler, "send_reconcile", send_reconcile)
     key = TransferKey("push", "D1", "job-1", 1)
+    leases.issue(key, "artifact-1")
     transfer_future = asyncio.get_running_loop().create_future()
     registry.register(key, transfer_future)
     accepted = await scheduler._await_acceptance(
@@ -271,6 +275,58 @@ async def test_accept_timeout_already_reconciled_keeps_exact_transfer_slot(monke
     assert accepted is True
     assert registry.get(key) is transfer_future
     assert sent and sent[0][1] == "D1"
+
+
+@pytest.mark.asyncio
+async def test_accept_timeout_store_conflict_drops_slot_after_lease_revocation():
+    class Manager:
+        async def mark_acceptance_reconciling(self, *_args, **_kwargs):
+            raise push_scheduler.StoreConflict("assignment changed")
+
+        async def assignment(self, _job_id, _device_id):
+            return {
+                "state": "reconciling",
+                "attempt": 1,
+                "accepted_at": None,
+                "reconciliation_reason": "device_disconnect",
+                "accept_deadline": None,
+                "cancel_requested_at": None,
+            }
+
+    registry = TransferRegistry()
+    leases = PushTransferLeases()
+    scheduler = PushScheduler(
+        manager=Manager(),
+        transfer_registry=registry,
+        transfer_slots=lambda: asyncio.Semaphore(1),
+        sessions=lambda: {},
+        publish=_publish,
+        leases=leases,
+        send_timeout=1,
+        accept_timeout=0,
+        accept_reconciliation_timeout=1,
+        reconciliation_timeout=1,
+    )
+    key = TransferKey("push", "D1", "job-1", 1)
+    transfer_future = asyncio.get_running_loop().create_future()
+    registry.register(key, transfer_future)
+    leases.issue(key, "artifact-1")
+    # A fast HTTP completion can revoke the token before the awaited WebSocket
+    # send returns and _await_acceptance observes it.
+    leases.revoke_now(key)
+
+    accepted = await scheduler._await_acceptance(
+        object(),
+        {"job_id": "job-1", "devices": {"D1": {"attempt": 1}}},
+        "D1",
+        asyncio.get_running_loop().create_future(),
+        key,
+        1234,
+    )
+
+    assert accepted is False
+    assert not transfer_future.done()
+    transfer_future.cancel()
 
 
 async def _record(target, value):
@@ -348,17 +404,18 @@ def _dispatch_scheduler(manager, websocket):
         http_base="http://server",
     )
     registry = TransferRegistry()
+    leases = PushTransferLeases()
     scheduler = PushScheduler(
         manager=manager,
         transfer_registry=registry,
         transfer_slots=_transfer_slot,
         sessions=lambda: {"D1": session},
         publish=_publish,
+        leases=leases,
         send_timeout=10,
         accept_timeout=1,
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
-        transfer_timeout=1,
     )
     return scheduler, registry
 

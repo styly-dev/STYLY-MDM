@@ -54,7 +54,7 @@ def _scheduler(manager, registry, leases, sessions, slots):
         manager=manager, transfer_registry=registry, leases=leases,
         transfer_slots=lambda: slots, sessions=lambda: sessions, publish=_publish,
         send_timeout=1, accept_timeout=0.1, accept_reconciliation_timeout=60,
-        reconciliation_timeout=60, transfer_timeout=600,
+        reconciliation_timeout=60,
     )
 
 
