@@ -1,5 +1,6 @@
 package com.styly.mdmclient
 
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -78,7 +79,7 @@ class PushProtocolTest {
     }
 
     @Test
-    fun `malformed active does not erase valid durable receipts`() {
+    fun `malformed active invalidates the durable snapshot even when receipts are valid`() {
         val command = PushProtocol.parseCommand(payload())
         val result = PushProtocol.Result(
             jobId = command.jobId,
@@ -103,11 +104,9 @@ class PushProtocolTest {
             })
         }
 
-        val decoded = PushProtocol.stateFromJson(json)
-
-        assertEquals(null, decoded.active)
-        assertEquals(listOf(receipt), decoded.pendingResults)
-        assertEquals(listOf(receipt), decoded.completedReceipts)
+        assertThrows(IllegalArgumentException::class.java) {
+            PushProtocol.stateFromJson(json)
+        }
     }
 
     @Test
@@ -130,5 +129,22 @@ class PushProtocolTest {
         assertTrue(decoded.active?.interrupted == true)
         assertEquals(123456L, decoded.active?.interruptedAt)
         assertEquals("download_retry_exhausted", decoded.active?.interruptionReason)
+    }
+
+    @Test
+    fun `durable issue 91 active command without revision remains readable`() {
+        val command = PushProtocol.parseCommand(payload()).toJson().apply { remove("revision") }
+        val state = JSONObject().apply {
+            put("active", JSONObject().apply {
+                put("command", command)
+                put("phase", PushProtocol.PHASE_DOWNLOADING)
+            })
+            put("pending_results", JSONArray())
+            put("completed_receipts", JSONArray())
+        }
+
+        val decoded = PushProtocol.stateFromJson(state)
+
+        assertEquals(0L, decoded.active?.command?.revision)
     }
 }

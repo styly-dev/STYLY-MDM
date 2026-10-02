@@ -909,26 +909,6 @@ class PushJobStore:
 
         return await self._call(op)
 
-    async def mark_dispatching(
-        self,
-        job_id: str,
-        device_id: str,
-        capabilities: Iterable[str],
-        accept_deadline: int,
-    ) -> dict[str, Any]:
-        return await self.transition_device(
-            job_id,
-            device_id,
-            expected={DeviceState.WAITING_TRANSFER},
-            target=DeviceState.DISPATCHING,
-            fields={
-                "dispatch_capability_snapshot_json": json.dumps(sorted(set(capabilities))),
-                "accept_deadline": accept_deadline,
-                "reconciliation_reason": None,
-                "reconciliation_deadline": None,
-            },
-        )
-
     async def transition_device(
         self,
         job_id: str,
@@ -998,15 +978,6 @@ class PushJobStore:
                     values,
                 )
                 self._increment_revision(conn, job_id, timestamp)
-                if target is DeviceState.DISPATCHING:
-                    job_revision = conn.execute(
-                        "SELECT revision FROM push_jobs WHERE job_id=?", (job_id,)
-                    ).fetchone()["revision"]
-                    conn.execute(
-                        "UPDATE push_job_devices SET dispatch_revision=COALESCE(dispatch_revision, ?) "
-                        "WHERE job_id=? AND device_id=?",
-                        (job_revision, job_id, device_id),
-                    )
                 self._rederive_job(conn, job_id, timestamp)
                 snapshot = self._snapshot(conn, job_id)
                 self._commit(conn)
@@ -1357,9 +1328,7 @@ class PushJobStore:
             row = conn.execute("SELECT * FROM push_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
             if row is None:
                 return None
-            record = dict(row)
-            record["etag"] = strong_etag(record["sha256"])
-            return record
+            return dict(row)
 
         return await self._call(op)
 
@@ -1441,22 +1410,7 @@ class PushJobStore:
 
         removed: list[str] = []
         for artifact_id, path in self._call_sync(op):
-            # Avoid reporting already-removed identities on every periodic GC
-            # pass. Use a strict unlink after this check so a concurrent remover
-            # cannot make a missing file look like a newly removed artifact.
             if path.parent != root:
-                continue
-            try:
-                # Check the directory entry itself rather than its resolved
-                # target: unlinking a symlink inside the artifact root is safe,
-                # including a dangling symlink left by an interrupted cleanup.
-                path.lstat()
-            except FileNotFoundError:
-                continue
-            except OSError:
-                logger.warning(
-                    "Could not inspect expired Push artifact bytes %s", path, exc_info=True
-                )
                 continue
             try:
                 path.unlink()

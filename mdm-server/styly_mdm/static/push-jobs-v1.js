@@ -194,6 +194,7 @@
     const current = pushJobs.get(job.job_id);
     if (current && current.revision >= job.revision) return;
     pushJobs.set(job.job_id, job);
+    pruneRetryRequestIds(pushJobs);
     renderJob(job);
     renderPausedJobs();
     syncDeviceAssignments();
@@ -205,6 +206,18 @@
     if (!current || current.revision < job.revision) {
       bufferedUpdates.set(job.job_id, job);
     }
+  }
+
+  function pruneRetryRequestIds(jobs) {
+    retryRequestIds.forEach(function (_requestId, key) {
+      const separator = key.lastIndexOf(':');
+      const jobId = key.slice(0, separator);
+      const revision = Number(key.slice(separator + 1));
+      const current = jobs.get(jobId);
+      if (!current || (Number.isFinite(revision) && revision < current.revision)) {
+        retryRequestIds.delete(key);
+      }
+    });
   }
 
   function replaceJobs(jobs) {
@@ -219,6 +232,7 @@
       if (!current || current.revision < job.revision) replacement.set(jobId, job);
     });
     bufferedUpdates = new Map();
+    pruneRetryRequestIds(replacement);
 
     jobEntries.forEach(function (entry, jobId) {
       if (replacement.has(jobId)) return;
@@ -367,18 +381,19 @@
     return true;
   }
 
-  function sendJobAttentionAction(job, type, button, label) {
+  function sendRetryJobAction(job, button) {
     if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return false;
-    const payload = { type: type, job_id: job.job_id };
-    if (type === 'RETRY_FAILED_PUSH_JOB') {
-      const key = job.job_id + ':' + job.revision;
-      if (!retryRequestIds.has(key)) retryRequestIds.set(key, uuid());
-      payload.client_request_id = retryRequestIds.get(key);
-    }
+    const key = job.job_id + ':' + job.revision;
+    if (!retryRequestIds.has(key)) retryRequestIds.set(key, uuid());
+    const payload = {
+      type: 'RETRY_FAILED_PUSH_JOB',
+      job_id: job.job_id,
+      client_request_id: retryRequestIds.get(key),
+    };
     try {
       nativeSend.call(currentAdminSocket, JSON.stringify(payload));
     } catch (error) {
-      appendLog('Could not ' + label.toLowerCase() + ': ' + error.message, 'fail');
+      appendLog('Could not retry failed devices: ' + error.message, 'fail');
       return false;
     }
     button.disabled = true;
@@ -392,7 +407,6 @@
     const container = document.getElementById('pushJobsTabActions');
     if (!container) return;
     container.replaceChildren();
-    container.style.display = paused.length ? '' : 'none';
     if (!paused.length) return;
 
     const resumeTargets = bulkActionGroups('resume').reduce(function (count, group) {
@@ -473,7 +487,7 @@
           retry.title = 'Every device to retry is offline';
         }
         retry.addEventListener('click', function () {
-          sendJobAttentionAction(job, 'RETRY_FAILED_PUSH_JOB', retry, 'Retry failed devices');
+          sendRetryJobAction(job, retry);
         });
         rowButtons.appendChild(retry);
       }

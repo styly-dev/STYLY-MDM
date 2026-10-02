@@ -62,6 +62,13 @@ class PushProtocolStrictTypesTest {
             PushProtocol.parseCommand(payload().apply { put("artifact_etag", "\"strong\"") })
                 .artifactEtag == "\"strong\"",
         )
+        assertTrue(PushProtocol.isStrongEtag("\"\""))
+        assertFalse(PushProtocol.isStrongEtag("\""))
+        assertFalse(PushProtocol.isStrongEtag("unquoted"))
+        assertFalse(PushProtocol.isStrongEtag("W/\"weak\""))
+        assertThrows(IllegalArgumentException::class.java) {
+            PushProtocol.parseCommand(payload().apply { put("artifact_etag", "\"") })
+        }
     }
 
     @Test

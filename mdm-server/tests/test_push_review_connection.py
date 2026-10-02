@@ -206,7 +206,9 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
             assert await manager.get_snapshot(job_id) == before
             assert not replacement.done()
             assert runtime.transfers.get(key) is replacement
-        command = PushScheduler._command(before, "D1", "http://server")
+        command = PushScheduler._command(
+            before, "D1", "http://server", lease_token="test-lease"
+        )
         assert command["revision"] == report["revision"]
         assert command["artifact_id"] == report["artifact_id"]
         assert ws.messages == []
@@ -328,7 +330,7 @@ async def test_retry_exhaustion_allows_another_device_waiting_for_a_slot(tmp_pat
             transfer_slots=lambda: slots, sessions=lambda: {"D2": session},
             publish=lambda _snapshot: asyncio.sleep(0), send_timeout=1,
             accept_timeout=1, accept_reconciliation_timeout=1,
-            reconciliation_timeout=1, transfer_timeout=1,
+            reconciliation_timeout=1, leases=PushTransferLeases(),
         )
         task = asyncio.create_task(scheduler._dispatch_assignment(waiting))
         try:
@@ -1138,7 +1140,6 @@ async def test_server_restart_active_registration_does_not_reuse_revoked_http_le
             accept_timeout=1,
             accept_reconciliation_timeout=1,
             reconciliation_timeout=1,
-            transfer_timeout=60,
             leases=leases,
         )
         runtime = object.__new__(PushRuntime)
