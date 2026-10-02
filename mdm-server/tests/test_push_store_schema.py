@@ -150,21 +150,48 @@ async def test_gc_tombstones_in_db_then_unlinks_outside_the_db_worker(tmp_path, 
 
 
 @pytest.mark.asyncio
-async def test_gc_unlink_failure_keeps_tombstone(tmp_path, monkeypatch):
+async def test_gc_retries_tombstoned_file_after_reopen_and_reports_removal_once(
+    tmp_path, monkeypatch
+):
     store = PushJobStore(tmp_path / 'jobs.sqlite3')
     manager = PushJobManager(store)
+    reopened = None
     try:
         job = await _ready_job(manager, tmp_path, {'D1': 'succeeded'})
         artifact_id = job['artifact']['artifact_id']
+        artifact_path = tmp_path / f'{artifact_id}.zip'
+        original_unlink = Path.unlink
+        attempts = 0
 
         def failing_unlink(self, missing_ok=False):
-            raise PermissionError('in use')
+            nonlocal attempts
+            if self == artifact_path and attempts == 0:
+                attempts += 1
+                raise PermissionError('temporary filesystem failure')
+            return original_unlink(self, missing_ok=missing_ok)
 
         monkeypatch.setattr(Path, 'unlink', failing_unlink)
         assert store.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=10) == []
         assert (await store.artifact_record(artifact_id))['retention_state'] == 'deleted'
+        assert artifact_path.is_file()
+
+        # Reopening after the tombstone commit models a process exit before unlink.
+        store.close()
+        reopened = PushJobStore(tmp_path / 'jobs.sqlite3')
+        reopened_manager = PushJobManager(reopened)
+        assert (await reopened.artifact_record(artifact_id))['retention_state'] == 'deleted'
+        assert reopened_manager.gc_artifacts_sync(
+            tmp_path, retry_window_ms=0, timestamp=11
+        ) == [artifact_id]
+        assert not artifact_path.exists()
+        assert (await reopened.artifact_record(artifact_id))['retention_state'] == 'deleted'
+        assert reopened_manager.gc_artifacts_sync(
+            tmp_path, retry_window_ms=0, timestamp=12
+        ) == []
     finally:
         store.close()
+        if reopened is not None:
+            reopened.close()
 
 
 def _actions(**overrides):

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from styly_mdm.push_job_manager import PushJobManager
-from styly_mdm.push_job_store import PushJobStore
+from styly_mdm.push_job_store import PushJobStore, now_ms
 from styly_mdm.push_jobs import DeviceState, ProtocolMode, canonicalize_create_request
 from styly_mdm.push_scheduler import PushScheduler
 from test_push_cancellation import CAPS, runtime_for, timed_out_job
@@ -57,7 +57,7 @@ async def admin_action(runtime, admin, message_type, job_id, **fields):
 
 
 @pytest.mark.asyncio
-async def test_admin_timeout_cancel_sends_existing_resume_rejection_under_owner_lock(manager, tmp_path):
+async def test_admin_queued_cancel_requests_exact_reconcile_under_owner_lock(manager, tmp_path):
     original = await timed_out_job(manager)
     runtime, session, admin = operator_runtime(manager, tmp_path)
     original_send = session.ws.send_str
@@ -69,17 +69,57 @@ async def test_admin_timeout_cancel_sends_existing_resume_rejection_under_owner_
     session.ws.send_str = send_while_owned
     await admin_action(runtime, admin, "CANCEL_PUSH_JOB", original["job_id"])
     assert not session.owner_lock.locked()
-    assert len(session.ws.messages) == 1
-    rejection = session.ws.messages[0]
-    assert rejection["type"] == "PUSH_RESUME_REJECTED"
-    assert rejection["job_id"] == original["job_id"]
-    assert rejection["artifact_id"] == original["artifact"]["artifact_id"]
-    assert rejection["revision"] == original["devices"]["D1"]["dispatch_revision"]
+    assert session.ws.messages == [{
+        "type": "PUSH_RECONCILE_REQUEST",
+        "jobs": [{
+            "job_id": original["job_id"],
+            "attempt": 1,
+            "artifact_id": original["artifact"]["artifact_id"],
+        }],
+    }]
     current = await manager.get_snapshot(original["job_id"])
     assert current["devices"]["D1"]["cancel_requested"]
     await admin_action(runtime, admin, "PUSH_FILES", original["job_id"])
     assert await manager.claim_next(["D1"]) is None
     assert not any(item["type"] == "EXECUTE_PUSH_FILES" for item in session.ws.messages)
+
+
+@pytest.mark.asyncio
+async def test_queued_cancel_is_confirmed_by_absent_from_client_without_interrupted_work(
+    manager, tmp_path
+):
+    """A client that no longer holds the interrupted identity (for example after a
+    state reset) answers absent; the cancellation must settle while it stays online."""
+    original = await timed_out_job(manager)
+    runtime, session, admin = operator_runtime(manager, tmp_path)
+    await admin_action(runtime, admin, "CANCEL_PUSH_JOB", original["job_id"])
+    session.ws.messages.clear()
+    await runtime._handle_reconcile_report(session, "D1", {
+        "job_id": original["job_id"],
+        "attempt": 1,
+        "artifact_id": original["artifact"]["artifact_id"],
+        "status": "absent",
+    })
+    device = (await manager.get_snapshot(original["job_id"]))["devices"]["D1"]
+    assert device["state"] == "failed"
+    assert device["failure"]["code"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_queued_cancel_rejects_interrupted_work_still_held_by_client(manager, tmp_path):
+    original = await timed_out_job(manager)
+    runtime, session, admin = operator_runtime(manager, tmp_path)
+    await admin_action(runtime, admin, "CANCEL_PUSH_JOB", original["job_id"])
+    session.ws.messages.clear()
+    await runtime._handle_reconcile_report(session, "D1", {
+        "job_id": original["job_id"],
+        "attempt": 1,
+        "artifact_id": original["artifact"]["artifact_id"],
+        "revision": original["devices"]["D1"]["dispatch_revision"],
+        "status": "interrupted",
+    })
+    assert [message["type"] for message in session.ws.messages] == ["PUSH_RESUME_REJECTED"]
+    assert (await manager.get_snapshot(original["job_id"]))["devices"]["D1"]["cancel_requested"]
 
 
 @pytest.mark.asyncio
@@ -286,3 +326,29 @@ async def test_resume_all_keeps_offline_timeout_waiting(manager, tmp_path):
     assert current["devices"]["D2"]["queue_reason"] == "download_retry_exhausted"
     runtime.sessions["D2"] = runtime.sessions["D1"]
     assert await manager.claim_next(["D2"]) is None
+
+
+@pytest.mark.asyncio
+async def test_active_report_consumes_pending_resume_authorization(manager):
+    active = await downloading_job(manager.store, manager, CAPS)
+    job_id = active["job_id"]
+    await manager.mark_reconciling(job_id, "D1", expected={DeviceState.DOWNLOADING},
+                                   reason="device_disconnect", deadline=now_ms() + 60_000)
+    await manager.store._call(lambda conn: conn.execute(
+        "UPDATE push_job_devices SET queue_reason='resumable_replay' WHERE job_id=?", (job_id,)))
+    outcome, _ = await manager.reconcile_report(job_id, "D1", 1, "active", "downloading", None)
+    assert outcome == "active"
+    device = (await manager.get_snapshot(job_id))["devices"]["D1"]
+    # A later client_restarted interruption must not inherit the consumed Resume.
+    assert device["state"] == "downloading" and device["queue_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_is_deferred_while_push_state_is_unavailable(manager, tmp_path):
+    original = await timed_out_job(manager)
+    runtime, session, admin = operator_runtime(manager, tmp_path)
+    session.push_state_available = False
+    await admin_action(runtime, admin, "CANCEL_PUSH_JOB", original["job_id"])
+    # An empty, unloaded client state would answer absent, which is not evidence.
+    assert session.ws.messages == []
+    assert (await manager.get_snapshot(original["job_id"]))["devices"]["D1"]["cancel_requested"]

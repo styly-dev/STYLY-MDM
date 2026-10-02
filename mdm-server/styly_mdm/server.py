@@ -39,6 +39,22 @@ logging.basicConfig(
 )
 log = logging.getLogger("stylymdm")
 
+
+class _RedactPushLeaseFilter(logging.Filter):
+    """Keep Push artifact lease tokens out of the HTTP access log request line."""
+
+    _LEASE = re.compile(r"(lease=)[^&\s\"]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        redacted = self._LEASE.sub(r"\1REDACTED", message)
+        if redacted != message:
+            record.msg, record.args = redacted, None
+        return True
+
+
+logging.getLogger("aiohttp.access").addFilter(_RedactPushLeaseFilter())
+
 # Writable runtime data (uploaded APKs, device registry) lives under a
 # configurable data directory rather than next to this module. When installed as
 # a package (pip/uvx) the module directory is read-only site-packages, so writes

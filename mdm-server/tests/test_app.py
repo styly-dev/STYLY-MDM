@@ -173,3 +173,23 @@ def test_build_device_list_includes_online_and_offline_battery(tmp_path):
     assert rows["online-1"]["battery"] == {"level": 87, "charging": True, "last_seen": 101}
     assert rows["offline-1"]["status"] == "offline"
     assert rows["offline-1"]["battery"] == {"level": 18, "charging": False, "last_seen": 91}
+
+
+def test_access_log_redacts_push_lease_tokens():
+    import io
+    import logging
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    access = logging.getLogger("aiohttp.access")
+    previous_level = access.level
+    access.setLevel(logging.INFO)
+    access.addHandler(handler)
+    try:
+        access.info('%s "%s" %s', "10.0.0.2",
+                    "GET /artifacts/a?lease=secret-token_1&x=1 HTTP/1.1", 200)
+    finally:
+        access.removeHandler(handler)
+        access.setLevel(previous_level)
+    assert "secret-token_1" not in stream.getvalue()
+    assert "lease=REDACTED&x=1" in stream.getvalue()

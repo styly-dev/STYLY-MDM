@@ -1434,7 +1434,10 @@ async def test_exact_success_settles_even_when_applying_phase_was_lost(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_disconnect_transition_finishes_before_replacement_register(tmp_path):
+@pytest.mark.parametrize("disconnect_first", [False, True])
+async def test_replacement_register_preserves_healthy_download_in_either_order(
+    tmp_path, disconnect_first
+):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
@@ -1448,7 +1451,8 @@ async def test_disconnect_transition_finishes_before_replacement_register(tmp_pa
         runtime.registration_candidates = {}
         runtime.transfers = TransferRegistry()
         runtime.leases = PushTransferLeases()
-        runtime.leases.issue(TransferKey("push", "D1", job_id, 1), artifact_id)
+        key = TransferKey("push", "D1", job_id, 1)
+        lease = runtime.leases.issue(key, artifact_id)
         runtime.accept_reconciliation_timeout = 0.1
         runtime.reconciliation_timeout = 1
         runtime.scheduler = Scheduler()
@@ -1488,9 +1492,7 @@ async def test_disconnect_transition_finishes_before_replacement_register(tmp_pa
             return await original_active(device_id)
 
         manager.active_assignment_for_device = blocked_active
-        disconnect = asyncio.create_task(runtime.disconnect_device("D1", old))
-        await asyncio.wait_for(entered.wait(), timeout=1)
-        registration = asyncio.create_task(runtime.register_device(
+        registration_call = runtime.register_device(
             new,
             {
                 "device_id": "D1",
@@ -1504,9 +1506,17 @@ async def test_disconnect_transition_finishes_before_replacement_register(tmp_pa
                 }},
             },
             "http://server",
-        ))
+        )
+        if disconnect_first:
+            disconnect = asyncio.create_task(runtime.disconnect_device("D1", old))
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            registration = asyncio.create_task(registration_call)
+        else:
+            registration = asyncio.create_task(registration_call)
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            disconnect = asyncio.create_task(runtime.disconnect_device("D1", old))
         await asyncio.sleep(0)
-        assert not registration.done()
+        assert not registration.done() and not disconnect.done()
 
         release.set()
         await asyncio.gather(disconnect, registration)
@@ -1515,6 +1525,81 @@ async def test_disconnect_transition_finishes_before_replacement_register(tmp_pa
         assert runtime.sessions["D1"].ws is new
         assert current["state"] == DeviceState.DOWNLOADING.value
         assert published[-1]["devices"]["D1"]["state"] == DeviceState.DOWNLOADING.value
+        assert runtime.leases.token(key) == lease.token
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disconnect_first", [False, True])
+@pytest.mark.parametrize("queued", [False, True])
+async def test_replacement_register_withdraws_pending_resume(
+    tmp_path, disconnect_first, queued
+):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    capabilities = frozenset({"push_job_id_v1", "push_resume_v1"})
+    try:
+        active = await downloading_job(store, manager, capabilities)
+        job_id = active["job_id"]
+        await manager.mark_reconciling(
+            job_id, "D1", expected={DeviceState.DOWNLOADING},
+            reason="device_disconnect", deadline=now_ms() + 60_000,
+        )
+        if queued:
+            outcome, _ = await manager.resume_interrupted(
+                job_id, "D1", attempt=1,
+                artifact_id=active["artifact"]["artifact_id"],
+                dispatch_revision=active["devices"]["D1"]["dispatch_revision"],
+                validated_offset=1,
+            )
+            assert outcome == "requeued"
+        await manager.enable_dispatch(job_id)
+        assert (await manager.assignment(job_id, "D1"))["queue_reason"] == "resumable_replay"
+        runtime = object.__new__(PushRuntime)
+        runtime.manager = manager
+        runtime.sessions = {}
+        runtime.device_locks = {}
+        runtime.registration_candidates = {}
+        runtime.transfers = TransferRegistry()
+        runtime.leases = PushTransferLeases()
+        runtime.accept_reconciliation_timeout = 1
+        runtime.reconciliation_timeout = 60
+        runtime.scheduler = Scheduler()
+        runtime.send_timeout = 1
+        runtime.publish = lambda value: asyncio.sleep(0)
+        old, new = Ws(), Ws()
+        process_id = str(uuid.uuid4())
+        runtime.sessions["D1"] = LiveSession(
+            "D1", "old", old, capabilities, process_id,
+            runtime._device_lock("D1"), "http://server",
+        )
+        runtime.legacy = types.SimpleNamespace(devices={"D1": {"ws": new}})
+        runtime.note_registration_candidate(new, "D1")
+        if disconnect_first:
+            await runtime.disconnect_device("D1", old)
+        await runtime.register_device(new, {
+            "device_id": "D1", "process_instance_id": process_id,
+            "capabilities": list(capabilities),
+            "push_runtime": {"active": {
+                "job_id": job_id, "attempt": 1,
+                "artifact_id": active["artifact"]["artifact_id"],
+                "revision": active["devices"]["D1"]["dispatch_revision"],
+                "phase": "downloading", "status": "interrupted",
+                "validated_offset": 1,
+            }},
+        }, "http://server")
+        paused = await manager.get_snapshot(job_id)
+        assert paused["devices"]["D1"]["state"] == "queued"
+        assert paused["devices"]["D1"]["queue_reason"] == "device_offline"
+        assert paused["devices"]["D1"]["resume_required"] is True
+        assert await manager.claim_next(["D1"]) is None
+        # A late close from the superseded socket cannot change the new owner.
+        await runtime.disconnect_device("D1", old)
+        assert await manager.get_snapshot(job_id) == paused
+        assert runtime.sessions["D1"].ws is new
+        await manager.enable_dispatch(job_id)
+        assert await manager.claim_next(["D1"]) is not None
     finally:
         store.close()
 
