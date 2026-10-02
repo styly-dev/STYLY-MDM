@@ -553,7 +553,7 @@ class WebSocketManager internal constructor(
                         socket.send(text)
                     }
                 },
-                requestReregistration = { reregisterAfterPushStateRecovery(socket) },
+                requestRegistrationRefresh = { refreshRegistrationAfterPushStateChange(socket) },
             )
         }
         if (identity is DeviceIdentityState.Ready) {
@@ -572,16 +572,24 @@ class WebSocketManager internal constructor(
     }
 
     /**
-     * Durable Push/Sync state became available after [socket] registered it as
-     * unavailable. Close the socket normally so the existing reconnect path sends a
-     * fresh REGISTER. A socket that has not sent its REGISTER yet needs nothing: the
-     * registration fields it is about to send are computed after the recovery.
+     * Push/Sync availability changed after [socket] sent REGISTER. Send a fresh REGISTER
+     * on the same socket; the server refreshes Push state in place and answers REGISTERED
+     * with the same session. Closing the socket instead would make the server settle the
+     * device as offline. If REGISTER has not been sent yet, an already queued payload
+     * send runs before this Handler task, while a later registration snapshot reads the
+     * updated state on the coordinator actor.
      */
-    private fun reregisterAfterPushStateRecovery(socket: WebSocket) {
+    private fun refreshRegistrationAfterPushStateChange(socket: WebSocket) {
         reconnectHandler.post {
             if (webSocket !== socket || !registration.isSent(socket)) return@post
-            Log.i(TAG, "Re-registering after Push/Sync state recovery")
-            socket.close(1000, "push state recovered")
+            val identity = identityResolver.snapshot() as? DeviceIdentityState.Ready ?: return@post
+            pushCoordinator.registrationFields { pushFields ->
+                reconnectHandler.post {
+                    if (webSocket !== socket || !registration.isSent(socket)) return@post
+                    Log.i(TAG, "Refreshing registration after Push/Sync state change")
+                    sendRegistrationPayload(socket, identity, pushFields)
+                }
+            }
         }
     }
 

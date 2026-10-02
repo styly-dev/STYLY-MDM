@@ -45,6 +45,9 @@ class LiveSession:
     process_instance_id: str | None
     owner_lock: asyncio.Lock
     http_base: str
+    # False while the client reports unavailable durable Push state. Its answers
+    # would not be authoritative evidence, so no reconciliation is requested.
+    push_state_available: bool = True
 
 
 class PushScheduler:
@@ -611,6 +614,8 @@ class PushScheduler:
     ) -> bool:
         job_id = snapshot["job_id"]
         attempt = snapshot["devices"][device_id]["attempt"]
+        transfer_future = self.transfer_registry.get(key)
+        lease_token = self.leases.token(key) if self.leases is not None else None
         try:
             outcome, payload = await asyncio.wait_for(accept_future, self.accept_timeout)
         except asyncio.TimeoutError:
@@ -622,13 +627,48 @@ class PushScheduler:
                     expected_accept_deadline=accept_deadline,
                     reconciliation_deadline=deadline,
                 )
-                if changed:
-                    await self.publish(next_snapshot)
+            except StoreConflict:
+                # Disconnect can win the timeout race without ending the HTTP
+                # transfer. A late active report can also win after the ACK waiter
+                # times out. Retain only this exact HTTP owner; terminal,
+                # interrupted, cancelled, or subsequently replayed work must not
+                # inherit its slot or URL.
+                current = await self.manager.assignment(job_id, device_id)
+                return bool(
+                    current is not None
+                    and current["attempt"] == attempt
+                    and (
+                        (
+                            current["state"] == DeviceState.RECONCILING.value
+                            and current.get("reconciliation_reason") in {
+                                "disconnect_before_accept", "device_disconnect"
+                            }
+                        )
+                        or (
+                            current["state"] == DeviceState.DOWNLOADING.value
+                            and current.get("accepted_at") is not None
+                        )
+                    )
+                    # Disconnect clears accept_deadline; the exact waiter and
+                    # lease below remain the local dispatch ownership proof.
+                    and current.get("accept_deadline") in {None, accept_deadline}
+                    and current.get("cancel_requested_at") is None
+                    and transfer_future is not None
+                    and not transfer_future.done()
+                    and self.transfer_registry.get(key) is transfer_future
+                    and self.leases is not None
+                    and lease_token is not None
+                    and self.leases.token(key) == lease_token
+                )
+            if changed:
+                await self.publish(next_snapshot)
+            try:
                 await self.send_reconcile(session, next_snapshot, device_id)
-                # Keep the exact transfer slot while the short probe is unresolved.
-                return True
-            except (StoreConflict, ConnectionError, asyncio.TimeoutError):
-                return False
+            except (ConnectionError, asyncio.TimeoutError):
+                # Management connectivity is independent of HTTP progress. The
+                # transfer watchdog still releases a missing or stalled lease.
+                log.info("Could not probe Push acceptance for %s/%s", job_id, device_id)
+            return True
 
         if outcome == "accepted":
             try:
@@ -905,6 +945,13 @@ class PushScheduler:
         *,
         owner_lock_held: bool = False,
     ) -> None:
+        if not session.push_state_available:
+            # Registration or a Push-state refresh asks again once state is available.
+            log.info(
+                "Deferring Push reconciliation for %s: durable Push state is unavailable",
+                session.device_id,
+            )
+            return
         payload = {
             "type": "PUSH_RECONCILE_REQUEST",
             "jobs": [

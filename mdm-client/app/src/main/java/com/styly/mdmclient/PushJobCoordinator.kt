@@ -69,6 +69,38 @@ internal fun buildActivePushReconcileReport(
     }
 }
 
+/**
+ * Answers one reconcile identity from durable state. Returns null while [stateLoaded] is
+ * false: the empty in-memory state is not authoritative, so it is no evidence of absence.
+ */
+internal fun buildPushReconcileReply(
+    state: PushProtocol.State,
+    stateLoaded: Boolean,
+    identity: PushProtocol.ReconcileIdentity,
+    validatedOffset: (PushProtocol.Command) -> Long,
+): JSONObject? {
+    if (!stateLoaded) return null
+    fun matches(command: PushProtocol.Command): Boolean =
+        command.jobId == identity.jobId &&
+            command.attempt == identity.attempt &&
+            (identity.artifactId == null ||
+                command.artifactId == identity.artifactId)
+
+    val active = state.active
+    if (active != null && matches(active.command)) {
+        return buildActivePushReconcileReport(identity, active, validatedOffset(active.command))
+    }
+    val settled = findPushReconcileReceipt(state) { matches(it) }
+    if (settled != null) return settled.result.toJson()
+    return JSONObject().apply {
+        put("type", "PUSH_RECONCILE_REPORT")
+        put("job_id", identity.jobId)
+        put("attempt", identity.attempt)
+        if (identity.artifactId != null) put("artifact_id", identity.artifactId)
+        put("status", "absent")
+    }
+}
+
 internal fun applyPushResumeRejectionToState(
     current: PushProtocol.State,
     jobId: String,
@@ -235,6 +267,19 @@ internal class PushStateResetNoticeTracker {
 
 internal enum class PushStateRecoveryAction { Reload, SaveUnsavedTerminal, ResaveCurrent }
 
+/** Tracks the server-visible durability status and refreshes registration once per change. */
+internal class PushStateAvailability(initiallyAvailable: Boolean = false) {
+    @Volatile
+    var available: Boolean = initiallyAvailable
+        private set
+
+    fun update(nextAvailable: Boolean, onChanged: () -> Unit) {
+        if (available == nextAvailable) return
+        available = nextAvailable
+        onChanged()
+    }
+}
+
 /**
  * Chooses what an automatic durable-state retry does. Before durable state was ever
  * adopted the in-memory state is not authoritative, so only a reload is safe. Afterwards
@@ -327,18 +372,17 @@ class PushJobCoordinator(
     private val processInstanceId = UUID.randomUUID().toString()
 
     private var state: PushProtocol.State = store.emptyState()
-    @Volatile
-    private var durabilityAvailable = false
+    private val pushStateAvailability = PushStateAvailability()
+    private val durabilityAvailable: Boolean
+        get() = pushStateAvailability.available
     /** True once durable state was loaded (or reset) and adopted; until then [state] is not authoritative. */
     private var stateLoaded = false
     private val recoveryBudget = PushStateRecoveryBudget(recoveryMaxAttempts)
     private val resetNotices = PushStateResetNoticeTracker()
     private var transportToken: Any? = null
     private var transportSend: ((JSONObject) -> Unit)? = null
-    private var transportReregister: (() -> Unit)? = null
+    private var transportRegistrationRefresh: (() -> Unit)? = null
     private var transportRegistered = false
-    /** The command whose worker execution has not reported its terminal outcome yet. */
-    private var runningWorker: PushProtocol.Command? = null
     /** A worker's terminal outcome whose durable save failed; saved by automatic recovery. */
     private var unsavedTerminal: Pair<PushProtocol.Command, PushFilesWorker.Execution>? = null
 
@@ -349,19 +393,19 @@ class PushJobCoordinator(
     }
 
     /**
-     * Attaches the transport that receives Push/Sync messages. [requestReregistration]
-     * asks that transport to register again, so the server learns about a durable state
-     * that became available after its registration was sent.
+     * Attaches the transport that receives Push/Sync messages. [requestRegistrationRefresh]
+     * asks that transport to refresh the registration after durable-state availability
+     * changes, so the server can stop or resume Push dispatch promptly.
      */
     fun attachTransport(
         token: Any,
         send: (JSONObject) -> Unit,
-        requestReregistration: () -> Unit,
+        requestRegistrationRefresh: () -> Unit,
     ) {
         actor.execute {
             transportToken = token
             transportSend = send
-            transportReregister = requestReregistration
+            transportRegistrationRefresh = requestRegistrationRefresh
             transportRegistered = false
         }
     }
@@ -371,7 +415,7 @@ class PushJobCoordinator(
             if (transportToken === token) {
                 transportToken = null
                 transportSend = null
-                transportReregister = null
+                transportRegistrationRefresh = null
                 transportRegistered = false
             }
         }
@@ -383,6 +427,11 @@ class PushJobCoordinator(
         }
     }
 
+    /**
+     * Runs for every REGISTERED on [token], including the reply to a registration refresh
+     * on the same socket. Replaying the durable outbox again is safe: results are ACKed
+     * idempotently by job identity.
+     */
     fun onRegistered(token: Any) {
         actor.execute {
             if (transportToken === token) {
@@ -484,9 +533,8 @@ class PushJobCoordinator(
         }
         if (recovered) {
             recoveryBudget.onRecovered()
-            durabilityAvailable = true
-            Log.i(TAG, "Durable Push/Sync state recovered; registering again")
-            requestReregistration()
+            setDurabilityAvailable(true)
+            Log.i(TAG, "Durable Push/Sync state recovered")
         } else if (recoveryBudget.onAttemptFailed()) {
             scheduleRecoveryAttempt()
         } else {
@@ -498,13 +546,17 @@ class PushJobCoordinator(
         }
     }
 
-    /** The current registration advertised unavailable state; let the transport register again. */
-    private fun requestReregistration() {
+    /** Refreshes server-visible Push availability if the current WebSocket has sent REGISTER. */
+    private fun requestRegistrationRefresh() {
         try {
-            transportReregister?.invoke()
+            transportRegistrationRefresh?.invoke()
         } catch (error: Throwable) {
-            Log.w(TAG, "Could not request Push/Sync re-registration", error)
+            Log.w(TAG, "Could not request Push/Sync registration refresh", error)
         }
+    }
+
+    private fun setDurabilityAvailable(available: Boolean) {
+        pushStateAvailability.update(available, ::requestRegistrationRefresh)
     }
 
     private fun handleCommand(payload: JSONObject) {
@@ -584,7 +636,6 @@ class PushJobCoordinator(
             return
         }
         if (command.isJobV1) sendAccepted(command, PushProtocol.PHASE_DOWNLOADING)
-        runningWorker = command
         workerExecutor.execute {
             val execution = worker.execute(
                 command,
@@ -784,7 +835,6 @@ class PushJobCoordinator(
         command: PushProtocol.Command,
         execution: PushFilesWorker.Execution,
     ) {
-        if (runningWorker?.identity == command.identity) runningWorker = null
         unsavedTerminal = null
         if (!isCurrent(command)) {
             cleanupExecution(execution)
@@ -894,33 +944,12 @@ class PushJobCoordinator(
                 Log.w(TAG, "Ignoring malformed Push reconcile identity: ${error.message}")
                 continue
             }
-            fun matches(command: PushProtocol.Command): Boolean =
-                command.jobId == identity.jobId &&
-                    command.attempt == identity.attempt &&
-                    (identity.artifactId == null ||
-                        command.artifactId == identity.artifactId)
-
-            val active = state.active
-            if (active != null && matches(active.command)) {
-                send(buildActivePushReconcileReport(
-                    identity,
-                    active,
-                    validatedOffset(active.command),
-                ))
+            val reply = buildPushReconcileReply(state, stateLoaded, identity, ::validatedOffset)
+            if (reply == null) {
+                Log.w(TAG, "Ignoring Push reconcile request for ${identity.jobId} until durable state is loaded")
                 continue
             }
-            val settled = findPushReconcileReceipt(state) { matches(it) }
-            if (settled != null) {
-                send(settled.result.toJson())
-                continue
-            }
-            send(JSONObject().apply {
-                put("type", "PUSH_RECONCILE_REPORT")
-                put("job_id", identity.jobId)
-                put("attempt", identity.attempt)
-                if (identity.artifactId != null) put("artifact_id", identity.artifactId)
-                put("status", "absent")
-            })
+            send(reply)
         }
     }
 
@@ -1045,12 +1074,12 @@ class PushJobCoordinator(
             state = saved
         }
         if (!persisted) {
-            durabilityAvailable = false
+            setDurabilityAvailable(false)
             beginRecovery()
         } else if (recoveryBudget.phase == PushStateRecoveryBudget.Phase.Healthy) {
             // While an incident is open (or exhausted), only a recovery attempt makes
             // state available again, so the server is told through a re-registration.
-            durabilityAvailable = true
+            setDurabilityAvailable(true)
         }
         return persisted
     }

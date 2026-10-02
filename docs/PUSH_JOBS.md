@@ -33,8 +33,9 @@ strong ETag. Garbage collection leaves a tombstone row, so neither an artifact
 ID nor its `/artifacts/{artifact_id}` URL can be reused after its bytes expire.
 It commits the tombstone first and removes the file afterwards, outside the
 single database worker, so deleting a multi-gigabyte artifact never blocks other
-Push state transitions. A failed removal is logged; the tombstoned bytes are no
-longer served or retried.
+Push state transitions. A failed removal is logged; later GC runs, including
+after server restart, retry removal of remaining tombstoned files. Their bytes
+remain unavailable for download or job Retry throughout cleanup.
 
 Job-v1 commands carry an immutable per-device `revision`, `artifact_id`, absolute
 URL, exact size, SHA-256, and ETag. The aggregate job revision may continue to
@@ -98,9 +99,13 @@ Response handling is fail-closed:
 - `404` and `410` are explicit artifact-unavailable failures;
 - `409` with `X-Push-Lease-Status: revoked` ends this attempt as interrupted,
   preserving the validated partial for manual Resume;
+- any other status fails a fresh download with `download_failed`; on a resume it
+  says nothing about the stored bytes, so the attempt ends as interrupted
+  (`download_retry_exhausted`) and keeps the validated partial for manual Resume;
 - transient I/O, `408`, `429`, and 5xx failures keep validated partial bytes and
   retry with bounded 1/2/4/8-second backoff while the 60-second no-progress
-  window remains open. Only received artifact bytes reset this monotonic deadline;
+  window remains open. A retry that received artifact bytes starts the backoff over.
+  Only received artifact bytes reset this monotonic deadline;
   connection establishment and response headers do not. Blocked HTTP operations
   are cancelled when the window expires. Management WebSocket loss alone does not
   stop a download that is still making progress. Local file write or sync failures
@@ -219,9 +224,11 @@ Resume before receiving a new token.
   An online active worker is not directly cancellable. Pending cancellation disappears from Needs attention because no
   further operator action is needed, but remains visible in Devices. Ownership and
   fences remain until exact absence or a terminal result confirms release; the next
-  job for that device cannot start earlier. When the client reports interrupted work,
-  the server sends the existing `PUSH_RESUME_REJECTED` with exact identity to discard
-  it. Reconnection never authorizes a cancelled assignment. Already-applied files
+  job for that device cannot start earlier. For an online device, Cancel sends an
+  exact `PUSH_RECONCILE_REQUEST` whatever the assignment state: a client that no
+  longer holds the identity answers `absent`, which confirms the cancellation at
+  once. When the client reports interrupted work, the server sends the existing
+  `PUSH_RESUME_REJECTED` with exact identity to discard it. Reconnection never authorizes a cancelled assignment. Already-applied files
   are not rolled back. Work already received and validating on an offline device
   may finish before cancellation is observed. Individual **Cancel** and **Cancel all**
   ask for confirmation; the latter shows the number of affected devices. Only
@@ -229,12 +236,19 @@ Resume before receiving a new token.
   exposes this as `resume_supported`.
 - Each snapshot assignment carries server-computed action flags from
   `push_jobs.assignment_actions`: `manual_wait` (a per-device wait for Resume),
-  `resume_required`, and `cancellable` (the same rule `CANCEL_PUSH_JOB` enforces).
+  `resume_required`, `cancellable` (the same rule `CANCEL_PUSH_JOB` enforces), and
+  `retryable` (the rule `RETRY_FAILED_PUSH_JOB` enforces before its online check).
   The console only combines them with live connectivity: Resume needs an online
   device, and a reconciling assignment is cancellable only while its device is
-  offline. Targets already moved to a retry job expose no actions.
+  offline. Targets already moved to a retry job expose no Resume/Cancel actions;
+  a remaining device fence still exposes Reconcile in the job controls.
 - **Retry failed devices** creates and dispatches a new job for online `failed`,
   `interrupted`, and `unconfirmed` targets, excluding `failure_code: cancelled`.
+  A target is also excluded when a later job for the same device and destination
+  was dispatched or is still pending: retrying the older artifact would overwrite
+  newer content (and, for Sync, delete it). Online means a live session that
+  advertises the Push job capabilities with available Push state; a target that
+  disconnects before the retry job is enabled is settled like any offline target.
   It reuses the immutable artifact without upload and leaves success records and
   device fences intact. Offline targets are skipped and stay eligible for a later
   Retry; the request fails when no eligible target is online. Fenced targets wait
@@ -242,7 +256,9 @@ Resume before receiving a new token.
   a new upload. The request UUID makes replay idempotent. Shared artifact retention
   is measured from the latest referencing terminal job, with active leases preserved.
   A target already included in a retry job is excluded from the original job's
-  attention and retry actions. History remains; any new failure belongs to the retry job.
+  retry actions. An unconfirmed target with a remaining fence stays in Needs
+  attention with Reconcile until canonical evidence clears that fence. The device
+  then shows its queued retry job. History remains; any new failure belongs to the retry job.
 - Offline task cells show **Job pending · offline** or **Resume required**,
   rather than claiming active pushing. Reconciliation
   shows **Awaiting status confirmation**, with **offline** appended when disconnected;
@@ -312,16 +328,24 @@ there is no operator retry command.
   retained partial. A result that was never delivered is reported the same way.
 - **Read I/O error at load, or save failure while running** (for example, full
   storage): the client stays unavailable, advertises no Push capabilities, and rejects
-  new work with `client_persistence_unavailable`. It retries every 60 seconds, at most
+  new work with `client_persistence_unavailable`. A runtime transition from available
+  to unavailable refreshes registration once so the server and console see the
+  failure. A refresh is a REGISTER repeated on the same socket: the server updates
+  the live session's capabilities and Push state in place and answers `REGISTERED`
+  with the same `session_id`. Closing the socket instead would settle the device's
+  queued work as offline. Repeated failures while unavailable do not trigger reconnect loops.
+  It retries every 60 seconds, at most
   five times per incident. A retry after a save failure re-saves the in-memory state,
   including a finished worker outcome that could not be saved, and never reloads disk.
-  On success the client reconnects once, so a fresh REGISTER reports the recovered
-  state. After five failures it stops until the next app start, which loads again and
+  On success the client refreshes its registration on the same socket, so the
+  server sees the recovered state, pending cancellations, and runtime report. After five failures it stops until the next app start, which loads again and
   gets five new attempts. The console shows **Push state unavailable** with the remedy:
   free device storage, then use **Reboot**.
 
 An unavailable registration is never authoritative absence evidence: the server keeps
-canonical reconciliation and fences untouched until the client reports available state.
+canonical reconciliation and fences untouched, and sends no `PUSH_RECONCILE_REQUEST`,
+until the client reports available state. A client that has not loaded its durable
+state ignores reconciliation requests instead of answering `absent`.
 Job creation for such a target fails with an explanation instead of a capability
 error.
 
@@ -350,7 +374,21 @@ The exact transfer waiter is registered before `waiting_transfer -> dispatching`
 
 Job-v1 messages from a device are also checked and settled under that owner lock. Disconnect removes the old owner and commits its canonical queue/reconciliation transition before a replacement REGISTER may acquire ownership, but it does not release an active Push transfer slot because the Android HTTP worker outlives the WebSocket. An exact active `downloading` report preserves ownership of an in-process live HTTP lease and also satisfies a still-live acceptance waiter. After a server restart, no HTTP token or active stream is recovered; the old URL is rejected and the client must report interrupted work before manual Resume can issue a fresh token and slot. The server maps `server_lease_revoked` to the existing per-device `download_retry_exhausted` Resume gate. Once a replacement REGISTER owns the device, the superseded socket cannot settle an ACK, phase, transfer completion, result, or reconciliation report. Committed admin snapshots are queued for publication and sent after this correctness path returns; browser backpressure is not part of device ownership.
 
-Artifact URLs in device commands are absolute HTTP(S) URLs derived from the accepted device connection's server authority and include a per-assignment `lease` query token. The canonical snapshot retains the relative `/artifacts/{artifact_id}` route for console/API use; it is not a downloadable job-v1 URL without an active lease.
+A failed acceptance probe on the management WebSocket does not stop independent
+HTTP progress. If disconnect or an exact late active report wins the acceptance
+timeout race, the scheduler preserves only the same live transfer waiter and lease
+in a compatible reconciliation/downloading state. Its HTTP no-progress watchdog
+still bounds the transfer; cancellation, terminal states, manual waits, and
+replacement ownership cannot inherit that continuation.
+For resumed commands, the earlier `accepted_at` remains historical evidence;
+the current dispatch state and exact `accept_deadline` govern the new acceptance wait.
+
+If a replacement REGISTER arrives before the old socket's disconnect callback,
+it applies the same offline queue settlement under the device owner lock before
+adopting the new report. Pending Resume authorization is withdrawn in either
+order, while an accepted worker's healthy HTTP transfer retains its lease.
+
+Artifact URLs in device commands are absolute HTTP(S) URLs derived from the accepted device connection's server authority and include a per-assignment `lease` query token. The canonical snapshot retains the relative `/artifacts/{artifact_id}` route for console/API use; it is not a downloadable job-v1 URL without an active lease. The server redacts the `lease` value from the HTTP access log, and it serves an artifact only when the stored file still has its recorded byte size (otherwise `404`).
 
 ## Restart and reconciliation
 

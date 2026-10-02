@@ -17,15 +17,20 @@ internal sealed class PushStateLoadResult {
     data class Corrupt(val error: Exception) : PushStateLoadResult()
 }
 
+/**
+ * [fileExists] tells a missing file apart from one that exists but cannot be opened:
+ * EACCES and EMFILE also surface as [FileNotFoundException].
+ */
 internal fun loadPushState(
     readText: () -> String,
     normalize: (PushProtocol.State) -> PushProtocol.State,
+    fileExists: () -> Boolean,
 ): PushStateLoadResult = try {
     PushStateLoadResult.Valid(
         normalize(PushProtocol.stateFromJsonStrict(JSONObject(readText()))),
     )
-} catch (_: FileNotFoundException) {
-    PushStateLoadResult.Missing
+} catch (error: FileNotFoundException) {
+    if (fileExists()) PushStateLoadResult.Unreadable(error) else PushStateLoadResult.Missing
 } catch (error: IOException) {
     PushStateLoadResult.Unreadable(error)
 } catch (error: Exception) {
@@ -64,6 +69,10 @@ class PushJobStore(
             atomicFile.openRead().bufferedReader(Charsets.UTF_8).use { it.readText() }
         },
         normalize = ::trim,
+        fileExists = {
+            // AtomicFile restores a legacy ".bak" backup on read; either file is state.
+            atomicFile.baseFile.exists() || File(atomicFile.baseFile.path + ".bak").exists()
+        },
     )
 
     /** Deletes the durable state file and its backup. */

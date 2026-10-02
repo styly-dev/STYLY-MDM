@@ -553,6 +553,11 @@ class PushFilesWorker internal constructor(
         val digest = digestFactory(partial)
         PushDownloadDeadline(monotonicMillis, noProgressTimeoutMs).use { deadline ->
             var retryIndex = 0
+            var receivedSinceRetry = false
+            val trackProgress: (Long) -> Unit = { received ->
+                receivedSinceRetry = true
+                onProgress(received)
+            }
             while (true) {
                 deadline.remaining()
                 try {
@@ -560,9 +565,11 @@ class PushFilesWorker internal constructor(
                         ?: throw PushWorkerException("artifact_identity_mismatch", "resumable metadata is missing")
                     val offset = partial.takeIf { it.isFile }?.length() ?: 0L
                     if (offset > expectedSize) throw PushWorkerException("artifact_identity_mismatch", "partial exceeds expected size")
-                    downloadOnce(command, work, metadata, offset, onProgress, deadline, digest)
+                    downloadOnce(command, work, metadata, offset, trackProgress, deadline, digest)
                     if (partial.length() == expectedSize) break
                     throw PushWorkerException("download_failed", "artifact response ended before declared size", retryable = true)
+                } catch (stop: PushTransferInterrupted) {
+                    throw stop.failure
                 } catch (error: PushWorkerException) {
                     if (!error.retryable) {
                         if (error.code != "artifact_unavailable" && error.code != PUSH_LEASE_REVOKED &&
@@ -575,6 +582,10 @@ class PushFilesWorker internal constructor(
                 } catch (_: IOException) {
                     // Keep the exact partial and retry only within the remaining idle window.
                 }
+                // Back off across consecutive failures only; a retry that received
+                // artifact bytes starts the backoff over.
+                if (receivedSinceRetry) retryIndex = 0
+                receivedSinceRetry = false
                 val delay = retryDelayMillis(retryIndex).coerceAtMost(deadline.remaining())
                 retryIndex = (retryIndex + 1).coerceAtMost(3)
                 retryDelay(delay)
@@ -627,7 +638,10 @@ class PushFilesWorker internal constructor(
         val request = Request.Builder().url(command.artifactUrl).header("Accept-Encoding", "identity")
         if (offset > 0L) {
             request.header("Range", "bytes=$offset-")
-            request.header("If-Match", requireNotNull(etag))
+            request.header(
+                "If-Match",
+                etag ?: throw PushWorkerException("artifact_identity_mismatch", "cannot resume without a stored strong ETag"),
+            )
         } else {
             (etag ?: command.artifactEtag)?.let { request.header("If-Match", it) }
         }
@@ -724,6 +738,18 @@ class PushFilesWorker internal constructor(
             if (status == 408 || status == 429 || status >= 500) {
                 throw PushWorkerException("download_failed", "artifact download returned HTTP $status", retryable = true)
             }
+            val handledStatuses = if (offset == 0L) {
+                setOf(HttpURLConnection.HTTP_OK)
+            } else {
+                setOf(HttpURLConnection.HTTP_PARTIAL, HttpURLConnection.HTTP_OK, 416)
+            }
+            if (status !in handledStatuses) {
+                val failure = "artifact download returned unexpected HTTP $status"
+                if (offset == 0L) throw PushWorkerException("download_failed", failure)
+                // The status says nothing about the stored bytes: keep the validated
+                // partial and end this attempt as interrupted for manual Resume.
+                throw PushTransferInterrupted(PushWorkerException("download_failed", failure, retryable = true))
+            }
             val contentEncoding = connection.header("Content-Encoding")
                 ?.trim()
                 ?.takeIf { it.isNotEmpty() }
@@ -735,9 +761,6 @@ class PushFilesWorker internal constructor(
             }
 
             if (offset == 0L) {
-                if (status != HttpURLConnection.HTTP_OK) {
-                    throw PushWorkerException("artifact_identity_mismatch", "initial artifact response must be HTTP 200")
-                }
                 validateResponseEtag(responseEtag, metadata.artifactEtag ?: command.artifactEtag)
                 val etag = requireNotNull(responseEtag)
                 writeMetadata(metadata.copy(artifactEtag = etag, updatedAt = System.currentTimeMillis()), work)
@@ -775,7 +798,6 @@ class PushFilesWorker internal constructor(
                     }
                     return
                 }
-                else -> throw PushWorkerException("download_failed", "artifact download returned HTTP $status")
             }
         } finally {
             deadline.attach(null)
@@ -1037,6 +1059,12 @@ class PushFilesWorker internal constructor(
         }
     }
 }
+
+/**
+ * Ends the job-v1 transfer loop without another retry. The wrapped retryable
+ * `download_failed` [failure] becomes an interrupted attempt that keeps the partial.
+ */
+private class PushTransferInterrupted(val failure: PushWorkerException) : Exception(failure.message, failure)
 
 class PushWorkerException(
     val code: String,
