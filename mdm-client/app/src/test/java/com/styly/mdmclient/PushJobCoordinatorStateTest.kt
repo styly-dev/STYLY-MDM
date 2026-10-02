@@ -24,16 +24,94 @@ class PushJobCoordinatorStateTest {
     }
 
     @Test
-    fun `retry is busy only while a worker runs and saves an unsaved terminal before reloading`() {
-        assertEquals(PushStateRetryAction.Busy, decidePushStateRetry(workerRunning = true, hasUnsavedTerminal = false))
-        assertEquals(PushStateRetryAction.Busy, decidePushStateRetry(workerRunning = true, hasUnsavedTerminal = true))
-        // A finished worker whose outcome was not saved must not stay busy, and must
-        // not be reloaded from disk where recovery would make it resumable again.
+    fun `recovery reloads only before state was adopted and saves an unsaved terminal as is`() {
         assertEquals(
-            PushStateRetryAction.SaveUnsavedTerminal,
-            decidePushStateRetry(workerRunning = false, hasUnsavedTerminal = true),
+            PushStateRecoveryAction.Reload,
+            decidePushStateRecovery(stateLoaded = false, hasUnsavedTerminal = false),
         )
-        assertEquals(PushStateRetryAction.Reload, decidePushStateRetry(workerRunning = false, hasUnsavedTerminal = false))
+        // A finished worker whose outcome was not saved must be saved from memory, never
+        // reloaded from disk where recovery would make it resumable again.
+        assertEquals(
+            PushStateRecoveryAction.SaveUnsavedTerminal,
+            decidePushStateRecovery(stateLoaded = true, hasUnsavedTerminal = true),
+        )
+        // Once adopted, the in-memory state equals the last successful save; a retry only
+        // re-saves it (also while a worker runs) and never reloads the file.
+        assertEquals(
+            PushStateRecoveryAction.ResaveCurrent,
+            decidePushStateRecovery(stateLoaded = true, hasUnsavedTerminal = false),
+        )
+    }
+
+    @Test
+    fun `recovery budget allows a bounded number of attempts per incident`() {
+        val budget = PushStateRecoveryBudget(maxAttempts = 5)
+        assertEquals(PushStateRecoveryBudget.Phase.Healthy, budget.phase)
+
+        assertTrue(budget.onFailure())
+        assertEquals(PushStateRecoveryBudget.Phase.Recovering, budget.phase)
+        // Further failures during an open incident do not schedule a second timer.
+        assertFalse(budget.onFailure())
+        repeat(4) { assertTrue(budget.onAttemptFailed()) }
+        assertFalse(budget.onAttemptFailed())
+        assertEquals(PushStateRecoveryBudget.Phase.Exhausted, budget.phase)
+        assertEquals(5, budget.attemptsUsed)
+    }
+
+    @Test
+    fun `exhausted recovery budget never starts a new incident in this process`() {
+        val budget = PushStateRecoveryBudget(maxAttempts = 1)
+        assertTrue(budget.onFailure())
+        assertFalse(budget.onAttemptFailed())
+
+        assertFalse(budget.onFailure())
+        assertEquals(PushStateRecoveryBudget.Phase.Exhausted, budget.phase)
+    }
+
+    @Test
+    fun `successful recovery lets a later failure start a fresh incident`() {
+        val budget = PushStateRecoveryBudget(maxAttempts = 5)
+        assertTrue(budget.onFailure())
+        repeat(4) { assertTrue(budget.onAttemptFailed()) }
+        budget.onRecovered()
+        assertEquals(PushStateRecoveryBudget.Phase.Healthy, budget.phase)
+        assertEquals(0, budget.attemptsUsed)
+
+        assertTrue(budget.onFailure())
+        repeat(4) { assertTrue(budget.onAttemptFailed()) }
+        assertFalse(budget.onAttemptFailed())
+    }
+
+    @Test
+    fun `reset notice detail is a trimmed single line of bounded length`() {
+        val notice = PushStateResetNotice.corruptStateDiscarded(
+            IllegalArgumentException("  malformed\r\n durable\tstate " + "x".repeat(400)),
+        )
+        assertEquals(PushStateResetNotice.REASON_CORRUPT_STATE_DISCARDED, notice.reason)
+        assertTrue(notice.detail.startsWith("malformed durable state x"))
+        assertEquals(256, notice.detail.length)
+        assertFalse(notice.detail.contains('\n'))
+
+        val unnamed = PushStateResetNotice.corruptStateDiscarded(IllegalStateException())
+        assertEquals(IllegalStateException::class.java.name, unnamed.detail)
+    }
+
+    @Test
+    fun `reset notice stays until the registration that carried it is acknowledged`() {
+        val tracker = PushStateResetNoticeTracker()
+        val notice = PushStateResetNotice(PushStateResetNotice.REASON_CORRUPT_STATE_DISCARDED, "bad json")
+        val first = Any()
+        val second = Any()
+        tracker.record(notice)
+
+        assertEquals(notice, tracker.forRegistration(first))
+        // An acknowledgement on a transport that did not carry it keeps the notice.
+        tracker.onRegistered(second)
+        assertEquals(notice, tracker.forRegistration(second))
+        tracker.onRegistered(first)
+        assertEquals(notice, tracker.forRegistration(second))
+        tracker.onRegistered(second)
+        assertEquals(null, tracker.forRegistration(first))
     }
 
     private fun command() = PushProtocol.Command(
@@ -350,19 +428,45 @@ class PushJobCoordinatorStateTest {
     }
 
     @Test
-    fun `unavailable registration advertises only explicit Push state retry`() {
+    fun `unavailable registration advertises no Push capabilities`() {
         val fields = buildPushRegistrationFields(
             PushProtocol.State(null, emptyList(), emptyList()),
             durabilityAvailable = false,
             processInstanceId = UUID.randomUUID().toString(),
+            resetNotice = PushStateResetNotice(PushStateResetNotice.REASON_CORRUPT_STATE_DISCARDED, "bad"),
             validatedOffset = { 0L },
         )
-        val capabilities = fields.getJSONArray("capabilities")
+        val pushState = fields.getJSONObject("push_state")
 
-        assertEquals(1, capabilities.length())
-        assertEquals(PushProtocol.CAP_PUSH_STATE_RETRY_V1, capabilities.getString(0))
-        assertEquals("unavailable", fields.getJSONObject("push_state").getString("status"))
+        assertEquals(0, fields.getJSONArray("capabilities").length())
+        assertEquals("unavailable", pushState.getString("status"))
+        assertFalse(pushState.has("reset"))
         assertTrue(fields.getJSONObject("push_runtime").isNull("active"))
+    }
+
+    @Test
+    fun `available registration carries a reset notice only when one is pending`() {
+        val notice = PushStateResetNotice(PushStateResetNotice.REASON_CORRUPT_STATE_DISCARDED, "bad json")
+        val withNotice = buildPushRegistrationFields(
+            PushProtocol.State(null, emptyList(), emptyList()),
+            durabilityAvailable = true,
+            processInstanceId = UUID.randomUUID().toString(),
+            resetNotice = notice,
+            validatedOffset = { 0L },
+        ).getJSONObject("push_state")
+        val reset = withNotice.getJSONObject("reset")
+
+        assertEquals("available", withNotice.getString("status"))
+        assertEquals("corrupt_state_discarded", reset.getString("reason"))
+        assertEquals("bad json", reset.getString("detail"))
+
+        val withoutNotice = buildPushRegistrationFields(
+            PushProtocol.State(null, emptyList(), emptyList()),
+            durabilityAvailable = true,
+            processInstanceId = UUID.randomUUID().toString(),
+            validatedOffset = { 0L },
+        ).getJSONObject("push_state")
+        assertFalse(withoutNotice.has("reset"))
     }
 
     @Test
@@ -383,7 +487,10 @@ class PushJobCoordinatorStateTest {
         val capabilities = fields.getJSONArray("capabilities")
         val active = fields.getJSONObject("push_runtime").getJSONObject("active")
 
-        assertEquals(3, capabilities.length())
+        assertEquals(
+            listOf(PushProtocol.CAP_PUSH_JOB_ID_V1, PushProtocol.CAP_PUSH_RESUME_V1),
+            (0 until capabilities.length()).map(capabilities::getString),
+        )
         assertEquals("available", fields.getJSONObject("push_state").getString("status"))
         assertEquals("interrupted", active.getString("status"))
         assertEquals(12L, active.getLong("validated_offset"))

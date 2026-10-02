@@ -153,7 +153,6 @@
     .attention-tab-job-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); }
     .attention-tab-job-buttons { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
     .attention-tab-job-buttons .push-job-action { min-height: 26px; padding: 3px 8px; font-size: 11px; }
-    .attention-push-state-actions { display: flex; justify-content: flex-end; margin: 12px 20px 0; }
 
     .targets-body { padding: 0; flex: 1 1 0; min-height: 0; overflow-y: auto; }
 
@@ -188,8 +187,6 @@
        body so a background DEVICE_LIST re-render (battery/heartbeat ticks) can't destroy
        the input mid-keystroke. */
     .dev-toolbar { display: flex; gap: 8px; padding: 10px 20px 4px; flex: 0 0 auto; }
-    .push-state-retry-all { white-space: nowrap; color: var(--warning); border-color: #665321; }
-    .push-state-retry-all:hover { color: var(--warning); border-color: var(--warning); background: rgba(251, 191, 36, .08); }
     .dev-search-input { flex: 1 1 auto; min-width: 0; padding: 8px 11px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 7px; color: var(--text-primary); font-size: 13px; font-family: inherit; }
     .dev-search-input:focus { outline: none; border-color: var(--accent); }
     /* Sort lives on the Device column header (spreadsheet-style): click to toggle
@@ -239,8 +236,7 @@
     .push-state-warning { display: flex; align-items: center; flex-wrap: wrap; min-width: 0; gap: 4px 7px; color: var(--warning); line-height: 1.3; }
     .push-state-warning-icon { flex: 0 0 auto; font-size: 11px; }
     .push-state-warning-label { min-width: 0; overflow-wrap: anywhere; }
-    .btn-push-state-retry { flex: 0 0 auto; font: 600 11px/1 inherit; color: var(--warning); background: transparent; border: 1px solid #665321; border-radius: 4px; padding: 3px 8px; cursor: pointer; white-space: nowrap; }
-    .btn-push-state-retry:hover { border-color: var(--warning); background: rgba(251, 191, 36, .08); }
+    .push-state-warning-hint { color: var(--text-secondary); font-size: 11px; }
     .dev-sub { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .dev-status { font-size: 13px; }
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 6px; vertical-align: middle; }
@@ -462,9 +458,6 @@
             <div class="subtabs-fill"></div>
           </div>
           <div class="attention-tab-actions" id="pushJobsTabActions" style="display:none"></div>
-          <div class="attention-push-state-actions" id="pushStateTabActions" style="display:none">
-            <button class="manage-btn push-state-retry-all" id="btnRetryAllPushStates" title="Retry durable Push state on every affected online device. This does not start a transfer.">↻ Retry affected</button>
-          </div>
           <div class="dev-toolbar" id="devToolbar" style="display:none">
             <input class="dev-search-input" id="devSearch" data-dev-search maxlength="64" placeholder="⌕ Filter devices by name…">
             <div class="seg" id="devStatusFilter" role="group" aria-label="Filter by connection status">
@@ -720,11 +713,9 @@
       const cntAttention = document.getElementById('cntAttention');
       const targetsBody = document.getElementById('targetsBody');
       const pushJobsTabActions = document.getElementById('pushJobsTabActions');
-      const pushStateTabActions = document.getElementById('pushStateTabActions');
       const devToolbar = document.getElementById('devToolbar');
       const devSearchInput = document.getElementById('devSearch');
       const devStatusFilter = document.getElementById('devStatusFilter');
-      const btnRetryAllPushStates = document.getElementById('btnRetryAllPushStates');
       const selCard = document.getElementById('selCard');
       const apkFile = document.getElementById('apkFile');
       const apkName = document.getElementById('apkName');
@@ -876,11 +867,11 @@
       // Command targets need a live WebSocket, which "updating" (mid self-update,
       // device rebooting) does not have — only strictly-online devices qualify.
       function getOnlineIds() { return devices.filter(function (d) { return d.status === 'online'; }).map(getDeviceId).filter(Boolean); }
-      function canRetryPushState(d) {
-        return !!(d && d.status === 'online' && d.push_state_retry_supported === true &&
-          d.push_state_status === 'unavailable');
+      // The device retries its durable Push state by itself for about five minutes,
+      // then waits for the next app start; the operator frees storage and reboots.
+      function pushStateUnavailable(d) {
+        return !!(d && d.status === 'online' && d.push_state_status === 'unavailable');
       }
-      function retryablePushStateDevices() { return devices.filter(canRetryPushState); }
       function knownIds() { return new Set(devices.map(getDeviceId).filter(Boolean)); }
       function labelFor(id) { if (!id) return '-'; const d = deviceById(id); return (d && d.label) ? d.label : id; }
       // Shared filter/sort for both the main Devices list and the Manage Groups picker
@@ -1089,13 +1080,10 @@
             break;
           }
           case 'PUSH_FILES_SENT': addLog((msg.delete_extras ? 'Sync' : 'Push') + (msg.resume ? ' resume requested for ' : ' job queued for ') + msg.target_count + ' device(s) → ' + (msg.dest_path || '-') + (msg.max_concurrent ? ' (max ' + msg.max_concurrent + ' concurrent transfer(s))' : ''), 'info'); break;
-          case 'PUSH_STATE_RETRY_SENT': addLog('Push state retry requested on ' + msg.sent_count + '/' + msg.target_count + ' device(s); no transfer was started', 'info'); break;
-          case 'PUSH_STATE_RETRY_RESULT': {
-            const ok = msg.status === 'success';
-            addLog('[' + (ok ? 'OK' : 'FAIL') + '] Push state retry on ' + labelFor(msg.device_id) +
-              (msg.detail ? ' - ' + msg.detail : '') + '; no transfer was started', ok ? 'success' : 'fail');
+          case 'PUSH_STATE_RESET':
+            addLog('Push state on ' + labelFor(msg.device_id) + ' was unreadable and has been reset' +
+              (msg.detail ? ' - ' + msg.detail : '') + '; unfinished Push/Sync status on it may show as interrupted', 'warn');
             break;
-          }
           case 'PUSH_PROGRESS': showTransferProgress('push', msg); break;
           case 'PUSH_DEVICE_STATE': {
             // Per-device companion to PUSH_PROGRESS, mirroring INSTALL_DEVICE_STATE.
@@ -1217,9 +1205,6 @@
         tabDevices.classList.toggle('active', targetTab === 'devices');
         tabAttention.classList.toggle('active', targetTab === 'attention');
         pushJobsTabActions.style.display = targetTab === 'attention' && pushJobsTabActions.children.length ? '' : 'none';
-        const retryable = retryablePushStateDevices();
-        pushStateTabActions.style.display = targetTab === 'attention' && retryable.length ? '' : 'none';
-        btnRetryAllPushStates.textContent = '↻ Retry affected (' + retryable.length + ')';
       }
 
       function renderTargets() {
@@ -1246,7 +1231,7 @@
       function pushAttentionDevices() {
         return devices.filter(function (device) {
           const assignment = pushAssignmentFor(getDeviceId(device));
-          return (assignment && assignment.needsAttention) || canRetryPushState(device);
+          return (assignment && assignment.needsAttention) || pushStateUnavailable(device);
         });
       }
 
@@ -1573,11 +1558,11 @@
           if (assignment.canCancel) actions.push(button('cancel', 'Cancel'));
           if (actions.length) task += '<span class="push-job-actions">' + actions.join('') + '</span>';
         }
-        if (!canRetryPushState(deviceById(id))) return task;
-        return task + '<div class="push-state-warning">' +
+        if (!pushStateUnavailable(deviceById(id))) return task;
+        return task + '<div class="push-state-warning" title="The device retries automatically for about 5 minutes. If this remains, free device storage and reboot the device.">' +
           '<span class="push-state-warning-icon" aria-hidden="true">⚠</span>' +
           '<span class="push-state-warning-label">Push state unavailable</span>' +
-          '<button class="btn-push-state-retry" data-act="retryPushState" data-id="' + esc(id) + '" title="Reload durable Push state and refresh capabilities. This does not start a transfer.">Retry</button>' +
+          '<span class="push-state-warning-hint">If it persists: free storage, then Reboot</span>' +
           '</div>';
       }
 
@@ -2122,14 +2107,6 @@
         deviceTaskState[id] = { task: 'install', status: 'queued', filename: clientApk.filename, detail: '' };
         updateTaskCell(id);
         addLog('Updating ' + name + ' to client v' + clientApk.version, 'info');
-      }
-      function retryPushStates(ids) {
-        const eligible = new Set(retryablePushStateDevices().map(getDeviceId));
-        const targets = Array.from(new Set(ids)).filter(function (id) { return eligible.has(id); });
-        if (!targets.length) { addLog('No affected online devices can retry Push state', 'warn'); return; }
-        if (wsSend({ type: 'RETRY_PUSH_STATE', target_devices: targets }, 'retry Push state')) {
-          addLog('Requesting Push state reload on ' + targets.length + ' device(s); this will not start a transfer', 'info');
-        }
       }
       // Bulk sibling of sendClientUpdate: fan the server's own client APK out to every selected
       // device that is online and behind (canUpdateDevice), skipping already-current, offline,
@@ -2912,7 +2889,6 @@
             setTimeout(function () { if (t.isConnected) t.disabled = false; }, 5000);
           }
         }
-        else if (act === 'retryPushState') retryPushStates([t.dataset.id]);
       });
       // Targets label-edit keyboard
       targetsBody.addEventListener('keydown', function (e) {
@@ -2944,9 +2920,6 @@
         deviceStatusFilter = btn.getAttribute('data-status');
         syncStatusFilterButtons();
         refreshDeviceRows();
-      });
-      btnRetryAllPushStates.addEventListener('click', function () {
-        retryPushStates(retryablePushStateDevices().map(getDeviceId));
       });
 
       // Selection card delegation

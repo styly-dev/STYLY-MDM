@@ -544,13 +544,17 @@ class WebSocketManager internal constructor(
     private fun sendRegistration(socket: WebSocket, identity: DeviceIdentityState) {
         if (registration.isSent(socket)) return
         if (identity is DeviceIdentityState.Ready) {
-            pushCoordinator.attachTransport(socket) { message ->
-                if (this@WebSocketManager.webSocket === socket && registration.isCanonicalAcknowledged(socket)) {
-                    val text = message.toString()
-                    Log.d(TAG, "Sending: $text")
-                    socket.send(text)
-                }
-            }
+            pushCoordinator.attachTransport(
+                socket,
+                send = { message ->
+                    if (this@WebSocketManager.webSocket === socket && registration.isCanonicalAcknowledged(socket)) {
+                        val text = message.toString()
+                        Log.d(TAG, "Sending: $text")
+                        socket.send(text)
+                    }
+                },
+                requestReregistration = { reregisterAfterPushStateRecovery(socket) },
+            )
         }
         if (identity is DeviceIdentityState.Ready) {
             pushCoordinator.registrationFields { pushFields ->
@@ -564,6 +568,20 @@ class WebSocketManager internal constructor(
                 if (webSocket !== socket) return@post
                 sendRegistrationPayload(socket, identity, null)
             }
+        }
+    }
+
+    /**
+     * Durable Push/Sync state became available after [socket] registered it as
+     * unavailable. Close the socket normally so the existing reconnect path sends a
+     * fresh REGISTER. A socket that has not sent its REGISTER yet needs nothing: the
+     * registration fields it is about to send are computed after the recovery.
+     */
+    private fun reregisterAfterPushStateRecovery(socket: WebSocket) {
+        reconnectHandler.post {
+            if (webSocket !== socket || !registration.isSent(socket)) return@post
+            Log.i(TAG, "Re-registering after Push/Sync state recovery")
+            socket.close(1000, "push state recovered")
         }
     }
 

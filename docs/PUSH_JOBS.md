@@ -284,28 +284,46 @@ New clients register:
 
 ```json
 {
-  "capabilities": ["push_state_retry_v1", "push_job_id_v1", "push_resume_v1"],
+  "capabilities": ["push_job_id_v1", "push_resume_v1"],
   "process_instance_id": "<process UUIDv4>",
   "push_state": {"status": "available"},
   "push_runtime": {"active": null}
 }
 ```
 
-`PushJobCoordinator` is owned by `MdmClientApplication`, not by a Service instance. It serializes commands on one actor, permits one active Push/Sync worker, persists active state before `PUSH_JOB_ACCEPTED`, and stores terminal results in an outbox until a matching `PUSH_RESULT_ACK` either accepts the result or marks its rejection as permanent with `retryable: false`. An older server that omits `retryable` is treated as retryable. Completed receipts retain the original command metadata for at most 256 entries and seven days. A missing state file is initialized as an empty state, while malformed JSON or malformed active/receipt entries are classified as corrupt, left untouched, and registered as unavailable rather than authoritative absence. If durable state cannot be loaded or saved, the coordinator keeps the rest of the MDM client alive but rejects new work with `client_persistence_unavailable`; it never starts a worker, publishes a phase, releases an execution lease, or sends a terminal result whose required state was not persisted.
+`PushJobCoordinator` is owned by `MdmClientApplication`, not by a Service instance. It serializes commands on one actor, permits one active Push/Sync worker, persists active state before `PUSH_JOB_ACCEPTED`, and stores terminal results in an outbox until a matching `PUSH_RESULT_ACK` either accepts the result or marks its rejection as permanent with `retryable: false`. An older server that omits `retryable` is treated as retryable. Completed receipts retain the original command metadata for at most 256 entries and seven days. A missing state file is initialized as an empty state. If durable state cannot be loaded or saved, the coordinator keeps the rest of the MDM client alive but rejects new work with `client_persistence_unavailable`; it never starts a worker, publishes a phase, releases an execution lease, or sends a terminal result whose required state was not persisted.
 
-`push_state_retry_v1` is advertised even while durable Push state is unavailable. The
-console then exposes `Retry Push state` on that online device and a bulk action for all
-affected online devices. These actions send only `RETRY_PUSH_STATE`: the coordinator
-rereads and republishes its durable state and answers with refreshed capability/state
-metadata. Only a running worker makes the retry answer `push_state_busy`. When a
-worker finished but its terminal or interrupted outcome could not be saved, the retry
-saves that in-memory outcome instead of reloading disk, then releases the execution
-and sends the result; reloading would recover the finished execution as resumable. An unavailable registration is not authoritative absence evidence. On a
-successful retry, exact interrupted identity may be reconciled and requeued, but a
-restart-paused job remains paused: the retry path never starts a worker, downloads an
-artifact, or wakes the Push scheduler. A separate job `Dispatch` or `Resume` action
-remains necessary. If that job was already explicitly resumed, the recovered device
-continues under that existing operator authority.
+### Durable state recovery
+
+The client recovers its durable Push state (`files/push-jobs/state.json`) by itself;
+there is no operator retry command.
+
+- **Unparseable file** (malformed JSON or entries): retrying cannot help, so the client
+  deletes the file, starts from an empty state, and continues normally. Its next
+  REGISTER carries a one-shot notice,
+  `push_state: {status: "available", reset: {reason: "corrupt_state_discarded", detail}}`
+  (single-line detail, at most 256 characters), cleared once acknowledged. The server
+  logs it and broadcasts `PUSH_STATE_RESET` to admin consoles. Only bookkeeping is lost:
+  no worker runs before the state is loaded, and job work directories (including
+  validated partials and their metadata) are untouched. Work the server still tracks
+  settles through normal reconciliation: an assignment awaiting status confirmation
+  becomes `interrupted` (`client_state_absent`) and can be retried; a fence is cleared
+  by the new process; a manual Resume wait stays and, when resumed, reuses the
+  retained partial. A result that was never delivered is reported the same way.
+- **Read I/O error at load, or save failure while running** (for example, full
+  storage): the client stays unavailable, advertises no Push capabilities, and rejects
+  new work with `client_persistence_unavailable`. It retries every 60 seconds, at most
+  five times per incident. A retry after a save failure re-saves the in-memory state,
+  including a finished worker outcome that could not be saved, and never reloads disk.
+  On success the client reconnects once, so a fresh REGISTER reports the recovered
+  state. After five failures it stops until the next app start, which loads again and
+  gets five new attempts. The console shows **Push state unavailable** with the remedy:
+  free device storage, then use **Reboot**.
+
+An unavailable registration is never authoritative absence evidence: the server keeps
+canonical reconciliation and fences untouched until the client reports available state.
+Job creation for such a target fails with an explanation instead of a capability
+error.
 
 The worker validates destination paths on the device as well as the server. It accepts only a shared-storage subdirectory, rejects protected top-level media/app directories, does not traverse destination symlinks, bounds ZIP entry count and expanded bytes, rejects duplicate or conflicting archive paths, and validates the exact job-v1 artifact size and SHA-256 before publishing the downloaded ZIP or touching the destination. Destination validation completes before the client reports `applying`.
 
