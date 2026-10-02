@@ -295,16 +295,11 @@
     container.scrollTop = container.scrollHeight;
   }
 
+  // Operator-action rules live on the server (push_jobs.assignment_actions); the
+  // console reads the snapshot flags and only adds live connectivity.
   function needsDispatchAction(job) {
-    const terminal = ['succeeded', 'completed_with_errors', 'failed', 'interrupted']
-      .indexOf(job.state) >= 0;
-    return !terminal && ['ready', 'running', 'reconciling'].indexOf(job.state) >= 0 &&
-      Object.values(job.devices || {}).some(function (d) {
-        return !d.cancel_requested && !d.retry_job_id && ['succeeded', 'failed', 'interrupted', 'unconfirmed'].indexOf(d.state) < 0 &&
-          (job.dispatch_enabled === false ||
-           (['queued', 'reconciling'].indexOf(d.state) >= 0 &&
-            ['download_retry_exhausted', 'dispatch_paused', 'client_restarted'].indexOf(d.queue_reason) >= 0));
-      });
+    return ['ready', 'running', 'reconciling'].indexOf(job.state) >= 0 &&
+      Object.values(job.devices || {}).some(function (d) { return d.resume_required === true; });
   }
 
   function hasRetryTargets(job) {
@@ -587,19 +582,14 @@
     const success = assignment.state === 'succeeded';
     const terminal = ['succeeded', 'failed', 'interrupted', 'unconfirmed'].indexOf(assignment.state) >= 0;
     const cancelled = failure.code === 'cancelled';
-    const resumeRequired = !assignment.cancel_requested && !assignment.retry_job_id && !terminal &&
-      ((['queued', 'reconciling'].indexOf(assignment.state) >= 0 &&
-        ['download_retry_exhausted', 'dispatch_paused', 'client_restarted'].indexOf(assignment.queue_reason) >= 0) ||
-       (job.dispatch_enabled === false && ['ready', 'running', 'reconciling'].indexOf(job.state) >= 0));
+    const resumeRequired = assignment.resume_required === true;
     const bridge = window.__stylyPushJobsV1Bridge;
     const online = !!(bridge && bridge.isDeviceOnline && bridge.isDeviceOnline(deviceId));
     const canResume = resumeRequired && online;
-    const canCancel = !assignment.cancel_requested && !assignment.retry_job_id &&
-      assignment.resume_supported === true &&
-      ((assignment.state === 'queued' &&
-        ['download_retry_exhausted', 'dispatch_paused', 'client_restarted'].indexOf(assignment.queue_reason) >= 0) ||
-       (!online && assignment.state === 'reconciling') ||
-       (assignment.state === 'unconfirmed' && !!assignment.device_fence));
+    // The server refuses to cancel a reconciling assignment while its device is
+    // online, because that device can still report its outcome.
+    const canCancel = assignment.cancellable === true &&
+      !(online && assignment.state === 'reconciling');
     const needsAttention = !assignment.cancel_requested && !assignment.retry_job_id && !success && !cancelled && (resumeRequired ||
       ['reconciling', 'unconfirmed', 'failed', 'interrupted'].indexOf(assignment.state) >= 0);
     return {
@@ -612,9 +602,7 @@
       revision: job.revision,
       enqueue_seq: assignment.enqueue_seq,
       status: cancelled ? 'cancelled' : (assignment.cancel_requested && (!terminal || (assignment.state === 'unconfirmed' && assignment.device_fence))) ? 'cancel_pending' :
-        ['queued', 'reconciling'].indexOf(assignment.state) >= 0 &&
-        ['download_retry_exhausted', 'dispatch_paused', 'client_restarted'].indexOf(assignment.queue_reason) >= 0
-          ? 'resume_required' : displayStatus(assignment.state),
+        assignment.manual_wait === true ? 'resume_required' : displayStatus(assignment.state),
       verb: job.mode === 'sync' ? 'Sync' : 'Push',
       filename: job.dest_path || '',
       note: success ? '+' + (result.added || 0) + ' ~' +
