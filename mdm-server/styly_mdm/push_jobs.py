@@ -51,6 +51,8 @@ CAP_PUSH_JOB_ID_V1 = "push_job_id_v1"
 CAP_PUSH_PROGRESS_V1 = "push_progress_v1"
 CAP_PUSH_RESUME_V1 = "push_resume_v1"
 CAP_PUSH_STATE_RETRY_V1 = "push_state_retry_v1"
+# Every Push job target must advertise both; there is no non-resumable fallback.
+PUSH_JOB_CAPABILITIES = frozenset({CAP_PUSH_JOB_ID_V1, CAP_PUSH_RESUME_V1})
 
 
 class PushMode(StrEnum):

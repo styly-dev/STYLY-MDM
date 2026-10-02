@@ -42,34 +42,12 @@ class _Ws:
         self.messages.append(json.loads(value))
 
 
-def test_protocol_admission_uses_the_configured_resume_threshold():
-    scheduler = object.__new__(PushScheduler)
-    scheduler.resume_threshold_bytes = 10
-    session = LiveSession(
-        device_id='D1',
-        session_id='session',
-        ws=_Ws(),
-        capabilities=frozenset({'push_job_id_v1'}),
-        process_instance_id='process',
-        owner_lock=asyncio.Lock(),
-        http_base='http://server',
-    )
-
-    assert scheduler._protocol_for(session, 10) is ProtocolMode.JOB_V1
-    assert scheduler._protocol_for(session, 11) is None
-    resumable = replace(
-        session, capabilities=frozenset({'push_job_id_v1', 'push_resume_v1'})
-    )
-    assert scheduler._protocol_for(resumable, 11) is ProtocolMode.JOB_V1
-
-
-@pytest.mark.parametrize("artifact_size,capabilities,expected_code", [
-    (11, {"push_job_id_v1"}, "artifact_requires_push_resume_v1"),
-    (10, set(), "capability_changed_before_dispatch"),
+@pytest.mark.parametrize("capabilities", [
+    {"push_job_id_v1"},
+    {"push_resume_v1"},
+    set(),
 ])
-def test_dispatch_reports_artifact_requirement_separately_from_capability_change(
-    artifact_size, capabilities, expected_code
-):
+def test_dispatch_requires_job_id_and_resume_capabilities(capabilities):
     async def scenario():
         session = LiveSession(
             device_id="D1", session_id="session", ws=_Ws(),
@@ -77,19 +55,18 @@ def test_dispatch_reports_artifact_requirement_separately_from_capability_change
             owner_lock=asyncio.Lock(), http_base="http://server",
         )
         scheduler = object.__new__(PushScheduler)
-        scheduler.resume_threshold_bytes = 10
         scheduler.sessions = lambda: {"D1": session}
         scheduler.transfer_slots = lambda: asyncio.Semaphore(1)
         scheduler._fail_current = AsyncMock()
         await scheduler._dispatch_assignment_inner({
             "job": {
                 "job_id": "job", "declared_total_bytes": 10,
-                "artifact": {"byte_size": artifact_size},
+                "artifact": {"byte_size": 10},
             },
             "device_id": "D1", "attempt": 1,
         })
         scheduler._fail_current.assert_awaited_once()
-        assert scheduler._fail_current.await_args.args[3] == expected_code
+        assert scheduler._fail_current.await_args.args[3] == "capability_changed_before_dispatch"
         assert session.ws.messages == []
 
     asyncio.run(scenario())

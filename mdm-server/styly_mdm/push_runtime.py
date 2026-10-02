@@ -34,6 +34,7 @@ from .push_job_store import (
     now_ms,
 )
 from .push_jobs import (
+    PUSH_JOB_CAPABILITIES,
     CAP_PUSH_JOB_ID_V1,
     CAP_PUSH_RESUME_V1,
     CAP_PUSH_STATE_RETRY_V1,
@@ -51,29 +52,16 @@ from .push_transfer_leases import PushTransferLeases
 
 log = logging.getLogger("stylymdm.push")
 
-class _ArtifactRequiresResumeError(PushJobError):
-    """A completed ZIP exceeds the size supported by one or more targets."""
-
-
 _INSTALLED = False
 _ORIGINAL_CREATE_APP: Any = None
 _RUNTIME_BY_DATA_DIR: dict[Path, "PushRuntime"] = {}
 _BACKGROUND_LOOP_RETRY_DELAY = 1.0
 _RECONCILIATION_POLL_INTERVAL = 1.0
-_DEFAULT_RESUME_THRESHOLD_BYTES = 64 * 1024 * 1024
 
 
 def _env_seconds(name: str, default: float) -> float:
     value = float(os.environ.get(name, str(default)))
     return max(0.05, value)
-
-
-def _env_bytes(name: str, default: int) -> int:
-    try:
-        value = int(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
-        value = default
-    return max(0, value)
 
 
 def _uuid_v4_or_none(value: Any) -> str | None:
@@ -290,9 +278,6 @@ class PushRuntime:
         self.pending_publications: dict[str, dict[str, Any]] = {}
         self.publication_revisions: dict[str, int] = {}
         self.publication_stopping = False
-        self.resume_threshold_bytes = _env_bytes(
-            "MDM_PUSH_RESUME_THRESHOLD_BYTES", _DEFAULT_RESUME_THRESHOLD_BYTES
-        )
         self.artifact_retry_window = _env_seconds(
             "MDM_PUSH_ARTIFACT_RETRY_WINDOW", 7 * 24 * 60 * 60
         )
@@ -387,7 +372,6 @@ class PushRuntime:
             accept_reconciliation_timeout=self.accept_reconciliation_timeout,
             reconciliation_timeout=self.reconciliation_timeout,
             transfer_timeout=self.legacy.TRANSFER_TIMEOUT,
-            resume_threshold_bytes=self.resume_threshold_bytes,
             leases=self.leases,
         )
         self.scheduler.start()
@@ -509,22 +493,16 @@ class PushRuntime:
                 session = dispatch_sessions.get(device_id)
                 if session is None:
                     raise PushJobError(f"target device is not online: {device_id}")
-                if CAP_PUSH_JOB_ID_V1 in session.capabilities:
-                    if (
-                        canonical.source.declared_total_bytes > self.resume_threshold_bytes
-                        and CAP_PUSH_RESUME_V1 not in session.capabilities
-                    ):
-                        raise PushJobError(
-                            f"target does not support push_resume_v1 for large artifact: {device_id}"
-                        )
-                    protocols[device_id] = (
-                        ProtocolMode.JOB_V1,
-                        set(session.capabilities),
-                    )
-                else:
+                # Every Push job is resumable; an older APK must self-update first.
+                missing = sorted(PUSH_JOB_CAPABILITIES - session.capabilities)
+                if missing:
                     raise PushJobError(
-                        f"target does not support push_job_id_v1: {device_id}"
+                        f"target does not support {', '.join(missing)}: {device_id}"
                     )
+                protocols[device_id] = (
+                    ProtocolMode.JOB_V1,
+                    set(session.capabilities),
+                )
             created, snapshot = await self.store.create_job(
                 canonical, protocols, int(self.create_timeout * 1000)
             )
@@ -614,16 +592,12 @@ class PushRuntime:
             )
             packaging = True
             await self.publish(snapshot)
-            targets_without_resume = tuple(
-                await self.store.devices_missing_resume_v1(job_id)
-            )
             artifact = await asyncio.to_thread(
                 self._package_and_publish,
                 job_id,
                 upload_root,
                 snapshot["source_label"],
                 tuple(sorted(seen)),
-                targets_without_resume,
             )
             ready = await self.store.publish_artifact(job_id, artifact)
             await self.publish(ready)
@@ -655,12 +629,7 @@ class PushRuntime:
             return aiohttp_web.json_response({"error": str(exc)}, status=409)
         except BaseException as exc:
             state = JobState.FAILED if packaging else JobState.INTERRUPTED
-            if isinstance(exc, _ArtifactRequiresResumeError):
-                code = "artifact_requires_push_resume_v1"
-            elif packaging:
-                code = "packaging_failed"
-            else:
-                code = "upload_interrupted"
+            code = "packaging_failed" if packaging else "upload_interrupted"
             await self._record_upload_failure(job_id, state, code, str(exc))
             await asyncio.to_thread(self.artifacts.cleanup_work_best_effort, job_id)
             status = 422 if isinstance(exc, (PushJobError, ValueError)) else 500
@@ -682,7 +651,6 @@ class PushRuntime:
         upload_root: Path,
         source_label: str,
         relative_paths: tuple[str, ...],
-        targets_without_resume: tuple[str, ...],
     ) -> dict[str, object]:
         _common_root, stripped = self.legacy.strip_common_root(list(relative_paths))
         if stripped != list(relative_paths):
@@ -692,16 +660,6 @@ class PushRuntime:
             content_root = upload_root
         part_path = self.artifacts.work_dir(job_id) / "artifact.part"
         self.legacy.zip_tree(content_root, part_path)
-        artifact_size = part_path.stat().st_size
-        if (
-            artifact_size > self.resume_threshold_bytes
-            and targets_without_resume
-        ):
-            target_list = ", ".join(targets_without_resume)
-            raise _ArtifactRequiresResumeError(
-                "Packaged artifact exceeds the push_resume_v1 size threshold "
-                f"({artifact_size} bytes); these targets do not support resume: {target_list}"
-            )
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", source_label).strip("._-") or "bundle"
         display_filename = safe if safe.lower().endswith(".zip") else f"{safe}.zip"
         return self.artifacts.publish(

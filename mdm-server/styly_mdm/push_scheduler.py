@@ -20,8 +20,7 @@ from .push_transfer_leases import (
 )
 from .push_jobs import (
     ACTIVE_DEVICE_STATES,
-    CAP_PUSH_JOB_ID_V1,
-    CAP_PUSH_RESUME_V1,
+    PUSH_JOB_CAPABILITIES,
     DeviceState,
     ProtocolMode,
 )
@@ -62,7 +61,6 @@ class PushScheduler:
         accept_reconciliation_timeout: float,
         reconciliation_timeout: float,
         transfer_timeout: float,
-        resume_threshold_bytes: int = 64 * 1024 * 1024,
         leases: PushTransferLeases | None = None,
     ) -> None:
         self.manager = manager
@@ -75,7 +73,6 @@ class PushScheduler:
         self.accept_reconciliation_timeout = accept_reconciliation_timeout
         self.reconciliation_timeout = reconciliation_timeout
         self.transfer_timeout = transfer_timeout
-        self.resume_threshold_bytes = max(0, resume_threshold_bytes)
         self.leases = leases
         self._wake = asyncio.Event()
         self._runner: asyncio.Task[None] | None = None
@@ -227,21 +224,13 @@ class PushScheduler:
                 )
                 return
 
-            artifact_size = int((job.get("artifact") or {}).get("byte_size") or 0)
-            protocol = self._protocol_for(session, artifact_size)
-            if protocol is None:
-                requires_resume = artifact_size > self.resume_threshold_bytes
+            if not PUSH_JOB_CAPABILITIES <= session.capabilities:
                 await self._fail_current(
                     job_id,
                     device_id,
                     {DeviceState.WAITING_TRANSFER},
-                    "artifact_requires_push_resume_v1" if requires_resume
-                    else "capability_changed_before_dispatch",
-                    (
-                        "Published artifact requires push_job_id_v1 and push_resume_v1"
-                        if requires_resume
-                        else "Live session no longer supports push_job_id_v1 and legacy fallback is disabled"
-                    ),
+                    "capability_changed_before_dispatch",
+                    "Live session no longer supports push_job_id_v1 and push_resume_v1",
                 )
                 return
 
@@ -263,7 +252,7 @@ class PushScheduler:
                 snapshot = await self.manager.prepare_dispatch(
                     job_id,
                     device_id,
-                    protocol_mode=protocol,
+                    protocol_mode=ProtocolMode.JOB_V1,
                     live_capabilities=session.capabilities,
                     accept_deadline=accept_deadline,
                 )
@@ -608,18 +597,6 @@ class PushScheduler:
                     device_id,
                 )
                 await asyncio.sleep(_RUN_RETRY_DELAY)
-
-    def _protocol_for(
-        self, session: LiveSession, artifact_size: int = 0
-    ) -> ProtocolMode | None:
-        if CAP_PUSH_JOB_ID_V1 in session.capabilities:
-            if (
-                artifact_size > self.resume_threshold_bytes
-                and CAP_PUSH_RESUME_V1 not in session.capabilities
-            ):
-                return None
-            return ProtocolMode.JOB_V1
-        return None
 
     async def _await_acceptance(
         self,

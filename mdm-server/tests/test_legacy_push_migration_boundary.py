@@ -119,7 +119,7 @@ async def test_unfinished_legacy_push_is_not_migrated_on_guid_registration(tmp_p
                     "ip": "1.1.1.2",
                     "version_code": 10,
                     "version_name": "guid",
-                    "capabilities": ["push_job_id_v1"],
+                    "capabilities": ["push_job_id_v1", "push_resume_v1"],
                     "process_instance_id": str(uuid.uuid4()),
                 }
             )
