@@ -853,7 +853,20 @@
         el.title = 'Download ' + clientApk.filename + ' to this machine for manual install';
         el.classList.add('shown');
       }
-      function deviceById(id) { return devices.find(function (d) { return getDeviceId(d) === id; }); }
+      // DEVICE_LIST replaces `devices` wholesale, so the index is rebuilt once per list.
+      let deviceIndexSource = null;
+      let deviceIndex = new Map();
+      function deviceById(id) {
+        if (deviceIndexSource !== devices) {
+          deviceIndex = new Map();
+          devices.forEach(function (d) {
+            const key = getDeviceId(d);
+            if (!deviceIndex.has(key)) deviceIndex.set(key, d);
+          });
+          deviceIndexSource = devices;
+        }
+        return deviceIndex.get(id);
+      }
       function connectionById(id) { return provisionalConnections.find(function (c) { return c.connection_id === id; }); }
       function shortConnectionId(id) { return id ? String(id).slice(0, 8) : '-'; }
       function attentionPowerSupported(entry) {
@@ -1525,7 +1538,12 @@
               (!device || device.status !== 'online')) {
             return '<span class="ins-queued" title="The device is disconnected. This job is unfinished; its current execution status is unknown.">◦ Job pending · offline</span>';
           }
-          if (st.status === 'resume_required') return '<span class="ins-queued">◦ Resume required</span>';
+          if (st.status === 'resume_required') {
+            if (!device || device.status !== 'online') {
+              return '<span class="ins-queued" title="The device is disconnected. Resume becomes available when it reconnects.">◦ Resume required · offline</span>';
+            }
+            return '<span class="ins-queued">◦ Resume required</span>';
+          }
           if (st.status === 'unconfirmed') {
             return '<span class="ins-queued" title="' + esc(st.detail || 'Waiting to confirm the device result') + '">◦ Status unknown</span>';
           }

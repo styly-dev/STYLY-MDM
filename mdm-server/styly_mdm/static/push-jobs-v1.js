@@ -302,11 +302,26 @@
       Object.values(job.devices || {}).some(function (d) { return d.resume_required === true; });
   }
 
+  function isDeviceOnline(deviceId) {
+    const bridge = window.__stylyPushJobsV1Bridge;
+    return !!(bridge && bridge.isDeviceOnline && bridge.isDeviceOnline(deviceId));
+  }
+
+  // A job stays listed for review while any target is retryable, as offline
+  // Resume targets do; the Retry command itself needs a connected target.
+  function hasRetryableAssignments(job) {
+    return Object.values(job.devices || {}).some(function (d) { return d.retryable === true; });
+  }
+
   function hasRetryTargets(job) {
-    return Object.values(job.devices || {}).some(function (d) {
-      return !d.cancel_requested && !d.retry_job_id && ['failed', 'interrupted', 'unconfirmed'].indexOf(d.state) >= 0 &&
-        (!d.failure || d.failure.code !== 'cancelled');
+    return Object.keys(job.devices || {}).some(function (deviceId) {
+      return job.devices[deviceId].retryable === true && isDeviceOnline(deviceId);
     });
+  }
+
+  function needsFenceReconciliation(assignment) {
+    // Retry creates new work but does not prove that the old worker has stopped.
+    return !!assignment.device_fence && !assignment.cancel_requested;
   }
 
   function actionTargetsForJob(job, action) {
@@ -333,8 +348,9 @@
     const targetCount = groups.reduce(function (count, group) {
       return count + group.targetDevices.length;
     }, 0);
+    const scope = targetCount + ' device(s) across ' + groups.length + ' job(s)';
     if (action === 'cancel' && typeof window.confirm === 'function' &&
-        !window.confirm('Cancel Push / Sync for ' + targetCount + ' device(s)?')) return false;
+        !window.confirm('Cancel Push / Sync for ' + scope + '?')) return false;
     try {
       groups.forEach(function (group) {
         nativeSend.call(currentAdminSocket, JSON.stringify({
@@ -347,7 +363,7 @@
       appendLog('Could not ' + label.toLowerCase() + ': ' + error.message, 'fail');
       return false;
     }
-    appendLog(label + ' requested for ' + targetCount + ' device(s)', 'info');
+    appendLog(label + ' requested for ' + scope, 'info');
     return true;
   }
 
@@ -394,7 +410,7 @@
     title.textContent = 'Push / Sync actions';
     const note = document.createElement('div');
     note.className = 'attention-tab-actions-note';
-    note.textContent = 'Apply an action to every eligible device in this list.';
+    note.textContent = 'Apply an action to every eligible device across all Push / Sync jobs.';
     copy.appendChild(title);
     copy.appendChild(note);
     const buttons = document.createElement('div');
@@ -430,9 +446,9 @@
     container.appendChild(head);
 
     const actionJobs = paused.filter(function (job) {
-      return hasRetryTargets(job) || Object.keys(job.devices || {}).some(function (deviceId) {
+      return hasRetryableAssignments(job) || Object.keys(job.devices || {}).some(function (deviceId) {
         const assignment = job.devices[deviceId];
-        return !!assignment.device_fence && !assignment.cancel_requested && !assignment.retry_job_id;
+        return needsFenceReconciliation(assignment);
       });
     });
     if (!actionJobs.length) return;
@@ -447,11 +463,15 @@
         job.job_id.slice(0, 8) + ' → ' + job.dest_path;
       const rowButtons = document.createElement('div');
       rowButtons.className = 'attention-tab-job-buttons';
-      if (hasRetryTargets(job)) {
+      if (hasRetryableAssignments(job)) {
         const retry = document.createElement('button');
         retry.type = 'button';
         retry.className = 'push-job-action';
         retry.textContent = 'Retry failed devices';
+        if (!hasRetryTargets(job)) {
+          retry.disabled = true;
+          retry.title = 'Every device to retry is offline';
+        }
         retry.addEventListener('click', function () {
           sendJobAttentionAction(job, 'RETRY_FAILED_PUSH_JOB', retry, 'Retry failed devices');
         });
@@ -459,7 +479,7 @@
       }
       const fenced = Object.keys(job.devices || {}).filter(function (deviceId) {
         const assignment = job.devices[deviceId];
-        return !!assignment.device_fence && !assignment.cancel_requested && !assignment.retry_job_id;
+        return needsFenceReconciliation(assignment);
       });
       if (fenced.length) {
         const reconcile = document.createElement('button');
@@ -492,8 +512,8 @@
 
   function renderPausedJobs() {
     const paused = Array.from(pushJobs.values()).filter(function (job) {
-      return needsDispatchAction(job) || hasRetryTargets(job) ||
-        Object.values(job.devices || {}).some(function (d) { return !!d.device_fence && !d.cancel_requested && !d.retry_job_id; });
+      return needsDispatchAction(job) || hasRetryableAssignments(job) ||
+        Object.values(job.devices || {}).some(needsFenceReconciliation);
     });
     renderAttentionTabActions(paused);
     const container = document.getElementById('pushJobsAttention');
@@ -536,7 +556,7 @@
     ]);
     const active = candidates.filter(function (candidate) {
       return activeStates.has(candidate.assignment.state) ||
-        (candidate.assignment.cancel_requested && candidate.assignment.state === 'unconfirmed' &&
+        (candidate.assignment.state === 'unconfirmed' &&
          !!candidate.assignment.device_fence);
     }).sort(function (left, right) {
       return left.assignment.enqueue_seq - right.assignment.enqueue_seq;
@@ -583,15 +603,15 @@
     const terminal = ['succeeded', 'failed', 'interrupted', 'unconfirmed'].indexOf(assignment.state) >= 0;
     const cancelled = failure.code === 'cancelled';
     const resumeRequired = assignment.resume_required === true;
-    const bridge = window.__stylyPushJobsV1Bridge;
-    const online = !!(bridge && bridge.isDeviceOnline && bridge.isDeviceOnline(deviceId));
+    const online = isDeviceOnline(deviceId);
     const canResume = resumeRequired && online;
     // The server refuses to cancel a reconciling assignment while its device is
     // online, because that device can still report its outcome.
     const canCancel = assignment.cancellable === true &&
       !(online && assignment.state === 'reconciling');
-    const needsAttention = !assignment.cancel_requested && !assignment.retry_job_id && !success && !cancelled && (resumeRequired ||
-      ['reconciling', 'unconfirmed', 'failed', 'interrupted'].indexOf(assignment.state) >= 0);
+    const needsAttention = needsFenceReconciliation(assignment) ||
+      (!assignment.cancel_requested && !assignment.retry_job_id && !success && !cancelled && (resumeRequired ||
+        assignment.state === 'reconciling' || assignment.retryable === true));
     return {
       device_id: deviceId,
       canResume: canResume,
@@ -602,7 +622,7 @@
       revision: job.revision,
       enqueue_seq: assignment.enqueue_seq,
       status: cancelled ? 'cancelled' : (assignment.cancel_requested && (!terminal || (assignment.state === 'unconfirmed' && assignment.device_fence))) ? 'cancel_pending' :
-        assignment.manual_wait === true ? 'resume_required' : displayStatus(assignment.state),
+        resumeRequired ? 'resume_required' : displayStatus(assignment.state),
       verb: job.mode === 'sync' ? 'Sync' : 'Push',
       filename: job.dest_path || '',
       note: success ? '+' + (result.added || 0) + ' ~' +

@@ -468,6 +468,23 @@ class PushJobStore:
         return retries
 
     @staticmethod
+    def _superseded_devices(conn: sqlite3.Connection, job: Mapping[str, Any]) -> set[str]:
+        """Targets of ``job`` with later dispatched or pending work for its destination."""
+
+        return {
+            row["device_id"]
+            for row in conn.execute(
+                "SELECT DISTINCT d.device_id FROM push_job_devices d "
+                "JOIN push_jobs j ON j.job_id=d.job_id "
+                "WHERE j.job_id<>? AND j.dest_path=? AND j.created_at>? "
+                "AND (d.dispatch_revision IS NOT NULL "
+                "OR d.state NOT IN ('succeeded','failed','interrupted','unconfirmed')) "
+                "AND d.device_id IN (SELECT device_id FROM push_job_devices WHERE job_id=?)",
+                (job["job_id"], job["dest_path"], job["created_at"], job["job_id"]),
+            )
+        }
+
+    @staticmethod
     def _resume_supported(row: Mapping[str, Any]) -> bool:
         """An assignment is resumable only when dispatched with push_resume_v1."""
 
@@ -496,6 +513,7 @@ class PushJobStore:
         aggregate = aggregate_device_states(row["state"] for row in device_rows)
         devices: dict[str, Any] = {}
         retries = PushJobStore._retry_job_ids(conn, job_id)
+        superseded = PushJobStore._superseded_devices(conn, job)
         for row in device_rows:
             fence = conn.execute(
                 """
@@ -544,6 +562,8 @@ class PushJobStore:
                 blocking_fence=fence is not None
                 and fence["blocking_job_id"] == job_id
                 and fence["blocking_attempt"] == row["attempt"],
+                failure_code=row["failure_code"],
+                superseded=row["device_id"] in superseded,
             )
             devices[row["device_id"]] = {
                 "state": row["state"],
@@ -554,6 +574,7 @@ class PushJobStore:
                 "manual_wait": actions.manual_wait,
                 "resume_required": actions.resume_required,
                 "cancellable": actions.cancellable,
+                "retryable": actions.retryable,
                 "protocol_mode": row["protocol_mode"],
                 "attempt": row["attempt"],
                 "enqueue_seq": row["enqueue_seq"],
@@ -1355,8 +1376,8 @@ class PushJobStore:
         404 and its UUID can never be reused. The eligibility decision and the
         tombstone commit in one serialized DB transaction; the files are removed
         afterwards, outside the single DB worker, so a slow multi-gigabyte unlink
-        never blocks other Push state transitions. A tombstoned artifact is no
-        longer served or retried, so a failed unlink only leaves bytes to remove.
+        never blocks other Push state transitions. Tombstoned files are selected
+        again on later runs so a failed unlink or process exit cannot strand bytes.
         """
 
         observed = now_ms() if timestamp is None else timestamp
@@ -1365,6 +1386,16 @@ class PushJobStore:
         def op(conn: sqlite3.Connection) -> list[tuple[str, Path]]:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # A prior run may have committed the tombstone and then failed or
+                # exited before removing the bytes. Keep these rows permanently
+                # unavailable, but retry their physical cleanup on every GC pass.
+                tombstoned = [
+                    (row["artifact_id"], root / row["storage_name"])
+                    for row in conn.execute(
+                        "SELECT artifact_id, storage_name FROM push_artifacts "
+                        "WHERE retention_state='deleted'"
+                    )
+                ]
                 rows = conn.execute(
                     """
                     SELECT a.artifact_id, a.storage_name
@@ -1392,7 +1423,6 @@ class PushJobStore:
                     """,
                     (retry_window_ms, observed),
                 ).fetchall()
-                tombstoned: list[tuple[str, Path]] = []
                 for row in rows:
                     path = root / row["storage_name"]
                     if path.resolve().parent != root:
@@ -1411,8 +1441,27 @@ class PushJobStore:
 
         removed: list[str] = []
         for artifact_id, path in self._call_sync(op):
+            # Avoid reporting already-removed identities on every periodic GC
+            # pass. Use a strict unlink after this check so a concurrent remover
+            # cannot make a missing file look like a newly removed artifact.
+            if path.parent != root:
+                continue
             try:
-                path.unlink(missing_ok=True)
+                # Check the directory entry itself rather than its resolved
+                # target: unlinking a symlink inside the artifact root is safe,
+                # including a dangling symlink left by an interrupted cleanup.
+                path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                logger.warning(
+                    "Could not inspect expired Push artifact bytes %s", path, exc_info=True
+                )
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
             except OSError:
                 logger.warning(
                     "Could not remove expired Push artifact bytes %s", path, exc_info=True

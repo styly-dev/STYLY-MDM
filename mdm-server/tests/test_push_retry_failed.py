@@ -140,3 +140,49 @@ async def test_old_failure_cannot_be_retried_twice_but_new_failure_can(manager, 
     _, again = await manager.retry_failed(retry['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
     assert set(again['devices']) == set(retry['devices'])
     assert (await manager.get_snapshot(retry['job_id']))['devices']['failed']['retry_job_id'] == again['job_id']
+
+
+@pytest.mark.asyncio
+async def test_retry_skips_targets_superseded_by_later_work_for_same_destination(manager, tmp_path):
+    original = await completed(manager, tmp_path)
+    assert {d for d, a in original['devices'].items() if a['retryable']} == {
+        'failed', 'interrupted', 'unknown'}
+    request = canonicalize_create_request({
+        'client_request_id': str(uuid.uuid4()), 'target_devices': ['failed', 'interrupted'],
+        'mode': 'sync', 'dest_path': original['dest_path'],
+        'source': {'display_name': 'newer', 'declared_file_count': 1, 'declared_total_bytes': 4},
+    })
+    _, newer = await manager.create_job(request, {
+        device: (ProtocolMode.JOB_V1, ['push_job_id_v1']) for device in ('failed', 'interrupted')
+    }, 600_000)
+    await manager.store._call(lambda conn: conn.execute(
+        'UPDATE push_jobs SET created_at=? WHERE job_id=?',
+        (original['created_at'] + 1000, newer['job_id'])))
+    # Pending newer work supersedes the old targets: retrying them would overwrite it.
+    current = await manager.get_snapshot(original['job_id'])
+    assert {d for d, a in current['devices'].items() if a['retryable']} == {'unknown'}
+    _, retry = await manager.retry_failed(
+        original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
+    assert set(retry['devices']) == {'unknown'}
+
+
+@pytest.mark.asyncio
+async def test_never_dispatched_later_failure_does_not_supersede_retry(manager, tmp_path):
+    original = await completed(manager, tmp_path)
+    request = canonicalize_create_request({
+        'client_request_id': str(uuid.uuid4()), 'target_devices': ['failed'],
+        'mode': 'sync', 'dest_path': original['dest_path'],
+        'source': {'display_name': 'newer', 'declared_file_count': 1, 'declared_total_bytes': 4},
+    })
+    _, newer = await manager.create_job(
+        request, {'failed': (ProtocolMode.JOB_V1, ['push_job_id_v1'])}, 600_000)
+
+    def fail_before_dispatch(conn):
+        conn.execute('UPDATE push_jobs SET created_at=? WHERE job_id=?',
+                     (original['created_at'] + 1000, newer['job_id']))
+        conn.execute("UPDATE push_job_devices SET state='failed', failure_code='upload_failed' "
+                     "WHERE job_id=?", (newer['job_id'],))
+
+    await manager.store._call(fail_before_dispatch)
+    current = await manager.get_snapshot(original['job_id'])
+    assert current['devices']['failed']['retryable'] is True

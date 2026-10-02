@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 import java.util.UUID
 
 class PushJobCoordinatorStateTest {
@@ -80,6 +81,111 @@ class PushJobCoordinatorStateTest {
         assertTrue(budget.onFailure())
         repeat(4) { assertTrue(budget.onAttemptFailed()) }
         assertFalse(budget.onAttemptFailed())
+    }
+
+    @Test
+    fun `persistence incident refreshes unavailable and recovered registration once`() {
+        val command = command()
+        val current = PushProtocol.State(
+            active = PushProtocol.Active(command, PushProtocol.PHASE_APPLYING),
+            pendingResults = emptyList(),
+            completedReceipts = emptyList(),
+        )
+        val terminalResult = PushProtocol.Result(
+            jobId = command.jobId,
+            attempt = command.attempt,
+            status = "success",
+            destPath = command.destPath,
+        )
+        val terminal = PushProtocol.Receipt(command, terminalResult)
+        val terminalState = current.copy(
+            active = null,
+            pendingResults = listOf(terminal),
+            completedReceipts = listOf(terminal),
+        )
+        val execution = PushFilesWorker.Execution(terminalResult, File("unused"))
+
+        var state = current
+        var unsavedTerminal: Pair<PushProtocol.Command, PushFilesWorker.Execution>? = null
+        var leaseReleased = false
+        var registrationRefreshes = 0
+        val availability = PushStateAvailability(initiallyAvailable = true)
+        val requestRegistrationRefresh: () -> Unit = { registrationRefreshes++ }
+
+        // A registration payload may already have been built with available status.
+        val previouslyBuiltRegistration = buildPushRegistrationFields(
+            current,
+            durabilityAvailable = availability.available,
+            processInstanceId = UUID.randomUUID().toString(),
+            validatedOffset = { 0L },
+        )
+        assertEquals("available", previouslyBuiltRegistration.getJSONObject("push_state").getString("status"))
+
+        val firstSave = persistPushStateBeforePublishing(
+            terminalState,
+            save = { throw IllegalStateException("disk full") },
+            afterPublish = { leaseReleased = true },
+            publish = { state = it },
+        )
+        assertFalse(firstSave)
+        unsavedTerminal = command to execution
+        availability.update(false, requestRegistrationRefresh)
+
+        assertSame(current, state)
+        assertSame(execution, unsavedTerminal?.second)
+        assertFalse(leaseReleased)
+        assertEquals(1, registrationRefreshes)
+        val unavailable = buildPushRegistrationFields(
+            state,
+            durabilityAvailable = availability.available,
+            processInstanceId = UUID.randomUUID().toString(),
+            validatedOffset = { 0L },
+        )
+        assertEquals(0, unavailable.getJSONArray("capabilities").length())
+        assertEquals("unavailable", unavailable.getJSONObject("push_state").getString("status"))
+        assertEquals(
+            command.jobId,
+            unavailable.getJSONObject("push_runtime").getJSONObject("active").getString("job_id"),
+        )
+
+        // More failed writes in the same incident do not trigger reconnect loops.
+        assertFalse(persistPushStateBeforePublishing(
+            terminalState,
+            save = { throw IllegalStateException("disk still full") },
+            afterPublish = { leaseReleased = true },
+            publish = { state = it },
+        ))
+        availability.update(false, requestRegistrationRefresh)
+        assertEquals(1, registrationRefreshes)
+        assertSame(execution, unsavedTerminal?.second)
+        assertFalse(leaseReleased)
+
+        assertEquals(
+            PushStateRecoveryAction.SaveUnsavedTerminal,
+            decidePushStateRecovery(stateLoaded = true, hasUnsavedTerminal = true),
+        )
+        val recovered = persistPushStateBeforePublishing(
+            terminalState,
+            save = { terminalState },
+            afterPublish = { leaseReleased = true },
+            publish = { state = it },
+        )
+        assertTrue(recovered)
+        unsavedTerminal = null
+        availability.update(true, requestRegistrationRefresh)
+
+        assertSame(terminalState, state)
+        assertSame(null, unsavedTerminal)
+        assertTrue(leaseReleased)
+        assertEquals(2, registrationRefreshes)
+        val available = buildPushRegistrationFields(
+            state,
+            durabilityAvailable = availability.available,
+            processInstanceId = UUID.randomUUID().toString(),
+            validatedOffset = { 0L },
+        )
+        assertEquals("available", available.getJSONObject("push_state").getString("status"))
+        assertEquals(2, available.getJSONArray("capabilities").length())
     }
 
     @Test
@@ -311,6 +417,52 @@ class PushJobCoordinatorStateTest {
 
         assertTrue(settled == null)
         assertSame(command, state.active?.command)
+    }
+
+    @Test
+    fun `reconcile is not answered absent before durable state is loaded`() {
+        val command = command()
+        val identity = PushProtocol.ReconcileIdentity(
+            requireNotNull(command.jobId),
+            command.attempt,
+            command.artifactId,
+        )
+        val empty = PushProtocol.State(null, emptyList(), emptyList())
+
+        assertEquals(null, buildPushReconcileReply(empty, stateLoaded = false, identity) { 0L })
+
+        val absent = requireNotNull(buildPushReconcileReply(empty, stateLoaded = true, identity) { 0L })
+        assertEquals("PUSH_RECONCILE_REPORT", absent.getString("type"))
+        assertEquals("absent", absent.getString("status"))
+        assertEquals(command.artifactId, absent.getString("artifact_id"))
+    }
+
+    @Test
+    fun `loaded reconcile reports active work and replays a settled receipt`() {
+        val active = PushProtocol.Active(command().copy(revision = 7L), PushProtocol.PHASE_DOWNLOADING)
+        val activeIdentity = PushProtocol.ReconcileIdentity(
+            requireNotNull(active.command.jobId),
+            active.command.attempt,
+            null,
+        )
+        val activeState = PushProtocol.State(active, emptyList(), emptyList())
+        val activeReply = requireNotNull(
+            buildPushReconcileReply(activeState, stateLoaded = true, activeIdentity) { 41L },
+        )
+        assertEquals("active", activeReply.getString("status"))
+        assertEquals(41L, activeReply.getLong("validated_offset"))
+
+        val settled = receipt()
+        val settledIdentity = PushProtocol.ReconcileIdentity(
+            requireNotNull(settled.command.jobId),
+            settled.command.attempt,
+            settled.command.artifactId,
+        )
+        val settledState = PushProtocol.State(null, emptyList(), listOf(settled))
+        val settledReply = requireNotNull(
+            buildPushReconcileReply(settledState, stateLoaded = true, settledIdentity) { 0L },
+        )
+        assertEquals(settled.result.toJson().toString(), settledReply.toString())
     }
 
     @Test

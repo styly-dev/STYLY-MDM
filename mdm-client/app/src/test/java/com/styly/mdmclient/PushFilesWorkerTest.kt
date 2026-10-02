@@ -168,6 +168,167 @@ class PushFilesWorkerTest {
     }
 
     @Test
+    fun `unexpected status on a resumed request interrupts and preserves the partial without retry`() {
+        val archive = zip("content.txt" to "unexpected-resume-status").readBytes()
+        val split = archive.size / 2
+        val work = File(tmp.root, "unexpected-resume-status-work")
+        val command = command(
+            artifactSize = archive.size.toLong(),
+            artifactSha256 = sha256(archive),
+        ).copy(revision = 7L)
+        val partial = archive.copyOfRange(0, split)
+        seedResume(work, command, partial)
+        var retryCount = 0
+
+        // No ETag: the status must be classified before any validator check.
+        OneShotServer(status = 403, headers = "Content-Length: 0").use { server ->
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+                retryDelay = { retryCount++ },
+            ).execute(
+                command.copy(artifactUrl = server.url),
+                PushFilesWorker.Callbacks({}, {}, {}),
+            )
+
+            assertEquals("download_failed", execution.result.failureCode)
+            assertTrue(execution.interrupted)
+            assertEquals("download_retry_exhausted", execution.interruptionReason)
+            assertEquals(0, retryCount)
+            assertTrue(server.request.contains("Range: bytes=$split-"))
+            assertArrayEquals(partial, File(work, "artifact.part").readBytes())
+        }
+    }
+
+    @Test
+    fun `unexpected initial status is a download failure, not an identity mismatch`() {
+        val archive = zip("content.txt" to "unexpected-initial-status").readBytes()
+        val work = File(tmp.root, "unexpected-initial-status-work")
+        var retryCount = 0
+
+        OneShotServer(status = 401, headers = "Content-Length: 0").use { server ->
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+                retryDelay = { retryCount++ },
+            ).execute(
+                command(
+                    artifactUrl = server.url,
+                    artifactSize = archive.size.toLong(),
+                    artifactSha256 = sha256(archive),
+                ).copy(revision = 7L),
+                PushFilesWorker.Callbacks({}, {}, {}),
+            )
+
+            assertEquals("fail", execution.result.status)
+            assertEquals("download_failed", execution.result.failureCode)
+            assertFalse(execution.interrupted)
+            assertEquals(0, retryCount)
+        }
+    }
+
+    @Test
+    fun `resume without a stored etag is an identity failure`() {
+        val archive = zip("content.txt" to "missing-stored-etag").readBytes()
+        val work = File(tmp.root, "missing-stored-etag-work")
+        val command = command(
+            // Never contacted: the request is refused before it is sent.
+            artifactUrl = "http://127.0.0.1:1/artifact.zip",
+            artifactSize = archive.size.toLong(),
+            artifactSha256 = sha256(archive),
+        ).copy(revision = 7L)
+        seedResume(work, command, archive.copyOfRange(0, archive.size / 2), etag = "")
+
+        val execution = PushFilesWorker(
+            hasExternalStorageAccess = { true },
+            attemptDirectoryProvider = { work },
+            retryDelay = {},
+        ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+
+        assertEquals("fail", execution.result.status)
+        assertEquals("artifact_identity_mismatch", execution.result.failureCode)
+        assertFalse(execution.interrupted)
+    }
+
+    @Test
+    fun `retry backoff starts over after a retry received artifact bytes`() {
+        val archive = zip("content.txt" to "backoff-reset").readBytes()
+        val split = archive.size / 2
+        val destination = tmp.newFolder("backoff-reset-destination")
+        val work = File(tmp.root, "backoff-reset-work")
+        val delays = mutableListOf<Long>()
+        fun response(head: String, body: ByteArray = byteArrayOf()) =
+            head.toByteArray(Charsets.US_ASCII) to body
+        val unavailable = response("HTTP/1.1 503 Retry\r\nContent-Length: 0\r\n")
+        val remaining = archive.copyOfRange(split, archive.size)
+
+        ScriptedServer(
+            listOf(
+                unavailable,
+                unavailable,
+                unavailable,
+                unavailable,
+                // Delivers half of the body, then the connection drops.
+                response(
+                    "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nContent-Length: ${archive.size}\r\n",
+                    archive.copyOfRange(0, split),
+                ),
+                unavailable,
+                response(
+                    "HTTP/1.1 206 Partial Content\r\nETag: \"v1\"\r\n" +
+                        "Content-Range: bytes $split-${archive.lastIndex}/${archive.size}\r\n" +
+                        "Content-Length: ${remaining.size}\r\n",
+                    remaining,
+                ),
+            ),
+        ).use { server ->
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+                destinationProvider = { destination },
+                retryDelay = { delay -> delays += delay },
+            ).execute(
+                command(
+                    artifactUrl = server.url,
+                    artifactSize = archive.size.toLong(),
+                    artifactSha256 = sha256(archive),
+                ),
+                PushFilesWorker.Callbacks({}, {}, {}),
+            )
+
+            assertEquals("success", execution.result.status)
+            assertEquals(listOf(1_000L, 2_000L, 4_000L, 8_000L, 1_000L, 2_000L), delays)
+            assertEquals("backoff-reset", File(destination, "content.txt").readText())
+        }
+    }
+
+    /** Serves one scripted response (headers without the blank line, then body) per connection. */
+    private class ScriptedServer(
+        private val responses: List<Pair<ByteArray, ByteArray>>,
+    ) : AutoCloseable {
+        private val server = ServerSocket(0, responses.size, InetAddress.getLoopbackAddress())
+        val url = "http://127.0.0.1:${server.localPort}/artifact.zip"
+        private val thread = Thread({
+            responses.forEach { (head, body) ->
+                server.accept().use { client ->
+                    val reader = client.getInputStream().bufferedReader(Charsets.US_ASCII)
+                    while (reader.readLine()?.isNotEmpty() == true) Unit
+                    val output = client.getOutputStream()
+                    output.write(head)
+                    output.write("Connection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                    output.write(body)
+                    output.flush()
+                }
+            }
+        }, "push-worker-scripted-test-http").apply { start() }
+
+        override fun close() {
+            server.close()
+            thread.join(5_000)
+        }
+    }
+
+    @Test
     fun `partial storage open failure is nonretryable`() {
         val archive = zip("content.txt" to "storage-error").readBytes()
         val work = File(tmp.root, "storage-error-work")

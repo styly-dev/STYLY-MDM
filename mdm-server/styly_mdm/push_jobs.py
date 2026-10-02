@@ -134,6 +134,7 @@ class AssignmentActions:
     manual_wait: bool
     resume_required: bool
     cancellable: bool
+    retryable: bool
 
 
 def assignment_actions(
@@ -146,6 +147,8 @@ def assignment_actions(
     retried: bool,
     resume_supported: bool,
     blocking_fence: bool,
+    failure_code: str | None = None,
+    superseded: bool = False,
 ) -> AssignmentActions:
     """Single source of truth for per-assignment operator actions.
 
@@ -153,6 +156,9 @@ def assignment_actions(
     ``cancellable`` is the durable rule enforced by ``cancel_interrupted``; the
     runtime additionally refuses to cancel a reconciling assignment while its
     device is online, because that device can still report its outcome.
+    ``retryable`` is the rule ``retry_failed`` enforces before its online check.
+    A ``superseded`` target already has later work for the same destination, so
+    retrying it would overwrite newer content.
     """
 
     manual_wait = (
@@ -182,7 +188,14 @@ def assignment_actions(
             or (state == DeviceState.UNCONFIRMED.value and blocking_fence)
         )
     )
-    return AssignmentActions(manual_wait, resume_required, cancellable)
+    retryable = (
+        open_for_action
+        and not superseded
+        and state
+        in {DeviceState.FAILED.value, DeviceState.INTERRUPTED.value, DeviceState.UNCONFIRMED.value}
+        and failure_code != "cancelled"
+    )
+    return AssignmentActions(manual_wait, resume_required, cancellable, retryable)
 
 
 JOB_TRANSITIONS: Mapping[JobState, frozenset[JobState]] = {

@@ -174,15 +174,22 @@ class PushJobManager:
                 ).fetchone()
                 if original is None:
                     raise StoreNotFound(job_id)
-                targets = conn.execute(
-                    "SELECT * FROM push_job_devices d WHERE job_id=? "
-                    "AND cancel_requested_at IS NULL "
-                    "AND NOT EXISTS (SELECT 1 FROM push_jobs r JOIN push_job_devices rd ON rd.job_id=r.job_id "
-                    "WHERE r.retry_of_job_id=? AND rd.device_id=d.device_id) "
-                    "AND state IN ('failed','interrupted','unconfirmed') "
-                    "AND COALESCE(failure_code,'') <> 'cancelled' ORDER BY target_ordinal",
-                    (job_id, job_id),
-                ).fetchall()
+                # The snapshot's retryable flag is the single eligibility rule.
+                eligible = {
+                    device_id
+                    for device_id, assignment in self.store._snapshot(conn, job_id)[
+                        "devices"
+                    ].items()
+                    if assignment["retryable"]
+                }
+                targets = [
+                    row
+                    for row in conn.execute(
+                        "SELECT * FROM push_job_devices WHERE job_id=? ORDER BY target_ordinal",
+                        (job_id,),
+                    )
+                    if row["device_id"] in eligible
+                ]
                 if not targets:
                     raise StoreConflict("job has no unsuccessful targets to retry")
                 targets = [target for target in targets if target["device_id"] in online]
@@ -461,7 +468,7 @@ class PushJobManager:
                 """
                 SELECT job_id, device_id, attempt, accept_deadline
                 FROM push_job_devices
-                WHERE state=? AND accepted_at IS NULL AND accept_deadline IS NOT NULL
+                WHERE state=? AND accept_deadline IS NOT NULL
                   AND accept_deadline<=?
                 ORDER BY accept_deadline, enqueue_seq
                 """,
@@ -483,14 +490,15 @@ class PushJobManager:
 
         The accept deadline is the durable dispatch token. Keeping and comparing it
         prevents a stale housekeeping row from changing a later replay of the same
-        job/attempt.
+        job/attempt. Resume retains accepted_at from the original worker, so that
+        history does not prove acceptance of the current dispatch.
         """
 
         def op(conn: sqlite3.Connection) -> tuple[bool, dict[str, Any]]:
             self.store._begin(conn)
             try:
                 row = conn.execute(
-                    "SELECT state, accepted_at, accept_deadline, reconciliation_reason "
+                    "SELECT state, accept_deadline, reconciliation_reason "
                     "FROM push_job_devices WHERE job_id=? AND device_id=?",
                     (job_id, device_id),
                 ).fetchone()
@@ -500,7 +508,6 @@ class PushJobManager:
                 exact_deadline = row["accept_deadline"] == expected_accept_deadline
                 if (
                     current is DeviceState.RECONCILING
-                    and row["accepted_at"] is None
                     and exact_deadline
                     and row["reconciliation_reason"] == "command_accept_timeout"
                 ):
@@ -509,7 +516,6 @@ class PushJobManager:
                     return False, snapshot
                 if (
                     current is not DeviceState.DISPATCHING
-                    or row["accepted_at"] is not None
                     or not exact_deadline
                 ):
                     raise StoreConflict("accept deadline no longer owns dispatch")
@@ -1550,10 +1556,12 @@ class PushJobManager:
                     if target is None:
                         raise StoreConflict("invalid active phase")
                     validate_device_transition(current, target)
+                    # Running work consumes any pending Resume authorization; a later
+                    # interruption must wait for a new one.
                     conn.execute(
                         "UPDATE push_job_devices SET state=?, accepted_at=COALESCE(accepted_at, ?), "
                         "accept_deadline=NULL, reconciliation_reason=NULL, "
-                        "reconciliation_deadline=NULL, updated_at=? "
+                        "reconciliation_deadline=NULL, queue_reason=NULL, updated_at=? "
                         "WHERE job_id=? AND device_id=?",
                         (target.value, timestamp, timestamp, job_id, device_id),
                     )

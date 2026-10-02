@@ -410,3 +410,22 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
         assert replayed["devices"]["D1"]["validated_offset"] == 3
     finally:
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_artifact_http_rejects_bytes_with_wrong_size(artifact_runtime):
+    runtime, artifact_id, _digest, payload = artifact_runtime
+    (runtime.artifacts.artifact_root / f"{artifact_id}.zip").write_bytes(payload[:4])
+    lease = runtime.leases.issue(TransferKey("push", "D1", "job", 1), artifact_id).token
+    app = web.Application()
+    app.router.add_get("/artifacts/{artifact_id}", runtime.artifact_handler)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        async with aiohttp.ClientSession() as client:
+            url = f"http://{server.host}:{server.port}/artifacts/{artifact_id}?lease={lease}"
+            response = await asyncio.wait_for(client.get(url), timeout=2)
+            # Never declare a Content-Length the truncated file cannot fill.
+            assert response.status == 404
+    finally:
+        await server.close()

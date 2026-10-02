@@ -13,9 +13,24 @@ class PushJobStoreLoadTest {
         val result = loadPushState(
             readText = { throw FileNotFoundException("missing") },
             normalize = { it },
+            fileExists = { false },
         )
 
         assertSame(PushStateLoadResult.Missing, result)
+    }
+
+    @Test
+    fun existingFileThatCannotBeOpenedIsUnreadableNotMissing() {
+        // EACCES and EMFILE surface as FileNotFoundException even though state exists.
+        val failure = FileNotFoundException("state.json: open failed: EACCES (Permission denied)")
+        val result = loadPushState(
+            readText = { throw failure },
+            normalize = { it },
+            fileExists = { true },
+        )
+
+        assertTrue(result is PushStateLoadResult.Unreadable)
+        assertSame(failure, (result as PushStateLoadResult.Unreadable).error)
     }
 
     @Test
@@ -24,6 +39,7 @@ class PushJobStoreLoadTest {
         val result = loadPushState(
             readText = { throw failure },
             normalize = { it },
+            fileExists = { true },
         )
 
         assertTrue(result is PushStateLoadResult.Unreadable)
@@ -35,6 +51,7 @@ class PushJobStoreLoadTest {
         val result = loadPushState(
             readText = { "{\"active\":null,\"pending_results\":[],\"completed_receipts\":[]}" },
             normalize = { it },
+            fileExists = { true },
         )
 
         assertTrue(result is PushStateLoadResult.Valid)
@@ -49,6 +66,7 @@ class PushJobStoreLoadTest {
         val result = loadPushState(
             readText = { "not-json" },
             normalize = { it },
+            fileExists = { true },
         )
 
         assertTrue(result is PushStateLoadResult.Corrupt)
@@ -62,6 +80,7 @@ class PushJobStoreLoadTest {
                     "\"pending_results\":[],\"completed_receipts\":[]}"
             },
             normalize = { it },
+            fileExists = { true },
         )
 
         assertTrue(result is PushStateLoadResult.Corrupt)
@@ -75,6 +94,7 @@ class PushJobStoreLoadTest {
                     "\"pending_results\":[],\"completed_receipts\":[]}"
             },
             normalize = { it },
+            fileExists = { true },
         )
 
         assertTrue(result is PushStateLoadResult.Corrupt)
