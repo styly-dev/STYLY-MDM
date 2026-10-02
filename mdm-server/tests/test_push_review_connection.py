@@ -858,6 +858,8 @@ async def test_ready_job_can_be_dispatched_with_existing_job_id(tmp_path):
         runtime.scheduler = Scheduler()
         runtime.admin_send_timeout = 1
         runtime.legacy = types.SimpleNamespace(MAX_CONCURRENT_TRANSFERS=5, devices={})
+        runtime.manager = manager
+        runtime.sessions = {device_id: object() for device_id in ready["devices"]}
         published = []
 
         async def publish(snapshot):
@@ -903,6 +905,8 @@ async def test_dispatch_ack_timeout_still_wakes_scheduler_and_closes_admin(tmp_p
         runtime.scheduler = Scheduler()
         runtime.admin_send_timeout = 0.01
         ws = BlockingWs()
+        runtime.manager = manager
+        runtime.sessions = {device_id: object() for device_id in ready["devices"]}
         runtime.legacy = types.SimpleNamespace(
             MAX_CONCURRENT_TRANSFERS=5,
             devices={},

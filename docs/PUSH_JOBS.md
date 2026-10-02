@@ -183,6 +183,18 @@ Resume before receiving a new token.
 
 ## Operator controls
 
+- **Offline devices never start queued work by reconnecting.** Job creation and
+  Retry failed devices accept only online targets, and the initial dispatch of a
+  job skips any target that went offline while the job was uploading. When a
+  device disconnects, or is offline when its queue turn arrives, its queued or
+  slot-waiting work in a dispatch-enabled job is settled at once
+  (`settle_offline_before_dispatch`): never-dispatched work fails with
+  `device_offline_before_dispatch` (the operator can Retry it), while an assignment
+  that was already dispatched and waits to resume returns to a manual
+  `device_offline` wait (**Resume required**), keeping its identity and the device's
+  validated partial. Existing manual waits and pending cancellations are
+  unchanged. Work the device has already accepted (downloading, validating,
+  applying) is not stopped by a management WebSocket disconnect.
 - **Resume** is available only for online devices. **Resume all** excludes offline
   devices, preserving their manual wait and Needs attention entry. Offline timed-out
   devices support **Cancel** only; reconnect alone never grants resume permission.
@@ -216,10 +228,11 @@ Resume before receiving a new token.
   The console only combines them with live connectivity: Resume needs an online
   device, and a reconciling assignment is cancellable only while its device is
   offline. Targets already moved to a retry job expose no actions.
-- **Retry failed devices** creates and dispatches a new job for `failed`,
+- **Retry failed devices** creates and dispatches a new job for online `failed`,
   `interrupted`, and `unconfirmed` targets, excluding `failure_code: cancelled`.
   It reuses the immutable artifact without upload and leaves success records and
-  device fences intact. Offline targets wait in the new queue; fenced targets wait
+  device fences intact. Offline targets are skipped and stay eligible for a later
+  Retry; the request fails when no eligible target is online. Fenced targets wait
   for evidence that the previous worker is gone. Expired/missing artifacts require
   a new upload. The request UUID makes replay idempotent. Shared artifact retention
   is measured from the latest referencing terminal job, with active leases preserved.
@@ -447,8 +460,8 @@ sequenceDiagram
     end
     opt Operator retries failed targets
         B->>S: RETRY_FAILED_PUSH_JOB(job_id, request UUID)
-        S->>DB: new job + unsuccessful targets + shared artifact lease
-        Note over S,D: Successful/cancelled targets excluded; fences remain
+        S->>DB: new job + unsuccessful online targets + shared artifact lease
+        Note over S,D: Successful/cancelled/offline targets excluded; fences remain
     end
 ```
 
