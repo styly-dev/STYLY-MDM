@@ -27,7 +27,7 @@ def test_job_v1_command_uses_absolute_artifact_url():
         'devices': {'D1': {'attempt': 1}},
     }
     command = PushScheduler._command(
-        snapshot, 'D1', ProtocolMode.JOB_V1, 'http://10.0.0.2:7070',
+        snapshot, 'D1', 'http://10.0.0.2:7070',
     )
     assert command['artifact_url'] == 'http://10.0.0.2:7070/artifacts/artifact'
     assert command['bundle_url'] == command['artifact_url']

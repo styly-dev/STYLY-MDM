@@ -149,6 +149,10 @@ async def test_offline_cancel_preserves_fence_and_artifact_until_exact_cleanup(m
     assert await manager.claim_next(['D1']) is None
     await runtime._handle_reconcile_report(session, 'D1', {**identity, 'status': 'absent', 'artifact_id': str(uuid.uuid4())})
     assert await manager.claim_next(['D1']) is None
+    without_artifact = {key: value for key, value in identity.items() if key != 'artifact_id'}
+    for mismatch in (without_artifact, {**without_artifact, 'artifact_id': None}):
+        await runtime._handle_reconcile_report(session, 'D1', {**mismatch, 'status': 'absent'})
+        assert await manager.claim_next(['D1']) is None
     await runtime._handle_reconcile_report(session, 'D1', {**identity, 'status': 'absent'})
     assert (await manager.get_snapshot(active['job_id']))['devices']['D1']['failure']['code'] == 'cancelled'
     assert (await manager.claim_next(['D1']))['job']['job_id'] == next_job['job_id']

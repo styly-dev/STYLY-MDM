@@ -45,6 +45,7 @@ from .push_jobs import (
     parse_capabilities,
 )
 from .push_scheduler import LiveSession, PushScheduler
+from .server import parse_push_state_status
 from .transfer_registry import TransferKey, TransferRegistry
 from .push_transfer_leases import PushTransferLeases
 
@@ -874,13 +875,7 @@ class PushRuntime:
             return
         capabilities = parse_capabilities(payload.get("capabilities"))
         process_instance_id = _uuid_v4_or_none(payload.get("process_instance_id"))
-        push_state = payload.get("push_state")
-        push_state_status = (
-            push_state.get("status")
-            if isinstance(push_state, dict)
-            and push_state.get("status") in {"available", "unavailable"}
-            else None
-        )
+        push_state_status = parse_push_state_status(payload.get("push_state"))
         if CAP_PUSH_JOB_ID_V1 in capabilities and process_instance_id is None:
             # Do not advertise safety guarantees the peer cannot fulfill.
             capabilities = frozenset(
@@ -1029,25 +1024,36 @@ class PushRuntime:
             await self.publish(snapshot)
         if not registered:
             return
-        if self.scheduler is not None and push_state_status != "unavailable":
-            for pending in await self.manager.pending_cancellations_for_device(device_id):
-                try:
-                    await self.scheduler.send_exact_reconcile(
-                        session,
-                        pending["job_id"],
-                        pending["attempt"],
-                        pending["artifact_id"],
-                    )
-                except (ConnectionError, asyncio.TimeoutError):
-                    log.info(
-                        "Could not send pending Push cancellation reconciliation to %s",
-                        device_id,
-                        exc_info=True,
-                    )
+        if push_state_status != "unavailable":
+            await self._send_pending_cancellations(session)
         if needs_reconcile and command_allowed(self.legacy.devices.get(device_id)):
             await self.request_reconcile(device_id)
         if self.scheduler is not None:
             self.scheduler.wake()
+
+    async def _send_pending_cancellations(self, session: LiveSession) -> None:
+        """Ask the live owner to confirm every durable cancellation it still holds.
+
+        Callers skip this while the client's durable Push state is unavailable,
+        because its absence reports would not be authoritative.
+        """
+        if self.scheduler is None:
+            return
+        device_id = session.device_id
+        for pending in await self.manager.pending_cancellations_for_device(device_id):
+            try:
+                await self.scheduler.send_exact_reconcile(
+                    session,
+                    pending["job_id"],
+                    pending["attempt"],
+                    pending["artifact_id"],
+                )
+            except (ConnectionError, asyncio.TimeoutError):
+                log.info(
+                    "Could not send pending Push cancellation reconciliation to %s",
+                    device_id,
+                    exc_info=True,
+                )
 
     async def acknowledge_registration(
         self,
@@ -1284,12 +1290,8 @@ class PushRuntime:
                     )
                 session.capabilities = capabilities
                 runtime = payload.get("push_runtime")
-                push_state = payload.get("push_state")
                 push_status = (
-                    push_state.get("status")
-                    if isinstance(push_state, dict)
-                    and push_state.get("status") in {"available", "unavailable"}
-                    else "unavailable"
+                    parse_push_state_status(payload.get("push_state")) or "unavailable"
                 )
                 active_report = (
                     runtime.get("active") if isinstance(runtime, dict) else None
@@ -1315,21 +1317,8 @@ class PushRuntime:
                     self.legacy.save_registry()
             for snapshot in retry_snapshots:
                 await self.publish(snapshot)
-            if push_status == "available" and self.scheduler is not None:
-                for pending in await self.manager.pending_cancellations_for_device(device_id):
-                    try:
-                        await self.scheduler.send_exact_reconcile(
-                            session,
-                            pending["job_id"],
-                            pending["attempt"],
-                            pending["artifact_id"],
-                        )
-                    except (ConnectionError, asyncio.TimeoutError):
-                        log.info(
-                            "Could not send pending Push cancellation reconciliation to %s",
-                            device_id,
-                            exc_info=True,
-                        )
+            if push_status == "available":
+                await self._send_pending_cancellations(session)
             if (
                 self.scheduler is not None
                 and any(snapshot["dispatch_enabled"] for snapshot in retry_snapshots)
@@ -2003,18 +1992,15 @@ class PushRuntime:
         if assignment is None:
             return
         if assignment.get("cancel_requested_at") is not None:
+            # Only assignments dispatched with push_resume_v1 are cancellable, and
+            # those clients echo the requested artifact_id in every absent report.
+            # A missing, null, or mismatched artifact cannot clear the fence.
             reported_artifact = payload.get("artifact_id")
-            exact_artifact = reported_artifact == assignment.get("artifact_id")
-            legacy_absent_without_artifact = (
+            if (
                 status == "absent"
-                and "artifact_id" not in payload
-            )
-            if status == "absent" and (exact_artifact or legacy_absent_without_artifact):
-                # Older job-v1 clients reported an exact job/attempt as absent but
-                # did not know artifact_id. The caller has already verified the
-                # current WebSocket owner, and this frame carries the exact job and
-                # attempt. An explicit wrong/null artifact remains a mismatch and
-                # cannot clear the cancellation fence.
+                and isinstance(reported_artifact, str)
+                and reported_artifact == assignment.get("artifact_id")
+            ):
                 snapshots = await self.manager.confirm_cancel(job_id, device_id)
                 for snapshot in snapshots:
                     await self.publish(snapshot)
@@ -2176,50 +2162,7 @@ class PushRuntime:
                     await self.publish(await self.store.get_snapshot(job_id))
                     await self.publish(snapshot)
                 else:
-                    snapshot = await self.store.get_snapshot(job_id)
-                    targets = self._job_action_targets(payload)
-                    if targets is not None and not set(targets) <= snapshot["devices"].keys():
-                        raise StoreConflict("Cancel targets must belong to this job")
-                    errors = []
-                    for device_id in (targets if targets is not None else snapshot["devices"]):
-                        async with self._device_lock(device_id):
-                            try:
-                                session = self.sessions.get(device_id)
-                                before = await self.manager.assignment(job_id, device_id)
-                                if session and before and before["state"] == "reconciling" and before.get("cancel_requested_at") is None:
-                                    raise StoreConflict("Wait for the connected device to report interruption before cancelling")
-                                snapshot = await self.manager.cancel_interrupted(job_id, device_id)
-                                key = TransferKey("push", device_id, job_id, 1)
-                                token = self.leases.token(key)
-                                if token is not None:
-                                    await self.leases.expire(key, token)
-                                self.transfers.release_exact(key, "cancelled")
-                                assignment = await self.manager.assignment(job_id, device_id)
-                                if session and assignment and assignment["state"] == "queued":
-                                    await self._send_resume_rejected(
-                                        session, job_id=job_id, artifact_id=assignment["artifact_id"],
-                                        revision=assignment["dispatch_revision"],
-                                    )
-                                elif session and assignment and self.scheduler is not None:
-                                    await self.scheduler.send_exact_reconcile(session, job_id, assignment["attempt"],
-                                        assignment["artifact_id"], owner_lock_held=True)
-                            except StoreConflict as exc:
-                                errors.append(str(exc))
-                            except (ConnectionError, asyncio.TimeoutError):
-                                # Cancellation intent is durable even if the live
-                                # socket disappears while its reconciliation request
-                                # is sent. Publish it and continue processing other
-                                # targets; registration will retry the request.
-                                log.info(
-                                    "Could not send Push cancellation reconciliation to %s",
-                                    device_id,
-                                    exc_info=True,
-                                )
-                        await self.publish(snapshot)
-                    if errors:
-                        await asyncio.wait_for(ws.send_str(json.dumps({
-                            "type": "ERROR", "message": "; ".join(errors),
-                        })), self.admin_send_timeout)
+                    snapshot = await self._cancel_push_job(ws, job_id, payload)
                 if self.scheduler is not None:
                     self.scheduler.wake()
                 await asyncio.wait_for(ws.send_str(json.dumps({
@@ -2236,7 +2179,7 @@ class PushRuntime:
             try:
                 targets = self._job_action_targets(payload)
                 current = await self.store.get_snapshot(job_id)
-                if current["state"] in {"running", "reconciling"}:
+                if current["state"] in {JobState.RUNNING.value, JobState.RECONCILING.value}:
                     requested = targets if targets is not None else list(current["devices"])
                     if not set(requested) <= current["devices"].keys():
                         raise StoreConflict("Resume targets must belong to this job")
@@ -2326,6 +2269,88 @@ class PushRuntime:
                 await self.request_reconcile(device_id)
             return True
         return False
+
+    async def _cancel_push_job(
+        self, ws: Any, job_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Cancel each requested target and return the latest job snapshot.
+
+        A per-target conflict does not stop the remaining targets; conflicts are
+        reported to the admin together after every target was processed.
+        """
+        snapshot = await self.store.get_snapshot(job_id)
+        targets = self._job_action_targets(payload)
+        if targets is None:
+            targets = list(snapshot["devices"])
+        elif not set(targets) <= snapshot["devices"].keys():
+            raise StoreConflict("Cancel targets must belong to this job")
+        errors = []
+        for device_id in targets:
+            async with self._device_lock(device_id):
+                try:
+                    snapshot = await self._cancel_push_target(job_id, device_id)
+                except StoreConflict as exc:
+                    # Nothing changed for this target, so there is nothing to publish.
+                    errors.append(str(exc))
+                    continue
+            await self.publish(snapshot)
+        if errors:
+            await asyncio.wait_for(ws.send_str(json.dumps({
+                "type": "ERROR", "message": "; ".join(errors),
+            })), self.admin_send_timeout)
+        return snapshot
+
+    async def _cancel_push_target(self, job_id: str, device_id: str) -> dict[str, Any]:
+        """Persist one cancellation, stop its transfer, and ask the owner to confirm.
+
+        The caller holds the device lock. Raises StoreConflict when the target is
+        not cancellable.
+        """
+        session = self.sessions.get(device_id)
+        before = await self.manager.assignment(job_id, device_id)
+        if (
+            session is not None
+            and before is not None
+            and before["state"] == DeviceState.RECONCILING.value
+            and before.get("cancel_requested_at") is None
+        ):
+            raise StoreConflict(
+                "Wait for the connected device to report interruption before cancelling"
+            )
+        snapshot = await self.manager.cancel_interrupted(job_id, device_id)
+        key = TransferKey("push", device_id, job_id, 1)
+        token = self.leases.token(key)
+        if token is not None:
+            await self.leases.expire(key, token)
+        self.transfers.release_exact(key, "cancelled")
+        assignment = await self.manager.assignment(job_id, device_id)
+        if session is None or assignment is None:
+            return snapshot
+        try:
+            if assignment["state"] == DeviceState.QUEUED.value:
+                await self._send_resume_rejected(
+                    session,
+                    job_id=job_id,
+                    artifact_id=assignment["artifact_id"],
+                    revision=assignment["dispatch_revision"],
+                )
+            elif self.scheduler is not None:
+                await self.scheduler.send_exact_reconcile(
+                    session,
+                    job_id,
+                    assignment["attempt"],
+                    assignment["artifact_id"],
+                    owner_lock_held=True,
+                )
+        except (ConnectionError, asyncio.TimeoutError):
+            # Cancellation intent is durable even if the live socket disappears
+            # while its reconciliation request is sent; registration retries it.
+            log.info(
+                "Could not send Push cancellation reconciliation to %s",
+                device_id,
+                exc_info=True,
+            )
+        return snapshot
 
     async def request_reconcile(self, device_id: str) -> None:
         session = self.sessions.get(device_id)
