@@ -178,7 +178,8 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
         assert paused["devices"]["D1"]["validated_offset"] == 1
         assert paused["dispatch_enabled"] is (reason is not None)
         assert paused["dispatch_paused_reason"] == (None if reason else "server_restart")
-        assert paused["devices"]["D1"]["queue_reason"] == (reason or "resumable_replay")
+        # Without a live operator Resume, evidence never authorizes dispatch.
+        assert paused["devices"]["D1"]["queue_reason"] == (reason or "dispatch_paused")
         assert await manager.claim_next(["D1"]) is None
         # Disconnect does not rewrite queued state: repeated REGISTER/reconcile
         # must retain it without a rejection or a revision change.
