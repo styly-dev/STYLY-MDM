@@ -89,7 +89,6 @@ class ArtifactStore:
             "display_filename": display_filename,
             "byte_size": byte_size,
             "sha256": sha256,
-            "etag": strong_etag(sha256),
             "entry_count": entry_count,
             "path": destination,
         }

@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -51,6 +52,16 @@ internal fun findPushReconcileReceipt(
 ): PushProtocol.Receipt? = state.pendingResults.firstOrNull { matches(it.command) }
     ?: state.completedReceipts.firstOrNull { matches(it.command) }
 
+private fun JSONObject.putActivePushFields(active: PushProtocol.Active, validatedOffset: Long) {
+    put("phase", active.phase)
+    put("status", if (active.interrupted) "interrupted" else "active")
+    put("revision", active.command.revision)
+    put("validated_offset", validatedOffset)
+    if (active.interrupted && active.interruptionReason != null) {
+        put("reason", active.interruptionReason)
+    }
+}
+
 internal fun buildActivePushReconcileReport(
     identity: PushProtocol.ReconcileIdentity,
     active: PushProtocol.Active,
@@ -60,13 +71,7 @@ internal fun buildActivePushReconcileReport(
     put("job_id", identity.jobId)
     put("attempt", identity.attempt)
     put("artifact_id", active.command.artifactId)
-    put("status", if (active.interrupted) "interrupted" else "active")
-    put("phase", active.phase)
-    put("revision", active.command.revision)
-    put("validated_offset", validatedOffset)
-    if (active.interrupted && active.interruptionReason != null) {
-        put("reason", active.interruptionReason)
-    }
+    putActivePushFields(active, validatedOffset)
 }
 
 /**
@@ -211,13 +216,7 @@ internal fun buildPushRegistrationFields(
                 put("job_id", active.command.jobId)
                 put("attempt", active.command.attempt)
                 put("artifact_id", active.command.artifactId)
-                put("phase", active.phase)
-                put("status", if (active.interrupted) "interrupted" else "active")
-                put("revision", active.command.revision)
-                put("validated_offset", validatedOffset(active.command))
-                if (active.interrupted && active.interruptionReason != null) {
-                    put("reason", active.interruptionReason)
-                }
+                putActivePushFields(active, validatedOffset(active.command))
             })
         }
     })
@@ -266,19 +265,6 @@ internal class PushStateResetNoticeTracker {
 }
 
 internal enum class PushStateRecoveryAction { Reload, SaveUnsavedTerminal, ResaveCurrent }
-
-/** Tracks the server-visible durability status and refreshes registration once per change. */
-internal class PushStateAvailability(initiallyAvailable: Boolean = false) {
-    @Volatile
-    var available: Boolean = initiallyAvailable
-        private set
-
-    fun update(nextAvailable: Boolean, onChanged: () -> Unit) {
-        if (available == nextAvailable) return
-        available = nextAvailable
-        onChanged()
-    }
-}
 
 /**
  * Chooses what an automatic durable-state retry does. Before durable state was ever
@@ -372,9 +358,7 @@ class PushJobCoordinator(
     private val processInstanceId = UUID.randomUUID().toString()
 
     private var state: PushProtocol.State = store.emptyState()
-    private val pushStateAvailability = PushStateAvailability()
-    private val durabilityAvailable: Boolean
-        get() = pushStateAvailability.available
+    private var durabilityAvailable = false
     /** True once durable state was loaded (or reset) and adopted; until then [state] is not authoritative. */
     private var stateLoaded = false
     private val recoveryBudget = PushStateRecoveryBudget(recoveryMaxAttempts)
@@ -556,7 +540,9 @@ class PushJobCoordinator(
     }
 
     private fun setDurabilityAvailable(available: Boolean) {
-        pushStateAvailability.update(available, ::requestRegistrationRefresh)
+        if (durabilityAvailable == available) return
+        durabilityAvailable = available
+        requestRegistrationRefresh()
     }
 
     private fun handleCommand(payload: JSONObject) {
@@ -756,9 +742,8 @@ class PushJobCoordinator(
         ) ?: return
         val (nextState, receipt) = settled
         val command = receipt.command
-        val result = receipt.result
         if (!persist(nextState, afterPublish = { gate.release(command) })) return
-        cleanupExecution(PushFilesWorker.Execution(result, attemptDirectory(command)))
+        cleanupExecution(attemptDirectory(command))
         send(JSONObject().apply {
             put("type", "PUSH_RECONCILE_REPORT")
             put("job_id", command.jobId)
@@ -837,7 +822,7 @@ class PushJobCoordinator(
     ) {
         unsavedTerminal = null
         if (!isCurrent(command)) {
-            cleanupExecution(execution)
+            cleanupExecution(execution.workDirectory)
             return
         }
         if (execution.interrupted) {
@@ -886,14 +871,14 @@ class PushJobCoordinator(
             unsavedTerminal = command to execution
             return
         }
-        cleanupExecution(execution)
+        cleanupExecution(execution.workDirectory)
         send(execution.result.toJson())
     }
 
-    private fun cleanupExecution(execution: PushFilesWorker.Execution) {
+    private fun cleanupExecution(workDirectory: File) {
         workerExecutor.execute {
             try {
-                worker.cleanup(execution)
+                worker.cleanup(workDirectory)
             } catch (error: Throwable) {
                 Log.w(TAG, "Could not clean Push/Sync attempt directory", error)
             }
@@ -1007,12 +992,7 @@ class PushJobCoordinator(
         // Keep resumable job-v1 work after a process restart. An exact EXECUTE
         // command is required before a worker can resume or apply it.
         gate.restore(state.active?.takeUnless { it.interrupted }?.command)
-        recovery.cleanupCommand?.let { command ->
-            cleanupExecution(PushFilesWorker.Execution(
-                PushProtocol.Result(command.jobId, command.attempt, "fail", command.destPath),
-                attemptDirectory(command),
-            ))
-        }
+        recovery.cleanupCommand?.let { command -> cleanupExecution(attemptDirectory(command)) }
         scheduleInterruptedExpiry(state.active)
         return true
     }
@@ -1051,7 +1031,7 @@ class PushJobCoordinator(
         if (!persist(nextState, afterPublish = { gate.release(command) })) {
             return ExpiredOwnership.PersistenceFailed
         }
-        cleanupExecution(PushFilesWorker.Execution(receipt.result, attemptDirectory(command)))
+        cleanupExecution(attemptDirectory(command))
         if (transportRegistered) send(receipt.result.toJson())
         return ExpiredOwnership.Settled
     }

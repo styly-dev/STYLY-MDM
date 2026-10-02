@@ -119,7 +119,9 @@ writes. After 60 seconds without such progress, it revokes the URL, aborts and a
 the matching HTTP handler, then releases that assignment's slot. A healthy transfer
 can continue beyond the previous 600-second timeout. Once revoked, the old URL cannot
 reconnect without a new operator-authorized Resume, so it cannot restart outside the
-slot limit. APK install and standalone Push through `/api/bundles` retain their
+slot limit. The accepted-work reconciliation deadline defers while this exact
+HTTP lease is live; the watchdog owns stalled-stream recovery. APK install and
+standalone Push through `/api/bundles` retain their
 existing timeout behavior; neither is a job-v1 fallback.
 
 If no artifact bytes arrive for 60 seconds, a resumable client persists interrupted
@@ -182,9 +184,7 @@ another download dispatch to release server ownership.
 General startup/periodic removal of unreferenced files belongs to Issue #92.
 Server restart rebuilds artifact-retention references from durable job/device rows
 before cleanup, so queued, active, reconciling, and resumable assignments keep their
-artifact bytes. In-memory HTTP transfer tokens are deliberately not recovered:
-restart invalidates old URLs, and the client retains its partial and waits for manual
-Resume before receiving a new token.
+artifact bytes. HTTP leases follow the restart behavior described above.
 
 ## Operator controls
 
@@ -269,9 +269,6 @@ Resume before receiving a new token.
   not leave stale entries. These registered devices are separate from provisional
   connection rows and never become provisional power-control targets.
 
-Older APKs cannot receive Push/Sync jobs from this server. Deploy the server and
-update clients while the old APK has no active Push/Sync transfer: its unscoped
-job-v1 artifact URLs are rejected after cutover.
 `CANCEL_PUSH_JOB` remains an admin action; clients receive the existing exact-identity
 `PUSH_RESUME_REJECTED` only after they report interrupted work. Only an `absent`
 reconciliation report from the current device owner that carries the exact job,
@@ -287,10 +284,10 @@ live eligible connection. Neither operation requires this Cancel action.
 Push/Sync uses three independent ownership mechanisms:
 
 - **Device execution ownership** remains held through validation and apply until a terminal result.
-- **Global transfer slot** is independent of the device WebSocket. A job-v1 slot is released when the client reports `PUSH_PHASE validating` after receiving all artifact bytes, on a matching terminal result, or when a reconnecting device registers an exact `validating`/`applying` phase after finishing the download offline; `PUSH_TRANSFER_COMPLETE` remains the post-SHA-256 checkpoint. If HTTP writes stop for 60 seconds before validation starts, the server revokes the assignment URL, aborts and awaits that HTTP handler, then releases the slot. Healthy job-v1 HTTP transfers have no 600-second cap.
+- **Global transfer slot** is independent of the device WebSocket. It is released on `PUSH_PHASE validating` before SHA-256, a matching terminal result, or an exact `validating`/`applying` registration after offline download completion. `PUSH_TRANSFER_COMPLETE` remains the post-SHA-256 checkpoint. The [HTTP lease watchdog](#resumable-artifact-transfer) bounds stalled transfers.
 - **Persistent device fence** blocks later jobs after an `unconfirmed` outcome until exact evidence proves the old worker is gone.
 
-The transfer registry uses typed keys. A job-v1 slot is addressed by `(job_id, device_id, attempt=1)`; a stale result cannot release a different job's slot. Job-v1 uses the existing server-wide transfer semaphore. APK install and standalone `/api/bundles` Push remain on their separate legacy path and keep its existing slot handling. Job-v1 HTTP URLs carry an in-memory assignment token; server restart invalidates it, so manual Resume is required to issue a replacement.
+The transfer registry uses typed keys. A job-v1 slot is addressed by `(job_id, device_id, attempt=1)`; a stale result cannot release a different job's slot. Job-v1 uses the existing server-wide transfer semaphore. APK install and standalone `/api/bundles` Push keep their separate legacy slot handling.
 
 The device queue is ordered by the server-wide monotonic `enqueue_seq`. A later enabled job cannot jump over an older non-terminal queued assignment merely because the older job is still uploading or has its dispatch gate paused. The console therefore keeps every dispatchable `ready`, `running`, or `reconciling` job with a closed gate in a stable attention panel; an uploaded `ready` job can be dispatched with its existing `job_id` even if the original browser send was lost.
 

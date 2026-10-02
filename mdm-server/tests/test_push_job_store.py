@@ -37,6 +37,16 @@ def canonical(client_request_id=None, targets=None):
     )
 
 
+async def prepare_job_v1_dispatch(manager, job_id):
+    return await manager.prepare_dispatch(
+        job_id,
+        "D1",
+        protocol_mode=ProtocolMode.JOB_V1,
+        live_capabilities={"push_job_id_v1"},
+        accept_deadline=now_ms() + 1000,
+    )
+
+
 @pytest.fixture
 def store(tmp_path):
     value = PushJobStore(tmp_path / "push_jobs.sqlite3")
@@ -177,7 +187,7 @@ async def test_terminal_result_wakes_canonical_aggregate(store, manager):
     })
     await store.enable_dispatch(job_id)
     await manager.claim_next(["D1"])
-    await store.mark_dispatching(job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000)
+    await prepare_job_v1_dispatch(manager, job_id)
     await store.transition_device(job_id, "D1", expected={DeviceState.DISPATCHING}, target=DeviceState.DOWNLOADING)
     await store.transition_device(job_id, "D1", expected={DeviceState.DOWNLOADING}, target=DeviceState.VALIDATING)
     await store.transition_device(job_id, "D1", expected={DeviceState.VALIDATING}, target=DeviceState.APPLYING)
@@ -226,8 +236,9 @@ async def test_failed_terminal_replay_requires_all_result_fields_to_match(store,
         "display_filename": "x.zip", "byte_size": 1, "sha256": "a" * 64, "entry_count": 1,
     })
     await store.enable_dispatch(job_id)
-    await PushJobManager(store).claim_next(["D1"])
-    await store.mark_dispatching(job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000)
+    manager = PushJobManager(store)
+    await manager.claim_next(["D1"])
+    await prepare_job_v1_dispatch(manager, job_id)
 
     accepted, reason, first = await store.settle_result(
         job_id, "D1", 1, "fail", **original
@@ -283,7 +294,7 @@ async def test_result_settlement_state_table_preserves_rejected_revision(
     await store.enable_dispatch(job_id)
     await manager.claim_next(["D1"])
     if state is not DeviceState.WAITING_TRANSFER:
-        await store.mark_dispatching(job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000)
+        await prepare_job_v1_dispatch(manager, job_id)
     if state in {DeviceState.DOWNLOADING, DeviceState.VALIDATING, DeviceState.APPLYING}:
         await store.transition_device(
             job_id, "D1", expected={DeviceState.DISPATCHING}, target=DeviceState.DOWNLOADING
@@ -364,7 +375,7 @@ async def test_unconfirmed_creates_persistent_fence_and_late_result_only_clears_
     })
     await store.enable_dispatch(job_id)
     await manager.claim_next(["D1"])
-    await store.mark_dispatching(job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000)
+    await prepare_job_v1_dispatch(manager, job_id)
     await store.mark_reconciling(job_id, "D1", expected={DeviceState.DISPATCHING}, reason="lost", deadline=now_ms())
     terminal = next(
         snapshot
@@ -398,7 +409,7 @@ async def test_process_replacement_clears_job_v1_fence_but_same_process_does_not
     })
     await store.enable_dispatch(job_id)
     await manager.claim_next(["D1"])
-    await store.mark_dispatching(job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000)
+    await prepare_job_v1_dispatch(manager, job_id)
     await store.mark_reconciling(job_id, "D1", expected={DeviceState.DISPATCHING}, reason="lost", deadline=now_ms())
     await manager.mark_unconfirmed(job_id, "D1", "process-a", "timeout")
     assert await manager.clear_fence_on_process_replacement("D1", "process-a", True) == []
@@ -456,7 +467,7 @@ async def test_reconcile_absent_clears_matching_fence_and_returns_exact_snapshot
     })
     await store.enable_dispatch(job_id)
     await manager.claim_next(["D1"])
-    await store.mark_dispatching(job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000)
+    await prepare_job_v1_dispatch(manager, job_id)
     await store.mark_reconciling(
         job_id, "D1", expected={DeviceState.DISPATCHING}, reason="lost", deadline=now_ms()
     )
@@ -485,7 +496,7 @@ async def test_clear_matching_fence_rejects_wrong_attempt_without_mutation(
     })
     await store.enable_dispatch(job_id)
     await manager.claim_next(["D1"])
-    await store.mark_dispatching(job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000)
+    await prepare_job_v1_dispatch(manager, job_id)
     await store.mark_reconciling(
         job_id, "D1", expected={DeviceState.DISPATCHING}, reason="lost", deadline=now_ms()
     )
@@ -526,9 +537,7 @@ def test_restart_recovery_uses_short_deadline_for_existing_preaccept_reconciliat
         })
         await first.enable_dispatch(job_id)
         await manager.claim_next(["D1"])
-        await first.mark_dispatching(
-            job_id, "D1", {"push_job_id_v1"}, now_ms() + 1000
-        )
+        await prepare_job_v1_dispatch(manager, job_id)
         await first.mark_reconciling(
             job_id,
             "D1",

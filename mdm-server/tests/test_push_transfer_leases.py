@@ -19,7 +19,6 @@ def test_transfer_with_progress_is_not_capped_at_ten_minutes(monkeypatch):
         future = asyncio.get_running_loop().create_future()
         scheduler = object.__new__(PushScheduler)
         scheduler.leases = leases
-        scheduler.transfer_timeout = 0.02
 
         waiting = asyncio.create_task(
             scheduler._wait_for_transfer_or_stall(lease, future)
@@ -27,7 +26,7 @@ def test_transfer_with_progress_is_not_capped_at_ten_minutes(monkeypatch):
         await asyncio.sleep(0)
 
         # Scale the idle window down for the test. Repeated progress keeps a
-        # transfer alive well beyond transfer_timeout, which used to be a hard cap.
+        # lease-owned transfer alive beyond a fixed total-duration cap.
         for _ in range(8):
             await asyncio.sleep(0.015)
             leases.progress(lease.token, 1024)

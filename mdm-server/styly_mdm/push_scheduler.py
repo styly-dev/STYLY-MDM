@@ -63,8 +63,7 @@ class PushScheduler:
         accept_timeout: float,
         accept_reconciliation_timeout: float,
         reconciliation_timeout: float,
-        transfer_timeout: float,
-        leases: PushTransferLeases | None = None,
+        leases: PushTransferLeases,
     ) -> None:
         self.manager = manager
         self.transfer_registry = transfer_registry
@@ -75,7 +74,6 @@ class PushScheduler:
         self.accept_timeout = accept_timeout
         self.accept_reconciliation_timeout = accept_reconciliation_timeout
         self.reconciliation_timeout = reconciliation_timeout
-        self.transfer_timeout = transfer_timeout
         self.leases = leases
         self._wake = asyncio.Event()
         self._runner: asyncio.Task[None] | None = None
@@ -157,8 +155,7 @@ class PushScheduler:
         current = self.transfer_registry.get(key)
         if current is not None and not current.done():
             return
-        if self.leases is not None:
-            self.leases.revoke_now(key)
+        self.leases.revoke_now(key)
 
     async def _run(self) -> None:
         while True:
@@ -273,7 +270,6 @@ class PushScheduler:
             if snapshot["devices"][device_id]["state"] != DeviceState.DISPATCHING.value:
                 self._clear_dispatch_waiters(key, transfer_future, accept_future)
                 return
-            lease: PushTransferLease | None = None
             try:
                 # REGISTER replacement, disconnect, final owner check, and send all
                 # share this per-device lock. The final assignment read and
@@ -288,18 +284,14 @@ class PushScheduler:
                     if assignment_now is None or assignment_now.get("cancel_requested_at") is not None:
                         self._clear_dispatch_waiters(key, transfer_future, accept_future)
                         return
-                    artifact = snapshot.get("artifact")
-                    if (
-                        self.leases is not None
-                        and isinstance(artifact, dict)
-                        and isinstance(artifact.get("artifact_id"), str)
-                    ):
-                        lease = self.leases.issue(key, artifact["artifact_id"])
+                    artifact = snapshot["artifact"]
+                    assert artifact is not None
+                    lease = self.leases.issue(key, artifact["artifact_id"])
                     command = self._command(
                         snapshot,
                         device_id,
                         session.http_base,
-                        lease_token=lease.token if lease is not None else None,
+                        lease_token=lease.token,
                     )
                     await asyncio.wait_for(
                         session.ws.send_str(json.dumps(command, separators=(",", ":"))),
@@ -342,40 +334,10 @@ class PushScheduler:
                 return
 
             try:
-                if lease is not None:
-                    while await self._wait_for_transfer_or_stall(
-                        lease, transfer_future
-                    ) and not await self._expire_stalled_transfer(lease, transfer_future):
-                        pass
-                else:
-                    await asyncio.wait_for(transfer_future, self.transfer_timeout)
-            except asyncio.TimeoutError:
-                # This is resource recovery only. The device execution remains owned
-                # and moves to reconciliation rather than becoming terminal.
-                active = await self.manager.active_assignment_for_device(device_id)
-                if active and active["job_id"] == job_id and active["attempt"] == attempt:
-                    current = DeviceState(active["state"])
-                    if current in {
-                        DeviceState.DISPATCHING,
-                        DeviceState.DOWNLOADING,
-                        DeviceState.VALIDATING,
-                        DeviceState.APPLYING,
-                    }:
-                        deadline = now_ms() + int(self.reconciliation_timeout * 1000)
-                        try:
-                            snapshot = await self.manager.mark_reconciling(
-                                job_id,
-                                device_id,
-                                expected={current},
-                                reason="transfer_timeout",
-                                deadline=deadline,
-                            )
-                            await self.publish(snapshot)
-                            live = self.sessions().get(device_id)
-                            if live is not None:
-                                await self.send_reconcile(live, snapshot, device_id)
-                        except (StoreConflict, ConnectionError, asyncio.TimeoutError):
-                            pass
+                while await self._wait_for_transfer_or_stall(
+                    lease, transfer_future
+                ) and not await self._expire_stalled_transfer(lease, transfer_future):
+                    pass
             finally:
                 self._clear_dispatch_waiters(key, transfer_future, accept_future)
 
@@ -389,7 +351,6 @@ class PushScheduler:
         Return True when the lease stalled or was revoked before ``future`` settled.
         """
 
-        assert self.leases is not None
         while not future.done():
             if not self.leases.is_current(lease):
                 return True
@@ -420,7 +381,6 @@ class PushScheduler:
         ``register``. A revoked lease therefore leaves no permit to protect.
         """
 
-        assert self.leases is not None
         key = lease.key
         if future.done() or self.transfer_registry.get(key) is not future:
             return True
@@ -615,7 +575,7 @@ class PushScheduler:
         job_id = snapshot["job_id"]
         attempt = snapshot["devices"][device_id]["attempt"]
         transfer_future = self.transfer_registry.get(key)
-        lease_token = self.leases.token(key) if self.leases is not None else None
+        lease_token = self.leases.token(key)
         try:
             outcome, payload = await asyncio.wait_for(accept_future, self.accept_timeout)
         except asyncio.TimeoutError:
@@ -656,7 +616,6 @@ class PushScheduler:
                     and transfer_future is not None
                     and not transfer_future.done()
                     and self.transfer_registry.get(key) is transfer_future
-                    and self.leases is not None
                     and lease_token is not None
                     and self.leases.token(key) == lease_token
                 )
@@ -889,18 +848,17 @@ class PushScheduler:
         device_id: str,
         http_base: str,
         *,
-        lease_token: str | None = None,
+        lease_token: str,
     ) -> dict[str, Any]:
         artifact = snapshot["artifact"]
         assert artifact is not None
         artifact_url = urljoin(http_base.rstrip("/") + "/", artifact["url"].lstrip("/"))
-        if lease_token is not None:
-            parts = urlsplit(artifact_url)
-            query = parse_qsl(parts.query, keep_blank_values=True)
-            query.append(("lease", lease_token))
-            artifact_url = urlunsplit(
-                (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
-            )
+        parts = urlsplit(artifact_url)
+        query = parse_qsl(parts.query, keep_blank_values=True)
+        query.append(("lease", lease_token))
+        artifact_url = urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+        )
         device = snapshot["devices"][device_id]
         assignment_revision = device.get("dispatch_revision")
         if not isinstance(assignment_revision, int):

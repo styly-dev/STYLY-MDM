@@ -395,7 +395,6 @@ class PushRuntime:
             accept_timeout=self.accept_timeout,
             accept_reconciliation_timeout=self.accept_reconciliation_timeout,
             reconciliation_timeout=self.reconciliation_timeout,
-            transfer_timeout=self.legacy.TRANSFER_TIMEOUT,
             leases=self.leases,
         )
         self.scheduler.start()

@@ -36,7 +36,7 @@ object PushProtocol {
         /**
          * Exact execution fingerprint, excluding the replaceable artifact URL. A zero
          * revision or missing ETag comes only from an Issue #91 server or from durable
-         * state migrated by [commandFromJson]; the server assigns a dispatch revision
+         * state migrated by [parseCommand]; the server assigns a dispatch revision
          * when it first redispatches such an assignment. Treating those two fields as
          * unknown lets a replay settle from the existing receipt or active execution
          * instead of being rejected as a conflict. Resume never relies on this: it
@@ -210,14 +210,6 @@ object PushProtocol {
         )
     }
 
-    fun commandFromJson(json: JSONObject): Command {
-        // State written before issue #94 had no revision. Keep it readable; only
-        // newly received job-v1 wire commands require the field strictly.
-        val migrated = JSONObject(json.toString())
-        if (migrated.has("job_id") && !migrated.has("revision")) migrated.put("revision", 0L)
-        return parseCommand(migrated)
-    }
-
     fun parseResultAck(payload: JSONObject): ResultAck {
         val jobId = requiredString(payload, "job_id")
         requireUuidV4(jobId, "job_id")
@@ -268,37 +260,26 @@ object PushProtocol {
         })
     }
 
-    fun stateFromJson(json: JSONObject): State = decodeState(json, failOnMalformedEntry = false)
-
-    internal fun stateFromJsonStrict(json: JSONObject): State =
-        decodeState(json, failOnMalformedEntry = true)
-
-    private fun decodeState(json: JSONObject, failOnMalformedEntry: Boolean): State {
+    fun stateFromJson(json: JSONObject): State {
         if (
-            failOnMalformedEntry && json.has("active") && !json.isNull("active") &&
+            json.has("active") && !json.isNull("active") &&
             json.optJSONObject("active") == null
         ) {
             throw IllegalArgumentException("malformed durable active state")
         }
-        val active = try {
-            json.optJSONObject("active")?.let {
-                Active(
-                    commandFromJson(it.getJSONObject("command")),
-                    it.getString("phase"),
-                    it.optBoolean("interrupted", false),
-                    it.optLong("interrupted_at", 0L).takeIf { value -> value > 0L },
-                    optionalString(it, "interruption_reason")?.ifBlank { null },
-                )
-            }
-        } catch (error: RuntimeException) {
-            if (failOnMalformedEntry) throw error
-            // A corrupt active record must not erase independently valid result receipts.
-            null
+        val active = json.optJSONObject("active")?.let {
+            Active(
+                parseCommand(it.getJSONObject("command")),
+                it.getString("phase"),
+                it.optBoolean("interrupted", false),
+                it.optLong("interrupted_at", 0L).takeIf { value -> value > 0L },
+                optionalString(it, "interruption_reason")?.ifBlank { null },
+            )
         }
         fun receipts(name: String): List<Receipt> {
             val parsed = json.optJSONArray(name)
             if (
-                failOnMalformedEntry && json.has(name) && !json.isNull(name) && parsed == null
+                json.has(name) && !json.isNull(name) && parsed == null
             ) {
                 throw IllegalArgumentException("malformed durable receipt collection: $name")
             }
@@ -307,31 +288,17 @@ object PushProtocol {
                 for (index in 0 until array.length()) {
                     val item = array.optJSONObject(index)
                     if (item == null) {
-                        if (failOnMalformedEntry) {
-                            throw IllegalArgumentException("malformed durable receipt")
-                        }
-                        continue
+                        throw IllegalArgumentException("malformed durable receipt")
                     }
                     val command = item.optJSONObject("command")
                     if (command == null) {
-                        if (failOnMalformedEntry) {
-                            throw IllegalArgumentException("malformed durable receipt command")
-                        }
-                        continue
+                        throw IllegalArgumentException("malformed durable receipt command")
                     }
                     val result = item.optJSONObject("result")
                     if (result == null) {
-                        if (failOnMalformedEntry) {
-                            throw IllegalArgumentException("malformed durable receipt result")
-                        }
-                        continue
+                        throw IllegalArgumentException("malformed durable receipt result")
                     }
-                    try {
-                        add(Receipt(commandFromJson(command), resultFromJson(result)))
-                    } catch (error: RuntimeException) {
-                        if (failOnMalformedEntry) throw error
-                        // One corrupt receipt must not erase valid durable state.
-                    }
+                    add(Receipt(parseCommand(command), resultFromJson(result)))
                 }
             }
         }
@@ -368,10 +335,12 @@ object PushProtocol {
         return longValue.toInt()
     }
 
+    internal fun isStrongEtag(value: String): Boolean =
+        value.isNotBlank() && !value.startsWith("W/") &&
+            value.startsWith("\"") && value.endsWith("\"") && value.length >= 2
+
     private fun validateStrongEtag(value: String) {
-        if (value.isBlank() || value.startsWith("W/") ||
-            !value.startsWith("\"") || !value.endsWith("\"") || value.length < 2
-        ) {
+        if (!isStrongEtag(value)) {
             throw malformed("artifact_etag must be a strong quoted ETag")
         }
     }

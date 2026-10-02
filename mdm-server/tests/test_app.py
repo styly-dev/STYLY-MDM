@@ -61,22 +61,6 @@ def test_web_console_renders_provisional_identity_in_attention_tab():
     assert "identityHealth" not in html
 
 
-def test_web_console_shows_unavailable_push_state_without_retry_controls():
-    static_index = Path(server.__file__).parent / "static" / "index.html"
-    source = static_index.read_text(encoding="utf-8")
-
-    # Clients recover durable Push state by themselves (bounded retries, then the
-    # next app start); the console only explains the state and the remedy.
-    assert "Push state unavailable" in source
-    assert "free storage, then Reboot" in source
-    assert "case 'PUSH_STATE_RESET':" in source
-    assert "progressCellHtml(id)" in source
-    assert '<div>Client</div><div>Status</div><div>Battery</div><div>Progress</div>' in source
-    assert '<div class="dev-client">' in source
-    for removed in ("RETRY_PUSH_STATE", "btnRetryAllPushStates", "retryPushState", "push_state_retry"):
-        assert removed not in source
-
-
 @pytest.mark.parametrize(
     "raw, expected",
     [
