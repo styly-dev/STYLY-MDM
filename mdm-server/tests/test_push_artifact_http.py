@@ -44,7 +44,7 @@ def artifact_runtime(tmp_path):
 @pytest.mark.asyncio
 async def test_artifact_http_range_etag_and_head(artifact_runtime):
     runtime, artifact_id, digest, payload = artifact_runtime
-    lease = runtime.leases.issue(TransferKey("push", "D1", "job", 1), artifact_id)
+    lease = runtime.leases.issue(TransferKey("push", "D1", "job", 1), artifact_id).token
     app = web.Application()
     app.router.add_get("/artifacts/{artifact_id}", runtime.artifact_handler)
     server = TestServer(app)
@@ -116,7 +116,7 @@ async def test_artifact_http_requires_a_scoped_lease(artifact_runtime):
             await response.read()
 
             key = TransferKey("push", "D1", "job", 1)
-            revoked_lease = runtime.leases.issue(key, artifact_id)
+            revoked_lease = runtime.leases.issue(key, artifact_id).token
             runtime.leases.revoke_now(key)
             response = await client.get(f"{url}?lease={revoked_lease}")
             assert response.status == 409
@@ -125,7 +125,7 @@ async def test_artifact_http_requires_a_scoped_lease(artifact_runtime):
 
             other_artifact_lease = runtime.leases.issue(
                 TransferKey("push", "D1", "other-job", 1), "some-other-artifact"
-            )
+            ).token
             response = await client.get(f"{url}?lease={other_artifact_lease}")
             assert response.status == 409
             assert response.headers["X-Push-Lease-Status"] == "revoked"
@@ -137,7 +137,7 @@ async def test_artifact_http_requires_a_scoped_lease(artifact_runtime):
 @pytest.mark.asyncio
 async def test_artifact_http_range_reconnect_replaces_busy_lease(artifact_runtime):
     runtime, artifact_id, _digest, payload = artifact_runtime
-    lease = runtime.leases.issue(TransferKey("push", "D1", "job", 1), artifact_id)
+    lease = runtime.leases.issue(TransferKey("push", "D1", "job", 1), artifact_id).token
     started = asyncio.Event()
     stopped = asyncio.Event()
     calls = 0
@@ -210,7 +210,7 @@ async def test_offline_cancel_revokes_http_lease_before_next_request(tmp_path):
         runtime.leases = PushTransferLeases()
         runtime.transfers = TransferRegistry(runtime.leases.revoke_now)
         key = TransferKey("push", "D1", active["job_id"], 1)
-        token = runtime.leases.issue(key, active["artifact"]["artifact_id"])
+        token = runtime.leases.issue(key, active["artifact"]["artifact_id"]).token
         future = asyncio.get_running_loop().create_future()
         runtime.transfers.register(key, future)
         started = asyncio.Event()
@@ -404,7 +404,7 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
             accept_deadline=now_ms() + 1000,
         )
         replayed = await manager.get_snapshot(job_id)
-        command = PushScheduler._command(replayed, "D1", ProtocolMode.JOB_V1, "http://server")
+        command = PushScheduler._command(replayed, "D1", "http://server")
         assert command["revision"] == immutable_revision
         assert replayed["revision"] > immutable_revision
         assert replayed["devices"]["D1"]["validated_offset"] == 3

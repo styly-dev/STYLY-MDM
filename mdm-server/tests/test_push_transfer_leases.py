@@ -15,14 +15,14 @@ def test_transfer_with_progress_is_not_capped_at_ten_minutes(monkeypatch):
         monkeypatch.setattr(push_scheduler, "_TRANSFER_IDLE_POLL_INTERVAL", 0.01)
         leases = PushTransferLeases()
         key = TransferKey("push", "D1", "job", 1)
-        token = leases.issue(key, "artifact")
+        lease = leases.issue(key, "artifact")
         future = asyncio.get_running_loop().create_future()
         scheduler = object.__new__(PushScheduler)
         scheduler.leases = leases
         scheduler.transfer_timeout = 0.02
 
         waiting = asyncio.create_task(
-            scheduler._wait_for_transfer_or_stall(key, future)
+            scheduler._wait_for_transfer_or_stall(lease, future)
         )
         await asyncio.sleep(0)
 
@@ -30,7 +30,7 @@ def test_transfer_with_progress_is_not_capped_at_ten_minutes(monkeypatch):
         # transfer alive well beyond transfer_timeout, which used to be a hard cap.
         for _ in range(8):
             await asyncio.sleep(0.015)
-            leases.progress(token, 1024)
+            leases.progress(lease.token, 1024)
         assert not waiting.done()
 
         future.set_result("download_complete")
@@ -44,7 +44,7 @@ def test_stalled_transfer_stops_http_stream_before_releasing_its_slot(monkeypatc
         monkeypatch.setattr(push_scheduler, "TRANSFER_IDLE_SECONDS", 0.01)
         key = TransferKey("push", "D1", "job", 1)
         leases = PushTransferLeases()
-        token = leases.issue(key, "artifact")
+        lease = leases.issue(key, "artifact")
         order = []
 
         class Transport:
@@ -86,11 +86,11 @@ def test_stalled_transfer_stops_http_stream_before_releasing_its_slot(monkeypatc
                 order.append("http_stream_stopped")
 
         stream = asyncio.create_task(stream_body())
-        assert await leases.claim("artifact", token, stream, Transport()) == "claimed"
+        assert await leases.claim("artifact", lease.token, stream, Transport()) == "claimed"
         await asyncio.sleep(0)
 
         await asyncio.sleep(0.02)
-        expired = await scheduler._expire_stalled_transfer(key, future, token)
+        expired = await scheduler._expire_stalled_transfer(lease, future)
 
         assert expired is True
         assert order == [
@@ -99,5 +99,33 @@ def test_stalled_transfer_stops_http_stream_before_releasing_its_slot(monkeypatc
             ("slot_released", True),
         ]
         assert future.result() == "transfer_stalled"
+
+    asyncio.run(scenario())
+
+
+def test_revoked_lease_releases_only_its_own_waiter(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(push_scheduler, "_TRANSFER_IDLE_POLL_INTERVAL", 0.01)
+        key = TransferKey("push", "D1", "job", 1)
+        leases = PushTransferLeases()
+        lease = leases.issue(key, "artifact")
+        scheduler = object.__new__(PushScheduler)
+        scheduler.leases = leases
+        scheduler.transfer_registry = TransferRegistry(leases.revoke_now)
+        future = asyncio.get_running_loop().create_future()
+        scheduler.transfer_registry.register(key, future)
+
+        waiting = asyncio.create_task(
+            scheduler._wait_for_transfer_or_stall(lease, future)
+        )
+        await asyncio.sleep(0.02)
+        assert not waiting.done()
+
+        # Cancellation revokes the lease before it releases the transfer slot.
+        leases.revoke_now(key)
+        assert await asyncio.wait_for(waiting, timeout=0.5) is True
+        assert not leases.is_current(lease)
+        assert await scheduler._expire_stalled_transfer(lease, future) is True
+        assert future.result() == "lease_missing"
 
     asyncio.run(scenario())

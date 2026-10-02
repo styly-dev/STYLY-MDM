@@ -237,6 +237,12 @@ _transfer_sem_loop: "asyncio.AbstractEventLoop | None" = None
 # Device registry (persistent, additive — never the identity key)
 # ---------------------------------------------------------------------------
 
+def parse_push_state_status(push_state) -> str | None:
+    """Return a device's reported durable Push state status, or None if malformed."""
+    status = push_state.get("status") if isinstance(push_state, dict) else None
+    return status if status in {"available", "unavailable"} else None
+
+
 def _coerce_record(value) -> dict | None:
     """Normalize a registry value into a record.
 
@@ -1511,13 +1517,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     socket_identity_kind = kind
                     capabilities = registration["capabilities"]
                     retry_supported = "push_state_retry_v1" in capabilities
-                    push_state = data.get("push_state")
-                    push_state_status = (
-                        push_state.get("status")
-                        if isinstance(push_state, dict)
-                        and push_state.get("status") in {"available", "unavailable"}
-                        else None
-                    )
+                    push_state_status = parse_push_state_status(data.get("push_state"))
                     devices[device_id] = {
                         "ws": ws,
                         "device_id": device_id,

@@ -205,7 +205,7 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
             assert await manager.get_snapshot(job_id) == before
             assert not replacement.done()
             assert runtime.transfers.get(key) is replacement
-        command = PushScheduler._command(before, "D1", ProtocolMode.JOB_V1, "http://server")
+        command = PushScheduler._command(before, "D1", "http://server")
         assert command["revision"] == report["revision"]
         assert command["artifact_id"] == report["artifact_id"]
         assert ws.messages == []

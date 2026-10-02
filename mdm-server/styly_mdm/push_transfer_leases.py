@@ -14,7 +14,7 @@ TRANSFER_IDLE_SECONDS = 60.0
 
 
 @dataclass(slots=True)
-class _Lease:
+class PushTransferLease:
     key: TransferKey
     artifact_id: str
     token: str
@@ -28,16 +28,20 @@ class PushTransferLeases:
     """An in-memory lease dies with the server process or its transfer slot."""
 
     def __init__(self) -> None:
-        self._by_key: dict[TransferKey, _Lease] = {}
-        self._by_token: dict[str, _Lease] = {}
+        self._by_key: dict[TransferKey, PushTransferLease] = {}
+        self._by_token: dict[str, PushTransferLease] = {}
 
-    def issue(self, key: TransferKey, artifact_id: str) -> str:
+    def issue(self, key: TransferKey, artifact_id: str) -> PushTransferLease:
         self.revoke_now(key)
         token = secrets.token_urlsafe(32)
-        lease = _Lease(key, artifact_id, token, time.monotonic())
+        lease = PushTransferLease(key, artifact_id, token, time.monotonic())
         self._by_key[key] = lease
         self._by_token[token] = lease
-        return token
+        return lease
+
+    def is_current(self, lease: PushTransferLease) -> bool:
+        """Return whether this exact lease has not been revoked or replaced."""
+        return self._by_key.get(lease.key) is lease
 
     def last_progress(self, key: TransferKey) -> float | None:
         lease = self._by_key.get(key)
