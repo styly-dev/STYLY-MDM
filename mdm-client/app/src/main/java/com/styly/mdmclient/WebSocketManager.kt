@@ -544,14 +544,60 @@ class WebSocketManager internal constructor(
     private fun sendRegistration(socket: WebSocket, identity: DeviceIdentityState) {
         if (registration.isSent(socket)) return
         if (identity is DeviceIdentityState.Ready) {
-            pushCoordinator.attachTransport(socket) { message ->
-                if (this@WebSocketManager.webSocket === socket && registration.isCanonicalAcknowledged(socket)) {
-                    val text = message.toString()
-                    Log.d(TAG, "Sending: $text")
-                    socket.send(text)
+            pushCoordinator.attachTransport(
+                socket,
+                send = { message ->
+                    if (this@WebSocketManager.webSocket === socket && registration.isCanonicalAcknowledged(socket)) {
+                        val text = message.toString()
+                        Log.d(TAG, "Sending: $text")
+                        socket.send(text)
+                    }
+                },
+                requestRegistrationRefresh = { refreshRegistrationAfterPushStateChange(socket) },
+            )
+        }
+        if (identity is DeviceIdentityState.Ready) {
+            pushCoordinator.registrationFields { pushFields ->
+                reconnectHandler.post {
+                    if (webSocket !== socket || registration.isSent(socket)) return@post
+                    sendRegistrationPayload(socket, identity, pushFields)
+                }
+            }
+        } else {
+            reconnectHandler.post {
+                if (webSocket !== socket) return@post
+                sendRegistrationPayload(socket, identity, null)
+            }
+        }
+    }
+
+    /**
+     * Push/Sync availability changed after [socket] sent REGISTER. Send a fresh REGISTER
+     * on the same socket; the server refreshes Push state in place and answers REGISTERED
+     * with the same session. Closing the socket instead would make the server settle the
+     * device as offline. If REGISTER has not been sent yet, an already queued payload
+     * send runs before this Handler task, while a later registration snapshot reads the
+     * updated state on the coordinator actor.
+     */
+    private fun refreshRegistrationAfterPushStateChange(socket: WebSocket) {
+        reconnectHandler.post {
+            if (webSocket !== socket || !registration.isSent(socket)) return@post
+            val identity = identityResolver.snapshot() as? DeviceIdentityState.Ready ?: return@post
+            pushCoordinator.registrationFields { pushFields ->
+                reconnectHandler.post {
+                    if (webSocket !== socket || !registration.isSent(socket)) return@post
+                    Log.i(TAG, "Refreshing registration after Push/Sync state change")
+                    sendRegistrationPayload(socket, identity, pushFields)
                 }
             }
         }
+    }
+
+    private fun sendRegistrationPayload(
+        socket: WebSocket,
+        identity: DeviceIdentityState,
+        pushFields: JSONObject?,
+    ) {
         val payload = JSONObject().apply {
             put("type", "REGISTER")
             put("identity_scheme", "styly_device_id_v1")
@@ -561,9 +607,9 @@ class WebSocketManager internal constructor(
             put("version_name", BuildConfig.VERSION_NAME)
             if (identity is DeviceIdentityState.Ready) {
                 put("device_id", identity.deviceId)
-                val pushFields = pushCoordinator.registrationFields()
-                put("process_instance_id", pushFields.getString("process_instance_id"))
+                put("process_instance_id", pushFields!!.getString("process_instance_id"))
                 put("capabilities", pushFields.getJSONArray("capabilities"))
+                put("push_state", pushFields.getJSONObject("push_state"))
                 put("push_runtime", pushFields.getJSONObject("push_runtime"))
                 val startupConfig = getStartupAppConfig()
                 if (startupConfig != null) {
@@ -584,12 +630,9 @@ class WebSocketManager internal constructor(
         }
         val text = payload.toString()
         Log.d(TAG, "Sending: $text")
-        // The reader may receive REGISTERED as soon as the send is queued.
         val canonical = identity is DeviceIdentityState.Ready
         if (canonical) registration.markSent(socket)
-        if (!socket.send(text) && canonical) {
-            registration.clearSent(socket)
-        }
+        if (!socket.send(text) && canonical) registration.clearSent(socket)
     }
 
     private fun commandContext(socket: WebSocket): CommandContext? {

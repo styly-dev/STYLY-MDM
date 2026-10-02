@@ -1,5 +1,6 @@
 package com.styly.mdmclient
 
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -17,6 +18,7 @@ class PushProtocolTest {
         put("artifact_url", "http://server/artifacts/value")
         put("artifact_size", 42)
         put("artifact_sha256", "a".repeat(64))
+        put("revision", 1)
         put("dest_path", "/sdcard/STYLY/content")
     }
 
@@ -77,7 +79,7 @@ class PushProtocolTest {
     }
 
     @Test
-    fun `malformed active does not erase valid durable receipts`() {
+    fun `malformed active invalidates the durable snapshot even when receipts are valid`() {
         val command = PushProtocol.parseCommand(payload())
         val result = PushProtocol.Result(
             jobId = command.jobId,
@@ -102,10 +104,47 @@ class PushProtocolTest {
             })
         }
 
-        val decoded = PushProtocol.stateFromJson(json)
+        assertThrows(IllegalArgumentException::class.java) {
+            PushProtocol.stateFromJson(json)
+        }
+    }
 
-        assertEquals(null, decoded.active)
-        assertEquals(listOf(receipt), decoded.pendingResults)
-        assertEquals(listOf(receipt), decoded.completedReceipts)
+    @Test
+    fun `interrupted retention timestamp survives state round trip`() {
+        val command = PushProtocol.parseCommand(payload())
+        val state = PushProtocol.State(
+            active = PushProtocol.Active(
+                command,
+                PushProtocol.PHASE_DOWNLOADING,
+                interrupted = true,
+                interruptedAt = 123456L,
+                interruptionReason = "download_retry_exhausted",
+            ),
+            pendingResults = emptyList(),
+            completedReceipts = emptyList(),
+        )
+
+        val decoded = PushProtocol.stateFromJson(PushProtocol.stateToJson(state))
+
+        assertTrue(decoded.active?.interrupted == true)
+        assertEquals(123456L, decoded.active?.interruptedAt)
+        assertEquals("download_retry_exhausted", decoded.active?.interruptionReason)
+    }
+
+    @Test
+    fun `durable issue 91 active command without revision remains readable`() {
+        val command = PushProtocol.parseCommand(payload()).toJson().apply { remove("revision") }
+        val state = JSONObject().apply {
+            put("active", JSONObject().apply {
+                put("command", command)
+                put("phase", PushProtocol.PHASE_DOWNLOADING)
+            })
+            put("pending_results", JSONArray())
+            put("completed_receipts", JSONArray())
+        }
+
+        val decoded = PushProtocol.stateFromJson(state)
+
+        assertEquals(0L, decoded.active?.command?.revision)
     }
 }

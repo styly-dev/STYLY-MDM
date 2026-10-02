@@ -382,7 +382,10 @@ def test_canonical_registration_is_new_device_and_does_not_settle_legacy_update(
                     "package_name": "com.styly.mdmclient",
                     "apk_filename": "",
                 })
-                await asyncio.sleep(0)
+                # A second REGISTER on the same socket is a message-order barrier:
+                # SELF_UPDATE_STARTING must finish before its acknowledgement.
+                await legacy.send_json({"type": "REGISTER", "device_id": "SERIAL-1", "model": "PICO", "version_code": 9})
+                await recv_type(legacy, "REGISTERED")
 
                 current = await session.ws_connect(base + "/ws/device")
                 await current.send_json(canonical())
@@ -408,7 +411,10 @@ def test_canonical_registration_is_new_device_and_does_not_settle_legacy_update(
                     "version_code": 9,
                 })
                 await recv_type(replacement_failed, "REGISTERED")
-                await asyncio.sleep(0)
+                # REGISTERED is sent before post-registration update settlement.
+                # The next same-socket acknowledgement proves that handler finished.
+                await replacement_failed.send_json({"type": "REGISTER", "device_id": "SERIAL-1", "model": "PICO", "version_code": 9})
+                await recv_type(replacement_failed, "REGISTERED")
                 assert "SERIAL-1" not in server.pending_self_updates
 
                 await replacement_failed.close()

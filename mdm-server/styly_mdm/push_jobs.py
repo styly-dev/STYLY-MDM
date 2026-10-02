@@ -50,6 +50,8 @@ except ImportError:  # Python 3.10
 CAP_PUSH_JOB_ID_V1 = "push_job_id_v1"
 CAP_PUSH_PROGRESS_V1 = "push_progress_v1"
 CAP_PUSH_RESUME_V1 = "push_resume_v1"
+# Every Push job target must advertise both; there is no non-resumable fallback.
+PUSH_JOB_CAPABILITIES = frozenset({CAP_PUSH_JOB_ID_V1, CAP_PUSH_RESUME_V1})
 
 
 class PushMode(StrEnum):
@@ -115,6 +117,85 @@ ACTIVE_DEVICE_STATES = frozenset(
         DeviceState.RECONCILING,
     }
 )
+
+# Per-device queue reasons that wait for an explicit operator Resume. The
+# scheduler never dispatches them on its own.
+MANUAL_WAIT_QUEUE_REASONS = frozenset(
+    {"download_retry_exhausted", "client_restarted", "dispatch_paused", "device_offline"}
+)
+# Constant SQL list literal for the reasons above (never built from input).
+MANUAL_WAIT_QUEUE_REASONS_SQL = (
+    "(" + ",".join(f"'{reason}'" for reason in sorted(MANUAL_WAIT_QUEUE_REASONS)) + ")"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AssignmentActions:
+    manual_wait: bool
+    resume_required: bool
+    cancellable: bool
+    retryable: bool
+
+
+def assignment_actions(
+    *,
+    job_state: str,
+    dispatch_enabled: bool,
+    state: str,
+    queue_reason: str | None,
+    cancel_requested: bool,
+    retried: bool,
+    resume_supported: bool,
+    blocking_fence: bool,
+    failure_code: str | None = None,
+    superseded: bool = False,
+) -> AssignmentActions:
+    """Single source of truth for per-assignment operator actions.
+
+    Snapshots expose these flags so the console never re-derives the rules.
+    ``cancellable`` is the durable rule enforced by ``cancel_interrupted``; the
+    runtime additionally refuses to cancel a reconciling assignment while its
+    device is online, because that device can still report its outcome.
+    ``retryable`` is the rule ``retry_failed`` enforces before its online check.
+    A ``superseded`` target already has later work for the same destination, so
+    retrying it would overwrite newer content.
+    """
+
+    manual_wait = (
+        state in {DeviceState.QUEUED.value, DeviceState.RECONCILING.value}
+        and queue_reason in MANUAL_WAIT_QUEUE_REASONS
+    )
+    # Pending cancellation and targets moved to a retry job need no action here.
+    open_for_action = not cancel_requested and not retried
+    resume_required = (
+        open_for_action
+        and state not in TERMINAL_DEVICE_STATES
+        and (
+            manual_wait
+            or (
+                not dispatch_enabled
+                and job_state
+                in {JobState.READY.value, JobState.RUNNING.value, JobState.RECONCILING.value}
+            )
+        )
+    )
+    cancellable = (
+        open_for_action
+        and resume_supported
+        and (
+            (state == DeviceState.QUEUED.value and queue_reason in MANUAL_WAIT_QUEUE_REASONS)
+            or state == DeviceState.RECONCILING.value
+            or (state == DeviceState.UNCONFIRMED.value and blocking_fence)
+        )
+    )
+    retryable = (
+        open_for_action
+        and not superseded
+        and state
+        in {DeviceState.FAILED.value, DeviceState.INTERRUPTED.value, DeviceState.UNCONFIRMED.value}
+        and failure_code != "cancelled"
+    )
+    return AssignmentActions(manual_wait, resume_required, cancellable, retryable)
 
 
 JOB_TRANSITIONS: Mapping[JobState, frozenset[JobState]] = {

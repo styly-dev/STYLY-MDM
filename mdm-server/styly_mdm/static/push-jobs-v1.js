@@ -15,6 +15,7 @@
   const jobEntries = new Map();
   const renderedAssignments = new Map();
   const pendingUploads = new Map();
+  const retryRequestIds = new Map();
   let currentAdminSocket = null;
   let awaitingInitialSnapshot = false;
   let bufferedUpdates = new Map();
@@ -193,6 +194,7 @@
     const current = pushJobs.get(job.job_id);
     if (current && current.revision >= job.revision) return;
     pushJobs.set(job.job_id, job);
+    pruneRetryRequestIds(pushJobs);
     renderJob(job);
     renderPausedJobs();
     syncDeviceAssignments();
@@ -204,6 +206,18 @@
     if (!current || current.revision < job.revision) {
       bufferedUpdates.set(job.job_id, job);
     }
+  }
+
+  function pruneRetryRequestIds(jobs) {
+    retryRequestIds.forEach(function (_requestId, key) {
+      const separator = key.lastIndexOf(':');
+      const jobId = key.slice(0, separator);
+      const revision = Number(key.slice(separator + 1));
+      const current = jobs.get(jobId);
+      if (!current || (Number.isFinite(revision) && revision < current.revision)) {
+        retryRequestIds.delete(key);
+      }
+    });
   }
 
   function replaceJobs(jobs) {
@@ -218,6 +232,7 @@
       if (!current || current.revision < job.revision) replacement.set(jobId, job);
     });
     bufferedUpdates = new Map();
+    pruneRetryRequestIds(replacement);
 
     jobEntries.forEach(function (entry, jobId) {
       if (replacement.has(jobId)) return;
@@ -291,36 +306,232 @@
         '; fenced ' + deviceId + ' (' + fenceText(device.device_fence) + ')',
       ));
     });
-    if (fenced.length) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.textContent = 'Reconcile';
-      button.style.marginLeft = '8px';
-      button.addEventListener('click', function () {
-        if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return;
-        fenced.forEach(function (deviceId) {
-          nativeSend.call(currentAdminSocket, JSON.stringify({
-            type: 'RECONCILE_PUSH_DEVICE',
-            device_id: deviceId,
-          }));
-        });
-      });
-      entry.body.appendChild(button);
-    }
     container.scrollTop = container.scrollHeight;
   }
 
+  // Operator-action rules live on the server (push_jobs.assignment_actions); the
+  // console reads the snapshot flags and only adds live connectivity.
   function needsDispatchAction(job) {
-    const terminal = ['succeeded', 'completed_with_errors', 'failed', 'interrupted']
-      .indexOf(job.state) >= 0;
-    return !terminal && job.dispatch_enabled === false &&
-      ['ready', 'running', 'reconciling'].indexOf(job.state) >= 0;
+    return ['ready', 'running', 'reconciling'].indexOf(job.state) >= 0 &&
+      Object.values(job.devices || {}).some(function (d) { return d.resume_required === true; });
+  }
+
+  function isDeviceOnline(deviceId) {
+    const bridge = window.__stylyPushJobsV1Bridge;
+    return !!(bridge && bridge.isDeviceOnline && bridge.isDeviceOnline(deviceId));
+  }
+
+  // A job stays listed for review while any target is retryable, as offline
+  // Resume targets do; the Retry command itself needs a connected target.
+  function hasRetryableAssignments(job) {
+    return Object.values(job.devices || {}).some(function (d) { return d.retryable === true; });
+  }
+
+  function hasRetryTargets(job) {
+    return Object.keys(job.devices || {}).some(function (deviceId) {
+      return job.devices[deviceId].retryable === true && isDeviceOnline(deviceId);
+    });
+  }
+
+  function needsFenceReconciliation(assignment) {
+    // Retry creates new work but does not prove that the old worker has stopped.
+    return !!assignment.device_fence && !assignment.cancel_requested;
+  }
+
+  function actionTargetsForJob(job, action) {
+    return Object.keys(job.devices || {}).filter(function (deviceId) {
+      const assignment = job.devices[deviceId];
+      const view = assignmentView({ job: job, assignment: assignment }, deviceId);
+      return action === 'resume' ? view.canResume : action === 'cancel' ? view.canCancel : false;
+    });
+  }
+
+  function bulkActionGroups(action) {
+    return Array.from(pushJobs.values()).map(function (job) {
+      return { job: job, targetDevices: actionTargetsForJob(job, action) };
+    }).filter(function (group) {
+      return group.targetDevices.length > 0;
+    });
+  }
+
+  function sendBulkAction(action) {
+    const groups = bulkActionGroups(action);
+    if (!groups.length || !currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return false;
+    const messageType = action === 'resume' ? 'PUSH_FILES' : 'CANCEL_PUSH_JOB';
+    const label = action === 'resume' ? 'Resume all' : 'Cancel all';
+    const targetCount = groups.reduce(function (count, group) {
+      return count + group.targetDevices.length;
+    }, 0);
+    const scope = targetCount + ' device(s) across ' + groups.length + ' job(s)';
+    if (action === 'cancel' && typeof window.confirm === 'function' &&
+        !window.confirm('Cancel Push / Sync for ' + scope + '?')) return false;
+    try {
+      groups.forEach(function (group) {
+        nativeSend.call(currentAdminSocket, JSON.stringify({
+          type: messageType,
+          job_id: group.job.job_id,
+          target_devices: group.targetDevices,
+        }));
+      });
+    } catch (error) {
+      appendLog('Could not ' + label.toLowerCase() + ': ' + error.message, 'fail');
+      return false;
+    }
+    appendLog(label + ' requested for ' + scope, 'info');
+    return true;
+  }
+
+  function sendRetryJobAction(job, button) {
+    if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return false;
+    const key = job.job_id + ':' + job.revision;
+    if (!retryRequestIds.has(key)) retryRequestIds.set(key, uuid());
+    const payload = {
+      type: 'RETRY_FAILED_PUSH_JOB',
+      job_id: job.job_id,
+      client_request_id: retryRequestIds.get(key),
+    };
+    try {
+      nativeSend.call(currentAdminSocket, JSON.stringify(payload));
+    } catch (error) {
+      appendLog('Could not retry failed devices: ' + error.message, 'fail');
+      return false;
+    }
+    button.disabled = true;
+    setTimeout(function () {
+      if (button.isConnected) button.disabled = false;
+    }, 5000);
+    return true;
+  }
+
+  function renderAttentionTabActions(paused) {
+    const container = document.getElementById('pushJobsTabActions');
+    if (!container) return;
+    container.replaceChildren();
+    if (!paused.length) return;
+
+    const resumeTargets = bulkActionGroups('resume').reduce(function (count, group) {
+      return count + group.targetDevices.length;
+    }, 0);
+    const cancelTargets = bulkActionGroups('cancel').reduce(function (count, group) {
+      return count + group.targetDevices.length;
+    }, 0);
+    const head = document.createElement('div');
+    head.className = 'attention-tab-actions-head';
+    const copy = document.createElement('div');
+    copy.className = 'attention-tab-actions-copy';
+    const title = document.createElement('div');
+    title.className = 'attention-tab-actions-title';
+    title.textContent = 'Push / Sync actions';
+    const note = document.createElement('div');
+    note.className = 'attention-tab-actions-note';
+    note.textContent = 'Apply an action to every eligible device across all Push / Sync jobs.';
+    copy.appendChild(title);
+    copy.appendChild(note);
+    const buttons = document.createElement('div');
+    buttons.className = 'attention-tab-actions-buttons';
+
+    function bulkButton(action, label, pendingLabel, targetCount) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'push-job-action attention-tab-action';
+      button.dataset.action = action;
+      button.textContent = label;
+      button.title = targetCount + ' eligible device(s)';
+      button.disabled = targetCount === 0;
+      button.addEventListener('click', function () {
+        if (!sendBulkAction(action)) return;
+        button.disabled = true;
+        button.textContent = pendingLabel;
+        setTimeout(function () {
+          if (!button.isConnected) return;
+          button.disabled = action === 'resume'
+            ? bulkActionGroups('resume').length === 0
+            : bulkActionGroups('cancel').length === 0;
+          button.textContent = label;
+        }, 5000);
+      });
+      return button;
+    }
+
+    buttons.appendChild(bulkButton('resume', 'Resume all', 'Resuming…', resumeTargets));
+    buttons.appendChild(bulkButton('cancel', 'Cancel all', 'Cancelling…', cancelTargets));
+    head.appendChild(copy);
+    head.appendChild(buttons);
+    container.appendChild(head);
+
+    const actionJobs = paused.filter(function (job) {
+      return hasRetryableAssignments(job) || Object.keys(job.devices || {}).some(function (deviceId) {
+        const assignment = job.devices[deviceId];
+        return needsFenceReconciliation(assignment);
+      });
+    });
+    if (!actionJobs.length) return;
+    const jobList = document.createElement('div');
+    jobList.className = 'attention-tab-job-list';
+    actionJobs.forEach(function (job) {
+      const row = document.createElement('div');
+      row.className = 'attention-tab-job';
+      const label = document.createElement('span');
+      label.className = 'attention-tab-job-label';
+      label.textContent = (job.mode === 'sync' ? 'Sync' : 'Push') + ' #' +
+        job.job_id.slice(0, 8) + ' → ' + job.dest_path;
+      const rowButtons = document.createElement('div');
+      rowButtons.className = 'attention-tab-job-buttons';
+      if (hasRetryableAssignments(job)) {
+        const retry = document.createElement('button');
+        retry.type = 'button';
+        retry.className = 'push-job-action';
+        retry.textContent = 'Retry failed devices';
+        if (!hasRetryTargets(job)) {
+          retry.disabled = true;
+          retry.title = 'Every device to retry is offline';
+        }
+        retry.addEventListener('click', function () {
+          sendRetryJobAction(job, retry);
+        });
+        rowButtons.appendChild(retry);
+      }
+      const fenced = Object.keys(job.devices || {}).filter(function (deviceId) {
+        const assignment = job.devices[deviceId];
+        return needsFenceReconciliation(assignment);
+      });
+      if (fenced.length) {
+        const reconcile = document.createElement('button');
+        reconcile.type = 'button';
+        reconcile.className = 'push-job-action';
+        reconcile.textContent = 'Reconcile';
+        reconcile.addEventListener('click', function () {
+          if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return;
+          try {
+            fenced.forEach(function (deviceId) {
+              nativeSend.call(currentAdminSocket, JSON.stringify({
+                type: 'RECONCILE_PUSH_DEVICE',
+                device_id: deviceId,
+              }));
+            });
+            reconcile.disabled = true;
+            setTimeout(function () { if (reconcile.isConnected) reconcile.disabled = false; }, 5000);
+          } catch (error) {
+            appendLog('Could not reconcile: ' + error.message, 'fail');
+          }
+        });
+        rowButtons.appendChild(reconcile);
+      }
+      row.appendChild(label);
+      row.appendChild(rowButtons);
+      jobList.appendChild(row);
+    });
+    container.appendChild(jobList);
   }
 
   function renderPausedJobs() {
+    const paused = Array.from(pushJobs.values()).filter(function (job) {
+      return needsDispatchAction(job) || hasRetryableAssignments(job) ||
+        Object.values(job.devices || {}).some(needsFenceReconciliation);
+    });
+    renderAttentionTabActions(paused);
     const container = document.getElementById('pushJobsAttention');
     if (!container) return;
-    const paused = Array.from(pushJobs.values()).filter(needsDispatchAction);
     container.replaceChildren();
     container.style.display = paused.length ? '' : 'none';
     if (!paused.length) return;
@@ -329,44 +540,22 @@
     title.className = 'push-attention-title';
     title.textContent = 'Push / Sync jobs need attention';
     container.appendChild(title);
-    paused.forEach(function (job) {
-      const item = document.createElement('div');
-      item.className = 'push-attention-item';
-      const label = document.createElement('span');
-      label.className = 'push-attention-job';
-      label.textContent = (job.mode === 'sync' ? 'Sync' : 'Push') + ' #' +
-        job.job_id.slice(0, 8) + ' → ' + job.dest_path;
-      const resume = document.createElement('button');
-      resume.type = 'button';
-      resume.className = 'push-resume';
-      const actionLabel = job.state === 'ready' ? 'Dispatch' : 'Resume';
-      resume.textContent = actionLabel;
-      resume.addEventListener('click', function () {
-        if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return;
-        resume.disabled = true;
-        resume.textContent = actionLabel === 'Dispatch' ? 'Dispatching…' : 'Resuming…';
-        try {
-          nativeSend.call(currentAdminSocket, JSON.stringify({
-            type: 'PUSH_FILES',
-            job_id: job.job_id,
-          }));
-        } catch (error) {
-          resume.disabled = false;
-          resume.textContent = actionLabel;
-          appendLog('Could not ' + actionLabel.toLowerCase() + ' job ' +
-            job.job_id.slice(0, 8) + ': ' + error.message, 'fail');
-          return;
-        }
-        setTimeout(function () {
-          if (!resume.isConnected) return;
-          resume.disabled = false;
-          resume.textContent = actionLabel;
-        }, 5000);
-      });
-      item.appendChild(label);
-      item.appendChild(resume);
-      container.appendChild(item);
+    const summary = document.createElement('div');
+    summary.className = 'push-attention-summary';
+    const message = document.createElement('span');
+    message.className = 'push-attention-message';
+    message.textContent = paused.length + ' Push / Sync job(s) need review in the Needs attention tab.';
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'push-job-action push-attention-open';
+    open.textContent = 'Open Needs attention';
+    open.addEventListener('click', function () {
+      const tab = document.getElementById('tabAttention');
+      if (tab) tab.click();
     });
+    summary.appendChild(message);
+    summary.appendChild(open);
+    container.appendChild(summary);
   }
 
   function selectedAssignmentFor(deviceId) {
@@ -380,7 +569,9 @@
       'applying', 'reconciling',
     ]);
     const active = candidates.filter(function (candidate) {
-      return activeStates.has(candidate.assignment.state);
+      return activeStates.has(candidate.assignment.state) ||
+        (candidate.assignment.state === 'unconfirmed' &&
+         !!candidate.assignment.device_fence);
     }).sort(function (left, right) {
       return left.assignment.enqueue_seq - right.assignment.enqueue_seq;
     });
@@ -410,9 +601,8 @@
       return 'queued';
     }
     if (state === 'downloading') return 'transferring';
-    if (['validating', 'applying', 'reconciling'].indexOf(state) >= 0) {
-      return 'applying';
-    }
+    if (state === 'validating' || state === 'applying') return state;
+    if (state === 'reconciling' || state === 'unconfirmed') return state;
     if (state === 'succeeded') return 'success';
     return 'fail';
   }
@@ -424,13 +614,29 @@
     const failure = assignment.failure || {};
     const jobFailure = job.failure || {};
     const success = assignment.state === 'succeeded';
+    const terminal = ['succeeded', 'failed', 'interrupted', 'unconfirmed'].indexOf(assignment.state) >= 0;
+    const cancelled = failure.code === 'cancelled';
+    const resumeRequired = assignment.resume_required === true;
+    const online = isDeviceOnline(deviceId);
+    const canResume = resumeRequired && online;
+    // The server refuses to cancel a reconciling assignment while its device is
+    // online, because that device can still report its outcome.
+    const canCancel = assignment.cancellable === true &&
+      !(online && assignment.state === 'reconciling');
+    const needsAttention = needsFenceReconciliation(assignment) ||
+      (!assignment.cancel_requested && !assignment.retry_job_id && !success && !cancelled && (resumeRequired ||
+        assignment.state === 'reconciling' || assignment.retryable === true));
     return {
       device_id: deviceId,
+      canResume: canResume,
+      canCancel: canCancel,
+      needsAttention: !!needsAttention,
       job_id: job.job_id,
       client_request_id: job.client_request_id,
       revision: job.revision,
       enqueue_seq: assignment.enqueue_seq,
-      status: displayStatus(assignment.state),
+      status: cancelled ? 'cancelled' : (assignment.cancel_requested && (!terminal || (assignment.state === 'unconfirmed' && assignment.device_fence))) ? 'cancel_pending' :
+        resumeRequired ? 'resume_required' : displayStatus(assignment.state),
       verb: job.mode === 'sync' ? 'Sync' : 'Push',
       filename: job.dest_path || '',
       note: success ? '+' + (result.added || 0) + ' ~' +
@@ -440,6 +646,37 @@
         ((assignment.state === 'unconfirmed') ? 'result unconfirmed' : ''),
     };
   }
+
+  // Read directly from canonical snapshots; no second attention-state cache.
+  window.__stylyPushJobsV1Actions = {
+    refreshConnectivity: function () { renderPausedJobs(); syncDeviceAssignments(); },
+    assignmentFor: function (deviceId) {
+      const selected = selectedAssignmentFor(deviceId);
+      return selected ? assignmentView(selected, deviceId) : null;
+    },
+    sendDeviceAction: function (deviceId, jobId, action) {
+      const selected = selectedAssignmentFor(deviceId);
+      if (!selected || selected.job.job_id !== jobId) return false;
+      const view = assignmentView(selected, deviceId);
+      if ((action === 'resume' && !view.canResume) ||
+          (action === 'cancel' && !view.canCancel) ||
+          ['resume', 'cancel'].indexOf(action) < 0) return false;
+      if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return false;
+      if (action === 'cancel' && typeof window.confirm === 'function' &&
+          !window.confirm('Cancel Push / Sync for ' + deviceId + '?')) return false;
+      try {
+        nativeSend.call(currentAdminSocket, JSON.stringify({
+          type: action === 'resume' ? 'PUSH_FILES' : 'CANCEL_PUSH_JOB',
+          job_id: jobId,
+          target_devices: [deviceId],
+        }));
+        return true;
+      } catch (error) {
+        appendLog('Could not ' + action + ' device job: ' + error.message, 'fail');
+        return false;
+      }
+    },
+  };
 
   function syncDeviceAssignments() {
     const bridge = window.__stylyPushJobsV1Bridge;
@@ -462,6 +699,7 @@
         renderedAssignments.delete(deviceId);
       }
     });
+    if (typeof bridge.refreshAttention === 'function') bridge.refreshAttention();
   }
 
   function observeMessage(socket, event) {
@@ -478,6 +716,17 @@
       if (socket !== currentAdminSocket) return;
       if (awaitingInitialSnapshot) bufferJob(message.job);
       else applyJob(message.job);
+    } else if (message.type === 'PUSH_JOB_ACTION_SENT') {
+      // Acknowledgement for job-level operator actions owned by this adapter.
+      event.stopImmediatePropagation();
+      if (socket !== currentAdminSocket) return;
+      const shortId = String(message.job_id || '').slice(0, 8);
+      if (message.action === 'CANCEL_PUSH_JOB') {
+        appendLog('Cancel recorded for job #' + shortId +
+          '; affected devices settle once they confirm the work is absent', 'info');
+      } else if (message.action === 'RETRY_FAILED_PUSH_JOB') {
+        appendLog('Created retry job #' + shortId + ' for unsuccessful devices', 'info');
+      }
     } else if (message.type === 'PUSH_PROGRESS' && message.job_id) {
       // Full revisioned snapshots already render concurrent jobs independently.
       event.stopImmediatePropagation();

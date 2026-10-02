@@ -39,6 +39,22 @@ logging.basicConfig(
 )
 log = logging.getLogger("stylymdm")
 
+
+class _RedactPushLeaseFilter(logging.Filter):
+    """Keep Push artifact lease tokens out of the HTTP access log request line."""
+
+    _LEASE = re.compile(r"(lease=)[^&\s\"]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        redacted = self._LEASE.sub(r"\1REDACTED", message)
+        if redacted != message:
+            record.msg, record.args = redacted, None
+        return True
+
+
+logging.getLogger("aiohttp.access").addFilter(_RedactPushLeaseFilter())
+
 # Writable runtime data (uploaded APKs, device registry) lives under a
 # configurable data directory rather than next to this module. When installed as
 # a package (pip/uvx) the module directory is read-only site-packages, so writes
@@ -237,6 +253,24 @@ _transfer_sem_loop: "asyncio.AbstractEventLoop | None" = None
 # Device registry (persistent, additive — never the identity key)
 # ---------------------------------------------------------------------------
 
+def parse_push_state_status(push_state) -> str | None:
+    """Return a device's reported durable Push state status, or None if malformed."""
+    status = push_state.get("status") if isinstance(push_state, dict) else None
+    return status if status in {"available", "unavailable"} else None
+
+
+def parse_push_state_reset(push_state) -> dict | None:
+    """Return a one-shot notice that the client discarded unreadable Push state."""
+    reset = push_state.get("reset") if isinstance(push_state, dict) else None
+    if not isinstance(reset, dict) or not isinstance(reset.get("reason"), str):
+        return None
+    detail = reset.get("detail") if isinstance(reset.get("detail"), str) else ""
+    return {
+        "reason": reset["reason"][:64],
+        "detail": " ".join(detail.split())[:256],
+    }
+
+
 def _coerce_record(value) -> dict | None:
     """Normalize a registry value into a record.
 
@@ -426,6 +460,8 @@ def build_device_list_msg() -> str:
             "last_seen": device_registry.get(d["device_id"], {}).get("last_seen"),
             "version_code": d.get("version_code"),
             "version_name": d.get("version_name", ""),
+            # Live-only: whether the connected client can currently accept Push.
+            "push_state_status": d.get("push_state_status"),
         }
         for d in devices.values()
     ]
@@ -458,6 +494,7 @@ def build_device_list_msg() -> str:
             "version_code": rec.get("version_code"),
             "version_name": rec.get("version_name", ""),
             "identity_kind": rec.get("identity_kind", "legacy"),
+            "push_state_status": None,
         })
     device_list.sort(
         key=lambda e: (e["label"] == "", (e["label"] or e["device_id"]).lower())
@@ -1453,7 +1490,6 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                             idempotent=True,
                         )
                         continue
-
                     if kind == "provisional":
                         now = time.time()
                         previous = provisional_connections.get(ws)
@@ -1500,6 +1536,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     provisional_connections.pop(ws, None)
                     device_id = new_device_id
                     socket_identity_kind = kind
+                    push_state_status = parse_push_state_status(data.get("push_state"))
                     devices[device_id] = {
                         "ws": ws,
                         "device_id": device_id,
@@ -1512,6 +1549,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "battery": prev.get("battery"),
                         "version_code": version_code,
                         "version_name": version_name,
+                        "push_state_status": push_state_status,
                     }
                     device_registry[device_id] = {
                         "label": prev.get("label", ""),
@@ -1823,9 +1861,9 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
         if device_id and not is_current:
             log.info("Superseded device connection closed, ignoring: %s", device_id)
         if device_id and is_current:
-            # Free every transfer slot this device was holding — it may have been in
-            # an install and a push at once — so a disconnect mid-job does not stall
-            # the queue until the timeout fires.
+            # Install keeps the legacy disconnect release. Push is deliberately
+            # retained by the runtime adapter because its Android HTTP worker outlives
+            # this WebSocket and remains bounded by exact completion or timeout.
             release_transfer_slot(device_id, "disconnect")
             # The dispatch record only bridges dispatch -> SELF_UPDATE_STARTING; by a
             # disconnect that announcement has already copied what it needed, so drop

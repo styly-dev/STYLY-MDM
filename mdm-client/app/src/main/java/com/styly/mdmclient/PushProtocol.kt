@@ -7,6 +7,7 @@ import java.util.UUID
 
 object PushProtocol {
     const val CAP_PUSH_JOB_ID_V1 = "push_job_id_v1"
+    const val CAP_PUSH_RESUME_V1 = "push_resume_v1"
     const val ATTEMPT_V1 = 1
     const val PHASE_DOWNLOADING = "downloading"
     const val PHASE_VALIDATING = "validating"
@@ -24,15 +25,30 @@ object PushProtocol {
         val bundleFilename: String,
         val destPath: String,
         val deleteExtras: Boolean,
+        /** Server revision of the immutable job assignment. Required for job-v1 wire commands. */
+        val revision: Long = 0L,
+        /** A strong HTTP ETag for the immutable artifact, when supplied by the server. */
+        val artifactEtag: String? = null,
     ) {
         val isJobV1: Boolean get() = jobId != null
         val identity: String get() = if (jobId != null) "$jobId:$attempt" else "legacy"
 
+        /**
+         * Exact execution fingerprint, excluding the replaceable artifact URL. A zero
+         * revision or missing ETag comes only from an Issue #91 server or from durable
+         * state migrated by [parseCommand]; the server assigns a dispatch revision
+         * when it first redispatches such an assignment. Treating those two fields as
+         * unknown lets a replay settle from the existing receipt or active execution
+         * instead of being rejected as a conflict. Resume never relies on this: it
+         * requires revision > 0 and an exact resume metadata match in the worker.
+         */
         fun sameExecution(other: Command): Boolean =
             jobId == other.jobId && attempt == other.attempt &&
-                artifactId == other.artifactId && artifactUrl == other.artifactUrl &&
+                artifactId == other.artifactId &&
                 artifactSize == other.artifactSize &&
                 artifactSha256.equals(other.artifactSha256, ignoreCase = true) &&
+                (revision == other.revision || revision == 0L || other.revision == 0L) &&
+                (artifactEtag == null || other.artifactEtag == null || artifactEtag == other.artifactEtag) &&
                 bundleFilename == other.bundleFilename && destPath == other.destPath &&
                 deleteExtras == other.deleteExtras
 
@@ -43,16 +59,30 @@ object PushProtocol {
             put("artifact_url", artifactUrl)
             if (artifactSize != null) put("artifact_size", artifactSize)
             if (artifactSha256 != null) put("artifact_sha256", artifactSha256)
+            if (jobId != null) put("revision", revision)
+            if (artifactEtag != null) put("artifact_etag", artifactEtag)
             put("bundle_filename", bundleFilename)
             put("dest_path", destPath)
             put("delete_extras", deleteExtras)
         }
     }
 
-    data class Active(val command: Command, val phase: String) {
+    data class Active(
+        val command: Command,
+        val phase: String,
+        /** True when the process restarted while the durable worker was active. */
+        val interrupted: Boolean = false,
+        /** First recovery time; bounds how long stale work can fence the device. */
+        val interruptedAt: Long? = null,
+        /** Why the worker paused; retained only while [interrupted] is true. */
+        val interruptionReason: String? = null,
+    ) {
         fun toJson(): JSONObject = JSONObject().apply {
             put("command", command.toJson())
             put("phase", phase)
+            put("interrupted", interrupted)
+            if (interruptedAt != null) put("interrupted_at", interruptedAt)
+            if (interruptionReason != null) put("interruption_reason", interruptionReason)
         }
     }
 
@@ -158,6 +188,11 @@ object PushProtocol {
         if (jobId != null && (artifactSize == null || artifactSha256 == null)) {
             throw malformed("job-v1 artifact size and SHA-256 are required")
         }
+        // Issue #91 servers did not send revision. Such commands remain runnable
+        // but revision=0 is never eligible for restart resume.
+        val revision = if (jobId == null) 0L else optionalLong(payload, "revision") ?: 0L
+        if (revision < 0L) throw malformed("revision must be non-negative")
+        val artifactEtag = optionalString(payload, "artifact_etag")?.also { validateStrongEtag(it) }
         val bundleFilename = optionalString(payload, "bundle_filename")
             ?.takeIf { it.isNotBlank() } ?: "bundle.zip"
         return Command(
@@ -170,10 +205,10 @@ object PushProtocol {
             bundleFilename = bundleFilename,
             destPath = destPath,
             deleteExtras = strictBoolean(payload, "delete_extras", false),
+            revision = revision,
+            artifactEtag = artifactEtag,
         )
     }
-
-    fun commandFromJson(json: JSONObject): Command = parseCommand(json)
 
     fun parseResultAck(payload: JSONObject): ResultAck {
         val jobId = requiredString(payload, "job_id")
@@ -226,26 +261,44 @@ object PushProtocol {
     }
 
     fun stateFromJson(json: JSONObject): State {
-        val active = try {
-            json.optJSONObject("active")?.let {
-                Active(commandFromJson(it.getJSONObject("command")), it.getString("phase"))
-            }
-        } catch (_: RuntimeException) {
-            // A corrupt active record must not erase independently valid result receipts.
-            null
+        if (
+            json.has("active") && !json.isNull("active") &&
+            json.optJSONObject("active") == null
+        ) {
+            throw IllegalArgumentException("malformed durable active state")
+        }
+        val active = json.optJSONObject("active")?.let {
+            Active(
+                parseCommand(it.getJSONObject("command")),
+                it.getString("phase"),
+                it.optBoolean("interrupted", false),
+                it.optLong("interrupted_at", 0L).takeIf { value -> value > 0L },
+                optionalString(it, "interruption_reason")?.ifBlank { null },
+            )
         }
         fun receipts(name: String): List<Receipt> {
-            val array = json.optJSONArray(name) ?: JSONArray()
+            val parsed = json.optJSONArray(name)
+            if (
+                json.has(name) && !json.isNull(name) && parsed == null
+            ) {
+                throw IllegalArgumentException("malformed durable receipt collection: $name")
+            }
+            val array = parsed ?: JSONArray()
             return buildList {
                 for (index in 0 until array.length()) {
-                    val item = array.optJSONObject(index) ?: continue
-                    val command = item.optJSONObject("command") ?: continue
-                    val result = item.optJSONObject("result") ?: continue
-                    try {
-                        add(Receipt(commandFromJson(command), resultFromJson(result)))
-                    } catch (_: RuntimeException) {
-                        // One corrupt receipt must not erase valid durable state.
+                    val item = array.optJSONObject(index)
+                    if (item == null) {
+                        throw IllegalArgumentException("malformed durable receipt")
                     }
+                    val command = item.optJSONObject("command")
+                    if (command == null) {
+                        throw IllegalArgumentException("malformed durable receipt command")
+                    }
+                    val result = item.optJSONObject("result")
+                    if (result == null) {
+                        throw IllegalArgumentException("malformed durable receipt result")
+                    }
+                    add(Receipt(parseCommand(command), resultFromJson(result)))
                 }
             }
         }
@@ -280,6 +333,16 @@ object PushProtocol {
             throw malformed("$field is outside the supported integer range")
         }
         return longValue.toInt()
+    }
+
+    internal fun isStrongEtag(value: String): Boolean =
+        value.isNotBlank() && !value.startsWith("W/") &&
+            value.startsWith("\"") && value.endsWith("\"") && value.length >= 2
+
+    private fun validateStrongEtag(value: String) {
+        if (!isStrongEtag(value)) {
+            throw malformed("artifact_etag must be a strong quoted ETag")
+        }
     }
 
     private fun optionalLong(payload: JSONObject, field: String): Long? {
