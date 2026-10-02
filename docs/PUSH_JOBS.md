@@ -13,12 +13,16 @@ A browser creates a job before uploading bytes:
 `client_request_id` makes job creation idempotent. The server looks up an existing request **before** live-target preflight, so loss of the first response followed by a device disconnect still returns the original job. The canonical fingerprint sorts targets, normalizes the shared-storage destination, and hashes stable JSON. Reusing an ID with different canonical data returns `409 Conflict`.
 
 Issue #94 upgrades the released Issue #91 `push_jobs.sqlite3` schema directly
-from version 1 to version 3. It adds an immutable per-device dispatch revision
-and nullable `cancel_requested_at` without discarding existing jobs. The Issue
-#91 server rejects any schema version other than 1 at startup. Rollback to that
-server therefore requires restoring a matching pre-upgrade database backup;
-the schema-3 database cannot be used by the old server. Schema 2 was never
-released.
+from version 1 to version 3. It adds an immutable per-device dispatch revision,
+nullable `cancel_requested_at`, and an indexed `retry_of_job_id` link from a
+Retry failed devices job to its original job, without discarding existing jobs.
+The upgrade runs in one transaction. Before it starts, the server writes a
+consistent copy of the old database to `push_jobs.sqlite3.v1.bak` in the same
+data directory (SQLite backup API, written to a temporary file and then renamed).
+The Issue #91 server rejects any schema version other than 1 at startup, so
+rollback means stopping the server and replacing `push_jobs.sqlite3` with that
+backup (and removing any `-wal`/`-shm` files). Jobs created after the upgrade are
+not in the backup. Schema 2 was never released.
 
 ## Resumable artifact transfer
 
@@ -27,6 +31,10 @@ SQLite artifact row stores the unique storage name, exact byte size, SHA-256,
 creation time, and retention state. The SHA-256 is also exposed as a quoted
 strong ETag. Garbage collection leaves a tombstone row, so neither an artifact
 ID nor its `/artifacts/{artifact_id}` URL can be reused after its bytes expire.
+It commits the tombstone first and removes the file afterwards, outside the
+single database worker, so deleting a multi-gigabyte artifact never blocks other
+Push state transitions. A failed removal is logged; the tombstoned bytes are no
+longer served or retried.
 
 Job-v1 commands carry an immutable per-device `revision`, `artifact_id`, absolute
 URL, exact size, SHA-256, and ETag. The aggregate job revision may continue to
@@ -207,6 +215,12 @@ Resume before receiving a new token.
   ask for confirmation; the latter shows the number of affected devices. Only
   assignments dispatched with `push_resume_v1` can be cancelled; the snapshot
   exposes this as `resume_supported`.
+- Each snapshot assignment carries server-computed action flags from
+  `push_jobs.assignment_actions`: `manual_wait` (a per-device wait for Resume),
+  `resume_required`, and `cancellable` (the same rule `CANCEL_PUSH_JOB` enforces).
+  The console only combines them with live connectivity: Resume needs an online
+  device, and a reconciling assignment is cancellable only while its device is
+  offline. Targets already moved to a retry job expose no actions.
 - **Retry failed devices** creates and dispatches a new job for `failed`,
   `interrupted`, and `unconfirmed` targets, excluding `failure_code: cancelled`.
   It reuses the immutable artifact without upload and leaves success records and
@@ -231,10 +245,10 @@ their previous retry timing. Deploy the server and APK together while the old AP
 has no active Push/Sync transfer: its unscoped job-v1 artifact URLs are rejected
 after cutover.
 `CANCEL_PUSH_JOB` remains an admin action; clients receive the existing exact-identity
-`PUSH_RESUME_REJECTED` only after they report interrupted work. Older job-v1 APKs
-omit `artifact_id` from an `absent` reconciliation report; the server accepts that
-omission only from the current device owner for the exact job and attempt. An
-explicit mismatched artifact ID never confirms cancellation.
+`PUSH_RESUME_REJECTED` only after they report interrupted work. Only an `absent`
+reconciliation report from the current device owner that carries the exact job,
+attempt, and artifact ID confirms cancellation; a missing or mismatched artifact
+ID never does.
 
 APK installation is a separate client worker and can overlap Push/Sync when a shared
 network slot is available. Reboot does not wait for a transfer slot but requires a

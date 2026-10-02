@@ -75,13 +75,46 @@ class FakeWebSocket {
 
   emit(message) {
     const event = {
-      data: JSON.stringify(message),
+      data: JSON.stringify(withServerActionFlags(message)),
       stopped: false,
       stopImmediatePropagation() { this.stopped = true; },
     };
     (this.listeners.get('message') || []).forEach((listener) => listener(event));
     return event;
   }
+}
+
+// Fixture stand-in for the server's per-assignment action flags. The rules are
+// owned by push_jobs.assignment_actions and covered by the Python tests; a
+// fixture may still set a flag explicitly to model a specific server answer.
+const MANUAL_WAIT_REASONS = ['download_retry_exhausted', 'client_restarted', 'dispatch_paused'];
+
+function withServerActionFlags(original) {
+  // Work on a copy: tests mutate and re-emit the same fixture objects.
+  const message = JSON.parse(JSON.stringify(original));
+  const jobs = message.jobs || (message.job ? [message.job] : []);
+  jobs.forEach((job) => {
+    Object.values(job.devices || {}).forEach((device) => {
+      const manualWait = ['queued', 'reconciling'].includes(device.state) &&
+        MANUAL_WAIT_REASONS.includes(device.queue_reason);
+      const open = !device.cancel_requested && !device.retry_job_id;
+      const terminal = ['succeeded', 'failed', 'interrupted', 'unconfirmed'].includes(device.state);
+      const fence = device.device_fence;
+      const blockingFence = !!fence && fence.blocking_job_id === job.job_id &&
+        (fence.blocking_attempt || 1) === (device.attempt || 1);
+      if (device.manual_wait === undefined) device.manual_wait = manualWait;
+      if (device.resume_required === undefined) {
+        device.resume_required = open && !terminal && (manualWait ||
+          (job.dispatch_enabled === false && ['ready', 'running', 'reconciling'].includes(job.state)));
+      }
+      if (device.cancellable === undefined) {
+        device.cancellable = open && device.resume_supported === true && (
+          (device.state === 'queued' && MANUAL_WAIT_REASONS.includes(device.queue_reason)) ||
+          device.state === 'reconciling' || (device.state === 'unconfirmed' && blockingFence));
+      }
+    });
+  });
+  return message;
 }
 
 function snapshot(jobId, revision, deviceId, state, enqueueSeq, options = {}) {
