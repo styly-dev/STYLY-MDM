@@ -253,7 +253,9 @@ class PushJobManager:
         assignment that was already dispatched and is waiting to resume keeps its
         identity and returns to a manual Resume wait, so the device's validated
         partial download is retained. Existing manual waits and pending
-        cancellations are unchanged.
+        cancellations are unchanged. For reconciling assignments, a pending
+        operator Resume returns to the manual wait and a lost acceptance is no
+        longer replayable, because either would start work on reconnect.
         """
 
         def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -302,6 +304,35 @@ class PushJobManager:
                     self.store._increment_revision(conn, row["job_id"], timestamp)
                     self.store._rederive_job(conn, row["job_id"], timestamp)
                     changed.append(row["job_id"])
+                # A disconnect also withdraws authority that only applied while the
+                # device stayed connected: a pending operator Resume and a lost
+                # acceptance that could otherwise be replayed on reconnect.
+                for row in conn.execute(
+                    "SELECT job_id, queue_reason, reconciliation_reason "
+                    "FROM push_job_devices WHERE device_id=? AND state=? "
+                    "AND (queue_reason='resumable_replay' "
+                    "OR reconciliation_reason='command_accept_timeout')"
+                    + (" AND job_id=?" if job_id is not None else ""),
+                    (device_id, DeviceState.RECONCILING.value,
+                     *((job_id,) if job_id is not None else ())),
+                ).fetchall():
+                    conn.execute(
+                        "UPDATE push_job_devices SET queue_reason=?, reconciliation_reason=?, "
+                        "updated_at=? WHERE job_id=? AND device_id=?",
+                        (
+                            "device_offline" if row["queue_reason"] == "resumable_replay"
+                            else row["queue_reason"],
+                            "disconnect_before_accept"
+                            if row["reconciliation_reason"] == "command_accept_timeout"
+                            else row["reconciliation_reason"],
+                            timestamp,
+                            row["job_id"],
+                            device_id,
+                        ),
+                    )
+                    self.store._increment_revision(conn, row["job_id"], timestamp)
+                    if row["job_id"] not in changed:
+                        changed.append(row["job_id"])
                 snapshots = [self.store._snapshot(conn, changed_job) for changed_job in changed]
                 self.store._commit(conn)
                 return snapshots
@@ -719,6 +750,25 @@ class PushJobManager:
 
         return await self.store._call(op)
 
+    @staticmethod
+    def _resume_queue_reason(
+        current: str | None, reported: str | None, retry_exhausted: bool
+    ) -> str:
+        """Choose the queue reason for exact interrupted evidence.
+
+        Only an operator Resume that is still pending (``resumable_replay``, which a
+        disconnect clears) lets the work dispatch automatically. Everything else
+        waits for Resume, so a reconnecting device never restarts work by itself.
+        """
+
+        if retry_exhausted:
+            return "download_retry_exhausted"
+        if current == "resumable_replay":
+            return "resumable_replay"
+        if current in MANUAL_WAIT_QUEUE_REASONS:
+            return current
+        return "client_restarted" if reported == "client_restarted" else "dispatch_paused"
+
     async def resume_interrupted(
         self,
         job_id: str,
@@ -769,7 +819,6 @@ class PushJobManager:
                 retry_exhausted = reason in {
                     "download_retry_exhausted", "server_lease_revoked", "storage_write_failed"
                 }
-                manual_restart = reason == "client_restarted" and row["queue_reason"] != "resumable_replay"
                 resumable = (
                     row["attempt"] == attempt == 1
                     and row["cancel_requested_at"] is None
@@ -817,9 +866,7 @@ class PushJobManager:
                     """,
                     (
                         DeviceState.QUEUED.value,
-                        "download_retry_exhausted" if retry_exhausted else "client_restarted" if manual_restart else (
-                            "dispatch_paused" if row["queue_reason"] == "dispatch_paused" else "resumable_replay"
-                        ),
+                        self._resume_queue_reason(row["queue_reason"], reason, retry_exhausted),
                         validated_offset,
                         timestamp,
                         job_id,
@@ -1515,8 +1562,9 @@ class PushJobManager:
                     replayable = (
                         status == "absent"
                         and row["accepted_at"] is None
-                        and row["reconciliation_reason"]
-                        in {"command_accept_timeout", "disconnect_before_accept"}
+                        # Only while the device stayed connected; after a disconnect
+                        # the device would start the work merely by reconnecting.
+                        and row["reconciliation_reason"] == "command_accept_timeout"
                         and row["accept_replay_count"] < 1
                         and bool(row["dispatch_enabled"])
                     )

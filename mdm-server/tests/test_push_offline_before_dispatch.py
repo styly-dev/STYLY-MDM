@@ -140,3 +140,41 @@ async def test_retry_failed_targets_only_online_devices(manager, tmp_path):
         job_id, str(uuid.uuid4()), artifact_root=tmp_path, online_devices={'OFF'},
     )
     assert set(later['devices']) == {'OFF'}
+
+
+@pytest.mark.asyncio
+async def test_lost_acceptance_replays_only_while_the_device_stays_connected(manager):
+    job_id = await _ready_job(manager, ['STAYED', 'LEFT'])
+    for device in ('STAYED', 'LEFT'):
+        await _set(manager, job_id, device, state='reconciling', dispatch_revision=1,
+                   reconciliation_reason='command_accept_timeout')
+
+    await manager.settle_offline_before_dispatch('LEFT')
+    assert (await manager.reconcile_report(job_id, 'STAYED', 1, 'absent', None, None))[0] == 'requeued'
+    outcome, _ = await manager.reconcile_report(job_id, 'LEFT', 1, 'absent', None, None)
+    assert outcome == 'interrupted'
+    devices = (await manager.get_snapshot(job_id))['devices']
+    assert devices['STAYED']['state'] == 'queued'
+    assert devices['LEFT']['state'] == 'interrupted'
+
+
+@pytest.mark.asyncio
+async def test_disconnect_withdraws_a_pending_operator_resume(manager):
+    job_id = await _ready_job(manager, ['D1'])
+    await _set(manager, job_id, 'D1', state='reconciling', dispatch_revision=1,
+               queue_reason='resumable_replay', reconciliation_reason='device_disconnect',
+               dispatch_capability_snapshot_json='["push_job_id_v1","push_resume_v1"]')
+    await manager.settle_offline_before_dispatch('D1')
+    device = (await manager.get_snapshot(job_id))['devices']['D1']
+    assert (device['state'], device['queue_reason']) == ('reconciling', 'device_offline')
+    assert device['manual_wait'] and device['resume_required']
+
+    artifact_id = (await manager.get_snapshot(job_id))['artifact']['artifact_id']
+    outcome, _ = await manager.resume_interrupted(
+        job_id, 'D1', attempt=1, artifact_id=artifact_id, dispatch_revision=1,
+        validated_offset=0, reason='client_restarted',
+    )
+    assert outcome == 'requeued'
+    device = (await manager.get_snapshot(job_id))['devices']['D1']
+    assert (device['state'], device['queue_reason']) == ('queued', 'device_offline')
+    assert await manager.claim_next(['D1']) is None
