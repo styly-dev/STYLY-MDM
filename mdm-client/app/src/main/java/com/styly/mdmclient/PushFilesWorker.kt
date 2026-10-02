@@ -95,7 +95,7 @@ internal class PushDownloadDeadline(
  * whole file once during validation instead.
  */
 internal class PartialFileDigest(private val file: File) {
-    private var digest = MessageDigest.getInstance("SHA-256")
+    private val digest = MessageDigest.getInstance("SHA-256")
     private var length = 0L
     private var tracking = true
     /** Bytes reread from disk at validation; exposed for tests. */
@@ -106,9 +106,7 @@ internal class PartialFileDigest(private val file: File) {
     fun beginWrite(append: Boolean) {
         if (!append) {
             // Opening without append truncated the file; restart from byte zero.
-            digest = MessageDigest.getInstance("SHA-256")
-            length = 0L
-            tracking = true
+            restart()
         } else if (!tracking || file.length() != length) {
             tracking = false
         }
@@ -124,26 +122,35 @@ internal class PartialFileDigest(private val file: File) {
     fun finishHex(): String {
         val actual = if (file.isFile) file.length() else 0L
         if (!tracking || actual != length) {
-            digest = MessageDigest.getInstance("SHA-256")
-            if (actual > 0L) {
-                file.inputStream().use { input ->
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        digest.update(buffer, 0, read)
-                    }
-                }
-            }
+            digest.reset()
+            if (actual > 0L) digest.updateWithFile(file)
             rehashedBytes += actual
         }
-        val hex = digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
-        digest = MessageDigest.getInstance("SHA-256")
+        return digest.hexDigest().also { restart() }
+    }
+
+    private fun restart() {
+        digest.reset()
         length = 0L
         tracking = true
-        return hex
     }
 }
+
+/** Streams the whole of [file] into this digest. */
+private fun MessageDigest.updateWithFile(file: File) {
+    file.inputStream().use { input ->
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            update(buffer, 0, read)
+        }
+    }
+}
+
+/** Completes this digest (which also resets it) as lowercase hexadecimal. */
+private fun MessageDigest.hexDigest(): String =
+    digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
 
 /** Blocking Push/Sync download, validation, extraction, and apply worker. */
 class PushFilesWorker internal constructor(
@@ -328,8 +335,7 @@ class PushFilesWorker internal constructor(
         rootDirectory: File,
     ): File {
         val normalized = destPath.trim().replace('\\', '/')
-        val windowsAbsolute = normalized.length >= 3 && normalized[1] == ':' && normalized[2] == '/'
-        if (normalized.isBlank() || (!normalized.startsWith('/') && !windowsAbsolute)) {
+        if (normalized.isBlank() || !normalized.startsWith('/')) {
             throw PushWorkerException(
                 "invalid_destination",
                 "destination must be an absolute path",
@@ -863,17 +869,8 @@ class PushFilesWorker internal constructor(
 
     private fun matchesArtifactIdentity(command: PushProtocol.Command, file: File): Boolean {
         if (!file.isFile || file.length() != command.artifactSize) return false
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            while (true) {
-                val read = input.read(buffer)
-                if (read < 0) break
-                digest.update(buffer, 0, read)
-            }
-        }
-        val actual = digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
-        return actual.equals(command.artifactSha256, ignoreCase = true)
+        val digest = MessageDigest.getInstance("SHA-256").apply { updateWithFile(file) }
+        return digest.hexDigest().equals(command.artifactSha256, ignoreCase = true)
     }
 
     private fun verifyLegacyAndFinalize(

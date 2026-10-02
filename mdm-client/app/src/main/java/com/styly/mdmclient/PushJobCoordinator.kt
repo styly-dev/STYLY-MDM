@@ -250,24 +250,7 @@ class PushJobCoordinator(context: Context) {
                         return@execute
                     }
                 }
-                val recovery = recover(loaded)
-                if (!persist(recovery.state)) return@execute
-                // Keep resumable job-v1 work after a process restart. An exact EXECUTE
-                // command is required before a worker can resume or apply it.
-                gate.restore(state.active?.takeUnless { it.interrupted }?.command)
-                recovery.cleanupCommand?.let { command ->
-                    workerExecutor.execute {
-                        try {
-                            worker.cleanup(PushFilesWorker.Execution(
-                                PushProtocol.Result(command.jobId, command.attempt, "fail", command.destPath),
-                                attemptDirectory(command),
-                            ))
-                        } catch (error: Throwable) {
-                            Log.w(TAG, "Could not clean recovered Push/Sync work directory", error)
-                        }
-                    }
-                }
-                scheduleInterruptedExpiry(state.active)
+                adoptRecoveredState(loaded)
             } catch (error: Throwable) {
                 Log.e(TAG, "Could not initialize durable Push/Sync state", error)
             }
@@ -373,8 +356,7 @@ class PushJobCoordinator(context: Context) {
                 PushStateLoadResult.Missing -> store.emptyState()
                 is PushStateLoadResult.Corrupt -> throw result.error
             }
-            val recovery = recover(loaded)
-            if (!persist(recovery.state)) {
+            if (!adoptRecoveredState(loaded)) {
                 sendPushStateRetryResult(
                     "failed",
                     "client_persistence_unavailable",
@@ -382,25 +364,6 @@ class PushJobCoordinator(context: Context) {
                 )
                 return
             }
-            gate.restore(state.active?.takeUnless { it.interrupted }?.command)
-            recovery.cleanupCommand?.let { command ->
-                workerExecutor.execute {
-                    try {
-                        worker.cleanup(PushFilesWorker.Execution(
-                            PushProtocol.Result(
-                                command.jobId,
-                                command.attempt,
-                                "fail",
-                                command.destPath,
-                            ),
-                            attemptDirectory(command),
-                        ))
-                    } catch (error: Throwable) {
-                        Log.w(TAG, "Could not clean recovered Push/Sync work directory", error)
-                    }
-                }
-            }
-            scheduleInterruptedExpiry(state.active)
             sendPushStateRetryResult("success", null, null)
         } catch (error: Throwable) {
             durabilityAvailable = false
@@ -886,6 +849,26 @@ class PushJobCoordinator(context: Context) {
             pendingResults = pending,
             completedReceipts = (loaded.completedReceipts + receipt).takeLast(MAX_RECEIPTS),
         ), active.command)
+    }
+
+    /**
+     * Recovers [loaded] durable state and makes it current. Returns false when the
+     * recovered state could not be saved; nothing else changes in that case.
+     */
+    private fun adoptRecoveredState(loaded: PushProtocol.State): Boolean {
+        val recovery = recover(loaded)
+        if (!persist(recovery.state)) return false
+        // Keep resumable job-v1 work after a process restart. An exact EXECUTE
+        // command is required before a worker can resume or apply it.
+        gate.restore(state.active?.takeUnless { it.interrupted }?.command)
+        recovery.cleanupCommand?.let { command ->
+            cleanupExecution(PushFilesWorker.Execution(
+                PushProtocol.Result(command.jobId, command.attempt, "fail", command.destPath),
+                attemptDirectory(command),
+            ))
+        }
+        scheduleInterruptedExpiry(state.active)
+        return true
     }
 
     private fun scheduleInterruptedExpiry(active: PushProtocol.Active?) {

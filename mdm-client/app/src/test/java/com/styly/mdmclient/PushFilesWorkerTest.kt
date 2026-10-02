@@ -1305,12 +1305,12 @@ class PushFilesWorkerTest {
         val link = File(root, "link")
         java.nio.file.Files.createSymbolicLink(link.toPath(), real.toPath())
 
-        assertThrows(PushWorkerException::class.java) {
-            PushFilesWorker().validateDestinationAgainstRoot(
-                "${root.absolutePath}/link/content",
-                root,
-            )
+        // Use the protocol alias so the symlink check runs on any host JVM, not an
+        // earlier "not absolute" rejection of a Windows drive path.
+        val error = assertThrows(PushWorkerException::class.java) {
+            PushFilesWorker().validateDestinationAgainstRoot("/sdcard/link/content", root)
         }
+        assertEquals("destination path contains a symbolic link", error.message)
     }
 
     @Test
