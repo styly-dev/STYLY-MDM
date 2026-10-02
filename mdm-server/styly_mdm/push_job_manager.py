@@ -135,9 +135,20 @@ class PushJobManager:
         self.store._call_sync(op)
 
     async def retry_failed(
-        self, job_id: str, client_request_id: str, *, artifact_root: Path
+        self,
+        job_id: str,
+        client_request_id: str,
+        *,
+        artifact_root: Path,
+        online_devices: Iterable[str],
     ) -> tuple[bool, dict[str, Any]]:
-        """Queue unsuccessful targets in a new job, retaining history and fences."""
+        """Queue unsuccessful online targets in a new job, retaining history and fences.
+
+        Like a new job, Retry targets only online devices. Offline targets stay
+        unsuccessful in the original job and remain eligible for a later Retry,
+        so a device never starts this work merely because it reconnects.
+        """
+        online = set(online_devices)
         from .push_jobs import require_uuid
 
         job_id = require_uuid(job_id, "job_id")
@@ -174,6 +185,9 @@ class PushJobManager:
                 ).fetchall()
                 if not targets:
                     raise StoreConflict("job has no unsuccessful targets to retry")
+                targets = [target for target in targets if target["device_id"] in online]
+                if not targets:
+                    raise StoreConflict("no unsuccessful target of this job is online")
                 artifact = conn.execute(
                     "SELECT * FROM push_artifacts WHERE artifact_id=?",
                     (original["artifact_id"],),
@@ -222,6 +236,75 @@ class PushJobManager:
                 snapshot = self.store._snapshot(conn, retry_id)
                 self.store._commit(conn)
                 return True, snapshot
+            except BaseException:
+                self.store._rollback(conn)
+                raise
+
+        return await self.store._call(op)
+
+    async def settle_offline_before_dispatch(
+        self, device_id: str, job_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Stop queued work of an offline device from starting when it reconnects.
+
+        Applies to assignments of dispatch-enabled jobs that are queued or
+        waiting for a transfer slot. A never-dispatched assignment fails with
+        ``device_offline_before_dispatch`` (the operator can Retry it). An
+        assignment that was already dispatched and is waiting to resume keeps its
+        identity and returns to a manual Resume wait, so the device's validated
+        partial download is retained. Existing manual waits and pending
+        cancellations are unchanged.
+        """
+
+        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            self.store._begin(conn)
+            try:
+                job_clause = " AND d.job_id=?" if job_id is not None else ""
+                rows = conn.execute(
+                    "SELECT d.job_id, d.state, d.queue_reason, d.dispatch_revision "
+                    "FROM push_job_devices d JOIN push_jobs j ON j.job_id=d.job_id "
+                    "WHERE d.device_id=? AND d.state IN (?, ?) "
+                    "AND d.cancel_requested_at IS NULL AND j.dispatch_enabled=1 "
+                    f"AND j.state IN (?, ?) "
+                    f"AND COALESCE(d.queue_reason, '') NOT IN {MANUAL_WAIT_QUEUE_REASONS_SQL}"
+                    + job_clause,
+                    (
+                        device_id,
+                        DeviceState.QUEUED.value,
+                        DeviceState.WAITING_TRANSFER.value,
+                        JobState.RUNNING.value,
+                        JobState.RECONCILING.value,
+                        *((job_id,) if job_id is not None else ()),
+                    ),
+                ).fetchall()
+                timestamp = now_ms()
+                changed: list[str] = []
+                for row in rows:
+                    current = DeviceState(row["state"])
+                    if row["dispatch_revision"] is None:
+                        validate_device_transition(current, DeviceState.FAILED)
+                        conn.execute(
+                            "UPDATE push_job_devices SET state=?, queue_reason=NULL, "
+                            "failure_code='device_offline_before_dispatch', "
+                            "failure_detail='Device went offline before its queue turn', "
+                            "terminal_at=?, updated_at=? WHERE job_id=? AND device_id=?",
+                            (DeviceState.FAILED.value, timestamp, timestamp,
+                             row["job_id"], device_id),
+                        )
+                    else:
+                        if current is not DeviceState.QUEUED:
+                            validate_device_transition(current, DeviceState.QUEUED)
+                        conn.execute(
+                            "UPDATE push_job_devices SET state=?, queue_reason='device_offline', "
+                            "updated_at=? WHERE job_id=? AND device_id=?",
+                            (DeviceState.QUEUED.value, timestamp, row["job_id"], device_id),
+                        )
+                    self.store._increment_revision(conn, row["job_id"], timestamp)
+                    self.store._rederive_job(conn, row["job_id"], timestamp)
+                    changed.append(row["job_id"])
+                snapshots = [self.store._snapshot(conn, changed_job) for changed_job in changed]
+                self.store._commit(conn)
+                return snapshots
             except BaseException:
                 self.store._rollback(conn)
                 raise

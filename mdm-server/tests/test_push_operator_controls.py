@@ -126,7 +126,8 @@ async def test_admin_cancel_rejects_active_or_already_resumed_work(manager, tmp_
 @pytest.mark.asyncio
 async def test_admin_retry_creates_enabled_job_reusing_artifact_and_failed_targets(manager, tmp_path):
     original = await completed(manager, tmp_path)
-    runtime, _, admin = operator_runtime(manager, tmp_path)
+    runtime, session, admin = operator_runtime(manager, tmp_path)
+    runtime.sessions = {device: session for device in ("failed", "interrupted", "unknown")}
     await admin_action(runtime, admin, "RETRY_FAILED_PUSH_JOB", original["job_id"],
                        client_request_id=str(uuid.uuid4()))
     retry_id = admin.messages[-1]["job_id"]

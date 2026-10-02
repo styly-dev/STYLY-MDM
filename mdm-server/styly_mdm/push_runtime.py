@@ -1176,52 +1176,42 @@ class PushRuntime:
             self.sessions.pop(device_id, None)
             if self._legacy_owns_device(device_id, ws):
                 self.legacy.devices[device_id]["registration_ready"] = False
+            # Queued work that has not started yet must not start by itself when
+            # the device reconnects (see settle_offline_before_dispatch).
+            offline_snapshots = await self.manager.settle_offline_before_dispatch(device_id)
             active = await self.manager.active_assignment_for_device(device_id)
-            if active is None:
-                return
-            job_id = active["job_id"]
-            attempt = active["attempt"]
-            state = DeviceState(active["state"])
-            try:
-                if state is DeviceState.WAITING_TRANSFER:
-                    snapshot = await self.manager.transition_device(
-                        job_id,
-                        device_id,
-                        expected={state},
-                        target=DeviceState.QUEUED,
-                        fields={"queue_reason": "awaiting_dispatch"},
-                    )
-                elif state in {
-                    DeviceState.DISPATCHING,
-                    DeviceState.DOWNLOADING,
-                    DeviceState.VALIDATING,
-                    DeviceState.APPLYING,
-                }:
-                    short = (
-                        state is DeviceState.DISPATCHING
-                        and active.get("accepted_at") is None
-                    )
-                    deadline = now_ms() + int(
-                        (
-                            self.accept_reconciliation_timeout
-                            if short
-                            else self.reconciliation_timeout
-                        )
-                        * 1000
-                    )
-                    snapshot = await self.manager.mark_reconciling(
-                        job_id,
-                        device_id,
-                        expected={state},
-                        reason=(
-                            "disconnect_before_accept" if short else "device_disconnect"
-                        ),
-                        deadline=deadline,
-                    )
-            except StoreConflict:
-                pass
+            if active is not None:
+                snapshot = await self._mark_disconnected_active(device_id, active)
+        for offline_snapshot in offline_snapshots:
+            await self.publish(offline_snapshot)
         if snapshot is not None:
             await self.publish(snapshot)
+
+    async def _mark_disconnected_active(
+        self, device_id: str, active: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Move a dispatched assignment to reconciliation after its socket closes."""
+
+        state = DeviceState(active["state"])
+        if state not in {
+            DeviceState.DISPATCHING,
+            DeviceState.DOWNLOADING,
+            DeviceState.VALIDATING,
+            DeviceState.APPLYING,
+        }:
+            return None
+        short = state is DeviceState.DISPATCHING and active.get("accepted_at") is None
+        timeout = self.accept_reconciliation_timeout if short else self.reconciliation_timeout
+        try:
+            return await self.manager.mark_reconciling(
+                active["job_id"],
+                device_id,
+                expected={state},
+                reason="disconnect_before_accept" if short else "device_disconnect",
+                deadline=now_ms() + int(timeout * 1000),
+            )
+        except StoreConflict:
+            return None
 
     async def handle_device_message(
         self,
@@ -2115,6 +2105,7 @@ class PushRuntime:
                     _, snapshot = await self.manager.retry_failed(
                         job_id, payload.get("client_request_id"),
                         artifact_root=self.artifacts.artifact_root,
+                        online_devices=self.sessions.keys(),
                     )
                     _, snapshot = await self.store.enable_dispatch(snapshot["job_id"])
                     await self.publish(await self.store.get_snapshot(job_id))
@@ -2145,6 +2136,15 @@ class PushRuntime:
                     if not targets:
                         raise StoreConflict("Resume requires an online device")
                 changed, snapshot = await self.store.enable_dispatch(job_id, targets)
+                # Like job creation, dispatch skips offline devices: their queued
+                # work must not start later merely because they reconnect.
+                for device_id in targets if targets is not None else list(snapshot["devices"]):
+                    if device_id in self.sessions:
+                        continue
+                    for offline_snapshot in await self.manager.settle_offline_before_dispatch(
+                        device_id, job_id
+                    ):
+                        snapshot, changed = offline_snapshot, True
             except (StoreConflict, StoreNotFound) as exc:
                 try:
                     await asyncio.wait_for(
