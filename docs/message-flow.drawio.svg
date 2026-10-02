@@ -213,9 +213,9 @@
   <text x="698" y="1001" text-anchor="middle" font-size="10" fill="#555">Resume / 24h expiry</text>
   <text x="698" y="1015" text-anchor="middle" font-size="10" fill="#555">reject / expiry: clean</text>
   <rect x="10" y="970" width="120" height="55" rx="4" ry="4" fill="#e1d5e7" stroke="#9673a6" stroke-width="1"/>
-  <text x="70" y="987" text-anchor="middle" font-size="10" fill="#555">Retry Push state</text>
-  <text x="70" y="1001" text-anchor="middle" font-size="10" fill="#555">reload + capabilities</text>
-  <text x="70" y="1015" text-anchor="middle" font-size="10" fill="#555">no artifact transfer</text>
+  <text x="70" y="987" text-anchor="middle" font-size="10" fill="#555">Push state recovery</text>
+  <text x="70" y="1001" text-anchor="middle" font-size="10" fill="#555">client: 5 × 60 s retry</text>
+  <text x="70" y="1015" text-anchor="middle" font-size="10" fill="#555">unreadable: reset</text>
 
   <!-- PUSH_TRANSFER_COMPLETE: Client -> Server -->
   <line x1="625" y1="1048" x2="380" y2="1048" stroke="#d6b656" stroke-width="2" marker-start="url(#mfArrowL)"/>

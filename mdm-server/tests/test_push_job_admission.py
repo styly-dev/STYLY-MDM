@@ -1,4 +1,4 @@
-"""Push job creation requires resumable job-v1 clients."""
+"""Push job admission and client durable-state reporting."""
 
 from __future__ import annotations
 
@@ -36,7 +36,12 @@ def reset_server_state(tmp_path):
     server.DATA_DIR, server.APK_DIR, server.BUNDLE_DIR, server.REGISTRY_PATH = saved_paths
 
 
-async def _registered(session: aiohttp.ClientSession, base: str, capabilities: list[str]):
+async def _registered(
+    session: aiohttp.ClientSession,
+    base: str,
+    capabilities: list[str],
+    push_state: dict | None = None,
+):
     device_id = str(uuid.uuid4())
     device = await session.ws_connect(base + "/ws/device")
     await device.send_json({
@@ -49,6 +54,8 @@ async def _registered(session: aiohttp.ClientSession, base: str, capabilities: l
         "version_name": "guid",
         "capabilities": capabilities,
         "process_instance_id": str(uuid.uuid4()),
+        "push_state": push_state or {"status": "available"},
+        "push_runtime": {"active": None},
     })
 
     async def registered() -> None:
@@ -94,5 +101,63 @@ async def test_push_job_targets_must_support_resume(capabilities, accepted):
                     assert response.status == 422
                     assert "push_resume_v1" in body["error"]
             await device.close()
+    finally:
+        await test_server.close()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_push_state_is_live_only_and_explained_on_create():
+    test_server = TestServer(server.create_app())
+    await test_server.start_server()
+    base = f"http://{test_server.host}:{test_server.port}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            device_id, device = await _registered(
+                session, base, [], push_state={"status": "unavailable"},
+            )
+            assert server.devices[device_id]["push_state_status"] == "unavailable"
+            # Connection-scoped state is never persisted in the device registry.
+            assert "push_state_status" not in server.device_registry[device_id]
+            async with session.post(base + "/api/push-jobs", json=_request(device_id)) as response:
+                assert response.status == 422
+                assert "cannot store Push state" in (await response.json())["error"]
+            await device.close()
+    finally:
+        await test_server.close()
+
+
+@pytest.mark.asyncio
+async def test_push_state_reset_notice_reaches_admins():
+    test_server = TestServer(server.create_app())
+    await test_server.start_server()
+    base = f"http://{test_server.host}:{test_server.port}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            admin = await session.ws_connect(base + "/ws/admin")
+            device_id, device = await _registered(
+                session, base, ["push_job_id_v1", "push_resume_v1"],
+                push_state={
+                    "status": "available",
+                    "reset": {"reason": "corrupt_state_discarded", "detail": "bad\njson"},
+                },
+            )
+
+            async def reset_notice() -> dict:
+                while True:
+                    message = await admin.receive()
+                    if message.type is aiohttp.WSMsgType.TEXT:
+                        payload = json.loads(message.data)
+                        if payload.get("type") == "PUSH_STATE_RESET":
+                            return payload
+
+            notice = await asyncio.wait_for(reset_notice(), timeout=2)
+            assert notice == {
+                "type": "PUSH_STATE_RESET",
+                "device_id": device_id,
+                "reason": "corrupt_state_discarded",
+                "detail": "bad json",
+            }
+            await device.close()
+            await admin.close()
     finally:
         await test_server.close()

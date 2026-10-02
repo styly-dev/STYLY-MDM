@@ -151,11 +151,11 @@ internal fun buildPushRegistrationFields(
     state: PushProtocol.State,
     durabilityAvailable: Boolean,
     processInstanceId: String,
+    resetNotice: PushStateResetNotice? = null,
     validatedOffset: (PushProtocol.Command) -> Long,
 ): JSONObject = JSONObject().apply {
     put("process_instance_id", processInstanceId)
     put("capabilities", JSONArray().apply {
-        put(PushProtocol.CAP_PUSH_STATE_RETRY_V1)
         if (durabilityAvailable) {
             put(PushProtocol.CAP_PUSH_JOB_ID_V1)
             put(PushProtocol.CAP_PUSH_RESUME_V1)
@@ -163,6 +163,12 @@ internal fun buildPushRegistrationFields(
     })
     put("push_state", JSONObject().apply {
         put("status", if (durabilityAvailable) "available" else "unavailable")
+        if (durabilityAvailable && resetNotice != null) {
+            put("reset", JSONObject().apply {
+                put("reason", resetNotice.reason)
+                put("detail", resetNotice.detail)
+            })
+        }
     })
     put("push_runtime", JSONObject().apply {
         val active = state.active
@@ -185,20 +191,108 @@ internal fun buildPushRegistrationFields(
     })
 }
 
-internal enum class PushStateRetryAction { Busy, SaveUnsavedTerminal, Reload }
+/** One-shot notice that unparseable durable Push/Sync state was discarded at load. */
+internal data class PushStateResetNotice(val reason: String, val detail: String) {
+    companion object {
+        const val REASON_CORRUPT_STATE_DISCARDED = "corrupt_state_discarded"
+        private const val MAX_DETAIL_LENGTH = 256
+
+        fun corruptStateDiscarded(error: Throwable): PushStateResetNotice {
+            val message = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.name
+            val detail = message.replace(Regex("\\s+"), " ").trim().take(MAX_DETAIL_LENGTH)
+            return PushStateResetNotice(REASON_CORRUPT_STATE_DISCARDED, detail)
+        }
+    }
+}
 
 /**
- * Chooses what `RETRY_PUSH_STATE` may do. Only a live worker makes the state busy; a
- * terminal outcome that could not be saved must be saved as is, never reloaded from
- * disk, because recovery would turn a finished execution into a resumable one.
+ * Keeps a [PushStateResetNotice] until a registration that carried it is acknowledged
+ * on the same transport. A registration on another transport carries it again.
  */
-internal fun decidePushStateRetry(
-    workerRunning: Boolean,
+internal class PushStateResetNoticeTracker {
+    private var notice: PushStateResetNotice? = null
+    private var carriedBy: Any? = null
+
+    fun record(next: PushStateResetNotice) {
+        notice = next
+        carriedBy = null
+    }
+
+    /** Returns the notice to include in a registration built for [transport]. */
+    fun forRegistration(transport: Any?): PushStateResetNotice? {
+        val current = notice ?: return null
+        if (transport != null) carriedBy = transport
+        return current
+    }
+
+    fun onRegistered(transport: Any) {
+        if (notice != null && carriedBy === transport) {
+            notice = null
+            carriedBy = null
+        }
+    }
+}
+
+internal enum class PushStateRecoveryAction { Reload, SaveUnsavedTerminal, ResaveCurrent }
+
+/**
+ * Chooses what an automatic durable-state retry does. Before durable state was ever
+ * adopted the in-memory state is not authoritative, so only a reload is safe. Afterwards
+ * the file is never reloaded: a worker may own it, and a terminal outcome that could not
+ * be saved must be saved as is, because recovery would turn a finished execution into a
+ * resumable one. Otherwise re-saving the in-memory state (equal to the last successful
+ * save) probes whether storage is writable again.
+ */
+internal fun decidePushStateRecovery(
+    stateLoaded: Boolean,
     hasUnsavedTerminal: Boolean,
-): PushStateRetryAction = when {
-    workerRunning -> PushStateRetryAction.Busy
-    hasUnsavedTerminal -> PushStateRetryAction.SaveUnsavedTerminal
-    else -> PushStateRetryAction.Reload
+): PushStateRecoveryAction = when {
+    !stateLoaded -> PushStateRecoveryAction.Reload
+    hasUnsavedTerminal -> PushStateRecoveryAction.SaveUnsavedTerminal
+    else -> PushStateRecoveryAction.ResaveCurrent
+}
+
+/**
+ * Bounded automatic recovery of durable Push/Sync state. A failure opens an incident
+ * with [maxAttempts] scheduled retries; success closes it so a later failure opens a
+ * fresh incident. Once an incident exhausts its attempts no further incident starts
+ * in this process; the next process start loads the state again.
+ */
+internal class PushStateRecoveryBudget(private val maxAttempts: Int) {
+    enum class Phase { Healthy, Recovering, Exhausted }
+
+    init {
+        require(maxAttempts > 0) { "maxAttempts must be positive" }
+    }
+
+    var phase: Phase = Phase.Healthy
+        private set
+    var attemptsUsed: Int = 0
+        private set
+
+    /** Records a durability failure. Returns true when a first retry must be scheduled. */
+    fun onFailure(): Boolean {
+        if (phase != Phase.Healthy) return false
+        phase = Phase.Recovering
+        attemptsUsed = 0
+        return true
+    }
+
+    /** Records a failed retry. Returns true when another retry must be scheduled. */
+    fun onAttemptFailed(): Boolean {
+        check(phase == Phase.Recovering) { "no recovery incident is open" }
+        attemptsUsed++
+        if (attemptsUsed < maxAttempts) return true
+        phase = Phase.Exhausted
+        return false
+    }
+
+    /** Records a successful retry and closes the incident. */
+    fun onRecovered() {
+        check(phase == Phase.Recovering) { "no recovery incident is open" }
+        phase = Phase.Healthy
+        attemptsUsed = 0
+    }
 }
 
 /**
@@ -208,10 +302,16 @@ internal fun decidePushStateRetry(
  * every durable state mutation are serialized on [actor]. File/network work uses a
  * separate single worker thread and never owns the WebSocket transport.
  */
-class PushJobCoordinator(context: Context) {
+class PushJobCoordinator(
+    context: Context,
+    private val recoveryRetryDelayMs: Long = RECOVERY_RETRY_DELAY_MS,
+    recoveryMaxAttempts: Int = RECOVERY_MAX_ATTEMPTS,
+) {
     companion object {
         private const val TAG = "PushJobCoordinator"
         private const val MAX_RECEIPTS = 256
+        private const val RECOVERY_RETRY_DELAY_MS = 60_000L
+        private const val RECOVERY_MAX_ATTEMPTS = 5
     }
 
     private val appContext = context.applicationContext
@@ -229,38 +329,39 @@ class PushJobCoordinator(context: Context) {
     private var state: PushProtocol.State = store.emptyState()
     @Volatile
     private var durabilityAvailable = false
+    /** True once durable state was loaded (or reset) and adopted; until then [state] is not authoritative. */
+    private var stateLoaded = false
+    private val recoveryBudget = PushStateRecoveryBudget(recoveryMaxAttempts)
+    private val resetNotices = PushStateResetNoticeTracker()
     private var transportToken: Any? = null
     private var transportSend: ((JSONObject) -> Unit)? = null
+    private var transportReregister: (() -> Unit)? = null
     private var transportRegistered = false
     /** The command whose worker execution has not reported its terminal outcome yet. */
     private var runningWorker: PushProtocol.Command? = null
-    /** A worker's terminal outcome whose durable save failed; kept for Retry. */
+    /** A worker's terminal outcome whose durable save failed; saved by automatic recovery. */
     private var unsavedTerminal: Pair<PushProtocol.Command, PushFilesWorker.Execution>? = null
 
     init {
         actor.execute {
-            try {
-                val loaded = when (val result = store.load()) {
-                    is PushStateLoadResult.Valid -> result.state
-                    PushStateLoadResult.Missing -> store.emptyState()
-                    is PushStateLoadResult.Corrupt -> {
-                        // The in-memory state deliberately remains empty but unavailable.
-                        // Never overwrite unknown durable ownership with an empty snapshot.
-                        Log.e(TAG, "Could not parse durable Push/Sync state", result.error)
-                        return@execute
-                    }
-                }
-                adoptRecoveredState(loaded)
-            } catch (error: Throwable) {
-                Log.e(TAG, "Could not initialize durable Push/Sync state", error)
-            }
+            if (!loadDurableState()) beginRecovery()
         }
     }
 
-    fun attachTransport(token: Any, send: (JSONObject) -> Unit) {
+    /**
+     * Attaches the transport that receives Push/Sync messages. [requestReregistration]
+     * asks that transport to register again, so the server learns about a durable state
+     * that became available after its registration was sent.
+     */
+    fun attachTransport(
+        token: Any,
+        send: (JSONObject) -> Unit,
+        requestReregistration: () -> Unit,
+    ) {
         actor.execute {
             transportToken = token
             transportSend = send
+            transportReregister = requestReregistration
             transportRegistered = false
         }
     }
@@ -270,6 +371,7 @@ class PushJobCoordinator(context: Context) {
             if (transportToken === token) {
                 transportToken = null
                 transportSend = null
+                transportReregister = null
                 transportRegistered = false
             }
         }
@@ -285,6 +387,7 @@ class PushJobCoordinator(context: Context) {
         actor.execute {
             if (transportToken === token) {
                 transportRegistered = true
+                resetNotices.onRegistered(token)
                 replayPendingResults()
             }
         }
@@ -308,10 +411,6 @@ class PushJobCoordinator(context: Context) {
             actor.execute { handleResumeRejected(payload) }
             true
         }
-        "RETRY_PUSH_STATE" -> {
-            actor.execute { retryDurableState() }
-            true
-        }
         else -> false
     }
 
@@ -320,74 +419,92 @@ class PushJobCoordinator(context: Context) {
             state,
             durabilityAvailable,
             processInstanceId,
-            ::validatedOffset,
+            resetNotice = if (durabilityAvailable) resetNotices.forRegistration(transportToken) else null,
+            validatedOffset = ::validatedOffset,
         )
     }
 
-    private fun retryDurableState() {
-        when (decidePushStateRetry(runningWorker != null, unsavedTerminal != null)) {
-            PushStateRetryAction.Busy -> {
-                sendPushStateRetryResult(
-                    "failed",
-                    "push_state_busy",
-                    "Push/Sync is active; durable state cannot be reloaded",
-                )
-                return
-            }
-            PushStateRetryAction.SaveUnsavedTerminal -> {
-                val (command, execution) = requireNotNull(unsavedTerminal)
-                onTerminal(command, execution)
-                if (unsavedTerminal == null) {
-                    sendPushStateRetryResult("success", null, null)
-                } else {
-                    sendPushStateRetryResult(
-                        "failed",
-                        "client_persistence_unavailable",
-                        "Device could not save durable Push/Sync state",
-                    )
-                }
-                return
-            }
-            PushStateRetryAction.Reload -> Unit
-        }
+    /**
+     * Loads durable state and adopts it. Unparseable content is discarded and replaced
+     * by an empty state, with a one-shot reset notice for the next registration. Returns
+     * false when the file could not be read or the adopted state could not be saved;
+     * the caller retries in that case.
+     */
+    private fun loadDurableState(): Boolean {
         try {
             val loaded = when (val result = store.load()) {
                 is PushStateLoadResult.Valid -> result.state
                 PushStateLoadResult.Missing -> store.emptyState()
-                is PushStateLoadResult.Corrupt -> throw result.error
+                is PushStateLoadResult.Unreadable -> {
+                    // The content is unknown. Never overwrite it with an empty snapshot.
+                    Log.e(TAG, "Could not read durable Push/Sync state", result.error)
+                    return false
+                }
+                is PushStateLoadResult.Corrupt -> {
+                    Log.w(TAG, "Discarding unparseable durable Push/Sync state", result.error)
+                    store.discard()
+                    resetNotices.record(PushStateResetNotice.corruptStateDiscarded(result.error))
+                    store.emptyState()
+                }
             }
-            if (!adoptRecoveredState(loaded)) {
-                sendPushStateRetryResult(
-                    "failed",
-                    "client_persistence_unavailable",
-                    "Device could not save durable Push/Sync state",
-                )
-                return
-            }
-            sendPushStateRetryResult("success", null, null)
+            if (!adoptRecoveredState(loaded)) return false
+            stateLoaded = true
+            return true
         } catch (error: Throwable) {
-            durabilityAvailable = false
-            Log.e(TAG, "Could not retry durable Push/Sync state", error)
-            sendPushStateRetryResult(
-                "failed",
-                "client_persistence_unavailable",
-                error.message ?: "Device could not reload durable Push/Sync state",
+            Log.e(TAG, "Could not load durable Push/Sync state", error)
+            return false
+        }
+    }
+
+    /** Opens a recovery incident for a durability failure unless one is open or exhausted. */
+    private fun beginRecovery() {
+        if (!recoveryBudget.onFailure()) return
+        Log.w(TAG, "Durable Push/Sync state is unavailable; retrying automatically")
+        scheduleRecoveryAttempt()
+    }
+
+    private fun scheduleRecoveryAttempt() {
+        actor.schedule({ attemptRecovery() }, recoveryRetryDelayMs, TimeUnit.MILLISECONDS)
+    }
+
+    private fun attemptRecovery() {
+        val recovered = try {
+            when (decidePushStateRecovery(stateLoaded, unsavedTerminal != null)) {
+                PushStateRecoveryAction.Reload -> loadDurableState()
+                PushStateRecoveryAction.SaveUnsavedTerminal -> {
+                    val (command, execution) = requireNotNull(unsavedTerminal)
+                    onTerminal(command, execution)
+                    unsavedTerminal == null
+                }
+                PushStateRecoveryAction.ResaveCurrent -> persist(state)
+            }
+        } catch (error: Throwable) {
+            Log.e(TAG, "Could not recover durable Push/Sync state", error)
+            false
+        }
+        if (recovered) {
+            recoveryBudget.onRecovered()
+            durabilityAvailable = true
+            Log.i(TAG, "Durable Push/Sync state recovered; registering again")
+            requestReregistration()
+        } else if (recoveryBudget.onAttemptFailed()) {
+            scheduleRecoveryAttempt()
+        } else {
+            Log.e(
+                TAG,
+                "Durable Push/Sync state is still unavailable after " +
+                    "${recoveryBudget.attemptsUsed} attempts; giving up until the client restarts",
             )
         }
     }
 
-    private fun sendPushStateRetryResult(status: String, reason: String?, detail: String?) {
-        val fields = buildRegistrationFields()
-        send(JSONObject().apply {
-            put("type", "PUSH_STATE_RETRY_RESULT")
-            put("status", status)
-            if (reason != null) put("reason", reason)
-            if (detail != null) put("detail", detail)
-            put("process_instance_id", fields.getString("process_instance_id"))
-            put("capabilities", fields.getJSONArray("capabilities"))
-            put("push_state", fields.getJSONObject("push_state"))
-            put("push_runtime", fields.getJSONObject("push_runtime"))
-        })
+    /** The current registration advertised unavailable state; let the transport register again. */
+    private fun requestReregistration() {
+        try {
+            transportReregister?.invoke()
+        } catch (error: Throwable) {
+            Log.w(TAG, "Could not request Push/Sync re-registration", error)
+        }
     }
 
     private fun handleCommand(payload: JSONObject) {
@@ -927,7 +1044,14 @@ class PushJobCoordinator(context: Context) {
         ) { saved ->
             state = saved
         }
-        durabilityAvailable = persisted
+        if (!persisted) {
+            durabilityAvailable = false
+            beginRecovery()
+        } else if (recoveryBudget.phase == PushStateRecoveryBudget.Phase.Healthy) {
+            // While an incident is open (or exhausted), only a recovery attempt makes
+            // state available again, so the server is told through a re-registration.
+            durabilityAvailable = true
+        }
         return persisted
     }
 

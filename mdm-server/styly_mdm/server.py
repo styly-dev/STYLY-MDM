@@ -243,6 +243,18 @@ def parse_push_state_status(push_state) -> str | None:
     return status if status in {"available", "unavailable"} else None
 
 
+def parse_push_state_reset(push_state) -> dict | None:
+    """Return a one-shot notice that the client discarded unreadable Push state."""
+    reset = push_state.get("reset") if isinstance(push_state, dict) else None
+    if not isinstance(reset, dict) or not isinstance(reset.get("reason"), str):
+        return None
+    detail = reset.get("detail") if isinstance(reset.get("detail"), str) else ""
+    return {
+        "reason": reset["reason"][:64],
+        "detail": " ".join(detail.split())[:256],
+    }
+
+
 def _coerce_record(value) -> dict | None:
     """Normalize a registry value into a record.
 
@@ -261,8 +273,6 @@ def _coerce_record(value) -> dict | None:
             "version_name": "",
             "retired": False,
             "identity_kind": "legacy",
-            "push_state_retry_supported": False,
-            "push_state_status": None,
         }
     if isinstance(value, dict):
         label = value.get("label", "")
@@ -290,10 +300,6 @@ def _coerce_record(value) -> dict | None:
                 if value.get("identity_kind") in {"canonical", "legacy"}
                 else "legacy"
             ),
-            "push_state_retry_supported": value.get("push_state_retry_supported") is True,
-            "push_state_status": value.get("push_state_status")
-            if value.get("push_state_status") in {"available", "unavailable"}
-            else None,
         }
     return None
 
@@ -438,7 +444,7 @@ def build_device_list_msg() -> str:
             "last_seen": device_registry.get(d["device_id"], {}).get("last_seen"),
             "version_code": d.get("version_code"),
             "version_name": d.get("version_name", ""),
-            "push_state_retry_supported": d.get("push_state_retry_supported", False),
+            # Live-only: whether the connected client can currently accept Push.
             "push_state_status": d.get("push_state_status"),
         }
         for d in devices.values()
@@ -472,8 +478,7 @@ def build_device_list_msg() -> str:
             "version_code": rec.get("version_code"),
             "version_name": rec.get("version_name", ""),
             "identity_kind": rec.get("identity_kind", "legacy"),
-            "push_state_retry_supported": rec.get("push_state_retry_supported", False),
-            "push_state_status": rec.get("push_state_status"),
+            "push_state_status": None,
         })
     device_list.sort(
         key=lambda e: (e["label"] == "", (e["label"] or e["device_id"]).lower())
@@ -1515,8 +1520,6 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     provisional_connections.pop(ws, None)
                     device_id = new_device_id
                     socket_identity_kind = kind
-                    capabilities = registration["capabilities"]
-                    retry_supported = "push_state_retry_v1" in capabilities
                     push_state_status = parse_push_state_status(data.get("push_state"))
                     devices[device_id] = {
                         "ws": ws,
@@ -1530,7 +1533,6 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "battery": prev.get("battery"),
                         "version_code": version_code,
                         "version_name": version_name,
-                        "push_state_retry_supported": retry_supported,
                         "push_state_status": push_state_status,
                     }
                     device_registry[device_id] = {
@@ -1543,8 +1545,6 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "version_code": version_code,
                         "version_name": version_name,
                         "identity_kind": kind,
-                        "push_state_retry_supported": retry_supported,
-                        "push_state_status": push_state_status,
                     }
                     save_registry()
 
