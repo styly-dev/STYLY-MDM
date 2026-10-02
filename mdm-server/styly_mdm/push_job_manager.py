@@ -21,8 +21,11 @@ from .push_jobs import (
     CAP_PUSH_RESUME_V1,
     DeviceState,
     JobState,
+    MANUAL_WAIT_QUEUE_REASONS,
+    MANUAL_WAIT_QUEUE_REASONS_SQL,
     ProtocolMode,
     TERMINAL_DEVICE_STATES,
+    assignment_actions,
     canonicalize_create_request,
     validate_device_transition,
 )
@@ -164,10 +167,10 @@ class PushJobManager:
                     "SELECT * FROM push_job_devices d WHERE job_id=? "
                     "AND cancel_requested_at IS NULL "
                     "AND NOT EXISTS (SELECT 1 FROM push_jobs r JOIN push_job_devices rd ON rd.job_id=r.job_id "
-                    "WHERE r.request_fingerprint=? AND rd.device_id=d.device_id) "
+                    "WHERE r.retry_of_job_id=? AND rd.device_id=d.device_id) "
                     "AND state IN ('failed','interrupted','unconfirmed') "
                     "AND COALESCE(failure_code,'') <> 'cancelled' ORDER BY target_ordinal",
-                    (job_id, fingerprint),
+                    (job_id, job_id),
                 ).fetchall()
                 if not targets:
                     raise StoreConflict("job has no unsuccessful targets to retry")
@@ -189,15 +192,16 @@ class PushJobManager:
                         job_id, client_request_id, request_fingerprint, revision, state,
                         mode, dest_path, source_label, declared_file_count,
                         declared_total_bytes, actual_file_count, actual_total_bytes,
-                        artifact_id, dispatch_enabled, created_at, create_expires_at,
-                        ready_at, updated_at
-                    ) VALUES (?, ?, ?, 1, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                        artifact_id, retry_of_job_id, dispatch_enabled, created_at,
+                        create_expires_at, ready_at, updated_at
+                    ) VALUES (?, ?, ?, 1, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                     """,
                     (retry_id, client_request_id, fingerprint, original["mode"],
                      original["dest_path"], original["source_label"],
                      original["declared_file_count"], original["declared_total_bytes"],
                      original["actual_file_count"], original["actual_total_bytes"],
-                     artifact["artifact_id"], timestamp, timestamp, timestamp, timestamp),
+                     artifact["artifact_id"], job_id, timestamp, timestamp, timestamp,
+                     timestamp),
                 )
                 start_seq = self.store._next_enqueue_seq(conn, len(targets))
                 for ordinal, target in enumerate(targets):
@@ -455,7 +459,7 @@ class PushJobManager:
                     FROM push_job_devices d
                     JOIN push_jobs j ON j.job_id=d.job_id
                     WHERE d.state=?
-                      AND COALESCE(d.queue_reason, '') NOT IN ('download_retry_exhausted','client_restarted','dispatch_paused')
+                      AND COALESCE(d.queue_reason, '') NOT IN {MANUAL_WAIT_QUEUE_REASONS_SQL}
                       AND d.cancel_requested_at IS NULL
                       AND d.device_id IN ({online_marks})
                       AND j.dispatch_enabled=1
@@ -563,7 +567,11 @@ class PushJobManager:
                 current = DeviceState(row["state"])
                 validate_device_transition(current, DeviceState.DISPATCHING)
                 timestamp = now_ms()
-                if row["cancel_requested_at"] is not None or not row["dispatch_enabled"] or row["queue_reason"] in {"download_retry_exhausted", "client_restarted", "dispatch_paused"}:
+                if (
+                    row["cancel_requested_at"] is not None
+                    or not row["dispatch_enabled"]
+                    or row["queue_reason"] in MANUAL_WAIT_QUEUE_REASONS
+                ):
                     # Recheck authorization after waiting for a shared slot;
                     # this assignment has not been dispatched yet.
                     conn.execute(
@@ -752,19 +760,31 @@ class PushJobManager:
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
             self.store._begin(conn)
             try:
-                row = conn.execute("SELECT * FROM push_job_devices WHERE job_id=? AND device_id=?",
-                                   (job_id, device_id)).fetchone()
+                row = conn.execute(
+                    "SELECT d.*, j.state AS job_state, j.dispatch_enabled "
+                    "FROM push_job_devices d JOIN push_jobs j ON j.job_id=d.job_id "
+                    "WHERE d.job_id=? AND d.device_id=?",
+                    (job_id, device_id),
+                ).fetchone()
                 if row is None:
                     raise StoreNotFound(f"{job_id}/{device_id}")
                 if row["cancel_requested_at"] is None and row["failure_code"] != "cancelled":
-                    capabilities = json.loads(row["dispatch_capability_snapshot_json"] or "[]")
-                    waiting = row["state"] == "queued" and row["queue_reason"] in {
-                        "download_retry_exhausted", "client_restarted", "dispatch_paused"}
-                    fenced = row["state"] == "unconfirmed" and conn.execute(
-                        "SELECT 1 FROM push_device_fences WHERE device_id=? AND blocking_job_id=? AND blocking_attempt=?",
-                        (device_id, job_id, row["attempt"])).fetchone() is not None
-                    if (not (waiting or row["state"] == "reconciling" or fenced)
-                            or CAP_PUSH_RESUME_V1 not in capabilities or row["dispatch_revision"] is None):
+                    blocking_fence = conn.execute(
+                        "SELECT 1 FROM push_device_fences "
+                        "WHERE device_id=? AND blocking_job_id=? AND blocking_attempt=?",
+                        (device_id, job_id, row["attempt"]),
+                    ).fetchone() is not None
+                    actions = assignment_actions(
+                        job_state=row["job_state"],
+                        dispatch_enabled=bool(row["dispatch_enabled"]),
+                        state=row["state"],
+                        queue_reason=row["queue_reason"],
+                        cancel_requested=False,
+                        retried=device_id in self.store._retry_job_ids(conn, job_id),
+                        resume_supported=self.store._resume_supported(row),
+                        blocking_fence=blocking_fence,
+                    )
+                    if not actions.cancellable:
                         raise StoreConflict("Only interrupted or unconfirmed transfers can be cancelled")
                     timestamp = now_ms()
                     conn.execute("UPDATE push_job_devices SET cancel_requested_at=?, updated_at=? WHERE job_id=? AND device_id=?",
