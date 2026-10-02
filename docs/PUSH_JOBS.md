@@ -39,12 +39,13 @@ longer served or retried.
 Job-v1 commands carry an immutable per-device `revision`, `artifact_id`, absolute
 URL, exact size, SHA-256, and ETag. The aggregate job revision may continue to
 advance; the dispatch revision remains fixed for one `(job_id, device_id,
-attempt)` and is the exact identity used when authorizing a resume. Large artifacts
-require `push_resume_v1`; every Push job target must advertise `push_job_id_v1`.
-The exact artifact size is checked after packaging and again at dispatch, so ZIP
-container overhead cannot bypass capability admission. The legacy job fallback is
-disabled and clients without `push_job_id_v1` are rejected as job targets. Standalone
-Push through `/api/bundles` remains a separate legacy flow.
+attempt)` and is the exact identity used when authorizing a resume. Every Push
+job target must advertise both `push_job_id_v1` and `push_resume_v1`, whatever the
+artifact size; there is no non-resumable fallback. Job creation rejects other
+targets, and dispatch rechecks the live session, failing the assignment with
+`capability_changed_before_dispatch` if it no longer qualifies. A device on an
+older APK must take the client self-update before it can receive Push/Sync jobs.
+Standalone Push through `/api/bundles` remains a separate legacy flow.
 
 Each job-v1 artifact URL includes a random, in-memory `lease` token scoped to its
 exact assignment. The server accepts the URL only while that assignment owns a
@@ -56,12 +57,6 @@ download must be manually resumed after the device reports the revoked lease.
 If a device reconnects with the same live token while its earlier HTTP handler
 is still open, the newer request aborts and replaces that handler. It can then
 continue with a Range request under the same assignment and transfer slot.
-
-Creation rejects a declared source size above the threshold for a target without
-resume support. Packaging checks the final ZIP size against the stored target
-capabilities before publishing the artifact; if it crosses the threshold, upload
-fails with `artifact_requires_push_resume_v1`. Dispatch checks the final size
-again against the live session, which may have changed since creation.
 
 The client keeps job-owned state below
 `Downloads/styly-mdm/.push-tmp/jobs/{job_id}/{attempt}/`:
@@ -240,10 +235,9 @@ Resume before receiving a new token.
   not leave stale entries. These registered devices are separate from provisional
   connection rows and never become provisional power-control targets.
 
-The 60-second deadline requires the matching Android APK; older clients retain
-their previous retry timing. Deploy the server and APK together while the old APK
-has no active Push/Sync transfer: its unscoped job-v1 artifact URLs are rejected
-after cutover.
+Older APKs cannot receive Push/Sync jobs from this server. Deploy the server and
+update clients while the old APK has no active Push/Sync transfer: its unscoped
+job-v1 artifact URLs are rejected after cutover.
 `CANCEL_PUSH_JOB` remains an admin action; clients receive the existing exact-identity
 `PUSH_RESUME_REJECTED` only after they report interrupted work. Only an `absent`
 reconciliation report from the current device owner that carries the exact job,
@@ -297,7 +291,7 @@ continues under that existing operator authority.
 
 The worker validates destination paths on the device as well as the server. It accepts only a shared-storage subdirectory, rejects protected top-level media/app directories, does not traverse destination symlinks, bounds ZIP entry count and expanded bytes, rejects duplicate or conflicting archive paths, and validates the exact job-v1 artifact size and SHA-256 before publishing the downloaded ZIP or touching the destination. Destination validation completes before the client reports `applying`.
 
-Push jobs require a registered GUID client advertising `push_job_id_v1`; large job artifacts also require `push_resume_v1`. The legacy job fallback is disabled. The standalone `/api/bundles` Push flow still uses the legacy `EXECUTE_PUSH_FILES` format and has no job-v1 exact-size, resume, or HTTP-lease guarantees. Legacy serial-ID clients remain eligible only for APK installation/update. Consistent with the standalone flow's prior behavior, its 2 GiB bundle limit applies to uploaded source bytes and extracted content, not the ZIP artifact; container overhead may make the downloaded artifact slightly larger.
+Push jobs require a registered GUID client advertising `push_job_id_v1` and `push_resume_v1`. The legacy job fallback is disabled. The standalone `/api/bundles` Push flow still uses the legacy `EXECUTE_PUSH_FILES` format and has no job-v1 exact-size, resume, or HTTP-lease guarantees. Legacy serial-ID clients remain eligible only for APK installation/update. Consistent with the standalone flow's prior behavior, its 2 GiB bundle limit applies to uploaded source bytes and extracted content, not the ZIP artifact; container overhead may make the downloaded artifact slightly larger.
 
 Finish pending serial-ID Push/Sync jobs with the previous server before upgrading
 to GUID identity. Old assignments are not migrated or resumed on serial clients;
@@ -364,7 +358,6 @@ An exact terminal result from the current owner settles any dispatched active ph
 | `MDM_PUSH_COMMAND_ACCEPT_TIMEOUT` | `15` | Wait for accept/reject before probing |
 | `MDM_PUSH_ACCEPT_RECONCILIATION_TIMEOUT` | `60` | Pre-accept reconciliation window |
 | `MDM_PUSH_RECONCILIATION_TIMEOUT` | `1800` | Accepted-work reconciliation window when no live HTTP transfer lease is active |
-| `MDM_PUSH_RESUME_THRESHOLD_BYTES` | `67108864` | Exact artifact bytes above which every target must advertise `push_resume_v1` |
 | `MDM_PUSH_ARTIFACT_RETRY_WINDOW` | `604800` | Seconds terminal artifact bytes remain available for recoverable retry |
 | `MDM_PUSH_ARTIFACT_GC_INTERVAL` | `60` | Seconds between lease-aware artifact GC scans |
 | `MDM_PUSH_RECENT_JOB_LIMIT` | `100` | Recent terminal snapshots returned |
