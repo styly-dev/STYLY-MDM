@@ -342,7 +342,7 @@ def _dispatch_scheduler(manager, websocket):
         device_id="D1",
         session_id="session-1",
         ws=websocket,
-        capabilities=frozenset({"push_job_id_v1"}),
+        capabilities=frozenset({"push_job_id_v1", "push_resume_v1"}),
         process_instance_id="process-1",
         owner_lock=asyncio.Lock(),
         http_base="http://server",

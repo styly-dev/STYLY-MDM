@@ -612,35 +612,6 @@ class PushJobStore:
             "devices": devices,
         }
 
-    async def devices_missing_resume_v1(self, job_id: str) -> list[str]:
-        """Return targets whose creation-time protocol snapshot lacks resume support."""
-
-        def op(conn: sqlite3.Connection) -> list[str]:
-            if conn.execute(
-                "SELECT 1 FROM push_jobs WHERE job_id=?", (job_id,)
-            ).fetchone() is None:
-                raise StoreNotFound(job_id)
-            rows = conn.execute(
-                "SELECT device_id, protocol_mode, create_capability_snapshot_json "
-                "FROM push_job_devices WHERE job_id=? ORDER BY target_ordinal",
-                (job_id,),
-            ).fetchall()
-            missing: list[str] = []
-            for row in rows:
-                try:
-                    capabilities = json.loads(row["create_capability_snapshot_json"])
-                except (TypeError, json.JSONDecodeError):
-                    capabilities = []
-                if (
-                    row["protocol_mode"] != ProtocolMode.JOB_V1.value
-                    or not isinstance(capabilities, list)
-                    or CAP_PUSH_RESUME_V1 not in capabilities
-                ):
-                    missing.append(row["device_id"])
-            return missing
-
-        return await self._call(op)
-
     async def create_job(
         self,
         request: Any,
