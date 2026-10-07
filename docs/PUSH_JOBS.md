@@ -64,9 +64,10 @@ The client keeps job-owned state below
 
 - `artifact.part` is the only authoritative byte offset;
 - atomically replaced `metadata.json` binds that file to the job, attempt,
-  dispatch revision, artifact ID, size, SHA-256, strong ETag, and retention
-  timestamps. The URL is a replaceable locator refreshed by each exact server
-  authorization, so a server authority change does not invalidate the artifact;
+  dispatch revision, artifact ID, size, SHA-256, and strong ETag from the
+  command. It does not store the URL: that is a replaceable locator taken from
+  each exact server authorization, so a server authority change does not
+  invalidate the artifact;
 - `artifact.zip` appears only after exact-size and SHA-256 verification.
 
 Unknown, malformed, or mismatched metadata is never appended to. Expired
@@ -75,11 +76,18 @@ validated partial of `N > 0` bytes is requested with `Range: bytes=N-`,
 `If-Match: <strong-etag>`, and `Accept-Encoding: identity`.
 
 Registration and reconciliation report a nonzero `validated_offset` only when
-the same worker metadata checks accept the partial identity, a strong ETag is
-available, and its length is within the expected artifact size. This is a resume
+the same worker metadata checks accept the partial identity and its length is
+within the expected artifact size. This is a resume
 offset, not a completed SHA-256 verification. The server sends unencoded bytes
 without a `Content-Encoding` header; the client still accepts older servers that
 explicitly send `Content-Encoding: identity`.
+
+Body writing and final size/SHA validation are shared with standalone bundles,
+which still allow omitted size, SHA, and ETag and do not enter the job retry loop.
+Partial-file deletion is decided in the worker, before terminal state persistence:
+retryable failures, unavailable artifacts, revoked leases, and storage failures
+with a validated prefix retain their bytes. A definitive response identity failure discards
+the partial; a final SHA mismatch also invalidates job metadata.
 
 `validated_offset` is reconciliation state, not live console byte progress. Wiring
 the worker's progress callback and maintaining monotonic displayed progress across
@@ -163,22 +171,31 @@ On process or device restart, the client retains a valid interrupted Issue #94 j
 record and reports its exact artifact, dispatch revision, attempt, and local
 offset during registration/reconciliation. The server requeues it only when that
 evidence matches the durable assignment and its recorded `push_resume_v1`
-capability. Restarted work also waits for manual Resume before the server sends
+capability. That capability comes from the snapshot stored at dispatch, not from
+the current session; a malformed snapshot grants nothing. Restarted work also waits for manual Resume before the server sends
 a fresh `EXECUTE_PUSH_FILES` authorization. The client
 never resumes, extracts, or applies stale partial work merely because it exists.
 If exact evidence cannot be authorized, the server sends
 `PUSH_RESUME_REJECTED`; the client durably releases only that exact interrupted
 identity, removes its owned work, and confirms `absent`. A verified
 `artifact.zip` surviving a restart is hash-checked and reused without network
-transfer. Issue #91 commands without a dispatch revision remain executable but
-are never treated as resumable. The current server does not issue those legacy
-commands as Push-job fallback; standalone `/api/bundles` Push remains a separate path.
+transfer.
+
+Push runs only between a server and client of the same version; a newer server
+only updates an older client's APK. The client therefore rejects a live job-v1
+command without a positive `revision` and a strong `artifact_etag` as malformed,
+and compares replays by exact execution fields. Durable state written by the
+Issue #91 client still loads: its active work, which has no revision, closes as
+`client_restarted` instead of resuming, and its receipts still answer result
+acknowledgements and reconciliation. Standalone `/api/bundles` Push remains a
+separate path.
 
 Interrupted client ownership uses a local deadline whose default is 24 hours,
 measured from the first interruption rather than the start of a long download.
-The coordinator's `interruptedAt` is the only expiration authority; the older
-metadata `retention_deadline` remains for file-format compatibility but cannot
-discard a freshly authorized partial. Reauthorization does not reset the first interruption time.
+The coordinator's `interruptedAt` is the only expiration authority. Reauthorization does not reset the first interruption time.
+One replaceable timer checks this deadline, and command acceptance checks it again
+in case the timer is delayed. Failed expiry persistence retains ownership and is
+retried after 60 seconds; successful persistence precedes release and cleanup.
 At expiry the client durably records `resume_expired`,
 releases its local execution gate, removes the exact job-owned work, and replays
 the terminal result when registered. The server remains authoritative for its

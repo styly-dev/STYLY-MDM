@@ -16,6 +16,7 @@ class PushProtocolStrictTypesTest {
         put("artifact_size", 42L)
         put("artifact_sha256", "a".repeat(64))
         put("revision", 1L)
+        put("artifact_etag", "\"v1\"")
         put("dest_path", "/sdcard/STYLY/content")
     }
 
@@ -48,10 +49,24 @@ class PushProtocolStrictTypesTest {
     }
 
     @Test
-    fun `job-v1 accepts issue 91 missing revision but rejects wrong types and weak etag`() {
-        assertTrue(
-            PushProtocol.parseCommand(payload().apply { remove("revision") }).revision == 0L,
+    fun `live job-v1 requires revision and strong etag but durable state does not`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            PushProtocol.parseCommand(payload().apply { remove("revision") })
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            PushProtocol.parseCommand(payload().apply { put("revision", 0L) })
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            PushProtocol.parseCommand(payload().apply { remove("artifact_etag") })
+        }
+        val issue91 = PushProtocol.parseCommand(
+            payload().apply {
+                remove("revision")
+                remove("artifact_etag")
+            },
+            durableState = true,
         )
+        assertTrue(issue91.revision == 0L && issue91.artifactEtag == null)
         assertThrows(IllegalArgumentException::class.java) {
             PushProtocol.parseCommand(payload().apply { put("revision", "1") })
         }

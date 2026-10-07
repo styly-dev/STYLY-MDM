@@ -19,6 +19,7 @@ class PushProtocolTest {
         put("artifact_size", 42)
         put("artifact_sha256", "a".repeat(64))
         put("revision", 1)
+        put("artifact_etag", "\"v1\"")
         put("dest_path", "/sdcard/STYLY/content")
     }
 
