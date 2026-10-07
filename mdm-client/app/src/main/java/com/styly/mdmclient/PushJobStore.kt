@@ -13,6 +13,8 @@ internal sealed class PushStateLoadResult {
     object Missing : PushStateLoadResult()
     /** The file could not be read (I/O error); its content is unknown, so retry later. */
     data class Unreadable(val error: IOException) : PushStateLoadResult()
+    /** Preserve the snapshot: dropping receipts would lose execution evidence. */
+    data class InvalidReceipts(val error: InvalidPushReceiptsException) : PushStateLoadResult()
     /** The file was read but its content is not a valid durable state. */
     data class Corrupt(val error: Exception) : PushStateLoadResult()
 }
@@ -33,6 +35,8 @@ internal fun loadPushState(
     if (fileExists()) PushStateLoadResult.Unreadable(error) else PushStateLoadResult.Missing
 } catch (error: IOException) {
     PushStateLoadResult.Unreadable(error)
+} catch (error: InvalidPushReceiptsException) {
+    PushStateLoadResult.InvalidReceipts(error)
 } catch (error: Exception) {
     PushStateLoadResult.Corrupt(error)
 }
