@@ -1040,7 +1040,7 @@ class PushFilesWorkerTest {
     }
 
     @Test
-    fun `inconsistent 416 response rejects a non-complete local artifact`() {
+    fun `inconsistent 416 response retains a non-complete local artifact`() {
         val archive = zip("content.txt" to "incomplete-416").readBytes()
         val split = archive.size / 2
         val work = File(tmp.root, "incomplete-416-work")
@@ -1052,7 +1052,7 @@ class PushFilesWorkerTest {
                 artifactUrl = server.url,
                 artifactSize = archive.size.toLong(),
                 artifactSha256 = sha256(archive),
-            )
+            ).copy(revision = 7L)
             seedResume(work, command, archive.copyOfRange(0, split))
             val execution = PushFilesWorker(
                 hasExternalStorageAccess = { true },
@@ -1060,8 +1060,10 @@ class PushFilesWorkerTest {
             ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
 
             assertEquals("fail", execution.result.status)
-            assertEquals("artifact_identity_mismatch", execution.result.failureCode)
-            assertFalse(File(work, "artifact.part").exists())
+            assertEquals("download_failed", execution.result.failureCode)
+            assertTrue(execution.interrupted)
+            assertEquals("download_retry_exhausted", execution.interruptionReason)
+            assertArrayEquals(archive.copyOfRange(0, split), File(work, "artifact.part").readBytes())
         }
     }
 
@@ -1080,7 +1082,7 @@ class PushFilesWorkerTest {
                 artifactUrl = server.url,
                 artifactSize = archive.size.toLong(),
                 artifactSha256 = sha256(archive),
-            )
+            ).copy(revision = 7L)
             seedResume(work, command, archive.copyOfRange(0, split))
             val execution = PushFilesWorker(
                 hasExternalStorageAccess = { true },
@@ -1089,6 +1091,7 @@ class PushFilesWorkerTest {
 
             assertEquals("fail", execution.result.status)
             assertEquals("artifact_identity_mismatch", execution.result.failureCode)
+            assertFalse(execution.interrupted)
             assertFalse(File(work, "artifact.part").exists())
         }
     }
@@ -1156,7 +1159,7 @@ class PushFilesWorkerTest {
                 artifactUrl = server.url,
                 artifactSize = archive.size.toLong(),
                 artifactSha256 = sha256(archive),
-            )
+            ).copy(revision = 7L)
             seedResume(work, command, archive.copyOfRange(0, split))
             val execution = PushFilesWorker(
                 hasExternalStorageAccess = { true },
@@ -1165,12 +1168,13 @@ class PushFilesWorkerTest {
 
             assertEquals("fail", execution.result.status)
             assertEquals("artifact_identity_mismatch", execution.result.failureCode)
+            assertFalse(execution.interrupted)
             assertFalse(File(work, "artifact.part").exists())
         }
     }
 
     @Test
-    fun `malformed content range rejects and discards the partial`() {
+    fun `malformed content range interrupts and retains the partial`() {
         val archive = zip("content.txt" to "range-invalid").readBytes()
         val split = archive.size / 2
         val remaining = archive.copyOfRange(split, archive.size)
@@ -1184,7 +1188,7 @@ class PushFilesWorkerTest {
                 artifactUrl = server.url,
                 artifactSize = archive.size.toLong(),
                 artifactSha256 = sha256(archive),
-            )
+            ).copy(revision = 7L)
             seedResume(work, command, archive.copyOfRange(0, split))
             val execution = PushFilesWorker(
                 hasExternalStorageAccess = { true },
@@ -1192,13 +1196,15 @@ class PushFilesWorkerTest {
             ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
 
             assertEquals("fail", execution.result.status)
-            assertEquals("artifact_identity_mismatch", execution.result.failureCode)
-            assertFalse(File(work, "artifact.part").exists())
+            assertEquals("download_failed", execution.result.failureCode)
+            assertTrue(execution.interrupted)
+            assertEquals("download_retry_exhausted", execution.interruptionReason)
+            assertArrayEquals(archive.copyOfRange(0, split), File(work, "artifact.part").readBytes())
         }
     }
 
     @Test
-    fun `content range ending at or beyond total is rejected before append`() {
+    fun `content range ending at or beyond total interrupts before append`() {
         val archive = zip("content.txt" to "range-end-overflow").readBytes()
         val split = archive.size / 2
         val remaining = archive.copyOfRange(split, archive.size)
@@ -1215,7 +1221,7 @@ class PushFilesWorkerTest {
                 artifactUrl = server.url,
                 artifactSize = archive.size.toLong(),
                 artifactSha256 = sha256(archive),
-            )
+            ).copy(revision = 7L)
             seedResume(work, command, archive.copyOfRange(0, split))
             val execution = PushFilesWorker(
                 hasExternalStorageAccess = { true },
@@ -1223,10 +1229,63 @@ class PushFilesWorkerTest {
                 retryDelay = { index -> retryDelays += index },
             ).execute(command, PushFilesWorker.Callbacks({}, {}, {}, { received -> progress += received }))
 
-            assertEquals("artifact_identity_mismatch", execution.result.failureCode)
-            assertFalse(File(work, "artifact.part").exists())
+            assertEquals("download_failed", execution.result.failureCode)
+            assertTrue(execution.interrupted)
+            assertEquals("download_retry_exhausted", execution.interruptionReason)
+            assertArrayEquals(archive.copyOfRange(0, split), File(work, "artifact.part").readBytes())
             assertTrue(progress.isEmpty())
             assertTrue(retryDelays.isEmpty())
+        }
+    }
+
+    @Test
+    fun `invalid resume headers keep the exact prefix and require manual resume`() {
+        val archive = zip("content.txt" to "invalid-response-headers").readBytes()
+        val split = archive.size / 2
+        val prefix = archive.copyOfRange(0, split)
+        val remaining = archive.copyOfRange(split, archive.size)
+        val etag = "ETag: \"v1\""
+        val range = "Content-Range: bytes $split-${archive.lastIndex}/${archive.size}"
+        val length = "Content-Length: ${remaining.size}"
+        val responses = listOf(
+            206 to "$range\r\n$length",
+            206 to "ETag: W/\"v1\"\r\n$range\r\n$length",
+            206 to "$etag\r\n$range\r\n$length\r\nContent-Encoding: gzip",
+            206 to "$etag\r\n$range",
+            206 to "$etag\r\n$range\r\nContent-Length: ${remaining.size + 1}",
+            206 to "$etag\r\nContent-Range: bytes 0-${remaining.lastIndex}/${archive.size}\r\n$length",
+            206 to "$etag\r\nContent-Range: bytes $split-${archive.lastIndex}/${archive.size + 1}\r\n$length",
+            200 to "$etag\r\n$length",
+            416 to "$etag\r\nContent-Range: bytes invalid\r\nContent-Length: 0",
+        )
+        responses.forEachIndexed { index, (status, headers) ->
+            val work = File(tmp.root, "invalid-headers-$index")
+            val command = command(
+                artifactSize = archive.size.toLong(),
+                artifactSha256 = sha256(archive),
+            ).copy(revision = 7L, artifactEtag = "\"v1\"")
+            seedResume(work, command, prefix)
+            val progress = mutableListOf<Long>()
+            val retryDelays = mutableListOf<Long>()
+            OneShotServer(status = status, headers = headers, body = remaining).use { server ->
+                val execution = PushFilesWorker(
+                    hasExternalStorageAccess = { true },
+                    attemptDirectoryProvider = { work },
+                    retryDelay = { retryDelays += it },
+                ).execute(
+                    command.copy(artifactUrl = server.url),
+                    PushFilesWorker.Callbacks({}, {}, {}, { progress += it }),
+                )
+
+                assertEquals("Case $index", "download_failed", execution.result.failureCode)
+                assertTrue("Case $index", execution.interrupted)
+                assertEquals("download_retry_exhausted", execution.interruptionReason)
+                assertArrayEquals(prefix, File(work, "artifact.part").readBytes())
+                assertTrue(File(work, "metadata.json").isFile)
+                assertTrue(progress.isEmpty())
+                assertTrue(retryDelays.isEmpty())
+                assertTrue(server.request.contains("Range: bytes=$split-"))
+            }
         }
     }
 
@@ -1354,7 +1413,7 @@ class PushFilesWorkerTest {
                     artifactUrl = server.url,
                     artifactSize = archive.size.toLong(),
                     artifactSha256 = "0".repeat(64),
-                ),
+                ).copy(revision = 7L),
                 PushFilesWorker.Callbacks(
                     onTransferComplete = { callbackInvoked = true },
                     onValidated = { callbackInvoked = true },
@@ -1364,6 +1423,7 @@ class PushFilesWorkerTest {
 
             assertEquals("fail", execution.result.status)
             assertEquals("artifact_identity_mismatch", execution.result.failureCode)
+            assertFalse(execution.interrupted)
         }
         assertFalse(callbackInvoked)
         assertEquals("unchanged", sentinel.readText())
