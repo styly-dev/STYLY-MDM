@@ -43,6 +43,7 @@ from .push_jobs import (
     PushJobError,
     canonicalize_create_request,
     parse_capabilities,
+    parse_dispatch_capabilities,
 )
 from .push_scheduler import LiveSession, PushScheduler
 from .server import parse_push_state_reset, parse_push_state_status
@@ -234,13 +235,10 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
                     # A failed operator action (for example a SQLite error) must not
                     # close the whole admin connection.
                     log.exception("Push admin action %s failed", payload.get("type"))
-                    await asyncio.wait_for(
-                        self.send_str(json.dumps({
-                            "type": "ERROR",
-                            "message": f"{payload.get('type')} failed on the server",
-                        })),
-                        self._push_runtime.admin_send_timeout,
-                    )
+                    await self._push_runtime.admin_send(self, {
+                        "type": "ERROR",
+                        "message": f"{payload.get('type')} failed on the server",
+                    })
                     continue
                 if handled:
                     continue
@@ -434,17 +432,7 @@ class PushRuntime:
         try:
             cutoff = now_ms() - self.recent_days * 86_400_000
             snapshots = await self.manager.list_snapshots(self.recent_limit, cutoff)
-            await asyncio.wait_for(
-                ws.send_str(
-                    json.dumps(
-                        {"type": "PUSH_JOBS_SNAPSHOT", "jobs": snapshots},
-                        separators=(",", ":"),
-                    )
-                ),
-                self.admin_send_timeout,
-            )
-        except asyncio.CancelledError:
-            raise
+            await self.admin_send(ws, {"type": "PUSH_JOBS_SNAPSHOT", "jobs": snapshots})
         except Exception as snapshot_error:
             log.exception("Could not send initial Push job snapshot")
             try:
@@ -456,11 +444,18 @@ class PushRuntime:
                     ),
                     self.admin_send_timeout,
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception:
                 log.exception("Could not close admin after initial Push snapshot failure")
                 raise snapshot_error
+
+    async def admin_send(
+        self, ws: RuntimeWebSocketResponse, payload: dict[str, Any]
+    ) -> None:
+        """Send one admin message, raising when it cannot be sent in time."""
+        await asyncio.wait_for(
+            ws.send_str(json.dumps(payload, separators=(",", ":"))),
+            self.admin_send_timeout,
+        )
 
     async def _close_failed_admin_socket(
         self, ws: RuntimeWebSocketResponse, message: bytes
@@ -480,9 +475,7 @@ class PushRuntime:
                 ),
                 self.admin_send_timeout,
             )
-        except asyncio.CancelledError:
-            raise
-        except (Exception, asyncio.TimeoutError):
+        except Exception:
             log.warning("Could not close failed admin WebSocket", exc_info=True)
 
     async def create_job_handler(self, request: aiohttp_web.Request) -> aiohttp_web.Response:
@@ -2048,13 +2041,9 @@ class PushRuntime:
                 self.scheduler.wake()
             return
         if status == "interrupted":
-            try:
-                dispatch_capabilities = set(
-                    json.loads(assignment.get("dispatch_capability_snapshot_json") or "[]")
-                )
-            except (TypeError, ValueError):
-                dispatch_capabilities = set()
-            if CAP_PUSH_RESUME_V1 in dispatch_capabilities:
+            if CAP_PUSH_RESUME_V1 in parse_dispatch_capabilities(
+                assignment.get("dispatch_capability_snapshot_json")
+            ):
                 snapshots = await self._resume_interrupted_report(
                     session, device_id, payload, assignment
                 )
@@ -2170,14 +2159,12 @@ class PushRuntime:
                     snapshot = await self._cancel_push_job(ws, job_id, payload)
                 if self.scheduler is not None:
                     self.scheduler.wake()
-                await asyncio.wait_for(ws.send_str(json.dumps({
+                await self.admin_send(ws, {
                     "type": "PUSH_JOB_ACTION_SENT", "job_id": snapshot["job_id"],
                     "action": message_type,
-                })), self.admin_send_timeout)
+                })
             except (StoreConflict, StoreNotFound, ValueError) as exc:
-                await asyncio.wait_for(ws.send_str(json.dumps({
-                    "type": "ERROR", "message": str(exc),
-                })), self.admin_send_timeout)
+                await self.admin_send(ws, {"type": "ERROR", "message": str(exc)})
             return True
         if message_type == "PUSH_FILES" and isinstance(payload.get("job_id"), str):
             job_id = payload["job_id"]
@@ -2203,13 +2190,8 @@ class PushRuntime:
                         snapshot, changed = offline_snapshot, True
             except (StoreConflict, StoreNotFound) as exc:
                 try:
-                    await asyncio.wait_for(
-                        ws.send_str(json.dumps({"type": "ERROR", "message": str(exc)})),
-                        self.admin_send_timeout,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except (Exception, asyncio.TimeoutError):
+                    await self.admin_send(ws, {"type": "ERROR", "message": str(exc)})
+                except Exception:
                     log.warning("Could not send Push dispatch error to admin", exc_info=True)
                     await self._close_failed_admin_socket(ws, b"admin send failed")
                 return True
@@ -2232,30 +2214,23 @@ class PushRuntime:
             try:
                 if changed:
                     await self.publish(snapshot)
-                await asyncio.wait_for(
-                    ws.send_str(
-                        json.dumps({
-                            "type": "PUSH_FILES_SENT",
-                            "job_id": job_id,
-                            "revision": snapshot["revision"],
-                            "state": snapshot["state"],
-                            "dispatch_enabled": snapshot["dispatch_enabled"],
-                            # A targeted Resume acts on the listed devices only.
-                            "target_count": (
-                                len(targets) if targets is not None
-                                else snapshot["aggregate"]["total"]
-                            ),
-                            "resume": targets is not None,
-                            "max_concurrent": self.legacy.MAX_CONCURRENT_TRANSFERS,
-                            "delete_extras": snapshot["mode"] == "sync",
-                            "dest_path": snapshot["dest_path"],
-                        }, separators=(",", ":"))
+                await self.admin_send(ws, {
+                    "type": "PUSH_FILES_SENT",
+                    "job_id": job_id,
+                    "revision": snapshot["revision"],
+                    "state": snapshot["state"],
+                    "dispatch_enabled": snapshot["dispatch_enabled"],
+                    # A targeted Resume acts on the listed devices only.
+                    "target_count": (
+                        len(targets) if targets is not None
+                        else snapshot["aggregate"]["total"]
                     ),
-                    self.admin_send_timeout,
-                )
-            except asyncio.CancelledError:
-                raise
-            except (Exception, asyncio.TimeoutError):
+                    "resume": targets is not None,
+                    "max_concurrent": self.legacy.MAX_CONCURRENT_TRANSFERS,
+                    "delete_extras": snapshot["mode"] == "sync",
+                    "dest_path": snapshot["dest_path"],
+                })
+            except Exception:
                 log.warning("Could not acknowledge Push dispatch to admin", exc_info=True)
                 await self._close_failed_admin_socket(ws, b"admin send failed")
             finally:
@@ -2309,9 +2284,7 @@ class PushRuntime:
                     continue
             await self.publish(snapshot)
         if errors:
-            await asyncio.wait_for(ws.send_str(json.dumps({
-                "type": "ERROR", "message": "; ".join(errors),
-            })), self.admin_send_timeout)
+            await self.admin_send(ws, {"type": "ERROR", "message": "; ".join(errors)})
         return snapshot
 
     async def _cancel_push_target(self, job_id: str, device_id: str) -> dict[str, Any]:
