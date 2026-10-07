@@ -170,12 +170,16 @@ is already running; it hashes the whole file once after `PUSH_PHASE validating`.
 On process or device restart, the client retains a valid interrupted Issue #94 job-v1
 record and reports its exact artifact, dispatch revision, attempt, and local
 offset during registration/reconciliation. The server requeues it only when that
-evidence matches the durable assignment and its recorded `push_resume_v1`
-capability. That capability comes from the snapshot stored at dispatch, not from
-the current session; a malformed snapshot grants nothing. Restarted work also waits for manual Resume before the server sends
+evidence matches a job-v1 assignment with an immutable dispatch revision, an
+authorized dispatch gate, and no pending cancellation. Dispatch admission requires
+both `push_job_id_v1` and `push_resume_v1`; resume does not parse historical
+capability snapshots or repeat the session capability check. New dispatches no
+longer write capability snapshots; the nullable database column and historical
+values remain for schema compatibility. Restarted work also
+waits for manual Resume before the server sends
 a fresh `EXECUTE_PUSH_FILES` authorization. The client
 never resumes, extracts, or applies stale partial work merely because it exists.
-If exact evidence cannot be authorized, the server sends
+If an interrupted report supplies a cleanup identity but cannot be authorized, the server sends
 `PUSH_RESUME_REJECTED`; the client durably releases only that exact interrupted
 identity, removes its owned work, and confirms `absent`. A verified
 `artifact.zip` surviving a restart is hash-checked and reused without network
@@ -183,9 +187,12 @@ transfer.
 
 Push runs only between a server and client of the same version; a newer server
 only updates an older client's APK. The client therefore rejects a live job-v1
-command without a positive `revision` and a strong `artifact_etag` as malformed,
-and compares replays by exact execution fields. Durable state written by the
-Issue #91 client still loads: its active work, which has no revision, closes as
+command without `artifact_url`, a positive `revision`, and a strong `artifact_etag`
+as malformed, and compares replays by exact execution fields. Job-v1 commands no
+longer duplicate `artifact_url` as `bundle_url`; the latter remains the URL field
+for standalone `/api/bundles` commands. Saved job-v1 commands also require
+`artifact_url`, which the released Issue #91 client (v0.6.0) already persisted.
+Durable state written by that client still loads: its active work, which has no revision, closes as
 `client_restarted` instead of resuming, and its receipts still answer result
 acknowledgements and reconciliation. Standalone `/api/bundles` Push remains a
 separate path.
@@ -382,6 +389,11 @@ to GUID identity. Old assignments are not migrated or resumed on serial clients;
 queued assignments may remain pending. Retain those records and create a new job
 for the registered GUID if delivery is still needed. A database reset is not
 required, and an old pending record is not evidence of successful delivery.
+Identity-less standalone Push messages do not settle old database-backed legacy
+assignments. Startup adds no legacy-specific terminal cleanup. A retained assignment or
+fence for the same device key can continue to block later work until the existing
+reconciliation policy resolves it; records under a different serial key do not
+block the registered GUID. Schema upgrades and their backups remain supported.
 
 ## State and revision
 
@@ -495,7 +507,7 @@ sequenceDiagram
     S->>DB: queued -> waiting_transfer
     S->>S: acquire shared transfer slot; register exact waiter
     S->>DB: waiting_transfer -> dispatching
-    S->>D: EXECUTE_PUSH_FILES(job_id, attempt, artifact URL + lease token)
+    S->>D: EXECUTE_PUSH_FILES(job_id, attempt, artifact_url + lease token)
     D->>D: persist active command
     D-->>S: PUSH_JOB_ACCEPTED
     S->>DB: downloading

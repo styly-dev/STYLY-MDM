@@ -135,7 +135,7 @@ async def test_admin_offline_timeout_cancel_finishes_without_device_command(mana
 
 @pytest.mark.asyncio
 async def test_cancel_intent_survives_exact_reconcile_send_failure(manager, tmp_path):
-    active = await downloading_job(manager.store, manager, CAPS)
+    active = await downloading_job(manager.store, manager)
     await manager.mark_reconciling(active["job_id"], "D1", expected={DeviceState.DOWNLOADING},
                                    reason="device_disconnect", deadline=1)
     await manager.mark_unconfirmed(active["job_id"], "D1", None, "timeout", observed_now=2)
@@ -153,7 +153,7 @@ async def test_cancel_intent_survives_exact_reconcile_send_failure(manager, tmp_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resumed", [False, True])
 async def test_admin_cancel_rejects_active_or_already_resumed_work(manager, tmp_path, resumed):
-    original = await timed_out_job(manager) if resumed else await downloading_job(manager.store, manager, CAPS)
+    original = await timed_out_job(manager) if resumed else await downloading_job(manager.store, manager)
     if resumed:
         _, original = await manager.enable_dispatch(original["job_id"])
     runtime, session, admin = operator_runtime(manager, tmp_path)
@@ -209,7 +209,7 @@ async def two_device_job(manager, *, interrupted=False, downloading=False):
         for device_id in ["D1", "D2"]:
             assert (await manager.claim_next([device_id]))["device_id"] == device_id
             await manager.prepare_dispatch(job_id, device_id, protocol_mode=ProtocolMode.JOB_V1,
-                                           live_capabilities=CAPS, accept_deadline=None)
+                                           accept_deadline=None)
             active = await manager.transition_device(job_id, device_id,
                 expected={DeviceState.DISPATCHING}, target=DeviceState.DOWNLOADING,
                 fields={"accepted_at": 1})
@@ -330,7 +330,7 @@ async def test_resume_all_keeps_offline_timeout_waiting(manager, tmp_path):
 
 @pytest.mark.asyncio
 async def test_active_report_consumes_pending_resume_authorization(manager):
-    active = await downloading_job(manager.store, manager, CAPS)
+    active = await downloading_job(manager.store, manager)
     job_id = active["job_id"]
     await manager.mark_reconciling(job_id, "D1", expected={DeviceState.DOWNLOADING},
                                    reason="device_disconnect", deadline=now_ms() + 60_000)

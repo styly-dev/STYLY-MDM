@@ -163,7 +163,11 @@ object PushProtocol {
             throw malformed("artifact_id is required")
         }
 
-        val urlKey = if (payload.has("artifact_url")) "artifact_url" else "bundle_url"
+        val urlKey = when {
+            payload.has("artifact_url") -> "artifact_url"
+            jobId != null -> throw malformed("artifact_url is required")
+            else -> "bundle_url"
+        }
         val artifactUrl = requiredString(payload, urlKey)
         validateArtifactUrl(artifactUrl)
         val destPath = requiredString(payload, "dest_path").trim()

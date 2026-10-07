@@ -37,6 +37,37 @@ class PushProtocolTest {
     }
 
     @Test
+    fun `live job v1 requires artifact url and prefers it over bundle url`() {
+        val value = payload().apply { remove("artifact_url") }
+        assertThrows(IllegalArgumentException::class.java) {
+            PushProtocol.parseCommand(value)
+        }
+
+        value.put("bundle_url", "http://server/legacy.zip")
+        assertThrows(IllegalArgumentException::class.java) {
+            PushProtocol.parseCommand(value)
+        }
+
+        value.put("artifact_url", "http://server/artifacts/value")
+        assertEquals("http://server/artifacts/value", PushProtocol.parseCommand(value).artifactUrl)
+        value.put("bundle_url", "http://server/legacy.zip")
+        assertEquals("http://server/artifacts/value", PushProtocol.parseCommand(value).artifactUrl)
+    }
+
+    @Test
+    fun `identity-less legacy command accepts bundle url`() {
+        val command = PushProtocol.parseCommand(
+            JSONObject().apply {
+                put("bundle_url", "http://server/legacy.zip")
+                put("dest_path", "/sdcard/STYLY/content")
+            },
+        )
+
+        assertEquals("http://server/legacy.zip", command.artifactUrl)
+        assertEquals(null, command.jobId)
+    }
+
+    @Test
     fun `job v1 rejects relative artifact URL and non-v4 UUID`() {
         val value = payload().apply { put("artifact_url", "/artifacts/value") }
         assertThrows(IllegalArgumentException::class.java) {

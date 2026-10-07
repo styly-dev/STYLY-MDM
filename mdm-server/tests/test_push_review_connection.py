@@ -12,7 +12,6 @@ from styly_mdm.push_jobs import (
     DeviceState,
     ProtocolMode,
     canonicalize_create_request,
-    parse_dispatch_capabilities,
 )
 from styly_mdm.push_runtime import PushRuntime
 from styly_mdm.push_scheduler import LiveSession, PushScheduler
@@ -54,7 +53,7 @@ async def ready_job(store, manager):
     return ready
 
 
-async def downloading_job(store, manager, capabilities=None):
+async def downloading_job(store, manager):
     ready = await ready_job(store, manager)
     job_id = ready["job_id"]
     await manager.enable_dispatch(job_id)
@@ -64,7 +63,6 @@ async def downloading_job(store, manager, capabilities=None):
         job_id,
         "D1",
         protocol_mode=ProtocolMode.JOB_V1,
-        live_capabilities=capabilities or {"push_job_id_v1"},
         accept_deadline=now_ms() + 60_000,
     )
     return await manager.transition_device(
@@ -135,7 +133,7 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
     manager = PushJobManager(store)
     capabilities = frozenset({"push_job_id_v1", "push_resume_v1"})
     try:
-        snapshot = await downloading_job(store, manager, capabilities)
+        snapshot = await downloading_job(store, manager)
         job_id = snapshot["job_id"]
         if reason is None:
             store.recover_startup_sync(
@@ -204,7 +202,7 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
             if state == "dispatching":
                 await manager.prepare_dispatch(
                     job_id, "D1", protocol_mode=ProtocolMode.JOB_V1,
-                    live_capabilities=capabilities, accept_deadline=now_ms() + 60_000,
+                    accept_deadline=now_ms() + 60_000,
                 )
             before = await manager.get_snapshot(job_id)
             await send_report()
@@ -223,12 +221,15 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mismatch", ["revision", "artifact_id", "validated_offset"])
+@pytest.mark.parametrize(
+    "mismatch",
+    ["revision", "missing_revision", "artifact_id", "validated_offset", "boolean_offset"],
+)
 async def test_retry_exhaustion_requires_exact_evidence_before_pausing(tmp_path, mismatch):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
-        snapshot = await downloading_job(store, manager, {"push_job_id_v1", "push_resume_v1"})
+        snapshot = await downloading_job(store, manager)
         evidence = {
             "dispatch_revision": snapshot["devices"]["D1"]["dispatch_revision"],
             "artifact_id": snapshot["artifact"]["artifact_id"],
@@ -236,8 +237,12 @@ async def test_retry_exhaustion_requires_exact_evidence_before_pausing(tmp_path,
         }
         if mismatch == "revision":
             evidence["dispatch_revision"] += 1
+        elif mismatch == "missing_revision":
+            evidence["dispatch_revision"] = None
         elif mismatch == "artifact_id":
             evidence["artifact_id"] = str(uuid.uuid4())
+        elif mismatch == "boolean_offset":
+            evidence["validated_offset"] = True
         else:
             evidence["validated_offset"] = 2
         outcome, unchanged = await manager.resume_interrupted(
@@ -255,7 +260,7 @@ async def test_paused_resume_can_expire_without_another_dispatch(tmp_path):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
-        snapshot = await downloading_job(store, manager, {"push_job_id_v1", "push_resume_v1"})
+        snapshot = await downloading_job(store, manager)
         job_id = snapshot["job_id"]
         await manager.resume_interrupted(
             job_id, "D1", attempt=1, reason="download_retry_exhausted",
@@ -277,12 +282,17 @@ async def test_paused_resume_can_expire_without_another_dispatch(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_non_resumable_interruption_keeps_terminal_reconciliation(tmp_path):
+async def test_unversioned_interrupted_report_waits_for_absent_reconciliation(tmp_path):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
         snapshot = await downloading_job(store, manager)
         job_id = snapshot["job_id"]
+        store._call_sync(lambda conn: conn.execute(
+            "UPDATE push_job_devices SET dispatch_revision=NULL "
+            "WHERE job_id=? AND device_id='D1'",
+            (job_id,),
+        ))
         await manager.mark_reconciling(
             job_id, "D1", expected={DeviceState.DOWNLOADING},
             reason="device_disconnect", deadline=now_ms() + 60_000,
@@ -301,26 +311,92 @@ async def test_non_resumable_interruption_keeps_terminal_reconciliation(tmp_path
             "job_id": job_id, "attempt": 1, "status": "interrupted",
             "artifact_id": snapshot["artifact"]["artifact_id"], "phase": "downloading",
         })
-        assert (await manager.assignment(job_id, "D1"))["state"] == "interrupted"
+        unversioned = await manager.assignment(job_id, "D1")
+        assert unversioned["state"] == DeviceState.RECONCILING.value
+        assert unversioned["dispatch_revision"] is None
+        assert unversioned["reconciliation_deadline"] is not None
+        assert session.ws.messages == []
+
+        await runtime._handle_reconcile_report(session, "D1", {
+            "job_id": job_id, "attempt": 1, "status": "absent",
+        })
+        reconciled = await manager.assignment(job_id, "D1")
+        assert reconciled["state"] == DeviceState.INTERRUPTED.value
+        assert reconciled["failure_code"] == "client_state_absent"
     finally:
         store.close()
 
 
 @pytest.mark.asyncio
-async def test_interrupted_reconcile_uses_persisted_dispatch_capabilities(
-    tmp_path,
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("attempt", True), ("attempt", 1.0), ("revision", True), ("revision", 1.0)],
+)
+async def test_interrupted_report_requires_integer_identity_fields(tmp_path, field, value):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        snapshot = await downloading_job(store, manager)
+        job_id = snapshot["job_id"]
+        # Make bool/float values compare equal to the authorized integer revision.
+        store._call_sync(lambda conn: conn.execute(
+            "UPDATE push_job_devices SET dispatch_revision=1 "
+            "WHERE job_id=? AND device_id='D1'",
+            (job_id,),
+        ))
+        await manager.mark_reconciling(
+            job_id, "D1", expected={DeviceState.DOWNLOADING},
+            reason="device_disconnect", deadline=now_ms() + 60_000,
+        )
+        runtime = object.__new__(PushRuntime)
+        runtime.manager = manager
+        runtime.transfers = TransferRegistry()
+        runtime.scheduler = None
+        runtime.send_timeout = 1
+        runtime.publish = lambda _snapshot: asyncio.sleep(0)
+        session = LiveSession(
+            "D1", "session", Ws(), frozenset({"push_job_id_v1"}),
+            str(uuid.uuid4()), asyncio.Lock(), "http://server",
+        )
+
+        report = {
+            "job_id": job_id,
+            "attempt": 1,
+            "status": "interrupted",
+            "artifact_id": snapshot["artifact"]["artifact_id"],
+            "revision": 1,
+            "validated_offset": 0,
+            "phase": "downloading",
+        }
+        report[field] = value
+        await runtime._handle_reconcile_report(session, "D1", report)
+
+        current = await manager.assignment(job_id, "D1")
+        assert current["state"] == DeviceState.RECONCILING.value
+        assert current["reconciliation_deadline"] is not None
+        assert session.ws.messages == []
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dispatch_capabilities_json", [None, "{", '["push_job_id_v1"]']
+)
+async def test_interrupted_reconcile_uses_job_v1_revision_not_capability_snapshot(
+    tmp_path, dispatch_capabilities_json,
 ):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
         dispatched = await downloading_job(
-            store, manager, {"push_job_id_v1", "push_resume_v1"}
+            store, manager
         )
         job_id = dispatched["job_id"]
         store._call_sync(lambda conn: conn.execute(
             "UPDATE push_job_devices SET dispatch_capability_snapshot_json=? "
             "WHERE job_id=? AND device_id='D1'",
-            (json.dumps(["push_job_id_v1"]), job_id),
+            (dispatch_capabilities_json, job_id),
         ))
         await manager.mark_reconciling(
             job_id,
@@ -339,7 +415,7 @@ async def test_interrupted_reconcile_uses_persisted_dispatch_capabilities(
             "D1",
             "session",
             Ws(),
-            frozenset({"push_job_id_v1", "push_resume_v1"}),
+            frozenset({"push_job_id_v1"}),
             str(uuid.uuid4()),
             asyncio.Lock(),
             "http://server",
@@ -350,20 +426,18 @@ async def test_interrupted_reconcile_uses_persisted_dispatch_capabilities(
             "attempt": 1,
             "status": "interrupted",
             "artifact_id": dispatched["artifact"]["artifact_id"],
+            "revision": dispatched["devices"]["D1"]["dispatch_revision"],
+            "validated_offset": 0,
             "phase": "downloading",
         })
 
         assignment = await manager.assignment(job_id, "D1")
-        assert assignment["state"] == DeviceState.INTERRUPTED.value
+        assert assignment["state"] == DeviceState.QUEUED.value
+        assert assignment["dispatch_revision"] == dispatched["devices"]["D1"]["dispatch_revision"]
+        assert assignment["validated_offset"] == 0
+        assert session.ws.messages == []
     finally:
         store.close()
-
-
-@pytest.mark.parametrize(
-    "dispatch_capabilities_json", ["{", "null", '["push_job_id_v1", {}]']
-)
-def test_malformed_dispatch_capabilities_are_ignored(dispatch_capabilities_json):
-    assert parse_dispatch_capabilities(dispatch_capabilities_json) == frozenset()
 
 
 @pytest.mark.asyncio
@@ -372,7 +446,7 @@ async def test_retry_exhaustion_allows_another_device_waiting_for_a_slot(tmp_pat
     manager = PushJobManager(store)
     capabilities = frozenset({"push_job_id_v1", "push_resume_v1"})
     try:
-        snapshot = await downloading_job(store, manager, capabilities)
+        snapshot = await downloading_job(store, manager)
         job_id = snapshot["job_id"]
         # Add a second target to the fixture before it is claimed, as a multi-target
         # job does at creation. D1 owns the only network slot.
@@ -1309,7 +1383,7 @@ async def test_active_registration_after_offline_download_releases_transfer_slot
 
 
 @pytest.mark.asyncio
-async def test_interrupted_registration_without_resume_capability_stays_reconciling(
+async def test_interrupted_registration_uses_revision_without_session_resume_capability(
     tmp_path,
 ):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
@@ -1329,6 +1403,7 @@ async def test_interrupted_registration_without_resume_capability_stays_reconcil
         ws = Ws()
         runtime = object.__new__(PushRuntime)
         runtime.manager = manager
+        runtime.transfers = TransferRegistry()
         runtime.send_timeout = 1
         session = LiveSession(
             device_id="D1",
@@ -1355,12 +1430,11 @@ async def test_interrupted_registration_without_resume_capability_stays_reconcil
         )
 
         current = await manager.assignment(job_id, "D1")
-        assert snapshots == []
-        assert current["state"] == DeviceState.RECONCILING.value
-        assert current["reconciliation_deadline"] is not None
-        assert ws.messages[0]["type"] == "PUSH_RESUME_REJECTED"
-        assert ws.messages[0]["artifact_id"] == artifact_id
-        assert ws.messages[0]["revision"] == assignment["dispatch_revision"]
+        assert len(snapshots) == 1
+        assert snapshots[0]["devices"]["D1"]["state"] == DeviceState.QUEUED.value
+        assert current["state"] == DeviceState.QUEUED.value
+        assert current["validated_offset"] == 0
+        assert ws.messages == []
     finally:
         store.close()
 
@@ -1372,6 +1446,55 @@ class LegacyEvents:
 
     async def forward_to_admins(self, event):
         self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_legacy_busy_report_still_creates_opaque_fence(tmp_path):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        ready = await ready_job(store, manager)
+        job_id = ready["job_id"]
+        await manager.enable_dispatch(job_id)
+        claimed = await manager.claim_next(["D1"])
+        assert claimed is not None
+        snapshot = await manager.prepare_dispatch(
+            job_id,
+            "D1",
+            protocol_mode=ProtocolMode.JOB_V1,
+            accept_deadline=now_ms() + 60_000,
+        )
+        session = LiveSession(
+            "D1", "session", Ws(), frozenset(), str(uuid.uuid4()),
+            asyncio.Lock(), "http://server",
+        )
+        published = []
+
+        async def publish(value):
+            published.append(value)
+
+        scheduler = object.__new__(PushScheduler)
+        scheduler.manager = manager
+        scheduler.sessions = lambda: {"D1": session}
+        scheduler.publish = publish
+        scheduler.wake = lambda: None
+
+        keep_transfer = await scheduler._handle_busy(
+            snapshot,
+            "D1",
+            {"active_job": {"legacy": True, "dest_path": "/sdcard/STYLY/content"}},
+        )
+
+        fence = await manager.fenced_assignment_for_device("D1")
+        current = await manager.assignment(job_id, "D1")
+        assert keep_transfer is False
+        assert fence["blocking_job_id"] is None
+        assert fence["protocol_mode"] == ProtocolMode.LEGACY.value
+        assert current["state"] == DeviceState.FAILED.value
+        assert current["failure_code"] == "client_state_conflict"
+        assert published
+    finally:
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -1606,7 +1729,7 @@ async def test_replacement_register_withdraws_pending_resume(
     manager = PushJobManager(store)
     capabilities = frozenset({"push_job_id_v1", "push_resume_v1"})
     try:
-        active = await downloading_job(store, manager, capabilities)
+        active = await downloading_job(store, manager)
         job_id = active["job_id"]
         await manager.mark_reconciling(
             job_id, "D1", expected={DeviceState.DOWNLOADING},
@@ -1790,7 +1913,7 @@ async def test_unknown_result_receives_negative_nonretryable_ack(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_canonical_legacy_result_is_consumed_once(tmp_path):
+async def test_legacy_result_does_not_settle_preserved_assignment(tmp_path):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
@@ -1817,7 +1940,6 @@ async def test_canonical_legacy_result_is_consumed_once(tmp_path):
             job_id,
             "D1",
             protocol_mode=ProtocolMode.LEGACY,
-            live_capabilities=set(),
             accept_deadline=None,
         )
         await manager.transition_device(
@@ -1877,8 +1999,11 @@ async def test_canonical_legacy_result_is_consumed_once(tmp_path):
                 "deleted": 0,
             },
         )
-        assert consumed is True
+        assert consumed is False
         assert runtime.legacy.events == []
-        assert runtime.pending_publications[job_id]["devices"]["D1"]["state"] == "succeeded"
+        assert ws.messages == []
+        current = await manager.assignment(job_id, "D1")
+        assert current["state"] == DeviceState.APPLYING.value
+        assert current["protocol_mode"] == ProtocolMode.LEGACY.value
     finally:
         store.close()

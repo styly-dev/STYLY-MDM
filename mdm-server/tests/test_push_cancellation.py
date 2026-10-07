@@ -43,7 +43,7 @@ def runtime_for(manager):
 
 
 async def timed_out_job(manager):
-    active = await downloading_job(manager.store, manager, CAPS)
+    active = await downloading_job(manager.store, manager)
     await manager.resume_interrupted(
         active['job_id'], 'D1', attempt=1, reason='download_retry_exhausted',
         artifact_id=active['artifact']['artifact_id'],
@@ -69,21 +69,35 @@ async def test_timeout_cancel_is_terminal_idempotent_and_unblocks_next_job(manag
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('capabilities, expected', [
-    (CAPS, True),
-    (frozenset({'push_job_id_v1'}), False),
-])
-async def test_snapshot_resume_supported_mirrors_cancel_identity(manager, capabilities, expected):
-    active = await downloading_job(manager.store, manager, capabilities)
+@pytest.mark.parametrize('dispatch_snapshot', [None, '{', '["push_job_id_v1"]'])
+async def test_snapshot_resume_supported_uses_job_v1_revision(manager, dispatch_snapshot):
+    active = await downloading_job(manager.store, manager)
+    manager.store._call_sync(lambda conn: conn.execute(
+        'UPDATE push_job_devices SET dispatch_capability_snapshot_json=? '
+        'WHERE job_id=? AND device_id=?',
+        (dispatch_snapshot, active['job_id'], 'D1'),
+    ))
     assert active['devices']['D1']['dispatch_revision'] is not None
-    assert active['devices']['D1']['resume_supported'] is expected
+    assert (await manager.get_snapshot(active['job_id']))['devices']['D1']['resume_supported'] is True
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=1)
-    if expected:
+    await manager.cancel_interrupted(active['job_id'], 'D1')
+
+
+@pytest.mark.asyncio
+async def test_legacy_assignment_revision_does_not_enable_resume_or_cancel(manager):
+    active = await downloading_job(manager.store, manager)
+    manager.store._call_sync(lambda conn: conn.execute(
+        "UPDATE push_job_devices SET protocol_mode='legacy' WHERE job_id=? AND device_id=?",
+        (active['job_id'], 'D1'),
+    ))
+    legacy = await manager.get_snapshot(active['job_id'])
+    assert legacy['devices']['D1']['dispatch_revision'] is not None
+    assert legacy['devices']['D1']['resume_supported'] is False
+    await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
+                                   reason='device_disconnect', deadline=1)
+    with pytest.raises(StoreConflict, match='Only interrupted'):
         await manager.cancel_interrupted(active['job_id'], 'D1')
-    else:
-        with pytest.raises(StoreConflict, match='Only interrupted'):
-            await manager.cancel_interrupted(active['job_id'], 'D1')
 
 
 @pytest.mark.asyncio
@@ -97,7 +111,7 @@ async def test_cancel_rejects_work_not_awaiting_timeout_resume(manager, phase):
     if phase == 'ready':
         original = await ready_job(manager.store, manager)
     elif phase == 'downloading':
-        original = await downloading_job(manager.store, manager, CAPS)
+        original = await downloading_job(manager.store, manager)
     else:
         original = await timed_out_job(manager)
         _, original = await manager.enable_dispatch(original['job_id'])
@@ -129,7 +143,7 @@ async def test_offline_cancel_rejects_recovered_partial_on_reconnect(manager):
 async def test_offline_cancel_preserves_fence_and_artifact_until_exact_cleanup(manager, tmp_path):
     from styly_mdm.push_jobs import DeviceState
     from styly_mdm.push_job_store import now_ms
-    active = await downloading_job(manager.store, manager, CAPS)
+    active = await downloading_job(manager.store, manager)
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=1)
     await manager.cancel_interrupted(active['job_id'], 'D1')
@@ -162,7 +176,7 @@ async def test_offline_cancel_preserves_fence_and_artifact_until_exact_cleanup(m
 @pytest.mark.parametrize('resume_first', [False, True])
 async def test_client_restart_requires_explicit_resume_even_when_job_enabled(manager, resume_first):
     from styly_mdm.push_jobs import DeviceState
-    active = await downloading_job(manager.store, manager, CAPS)
+    active = await downloading_job(manager.store, manager)
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=9999999999999)
     if resume_first:
@@ -180,7 +194,7 @@ async def test_client_restart_requires_explicit_resume_even_when_job_enabled(man
 
 @pytest.mark.asyncio
 async def test_storage_failure_retains_exact_partial_for_manual_resume(manager):
-    active = await downloading_job(manager.store, manager, CAPS)
+    active = await downloading_job(manager.store, manager)
     outcome, snapshot = await manager.resume_interrupted(
         active['job_id'], 'D1', attempt=1,
         artifact_id=active['artifact']['artifact_id'],
@@ -206,7 +220,7 @@ async def test_late_absent_cannot_rewrite_completed_terminal_result(manager):
 @pytest.mark.asyncio
 async def test_cancelled_reconciling_assignment_ignores_late_phase_and_completion(manager):
     from styly_mdm.push_jobs import DeviceState
-    active = await downloading_job(manager.store, manager, CAPS)
+    active = await downloading_job(manager.store, manager)
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=9999999999999)
     await manager.cancel_interrupted(active['job_id'], 'D1')
@@ -223,7 +237,7 @@ async def test_cancelled_reconciling_assignment_ignores_late_phase_and_completio
 
 @pytest.mark.asyncio
 async def test_validation_phase_releases_slot_before_verified_completion(manager):
-    active = await downloading_job(manager.store, manager, CAPS)
+    active = await downloading_job(manager.store, manager)
     runtime, _session = runtime_for(manager)
     runtime.leases = PushTransferLeases()
     runtime.transfers = TransferRegistry(runtime.leases.revoke_now)
@@ -244,7 +258,7 @@ async def test_validation_phase_releases_slot_before_verified_completion(manager
 @pytest.mark.asyncio
 async def test_exact_verified_completion_recovers_reconciling_state(manager):
     from styly_mdm.push_jobs import DeviceState
-    active = await downloading_job(manager.store, manager, CAPS)
+    active = await downloading_job(manager.store, manager)
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='transfer_stalled', deadline=9999999999999)
     runtime, _session = runtime_for(manager)
@@ -258,7 +272,7 @@ async def test_exact_verified_completion_recovers_reconciling_state(manager):
 @pytest.mark.asyncio
 async def test_success_after_cancelled_absence_was_missed_settles_exact_result(manager):
     from styly_mdm.push_jobs import DeviceState
-    active = await downloading_job(manager.store, manager, CAPS)
+    active = await downloading_job(manager.store, manager)
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=1)
     await manager.cancel_interrupted(active['job_id'], 'D1')

@@ -23,7 +23,6 @@ from typing import Any, TypeVar
 
 from .push_artifacts import strong_etag
 from .push_jobs import (
-    CAP_PUSH_RESUME_V1,
     DeviceState,
     JobState,
     ProtocolMode,
@@ -33,7 +32,6 @@ from .push_jobs import (
     assignment_actions,
     derive_dispatched_job_state,
     is_terminal_job_state,
-    parse_dispatch_capabilities,
     validate_device_transition,
     validate_job_transition,
 )
@@ -487,10 +485,11 @@ class PushJobStore:
 
     @staticmethod
     def _resume_supported(row: Mapping[str, Any]) -> bool:
-        """An assignment is resumable only when dispatched with push_resume_v1."""
+        """Only a dispatched job-v1 assignment can retain resumable ownership."""
 
-        return row["dispatch_revision"] is not None and CAP_PUSH_RESUME_V1 in (
-            parse_dispatch_capabilities(row["dispatch_capability_snapshot_json"])
+        return (
+            row["protocol_mode"] == ProtocolMode.JOB_V1.value
+            and row["dispatch_revision"] is not None
         )
 
     @staticmethod
