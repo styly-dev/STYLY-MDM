@@ -255,7 +255,6 @@ class PushScheduler:
                     job_id,
                     device_id,
                     protocol_mode=ProtocolMode.JOB_V1,
-                    live_capabilities=session.capabilities,
                     accept_deadline=accept_deadline,
                 )
             except BaseException:
@@ -686,30 +685,6 @@ class PushScheduler:
         active_job_id = active.get("job_id")
         active_attempt = active.get("attempt")
 
-        if active.get("legacy") is True:
-            canonical_legacy = await self.manager.active_assignment_for_device(device_id)
-            if (
-                canonical_legacy is not None
-                and canonical_legacy["job_id"] != job_id
-                and canonical_legacy["protocol_mode"] == ProtocolMode.LEGACY.value
-            ):
-                try:
-                    queued = await self.manager.transition_device(
-                        job_id,
-                        device_id,
-                        expected={DeviceState.DISPATCHING, DeviceState.RECONCILING},
-                        target=DeviceState.QUEUED,
-                        fields={
-                            "queue_reason": "same_device_job",
-                            "accept_deadline": None,
-                        },
-                    )
-                    await self.publish(queued)
-                except StoreConflict:
-                    return False
-                self.wake()
-                return False
-
         if active_job_id == job_id and active_attempt == 1:
             # A duplicate-safe client should normally answer ACCEPTED, but treating
             # this exact identity as accepted is safer than creating a second worker.
@@ -865,7 +840,6 @@ class PushScheduler:
             assignment_revision = snapshot["revision"]
         return {
             "type": "EXECUTE_PUSH_FILES",
-            "bundle_url": artifact_url,
             "bundle_filename": artifact["display_filename"],
             "dest_path": snapshot["dest_path"],
             "delete_extras": snapshot["mode"] == "sync",

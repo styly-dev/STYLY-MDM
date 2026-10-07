@@ -30,7 +30,7 @@ def test_job_v1_command_uses_absolute_artifact_url():
         snapshot, 'D1', 'http://10.0.0.2:7070', lease_token='test-lease',
     )
     assert command['artifact_url'] == 'http://10.0.0.2:7070/artifacts/artifact?lease=test-lease'
-    assert command['bundle_url'] == command['artifact_url']
+    assert 'bundle_url' not in command
     assert command['delete_extras'] is True
 
 
