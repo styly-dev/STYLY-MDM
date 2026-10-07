@@ -660,7 +660,6 @@ class PushJobManager:
         job_id: str,
         device_id: str,
         *,
-        protocol_mode: ProtocolMode,
         accept_deadline: int | None,
     ) -> dict[str, Any]:
         """Commit waiter-ready dispatch metadata after the exact waiter exists."""
@@ -704,7 +703,7 @@ class PushJobManager:
                     "updated_at=? WHERE job_id=? AND device_id=? AND state=?",
                     (
                         DeviceState.DISPATCHING.value,
-                        protocol_mode.value,
+                        ProtocolMode.JOB_V1.value,
                         accept_deadline,
                         timestamp,
                         job_id,
@@ -751,7 +750,7 @@ class PushJobManager:
 
     @staticmethod
     def _resume_queue_reason(
-        current: str | None, reported: str | None, retry_exhausted: bool
+        current: str | None, reported: str | None, transfer_interrupted: bool
     ) -> str:
         """Choose the queue reason for exact interrupted evidence.
 
@@ -760,8 +759,8 @@ class PushJobManager:
         waits for Resume, so a reconnecting device never restarts work by itself.
         """
 
-        if retry_exhausted:
-            return "download_retry_exhausted"
+        if transfer_interrupted:
+            return "download_interrupted"
         if current == "resumable_replay":
             return "resumable_replay"
         if current in MANUAL_WAIT_QUEUE_REASONS:
@@ -814,8 +813,8 @@ class PushJobManager:
                     and 0 <= validated_offset <= int(row["byte_size"] or 0)
                 )
                 current = DeviceState(row["state"])
-                retry_exhausted = reason in {
-                    "download_retry_exhausted", "server_lease_revoked", "storage_write_failed"
+                transfer_interrupted = reason in {
+                    "download_interrupted", "server_lease_revoked", "storage_write_failed"
                 }
                 resumable = (
                     row["attempt"] == attempt == 1
@@ -823,9 +822,7 @@ class PushJobManager:
                     and row["protocol_mode"] == ProtocolMode.JOB_V1.value
                     and (
                         bool(row["dispatch_enabled"])
-                        or row["dispatch_paused_reason"] in {
-                            "server_restart", "download_retry_exhausted"
-                        }
+                        or row["dispatch_paused_reason"] == "server_restart"
                     )
                     and exact_artifact
                     and exact_revision
@@ -844,7 +841,7 @@ class PushJobManager:
                     self.store._commit(conn)
                     return "retained", snapshot
                 if current is not DeviceState.RECONCILING and not (
-                    retry_exhausted and current is DeviceState.DOWNLOADING
+                    transfer_interrupted and current is DeviceState.DOWNLOADING
                 ):
                     snapshot = self.store._snapshot(conn, job_id)
                     self.store._commit(conn)
@@ -863,7 +860,9 @@ class PushJobManager:
                     """,
                     (
                         DeviceState.QUEUED.value,
-                        self._resume_queue_reason(row["queue_reason"], reason, retry_exhausted),
+                        self._resume_queue_reason(
+                            row["queue_reason"], reason, transfer_interrupted
+                        ),
                         validated_offset,
                         timestamp,
                         job_id,

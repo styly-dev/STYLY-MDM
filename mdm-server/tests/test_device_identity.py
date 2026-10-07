@@ -647,7 +647,7 @@ def test_replacement_does_not_reuse_previous_owners_ready_flag(tmp_path):
         async with TestServer(app) as ts, aiohttp.ClientSession() as client:
             old = await client.ws_connect(ts.make_url("/ws/device"))
             await old.send_json(canonical())
-            await recv_type(old, "REGISTERED")
+            old_ack = await recv_type(old, "REGISTERED")
             new = await client.ws_connect(ts.make_url("/ws/device"))
             old_owner = server.devices[GUID]["ws"]
             async with runtime._device_lock(GUID):
@@ -661,7 +661,9 @@ def test_replacement_does_not_reuse_previous_owners_ready_flag(tmp_path):
                 for command in ["EXECUTE_INSTALL", "SET_STARTUP_APP", "CLEAR_STARTUP_APP"]:
                     with pytest.raises(ConnectionResetError):
                         await new_owner.send_str(json.dumps({"type": command}))
-            assert (await new.receive_json())["type"] == "REGISTERED"
+            new_ack = await recv_type(new, "REGISTERED")
+            assert new_ack["session_id"] != old_ack["session_id"]
+            assert runtime.sessions[GUID].ws is server.devices[GUID]["ws"]
             await old.close()
             await new.close()
     asyncio.run(body())
@@ -689,29 +691,6 @@ def test_provisional_policy_allows_only_capability_gated_power_commands():
     assert not command_allowed(entry, "EXECUTE_INSTALL")
     entry["capabilities"] = []
     assert not command_allowed(entry, "EXECUTE_REBOOT")
-
-
-@pytest.mark.parametrize("kind", ["canonical", "legacy"])
-@pytest.mark.parametrize("ready,current", [(True, True), (False, True), (True, False)])
-def test_registration_ack_requires_current_ready_owner(kind, ready, current):
-    async def body():
-        sent = []
-        class Socket:
-            async def send_str(self, message):
-                sent.append(json.loads(message))
-        ws = Socket()
-        runtime = object.__new__(push_runtime.PushRuntime)
-        runtime.sessions = {GUID: SimpleNamespace(ws=ws, session_id="session")}
-        runtime.legacy = SimpleNamespace(devices={GUID: {
-            "ws": ws if current else object(),
-            "identity_kind": kind,
-            "registration_ready": ready,
-        }})
-        runtime.send_timeout = 1
-        await runtime.acknowledge_registration(ws, GUID)
-        assert sent == ([{"type": "REGISTERED", "session_id": "session"}]
-                        if ready and current else [])
-    asyncio.run(body())
 
 
 def test_offline_legacy_push_reports_apk_only_policy(tmp_path):

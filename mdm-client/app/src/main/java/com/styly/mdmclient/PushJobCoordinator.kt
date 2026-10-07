@@ -831,7 +831,7 @@ class PushJobCoordinator(
             cleanupExecution(execution.workDirectory)
             return
         }
-        if (execution.interrupted) {
+        if (execution.interruptionReason != null) {
             val active = state.active ?: return
             val nextState = state.copy(
                 active = active.copy(

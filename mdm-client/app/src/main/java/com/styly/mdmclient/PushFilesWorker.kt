@@ -213,22 +213,19 @@ class PushFilesWorker internal constructor(
         val onTransferComplete: (Long) -> Unit,
         val onValidated: () -> Unit,
         val onApplying: () -> Unit,
-        val onTransferProgress: (Long) -> Unit = {},
         val onValidationStart: () -> Unit = {},
     )
 
     data class Execution(
         val result: PushProtocol.Result,
         val workDirectory: File,
-        /** A retryable job-v1 transfer exhausted its short in-process retry budget. */
-        val interrupted: Boolean = false,
         val interruptionReason: String? = null,
     )
 
     fun execute(command: PushProtocol.Command, callbacks: Callbacks): Execution {
         if (!hasExternalStorageAccess()) {
             val work = attemptDirectoryProvider(command)
-            val execution = Execution(
+            return Execution(
                 PushProtocol.Result(
                     jobId = command.jobId,
                     attempt = command.attempt,
@@ -239,14 +236,12 @@ class PushFilesWorker internal constructor(
                 ),
                 work,
             )
-            return execution
         }
         val work = attemptDirectoryProvider(command)
-        var interrupted = false
         var interruptionReason: String? = null
         val result = try {
             if (command.isJobV1) prepareResumableDirectory(command, work) else recreateDirectory(work)
-            val bundle = download(command, work, callbacks.onTransferProgress, callbacks.onValidationStart)
+            val bundle = download(command, work, callbacks.onValidationStart)
             callbacks.onTransferComplete(bundle.length())
             val staging = File(work, "staging")
             validateAndExtract(bundle, staging)
@@ -268,18 +263,7 @@ class PushFilesWorker internal constructor(
             )
         } catch (error: Throwable) {
             val failure = error as? PushWorkerException
-            interrupted = command.isJobV1 && (
-                (failure?.code == "download_failed" && failure.retryable) ||
-                    failure?.code == PUSH_LEASE_REVOKED ||
-                    (failure?.code == "storage_write_failed" && validatedResumeOffset(command) > 0L)
-                )
-            if (interrupted) {
-                interruptionReason = when (failure?.code) {
-                    PUSH_LEASE_REVOKED -> "server_lease_revoked"
-                    "storage_write_failed" -> "storage_write_failed"
-                    else -> "download_retry_exhausted"
-                }
-            }
+            interruptionReason = interruptionReasonFor(command, failure)
             PushProtocol.Result(
                 jobId = command.jobId,
                 attempt = command.attempt,
@@ -293,8 +277,8 @@ class PushFilesWorker internal constructor(
             )
         }
         // The coordinator persists this execution outcome before terminal cleanup;
-        // retry-budget exhaustion instead becomes an interrupted durable state.
-        return Execution(result, work, interrupted, interruptionReason)
+        // interrupted downloads instead retain their durable ownership and bytes.
+        return Execution(result, work, interruptionReason)
     }
 
     fun cleanup(workDirectory: File) {
@@ -511,10 +495,9 @@ class PushFilesWorker internal constructor(
     private fun download(
         command: PushProtocol.Command,
         work: File,
-        onProgress: (Long) -> Unit,
         onValidationStart: () -> Unit,
     ): File {
-        if (!command.isJobV1) return downloadLegacy(command, work, onProgress)
+        if (!command.isJobV1) return downloadLegacy(command, work)
         val expectedSize = requireNotNull(command.artifactSize)
         val partial = File(work, "artifact.part")
         val completed = File(work, "artifact.zip")
@@ -527,19 +510,22 @@ class PushFilesWorker internal constructor(
         // A prefix kept from an earlier execution is hashed during validation, not
         // here: rereading it before the request would consume the HTTP lease window.
         val digest = digestFactory(partial)
+        if (partial.isFile && partial.length() == expectedSize) {
+            onValidationStart()
+            verifyAndFinalize(command, partial, completed, digest)
+            return completed
+        }
         PushDownloadDeadline(monotonicMillis, noProgressTimeoutMs).use { deadline ->
             var retryIndex = 0
             var receivedSinceRetry = false
-            val trackProgress: (Long) -> Unit = { received ->
-                receivedSinceRetry = true
-                onProgress(received)
-            }
             while (true) {
                 deadline.remaining()
                 try {
                     val offset = partial.takeIf { it.isFile }?.length() ?: 0L
                     if (offset > expectedSize) throw PushWorkerException("artifact_identity_mismatch", "partial exceeds expected size")
-                    downloadOnce(command, partial, offset, trackProgress, deadline, digest)
+                    downloadOnce(command, partial, offset, deadline, digest) {
+                        receivedSinceRetry = true
+                    }
                     if (partial.length() == expectedSize) break
                     throw PushWorkerException("download_failed", "artifact response ended before declared size", retryable = true)
                 } catch (stop: PushTransferInterrupted) {
@@ -549,6 +535,9 @@ class PushFilesWorker internal constructor(
                     if (!error.retryable) throw error
                 } catch (_: IOException) {
                     // Keep the exact partial and retry only within the remaining idle window.
+                }
+                if (partial.isFile && partial.length() == expectedSize) {
+                    break
                 }
                 // Back off across consecutive failures only; a retry that received
                 // artifact bytes starts the backoff over.
@@ -565,6 +554,19 @@ class PushFilesWorker internal constructor(
         return completed
     }
 
+    private fun interruptionReasonFor(
+        command: PushProtocol.Command,
+        failure: PushWorkerException?,
+    ): String? {
+        if (!command.isJobV1) return null
+        return when (failure?.code) {
+            "download_failed" -> if (failure.retryable) "download_interrupted" else null
+            PUSH_LEASE_REVOKED -> "server_lease_revoked"
+            "storage_write_failed" -> if (validatedResumeOffset(command) > 0L) "storage_write_failed" else null
+            else -> null
+        }
+    }
+
     /** Keep failure cleanup in the worker even if the coordinator cannot save its result. */
     private fun discardPartialOnFailure(
         command: PushProtocol.Command,
@@ -572,15 +574,12 @@ class PushFilesWorker internal constructor(
         failure: PushWorkerException,
         invalidateMetadata: Boolean = false,
     ) {
-        if (failure.retryable || failure.code == "artifact_unavailable" ||
-            failure.code == PUSH_LEASE_REVOKED ||
-            (failure.code == "storage_write_failed" && validatedResumeOffset(command) > 0L)
-        ) return
+        if (failure.code == "artifact_unavailable" || interruptionReasonFor(command, failure) != null) return
         partial.deleteRecursively()
         if (invalidateMetadata && command.isJobV1) File(partial.parentFile, "metadata.json").delete()
     }
 
-    private fun downloadLegacy(command: PushProtocol.Command, work: File, onProgress: (Long) -> Unit): File {
+    private fun downloadLegacy(command: PushProtocol.Command, work: File): File {
         val partial = File(work, "artifact.part")
         val completed = File(work, "artifact.zip")
         val connection = openConnection(command)
@@ -591,7 +590,7 @@ class PushFilesWorker internal constructor(
             if (command.artifactSize != null && declared >= 0L && declared != command.artifactSize) {
                 throw PushWorkerException("artifact_identity_mismatch", "HTTP body length does not match the expected range")
             }
-            writeDownloadBody(connection.inputStream, partial, false, command.artifactSize, onProgress, digest)
+            writeDownloadBody(connection.inputStream, partial, false, command.artifactSize, digest)
             verifyAndFinalize(command, partial, completed, digest)
             return completed
         } catch (error: IOException) {
@@ -639,13 +638,11 @@ class PushFilesWorker internal constructor(
         partial: File,
         append: Boolean,
         expectedLength: Long?,
-        onProgress: (Long) -> Unit,
         digest: PartialFileDigest,
         beforeRead: () -> Unit = {},
         onBytesWritten: () -> Unit = {},
     ) {
         var received = 0L
-        val initialLength = if (append) partial.length() else 0L
         input.use {
             val output = openStorageOutput(partial, append)
             try {
@@ -663,12 +660,11 @@ class PushFilesWorker internal constructor(
                     storageWrite { output.write(buffer, 0, read) }
                     digest.update(buffer, 0, read)
                     onBytesWritten()
-                    onProgress(safeAdd(initialLength, received))
                 }
             } finally {
                 try {
                     // Persist the exact bytes already written even when the network
-                    // read or idle deadline failed, before a retry can observe EOF/416.
+                    // read or idle deadline failed, before retry or local validation.
                     storageWrite {
                         output.flush()
                         output.fd.sync()
@@ -687,9 +683,9 @@ class PushFilesWorker internal constructor(
         command: PushProtocol.Command,
         partial: File,
         offset: Long,
-        onProgress: (Long) -> Unit,
         deadline: PushDownloadDeadline,
         digest: PartialFileDigest,
+        onBytesWritten: () -> Unit,
     ) {
         val expectedSize = requireNotNull(command.artifactSize)
         val connection = openResumableResponse(command, offset, deadline)
@@ -753,9 +749,12 @@ class PushFilesWorker internal constructor(
                     rejectInvalidResponse("HTTP body length does not match the expected range")
                 }
                 writeDownloadBody(
-                    body.byteStream(), partial, append, expectedLength, onProgress, digest,
+                    body.byteStream(), partial, append, expectedLength, digest,
                     beforeRead = { deadline.remaining() },
-                    onBytesWritten = deadline::receivedBytes,
+                    onBytesWritten = {
+                        deadline.receivedBytes()
+                        onBytesWritten()
+                    },
                 )
             }
 
@@ -783,14 +782,7 @@ class PushFilesWorker internal constructor(
                     // A server that ignored Range must never be appended to a partial file.
                     writeBody(append = false, expectedLength = expectedSize)
                 }
-                416 -> {
-                    val total = parseUnsatisfiedContentRange(connection.header("Content-Range"))
-                        ?: rejectInvalidResponse("missing or malformed 416 Content-Range")
-                    if (total != expectedSize || offset != total) {
-                        rejectInvalidResponse("416 range does not describe the complete expected artifact")
-                    }
-                    return
-                }
+                416 -> rejectInvalidResponse("416 range cannot describe an incomplete local artifact")
             }
         } finally {
             deadline.attach(null)
@@ -805,11 +797,6 @@ class PushFilesWorker internal constructor(
         return try {
             ContentRange(match.groupValues[1].toLong(), match.groupValues[2].toLong(), match.groupValues[3].toLong())
         } catch (_: NumberFormatException) { null }
-    }
-
-    private fun parseUnsatisfiedContentRange(value: String?): Long? {
-        val match = Regex("^bytes \\*/([0-9]+)$").matchEntire(value ?: "") ?: return null
-        return match.groupValues[1].toLongOrNull()
     }
 
     private fun verifyAndFinalize(

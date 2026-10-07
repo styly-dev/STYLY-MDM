@@ -142,10 +142,10 @@ class PushScheduler:
             for task, (key, _transfer_future, accept_future) in self._dispatch_waiters.items()
         )
 
-    async def ensure_active_transfer_slot(
+    async def reconcile_active_transfer(
         self, job_id: str, device_id: str, attempt: int
     ) -> None:
-        """Keep an existing live lease owner; never resurrect an old URL."""
+        """Resolve acceptance and revoke an orphaned lease for active work."""
 
         key = TransferKey("push", device_id, job_id, attempt)
         accept_waiter = self._accept_waiters.get((job_id, device_id, attempt))
@@ -254,7 +254,6 @@ class PushScheduler:
                 snapshot = await self.manager.prepare_dispatch(
                     job_id,
                     device_id,
-                    protocol_mode=ProtocolMode.JOB_V1,
                     accept_deadline=accept_deadline,
                 )
             except BaseException:
@@ -836,8 +835,9 @@ class PushScheduler:
         )
         device = snapshot["devices"][device_id]
         assignment_revision = device.get("dispatch_revision")
-        if not isinstance(assignment_revision, int):
-            assignment_revision = snapshot["revision"]
+        assert (
+            type(assignment_revision) is int and assignment_revision > 0
+        ), "dispatch_revision must be a positive integer"
         return {
             "type": "EXECUTE_PUSH_FILES",
             "bundle_filename": artifact["display_filename"],

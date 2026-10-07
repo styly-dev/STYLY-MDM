@@ -62,7 +62,6 @@ async def downloading_job(store, manager):
     await manager.prepare_dispatch(
         job_id,
         "D1",
-        protocol_mode=ProtocolMode.JOB_V1,
         accept_deadline=now_ms() + 60_000,
     )
     return await manager.transition_device(
@@ -104,7 +103,7 @@ class Scheduler:
     async def send_reconcile(self, session, snapshot, device_id):
         self.reconcile_calls.append((session, snapshot, device_id))
 
-    async def ensure_active_transfer_slot(self, job_id, device_id, attempt):
+    async def reconcile_active_transfer(self, job_id, device_id, attempt):
         self.active_transfer_slots.append((job_id, device_id, attempt))
 
 
@@ -125,7 +124,13 @@ class RegistrationManager:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("report_path", ["registration", "reconcile"])
-@pytest.mark.parametrize("reason", [None, "download_retry_exhausted"])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        None,
+        "download_interrupted",
+    ],
+)
 async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
     tmp_path, report_path, reason
 ):
@@ -182,7 +187,12 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
         assert paused["dispatch_enabled"] is (reason is not None)
         assert paused["dispatch_paused_reason"] == (None if reason else "server_restart")
         # Without a live operator Resume, evidence never authorizes dispatch.
-        assert paused["devices"]["D1"]["queue_reason"] == (reason or "dispatch_paused")
+        expected_queue_reason = (
+            "download_interrupted"
+            if reason == "download_interrupted"
+            else reason or "dispatch_paused"
+        )
+        assert paused["devices"]["D1"]["queue_reason"] == expected_queue_reason
         assert await manager.claim_next(["D1"]) is None
         # Disconnect does not rewrite queued state: repeated REGISTER/reconcile
         # must retain it without a rejection or a revision change.
@@ -201,7 +211,7 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
         for state in ("waiting_transfer", "dispatching"):
             if state == "dispatching":
                 await manager.prepare_dispatch(
-                    job_id, "D1", protocol_mode=ProtocolMode.JOB_V1,
+                    job_id, "D1",
                     accept_deadline=now_ms() + 60_000,
                 )
             before = await manager.get_snapshot(job_id)
@@ -223,9 +233,15 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mismatch",
-    ["revision", "missing_revision", "artifact_id", "validated_offset", "boolean_offset"],
+    [
+        "revision",
+        "missing_revision",
+        "artifact_id",
+        "validated_offset",
+        "boolean_offset",
+    ],
 )
-async def test_retry_exhaustion_requires_exact_evidence_before_pausing(tmp_path, mismatch):
+async def test_interrupted_transfer_requires_exact_evidence_before_pausing(tmp_path, mismatch):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
@@ -247,7 +263,7 @@ async def test_retry_exhaustion_requires_exact_evidence_before_pausing(tmp_path,
             evidence["validated_offset"] = 2
         outcome, unchanged = await manager.resume_interrupted(
             snapshot["job_id"], "D1", attempt=1,
-            reason="download_retry_exhausted", **evidence,
+            reason="download_interrupted", **evidence,
         )
         assert outcome == "rejected"
         assert unchanged == snapshot
@@ -263,7 +279,7 @@ async def test_paused_resume_can_expire_without_another_dispatch(tmp_path):
         snapshot = await downloading_job(store, manager)
         job_id = snapshot["job_id"]
         await manager.resume_interrupted(
-            job_id, "D1", attempt=1, reason="download_retry_exhausted",
+            job_id, "D1", attempt=1, reason="download_interrupted",
             artifact_id=snapshot["artifact"]["artifact_id"],
             dispatch_revision=snapshot["devices"]["D1"]["dispatch_revision"],
             validated_offset=1,
@@ -476,7 +492,7 @@ async def test_retry_exhaustion_allows_another_device_waiting_for_a_slot(tmp_pat
             await asyncio.sleep(0)
             assert not task.done()
             await manager.resume_interrupted(
-                job_id, "D1", attempt=1, reason="download_retry_exhausted",
+                job_id, "D1", attempt=1, reason="download_interrupted",
                 artifact_id=snapshot["artifact"]["artifact_id"],
                 dispatch_revision=snapshot["devices"]["D1"]["dispatch_revision"],
                 validated_offset=1,
@@ -1000,6 +1016,52 @@ async def test_current_register_is_bound_to_legacy_owner():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entry_is_current", "registration_ready"),
+    [(True, True), (False, True), (True, False)],
+)
+async def test_refresh_registration_ack_requires_current_ready_owner(
+    entry_is_current, registration_ready
+):
+    ws = Ws()
+    entry_owner = ws if entry_is_current else Ws()
+    process_instance_id = str(uuid.uuid4())
+    runtime = object.__new__(PushRuntime)
+    runtime.sessions = {
+        "D1": LiveSession(
+            "D1", "session", ws, frozenset(), process_instance_id,
+            asyncio.Lock(), "http://server", push_state_available=False,
+        )
+    }
+    runtime.device_locks = {}
+    runtime.legacy = types.SimpleNamespace(
+        devices={"D1": {
+            "ws": entry_owner,
+            "registration_ready": registration_ready,
+            "push_state_status": "unavailable",
+        }},
+        broadcast_device_list=lambda: asyncio.sleep(0),
+    )
+    runtime.send_timeout = 1
+    runtime.scheduler = Scheduler()
+    runtime._spawn_background = lambda coro, **_kwargs: coro.close()
+
+    async def after_registration(*_args):
+        return None
+
+    runtime._after_registration = after_registration
+    await runtime.refresh_registration(ws, "D1", {
+        "process_instance_id": process_instance_id,
+        "capabilities": [],
+        "push_state": {"status": "unavailable"},
+    })
+
+    expected = ([{"type": "REGISTERED", "session_id": "session"}]
+                if entry_is_current and registration_ready else [])
+    assert ws.messages == expected
+
+
+@pytest.mark.asyncio
 async def test_unavailable_push_state_does_not_report_absence_or_request_reconcile():
     class ReconcilingManager(RegistrationManager):
         async def active_assignment_for_device(self, _device_id):
@@ -1461,7 +1523,6 @@ async def test_legacy_busy_report_still_creates_opaque_fence(tmp_path):
         snapshot = await manager.prepare_dispatch(
             job_id,
             "D1",
-            protocol_mode=ProtocolMode.JOB_V1,
             accept_deadline=now_ms() + 60_000,
         )
         session = LiveSession(
@@ -1939,8 +2000,17 @@ async def test_legacy_result_does_not_settle_preserved_assignment(tmp_path):
         await manager.prepare_dispatch(
             job_id,
             "D1",
-            protocol_mode=ProtocolMode.LEGACY,
             accept_deadline=None,
+        )
+        store._call_sync(
+            lambda conn: (
+                conn.execute(
+                    "UPDATE push_job_devices SET protocol_mode='legacy' "
+                    "WHERE job_id=? AND device_id=?",
+                    (job_id, "D1"),
+                ),
+                conn.commit(),
+            )
         )
         await manager.transition_device(
             job_id,

@@ -56,11 +56,11 @@ async def test_artifact_http_range_etag_and_head(artifact_runtime):
             assert response.status == 200
             assert "Content-Encoding" not in response.headers
             assert await response.read() == payload
-            response = await client.get(url, headers={"Range": "bytes=2-5"})
+            response = await client.get(url, headers={"Range": "bytes=2-"})
             assert response.status == 206
-            assert await response.read() == payload[2:6]
-            assert response.headers["Content-Range"] == f"bytes 2-5/{len(payload)}"
-            assert response.headers["Content-Length"] == "4"
+            assert await response.read() == payload[2:]
+            assert response.headers["Content-Range"] == f"bytes 2-{len(payload) - 1}/{len(payload)}"
+            assert response.headers["Content-Length"] == str(len(payload) - 2)
             assert response.headers["Accept-Ranges"] == "bytes"
             assert response.headers["ETag"] == f'"{digest}"'
             assert "Content-Encoding" not in response.headers
@@ -68,6 +68,35 @@ async def test_artifact_http_range_etag_and_head(artifact_runtime):
             response = await client.get(url, headers={"If-Match": '"wrong"'})
             assert response.status == 412
             assert await response.read() == b""
+
+            # Job clients send one open-ended range and the exact artifact ETag.
+            response = await client.get(
+                url,
+                headers={"Range": "bytes=4-", "If-Match": f'"{digest}"'},
+            )
+            assert response.status == 206
+            assert await response.read() == payload[4:]
+
+            for unsupported_range in ("bytes=-3", "bytes=2-5"):
+                response = await client.get(
+                    url,
+                    headers={
+                        "Range": unsupported_range,
+                        "If-Match": f'"{digest}"',
+                    },
+                )
+                assert response.status == 200
+                assert await response.read() == payload
+
+            for unsupported_if_match in (
+                "*",
+                f'"wrong", "{digest}"',
+            ):
+                response = await client.get(
+                    url, headers={"If-Match": unsupported_if_match}
+                )
+                assert response.status == 412
+                assert await response.read() == b""
 
             response = await client.get(
                 url, headers={"Range": "bytes=99-", "If-Match": f'"{digest}"'}
@@ -345,7 +374,6 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
         await manager.prepare_dispatch(
             job_id,
             "D1",
-            protocol_mode=ProtocolMode.JOB_V1,
             accept_deadline=now_ms() + 1000,
         )
         first = await manager.assignment(job_id, "D1")
@@ -398,7 +426,6 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
         await manager.prepare_dispatch(
             job_id,
             "D1",
-            protocol_mode=ProtocolMode.JOB_V1,
             accept_deadline=now_ms() + 1000,
         )
         replayed = await manager.get_snapshot(job_id)
@@ -406,8 +433,22 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
             replayed, "D1", "http://server", lease_token="test-lease"
         )
         assert command["revision"] == immutable_revision
-        assert replayed["revision"] > immutable_revision
+        assert replayed["revision"] != immutable_revision
         assert replayed["devices"]["D1"]["validated_offset"] == 3
+        for invalid_revision in (None, 0, -1, True, "1"):
+            invalid = {
+                **replayed,
+                "devices": {
+                    "D1": {
+                        **replayed["devices"]["D1"],
+                        "dispatch_revision": invalid_revision,
+                    }
+                },
+            }
+            with pytest.raises(AssertionError, match="dispatch_revision"):
+                PushScheduler._command(
+                    invalid, "D1", "http://server", lease_token="test-lease"
+                )
     finally:
         store.close()
 

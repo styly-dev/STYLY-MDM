@@ -19,8 +19,15 @@ class PushJobCoordinatorStateTest {
         assertEquals("interrupted", report.getString("status"))
         assertEquals("client_restarted", report.getString("reason"))
         assertEquals(1_000L, interruptPushAfterRestart(recovered, 10_000L).interruptedAt)
-        val timedOut = recovered.copy(interruptionReason = "download_retry_exhausted")
-        assertEquals("download_retry_exhausted", interruptPushAfterRestart(timedOut, 20_000L).interruptionReason)
+        val timedOut = recovered.copy(interruptionReason = "download_interrupted")
+        val restarted = interruptPushAfterRestart(timedOut, 20_000L)
+        assertEquals("download_interrupted", restarted.interruptionReason)
+        assertEquals(1_000L, restarted.interruptedAt)
+        val restartedReport = buildActivePushReconcileReport(
+            PushProtocol.ReconcileIdentity(requireNotNull(active.command.jobId), active.command.attempt, active.command.artifactId),
+            restarted, 0L,
+        )
+        assertEquals("download_interrupted", restartedReport.getString("reason"))
     }
 
     @Test
@@ -265,7 +272,7 @@ class PushJobCoordinatorStateTest {
                 PushProtocol.PHASE_DOWNLOADING,
                 interrupted = true,
                 interruptedAt = 123L,
-                interruptionReason = "download_retry_exhausted",
+                interruptionReason = "download_interrupted",
             ),
             pendingResults = emptyList(),
             completedReceipts = emptyList(),
@@ -367,7 +374,7 @@ class PushJobCoordinatorStateTest {
             PushProtocol.PHASE_DOWNLOADING,
             interrupted = true,
             interruptedAt = 123L,
-            interruptionReason = "download_retry_exhausted",
+            interruptionReason = "download_interrupted",
         )
         val report = buildActivePushReconcileReport(
             PushProtocol.ReconcileIdentity(
@@ -384,7 +391,7 @@ class PushJobCoordinatorStateTest {
         assertEquals(command.revision, report.getLong("revision"))
         assertEquals("interrupted", report.getString("status"))
         assertEquals(41L, report.getLong("validated_offset"))
-        assertEquals("download_retry_exhausted", report.getString("reason"))
+        assertEquals("download_interrupted", report.getString("reason"))
     }
 
     @Test
@@ -396,7 +403,7 @@ class PushJobCoordinatorStateTest {
                 PushProtocol.PHASE_DOWNLOADING,
                 interrupted = true,
                 interruptedAt = 1_000L,
-                interruptionReason = "download_retry_exhausted",
+                interruptionReason = "download_interrupted",
             ),
             pendingResults = emptyList(),
             completedReceipts = emptyList(),
@@ -422,7 +429,7 @@ class PushJobCoordinatorStateTest {
                 PushProtocol.PHASE_DOWNLOADING,
                 interrupted = true,
                 interruptedAt = 1_000L,
-                interruptionReason = "download_retry_exhausted",
+                interruptionReason = "download_interrupted",
             ),
             pendingResults = emptyList(),
             completedReceipts = emptyList(),
@@ -522,7 +529,7 @@ class PushJobCoordinatorStateTest {
             PushProtocol.PHASE_DOWNLOADING,
             interrupted = true,
             interruptedAt = 1_000L,
-            interruptionReason = "download_retry_exhausted",
+            interruptionReason = "download_interrupted",
         )
         val fields = buildPushRegistrationFields(
             PushProtocol.State(interrupted, emptyList(), emptyList()),
@@ -540,7 +547,7 @@ class PushJobCoordinatorStateTest {
         assertEquals("available", fields.getJSONObject("push_state").getString("status"))
         assertEquals("interrupted", active.getString("status"))
         assertEquals(12L, active.getLong("validated_offset"))
-        assertEquals("download_retry_exhausted", active.getString("reason"))
+        assertEquals("download_interrupted", active.getString("reason"))
     }
 
     @Test

@@ -72,8 +72,24 @@ The client keeps job-owned state below
 
 Unknown, malformed, or mismatched metadata is never appended to. Expired
 interrupted ownership is rejected by the coordinator before starting a worker. A
-validated partial of `N > 0` bytes is requested with `Range: bytes=N-`,
+validated partial of `0 < N < artifact_size` bytes is requested with `Range: bytes=N-`,
 `If-Match: <strong-etag>`, and `Accept-Encoding: identity`.
+If a metadata-bound partial already has the exact artifact size, the worker enters
+validation and verifies its SHA-256 locally without an HTTP request or download
+deadline. A matching file is atomically renamed and reused; a hash mismatch removes
+the partial and its metadata before extraction or destination apply. If an HTTP I/O
+failure or idle expiry occurs after all bytes were durably written, the same local
+validation can finish without another request or a new operator Resume. Incomplete interrupted
+ownership still requires an exact operator-authorized Resume, and dispatch still
+acquires a transfer slot and issues a lease. The validating phase releases that slot
+before the whole-file hash begins, just as it does after an HTTP download.
+
+The job-v1 artifact endpoint supports only open-ended `Range: bytes=N-` requests
+and an exact ETag in `If-Match`. A missing `If-Match` still permits a full request;
+wildcard, weak, and multiple validators fail with `412`. Unsupported Range syntax,
+including suffix and bounded ranges, is ignored and returns the whole artifact with
+`200`; an unsatisfiable open-ended range returns `416`. This is a dedicated endpoint
+for the matching client version, not a general-purpose range service.
 
 Registration and reconciliation report a nonzero `validated_offset` only when
 the same worker metadata checks accept the partial identity and its length is
@@ -88,10 +104,14 @@ Partial-file deletion is decided in the worker, before terminal state persistenc
 retryable failures, unavailable artifacts, revoked leases, and storage failures
 with a validated prefix retain their bytes. A definitive response identity failure discards
 the partial; a final SHA mismatch also invalidates job metadata.
+The coordinator keeps interrupted ownership and its bytes for manual Resume.
+`artifact_unavailable` is instead a terminal failure: its bytes survive only until
+the terminal result is saved, then the coordinator deletes the attempt directory.
+If saving the result fails, cleanup waits for durable recovery.
 
-`validated_offset` is reconciliation state, not live console byte progress. Wiring
-the worker's progress callback and maintaining monotonic displayed progress across
-an ignored-Range full restart remain part of Issue #85.
+`validated_offset` is reconciliation state, not live console byte progress.
+Live byte reporting and monotonic displayed progress across an ignored-Range full
+restart remain part of Issue #85; the worker currently exposes no progress callback.
 
 Response handling is fail-closed:
 
@@ -102,14 +122,15 @@ Response handling is fail-closed:
 - `200` is never appended; with the same validator it replaces the partial from
   byte zero;
 - `412` is an artifact-identity failure;
-- `416` is accepted only when `Content-Range: bytes */T` proves the local file is
-  already the exact complete artifact;
+- `416` is always rejected because HTTP requests start from an incomplete local
+  artifact; the validated partial is retained for manual Resume. Complete partials
+  take the local validation path above;
 - `404` and `410` are explicit artifact-unavailable failures;
 - `409` with `X-Push-Lease-Status: revoked` ends this attempt as interrupted,
   preserving the validated partial for manual Resume;
 - any other status fails a fresh download with `download_failed`; on a resume it
   says nothing about the stored bytes, so the attempt ends as interrupted
-  (`download_retry_exhausted`) and keeps the validated partial for manual Resume;
+  (`download_interrupted`) and keeps the validated partial for manual Resume;
 - transient I/O, `408`, `429`, and 5xx failures keep validated partial bytes and
   retry with bounded 1/2/4/8-second backoff while the 60-second no-progress
   window remains open. A retry that received artifact bytes starts the backoff over.
@@ -133,11 +154,13 @@ standalone Push through `/api/bundles` retain their
 existing timeout behavior; neither is a job-v1 fallback.
 
 If no artifact bytes arrive for 60 seconds, a resumable client persists interrupted
-ownership with `reason: download_retry_exhausted` instead of creating a terminal
+ownership with `reason: download_interrupted` instead of creating a terminal
 receipt or deleting the partial. It includes that reason in reconciliation and
 registration reports. The server validates the exact assignment, atomically
-requeues it with per-device `queue_reason: download_retry_exhausted`.
-When the client reports `server_lease_revoked`, the server maps it to the same
+requeues it with per-device `queue_reason: download_interrupted`. This generic reason
+also covers a resumed response rejected before writing, without implying that
+network retries occurred. When the client reports `server_lease_revoked` or
+`storage_write_failed`, the server maps it to the same
 per-device manual Resume gate.
 The console exposes **Resume** while the job's dispatch gate remains enabled.
 Only that assignment waits for authorization; other queued and running devices continue.
@@ -408,7 +431,7 @@ The server coalesces pending publication by `job_id` and sends only the newest q
 
 The exact transfer waiter is registered before `waiting_transfer -> dispatching` commits and before the command is sent. Waiter cleanup is identity-checked, so a superseded dispatch task cannot cancel a replacement task's waiter. The durable `accept_deadline` is swept into short reconciliation only when no live dispatch task still owns the exact in-memory acceptance waiter. The local waiter owns the normal timeout; the durable sweep recovers process/background-task loss. Its transition compares the exact stored deadline in the same transaction, so a stale sweep cannot capture a later replay of the same attempt. After slot acquisition, the scheduler rechecks the live connection and capability. It then holds the same per-device owner lock used by REGISTER replacement and disconnect while performing the final session check and bounded `send_str`.
 
-Job-v1 messages from a device are also checked and settled under that owner lock. Disconnect removes the old owner and commits its canonical queue/reconciliation transition before a replacement REGISTER may acquire ownership, but it does not release an active Push transfer slot because the Android HTTP worker outlives the WebSocket. An exact active `downloading` report preserves ownership of an in-process live HTTP lease and also satisfies a still-live acceptance waiter. After a server restart, no HTTP token or active stream is recovered; the old URL is rejected and the client must report interrupted work before manual Resume can issue a fresh token and slot. The server maps `server_lease_revoked` to the existing per-device `download_retry_exhausted` Resume gate. Once a replacement REGISTER owns the device, the superseded socket cannot settle an ACK, phase, transfer completion, result, or reconciliation report. Committed admin snapshots are queued for publication and sent after this correctness path returns; browser backpressure is not part of device ownership.
+Job-v1 messages from a device are also checked and settled under that owner lock. Disconnect removes the old owner and commits its canonical queue/reconciliation transition before a replacement REGISTER may acquire ownership, but it does not release an active Push transfer slot because the Android HTTP worker outlives the WebSocket. An exact active `downloading` report preserves ownership of an in-process live HTTP lease and also satisfies a still-live acceptance waiter. After a server restart, no HTTP token or active stream is recovered; the old URL is rejected and the client must report interrupted work before manual Resume can issue a fresh token and slot. The server maps `server_lease_revoked` to the existing per-device `download_interrupted` Resume gate. Once a replacement REGISTER owns the device, the superseded socket cannot settle an ACK, phase, transfer completion, result, or reconciliation report. Committed admin snapshots are queued for publication and sent after this correctness path returns; browser backpressure is not part of device ownership.
 
 A failed acceptance probe on the management WebSocket does not stop independent
 HTTP progress. If disconnect or an exact late active report wins the acceptance
@@ -434,7 +457,7 @@ On server restart:
 - expired `created` jobs become `interrupted`;
 - `waiting_transfer` returns to `queued`;
 - dispatched phases become `reconciling`;
-- active download URLs are not recovered after process restart; the old URL is rejected and the device must report `server_lease_revoked` before manual Resume can issue a new lease. The server maps this reason to the existing `download_retry_exhausted` gate;
+- active download URLs are not recovered after process restart; the old URL is rejected and the device must report `server_lease_revoked` before manual Resume can issue a new lease. The server maps this reason to the existing `download_interrupted` gate;
 - dispatch is paused and no command is automatically resent;
 - the operator re-enables an existing job through **Resume** or **Resume all** in Needs attention, which sends `PUSH_FILES` for the selected target devices; this also covers an uploaded `ready` job whose original dispatch send was lost;
 - scheduler wake-up immediately follows the durable re-enable and does not wait for its direct admin acknowledgement.
@@ -511,33 +534,38 @@ sequenceDiagram
     D->>D: persist active command
     D-->>S: PUSH_JOB_ACCEPTED
     S->>DB: downloading
-    D->>S: HTTP Range + If-Match + identity encoding + lease token
-    opt No successful HTTP writes for 60 seconds
-        S->>S: revoke token; abort and await exact handler; release exact slot
-        D->>S: retry old URL + revoked token
-        S-->>D: HTTP 409 X-Push-Lease-Status: revoked
-        Note over S,D: Keep partial; manual Resume issues a new URL and lease
+    alt Metadata-bound partial already has the complete size
+        D->>D: reuse local partial; skip HTTP
+        Note over S,D: Exact Resume authorization and dispatch slot still required
+    else Network transfer required
+        D->>S: HTTP Range + If-Match + identity encoding + lease token
+        opt No successful HTTP writes for 60 seconds
+            S->>S: revoke token; abort and await exact handler; release exact slot
+            D->>S: retry old URL + revoked token
+            S-->>D: HTTP 409 X-Push-Lease-Status: revoked
+            Note over S,D: Keep partial; manual Resume issues a new URL and lease
+        end
+        opt Server restarts while the device keeps downloading
+            S->>S: discard in-memory lease; do not reissue the old URL
+            D->>S: retry old URL + revoked token
+            S-->>D: HTTP 409 X-Push-Lease-Status: revoked
+            D-->>S: PUSH_RECONCILE_REPORT interrupted + server_lease_revoked + offset
+            S->>DB: map to existing per-device manual Resume gate
+            Note over S,D: Retain partial; Resume creates a new lease and reserves a slot
+        end
+        opt No artifact bytes received for 60 seconds
+            D->>D: persist interruption reason; retain partial and original expiry
+            D-->>S: PUSH_RECONCILE_REPORT interrupted + exact identity + offset
+            S->>DB: requeue only this device with manual Resume required
+            S-->>B: snapshot: download_interrupted
+            Note over S,D: Repeated waiting reports retain work and replacement slots
+            Note over S,D: Other devices continue; reconnect alone cannot resume this one
+            B->>S: Resume interrupted devices in existing job
+            S->>D: EXECUTE_PUSH_FILES with same assignment revision
+            D->>S: HTTP Range + If-Match + identity encoding
+        end
     end
-    opt Server restarts while the device keeps downloading
-        S->>S: discard in-memory lease; do not reissue the old URL
-        D->>S: retry old URL + revoked token
-        S-->>D: HTTP 409 X-Push-Lease-Status: revoked
-        D-->>S: PUSH_RECONCILE_REPORT interrupted + server_lease_revoked + offset
-        S->>DB: map to existing per-device manual Resume gate
-        Note over S,D: Retain partial; Resume creates a new lease and reserves a slot
-    end
-    opt No artifact bytes received for 60 seconds
-        D->>D: persist interruption reason; retain partial and original expiry
-        D-->>S: PUSH_RECONCILE_REPORT interrupted + exact identity + offset
-        S->>DB: requeue only this device with manual Resume required
-        S-->>B: snapshot: download_retry_exhausted
-        Note over S,D: Repeated waiting reports retain work and replacement slots
-        Note over S,D: Other devices continue; reconnect alone cannot resume this one
-        B->>S: Resume interrupted devices in existing job
-        S->>D: EXECUTE_PUSH_FILES with same assignment revision
-        D->>S: HTTP Range + If-Match + identity encoding
-    end
-    D-->>S: PUSH_PHASE validating (all bytes received, before SHA-256)
+    D-->>S: PUSH_PHASE validating (complete bytes available, before SHA-256)
     S->>DB: validating; release exact transfer slot
     D->>D: verify exact size and SHA-256
     D-->>S: PUSH_TRANSFER_COMPLETE

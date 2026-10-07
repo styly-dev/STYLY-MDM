@@ -121,7 +121,7 @@ ACTIVE_DEVICE_STATES = frozenset(
 # Per-device queue reasons that wait for an explicit operator Resume. The
 # scheduler never dispatches them on its own.
 MANUAL_WAIT_QUEUE_REASONS = frozenset(
-    {"download_retry_exhausted", "client_restarted", "dispatch_paused", "device_offline"}
+    {"download_interrupted", "client_restarted", "dispatch_paused", "device_offline"}
 )
 # Constant SQL list literal for the reasons above (never built from input).
 MANUAL_WAIT_QUEUE_REASONS_SQL = (

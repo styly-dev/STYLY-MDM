@@ -45,7 +45,7 @@ def runtime_for(manager):
 async def timed_out_job(manager):
     active = await downloading_job(manager.store, manager)
     await manager.resume_interrupted(
-        active['job_id'], 'D1', attempt=1, reason='download_retry_exhausted',
+        active['job_id'], 'D1', attempt=1, reason='download_interrupted',
         artifact_id=active['artifact']['artifact_id'],
         dispatch_revision=active['devices']['D1']['dispatch_revision'], validated_offset=1)
     return await manager.get_snapshot(active['job_id'])
@@ -127,7 +127,7 @@ async def test_offline_cancel_rejects_recovered_partial_on_reconnect(manager):
     runtime, session = runtime_for(manager)
     active_report = {
         'job_id': original['job_id'], 'attempt': 1, 'status': 'interrupted',
-        'phase': 'downloading', 'reason': 'download_retry_exhausted',
+        'phase': 'downloading', 'reason': 'download_interrupted',
         'artifact_id': original['artifact']['artifact_id'],
         'revision': original['devices']['D1']['dispatch_revision'], 'validated_offset': 1,
     }
@@ -193,16 +193,17 @@ async def test_client_restart_requires_explicit_resume_even_when_job_enabled(man
 
 
 @pytest.mark.asyncio
-async def test_storage_failure_retains_exact_partial_for_manual_resume(manager):
+@pytest.mark.parametrize("reason", ["storage_write_failed", "server_lease_revoked"])
+async def test_transfer_interruption_failures_wait_for_manual_resume(manager, reason):
     active = await downloading_job(manager.store, manager)
     outcome, snapshot = await manager.resume_interrupted(
         active['job_id'], 'D1', attempt=1,
         artifact_id=active['artifact']['artifact_id'],
         dispatch_revision=active['devices']['D1']['dispatch_revision'],
-        validated_offset=1, reason='storage_write_failed',
+        validated_offset=1, reason=reason,
     )
     assert outcome == 'requeued'
-    assert snapshot['devices']['D1']['queue_reason'] == 'download_retry_exhausted'
+    assert snapshot['devices']['D1']['queue_reason'] == 'download_interrupted'
     assert snapshot['devices']['D1']['validated_offset'] == 1
     assert await manager.claim_next(['D1']) is None
 

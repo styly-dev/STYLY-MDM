@@ -98,7 +98,7 @@ async def test_fence_mutation_revisions_every_visible_job(manager):
     await manager.enable_dispatch(first['job_id'])
     await manager.claim_next(['D1'])
     await manager.prepare_dispatch(
-        first['job_id'], 'D1', protocol_mode=ProtocolMode.JOB_V1,
+        first['job_id'], 'D1',
         accept_deadline=now_ms() + 1_000,
     )
     await manager.mark_reconciling(
@@ -146,7 +146,7 @@ async def test_preaccept_absent_requeues_same_attempt_only_once(manager):
     await manager.enable_dispatch(job_id)
     await manager.claim_next(['D1'])
     await manager.prepare_dispatch(
-        job_id, 'D1', protocol_mode=ProtocolMode.JOB_V1,
+        job_id, 'D1',
         accept_deadline=now_ms() + 1_000,
     )
     await manager.mark_reconciling(
@@ -162,7 +162,7 @@ async def test_preaccept_absent_requeues_same_attempt_only_once(manager):
 
     await manager.claim_next(['D1'])
     await manager.prepare_dispatch(
-        job_id, 'D1', protocol_mode=ProtocolMode.JOB_V1,
+        job_id, 'D1',
         accept_deadline=now_ms() + 1_000,
     )
     await manager.mark_reconciling(
@@ -184,7 +184,7 @@ async def test_exact_absent_clears_fence_when_reconciliation_deadline_wins(manag
     await manager.enable_dispatch(job_id)
     await manager.claim_next(['D1'])
     await manager.prepare_dispatch(
-        job_id, 'D1', protocol_mode=ProtocolMode.JOB_V1,
+        job_id, 'D1',
         accept_deadline=now_ms() + 1_000,
     )
     await manager.mark_reconciling(
@@ -213,7 +213,7 @@ async def test_expired_acceptance_query_tracks_only_unaccepted_dispatches(manage
     await manager.claim_next(['D1'])
     deadline = now_ms() - 1
     await manager.prepare_dispatch(
-        job_id, 'D1', protocol_mode=ProtocolMode.JOB_V1,
+        job_id, 'D1',
         accept_deadline=deadline,
     )
     assignment = await manager.assignment(job_id, 'D1')
@@ -245,7 +245,7 @@ async def test_stale_expired_acceptance_cannot_reconcile_replayed_dispatch(manag
     await manager.claim_next(['D1'])
     first_deadline = now_ms() - 1
     await manager.prepare_dispatch(
-        job_id, 'D1', protocol_mode=ProtocolMode.JOB_V1,
+        job_id, 'D1',
         accept_deadline=first_deadline,
     )
 
@@ -274,7 +274,7 @@ async def test_stale_expired_acceptance_cannot_reconcile_replayed_dispatch(manag
     await manager.claim_next(['D1'])
     second_deadline = first_deadline + 120_000
     await manager.prepare_dispatch(
-        job_id, 'D1', protocol_mode=ProtocolMode.JOB_V1,
+        job_id, 'D1',
         accept_deadline=second_deadline,
     )
 
@@ -317,7 +317,7 @@ async def test_new_job_v1_process_clears_offline_job_v1_fence(manager):
     await manager.enable_dispatch(second['job_id'])
     await manager.claim_next(['D1'])
     await manager.prepare_dispatch(
-        first['job_id'], 'D1', protocol_mode=ProtocolMode.JOB_V1,
+        first['job_id'], 'D1',
         accept_deadline=now_ms() + 1_000,
     )
     await manager.mark_reconciling(
@@ -343,7 +343,7 @@ async def test_stale_reconciliation_deadline_cannot_mark_recovered_assignment(ma
     await manager.enable_dispatch(job_id)
     await manager.claim_next(['D1'])
     await manager.prepare_dispatch(
-        job_id, 'D1', protocol_mode=ProtocolMode.JOB_V1,
+        job_id, 'D1',
         accept_deadline=now_ms() + 1_000,
     )
     first_deadline = now_ms() + 10
@@ -398,7 +398,6 @@ async def test_exact_late_result_is_acked_after_process_replacement_cleared_fenc
     await manager.prepare_dispatch(
         job_id,
         'D1',
-        protocol_mode=ProtocolMode.JOB_V1,
         accept_deadline=now_ms() + 1_000,
     )
     await manager.mark_reconciling(

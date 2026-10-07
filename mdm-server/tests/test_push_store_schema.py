@@ -197,7 +197,7 @@ async def test_gc_retries_tombstoned_file_after_reopen_and_reports_removal_once(
 def _actions(**overrides):
     values = dict(
         job_state='running', dispatch_enabled=True, state='queued',
-        queue_reason='download_retry_exhausted', cancel_requested=False, retried=False,
+        queue_reason='download_interrupted', cancel_requested=False, retried=False,
         resume_supported=True, blocking_fence=False,
     )
     values.update(overrides)
