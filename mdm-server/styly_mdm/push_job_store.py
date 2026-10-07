@@ -33,6 +33,7 @@ from .push_jobs import (
     assignment_actions,
     derive_dispatched_job_state,
     is_terminal_job_state,
+    parse_dispatch_capabilities,
     validate_device_transition,
     validate_job_transition,
 )
@@ -488,8 +489,8 @@ class PushJobStore:
     def _resume_supported(row: Mapping[str, Any]) -> bool:
         """An assignment is resumable only when dispatched with push_resume_v1."""
 
-        return row["dispatch_revision"] is not None and CAP_PUSH_RESUME_V1 in json.loads(
-            row["dispatch_capability_snapshot_json"] or "[]"
+        return row["dispatch_revision"] is not None and CAP_PUSH_RESUME_V1 in (
+            parse_dispatch_capabilities(row["dispatch_capability_snapshot_json"])
         )
 
     @staticmethod

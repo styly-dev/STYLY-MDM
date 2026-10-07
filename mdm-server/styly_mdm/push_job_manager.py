@@ -27,6 +27,7 @@ from .push_jobs import (
     TERMINAL_DEVICE_STATES,
     assignment_actions,
     canonicalize_create_request,
+    parse_dispatch_capabilities,
     validate_device_transition,
 )
 
@@ -810,7 +811,9 @@ class PushJobManager:
                 ).fetchone()
                 if row is None:
                     raise StoreNotFound(f"{job_id}/{device_id}")
-                capabilities = set(json.loads(row["dispatch_capability_snapshot_json"] or "[]"))
+                capabilities = parse_dispatch_capabilities(
+                    row["dispatch_capability_snapshot_json"]
+                )
                 exact_artifact = artifact_id is not None and artifact_id == row["job_artifact_id"]
                 exact_revision = (
                     dispatch_revision is not None
