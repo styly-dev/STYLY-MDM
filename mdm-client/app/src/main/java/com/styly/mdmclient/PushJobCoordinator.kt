@@ -473,6 +473,11 @@ class PushJobCoordinator(
                     Log.e(TAG, "Could not read durable Push/Sync state", result.error)
                     return false
                 }
+                is PushStateLoadResult.InvalidReceipts -> {
+                    // Retain all execution evidence until the snapshot can be repaired.
+                    Log.e(TAG, "Preserving durable Push/Sync state with invalid receipts", result.error)
+                    return false
+                }
                 is PushStateLoadResult.Corrupt -> {
                     Log.w(TAG, "Discarding unparseable durable Push/Sync state", result.error)
                     store.discard()

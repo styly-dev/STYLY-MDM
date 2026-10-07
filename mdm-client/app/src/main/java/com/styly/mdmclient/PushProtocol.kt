@@ -5,6 +5,10 @@ import org.json.JSONObject
 import java.net.URI
 import java.util.UUID
 
+/** Receipts may be the only evidence that a command was already applied. */
+internal class InvalidPushReceiptsException(name: String, cause: Exception) :
+    IllegalArgumentException("Invalid durable receipt collection: $name", cause)
+
 object PushProtocol {
     const val CAP_PUSH_JOB_ID_V1 = "push_job_id_v1"
     const val CAP_PUSH_RESUME_V1 = "push_resume_v1"
@@ -276,7 +280,7 @@ object PushProtocol {
                 optionalString(it, "interruption_reason")?.ifBlank { null },
             )
         }
-        fun receipts(name: String): List<Receipt> {
+        fun receipts(name: String): List<Receipt> = try {
             val parsed = json.optJSONArray(name)
             if (
                 json.has(name) && !json.isNull(name) && parsed == null
@@ -284,7 +288,7 @@ object PushProtocol {
                 throw IllegalArgumentException("malformed durable receipt collection: $name")
             }
             val array = parsed ?: JSONArray()
-            return buildList {
+            buildList {
                 for (index in 0 until array.length()) {
                     val item = array.optJSONObject(index)
                     if (item == null) {
@@ -301,6 +305,10 @@ object PushProtocol {
                     add(Receipt(parseCommand(command), resultFromJson(result)))
                 }
             }
+        } catch (error: Exception) {
+            // Never silently skip a receipt: that could allow an already-applied
+            // command to execute again or falsely report it absent to the server.
+            throw InvalidPushReceiptsException(name, error)
         }
         return State(active, receipts("pending_results"), receipts("completed_receipts"))
     }

@@ -148,6 +148,10 @@ in-flight old job-v1 download. APK install and standalone `/api/bundles` Push ar
 unchanged. Cancellation intent requires schema 3 as described below; no new device
 WebSocket message type is required.
 
+Malformed response headers rejected before writing do not invalidate an existing
+partial: the client retains it and waits for manual Resume. A changed strong ETag
+or failed artifact integrity check still rejects the artifact.
+
 Extraction and destination apply start only after size and SHA-256 verification
 and an atomic local rename. A hash mismatch removes the untrusted partial. The
 client hashes bytes as they are written, so an uninterrupted download is not read
@@ -311,7 +315,13 @@ New clients register:
 The client recovers its durable Push state (`files/push-jobs/state.json`) by itself;
 there is no operator retry command.
 
-- **Unparseable file** (malformed JSON or entries): retrying cannot help, so the client
+- **Malformed receipt records or collections**: the client preserves the entire state
+  file and stays unavailable, rather than losing valid active work or deduplication
+  evidence. It does not report absence or start another worker. The bounded load
+  retries below can recover if the file is repaired or restored; reboot alone does
+  not repair malformed records. After retries are exhausted, repair or restore the
+  state file and restart the client.
+- **Other unparseable state** (malformed JSON or active entry): retrying cannot help, so the client
   deletes the file, starts from an empty state, and continues normally. Its next
   REGISTER carries a one-shot notice,
   `push_state: {status: "available", reset: {reason: "corrupt_state_discarded", detail}}`

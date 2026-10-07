@@ -664,10 +664,6 @@ class PushFilesWorker internal constructor(
         digest: PartialFileDigest,
     ) {
         val body = requireNotNull(response.body)
-        val declared = body.contentLength()
-        if (declared >= 0L && declared != expectedLength) {
-            throw PushWorkerException("artifact_identity_mismatch", "HTTP body length does not match the expected range")
-        }
         var received = 0L
         val initialLength = if (append) partial.length() else 0L
         body.byteStream().use { input ->
@@ -750,51 +746,72 @@ class PushFilesWorker internal constructor(
                 // partial and end this attempt as interrupted for manual Resume.
                 throw PushTransferInterrupted(PushWorkerException("download_failed", failure, retryable = true))
             }
+            fun rejectInvalidResponse(detail: String): Nothing {
+                // Reject this response before writing, without discarding an authorized prefix.
+                if (offset > 0L && command.revision > 0L) {
+                    throw PushTransferInterrupted(PushWorkerException("download_failed", detail, retryable = true))
+                }
+                throw PushWorkerException("artifact_identity_mismatch", detail)
+            }
+            val expectedEtag = if (offset > 0L) {
+                metadata.artifactEtag
+                    ?: throw PushWorkerException("artifact_identity_mismatch", "cannot resume without a stored strong ETag")
+            } else {
+                metadata.artifactEtag ?: command.artifactEtag
+            }
+            if (responseEtag == null || !PushProtocol.isStrongEtag(responseEtag)) {
+                rejectInvalidResponse("response did not provide a strong ETag")
+            }
+            if (expectedEtag != null && responseEtag != expectedEtag) {
+                throw PushWorkerException("artifact_identity_mismatch", "artifact ETag changed while resuming")
+            }
             val contentEncoding = connection.header("Content-Encoding")
                 ?.trim()
                 ?.takeIf { it.isNotEmpty() }
             if (contentEncoding != null && !contentEncoding.equals("identity", ignoreCase = true)) {
-                throw PushWorkerException(
-                    "artifact_identity_mismatch",
-                    "artifact response used non-identity Content-Encoding",
-                )
+                rejectInvalidResponse("artifact response used non-identity Content-Encoding")
+            }
+
+            fun writeBody(append: Boolean, expectedLength: Long) {
+                val body = requireNotNull(connection.body)
+                val declared = body.contentLength()
+                if (declared >= 0L && declared != expectedLength) {
+                    rejectInvalidResponse("HTTP body length does not match the expected range")
+                }
+                writeResumableResponse(connection, deadline, partial, append, expectedLength, onProgress, digest)
             }
 
             if (offset == 0L) {
-                validateResponseEtag(responseEtag, metadata.artifactEtag ?: command.artifactEtag)
                 val etag = requireNotNull(responseEtag)
                 writeMetadata(metadata.copy(artifactEtag = etag, updatedAt = System.currentTimeMillis()), work)
-                writeResumableResponse(connection, deadline, partial, append = false, expectedLength = expectedSize, onProgress = onProgress, digest = digest)
+                writeBody(append = false, expectedLength = expectedSize)
                 return
             }
 
-            val storedEtag = metadata.artifactEtag
-                ?: throw PushWorkerException("artifact_identity_mismatch", "cannot resume without a stored strong ETag")
-            validateResponseEtag(responseEtag, storedEtag)
             when (status) {
                 HttpURLConnection.HTTP_PARTIAL -> {
                     val range = parseContentRange(connection.header("Content-Range"))
-                        ?: throw PushWorkerException("artifact_identity_mismatch", "missing or malformed Content-Range")
+                        ?: rejectInvalidResponse("missing or malformed Content-Range")
                     if (range.first != offset || range.third != expectedSize ||
                         range.second < range.first || range.second >= range.third
                     ) {
-                        throw PushWorkerException("artifact_identity_mismatch", "Content-Range does not match the requested offset or expected size")
+                        rejectInvalidResponse("Content-Range does not match the requested offset or expected size")
                     }
                     val rangeLength = range.second - range.first + 1L
                     if ((connection.body?.contentLength() ?: -1L) != rangeLength) {
-                        throw PushWorkerException("artifact_identity_mismatch", "Content-Length does not match Content-Range")
+                        rejectInvalidResponse("Content-Length does not match Content-Range")
                     }
-                    writeResumableResponse(connection, deadline, partial, append = true, expectedLength = rangeLength, onProgress = onProgress, digest = digest)
+                    writeBody(append = true, expectedLength = rangeLength)
                 }
                 HttpURLConnection.HTTP_OK -> {
                     // A server that ignored Range must never be appended to a partial file.
-                    writeResumableResponse(connection, deadline, partial, append = false, expectedLength = expectedSize, onProgress = onProgress, digest = digest)
+                    writeBody(append = false, expectedLength = expectedSize)
                 }
                 416 -> {
                     val total = parseUnsatisfiedContentRange(connection.header("Content-Range"))
-                        ?: throw PushWorkerException("artifact_identity_mismatch", "missing or malformed 416 Content-Range")
+                        ?: rejectInvalidResponse("missing or malformed 416 Content-Range")
                     if (total != expectedSize || offset != total) {
-                        throw PushWorkerException("artifact_identity_mismatch", "416 range does not describe the complete expected artifact")
+                        rejectInvalidResponse("416 range does not describe the complete expected artifact")
                     }
                     return
                 }
@@ -817,15 +834,6 @@ class PushFilesWorker internal constructor(
     private fun parseUnsatisfiedContentRange(value: String?): Long? {
         val match = Regex("^bytes \\*/([0-9]+)$").matchEntire(value ?: "") ?: return null
         return match.groupValues[1].toLongOrNull()
-    }
-
-    private fun validateResponseEtag(response: String?, expected: String?) {
-        if (response == null || !PushProtocol.isStrongEtag(response)) {
-            throw PushWorkerException("artifact_identity_mismatch", "response did not provide a strong ETag")
-        }
-        if (expected != null && response != expected) {
-            throw PushWorkerException("artifact_identity_mismatch", "artifact ETag changed while resuming")
-        }
     }
 
     private fun writeResponse(
