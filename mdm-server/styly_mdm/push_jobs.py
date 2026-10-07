@@ -428,6 +428,18 @@ def parse_capabilities(value: Any) -> frozenset[str]:
     return frozenset(parsed)
 
 
+def parse_dispatch_capabilities(serialized: str | None) -> frozenset[str]:
+    """Parse the capability snapshot stored when an assignment was dispatched.
+
+    A malformed snapshot grants no capability, so it never authorizes resume.
+    """
+    try:
+        value = json.loads(serialized or "[]")
+    except (TypeError, ValueError):
+        return frozenset()
+    return parse_capabilities(value)
+
+
 def validate_job_transition(current: str | JobState, target: str | JobState) -> None:
     src, dst = JobState(current), JobState(target)
     if src == dst:

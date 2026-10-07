@@ -8,7 +8,12 @@ import pytest
 from styly_mdm import push_runtime
 from styly_mdm.push_job_manager import PushJobManager
 from styly_mdm.push_job_store import PushJobStore, now_ms
-from styly_mdm.push_jobs import DeviceState, ProtocolMode, canonicalize_create_request
+from styly_mdm.push_jobs import (
+    DeviceState,
+    ProtocolMode,
+    canonicalize_create_request,
+    parse_dispatch_capabilities,
+)
 from styly_mdm.push_runtime import PushRuntime
 from styly_mdm.push_scheduler import LiveSession, PushScheduler
 from styly_mdm.push_transfer_leases import PushTransferLeases
@@ -299,6 +304,66 @@ async def test_non_resumable_interruption_keeps_terminal_reconciliation(tmp_path
         assert (await manager.assignment(job_id, "D1"))["state"] == "interrupted"
     finally:
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_reconcile_uses_persisted_dispatch_capabilities(
+    tmp_path,
+):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        dispatched = await downloading_job(
+            store, manager, {"push_job_id_v1", "push_resume_v1"}
+        )
+        job_id = dispatched["job_id"]
+        store._call_sync(lambda conn: conn.execute(
+            "UPDATE push_job_devices SET dispatch_capability_snapshot_json=? "
+            "WHERE job_id=? AND device_id='D1'",
+            (json.dumps(["push_job_id_v1"]), job_id),
+        ))
+        await manager.mark_reconciling(
+            job_id,
+            "D1",
+            expected={DeviceState.DOWNLOADING},
+            reason="device_disconnect",
+            deadline=now_ms() + 60_000,
+        )
+        runtime = object.__new__(PushRuntime)
+        runtime.manager = manager
+        runtime.transfers = TransferRegistry()
+        runtime.scheduler = None
+        runtime.send_timeout = 1
+        runtime.publish = lambda _snapshot: asyncio.sleep(0)
+        session = LiveSession(
+            "D1",
+            "session",
+            Ws(),
+            frozenset({"push_job_id_v1", "push_resume_v1"}),
+            str(uuid.uuid4()),
+            asyncio.Lock(),
+            "http://server",
+        )
+
+        await runtime._handle_reconcile_report(session, "D1", {
+            "job_id": job_id,
+            "attempt": 1,
+            "status": "interrupted",
+            "artifact_id": dispatched["artifact"]["artifact_id"],
+            "phase": "downloading",
+        })
+
+        assignment = await manager.assignment(job_id, "D1")
+        assert assignment["state"] == DeviceState.INTERRUPTED.value
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "dispatch_capabilities_json", ["{", "null", '["push_job_id_v1", {}]']
+)
+def test_malformed_dispatch_capabilities_are_ignored(dispatch_capabilities_json):
+    assert parse_dispatch_capabilities(dispatch_capabilities_json) == frozenset()
 
 
 @pytest.mark.asyncio
