@@ -68,7 +68,7 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
     async with _ready(tmp_path) as (manager, capabilities, snapshot, claimed):
         if resumed:
             prior = await manager.prepare_dispatch(
-                snapshot["job_id"], "D1", protocol_mode=ProtocolMode.JOB_V1,
+                snapshot["job_id"], "D1",
                 accept_deadline=now_ms() + 1_000,
             )
             await manager.transition_device(
@@ -80,7 +80,7 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
                 snapshot["job_id"], "D1", attempt=1,
                 artifact_id=snapshot["artifact"]["artifact_id"],
                 dispatch_revision=prior["devices"]["D1"]["dispatch_revision"],
-                validated_offset=0, reason="download_retry_exhausted",
+                validated_offset=0, reason="download_interrupted",
             )
             assert outcome == "requeued"
             await manager.enable_dispatch(snapshot["job_id"])
@@ -247,7 +247,7 @@ async def test_disconnect_timeout_cannot_keep_obsolete_transfer(tmp_path, change
         job_id = snapshot["job_id"]
         deadline = 1234
         snapshot = await manager.prepare_dispatch(
-            job_id, "D1", protocol_mode=ProtocolMode.JOB_V1,
+            job_id, "D1",
             accept_deadline=deadline,
         )
         await manager.mark_reconciling(

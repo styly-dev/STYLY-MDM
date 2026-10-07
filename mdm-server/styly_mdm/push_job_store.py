@@ -870,7 +870,7 @@ class PushJobStore:
                             conn.execute(
                                 "UPDATE push_job_devices SET queue_reason='dispatch_paused' "
                                 "WHERE job_id=? AND state IN ('queued','waiting_transfer','reconciling') "
-                                "AND COALESCE(queue_reason,'') != 'download_retry_exhausted' "
+                                "AND COALESCE(queue_reason,'') != 'download_interrupted' "
                                 f"AND device_id NOT IN ({marks})", (job_id, *target_args),
                             )
                     # Resume authorizes only currently interrupted assignments.
@@ -938,8 +938,6 @@ class PushJobStore:
             "deleted",
             "reconciliation_reason",
             "reconciliation_deadline",
-            "dispatch_capability_snapshot_json",
-            "dispatch_revision",
         }
         unknown = set(fields) - allowed_columns
         if unknown:

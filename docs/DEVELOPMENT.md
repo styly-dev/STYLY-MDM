@@ -40,7 +40,8 @@ rules, protocol, operator controls, and schema-3 deployment requirements.
 Push runs only between a server and client of the same version; see
 [Push / Sync jobs](PUSH_JOBS.md) for how the worker shares download code with
 standalone bundles, where partial files are discarded, and how interrupted
-ownership expires.
+ownership expires. The guide also covers local validation of complete partials,
+the dedicated HTTP request format, and interruption reasons.
 
 Management connection loss leaves healthy HTTP transfers under their existing
 watchdog. Replacement registration withdraws unstarted Resume authorization,
@@ -461,7 +462,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `PUSH_JOB_ACCEPTED` / `PUSH_JOB_REJECTED` | Exact command acceptance after the client durably persists active state, or a duplicate-safe rejection (`device_busy`, `client_persistence_unavailable`, malformed identity, destination/artifact conflict). A persistence rejection keeps the MDM process alive but starts no worker. Fields include `job_id`, fixed `attempt=1`, and current phase/reason. |
 | `PUSH_TRANSFER_COMPLETE` | Job-v1 post-SHA-256 checkpoint. Fields: `job_id`, `attempt`, `artifact_id`, cumulative exact `received_size` including a validated resume prefix. It follows `PUSH_PHASE validating` and accepts an exact reconciling assignment if that phase was lost. |
 | `PUSH_PHASE` | Job-v1 phase transition. `phase=validating` carries `artifact_id` and is sent after all bytes arrive but before SHA-256; it releases the HTTP slot and stops the 60-second write watchdog. `phase=applying` follows artifact and destination validation. Both carry `job_id` and `attempt`. |
-| `PUSH_RECONCILE_REPORT` | Exact `active`, `absent`, or `interrupted` answer to a server reconciliation request. A resumable interrupted report proves `artifact_id`, immutable dispatch `revision`, and local `validated_offset`; missing or mismatched identity is never requeued. `server_lease_revoked` maps to the existing per-device `download_retry_exhausted` Resume gate. `absent` is sent only in response to that request. |
+| `PUSH_RECONCILE_REPORT` | Exact `active`, `absent`, or `interrupted` answer to a server reconciliation request. A resumable interrupted report proves `artifact_id`, immutable dispatch `revision`, and local `validated_offset`; missing or mismatched identity is never requeued. `server_lease_revoked` maps to the per-device `download_interrupted` Resume gate. `absent` is sent only in response to that request. |
 | `PUSH_FILES_RESULT` | Durable terminal result. Job-v1 fields: `job_id`, fixed `attempt=1`, `status`, `dest_path`, success counts or `failure_code` + `detail`. The client retains it until a matching accepted or permanent-rejection ACK and can replay the bounded completed receipt during exact reconciliation. |
 | `VERIFY_APK_RESULT` | Result of an APK integrity check. Fields: `package_name`, `found` (boolean), `size`, `cd_sha256`, `full_sha256`, `version_code`, `version_name`, `signer_sha256`, `error` (optional). Absent hash/version fields when `found` is false. |
 | `VERIFY_DIR_RESULT` | Result of a directory integrity check. Fields: `path`, `found` (boolean), `tree_hash`, `file_count`, `total_size`, `manifest` (optional array of `{relative_path, size, sha256}`, omitted above a cap), `error` (optional) |
@@ -517,7 +518,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `GET /apks/{filename}` | Serves uploaded APK files to devices on the LAN, and backs the console's top-bar client-APK download link (see the client-APK download note below). |
 | `POST /api/push-jobs` | Validate a canonical request and commit `job_id` + per-device rows before any upload bytes. `client_request_id` makes identical replay idempotent; conflicting reuse is 409. |
 | `POST /api/push-jobs/{job_id}/upload` | Job-owned multipart upload, measured limits, packaging, fsync + atomic immutable artifact publication, then `ready`. |
-| `GET /artifacts/{artifact_id}?lease=...` | DB-resolved immutable job-v1 ZIP with identity encoding, `Accept-Ranges: bytes`, stable SHA-256 strong ETag, and an in-memory token scoped to the assignment's transfer slot. Supports full `200`, validated single-range `206`, strong `If-Match` failure `412`, and `416` with `Content-Range: bytes */T`. A missing or revoked job-v1 token returns `409` with `X-Push-Lease-Status: revoked`; server restart invalidates all such tokens. An expired tombstoned identity remains unavailable and is never reused. |
+| `GET /artifacts/{artifact_id}?lease=...` | DB-resolved immutable job-v1 ZIP with identity encoding, `Accept-Ranges: bytes`, stable SHA-256 strong ETag, and an in-memory token scoped to the assignment's transfer slot. Supports full `200`, open-ended `Range: bytes=N-` as `206`, exact-ETag `If-Match` failure `412`, and `416` with `Content-Range: bytes */T` for an unsatisfiable range. The job client never sends a range from a complete local file, so it always rejects `416`. A missing or revoked job-v1 token returns `409` with `X-Push-Lease-Status: revoked`; server restart invalidates all such tokens. An expired tombstoned identity remains unavailable and is never reused. |
 | `POST /api/bundles` / `GET /bundles/{filename}` | Legacy compatibility only. The new console Push/Sync flow does not use these routes. |
 
 ### Server → Admin

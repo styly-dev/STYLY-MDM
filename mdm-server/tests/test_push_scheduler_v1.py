@@ -24,12 +24,13 @@ def test_job_v1_command_uses_absolute_artifact_url():
             'sha256': 'a' * 64,
             'etag': '"' + 'a' * 64 + '"',
         },
-        'devices': {'D1': {'attempt': 1}},
+        'devices': {'D1': {'attempt': 1, 'dispatch_revision': 7}},
     }
     command = PushScheduler._command(
         snapshot, 'D1', 'http://10.0.0.2:7070', lease_token='test-lease',
     )
     assert command['artifact_url'] == 'http://10.0.0.2:7070/artifacts/artifact?lease=test-lease'
+    assert command['revision'] == 7
     assert 'bundle_url' not in command
     assert command['delete_extras'] is True
 
@@ -84,7 +85,7 @@ def test_active_reconnect_keeps_the_existing_transfer_slot():
         scheduler.transfer_registry.register(key, future)
 
         await asyncio.wait_for(
-            scheduler.ensure_active_transfer_slot("job", "D1", 1), timeout=0.5
+            scheduler.reconcile_active_transfer("job", "D1", 1), timeout=0.5
         )
 
         assert scheduler.transfer_registry.get(key) is future

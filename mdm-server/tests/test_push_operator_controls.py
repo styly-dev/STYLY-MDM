@@ -208,7 +208,7 @@ async def two_device_job(manager, *, interrupted=False, downloading=False):
         await manager.enable_dispatch(job_id)
         for device_id in ["D1", "D2"]:
             assert (await manager.claim_next([device_id]))["device_id"] == device_id
-            await manager.prepare_dispatch(job_id, device_id, protocol_mode=ProtocolMode.JOB_V1,
+            await manager.prepare_dispatch(job_id, device_id,
                                            accept_deadline=None)
             active = await manager.transition_device(job_id, device_id,
                 expected={DeviceState.DISPATCHING}, target=DeviceState.DOWNLOADING,
@@ -217,7 +217,7 @@ async def two_device_job(manager, *, interrupted=False, downloading=False):
                 await manager.resume_interrupted(job_id, device_id, attempt=1,
                     artifact_id=active["artifact"]["artifact_id"],
                     dispatch_revision=active["devices"][device_id]["dispatch_revision"],
-                    validated_offset=1, reason="download_retry_exhausted")
+                    validated_offset=1, reason="download_interrupted")
     return await manager.get_snapshot(job_id)
 
 
@@ -240,6 +240,34 @@ async def test_individual_action_leaves_other_interrupted_device_untouched(manag
     else:
         assert current["devices"]["D1"]["cancel_requested"]
         assert current["devices"]["D2"]["state"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_targeted_resume_preserves_non_target_interruption_reason(manager):
+    original = await two_device_job(manager)
+    job_id = original["job_id"]
+    manager.store._call_sync(
+        lambda conn: (
+            conn.execute(
+                "UPDATE push_jobs SET dispatch_enabled=0, "
+                "dispatch_paused_reason='server_restart' WHERE job_id=?",
+                (job_id,),
+            ),
+            conn.execute(
+                "UPDATE push_job_devices SET queue_reason='download_interrupted' "
+                "WHERE job_id=?",
+                (job_id,),
+            ),
+            conn.commit(),
+        )
+    )
+
+    enabled, resumed = await manager.enable_dispatch(job_id, target_devices=["D1"])
+
+    assert enabled is True
+    assert resumed["devices"]["D1"]["queue_reason"] == "resumable_replay"
+    assert resumed["devices"]["D2"]["queue_reason"] == "download_interrupted"
+    assert resumed["devices"]["D2"]["manual_wait"] is True
 
 
 @pytest.mark.asyncio
@@ -323,7 +351,7 @@ async def test_resume_all_keeps_offline_timeout_waiting(manager, tmp_path):
     await admin_action(runtime, admin, "PUSH_FILES", original["job_id"])
     current = await manager.get_snapshot(original["job_id"])
     assert current["devices"]["D1"]["queue_reason"] == "resumable_replay"
-    assert current["devices"]["D2"]["queue_reason"] == "download_retry_exhausted"
+    assert current["devices"]["D2"]["queue_reason"] == "download_interrupted"
     runtime.sessions["D2"] = runtime.sessions["D1"]
     assert await manager.claim_next(["D2"]) is None
 

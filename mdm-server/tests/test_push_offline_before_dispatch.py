@@ -55,7 +55,7 @@ async def test_never_dispatched_work_fails_and_pending_resume_waits(manager):
     await _set(manager, job_id, 'SLOT', state='waiting_transfer', queue_reason=None)
     await _set(manager, job_id, 'RESUME', queue_reason='resumable_replay', dispatch_revision=3,
                dispatch_capability_snapshot_json='["push_job_id_v1","push_resume_v1"]')
-    await _set(manager, job_id, 'WAIT', queue_reason='download_retry_exhausted',
+    await _set(manager, job_id, 'WAIT', queue_reason='download_interrupted',
                dispatch_revision=3)
 
     for device in ('NEW', 'SLOT', 'RESUME', 'WAIT'):
@@ -70,8 +70,10 @@ async def test_never_dispatched_work_fails_and_pending_resume_waits(manager):
     assert resume['dispatch_revision'] == 3
     assert resume['manual_wait'] and resume['resume_required'] and resume['cancellable']
     assert (devices['WAIT']['state'], devices['WAIT']['queue_reason']) == (
-        'queued', 'download_retry_exhausted',
+        'queued', 'download_interrupted',
     )
+    assert devices['WAIT']['manual_wait']
+    assert await manager.claim_next(['WAIT']) is None
 
 
 @pytest.mark.asyncio

@@ -505,7 +505,7 @@ test('download retry exhaustion explains that Resume retains the partial', () =>
     type: 'PUSH_JOBS_SNAPSHOT',
     jobs: [snapshot('paused-job', 4, 'D1', 'queued', 1, {
       dispatchEnabled: false,
-      dispatchPausedReason: 'download_retry_exhausted',
+      dispatchPausedReason: 'download_interrupted',
       resumeRequired: true,
     })],
   });
@@ -740,7 +740,7 @@ test('retry-exhausted queued assignment stays visibly paused across reconnection
   const harness = loadAdapter();
   const socket = new window.WebSocket('ws://localhost/ws/admin');
   const job = snapshot('paused-device', 1, 'D1', 'queued', 1);
-  job.devices.D1.queue_reason = 'download_retry_exhausted';
+  job.devices.D1.queue_reason = 'download_interrupted';
   job.devices.D1.resume_required = true;
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
   assert.equal(harness.bridgeState.get('D1').status, 'resume_required');
@@ -763,7 +763,7 @@ test('per-device Resume remains available while other devices may dispatch', () 
   const job = snapshot('partial-job', 4, 'D1', 'queued', 1, {
     dispatchEnabled: true, resumeRequired: true, cancellable: true,
   });
-  job.devices.D1.queue_reason = 'download_retry_exhausted';
+  job.devices.D1.queue_reason = 'download_interrupted';
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
   assert.equal(h.bridgeState.get('D1').status, 'resume_required');
   assert.equal(h.pushJobsAttention.style.display, '');
@@ -829,7 +829,7 @@ test('inline actions send only the selected device while Resume all targets elig
   const job = snapshot('per-device-job', 1, 'D1', 'queued', 1, {
     resumeRequired: true, cancellable: true,
   });
-  job.devices.D1.queue_reason = 'download_retry_exhausted';
+  job.devices.D1.queue_reason = 'download_interrupted';
   job.devices.D2 = { ...job.devices.D1, enqueue_seq: 2 };
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
   const api = window.__stylyPushJobsV1Actions;
@@ -888,7 +888,7 @@ test('individual Cancel requires confirmation', () => {
   const h = loadAdapter({ confirm: message => { prompt = message; return false; } });
   const socket = new window.WebSocket('ws://localhost/ws/admin');
   const job = snapshot('confirm-cancel', 1, 'D1', 'queued', 1, { cancellable: true });
-  job.devices.D1.queue_reason = 'download_retry_exhausted';
+  job.devices.D1.queue_reason = 'download_interrupted';
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
   assert.equal(window.__stylyPushJobsV1Actions.sendDeviceAction('D1', job.job_id, 'cancel'), false);
   assert.match(prompt, /D1/);
@@ -1031,7 +1031,7 @@ test('only a timed-out queued assignment exposes or sends Cancel', () => {
     assert.equal(window.__stylyPushJobsV1Actions.sendDeviceAction('D1', job.job_id, 'cancel'), false, state);
   }
   const paused = snapshot('cancel-scope', ++revision, 'D1', 'queued', 1, { cancellable: true });
-  paused.devices.D1.queue_reason = 'download_retry_exhausted';
+  paused.devices.D1.queue_reason = 'download_interrupted';
   socket.emit({ type: 'PUSH_JOB_UPDATED', job: paused });
   assert.equal(window.__stylyPushJobsV1Actions.assignmentFor('D1').canCancel, true);
   assert.equal(window.__stylyPushJobsV1Actions.sendDeviceAction('D1', paused.job_id, 'cancel'), true);
@@ -1072,7 +1072,7 @@ test('offline timeout keeps attention and Cancel but excludes Resume and refresh
   const job = snapshot('offline-resume', 1, 'D1', 'queued', 1, {
     resumeRequired: true, cancellable: true,
   });
-  job.devices.D1.queue_reason = 'download_retry_exhausted';
+  job.devices.D1.queue_reason = 'download_interrupted';
   job.devices.D2 = { ...job.devices.D1, enqueue_seq: 2 };
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job] });
   const api = window.__stylyPushJobsV1Actions;
@@ -1243,11 +1243,11 @@ test('Cancel all confirmation states devices and jobs', () => {
   const first = snapshot('cancel-scope-a', 1, 'D1', 'queued', 1, {
     cancellable: true, resumeRequired: true,
   });
-  first.devices.D1.queue_reason = 'download_retry_exhausted';
+  first.devices.D1.queue_reason = 'download_interrupted';
   const second = snapshot('cancel-scope-b', 1, 'D2', 'queued', 2, {
     cancellable: true, resumeRequired: true,
   });
-  second.devices.D2.queue_reason = 'download_retry_exhausted';
+  second.devices.D2.queue_reason = 'download_interrupted';
   second.devices.D3 = { ...second.devices.D2, enqueue_seq: 3 };
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [first, second] });
   findElementByText(h.pushJobsTabActions, 'Cancel all').click();
