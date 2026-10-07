@@ -8,7 +8,8 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 internal fun persistPushStateBeforePublishing(
@@ -349,9 +350,14 @@ class PushJobCoordinator(
     private val store = PushJobStore(appContext)
     private val gate = PushExecutionGate()
     private val worker = PushFilesWorker()
-    private val actor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
+    private val actor = ScheduledThreadPoolExecutor(1) { runnable ->
         Thread(runnable, "push-job-actor")
-    }
+    }.apply { removeOnCancelPolicy = true }
+    /**
+     * The only pending interrupted-expiry check. It is replaced on the single actor
+     * thread, so a canceled check that has not started can never run.
+     */
+    private var interruptedExpiryTimer: ScheduledFuture<*>? = null
     private val workerExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "push-job-worker")
     }
@@ -561,7 +567,7 @@ class PushJobCoordinator(
         // A delayed scheduler must not let an already-expired retry pause restart
         // simply because its exact command arrived first. A successful expiry still
         // lets an unrelated incoming command proceed against the new terminal state.
-        if (settleExpiredInterruptedOwnership() == ExpiredOwnership.PersistenceFailed) return
+        if (expireIfStale() == ExpiredOwnership.PersistenceFailed) return
 
         val terminal = state.pendingResults.firstOrNull { sameIdentity(it.command, command) }
             ?: state.completedReceipts.firstOrNull { sameIdentity(it.command, command) }
@@ -726,18 +732,13 @@ class PushJobCoordinator(
     }
 
     private fun handleResumeRejected(payload: JSONObject) {
-        val jobId = payload.opt("job_id") as? String ?: return
-        val attempt = when (val value = payload.opt("attempt")) {
-            is Int -> value
-            is Long -> value.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }?.toInt()
-            else -> null
-        } ?: return
-        val artifactId = payload.opt("artifact_id") as? String ?: return
-        val revision = when (val value = payload.opt("revision")) {
-            is Int -> value.toLong()
-            is Long -> value
-            else -> null
-        } ?: return
+        // A malformed rejection cannot identify interrupted work, so it is ignored.
+        fun <T> field(parse: (JSONObject, String) -> T, name: String): T? =
+            try { parse(payload, name) } catch (_: IllegalArgumentException) { null }
+        val jobId = field(PushProtocol::requiredString, "job_id") ?: return
+        val attempt = field(PushProtocol::strictInt, "attempt") ?: return
+        val artifactId = field(PushProtocol::requiredString, "artifact_id") ?: return
+        val revision = field(PushProtocol::optionalLong, "revision") ?: return
         val reason = (payload.opt("reason") as? String)?.ifBlank { null }
             ?: "resume_not_authorized"
         val detail = payload.opt("detail") as? String
@@ -845,7 +846,6 @@ class PushJobCoordinator(
                 unsavedTerminal = command to execution
                 return
             }
-            scheduleInterruptedExpiry(state.active)
             if (command.isJobV1) {
                 val identity = PushProtocol.ReconcileIdentity(
                     requireNotNull(command.jobId),
@@ -998,32 +998,39 @@ class PushJobCoordinator(
         // command is required before a worker can resume or apply it.
         gate.restore(state.active?.takeUnless { it.interrupted }?.command)
         recovery.cleanupCommand?.let { command -> cleanupExecution(attemptDirectory(command)) }
-        scheduleInterruptedExpiry(state.active)
         return true
     }
 
     private fun scheduleInterruptedExpiry(active: PushProtocol.Active?) {
-        val delay = interruptedExpiryDelayMillis(
-            active,
-            System.currentTimeMillis(),
-            PushFilesWorker.PARTIAL_RETENTION_MS,
-        ) ?: return
-        actor.schedule({ expireInterruptedOwnership() }, delay, TimeUnit.MILLISECONDS)
+        replaceInterruptedExpiryTimer(
+            interruptedExpiryDelayMillis(
+                active,
+                System.currentTimeMillis(),
+                PushFilesWorker.PARTIAL_RETENTION_MS,
+            ),
+        )
+    }
+
+    private fun replaceInterruptedExpiryTimer(delayMillis: Long?) {
+        interruptedExpiryTimer?.cancel(false)
+        interruptedExpiryTimer = delayMillis?.let {
+            actor.schedule({ expireInterruptedOwnership() }, it, TimeUnit.MILLISECONDS)
+        }
     }
 
     private enum class ExpiredOwnership { NotDue, Settled, PersistenceFailed }
 
     private fun expireInterruptedOwnership() {
-        when (settleExpiredInterruptedOwnership()) {
+        when (expireIfStale()) {
             ExpiredOwnership.NotDue -> scheduleInterruptedExpiry(state.active)
             ExpiredOwnership.PersistenceFailed ->
-                actor.schedule({ expireInterruptedOwnership() }, 60_000L, TimeUnit.MILLISECONDS)
+                replaceInterruptedExpiryTimer(60_000L)
             ExpiredOwnership.Settled -> Unit
         }
     }
 
     /** Settles only an already-expired interrupted ownership; never schedules work. */
-    private fun settleExpiredInterruptedOwnership(): ExpiredOwnership {
+    private fun expireIfStale(): ExpiredOwnership {
         val settled = expireInterruptedPushState(
             state,
             System.currentTimeMillis(),
@@ -1061,10 +1068,13 @@ class PushJobCoordinator(
         if (!persisted) {
             setDurabilityAvailable(false)
             beginRecovery()
-        } else if (recoveryBudget.phase == PushStateRecoveryBudget.Phase.Healthy) {
-            // While an incident is open (or exhausted), only a recovery attempt makes
-            // state available again, so the server is told through a re-registration.
-            setDurabilityAvailable(true)
+        } else {
+            scheduleInterruptedExpiry(state.active)
+            if (recoveryBudget.phase == PushStateRecoveryBudget.Phase.Healthy) {
+                // While an incident is open (or exhausted), only a recovery attempt makes
+                // state available again, so the server is told through a re-registration.
+                setDurabilityAvailable(true)
+            }
         }
         return persisted
     }

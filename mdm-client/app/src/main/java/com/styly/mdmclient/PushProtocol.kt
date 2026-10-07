@@ -31,30 +31,15 @@ object PushProtocol {
         val deleteExtras: Boolean,
         /** Server revision of the immutable job assignment. Required for job-v1 wire commands. */
         val revision: Long = 0L,
-        /** A strong HTTP ETag for the immutable artifact, when supplied by the server. */
+        /** A strong HTTP ETag for the immutable artifact. Required for job-v1 wire commands. */
         val artifactEtag: String? = null,
     ) {
         val isJobV1: Boolean get() = jobId != null
         val identity: String get() = if (jobId != null) "$jobId:$attempt" else "legacy"
 
-        /**
-         * Exact execution fingerprint, excluding the replaceable artifact URL. A zero
-         * revision or missing ETag comes only from an Issue #91 server or from durable
-         * state migrated by [parseCommand]; the server assigns a dispatch revision
-         * when it first redispatches such an assignment. Treating those two fields as
-         * unknown lets a replay settle from the existing receipt or active execution
-         * instead of being rejected as a conflict. Resume never relies on this: it
-         * requires revision > 0 and an exact resume metadata match in the worker.
-         */
+        /** Exact execution fingerprint, excluding the replaceable artifact URL. */
         fun sameExecution(other: Command): Boolean =
-            jobId == other.jobId && attempt == other.attempt &&
-                artifactId == other.artifactId &&
-                artifactSize == other.artifactSize &&
-                artifactSha256.equals(other.artifactSha256, ignoreCase = true) &&
-                (revision == other.revision || revision == 0L || other.revision == 0L) &&
-                (artifactEtag == null || other.artifactEtag == null || artifactEtag == other.artifactEtag) &&
-                bundleFilename == other.bundleFilename && destPath == other.destPath &&
-                deleteExtras == other.deleteExtras
+            copy(artifactUrl = "") == other.copy(artifactUrl = "")
 
         fun toJson(): JSONObject = JSONObject().apply {
             if (jobId != null) put("job_id", jobId)
@@ -157,7 +142,11 @@ object PushProtocol {
         val artifactId: String?,
     )
 
-    fun parseCommand(payload: JSONObject): Command {
+    /**
+     * Parses a live command. [durableState] accepts records persisted by the Issue #91
+     * client, which have no dispatch revision or artifact ETag.
+     */
+    fun parseCommand(payload: JSONObject, durableState: Boolean = false): Command {
         val jobId = optionalString(payload, "job_id")?.also {
             if (it.isBlank()) throw malformed("job_id must not be blank")
             requireUuidV4(it, "job_id")
@@ -192,11 +181,15 @@ object PushProtocol {
         if (jobId != null && (artifactSize == null || artifactSha256 == null)) {
             throw malformed("job-v1 artifact size and SHA-256 are required")
         }
-        // Issue #91 servers did not send revision. Such commands remain runnable
-        // but revision=0 is never eligible for restart resume.
         val revision = if (jobId == null) 0L else optionalLong(payload, "revision") ?: 0L
         if (revision < 0L) throw malformed("revision must be non-negative")
         val artifactEtag = optionalString(payload, "artifact_etag")?.also { validateStrongEtag(it) }
+        // Push runs only between a server and client of the same version, so a live
+        // job-v1 command always carries both. Only durable state written by the Issue
+        // #91 client lacks them; recovery closes that work instead of resuming it.
+        if (jobId != null && !durableState && (revision == 0L || artifactEtag == null)) {
+            throw malformed("job-v1 revision and artifact_etag are required")
+        }
         val bundleFilename = optionalString(payload, "bundle_filename")
             ?.takeIf { it.isNotBlank() } ?: "bundle.zip"
         return Command(
@@ -273,7 +266,7 @@ object PushProtocol {
         }
         val active = json.optJSONObject("active")?.let {
             Active(
-                parseCommand(it.getJSONObject("command")),
+                parseCommand(it.getJSONObject("command"), durableState = true),
                 it.getString("phase"),
                 it.optBoolean("interrupted", false),
                 it.optLong("interrupted_at", 0L).takeIf { value -> value > 0L },
@@ -302,7 +295,7 @@ object PushProtocol {
                     if (result == null) {
                         throw IllegalArgumentException("malformed durable receipt result")
                     }
-                    add(Receipt(parseCommand(command), resultFromJson(result)))
+                    add(Receipt(parseCommand(command, durableState = true), resultFromJson(result)))
                 }
             }
         } catch (error: Exception) {
@@ -326,10 +319,10 @@ object PushProtocol {
             ?: throw malformed("$field must be a string")
     }
 
-    private fun requiredString(payload: JSONObject, field: String): String =
+    internal fun requiredString(payload: JSONObject, field: String): String =
         optionalString(payload, field) ?: throw malformed("$field is required")
 
-    private fun strictInt(payload: JSONObject, field: String): Int {
+    internal fun strictInt(payload: JSONObject, field: String): Int {
         val longValue = when (val value = payload.opt(field)) {
             is Byte -> value.toLong()
             is Short -> value.toLong()
@@ -353,7 +346,7 @@ object PushProtocol {
         }
     }
 
-    private fun optionalLong(payload: JSONObject, field: String): Long? {
+    internal fun optionalLong(payload: JSONObject, field: String): Long? {
         if (!payload.has(field) || payload.isNull(field)) return null
         return when (val value = payload.opt(field)) {
             is Byte -> value.toLong()

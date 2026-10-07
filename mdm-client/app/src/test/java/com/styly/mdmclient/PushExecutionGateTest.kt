@@ -1,5 +1,6 @@
 package com.styly.mdmclient
 
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.UUID
@@ -71,12 +72,12 @@ class PushExecutionGateTest {
     }
 
     @Test
-    fun `issue 91 revision and missing etag remain replay compatible`() {
+    fun `issue 91 durable state does not match a revisioned command`() {
         val current = command().copy(revision = 0, artifactEtag = null)
         val upgraded = current.copy(revision = 7, artifactEtag = "\"etag\"")
 
-        assertTrue(current.sameExecution(upgraded))
-        assertTrue(upgraded.sameExecution(current))
+        assertFalse(current.sameExecution(upgraded))
+        assertFalse(upgraded.sameExecution(current))
     }
 
     @Test

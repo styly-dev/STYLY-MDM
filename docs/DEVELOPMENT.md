@@ -37,6 +37,11 @@ Issue #94 adds resumable transfers, per-device Resume and Cancel controls, and
 retry of failed targets. See [Push / Sync jobs](PUSH_JOBS.md) for the recovery
 rules, protocol, operator controls, and schema-3 deployment requirements.
 
+Push runs only between a server and client of the same version; see
+[Push / Sync jobs](PUSH_JOBS.md) for how the worker shares download code with
+standalone bundles, where partial files are discarded, and how interrupted
+ownership expires.
+
 Management connection loss leaves healthy HTTP transfers under their existing
 watchdog. Replacement registration withdraws unstarted Resume authorization,
 and a retained fence keeps Reconcile visible even after Retry. Artifact GC

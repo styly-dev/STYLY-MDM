@@ -228,29 +228,6 @@ class PushFilesWorkerTest {
     }
 
     @Test
-    fun `resume without a stored etag is an identity failure`() {
-        val archive = zip("content.txt" to "missing-stored-etag").readBytes()
-        val work = File(tmp.root, "missing-stored-etag-work")
-        val command = command(
-            // Never contacted: the request is refused before it is sent.
-            artifactUrl = "http://127.0.0.1:1/artifact.zip",
-            artifactSize = archive.size.toLong(),
-            artifactSha256 = sha256(archive),
-        ).copy(revision = 7L)
-        seedResume(work, command, archive.copyOfRange(0, archive.size / 2), etag = "")
-
-        val execution = PushFilesWorker(
-            hasExternalStorageAccess = { true },
-            attemptDirectoryProvider = { work },
-            retryDelay = {},
-        ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
-
-        assertEquals("fail", execution.result.status)
-        assertEquals("artifact_identity_mismatch", execution.result.failureCode)
-        assertFalse(execution.interrupted)
-    }
-
-    @Test
     fun `retry backoff starts over after a retry received artifact bytes`() {
         val archive = zip("content.txt" to "backoff-reset").readBytes()
         val split = archive.size / 2
@@ -501,6 +478,8 @@ class PushFilesWorkerTest {
         bundleFilename = "bundle.zip",
         destPath = "/sdcard/STYLY/content",
         deleteExtras = false,
+        revision = 7L,
+        artifactEtag = "\"v1\"",
     )
 
     private fun sha256(bytes: ByteArray): String =
@@ -522,13 +501,9 @@ class PushFilesWorkerTest {
                 put("attempt", command.attempt)
                 put("revision", command.revision)
                 put("artifact_id", command.artifactId)
-                put("artifact_url", command.artifactUrl)
                 put("artifact_size", command.artifactSize)
                 put("artifact_sha256", command.artifactSha256)
                 put("artifact_etag", etag)
-                put("created_at", 1)
-                put("updated_at", 1)
-                put("retention_deadline", System.currentTimeMillis() + 60_000)
             }.toString(),
         )
     }
@@ -596,7 +571,7 @@ class PushFilesWorkerTest {
 
     private fun artifactServer(content: ByteArray) = OneShotServer(
         status = 200,
-        headers = "Content-Length: ${content.size}\r\nETag: \"test-artifact\"",
+        headers = "Content-Length: ${content.size}\r\nETag: \"v1\"",
         body = content,
     )
 
@@ -659,7 +634,7 @@ class PushFilesWorkerTest {
                             output.write(
                                 ("HTTP/1.1 200 OK\r\n" +
                                     "Content-Length: ${content.size}\r\n" +
-                                    "ETag: \"retry-artifact\"\r\n" +
+                                    "ETag: \"v1\"\r\n" +
                                     "Connection: close\r\n\r\n")
                                     .toByteArray(Charsets.US_ASCII),
                             )
@@ -798,10 +773,8 @@ class PushFilesWorkerTest {
             assertEquals("success", execution.result.status)
             assertTrue(server.request.contains("Range: bytes=$split-"))
             assertEquals("new-authority", File(destination, "content.txt").readText())
-            assertEquals(
-                server.url,
-                JSONObject(File(work, "metadata.json").readText()).getString("artifact_url"),
-            )
+            // The locator always comes from the command, so metadata never stores it.
+            assertFalse(JSONObject(File(work, "metadata.json").readText()).has("artifact_url"))
         }
     }
 
@@ -918,7 +891,7 @@ class PushFilesWorkerTest {
     }
 
     @Test
-    fun `expired metadata deadline does not discard an exactly authorized partial`() {
+    fun `metadata written with earlier locator and timestamp fields still resumes`() {
         val archive = zip("content.txt" to "coordinator-authorized").readBytes()
         val split = archive.size / 2
         val destination = tmp.newFolder("expired-metadata-destination")
@@ -936,6 +909,9 @@ class PushFilesWorkerTest {
             ).copy(revision = 7L)
             seedResume(work, command, archive.copyOfRange(0, split))
             val metadata = JSONObject(File(work, "metadata.json").readText())
+            metadata.put("artifact_url", "http://old-server/artifact.zip")
+            metadata.put("created_at", 1L)
+            metadata.put("updated_at", 1L)
             metadata.put("retention_deadline", System.currentTimeMillis() - 1)
             File(work, "metadata.json").writeText(metadata.toString())
 
@@ -1170,6 +1146,35 @@ class PushFilesWorkerTest {
             assertEquals("artifact_identity_mismatch", execution.result.failureCode)
             assertFalse(execution.interrupted)
             assertFalse(File(work, "artifact.part").exists())
+            // A new worker after an unsaved terminal result must not report these bytes.
+            assertEquals(0L, PushFilesWorker({ true }, { work }).validatedResumeOffset(command))
+        }
+    }
+
+    @Test
+    fun `unavailable artifact and revoked lease preserve bytes with different terminal outcomes`() {
+        val archive = zip("content.txt" to "retained-prefix").readBytes()
+        val prefix = archive.copyOfRange(0, archive.size / 2)
+        for (status in listOf(404, 410, 409)) {
+            val work = File(tmp.root, "retained-$status")
+            val headers = "Content-Length: 0" +
+                if (status == 409) "\r\nX-Push-Lease-Status: revoked" else ""
+            OneShotServer(status, headers).use { server ->
+                val command = command(
+                    artifactUrl = server.url,
+                    artifactSize = archive.size.toLong(),
+                    artifactSha256 = sha256(archive),
+                )
+                seedResume(work, command, prefix)
+                val worker = PushFilesWorker({ true }, { work })
+                val execution = worker.execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+
+                assertEquals("fail", execution.result.status)
+                assertEquals(if (status == 409) "push_lease_revoked" else "artifact_unavailable", execution.result.failureCode)
+                assertEquals(status == 409, execution.interrupted)
+                assertArrayEquals(prefix, File(work, "artifact.part").readBytes())
+                assertEquals(prefix.size.toLong(), worker.validatedResumeOffset(command))
+            }
         }
     }
 
@@ -1396,6 +1401,75 @@ class PushFilesWorkerTest {
     }
 
     @Test
+    fun `legacy body with unknown length and no integrity fields remains compatible`() {
+        val archive = zip("content.txt" to "optional-integrity").readBytes()
+        val destination = tmp.newFolder("legacy-optional-destination")
+        OneShotServer(200, "Content-Type: application/zip", archive).use { server ->
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { File(tmp.root, "legacy-optional-work") },
+                destinationProvider = { destination },
+            ).execute(
+                command(null, null, server.url, null, null).copy(revision = 0L, artifactEtag = null),
+                PushFilesWorker.Callbacks({}, {}, {}),
+            )
+            assertEquals("success", execution.result.status)
+            assertFalse(server.request.contains("Range:"))
+            assertFalse(server.request.contains("If-Match:"))
+            assertEquals("optional-integrity", File(destination, "content.txt").readText())
+        }
+    }
+
+    @Test
+    fun `legacy truncated body fails without entering the resumable retry loop`() {
+        val archive = zip("content.txt" to "truncated-legacy").readBytes()
+        val prefix = archive.copyOfRange(0, archive.size / 2)
+        val work = File(tmp.root, "legacy-truncated-work")
+        val delays = mutableListOf<Long>()
+        var callbackInvoked = false
+        OneShotServer(200, "Content-Length: ${archive.size}", prefix).use { server ->
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+                retryDelay = { delays += it },
+                destinationProvider = { throw AssertionError("A truncated archive must not be applied") },
+            ).execute(
+                command(null, null, server.url, archive.size.toLong(), sha256(archive))
+                    .copy(revision = 0L, artifactEtag = null),
+                PushFilesWorker.Callbacks({ callbackInvoked = true }, { callbackInvoked = true }, { callbackInvoked = true }),
+            )
+            assertEquals("download_failed", execution.result.failureCode)
+            assertFalse(execution.interrupted)
+            assertFalse(callbackInvoked)
+            assertTrue(delays.isEmpty())
+            assertArrayEquals(prefix, File(work, "artifact.part").readBytes())
+            assertFalse(File(work, "artifact.zip").exists())
+        }
+    }
+
+    @Test
+    fun `legacy SHA mismatch discards bytes before callbacks or destination changes`() {
+        val archive = zip("content.txt" to "invalid-legacy-sha").readBytes()
+        val work = File(tmp.root, "legacy-invalid-sha-work")
+        var callbackInvoked = false
+        OneShotServer(200, "Content-Length: ${archive.size}", archive).use { server ->
+            val execution = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+                destinationProvider = { throw AssertionError("An untrusted archive must not be applied") },
+            ).execute(
+                command(null, null, server.url, archive.size.toLong(), "0".repeat(64))
+                    .copy(revision = 0L, artifactEtag = null),
+                PushFilesWorker.Callbacks({ callbackInvoked = true }, { callbackInvoked = true }, { callbackInvoked = true }),
+            )
+            assertEquals("artifact_identity_mismatch", execution.result.failureCode)
+            assertFalse(callbackInvoked)
+            assertFalse(File(work, "artifact.part").exists())
+            assertFalse(File(work, "artifact.zip").exists())
+        }
+    }
+
+    @Test
     fun `mismatched artifact SHA stops before callbacks and destination changes`() {
         val archive = zip("content.txt" to "untrusted").readBytes()
         val destination = tmp.newFolder("sha-mismatch-destination")
@@ -1429,6 +1503,7 @@ class PushFilesWorkerTest {
         assertEquals("unchanged", sentinel.readText())
         assertFalse(File(work, "artifact.part").exists())
         assertFalse(File(work, "artifact.zip").exists())
+        assertFalse(File(work, "metadata.json").exists())
     }
 
     @Test
