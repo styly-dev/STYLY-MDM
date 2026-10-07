@@ -42,7 +42,6 @@ async def prepare_job_v1_dispatch(manager, job_id):
         job_id,
         "D1",
         protocol_mode=ProtocolMode.JOB_V1,
-        live_capabilities={"push_job_id_v1"},
         accept_deadline=now_ms() + 1000,
     )
 

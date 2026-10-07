@@ -18,7 +18,6 @@ from typing import Any, Literal
 
 from .push_job_store import PushJobStore, StoreConflict, StoreNotFound, now_ms
 from .push_jobs import (
-    CAP_PUSH_RESUME_V1,
     DeviceState,
     JobState,
     MANUAL_WAIT_QUEUE_REASONS,
@@ -27,7 +26,6 @@ from .push_jobs import (
     TERMINAL_DEVICE_STATES,
     assignment_actions,
     canonicalize_create_request,
-    parse_dispatch_capabilities,
     validate_device_transition,
 )
 
@@ -663,14 +661,9 @@ class PushJobManager:
         device_id: str,
         *,
         protocol_mode: ProtocolMode,
-        live_capabilities: Iterable[str],
         accept_deadline: int | None,
     ) -> dict[str, Any]:
         """Commit waiter-ready dispatch metadata after the exact waiter exists."""
-
-        capabilities_json = json.dumps(
-            sorted(set(live_capabilities)), separators=(",", ":")
-        )
 
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
             self.store._begin(conn)
@@ -707,12 +700,11 @@ class PushJobManager:
                     return snapshot
                 result = conn.execute(
                     "UPDATE push_job_devices SET state=?, protocol_mode=?, queue_reason=NULL, "
-                    "dispatch_capability_snapshot_json=?, accept_deadline=?, "
+                    "accept_deadline=?, "
                     "updated_at=? WHERE job_id=? AND device_id=? AND state=?",
                     (
                         DeviceState.DISPATCHING.value,
                         protocol_mode.value,
-                        capabilities_json,
                         accept_deadline,
                         timestamp,
                         job_id,
@@ -811,9 +803,6 @@ class PushJobManager:
                 ).fetchone()
                 if row is None:
                     raise StoreNotFound(f"{job_id}/{device_id}")
-                capabilities = parse_dispatch_capabilities(
-                    row["dispatch_capability_snapshot_json"]
-                )
                 exact_artifact = artifact_id is not None and artifact_id == row["job_artifact_id"]
                 exact_revision = (
                     dispatch_revision is not None
@@ -832,7 +821,6 @@ class PushJobManager:
                     row["attempt"] == attempt == 1
                     and row["cancel_requested_at"] is None
                     and row["protocol_mode"] == ProtocolMode.JOB_V1.value
-                    and CAP_PUSH_RESUME_V1 in capabilities
                     and (
                         bool(row["dispatch_enabled"])
                         or row["dispatch_paused_reason"] in {

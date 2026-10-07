@@ -36,14 +36,12 @@ from .push_job_store import (
 from .push_jobs import (
     PUSH_JOB_CAPABILITIES,
     CAP_PUSH_JOB_ID_V1,
-    CAP_PUSH_RESUME_V1,
     DeviceState,
     JobState,
     ProtocolMode,
     PushJobError,
     canonicalize_create_request,
     parse_capabilities,
-    parse_dispatch_capabilities,
 )
 from .push_scheduler import LiveSession, PushScheduler
 from .server import parse_push_state_reset, parse_push_state_status
@@ -1185,7 +1183,13 @@ class PushRuntime:
         job_id = active_report.get("job_id")
         attempt = active_report.get("attempt")
         phase = active_report.get("phase")
-        if not isinstance(job_id, str) or attempt != 1 or not isinstance(phase, str):
+        if (
+            not isinstance(job_id, str)
+            or not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or attempt != 1
+            or not isinstance(phase, str)
+        ):
             return await self.manager.add_opaque_fence(
                 device_id,
                 self.manager.opaque_identity_for_active(active_report),
@@ -1371,12 +1375,7 @@ class PushRuntime:
             "PUSH_RECONCILE_REPORT",
         } or (message_type in {"DOWNLOAD_COMPLETE", "PUSH_FILES_RESULT"} and isinstance(job_id, str))
 
-        legacy_push_message = (
-            message_type == "DOWNLOAD_COMPLETE" and payload.get("task") == "push"
-        ) or (
-            message_type == "PUSH_FILES_RESULT" and not isinstance(job_id, str)
-        )
-        if job_v1 or legacy_push_message:
+        if job_v1:
             lock = self._device_lock(device_id)
             async with lock:
                 candidate = self.registration_candidates.get(device_id)
@@ -1384,56 +1383,11 @@ class PushRuntime:
                 if (
                     candidate is not None and candidate is not ws
                 ) or session is None or session.ws is not ws:
-                    # Consume a stale job-v1 frame. For a legacy frame return False so
-                    # the established server sees it too, but its own _owns_device guard
-                    # will reject the superseded connection.
-                    return True if job_v1 else False
-                if job_v1:
-                    return await self._handle_owned_job_v1_message(
-                        session, device_id, payload
-                    )
-                return await self._handle_owned_legacy_message(
+                    # Consume stale job-v1 frames so they cannot reach legacy handlers.
+                    return True
+                return await self._handle_owned_job_v1_message(
                     session, device_id, payload
                 )
-        return False
-
-    async def _handle_owned_legacy_message(
-        self,
-        session: LiveSession,
-        device_id: str,
-        payload: dict[str, Any],
-    ) -> bool:
-        """Settle migration-only legacy Push only for the current socket owner."""
-
-        message_type = payload.get("type")
-        if message_type == "DOWNLOAD_COMPLETE" and payload.get("task") == "push":
-            active = await self.manager.active_assignment_for_device(device_id)
-            if active and active["protocol_mode"] == ProtocolMode.LEGACY.value:
-                key = TransferKey("push", device_id, active["job_id"], 1)
-                self.transfers.release_exact(key, "legacy_download_complete")
-                try:
-                    snapshot = await self.manager.transition_device(
-                        active["job_id"],
-                        device_id,
-                        expected={DeviceState.DOWNLOADING},
-                        target=DeviceState.VALIDATING,
-                        fields={"transfer_completed_at": now_ms()},
-                    )
-                    await self.publish(snapshot)
-                except StoreConflict:
-                    pass
-                return True
-            return False
-        if message_type == "PUSH_FILES_RESULT":
-            active = await self.manager.active_assignment_for_device(device_id)
-            if active and active["protocol_mode"] == ProtocolMode.LEGACY.value:
-                enriched = dict(payload)
-                enriched["job_id"] = active["job_id"]
-                enriched["attempt"] = 1
-                await self._handle_result(
-                    device_id, enriched, owned_session=session
-                )
-                return True
         return False
 
     async def _handle_owned_job_v1_message(
@@ -1753,7 +1707,7 @@ class PushRuntime:
             failure_code = failure_code[:128]
         detail = payload.get("detail")
         if not isinstance(detail, str):
-            detail = payload.get("error") if isinstance(payload.get("error"), str) else ""
+            detail = ""
         detail = detail[:2000]
         if assignment.get("cancel_requested_at") is not None and assignment["state"] == DeviceState.UNCONFIRMED.value:
             accepted, snapshots = await self.manager.settle_cancelled_late_result(
@@ -1955,7 +1909,7 @@ class PushRuntime:
                 await self._send_resume_rejected(session, job_id=job_id,
                     artifact_id=artifact_id, revision=revision)
             return []
-        if CAP_PUSH_RESUME_V1 in session.capabilities and isinstance(artifact_id, str):
+        if isinstance(artifact_id, str):
             key = TransferKey("push", device_id, job_id, 1)
             previous_transfer = self.transfers.get(key)
             try:
@@ -1995,11 +1949,13 @@ class PushRuntime:
         job_id = payload.get("job_id")
         attempt = payload.get("attempt")
         status = payload.get("status")
-        if not isinstance(job_id, str) or attempt != 1 or status not in {
-            "active",
-            "absent",
-            "interrupted",
-        }:
+        if (
+            not isinstance(job_id, str)
+            or not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or attempt != 1
+            or status not in {"active", "absent", "interrupted"}
+        ):
             return
         if status in {"absent", "interrupted"}:
             matched, opaque_snapshots = await self.manager.clear_matching_opaque_fence(
@@ -2013,8 +1969,8 @@ class PushRuntime:
         if assignment is None:
             return
         if assignment.get("cancel_requested_at") is not None:
-            # Only assignments dispatched with push_resume_v1 are cancellable, and
-            # those clients echo the requested artifact_id in every absent report.
+            # Only dispatched job-v1 assignments are cancellable, and those clients
+            # echo the requested artifact_id in every absent report.
             # A missing, null, or mismatched artifact cannot clear the fence.
             reported_artifact = payload.get("artifact_id")
             if (
@@ -2041,23 +1997,15 @@ class PushRuntime:
                 self.scheduler.wake()
             return
         if status == "interrupted":
-            if CAP_PUSH_RESUME_V1 in parse_dispatch_capabilities(
-                assignment.get("dispatch_capability_snapshot_json")
-            ):
-                snapshots = await self._resume_interrupted_report(
-                    session, device_id, payload, assignment
-                )
-                for snapshot in snapshots:
-                    await self.publish(snapshot)
-                    if snapshot["dispatch_enabled"] and self.scheduler is not None:
-                        self.scheduler.wake()
-                return
+            snapshots = await self._resume_interrupted_report(
+                session, device_id, payload, assignment
+            )
+            for snapshot in snapshots:
+                await self.publish(snapshot)
+                if snapshot["dispatch_enabled"] and self.scheduler is not None:
+                    self.scheduler.wake()
+            return
         if assignment["state"] != DeviceState.RECONCILING.value:
-            if status == "interrupted":
-                await self._send_resume_rejected(
-                    session, job_id=job_id, artifact_id=payload.get("artifact_id"),
-                    revision=payload.get("revision"),
-                )
             return
         if status == "active" and payload.get("phase") == "downloading" and self.leases.token(
             TransferKey("push", device_id, job_id, 1)
@@ -2073,11 +2021,6 @@ class PushRuntime:
                 payload.get("phase") if isinstance(payload.get("phase"), str) else None,
                 payload.get("detail") if isinstance(payload.get("detail"), str) else None,
             )
-            if status == "interrupted":
-                await self._send_resume_rejected(
-                    session, job_id=job_id, artifact_id=payload.get("artifact_id"),
-                    revision=payload.get("revision"),
-                )
         except (StoreConflict, StoreNotFound):
             return
         for snapshot in snapshots:

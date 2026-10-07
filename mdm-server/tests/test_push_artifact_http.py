@@ -205,7 +205,7 @@ async def test_offline_cancel_revokes_http_lease_before_next_request(tmp_path):
     server = None
     old_writer = None
     try:
-        active = await downloading_job(store, manager, CAPS)
+        active = await downloading_job(store, manager)
         runtime, _session, admin = operator_runtime(manager, tmp_path)
         runtime.leases = PushTransferLeases()
         runtime.transfers = TransferRegistry(runtime.leases.revoke_now)
@@ -346,7 +346,6 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
             job_id,
             "D1",
             protocol_mode=ProtocolMode.JOB_V1,
-            live_capabilities={"push_job_id_v1", "push_resume_v1"},
             accept_deadline=now_ms() + 1000,
         )
         first = await manager.assignment(job_id, "D1")
@@ -400,7 +399,6 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
             job_id,
             "D1",
             protocol_mode=ProtocolMode.JOB_V1,
-            live_capabilities={"push_job_id_v1", "push_resume_v1"},
             accept_deadline=now_ms() + 1000,
         )
         replayed = await manager.get_snapshot(job_id)

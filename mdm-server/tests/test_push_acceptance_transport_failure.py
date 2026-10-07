@@ -69,7 +69,7 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
         if resumed:
             prior = await manager.prepare_dispatch(
                 snapshot["job_id"], "D1", protocol_mode=ProtocolMode.JOB_V1,
-                live_capabilities=capabilities, accept_deadline=now_ms() + 1_000,
+                accept_deadline=now_ms() + 1_000,
             )
             await manager.transition_device(
                 snapshot["job_id"], "D1", expected={DeviceState.DISPATCHING},
@@ -248,7 +248,7 @@ async def test_disconnect_timeout_cannot_keep_obsolete_transfer(tmp_path, change
         deadline = 1234
         snapshot = await manager.prepare_dispatch(
             job_id, "D1", protocol_mode=ProtocolMode.JOB_V1,
-            live_capabilities=capabilities, accept_deadline=deadline,
+            accept_deadline=deadline,
         )
         await manager.mark_reconciling(
             job_id, "D1", expected={DeviceState.DISPATCHING},
