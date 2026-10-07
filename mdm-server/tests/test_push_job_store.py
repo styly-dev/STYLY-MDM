@@ -41,7 +41,6 @@ async def prepare_job_v1_dispatch(manager, job_id):
     return await manager.prepare_dispatch(
         job_id,
         "D1",
-        protocol_mode=ProtocolMode.JOB_V1,
         accept_deadline=now_ms() + 1000,
     )
 
@@ -82,6 +81,22 @@ async def test_db_worker_survives_cancellation_during_sqlite_work(tmp_path):
     finally:
         release.set()
         worker.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    ["dispatch_revision", "dispatch_capability_snapshot_json"],
+)
+async def test_transition_device_rejects_dispatch_identity_overwrites(store, field):
+    with pytest.raises(ValueError, match="unsupported device fields"):
+        await store.transition_device(
+            "job",
+            "D1",
+            expected=None,
+            target=DeviceState.QUEUED,
+            fields={field: 1},
+        )
 
 
 def test_db_worker_fails_pending_and_future_submissions_after_unexpected_exit(tmp_path):

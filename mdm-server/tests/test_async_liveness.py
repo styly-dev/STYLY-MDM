@@ -356,7 +356,7 @@ class _DispatchManager:
                 "sha256": "a" * 64,
                 "etag": '"' + "a" * 64 + '"',
             },
-            "devices": {"D1": {"attempt": 1, "state": "dispatching"}},
+            "devices": {"D1": {"attempt": 1, "state": "dispatching", "dispatch_revision": 1}},
         }
 
     async def claim_next(self, _online_device_ids):
@@ -428,6 +428,7 @@ async def test_dispatch_send_failure_cleans_all_registered_waiters():
     scheduler.start()
     try:
         await asyncio.wait_for(manager.transitioned.wait(), timeout=1)
+        assert websocket.started.is_set()
         assert manager.transitions == [push_scheduler.DeviceState.FAILED]
         assert len(registry) == 0
         assert scheduler._accept_waiters == {}

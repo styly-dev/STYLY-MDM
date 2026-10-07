@@ -813,37 +813,20 @@ class PushRuntime:
     def _if_match_satisfied(value: str | None, etag: str) -> bool:
         if value is None:
             return True
-        # If-Match uses strong comparison; weak tags deliberately do not match.
-        tags = [item.strip() for item in value.split(",")]
-        return "*" in tags or etag in tags
+        # This endpoint accepts one exact strong ETag, matching the job client.
+        return value.strip() == etag
 
     @staticmethod
     def _parse_range(value: str, total: int) -> tuple[int, int] | None:
-        if not isinstance(value, str) or "," in value:
-            raise ValueError("unsupported Range syntax")
-        if total <= 0:
-            return None
-        match = re.fullmatch(r"bytes=(\d*)-(\d*)", value.strip())
+        if not isinstance(value, str):
+            raise ValueError("invalid Range syntax")
+        match = re.fullmatch(r"bytes=(\d+)-", value.strip())
         if match is None:
-            raise ValueError("invalid Range syntax")
-        raw_start, raw_end = match.groups()
-        if not raw_start and not raw_end:
-            raise ValueError("invalid Range syntax")
-        try:
-            if not raw_start:
-                length = int(raw_end)
-                if length <= 0:
-                    return None
-                return max(0, total - length), total - 1
-            start = int(raw_start)
-            if start >= total:
-                return None
-            end = total - 1 if not raw_end else int(raw_end)
-        except ValueError:
+            raise ValueError("unsupported Range syntax")
+        start = int(match.group(1))
+        if total <= 0 or start >= total:
             return None
-        if end < start:
-            return None
-        return start, min(end, total - 1)
+        return start, total - 1
 
     @staticmethod
     def _registered_capabilities(payload: dict[str, Any]) -> frozenset[str]:
@@ -1158,22 +1141,6 @@ class PushRuntime:
             return None
         return session
 
-    async def acknowledge_registration(
-        self,
-        ws: RuntimeWebSocketResponse,
-        device_id: str,
-    ) -> None:
-        session = self._registered_session(ws, device_id)
-        if session is None:
-            return
-        await asyncio.wait_for(
-            ws.send_str(json.dumps({
-                "type": "REGISTERED",
-                "session_id": session.session_id,
-            }, separators=(",", ":"))),
-            self.send_timeout,
-        )
-
     async def _registration_active_snapshots(
         self,
         device_id: str,
@@ -1290,7 +1257,7 @@ class PushRuntime:
                 return []
             if phase == "downloading":
                 if self.scheduler is not None:
-                    await self.scheduler.ensure_active_transfer_slot(
+                    await self.scheduler.reconcile_active_transfer(
                         job_id, device_id, 1
                     )
             else:
@@ -2030,7 +1997,7 @@ class PushRuntime:
             and payload.get("phase") == "downloading"
             and self.scheduler is not None
         ):
-            await self.scheduler.ensure_active_transfer_slot(job_id, device_id, 1)
+            await self.scheduler.reconcile_active_transfer(job_id, device_id, 1)
         if outcome in {"requeued", "interrupted"} or (
             outcome == "active" and payload.get("phase") in {"validating", "applying"}
         ):
@@ -2142,9 +2109,8 @@ class PushRuntime:
             if self.scheduler is not None:
                 self.scheduler.wake()
                 scheduler_woken = True
-            # Durable-state Retry only reloads and republishes client state. The
-            # operator's separate Resume action is the authority to reconcile and
-            # requeue recovered interrupted work.
+            # Resume reconciles recovered assignments before returning them to
+            # the dispatch queue.
             live_device_entries = self.legacy.devices
             reconciling_devices = [
                 device_id
