@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import uuid
+from contextlib import asynccontextmanager
 
 import aiohttp
 import pytest
@@ -15,6 +16,18 @@ from styly_mdm.push_scheduler import PushScheduler
 from styly_mdm.push_runtime import PushRuntime
 from styly_mdm.push_transfer_leases import PushTransferLeases
 from styly_mdm.transfer_registry import TransferKey
+
+
+@asynccontextmanager
+async def _artifact_server(runtime):
+    app = web.Application()
+    app.router.add_get("/artifacts/{artifact_id}", runtime.artifact_handler)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        yield server
+    finally:
+        await server.close()
 
 
 @pytest.fixture
@@ -45,11 +58,7 @@ def artifact_runtime(tmp_path):
 async def test_artifact_http_range_etag_and_head(artifact_runtime):
     runtime, artifact_id, digest, payload = artifact_runtime
     lease = runtime.leases.issue(TransferKey("push", "D1", "job", 1), artifact_id).token
-    app = web.Application()
-    app.router.add_get("/artifacts/{artifact_id}", runtime.artifact_handler)
-    server = TestServer(app)
-    await server.start_server()
-    try:
+    async with _artifact_server(runtime) as server:
         async with aiohttp.ClientSession() as client:
             url = f"http://{server.host}:{server.port}/artifacts/{artifact_id}?lease={lease}"
             response = await client.get(url, headers={"Accept-Encoding": "identity"})
@@ -120,47 +129,26 @@ async def test_artifact_http_range_etag_and_head(artifact_runtime):
             assert response.status == 206
             assert response.headers["Content-Length"] == str(len(payload) - 4)
             assert await response.read() == b""
-    finally:
-        await server.close()
 
 
 @pytest.mark.asyncio
 async def test_artifact_http_requires_a_scoped_lease(artifact_runtime):
     runtime, artifact_id, _digest, _payload = artifact_runtime
-    app = web.Application()
-    app.router.add_get("/artifacts/{artifact_id}", runtime.artifact_handler)
-    server = TestServer(app)
-    await server.start_server()
-    try:
+    async with _artifact_server(runtime) as server:
         async with aiohttp.ClientSession() as client:
             url = f"http://{server.host}:{server.port}/artifacts/{artifact_id}"
-            response = await client.get(url)
-            assert response.status == 409
-            assert response.headers["X-Push-Lease-Status"] == "revoked"
-            await response.read()
-
-            response = await client.get(f"{url}?lease=unknown-token")
-            assert response.status == 409
-            assert response.headers["X-Push-Lease-Status"] == "revoked"
-            await response.read()
-
             key = TransferKey("push", "D1", "job", 1)
             revoked_lease = runtime.leases.issue(key, artifact_id).token
             runtime.leases.revoke_now(key)
-            response = await client.get(f"{url}?lease={revoked_lease}")
-            assert response.status == 409
-            assert response.headers["X-Push-Lease-Status"] == "revoked"
-            await response.read()
-
             other_artifact_lease = runtime.leases.issue(
                 TransferKey("push", "D1", "other-job", 1), "some-other-artifact"
             ).token
-            response = await client.get(f"{url}?lease={other_artifact_lease}")
-            assert response.status == 409
-            assert response.headers["X-Push-Lease-Status"] == "revoked"
-            await response.read()
-    finally:
-        await server.close()
+            for token in (None, "unknown-token", revoked_lease, other_artifact_lease):
+                request_url = url if token is None else f"{url}?lease={token}"
+                response = await client.get(request_url)
+                assert response.status == 409
+                assert response.headers["X-Push-Lease-Status"] == "revoked"
+                await response.read()
 
 
 @pytest.mark.asyncio
@@ -190,36 +178,32 @@ async def test_artifact_http_range_reconnect_replaces_busy_lease(artifact_runtim
         )
 
     runtime._serve_artifact = blocked_serve
-    app = web.Application()
-    app.router.add_get("/artifacts/{artifact_id}", runtime.artifact_handler)
-    server = TestServer(app)
-    await server.start_server()
     old_writer = None
-    try:
+    async with _artifact_server(runtime) as server:
         old_reader, old_writer = await asyncio.open_connection(server.host, server.port)
-        old_writer.write(
-            f"GET /artifacts/{artifact_id}?lease={lease} HTTP/1.1\r\n"
-            f"Host: {server.host}:{server.port}\r\n\r\n".encode()
-        )
-        await old_writer.drain()
-        await asyncio.wait_for(started.wait(), timeout=1)
-        async with aiohttp.ClientSession() as client:
-            url = f"http://{server.host}:{server.port}/artifacts/{artifact_id}?lease={lease}"
-            head = await asyncio.wait_for(client.head(url), timeout=1)
-            assert head.status == 200
-            assert not stopped.is_set()
-            response = await asyncio.wait_for(
-                client.get(url, headers={"Range": "bytes=5-"}), timeout=1
+        try:
+            old_writer.write(
+                f"GET /artifacts/{artifact_id}?lease={lease} HTTP/1.1\r\n"
+                f"Host: {server.host}:{server.port}\r\n\r\n".encode()
             )
-            assert stopped.is_set()
-            assert response.status == 206
-            assert await response.read() == payload[5:]
-        assert await asyncio.wait_for(old_reader.read(), timeout=1) == b""
-    finally:
-        if old_writer is not None:
-            old_writer.close()
-            await old_writer.wait_closed()
-        await server.close()
+            await old_writer.drain()
+            await asyncio.wait_for(started.wait(), timeout=1)
+            async with aiohttp.ClientSession() as client:
+                url = f"http://{server.host}:{server.port}/artifacts/{artifact_id}?lease={lease}"
+                head = await asyncio.wait_for(client.head(url), timeout=1)
+                assert head.status == 200
+                assert not stopped.is_set()
+                response = await asyncio.wait_for(
+                    client.get(url, headers={"Range": "bytes=5-"}), timeout=1
+                )
+                assert stopped.is_set()
+                assert response.status == 206
+                assert await response.read() == payload[5:]
+            assert await asyncio.wait_for(old_reader.read(), timeout=1) == b""
+        finally:
+            if old_writer is not None:
+                old_writer.close()
+                await old_writer.wait_closed()
 
 
 @pytest.mark.asyncio
@@ -458,15 +442,9 @@ async def test_artifact_http_rejects_bytes_with_wrong_size(artifact_runtime):
     runtime, artifact_id, _digest, payload = artifact_runtime
     (runtime.artifacts.artifact_root / f"{artifact_id}.zip").write_bytes(payload[:4])
     lease = runtime.leases.issue(TransferKey("push", "D1", "job", 1), artifact_id).token
-    app = web.Application()
-    app.router.add_get("/artifacts/{artifact_id}", runtime.artifact_handler)
-    server = TestServer(app)
-    await server.start_server()
-    try:
+    async with _artifact_server(runtime) as server:
         async with aiohttp.ClientSession() as client:
             url = f"http://{server.host}:{server.port}/artifacts/{artifact_id}?lease={lease}"
             response = await asyncio.wait_for(client.get(url), timeout=2)
             # Never declare a Content-Length the truncated file cannot fill.
             assert response.status == 404
-    finally:
-        await server.close()

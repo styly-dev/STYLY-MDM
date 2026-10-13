@@ -388,58 +388,33 @@ class PushJobCoordinatorStateTest {
     }
 
     @Test
-    fun `interrupted ownership is retained before the twenty four hour deadline`() {
+    fun `interrupted ownership expires exactly at the twenty four hour deadline`() {
         val command = command().copy(revision = 7L)
         val state = PushProtocol.State(
             active = PushProtocol.Active(
-                command,
-                PushProtocol.PHASE_DOWNLOADING,
-                interrupted = true,
-                interruptedAt = 1_000L,
-                interruptionReason = "download_interrupted",
+                command, PushProtocol.PHASE_DOWNLOADING, interrupted = true,
+                interruptedAt = 1_000L, interruptionReason = "download_interrupted",
             ),
             pendingResults = emptyList(),
             completedReceipts = emptyList(),
         )
-
-        val settled = expireInterruptedPushState(
-            state,
-            now = 1_000L + PushFilesWorker.PARTIAL_RETENTION_MS - 1L,
-            retentionMs = PushFilesWorker.PARTIAL_RETENTION_MS,
-            maxReceipts = 256,
-        )
-
-        assertTrue(settled == null)
-        assertSame(command, state.active?.command)
-    }
-
-    @Test
-    fun `interrupted ownership expires durably at twenty four hours`() {
-        val command = command().copy(revision = 7L)
-        val state = PushProtocol.State(
-            active = PushProtocol.Active(
-                command,
-                PushProtocol.PHASE_DOWNLOADING,
-                interrupted = true,
-                interruptedAt = 1_000L,
-                interruptionReason = "download_interrupted",
-            ),
-            pendingResults = emptyList(),
-            completedReceipts = emptyList(),
-        )
-
-        val settled = expireInterruptedPushState(
-            state,
-            now = 1_000L + PushFilesWorker.PARTIAL_RETENTION_MS,
-            retentionMs = PushFilesWorker.PARTIAL_RETENTION_MS,
-            maxReceipts = 256,
-        )
-
-        requireNotNull(settled)
-        assertTrue(settled.first.active == null)
-        assertEquals("resume_expired", settled.second.result.failureCode)
-        assertEquals(listOf(settled.second), settled.first.pendingResults)
-        assertEquals(listOf(settled.second), settled.first.completedReceipts)
+        val deadline = 1_000L + PushFilesWorker.PARTIAL_RETENTION_MS
+        val cases = listOf("one millisecond before" to (deadline - 1L), "at deadline" to deadline)
+        for ((label, now) in cases) {
+            val settled = expireInterruptedPushState(
+                state, now, PushFilesWorker.PARTIAL_RETENTION_MS, maxReceipts = 256,
+            )
+            if (now < deadline) {
+                assertTrue("$label retains ownership", settled == null)
+                assertSame(command, state.active?.command)
+            } else {
+                val expired = requireNotNull(settled) { "$label expires durably" }
+                assertTrue(expired.first.active == null)
+                assertEquals("resume_expired", expired.second.result.failureCode)
+                assertEquals(listOf(expired.second), expired.first.pendingResults)
+                assertEquals(listOf(expired.second), expired.first.completedReceipts)
+            }
+        }
     }
 
     @Test
@@ -552,22 +527,9 @@ class PushJobCoordinatorStateTest {
             interruptedAt = 10_000L,
         )
 
-        assertEquals(
-            PushFilesWorker.PARTIAL_RETENTION_MS,
-            interruptedExpiryDelayMillis(
-                active,
-                now = 5_000L,
-                retentionMs = PushFilesWorker.PARTIAL_RETENTION_MS,
-            ),
-        )
-        assertEquals(
-            PushFilesWorker.PARTIAL_RETENTION_MS - 1_000L,
-            interruptedExpiryDelayMillis(
-                active,
-                now = 11_000L,
-                retentionMs = PushFilesWorker.PARTIAL_RETENTION_MS,
-            ),
-        )
+        val retention = PushFilesWorker.PARTIAL_RETENTION_MS
+        assertEquals(retention, interruptedExpiryDelayMillis(active, 5_000L, retention))
+        assertEquals(retention - 1_000L, interruptedExpiryDelayMillis(active, 11_000L, retention))
     }
 
     private fun receipt(): PushProtocol.Receipt {
