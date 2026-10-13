@@ -8,6 +8,7 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -15,7 +16,6 @@ import java.util.concurrent.TimeUnit
 internal fun persistPushStateBeforePublishing(
     nextState: PushProtocol.State,
     save: (PushProtocol.State) -> PushProtocol.State,
-    afterPublish: () -> Unit = {},
     onFailure: (Throwable) -> Unit = {},
     publish: (PushProtocol.State) -> Unit,
 ): Boolean {
@@ -26,7 +26,6 @@ internal fun persistPushStateBeforePublishing(
         return false
     }
     publish(persisted)
-    afterPublish()
     return true
 }
 
@@ -327,6 +326,21 @@ internal class PushStateRecoveryBudget(private val maxAttempts: Int) {
     }
 }
 
+/** Runtime boundaries for focused tests of the real coordinator actor. */
+internal class PushJobCoordinatorDependencies(
+    val loadState: () -> PushStateLoadResult,
+    val discardState: () -> Unit,
+    val saveState: (PushProtocol.State) -> PushProtocol.State,
+    val emptyState: () -> PushProtocol.State,
+    val execute: (PushProtocol.Command, PushFilesWorker.Callbacks) -> PushFilesWorker.Execution,
+    val cleanup: (File) -> Unit,
+    val validatedResumeOffset: (PushProtocol.Command) -> Long,
+    val attemptDirectory: (PushProtocol.Command) -> File,
+    val actor: ScheduledExecutorService,
+    val workerExecutor: ExecutorService,
+    val log: (Int, String, Throwable?) -> Unit,
+)
+
 /**
  * Application-scoped single owner for every Push/Sync execution.
  *
@@ -334,36 +348,66 @@ internal class PushStateRecoveryBudget(private val maxAttempts: Int) {
  * every durable state mutation are serialized on [actor]. File/network work uses a
  * separate single worker thread and never owns the WebSocket transport.
  */
-class PushJobCoordinator(
-    context: Context,
-    private val recoveryRetryDelayMs: Long = RECOVERY_RETRY_DELAY_MS,
-    recoveryMaxAttempts: Int = RECOVERY_MAX_ATTEMPTS,
+class PushJobCoordinator internal constructor(
+    private val dependencies: PushJobCoordinatorDependencies,
+    private val recoveryRetryDelayMs: Long,
+    recoveryMaxAttempts: Int,
 ) {
+    constructor(
+        context: Context,
+        recoveryRetryDelayMs: Long = RECOVERY_RETRY_DELAY_MS,
+        recoveryMaxAttempts: Int = RECOVERY_MAX_ATTEMPTS,
+    ) : this(
+        productionDependencies(context.applicationContext),
+        recoveryRetryDelayMs,
+        recoveryMaxAttempts,
+    )
+
     companion object {
         private const val TAG = "PushJobCoordinator"
         private const val MAX_RECEIPTS = 256
         private const val RECOVERY_RETRY_DELAY_MS = 60_000L
         private const val RECOVERY_MAX_ATTEMPTS = 5
+
+        private fun productionDependencies(context: Context): PushJobCoordinatorDependencies {
+            val store = PushJobStore(context)
+            val worker = PushFilesWorker()
+            return PushJobCoordinatorDependencies(
+                loadState = store::load,
+                discardState = store::discard,
+                saveState = store::save,
+                emptyState = store::emptyState,
+                execute = worker::execute,
+                cleanup = worker::cleanup,
+                validatedResumeOffset = worker::validatedResumeOffset,
+                attemptDirectory = PushFilesWorker::defaultAttemptDirectory,
+                actor = ScheduledThreadPoolExecutor(1) { runnable ->
+                    Thread(runnable, "push-job-actor")
+                }.apply { removeOnCancelPolicy = true },
+                workerExecutor = Executors.newSingleThreadExecutor { runnable ->
+                    Thread(runnable, "push-job-worker")
+                },
+                log = { priority, message, error ->
+                    when (priority) {
+                        Log.ERROR -> Log.e(TAG, message, error)
+                        Log.WARN -> Log.w(TAG, message, error)
+                        else -> Log.i(TAG, message)
+                    }
+                },
+            )
+        }
     }
 
-    private val appContext = context.applicationContext
-    private val store = PushJobStore(appContext)
-    private val gate = PushExecutionGate()
-    private val worker = PushFilesWorker()
-    private val actor = ScheduledThreadPoolExecutor(1) { runnable ->
-        Thread(runnable, "push-job-actor")
-    }.apply { removeOnCancelPolicy = true }
+    private val actor = dependencies.actor
     /**
      * The only pending interrupted-expiry check. It is replaced on the single actor
      * thread, so a canceled check that has not started can never run.
      */
     private var interruptedExpiryTimer: ScheduledFuture<*>? = null
-    private val workerExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "push-job-worker")
-    }
+    private val workerExecutor = dependencies.workerExecutor
     private val processInstanceId = UUID.randomUUID().toString()
 
-    private var state: PushProtocol.State = store.emptyState()
+    private var state: PushProtocol.State = dependencies.emptyState()
     private var durabilityAvailable = false
     /** True once durable state was loaded (or reset) and adopted; until then [state] is not authoritative. */
     private var stateLoaded = false
@@ -471,31 +515,31 @@ class PushJobCoordinator(
      */
     private fun loadDurableState(): Boolean {
         try {
-            val loaded = when (val result = store.load()) {
+            val loaded = when (val result = dependencies.loadState()) {
                 is PushStateLoadResult.Valid -> result.state
-                PushStateLoadResult.Missing -> store.emptyState()
+                PushStateLoadResult.Missing -> dependencies.emptyState()
                 is PushStateLoadResult.Unreadable -> {
                     // The content is unknown. Never overwrite it with an empty snapshot.
-                    Log.e(TAG, "Could not read durable Push/Sync state", result.error)
+                    log(Log.ERROR, "Could not read durable Push/Sync state", result.error)
                     return false
                 }
                 is PushStateLoadResult.InvalidReceipts -> {
                     // Retain all execution evidence until the snapshot can be repaired.
-                    Log.e(TAG, "Preserving durable Push/Sync state with invalid receipts", result.error)
+                    log(Log.ERROR, "Preserving durable Push/Sync state with invalid receipts", result.error)
                     return false
                 }
                 is PushStateLoadResult.Corrupt -> {
-                    Log.w(TAG, "Discarding unparseable durable Push/Sync state", result.error)
-                    store.discard()
+                    log(Log.WARN, "Discarding unparseable durable Push/Sync state", result.error)
+                    dependencies.discardState()
                     resetNotices.record(PushStateResetNotice.corruptStateDiscarded(result.error))
-                    store.emptyState()
+                    dependencies.emptyState()
                 }
             }
             if (!adoptRecoveredState(loaded)) return false
             stateLoaded = true
             return true
         } catch (error: Throwable) {
-            Log.e(TAG, "Could not load durable Push/Sync state", error)
+            log(Log.ERROR, "Could not load durable Push/Sync state", error)
             return false
         }
     }
@@ -503,7 +547,7 @@ class PushJobCoordinator(
     /** Opens a recovery incident for a durability failure unless one is open or exhausted. */
     private fun beginRecovery() {
         if (!recoveryBudget.onFailure()) return
-        Log.w(TAG, "Durable Push/Sync state is unavailable; retrying automatically")
+        log(Log.WARN, "Durable Push/Sync state is unavailable; retrying automatically", null)
         scheduleRecoveryAttempt()
     }
 
@@ -523,20 +567,21 @@ class PushJobCoordinator(
                 PushStateRecoveryAction.ResaveCurrent -> persist(state)
             }
         } catch (error: Throwable) {
-            Log.e(TAG, "Could not recover durable Push/Sync state", error)
+            log(Log.ERROR, "Could not recover durable Push/Sync state", error)
             false
         }
         if (recovered) {
             recoveryBudget.onRecovered()
             setDurabilityAvailable(true)
-            Log.i(TAG, "Durable Push/Sync state recovered")
+            log(Log.INFO, "Durable Push/Sync state recovered", null)
         } else if (recoveryBudget.onAttemptFailed()) {
             scheduleRecoveryAttempt()
         } else {
-            Log.e(
-                TAG,
+            log(
+                Log.ERROR,
                 "Durable Push/Sync state is still unavailable after " +
                     "${recoveryBudget.attemptsUsed} attempts; giving up until the client restarts",
+                null,
             )
         }
     }
@@ -546,7 +591,7 @@ class PushJobCoordinator(
         try {
             transportRegistrationRefresh?.invoke()
         } catch (error: Throwable) {
-            Log.w(TAG, "Could not request Push/Sync registration refresh", error)
+            log(Log.WARN, "Could not request Push/Sync registration refresh", error)
         }
     }
 
@@ -590,10 +635,8 @@ class PushJobCoordinator(
                     // The artifact URL is a replaceable locator, not execution identity.
                     // A manual resume may therefore carry a fresh server lease URL while
                     // reusing the durable partial for this exact artifact and revision.
-                    // Recovery deliberately leaves the gate empty while waiting
-                    // for exact server authorization. Reacquire it before the
-                    // worker starts so duplicate/other commands remain fenced.
-                    gate.restore(command)
+                    // Interrupted state remains the reservation until exact server
+                    // authorization replaces it with a running active state.
                     accept(command)
                 }
                 else rejectConflict(command, "interrupted job identity carried different execution fields")
@@ -608,11 +651,12 @@ class PushJobCoordinator(
             return
         }
 
-        when (val decision = gate.offer(command)) {
-            PushExecutionGate.Decision.Accepted -> accept(command)
-            is PushExecutionGate.Decision.Duplicate -> handleDuplicate(command)
-            is PushExecutionGate.Decision.Busy -> rejectBusy(command, decision.active)
-            is PushExecutionGate.Decision.Conflict -> rejectConflict(command, decision.detail)
+        val current = state.active?.command
+        when {
+            current == null -> accept(command)
+            !sameIdentity(current, command) -> rejectBusy(command, current)
+            current.sameExecution(command) -> handleDuplicate(command)
+            else -> rejectConflict(command, "same identity carried different artifact, destination, or mode")
         }
     }
 
@@ -628,13 +672,12 @@ class PushJobCoordinator(
             ),
         )
         if (!persist(nextState)) { // durability before acceptance and before worker start
-            gate.release(command)
             rejectPersistenceUnavailable(command)
             return
         }
         if (command.isJobV1) sendAccepted(command, PushProtocol.PHASE_DOWNLOADING)
         workerExecutor.execute {
-            val execution = worker.execute(
+            val execution = dependencies.execute(
                 command,
                 PushFilesWorker.Callbacks(
                     onTransferComplete = { received ->
@@ -748,7 +791,7 @@ class PushJobCoordinator(
         ) ?: return
         val (nextState, receipt) = settled
         val command = receipt.command
-        if (!persist(nextState, afterPublish = { gate.release(command) })) return
+        if (!persist(nextState)) return
         cleanupExecution(attemptDirectory(command))
         send(JSONObject().apply {
             put("type", "PUSH_RECONCILE_REPORT")
@@ -840,9 +883,9 @@ class PushJobCoordinator(
                     interruptionReason = execution.interruptionReason,
                 ),
             )
-            // Preserve work. The durable interrupted state fences other jobs; release
-            // the in-memory gate as recovery does, then require exact reauthorization.
-            if (!persist(nextState, afterPublish = { gate.release(command) })) {
+            // Preserve work. The durable interrupted state fences other jobs until
+            // the server authorizes an exact resume.
+            if (!persist(nextState)) {
                 unsavedTerminal = command to execution
                 return
             }
@@ -868,11 +911,8 @@ class PushJobCoordinator(
             pendingResults = pending,
             completedReceipts = completed,
         )
-        // Persist the terminal outbox before releasing the lease, cleaning up, or sending.
-        if (!persist(
-            nextState,
-            afterPublish = { gate.release(command) },
-        )) {
+        // Persist the terminal outbox before clearing active state, cleaning up, or sending.
+        if (!persist(nextState)) {
             unsavedTerminal = command to execution
             return
         }
@@ -883,9 +923,9 @@ class PushJobCoordinator(
     private fun cleanupExecution(workDirectory: File) {
         workerExecutor.execute {
             try {
-                worker.cleanup(workDirectory)
+                dependencies.cleanup(workDirectory)
             } catch (error: Throwable) {
-                Log.w(TAG, "Could not clean Push/Sync attempt directory", error)
+                log(Log.WARN, "Could not clean Push/Sync attempt directory", error)
             }
         }
     }
@@ -912,7 +952,7 @@ class PushJobCoordinator(
         val ack = try {
             PushProtocol.parseResultAck(payload)
         } catch (error: IllegalArgumentException) {
-            Log.w(TAG, "Ignoring malformed Push result ACK: ${error.message}")
+            log(Log.WARN, "Ignoring malformed Push result ACK: ${error.message}", null)
             return
         }
         val next = applyPushResultAckToState(state, ack, MAX_RECEIPTS)
@@ -931,12 +971,12 @@ class PushJobCoordinator(
             val identity = try {
                 PushProtocol.parseReconcileIdentity(requested)
             } catch (error: IllegalArgumentException) {
-                Log.w(TAG, "Ignoring malformed Push reconcile identity: ${error.message}")
+                log(Log.WARN, "Ignoring malformed Push reconcile identity: ${error.message}", null)
                 continue
             }
             val reply = buildPushReconcileReply(state, stateLoaded, identity, ::validatedOffset)
             if (reply == null) {
-                Log.w(TAG, "Ignoring Push reconcile request for ${identity.jobId} until durable state is loaded")
+                log(Log.WARN, "Ignoring Push reconcile request for ${identity.jobId} until durable state is loaded", null)
                 continue
             }
             send(reply)
@@ -961,10 +1001,10 @@ class PushJobCoordinator(
                 MAX_RECEIPTS,
             )
             if (expired != null) {
-                Log.w(TAG, "Expired interrupted Push/Sync ${active.command.identity}")
+                log(Log.WARN, "Expired interrupted Push/Sync ${active.command.identity}", null)
                 return Recovery(expired.first, active.command)
             }
-            Log.w(TAG, "Recovered resumable Push/Sync ${active.command.identity}")
+            log(Log.WARN, "Recovered resumable Push/Sync ${active.command.identity}", null)
             return Recovery(loaded.copy(active = interruptPushAfterRestart(active, System.currentTimeMillis())))
         }
         val interrupted = PushProtocol.Result(
@@ -979,7 +1019,7 @@ class PushJobCoordinator(
         val receipt = PushProtocol.Receipt(active.command, interrupted)
         val pending = if (active.command.isJobV1) loaded.pendingResults + receipt
         else loaded.pendingResults
-        Log.w(TAG, "Recovered interrupted Push/Sync ${active.command.identity}")
+        log(Log.WARN, "Recovered interrupted Push/Sync ${active.command.identity}", null)
         return Recovery(loaded.copy(
             active = null,
             pendingResults = pending,
@@ -996,7 +1036,6 @@ class PushJobCoordinator(
         if (!persist(recovery.state)) return false
         // Keep resumable job-v1 work after a process restart. An exact EXECUTE
         // command is required before a worker can resume or apply it.
-        gate.restore(state.active?.takeUnless { it.interrupted }?.command)
         recovery.cleanupCommand?.let { command -> cleanupExecution(attemptDirectory(command)) }
         return true
     }
@@ -1040,7 +1079,7 @@ class PushJobCoordinator(
         if (settled == null) return ExpiredOwnership.NotDue
         val (nextState, receipt) = settled
         val command = receipt.command
-        if (!persist(nextState, afterPublish = { gate.release(command) })) {
+        if (!persist(nextState)) {
             return ExpiredOwnership.PersistenceFailed
         }
         cleanupExecution(attemptDirectory(command))
@@ -1048,19 +1087,14 @@ class PushJobCoordinator(
         return ExpiredOwnership.Settled
     }
 
-    private fun attemptDirectory(command: PushProtocol.Command) =
-        PushFilesWorker.defaultAttemptDirectory(command)
+    private fun attemptDirectory(command: PushProtocol.Command) = dependencies.attemptDirectory(command)
 
-    private fun persist(
-        nextState: PushProtocol.State,
-        afterPublish: () -> Unit = {},
-    ): Boolean {
+    private fun persist(nextState: PushProtocol.State): Boolean {
         val persisted = persistPushStateBeforePublishing(
             nextState,
-            save = store::save,
-            afterPublish = afterPublish,
+            save = dependencies.saveState,
             onFailure = { error ->
-                Log.e(TAG, "Could not persist durable Push/Sync state", error)
+                log(Log.ERROR, "Could not persist durable Push/Sync state", error)
             },
         ) { saved ->
             state = saved
@@ -1080,17 +1114,21 @@ class PushJobCoordinator(
     }
 
     private fun validatedOffset(command: PushProtocol.Command): Long {
-        return worker.validatedResumeOffset(command)
+        return dependencies.validatedResumeOffset(command)
     }
 
     private fun send(message: JSONObject) {
         try {
             transportSend?.invoke(message)
         } catch (error: Throwable) {
-            Log.w(TAG, "Could not send Push/Sync protocol message", error)
+            log(Log.WARN, "Could not send Push/Sync protocol message", error)
         }
     }
 
     private fun sameIdentity(first: PushProtocol.Command, second: PushProtocol.Command): Boolean =
         first.jobId != null && first.jobId == second.jobId && first.attempt == second.attempt
+
+    private fun log(priority: Int, message: String, error: Throwable? = null) {
+        dependencies.log(priority, message, error)
+    }
 }

@@ -334,7 +334,7 @@ live eligible connection. Neither operation requires this Cancel action.
 
 Push/Sync uses three independent ownership mechanisms:
 
-- **Device execution ownership** remains held through validation and apply until a terminal result.
+- **Device execution ownership** is the coordinator's durable `state.active`, held through validation and apply until the terminal result is persisted. Interrupted ownership also reserves the device until exact Resume authorization or durable settlement; no separate in-memory gate tracks ownership.
 - **Global transfer slot** is independent of the device WebSocket. It is released on `PUSH_PHASE validating` before SHA-256, a matching terminal result, or an exact `validating`/`applying` registration after offline download completion. `PUSH_TRANSFER_COMPLETE` remains the post-SHA-256 checkpoint. The [HTTP lease watchdog](#resumable-artifact-transfer) bounds stalled transfers.
 - **Persistent device fence** blocks later jobs after an `unconfirmed` outcome until exact evidence proves the old worker is gone.
 
@@ -424,6 +424,16 @@ Each job has a monotonic 64-bit `revision`. Canonical mutations are committed an
 
 - `PUSH_JOBS_SNAPSHOT` after connection,
 - `PUSH_JOB_UPDATED` with a full job snapshot.
+
+`PushJobManager.settle_result` reads the current assignment and fence, decides
+normal/cancelled/late/opaque-fenced results, and commits outcome changes and
+affected revisions in one transaction. A late result without cancellation clears
+its exact fence while preserving the `unconfirmed` history; after cancellation,
+the actual terminal success/failure is retained. Identical terminal replays do
+not create revisions or publications. The returned `ResultSettlement` authorizes
+transfer release, snapshot publication and ACK only after commit. A failed
+transaction produces none of these effects; the client retains its result for
+replay. No protocol or persisted-format migration is required for this refactor.
 
 The server coalesces pending publication by `job_id` and sends only the newest queued revision from a single best-effort publication worker. Admin WebSocket sends are concurrent across connections and individually bounded by `MDM_ADMIN_SEND_TIMEOUT`, so a stalled browser cannot hold a device owner lock or delay another browser. A failed or timed-out admin socket, including one whose initial canonical snapshot cannot be sent, is closed; the current console's existing reconnect loop opens a new socket after three seconds and restores state from a fresh full snapshot. The console treats `PUSH_JOBS_SNAPSHOT` as a full replacement, buffers updates that arrive before that initial snapshot, and ignores revisions that are not newer. Fence create/clear, including an opaque fence, revises every non-terminal job whose snapshot displays that device fence plus the terminal blocking job.
 
@@ -572,9 +582,11 @@ sequenceDiagram
     D-->>S: DOWNLOAD_COMPLETE
     D-->>S: PUSH_PHASE applying
     S->>DB: applying
-    D->>D: persist terminal outbox
+    D->>D: atomically clear state.active and persist terminal outbox
     D-->>S: PUSH_FILES_RESULT
-    S->>DB: terminal assignment + aggregate job state
+    S->>DB: one transaction: current assignment/fence + result + affected revisions
+    DB-->>S: committed ResultSettlement
+    S->>S: release authorized transfer; publish changed snapshots
     S-->>D: PUSH_RESULT_ACK accepted or permanent/retryable rejection
     D->>D: remove accepted/permanently rejected result; retain retryable result
     opt Operator cancels interrupted or unresolved offline work

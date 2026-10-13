@@ -134,7 +134,7 @@ class PushJobCoordinatorStateTest {
     )
 
     @Test
-    fun `failed persistence neither publishes replacement state nor releases the lease`() {
+    fun `failed persistence does not publish replacement state`() {
         val previous = PushProtocol.State(
             active = null,
             pendingResults = emptyList(),
@@ -144,13 +144,10 @@ class PushJobCoordinatorStateTest {
             active = PushProtocol.Active(command(), PushProtocol.PHASE_DOWNLOADING),
         )
         var published = previous
-        var released = false
-
         var failure: Throwable? = null
         val persisted = persistPushStateBeforePublishing(
             replacement,
             save = { throw IllegalStateException("injected persistence failure") },
-            afterPublish = { released = true },
             onFailure = { failure = it },
             publish = { published = it },
         )
@@ -158,11 +155,10 @@ class PushJobCoordinatorStateTest {
         assertFalse(persisted)
         assertTrue(failure is IllegalStateException)
         assertSame(previous, published)
-        assertFalse(released)
     }
 
     @Test
-    fun `successful persistence publishes normalized state before releasing the lease`() {
+    fun `successful persistence publishes the saved state`() {
         val next = PushProtocol.State(
             active = null,
             pendingResults = emptyList(),
@@ -170,18 +166,15 @@ class PushJobCoordinatorStateTest {
         )
         val normalized = next.copy(completedReceipts = emptyList())
         var published: PushProtocol.State? = null
-        var publishedBeforeRelease = false
 
         val persisted = persistPushStateBeforePublishing(
             next,
             save = { normalized },
-            afterPublish = { publishedBeforeRelease = published === normalized },
             publish = { published = it },
         )
 
         assertTrue(persisted)
         assertSame(normalized, published)
-        assertTrue(publishedBeforeRelease)
     }
 
     @Test
