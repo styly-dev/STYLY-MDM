@@ -33,6 +33,13 @@ The authoritative implementation and protocol guide is
 dispatch, command acceptance, transfer completion, validation/apply, terminal result,
 ACK, restart recovery, and persistent device-fence reconciliation.
 
+Terminal results are decided by `PushJobManager.settle_result` in one SQLite
+transaction, including assignment/fence checks, outcome updates and revisions.
+The runtime then releases the authorized transfer, publishes changed snapshots
+and sends the ACK. On Android, the coordinator's durable `state.active` is the
+sole execution owner; the actor checks incoming commands directly against that state.
+These internal changes preserve the wire protocol, SQLite schema and state JSON.
+
 Issue #94 adds resumable transfers, per-device Resume and Cancel controls, and
 retry of failed targets. See [Push / Sync jobs](PUSH_JOBS.md) for the recovery
 rules, protocol, operator controls, and schema-3 deployment requirements.

@@ -1618,55 +1618,6 @@ class PushRuntime:
                 owned_session=owned_session,
             )
             return
-        opaque_matched, opaque_snapshots = (
-            await self.manager.clear_matching_opaque_fence(
-                device_id, job_id, 1
-            )
-        )
-        if opaque_matched:
-            for snapshot in opaque_snapshots:
-                await self.publish(snapshot)
-            local = next(
-                (
-                    snapshot
-                    for snapshot in opaque_snapshots
-                    if snapshot["job_id"] == job_id
-                ),
-                None,
-            )
-            await self._send_result_ack(
-                device_id,
-                job_id,
-                True,
-                local["revision"] if local else None,
-                None,
-                owned_session=owned_session,
-            )
-            if self.scheduler is not None:
-                self.scheduler.wake()
-            return
-
-        assignment = await self.manager.assignment(job_id, device_id)
-        if assignment is None:
-            await self._send_result_ack(
-                device_id,
-                job_id,
-                False,
-                None,
-                "unknown_job",
-                owned_session=owned_session,
-            )
-            return
-        if assignment["attempt"] != 1:
-            await self._send_result_ack(
-                device_id,
-                job_id,
-                False,
-                None,
-                "stale_result",
-                owned_session=owned_session,
-            )
-            return
         failure_code = payload.get("failure_code")
         if not isinstance(failure_code, str) or not failure_code:
             failure_code = "apply_failed" if status == "fail" else None
@@ -1676,120 +1627,25 @@ class PushRuntime:
         if not isinstance(detail, str):
             detail = ""
         detail = detail[:2000]
-        if assignment.get("cancel_requested_at") is not None and assignment["state"] == DeviceState.UNCONFIRMED.value:
-            accepted, snapshots = await self.manager.settle_cancelled_late_result(
-                job_id,
-                device_id,
-                1,
-                status,
-                added=self._nonnegative_int(payload.get("added")),
-                updated=self._nonnegative_int(payload.get("updated")),
-                deleted=self._nonnegative_int(payload.get("deleted")),
-                failure_code=failure_code,
-                failure_detail=detail,
-            )
-            for snapshot in snapshots:
-                await self.publish(snapshot)
-            if accepted:
-                self.transfers.release_exact(
-                    TransferKey("push", device_id, job_id, 1), "terminal_result"
-                )
-            revision = next(
-                (snapshot["revision"] for snapshot in snapshots if snapshot["job_id"] == job_id),
-                None,
-            )
-            await self._send_result_ack(
-                device_id,
-                job_id,
-                accepted,
-                revision,
-                None if accepted else "stale_result",
-                owned_session=owned_session,
-            )
-            if accepted and self.scheduler is not None:
-                self.scheduler.wake()
-            return
-        if assignment["state"] == DeviceState.UNCONFIRMED.value:
-            accepted, snapshots = await self.manager.settle_late_fenced_result(
-                job_id, device_id, 1
-            )
-            if accepted:
-                self.transfers.release_exact(
-                    TransferKey("push", device_id, job_id, 1), "terminal_result"
-                )
-            for snapshot in snapshots:
-                await self.publish(snapshot)
-            revision = next(
-                (snapshot["revision"] for snapshot in snapshots if snapshot["job_id"] == job_id),
-                None,
-            )
-            await self._send_result_ack(
-                device_id,
-                job_id,
-                accepted,
-                revision,
-                None if accepted else "stale_result",
-                owned_session=owned_session,
-            )
-            if accepted and self.scheduler is not None:
-                self.scheduler.wake()
-            return
-
-        was_terminal = assignment["state"] in {
-            DeviceState.SUCCEEDED.value,
-            DeviceState.FAILED.value,
-            DeviceState.INTERRUPTED.value,
-        }
-        accepted, reason, snapshot = await self.store.settle_result(
-            job_id,
-            device_id,
-            1,
-            status,
+        result = await self.manager.settle_result(
+            job_id, device_id, 1, status,
             added=self._nonnegative_int(payload.get("added")),
             updated=self._nonnegative_int(payload.get("updated")),
             deleted=self._nonnegative_int(payload.get("deleted")),
             failure_code=failure_code,
             failure_detail=detail,
         )
-        late_snapshots: list[dict[str, Any]] = []
-        current_after_settle = snapshot["devices"].get(device_id) if snapshot else None
-        if (
-            not accepted
-            and reason in {"unexpected_result_state", "conflicting_terminal_result"}
-            and current_after_settle is not None
-            and current_after_settle["state"] == DeviceState.UNCONFIRMED.value
-        ):
-            # Reconciliation housekeeping may commit RECONCILING -> UNCONFIRMED
-            # between the assignment read above and settle_result's transaction.
-            # Re-check the exact fence through the canonical Manager policy so a
-            # matching late result clears it instead of receiving a permanent ACK.
-            accepted, late_snapshots = await self.manager.settle_late_fenced_result(
-                job_id, device_id, 1
-            )
-            if accepted:
-                reason = None
-                snapshot = next(
-                    (item for item in late_snapshots if item["job_id"] == job_id),
-                    snapshot,
-                )
-        if accepted:
+        if result.release_transfer:
             self.transfers.release_exact(
                 TransferKey("push", device_id, job_id, 1), "terminal_result"
             )
-        if accepted and late_snapshots:
-            for late_snapshot in late_snapshots:
-                await self.publish(late_snapshot)
-        elif accepted and snapshot is not None and not was_terminal:
+        for snapshot in result.snapshots:
             await self.publish(snapshot)
         await self._send_result_ack(
-            device_id,
-            job_id,
-            accepted,
-            snapshot["revision"] if snapshot else None,
-            reason,
+            device_id, job_id, result.accepted, result.revision, result.reason,
             owned_session=owned_session,
         )
-        if accepted and self.scheduler is not None:
+        if result.accepted and self.scheduler is not None:
             self.scheduler.wake()
 
     async def _send_result_ack(

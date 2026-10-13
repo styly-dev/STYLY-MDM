@@ -50,7 +50,7 @@ def manager(tmp_path):
 
 def test_policy_mutations_have_one_owner():
     policy_methods = {
-        'settle_late_fenced_result',
+        'settle_result',
         'reconcile_report',
         'mark_unconfirmed',
         'add_opaque_fence',
@@ -414,11 +414,12 @@ async def test_exact_late_result_is_acked_after_process_replacement_cleared_fenc
         'D1', 'process-b', True
     )
     before = await manager.get_snapshot(job_id)
-    accepted, snapshots = await manager.settle_late_fenced_result(
-        job_id, 'D1', 1
-    )
-    assert accepted
-    current = next(item for item in snapshots if item['job_id'] == job_id)
+    result = await manager.settle_result(job_id, 'D1', 1, 'success')
+    assert result.accepted
+    assert result.release_transfer
+    assert result.revision == before['revision']
+    assert result.snapshots == []
+    current = await manager.get_snapshot(job_id)
     assert current['state'] == JobState.COMPLETED_WITH_ERRORS.value
     assert current['devices']['D1']['state'] == DeviceState.UNCONFIRMED.value
     assert current['devices']['D1']['device_fence'] is None

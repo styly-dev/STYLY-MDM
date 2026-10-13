@@ -212,7 +212,10 @@ async def test_transfer_interruption_failures_wait_for_manual_resume(manager, re
 async def test_late_absent_cannot_rewrite_completed_terminal_result(manager):
     original = await timed_out_job(manager)
     await manager.cancel_interrupted(original['job_id'], 'D1')
-    await manager.store.settle_result(original['job_id'], 'D1', 1, 'fail', failure_code='resume_expired')
+    result = await manager.settle_result(
+        original['job_id'], 'D1', 1, 'fail', failure_code='resume_expired'
+    )
+    assert result.accepted
     terminal = await manager.get_snapshot(original['job_id'])
     assert await manager.confirm_cancel(original['job_id'], 'D1') == []
     assert await manager.get_snapshot(original['job_id']) == terminal
@@ -234,6 +237,71 @@ async def test_cancelled_reconciling_assignment_ignores_late_phase_and_completio
     current = await manager.get_snapshot(active['job_id'])
     assert current['devices']['D1']['state'] == 'reconciling'
     assert current['devices']['D1']['cancel_requested']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('status', 'failure_code', 'expected_state'),
+    [
+        ('success', None, 'succeeded'),
+        ('fail', 'apply_failed', 'failed'),
+    ],
+)
+async def test_cancelled_late_result_racing_timeout_is_settled_with_exact_fence(
+    manager, status, failure_code, expected_state
+):
+    from styly_mdm.push_jobs import DeviceState
+
+    active = await downloading_job(manager.store, manager)
+    job_id = active['job_id']
+    await manager.mark_reconciling(
+        job_id, 'D1', expected={DeviceState.DOWNLOADING},
+        reason='device_disconnect', deadline=1,
+    )
+    await manager.cancel_interrupted(job_id, 'D1')
+    await manager.mark_unconfirmed(job_id, 'D1', 'process-a', 'timeout', observed_now=2)
+
+    runtime, session = runtime_for(manager)
+    published = []
+    original_publish = runtime.publish
+
+    async def track_publish(snapshot):
+        published.append(snapshot)
+        await original_publish(snapshot)
+
+    runtime.publish = track_publish
+    waiter = asyncio.get_running_loop().create_future()
+    runtime.transfers.register(TransferKey('push', 'D1', job_id, 1), waiter)
+    payload = {
+        'job_id': job_id,
+        'attempt': 1,
+        'status': status,
+        'added': 1,
+        'updated': 2,
+        'deleted': 3,
+    }
+    if failure_code is not None:
+        payload['failure_code'] = failure_code
+
+    await runtime._handle_result('D1', payload, owned_session=session)
+
+    after = await manager.get_snapshot(job_id)
+    device = after['devices']['D1']
+    assert device['state'] == expected_state
+    assert device['device_fence'] is None
+    assert device['result'] == {'added': 1, 'updated': 2, 'deleted': 3}
+    assert device['failure'] == (
+        None if status == 'success' else {'code': 'apply_failed', 'detail': ''}
+    )
+    assert waiter.result() == 'terminal_result'
+    assert session.ws.messages[-1]['accepted'] is True
+    assert session.ws.messages[-1]['revision'] == after['revision']
+    assert len(published) == 1
+    if status == 'success':
+        await runtime._handle_result('D1', payload, owned_session=session)
+        assert session.ws.messages[-1]['accepted'] is True
+        assert session.ws.messages[-1]['revision'] == after['revision']
+        assert len(published) == 1
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,7 @@ import pytest
 
 from styly_mdm import push_runtime
 from styly_mdm.push_job_manager import PushJobManager
-from styly_mdm.push_job_store import PushJobStore, now_ms
+from styly_mdm.push_job_store import PushJobStore, StoreConflict, now_ms
 from styly_mdm.push_jobs import (
     DeviceState,
     ProtocolMode,
@@ -284,12 +284,13 @@ async def test_paused_resume_can_expire_without_another_dispatch(tmp_path):
             dispatch_revision=snapshot["devices"]["D1"]["dispatch_revision"],
             validated_offset=1,
         )
-        accepted, _, _ = await store.settle_result(job_id, "D1", 1, "success")
-        assert not accepted  # A queued row still cannot report arbitrary success.
-        accepted, _, expired = await store.settle_result(
+        rejected = await manager.settle_result(job_id, "D1", 1, "success")
+        assert not rejected.accepted  # A queued row still cannot report arbitrary success.
+        settled = await manager.settle_result(
             job_id, "D1", 1, "fail", failure_code="resume_expired",
         )
-        assert accepted
+        assert settled.accepted
+        expired = await store.get_snapshot(job_id)
         assert expired["devices"]["D1"]["state"] == "failed"
         assert (await manager.assignment(job_id, "D1"))["failure_code"] == "resume_expired"
         assert await manager.active_assignment_for_device("D1") is None
@@ -1591,6 +1592,14 @@ async def test_first_terminal_result_queues_one_canonical_update_and_duplicate_i
         runtime.pending_publications = {}
         runtime.publication_revisions = {}
         runtime.publication_wake = asyncio.Event()
+        published = []
+        original_publish = runtime.publish
+
+        async def track_publish(snapshot):
+            published.append(snapshot)
+            await original_publish(snapshot)
+
+        runtime.publish = track_publish
         session = LiveSession(
             device_id="D1",
             session_id="session",
@@ -1614,12 +1623,15 @@ async def test_first_terminal_result_queues_one_canonical_update_and_duplicate_i
         await runtime._handle_result("D1", result, owned_session=session)
         assert runtime.legacy.events == []
         assert runtime.pending_publications[job_id]["state"] == "succeeded"
+        assert len(published) == 1
 
         queued_revision = runtime.pending_publications[job_id]["revision"]
         await runtime._handle_result("D1", result, owned_session=session)
         assert runtime.legacy.events == []
+        assert len(published) == 1
         assert runtime.pending_publications[job_id]["revision"] == queued_revision
         assert session.ws.messages[-1]["accepted"] is True
+        assert session.ws.messages[-1]["revision"] == queued_revision
     finally:
         store.close()
 
@@ -1679,6 +1691,69 @@ async def test_exact_success_settles_even_when_applying_phase_was_lost(tmp_path)
             "accepted": True,
             "revision": after["revision"],
         }
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_result_settlement_failure_rolls_back_without_ack_or_transfer_release(
+    tmp_path, monkeypatch
+):
+    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
+    manager = PushJobManager(store)
+    try:
+        active = await downloading_job(store, manager)
+        job_id = active["job_id"]
+        before = await store.get_snapshot(job_id)
+        runtime = object.__new__(PushRuntime)
+        runtime.store = store
+        runtime.manager = manager
+        runtime.transfers = TransferRegistry()
+        runtime.scheduler = Scheduler()
+        runtime.send_timeout = 1
+        runtime.legacy = LegacyEvents()
+        runtime.sessions = {}
+        runtime.pending_publications = {}
+        runtime.publication_revisions = {}
+        runtime.publication_wake = asyncio.Event()
+        ws = Ws()
+        session = LiveSession(
+            device_id="D1",
+            session_id="session",
+            ws=ws,
+            capabilities=frozenset({"push_job_id_v1"}),
+            process_instance_id="process-a",
+            owner_lock=asyncio.Lock(),
+            http_base="http://server",
+        )
+        runtime.sessions["D1"] = session
+        waiter = asyncio.get_running_loop().create_future()
+        runtime.transfers.register(TransferKey("push", "D1", job_id, 1), waiter)
+
+        def fail_snapshot(_conn, _job_id):
+            raise RuntimeError("injected settlement snapshot failure")
+
+        monkeypatch.setattr(store, "_snapshot", fail_snapshot)
+        with pytest.raises(RuntimeError, match="injected settlement snapshot failure"):
+            await runtime._handle_result(
+                "D1",
+                {
+                    "job_id": job_id,
+                    "attempt": 1,
+                    "status": "success",
+                    "added": 1,
+                    "updated": 0,
+                    "deleted": 0,
+                },
+                owned_session=session,
+            )
+
+        monkeypatch.undo()
+        after = await store.get_snapshot(job_id)
+        assert after == before
+        assert waiter.done() is False
+        assert ws.messages == []
+        assert runtime.pending_publications == {}
     finally:
         store.close()
 
@@ -1855,7 +1930,10 @@ async def test_replacement_register_withdraws_pending_resume(
 
 
 @pytest.mark.asyncio
-async def test_result_racing_unconfirmed_clears_exact_fence_and_is_acked(tmp_path):
+@pytest.mark.parametrize("timeout_first", [False, True])
+async def test_result_racing_unconfirmed_is_settled_atomically_and_acked(
+    tmp_path, monkeypatch, timeout_first
+):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
@@ -1892,15 +1970,16 @@ async def test_result_racing_unconfirmed_clears_exact_fence_and_is_acked(tmp_pat
         runtime.sessions["D1"] = session
         waiter = asyncio.get_running_loop().create_future()
         runtime.transfers.register(TransferKey("push", "D1", job_id, 1), waiter)
-        settle = store.settle_result
+        if timeout_first:
+            settle = manager.settle_result
 
-        async def settle_after_timeout(*args, **kwargs):
-            await manager.mark_unconfirmed(
-                job_id, "D1", "process-a", "reconciliation timed out"
-            )
-            return await settle(*args, **kwargs)
+            async def settle_after_timeout(*args, **kwargs):
+                await manager.mark_unconfirmed(
+                    job_id, "D1", "process-a", "reconciliation timed out"
+                )
+                return await settle(*args, **kwargs)
 
-        store.settle_result = settle_after_timeout
+            monkeypatch.setattr(manager, "settle_result", settle_after_timeout)
         await runtime._handle_result(
             "D1",
             {
@@ -1914,9 +1993,27 @@ async def test_result_racing_unconfirmed_clears_exact_fence_and_is_acked(tmp_pat
             owned_session=session,
         )
 
+        if not timeout_first:
+            # The timer may have read this row before the terminal result committed.
+            # Its fenced transition must fail closed after the result wins.
+            with pytest.raises(StoreConflict):
+                await manager.mark_unconfirmed(
+                    job_id, "D1", "process-a", "stale reconciliation timeout"
+                )
+
         after = await store.get_snapshot(job_id)
-        assert after["devices"]["D1"]["state"] == "unconfirmed"
-        assert after["devices"]["D1"]["device_fence"] is None
+        expected_state = "unconfirmed" if timeout_first else "succeeded"
+        device = after["devices"]["D1"]
+        assert device["state"] == expected_state
+        assert device["device_fence"] is None
+        if timeout_first:
+            assert device["failure"]["code"] == "reconciliation_timeout"
+            assert device["result"] == {
+                "added": None, "updated": None, "deleted": None
+            }
+        else:
+            assert device["failure"] is None
+            assert device["result"] == {"added": 1, "updated": 0, "deleted": 0}
         assert waiter.result() == "terminal_result"
         assert ws.messages[-1]["accepted"] is True
         assert ws.messages[-1]["revision"] == after["revision"]
