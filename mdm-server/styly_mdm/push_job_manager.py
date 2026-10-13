@@ -13,6 +13,7 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -38,6 +39,17 @@ NON_TERMINAL_JOB_VALUES = (
     JobState.RUNNING.value,
     JobState.RECONCILING.value,
 )
+
+
+@dataclass(frozen=True)
+class ResultSettlement:
+    """Committed terminal decision and the effects authorized by that decision."""
+
+    accepted: bool
+    reason: str | None
+    revision: int | None
+    snapshots: list[dict[str, Any]]
+    release_transfer: bool = False
 
 
 class PushJobManager:
@@ -959,7 +971,7 @@ class PushJobManager:
                 raise
         return await self.store._call(op)
 
-    async def settle_cancelled_late_result(
+    async def settle_result(
         self,
         job_id: str,
         device_id: str,
@@ -971,86 +983,122 @@ class PushJobManager:
         deleted: int = 0,
         failure_code: str | None = None,
         failure_detail: str | None = None,
-    ) -> tuple[bool, list[dict[str, Any]]]:
-        """Settle an exact terminal result for a cancelled, fenced assignment.
+    ) -> ResultSettlement:
+        """Choose and settle a terminal result against current assignment and fence.
 
-        A success is stronger evidence than the earlier unconfirmed timeout and
-        must remain visible as a success. Other failures retain their exact terminal
-        details; only explicit cancellation-confirmation codes become ``cancelled``.
+        The caller holds the live session's owner lock. All durable evidence is
+        read and changed in one transaction; transport effects happen after commit.
         """
-        if (
-            isinstance(attempt, bool)
-            or attempt != 1
-            or not isinstance(status, str)
-            or status not in {"success", "fail"}
-        ):
-            return False, []
+        if attempt != 1:
+            raise StoreConflict("stale_attempt")
+        if status not in {"success", "fail"}:
+            raise ValueError("status must be success or fail")
 
-        def op(conn: sqlite3.Connection) -> tuple[bool, list[dict[str, Any]]]:
-            self.store._begin(conn)
-            try:
-                assignment = conn.execute(
-                    "SELECT state, attempt, cancel_requested_at FROM push_job_devices "
-                    "WHERE job_id=? AND device_id=?",
-                    (job_id, device_id),
-                ).fetchone()
-                fence = conn.execute(
-                    "SELECT blocking_job_id, blocking_attempt FROM push_device_fences "
-                    "WHERE device_id=?",
-                    (device_id,),
-                ).fetchone()
-                if (
-                    assignment is None
-                    or assignment["state"] != DeviceState.UNCONFIRMED.value
-                    or assignment["attempt"] != attempt
-                    or assignment["cancel_requested_at"] is None
-                    or fence is None
-                    or fence["blocking_job_id"] != job_id
-                    or fence["blocking_attempt"] != attempt
-                ):
-                    self.store._commit(conn)
-                    return False, []
+        def settle(conn: sqlite3.Connection) -> ResultSettlement:
+            matched, snapshots = self._clear_matching_opaque_fence(
+                conn, device_id, job_id, attempt,
+            )
+            if matched:
+                revision = next(
+                    (item["revision"] for item in snapshots if item["job_id"] == job_id),
+                    None,
+                )
+                return ResultSettlement(True, None, revision, snapshots)
 
-                timestamp = now_ms()
-                succeeded = status == "success"
-                cancelled = not succeeded and failure_code in {
-                    "cancelled",
-                    "resume_not_authorized",
-                }
+            row = conn.execute(
+                "SELECT d.*, j.revision AS job_revision FROM push_job_devices d "
+                "JOIN push_jobs j ON j.job_id=d.job_id WHERE d.job_id=? AND d.device_id=?",
+                (job_id, device_id),
+            ).fetchone()
+            if row is None:
+                return ResultSettlement(False, "unknown_job", None, [])
+            if row["attempt"] != attempt:
+                return ResultSettlement(False, "stale_result", None, [])
+            current = DeviceState(row["state"])
+            target = DeviceState.SUCCEEDED if status == "success" else DeviceState.FAILED
+            result_code = failure_code if status == "fail" else None
+            result_detail = failure_detail if status == "fail" else None
+            counts = (added, updated, deleted)
+            cancel_pending = row["cancel_requested_at"] is not None
+            fence = conn.execute(
+                "SELECT * FROM push_device_fences WHERE device_id=?", (device_id,),
+            ).fetchone()
+            exact_fence = (
+                fence is not None and fence["blocking_job_id"] == job_id
+                and fence["blocking_attempt"] == attempt
+            )
+            if current is DeviceState.UNCONFIRMED:
+                if (fence is not None or cancel_pending) and not exact_fence:
+                    return ResultSettlement(False, "stale_result", None, [])
+                if not cancel_pending and fence is None:
+                    return ResultSettlement(
+                        True, None, row["job_revision"], [], release_transfer=True,
+                    )
+                # A late result clears the fence without rewriting timeout history,
+                # except cancellation must retain the actual success/failure outcome.
+            if status == "fail" and cancel_pending and result_code in {
+                "cancelled", "resume_not_authorized",
+            }:
+                result_code = "cancelled"
+                result_detail = "Client confirmed cancelled work is absent"
+                counts = (0, 0, 0)
+            if current in TERMINAL_DEVICE_STATES and current is not DeviceState.UNCONFIRMED:
+                # Success has no failure metadata. Older rows can contain an empty
+                # detail while cancelled late success used NULL; both replay alike.
+                same = (
+                    current is target
+                    and (row["added"], row["updated"], row["deleted"]) == counts
+                    and (
+                        status == "success"
+                        or (row["failure_code"], row["failure_detail"])
+                        == (result_code, result_detail)
+                    )
+                )
+                return ResultSettlement(
+                    same, None if same else "conflicting_terminal_result",
+                    row["job_revision"], [], release_transfer=same,
+                )
+            allowed = {
+                DeviceState.DISPATCHING, DeviceState.DOWNLOADING, DeviceState.VALIDATING,
+                DeviceState.APPLYING, DeviceState.RECONCILING, DeviceState.UNCONFIRMED,
+            }
+            expired_resume = (
+                status == "fail" and (result_code == "resume_expired" or cancel_pending)
+                and row["dispatch_revision"] is not None
+                and current in {DeviceState.QUEUED, DeviceState.WAITING_TRANSFER}
+            )
+            if current not in allowed and not expired_resume:
+                return ResultSettlement(False, "unexpected_result_state", row["job_revision"], [])
+
+            timestamp = now_ms()
+            if current is not DeviceState.UNCONFIRMED or cancel_pending:
                 conn.execute(
                     "UPDATE push_job_devices SET state=?, queue_reason=NULL, updated_at=?, "
                     "terminal_at=?, failure_code=?, failure_detail=?, added=?, updated=?, deleted=?, "
                     "accept_deadline=NULL, reconciliation_reason=NULL, reconciliation_deadline=NULL "
                     "WHERE job_id=? AND device_id=?",
-                    (
-                        DeviceState.SUCCEEDED.value if succeeded else DeviceState.FAILED.value,
-                        timestamp,
-                        timestamp,
-                        None if succeeded else ("cancelled" if cancelled else failure_code),
-                        None if succeeded else (
-                            "Client confirmed cancelled work is absent"
-                            if cancelled
-                            else failure_detail
-                        ),
-                        added if not cancelled else 0,
-                        updated if not cancelled else 0,
-                        deleted if not cancelled else 0,
-                        job_id,
-                        device_id,
-                    ),
+                    (target.value, timestamp, timestamp, result_code, result_detail,
+                     *counts, job_id, device_id),
                 )
-                conn.execute(
-                    "DELETE FROM push_device_fences WHERE device_id=? AND blocking_job_id=? "
-                    "AND blocking_attempt=?",
-                    (device_id, job_id, attempt),
-                )
-                ids = self._visible_job_ids(self.store, conn, device_id, job_id)
-                for affected in ids:
-                    self.store._increment_revision(conn, affected, timestamp)
-                self.store._rederive_job(conn, job_id, timestamp)
-                snapshots = [self.store._snapshot(conn, affected) for affected in ids]
+            ids = (
+                self._visible_job_ids(self.store, conn, device_id, job_id)
+                if exact_fence else [job_id]
+            )
+            if exact_fence:
+                conn.execute("DELETE FROM push_device_fences WHERE device_id=?", (device_id,))
+            for affected in ids:
+                self.store._increment_revision(conn, affected, timestamp)
+            self.store._rederive_job(conn, job_id, timestamp)
+            snapshots = [self.store._snapshot(conn, affected) for affected in ids]
+            revision = next(item["revision"] for item in snapshots if item["job_id"] == job_id)
+            return ResultSettlement(True, None, revision, snapshots, release_transfer=True)
+
+        def op(conn: sqlite3.Connection) -> ResultSettlement:
+            self.store._begin(conn)
+            try:
+                result = settle(conn)
                 self.store._commit(conn)
-                return True, snapshots
+                return result
             except BaseException:
                 self.store._rollback(conn)
                 raise
@@ -1367,114 +1415,52 @@ class PushJobManager:
 
         return await self.store._call(op)
 
-    async def clear_matching_opaque_fence(
-        self,
-        device_id: str,
-        job_id: str,
-        attempt: int,
+    def _clear_matching_opaque_fence(
+        self, conn: sqlite3.Connection, device_id: str, job_id: str, attempt: int,
     ) -> tuple[bool, list[dict[str, Any]]]:
-        """Clear only a canonical opaque job-v1 fence matching exact evidence."""
-
+        """Clear exact opaque evidence inside the caller's transaction."""
         expected = self.canonical_opaque_job_identity(
             {"job_id": job_id, "attempt": attempt}
         )
         if expected is None:
             return False, []
         expected_identity = json.loads(expected)
-
-        def op(conn: sqlite3.Connection) -> tuple[bool, list[dict[str, Any]]]:
-            self.store._begin(conn)
-            try:
-                fence = conn.execute(
-                    "SELECT * FROM push_device_fences WHERE device_id=?",
-                    (device_id,),
-                ).fetchone()
-                if (
-                    fence is None
-                    or fence["blocking_job_id"] is not None
-                    or fence["protocol_mode"] != ProtocolMode.JOB_V1.value
-                ):
-                    self.store._commit(conn)
-                    return False, []
-                stored = self.parse_opaque_job_identity(
-                    fence["blocking_opaque_identity"]
-                )
-                if (
-                    stored is None
-                    or stored["job_id"] != expected_identity["job_id"]
-                    or stored["attempt"] != expected_identity["attempt"]
-                ):
-                    self.store._commit(conn)
-                    return False, []
-                # Capture every snapshot that currently exposes the fence before
-                # deleting it; otherwise a terminal opaque-fence display row could be
-                # omitted from the clear transaction's revision set.
-                ids = self._visible_job_ids(self.store, conn, device_id)
-                conn.execute(
-                    "DELETE FROM push_device_fences WHERE device_id=?", (device_id,)
-                )
-                timestamp = now_ms()
-                for affected in ids:
-                    self.store._increment_revision(conn, affected, timestamp)
-                snapshots = [
-                    self.store._snapshot(conn, affected) for affected in ids
-                ]
-                self.store._commit(conn)
-                return True, snapshots
-            except BaseException:
-                self.store._rollback(conn)
-                raise
-
-        return await self.store._call(op)
-
-    async def settle_late_fenced_result(
-        self, job_id: str, device_id: str, attempt: int
-    ) -> tuple[bool, list[dict[str, Any]]]:
-        if attempt != 1:
+        fence = conn.execute(
+            "SELECT * FROM push_device_fences WHERE device_id=?", (device_id,),
+        ).fetchone()
+        if (
+            fence is None or fence["blocking_job_id"] is not None
+            or fence["protocol_mode"] != ProtocolMode.JOB_V1.value
+        ):
             return False, []
+        stored = self.parse_opaque_job_identity(fence["blocking_opaque_identity"])
+        if (
+            stored is None
+            or stored["job_id"] != expected_identity["job_id"]
+            or stored["attempt"] != expected_identity["attempt"]
+        ):
+            return False, []
+        # Capture the terminal display row before removing its opaque fence.
+        ids = self._visible_job_ids(self.store, conn, device_id)
+        conn.execute("DELETE FROM push_device_fences WHERE device_id=?", (device_id,))
+        timestamp = now_ms()
+        for affected in ids:
+            self.store._increment_revision(conn, affected, timestamp)
+        return True, [self.store._snapshot(conn, affected) for affected in ids]
 
+    async def clear_matching_opaque_fence(
+        self, device_id: str, job_id: str, attempt: int,
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        """Clear only a canonical opaque job-v1 fence matching exact evidence."""
         def op(conn: sqlite3.Connection) -> tuple[bool, list[dict[str, Any]]]:
             self.store._begin(conn)
             try:
-                assignment = conn.execute(
-                    "SELECT state FROM push_job_devices WHERE job_id=? AND device_id=? "
-                    "AND attempt=1",
-                    (job_id, device_id),
-                ).fetchone()
-                fence = conn.execute(
-                    "SELECT * FROM push_device_fences WHERE device_id=?",
-                    (device_id,),
-                ).fetchone()
-                if (
-                    assignment is None
-                    or assignment["state"] != DeviceState.UNCONFIRMED.value
-                ):
-                    self.store._commit(conn)
-                    return False, []
-                if fence is None:
-                    # Exact identity is already terminal and safe evidence cleared
-                    # the fence earlier. ACK without manufacturing a new revision.
-                    snapshot = self.store._snapshot(conn, job_id)
-                    self.store._commit(conn)
-                    return True, [snapshot]
-                if (
-                    fence["blocking_job_id"] != job_id
-                    or fence["blocking_attempt"] != 1
-                ):
-                    self.store._commit(conn)
-                    return False, []
-                conn.execute("DELETE FROM push_device_fences WHERE device_id=?", (device_id,))
-                timestamp = now_ms()
-                ids = self._visible_job_ids(self.store, conn, device_id, job_id)
-                for affected in ids:
-                    self.store._increment_revision(conn, affected, timestamp)
-                snapshots = [self.store._snapshot(conn, affected) for affected in ids]
+                result = self._clear_matching_opaque_fence(conn, device_id, job_id, attempt)
                 self.store._commit(conn)
-                return True, snapshots
+                return result
             except BaseException:
                 self.store._rollback(conn)
                 raise
-
         return await self.store._call(op)
 
     async def reconcile_report(
