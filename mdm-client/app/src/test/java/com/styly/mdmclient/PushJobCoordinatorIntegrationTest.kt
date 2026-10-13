@@ -8,7 +8,6 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 import java.io.IOException
-import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -21,7 +20,7 @@ class PushJobCoordinatorIntegrationTest {
     private val harnesses = CopyOnWriteArrayList<Harness>()
 
     private inner class Harness(
-        initialState: PushProtocol.State = emptyState(),
+        initialState: PushProtocol.State = PushProtocol.State(null, emptyList(), emptyList()),
         retryDelayMs: Long = 10_000L,
         recoveryMaxAttempts: Int = 5,
     ) {
@@ -58,7 +57,7 @@ class PushJobCoordinatorIntegrationTest {
                     })
                     next
                 },
-                emptyState = ::emptyState,
+                emptyState = { PushProtocol.State(null, emptyList(), emptyList()) },
                 execute = { command, callbacks ->
                     workerRuns.incrementAndGet()
                     events.add("worker:start")
@@ -291,21 +290,7 @@ class PushJobCoordinatorIntegrationTest {
         assertTrue("condition was not reached", condition())
     }
 
-    private fun command() = PushProtocol.Command(
-        jobId = UUID.randomUUID().toString(),
-        attempt = PushProtocol.ATTEMPT_V1,
-        artifactId = UUID.randomUUID().toString(),
-        artifactUrl = "http://server/artifact.zip",
-        artifactSize = 42,
-        artifactSha256 = "a".repeat(64),
-        bundleFilename = "bundle.zip",
-        destPath = "/sdcard/STYLY/content",
-        deleteExtras = false,
-        revision = 7L,
-        artifactEtag = "\"etag\"",
-    )
-
-    private fun emptyState() = PushProtocol.State(null, emptyList(), emptyList())
+    private fun command() = pushTestCommand(revision = 7L, artifactEtag = "\"etag\"")
 
     private fun execution(
         command: PushProtocol.Command,
