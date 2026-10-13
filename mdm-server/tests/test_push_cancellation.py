@@ -9,8 +9,7 @@ from styly_mdm.push_job_store import PushJobStore, StoreConflict
 from styly_mdm.push_jobs import DeviceState
 from styly_mdm.push_runtime import PushRuntime
 from styly_mdm.push_scheduler import LiveSession
-from styly_mdm.transfer_registry import TransferRegistry
-from styly_mdm.transfer_registry import TransferKey
+from styly_mdm.transfer_registry import TransferKey, TransferRegistry
 from styly_mdm.push_transfer_leases import PushTransferLeases
 from test_push_review_connection import ready_job, downloading_job, Ws, Scheduler, LegacyEvents
 
@@ -141,7 +140,6 @@ async def test_offline_cancel_rejects_recovered_partial_on_reconnect(manager):
 
 @pytest.mark.asyncio
 async def test_offline_cancel_preserves_fence_and_artifact_until_exact_cleanup(manager, tmp_path):
-    from styly_mdm.push_jobs import DeviceState
     from styly_mdm.push_job_store import now_ms
     active = await downloading_job(manager.store, manager)
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
@@ -175,7 +173,6 @@ async def test_offline_cancel_preserves_fence_and_artifact_until_exact_cleanup(m
 @pytest.mark.asyncio
 @pytest.mark.parametrize('resume_first', [False, True])
 async def test_client_restart_requires_explicit_resume_even_when_job_enabled(manager, resume_first):
-    from styly_mdm.push_jobs import DeviceState
     active = await downloading_job(manager.store, manager)
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=9999999999999)
@@ -223,7 +220,6 @@ async def test_late_absent_cannot_rewrite_completed_terminal_result(manager):
 
 @pytest.mark.asyncio
 async def test_cancelled_reconciling_assignment_ignores_late_phase_and_completion(manager):
-    from styly_mdm.push_jobs import DeviceState
     active = await downloading_job(manager.store, manager)
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=9999999999999)
@@ -250,8 +246,6 @@ async def test_cancelled_reconciling_assignment_ignores_late_phase_and_completio
 async def test_cancelled_late_result_racing_timeout_is_settled_with_exact_fence(
     manager, status, failure_code, expected_state
 ):
-    from styly_mdm.push_jobs import DeviceState
-
     active = await downloading_job(manager.store, manager)
     job_id = active['job_id']
     await manager.mark_reconciling(
@@ -326,7 +320,6 @@ async def test_validation_phase_releases_slot_before_verified_completion(manager
 
 @pytest.mark.asyncio
 async def test_exact_verified_completion_recovers_reconciling_state(manager):
-    from styly_mdm.push_jobs import DeviceState
     active = await downloading_job(manager.store, manager)
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='transfer_stalled', deadline=9999999999999)
@@ -340,7 +333,6 @@ async def test_exact_verified_completion_recovers_reconciling_state(manager):
 
 @pytest.mark.asyncio
 async def test_success_after_cancelled_absence_was_missed_settles_exact_result(manager):
-    from styly_mdm.push_jobs import DeviceState
     active = await downloading_job(manager.store, manager)
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=1)

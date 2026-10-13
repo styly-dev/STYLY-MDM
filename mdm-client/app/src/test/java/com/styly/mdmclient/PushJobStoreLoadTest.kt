@@ -75,46 +75,26 @@ class PushJobStoreLoadTest {
     }
 
     @Test
-    fun malformedActiveStateIsNotSanitizedIntoAuthoritativeAbsence() {
-        val result = loadPushState(
-            readText = {
-                "{\"active\":{\"phase\":\"downloading\"}," +
-                    "\"pending_results\":[],\"completed_receipts\":[]}"
-            },
-            normalize = { it },
-            fileExists = { true },
+    fun malformedActiveStateDoesNotBecomeAuthoritativeAbsence() {
+        val cases = listOf(
+            "active object missing command" to "{\"active\":{\"phase\":\"downloading\"},",
+            "active has wrong type" to "{\"active\":\"broken\",",
         )
-
-        assertTrue(result is PushStateLoadResult.Corrupt)
-    }
-
-    @Test
-    fun wrongTypedActiveStateIsNotTreatedAsNull() {
-        val result = loadPushState(
-            readText = {
-                "{\"active\":\"broken\"," +
-                    "\"pending_results\":[],\"completed_receipts\":[]}"
-            },
-            normalize = { it },
-            fileExists = { true },
-        )
-
-        assertTrue(result is PushStateLoadResult.Corrupt)
+        for ((label, prefix) in cases) {
+            val json = prefix + "\"pending_results\":[],\"completed_receipts\":[]}"
+            val result = loadPushState({ json }, { it }, { true })
+            assertTrue(label, result is PushStateLoadResult.Corrupt)
+        }
     }
 
     @Test
     fun invalidReceiptDoesNotAuthorizeDiscardingValidActiveAndResults() {
-        val command = PushProtocol.Command(
+        val command = pushTestCommand(
             jobId = "12345678-1234-4234-8234-123456789abc",
-            attempt = 1,
             artifactId = "87654321-4321-4321-8321-cba987654321",
-            artifactUrl = "http://server/artifact.zip",
-            artifactSize = 10,
-            artifactSha256 = "a".repeat(64),
+            artifactSize = 10L,
             bundleFilename = "content.zip",
-            destPath = "/sdcard/STYLY/content",
-            deleteExtras = false,
-            revision = 7,
+            revision = 7L,
         )
         val receipt = PushProtocol.Receipt(
             command,

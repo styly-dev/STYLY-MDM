@@ -15,6 +15,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
+import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.security.MessageDigest
 import java.util.UUID
@@ -73,7 +74,7 @@ class PushFilesWorkerTest {
     fun `more than six transient failures can recover inside the idle window`() {
         val archive = zip("content.txt" to "after-seven-retries").readBytes()
         var now = 0L
-        RetryServer(archive, transientFailures = 7).use { server ->
+        retryServer(archive, failures = 7).use { server ->
             val result = PushFilesWorker(
                 { true }, { File(tmp.root, "seven-work") }, { File(tmp.root, "seven-dest") },
                 retryDelay = { now += it }, monotonicMillis = { now },
@@ -82,7 +83,7 @@ class PushFilesWorkerTest {
                 PushFilesWorker.Callbacks({}, {}, {}),
             )
             assertEquals("success", result.result.status)
-            assertEquals(8, server.requestCount)
+            assertEquals(8, server.requests.size)
             assertTrue(now < 60_000L)
         }
     }
@@ -164,15 +165,13 @@ class PushFilesWorkerTest {
             status = 409,
             headers = "X-Push-Lease-Status: revoked\r\nContent-Length: 0",
         ).use { server ->
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
+            val execution = worker(
+                work,
                 retryDelay = { delay -> retryCount++; now += delay },
                 monotonicMillis = { now },
-                noProgressTimeoutMs = 60_000L,
             ).execute(
                 command.copy(artifactUrl = server.url),
-                PushFilesWorker.Callbacks({}, {}, {}),
+                workerCallbacks(),
             )
 
             assertEquals("fail", execution.result.status)
@@ -200,13 +199,12 @@ class PushFilesWorkerTest {
 
         // No ETag: the status must be classified before any validator check.
         OneShotServer(status = 403, headers = "Content-Length: 0").use { server ->
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
+            val execution = worker(
+                work,
                 retryDelay = { retryCount++ },
             ).execute(
                 command.copy(artifactUrl = server.url),
-                PushFilesWorker.Callbacks({}, {}, {}),
+                workerCallbacks(),
             )
 
             assertEquals("download_failed", execution.result.failureCode)
@@ -225,9 +223,8 @@ class PushFilesWorkerTest {
         var retryCount = 0
 
         OneShotServer(status = 401, headers = "Content-Length: 0").use { server ->
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
+            val execution = worker(
+                work,
                 retryDelay = { retryCount++ },
             ).execute(
                 command(
@@ -235,7 +232,7 @@ class PushFilesWorkerTest {
                     artifactSize = archive.size.toLong(),
                     artifactSha256 = sha256(archive),
                 ).copy(revision = 7L),
-                PushFilesWorker.Callbacks({}, {}, {}),
+                workerCallbacks(),
             )
 
             assertEquals("fail", execution.result.status)
@@ -252,12 +249,10 @@ class PushFilesWorkerTest {
         val destination = tmp.newFolder("backoff-reset-destination")
         val work = File(tmp.root, "backoff-reset-work")
         val delays = mutableListOf<Long>()
-        fun response(head: String, body: ByteArray = byteArrayOf()) =
-            head.toByteArray(Charsets.US_ASCII) to body
         val unavailable = response("HTTP/1.1 503 Retry\r\nContent-Length: 0\r\n")
         val remaining = archive.copyOfRange(split, archive.size)
 
-        ScriptedServer(
+        TestHttpServer(
             listOf(
                 unavailable,
                 unavailable,
@@ -294,32 +289,6 @@ class PushFilesWorkerTest {
             assertEquals("success", execution.result.status)
             assertEquals(listOf(1_000L, 2_000L, 4_000L, 8_000L, 1_000L, 2_000L), delays)
             assertEquals("backoff-reset", File(destination, "content.txt").readText())
-        }
-    }
-
-    /** Serves one scripted response (headers without the blank line, then body) per connection. */
-    private class ScriptedServer(
-        private val responses: List<Pair<ByteArray, ByteArray>>,
-    ) : AutoCloseable {
-        private val server = ServerSocket(0, responses.size, InetAddress.getLoopbackAddress())
-        val url = "http://127.0.0.1:${server.localPort}/artifact.zip"
-        private val thread = Thread({
-            responses.forEach { (head, body) ->
-                server.accept().use { client ->
-                    val reader = client.getInputStream().bufferedReader(Charsets.US_ASCII)
-                    while (reader.readLine()?.isNotEmpty() == true) Unit
-                    val output = client.getOutputStream()
-                    output.write(head)
-                    output.write("Connection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
-                    output.write(body)
-                    output.flush()
-                }
-            }
-        }, "push-worker-scripted-test-http").apply { start() }
-
-        override fun close() {
-            server.close()
-            thread.join(5_000)
         }
     }
 
@@ -414,12 +383,12 @@ class PushFilesWorkerTest {
         }.apply { start() }
         val started = System.nanoTime()
         try {
-            val result = PushFilesWorker(
-                { true }, { File(tmp.root, "slow-work") }, { File(tmp.root, "slow-dest") },
+            val result = worker(
+                File(tmp.root, "slow-work"), { File(tmp.root, "slow-dest") },
                 noProgressTimeoutMs = 500L,
             ).execute(command(artifactUrl = "http://127.0.0.1:${server.localPort}/artifact.zip",
                 artifactSize = archive.size.toLong(), artifactSha256 = sha256(archive)).copy(revision = 1L),
-                PushFilesWorker.Callbacks({}, {}, {}))
+                workerCallbacks())
             val elapsed = (System.nanoTime() - started) / 1_000_000L
             assertEquals("success", result.result.status)
             assertTrue("Progressing download took ${elapsed}ms", elapsed in 700L..3_000L)
@@ -446,10 +415,10 @@ class PushFilesWorkerTest {
         }.apply { start() }
         val started = System.nanoTime()
         try {
-            val result = PushFilesWorker(
-                { true }, { File(tmp.root, "stalled-$sendHeaders") }, noProgressTimeoutMs = 250L,
+            val result = worker(
+                File(tmp.root, "stalled-$sendHeaders"), noProgressTimeoutMs = 250L,
             ).execute(command(artifactUrl = "http://127.0.0.1:${server.localPort}/artifact.zip").copy(revision = 1L),
-                PushFilesWorker.Callbacks({}, {}, {}))
+                workerCallbacks())
             return result to (System.nanoTime() - started) / 1_000_000L
         } finally {
             release.countDown()
@@ -486,18 +455,44 @@ class PushFilesWorkerTest {
         artifactUrl: String = "http://server/artifacts/value",
         artifactSize: Long? = 42,
         artifactSha256: String? = "a".repeat(64),
-    ) = PushProtocol.Command(
+    ) = pushTestCommand(
         jobId = jobId,
-        attempt = PushProtocol.ATTEMPT_V1,
         artifactId = artifactId,
         artifactUrl = artifactUrl,
         artifactSize = artifactSize,
         artifactSha256 = artifactSha256,
-        bundleFilename = "bundle.zip",
-        destPath = "/sdcard/STYLY/content",
-        deleteExtras = false,
         revision = 7L,
         artifactEtag = "\"v1\"",
+    )
+
+    private fun worker(
+        work: File,
+        destinationProvider: ((String) -> File)? = null,
+        retryDelay: (Long) -> Unit = { Thread.sleep(it) },
+        monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000L },
+        noProgressTimeoutMs: Long = PushFilesWorker.DOWNLOAD_NO_PROGRESS_TIMEOUT_MS,
+        digestFactory: (File) -> PartialFileDigest = ::PartialFileDigest,
+    ) = PushFilesWorker(
+        hasExternalStorageAccess = { true },
+        attemptDirectoryProvider = { work },
+        destinationProvider = destinationProvider,
+        retryDelay = retryDelay,
+        monotonicMillis = monotonicMillis,
+        noProgressTimeoutMs = noProgressTimeoutMs,
+        digestFactory = digestFactory,
+    )
+
+    private fun workerCallbacks(
+        events: MutableList<String>? = null,
+        onTransferComplete: (Long) -> Unit = { events?.add("transfer") },
+        onValidated: () -> Unit = { events?.add("validated") },
+        onApplying: () -> Unit = { events?.add("applying") },
+        onValidationStart: () -> Unit = { events?.add("validation_start") },
+    ) = PushFilesWorker.Callbacks(
+        onTransferComplete = onTransferComplete,
+        onValidated = onValidated,
+        onApplying = onApplying,
+        onValidationStart = onValidationStart,
     )
 
     private fun sha256(bytes: ByteArray): String =
@@ -593,76 +588,66 @@ class PushFilesWorkerTest {
         body = content,
     )
 
-    private class OneShotServer(
-        private val status: Int,
-        private val headers: String,
-        private val body: ByteArray = byteArrayOf(),
+    private fun OneShotServer(
+        status: Int,
+        headers: String,
+        body: ByteArray = byteArrayOf(),
+    ) = TestHttpServer(
+        listOf(response("HTTP/1.1 $status Test\r\n$headers", body)),
+    )
+
+    private fun retryServer(content: ByteArray, failures: Int) = TestHttpServer(
+        buildList {
+            repeat(failures) {
+                add(response("HTTP/1.1 503 Retry\r\nContent-Length: 0"))
+            }
+            add(
+                response(
+                    "HTTP/1.1 200 OK\r\nContent-Length: ${content.size}\r\nETag: \"v1\"",
+                    content,
+                ),
+            )
+        },
+    )
+
+    private fun response(head: String, body: ByteArray = byteArrayOf()) =
+        head.trimEnd('\r', '\n').toByteArray(Charsets.US_ASCII) to body
+
+    private class TestHttpServer(
+        private val responses: List<Pair<ByteArray, ByteArray>>,
     ) : AutoCloseable {
-        private val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
+        private val server = ServerSocket(0, responses.size, InetAddress.getLoopbackAddress())
         val url = "http://127.0.0.1:${server.localPort}/artifact.zip"
-        @Volatile var request = ""
+        val requests = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val request: String get() = requests.firstOrNull().orEmpty()
         @Volatile var responseBytesWritten = 0
-        private val thread = Thread({
-            server.accept().use { client ->
-                val reader = client.getInputStream().bufferedReader(Charsets.US_ASCII)
-                val lines = buildList {
-                    while (true) {
-                        val line = reader.readLine() ?: break
-                        if (line.isEmpty()) break
-                        add(line)
-                    }
-                }
-                request = lines.joinToString("\n")
-                client.getOutputStream().use { output ->
-                    output.write(("HTTP/1.1 $status Test\r\n$headers\r\nConnection: close\r\n\r\n")
-                        .toByteArray(Charsets.US_ASCII))
-                    output.write(body)
-                    output.flush()
-                    responseBytesWritten = body.size
-                }
-            }
-        }, "push-worker-resume-test-http").apply { start() }
+            private set
 
-        override fun close() {
-            server.close()
-            thread.join(5_000)
-        }
-    }
-
-    private class RetryServer(
-        private val content: ByteArray,
-        private val transientFailures: Int,
-    ) : AutoCloseable {
-        private val server = ServerSocket(0, transientFailures + 1, InetAddress.getLoopbackAddress())
-        val url = "http://127.0.0.1:${server.localPort}/artifact.zip"
-        @Volatile var requestCount = 0
         private val thread = Thread({
-            repeat(transientFailures + 1) { index ->
-                server.accept().use { client ->
-                    val reader = client.getInputStream().bufferedReader(Charsets.US_ASCII)
-                    while (reader.readLine()?.isNotEmpty() == true) Unit
-                    requestCount++
-                    client.getOutputStream().use { output ->
-                        if (index < transientFailures) {
-                            output.write(
-                                "HTTP/1.1 503 Retry\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                                    .toByteArray(Charsets.US_ASCII),
-                            )
-                        } else {
-                            output.write(
-                                ("HTTP/1.1 200 OK\r\n" +
-                                    "Content-Length: ${content.size}\r\n" +
-                                    "ETag: \"v1\"\r\n" +
-                                    "Connection: close\r\n\r\n")
-                                    .toByteArray(Charsets.US_ASCII),
-                            )
-                            output.write(content)
+            try {
+                responses.forEach { (head, body) ->
+                    server.accept().use { client ->
+                        val reader = client.getInputStream().bufferedReader(Charsets.US_ASCII)
+                        requests += buildList {
+                            while (true) {
+                                val line = reader.readLine() ?: break
+                                if (line.isEmpty()) break
+                                add(line)
+                            }
+                        }.joinToString("\n")
+                        client.getOutputStream().use { output ->
+                            output.write(head)
+                            output.write("\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                            output.write(body)
+                            output.flush()
+                            responseBytesWritten += body.size
                         }
-                        output.flush()
                     }
                 }
+            } catch (error: SocketException) {
+                if (!server.isClosed) throw error
             }
-        }, "push-worker-retry-test-http").apply { start() }
+        }, "push-worker-test-http").apply { start() }
 
         override fun close() {
             server.close()
@@ -707,22 +692,13 @@ class PushFilesWorkerTest {
         val callbacks = mutableListOf<String>()
 
         artifactServer(archive).use { server ->
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-                destinationProvider = { destination },
-            ).execute(
+            val execution = worker(work, { destination }).execute(
                 command(
                     artifactUrl = server.url,
                     artifactSize = archive.size.toLong(),
                     artifactSha256 = sha256(archive).uppercase(),
                 ),
-                PushFilesWorker.Callbacks(
-                    onTransferComplete = { callbacks += "transfer" },
-                    onValidated = { callbacks += "validated" },
-                    onApplying = { callbacks += "applying" },
-                    onValidationStart = { callbacks += "validation_start" },
-                ),
+                workerCallbacks(callbacks),
             )
 
             assertEquals("success", execution.result.status)
@@ -749,11 +725,7 @@ class PushFilesWorkerTest {
                 artifactSha256 = sha256(archive),
             )
             seedResume(work, command, archive.copyOfRange(0, split))
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-                destinationProvider = { destination },
-            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+            val execution = worker(work, { destination }).execute(command, workerCallbacks())
             assertEquals("success", execution.result.status)
             assertTrue(server.request.contains("Range: bytes=$split-"))
             assertTrue(server.request.contains("If-Match: \"v1\""))
@@ -782,11 +754,7 @@ class PushFilesWorkerTest {
             body = remaining,
         ).use { server ->
             val command = oldCommand.copy(artifactUrl = server.url)
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-                destinationProvider = { destination },
-            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+            val execution = worker(work, { destination }).execute(command, workerCallbacks())
 
             assertEquals("success", execution.result.status)
             assertTrue(server.request.contains("Range: bytes=$split-"))
@@ -803,11 +771,10 @@ class PushFilesWorkerTest {
         val work = File(tmp.root, "retry-work")
         val delays = mutableListOf<Long>()
 
-        RetryServer(archive, transientFailures = 3).use { server ->
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-                destinationProvider = { destination },
+        retryServer(archive, failures = 3).use { server ->
+            val execution = worker(
+                work,
+                { destination },
                 retryDelay = { delay -> delays += delay },
             ).execute(
                 command(
@@ -815,11 +782,11 @@ class PushFilesWorkerTest {
                     artifactSize = archive.size.toLong(),
                     artifactSha256 = sha256(archive),
                 ),
-                PushFilesWorker.Callbacks({}, {}, {}),
+                workerCallbacks(),
             )
 
             assertEquals("success", execution.result.status)
-            assertEquals(4, server.requestCount)
+            assertEquals(4, server.requests.size)
             assertEquals(listOf(1_000L, 2_000L, 4_000L), delays)
             assertEquals("retried", File(destination, "content.txt").readText())
         }
@@ -835,11 +802,20 @@ class PushFilesWorkerTest {
         val destination = tmp.newFolder("digest-retry-destination")
         val digests = mutableListOf<PartialFileDigest>()
 
-        TruncatingServer(archive, split).use { server ->
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { File(tmp.root, "digest-retry-work") },
-                destinationProvider = { destination },
+        TestHttpServer(
+            listOf(
+                response("HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nContent-Length: ${archive.size}", archive.copyOfRange(0, split)),
+                response(
+                    "HTTP/1.1 206 Partial Content\r\nETag: \"v1\"\r\n" +
+                        "Content-Range: bytes $split-${archive.lastIndex}/${archive.size}\r\n" +
+                        "Content-Length: ${archive.size - split}",
+                    archive.copyOfRange(split, archive.size),
+                ),
+            ),
+        ).use { server ->
+            val execution = worker(
+                File(tmp.root, "digest-retry-work"),
+                { destination },
                 retryDelay = {},
                 digestFactory = { file -> PartialFileDigest(file).also { digests += it } },
             ).execute(
@@ -848,63 +824,15 @@ class PushFilesWorkerTest {
                     artifactSize = archive.size.toLong(),
                     artifactSha256 = sha256(archive),
                 ),
-                PushFilesWorker.Callbacks({}, {}, {}),
+                workerCallbacks(),
             )
 
             assertEquals("success", execution.result.status)
-            assertTrue(server.secondRequest.contains("Range: bytes=$split-"))
+            assertTrue(server.requests[1].contains("Range: bytes=$split-"))
             assertEquals(archive.size, server.responseBytesWritten)
             assertEquals(1, digests.size)
             assertEquals(0L, digests.single().rehashedBytes)
             assertEquals(content, File(destination, "content.txt").readText())
-        }
-    }
-
-    /** Drops the first full response after [split] bytes, then serves the exact remainder. */
-    private class TruncatingServer(
-        private val content: ByteArray,
-        private val split: Int,
-    ) : AutoCloseable {
-        private val server = ServerSocket(0, 2, InetAddress.getLoopbackAddress())
-        val url = "http://127.0.0.1:${server.localPort}/artifact.zip"
-        @Volatile var secondRequest = ""
-        @Volatile var responseBytesWritten = 0
-        private val thread = Thread({
-            repeat(2) { index ->
-                server.accept().use { client ->
-                    val reader = client.getInputStream().bufferedReader(Charsets.US_ASCII)
-                    val request = buildList {
-                        while (true) {
-                            val line = reader.readLine() ?: break
-                            if (line.isEmpty()) break
-                            add(line)
-                        }
-                    }.joinToString("\n")
-                    val output = client.getOutputStream()
-                    if (index == 0) {
-                        output.write(("HTTP/1.1 200 OK\r\nETag: \"v1\"\r\n" +
-                            "Content-Length: ${content.size}\r\nConnection: close\r\n\r\n")
-                            .toByteArray(Charsets.US_ASCII))
-                        output.write(content, 0, split)
-                        responseBytesWritten += split
-                    } else {
-                        secondRequest = request
-                        val remaining = content.size - split
-                        output.write(("HTTP/1.1 206 Partial Content\r\nETag: \"v1\"\r\n" +
-                            "Content-Range: bytes $split-${content.lastIndex}/${content.size}\r\n" +
-                            "Content-Length: $remaining\r\nConnection: close\r\n\r\n")
-                            .toByteArray(Charsets.US_ASCII))
-                        output.write(content, split, remaining)
-                        responseBytesWritten += remaining
-                    }
-                    output.flush()
-                }
-            }
-        }, "push-worker-truncating-test-http").apply { start() }
-
-        override fun close() {
-            server.close()
-            thread.join(5_000)
         }
     }
 
@@ -933,11 +861,7 @@ class PushFilesWorkerTest {
             metadata.put("retention_deadline", System.currentTimeMillis() - 1)
             File(work, "metadata.json").writeText(metadata.toString())
 
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-                destinationProvider = { destination },
-            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+            val execution = worker(work, { destination }).execute(command, workerCallbacks())
 
             assertEquals("success", execution.result.status)
             assertTrue(server.request.contains("Range: bytes=$split-"))
@@ -954,20 +878,19 @@ class PushFilesWorkerTest {
         val delays = mutableListOf<Long>()
         var now = 0L
 
-        RetryServer(archive, transientFailures = 10).use { unavailable ->
+        retryServer(archive, failures = 10).use { unavailable ->
             val command = command(
                 artifactUrl = unavailable.url,
                 artifactSize = archive.size.toLong(),
                 artifactSha256 = sha256(archive),
             ).copy(revision = 7L)
             seedResume(work, command, archive.copyOfRange(0, split))
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-                destinationProvider = { destination },
+            val execution = worker(
+                work,
+                { destination },
                 retryDelay = { delay -> delays += delay; now += delay },
                 monotonicMillis = { now },
-            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+            ).execute(command, workerCallbacks())
 
             assertEquals("fail", execution.result.status)
             assertEquals("download_failed", execution.result.failureCode)
@@ -994,11 +917,7 @@ class PushFilesWorkerTest {
                 jobId = original.getString("job_id"),
                 artifactId = original.getString("artifact_id"),
             ).also { exact ->
-                val execution = PushFilesWorker(
-                    hasExternalStorageAccess = { true },
-                    attemptDirectoryProvider = { work },
-                    destinationProvider = { destination },
-                ).execute(exact, PushFilesWorker.Callbacks({}, {}, {}))
+                val execution = worker(work, { destination }).execute(exact, workerCallbacks())
                 assertEquals("success", execution.result.status)
             }
             assertTrue(resumed.request.contains("Range: bytes=$split-"))
@@ -1020,18 +939,12 @@ class PushFilesWorkerTest {
                 artifactSha256 = sha256(archive),
             )
             seedResume(work, command, archive)
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-                destinationProvider = { destination },
+            val execution = worker(
+                work,
+                { destination },
                 noProgressTimeoutMs = 250L,
                 digestFactory = { file -> PartialFileDigest(file).also { digests += it } },
-            ).execute(command, PushFilesWorker.Callbacks(
-                onTransferComplete = { callbacks += "transfer" },
-                onValidated = { callbacks += "validated" },
-                onApplying = { callbacks += "applying" },
-                onValidationStart = { callbacks += "validation_start" },
-            ))
+            ).execute(command, workerCallbacks(callbacks))
 
             assertEquals("success", execution.result.status)
             assertNull(execution.interruptionReason)
@@ -1055,15 +968,10 @@ class PushFilesWorkerTest {
             artifactSha256 = sha256(archive),
         )
         seedResume(work, command, archive.clone().apply { this[lastIndex] = (this[lastIndex].toInt() xor 1).toByte() })
-        val execution = PushFilesWorker(
-            { true }, { work },
+        val execution = worker(
+            work,
             monotonicMillis = { error("A complete partial must not start an HTTP deadline") },
-        ).execute(command, PushFilesWorker.Callbacks(
-            onTransferComplete = { callbacks += "transfer" },
-            onValidated = { callbacks += "validated" },
-            onApplying = { callbacks += "applying" },
-            onValidationStart = { callbacks += "validation_start" },
-        ))
+        ).execute(command, workerCallbacks(callbacks))
 
         assertEquals("artifact_identity_mismatch", execution.result.failureCode)
         assertNull(execution.interruptionReason)
@@ -1091,18 +999,13 @@ class PushFilesWorkerTest {
                     artifactSize = archive.size.toLong(),
                     artifactSha256 = sha256(archive),
                 )
-                val execution = PushFilesWorker(
-                    { true }, { work }, { destination },
+                val execution = worker(
+                    work, { destination },
                     monotonicMillis = {
                         if (File(work, "artifact.part").length() == archive.size.toLong()) 60_000L else 0L
                     },
                     retryDelay = { delays += it },
-                ).execute(command, PushFilesWorker.Callbacks(
-                    onTransferComplete = { callbacks += "transfer" },
-                    onValidated = { callbacks += "validated" },
-                    onApplying = { callbacks += "applying" },
-                    onValidationStart = { callbacks += "validation_start" },
-                ))
+                ).execute(command, workerCallbacks(callbacks))
 
                 assertNull(execution.interruptionReason)
                 assertTrue(delays.isEmpty())
@@ -1130,18 +1033,13 @@ class PushFilesWorkerTest {
         val callbacks = mutableListOf<String>()
         val delays = mutableListOf<Long>()
         OneShotServer(200, "ETag: \"v1\"\r\nContent-Length: ${archive.size}", prefix).use { server ->
-            val execution = PushFilesWorker(
-                { true }, { work }, { tmp.newFolder("incomplete-at-expiry-destination") },
+            val execution = worker(
+                work, { tmp.newFolder("incomplete-at-expiry-destination") },
                 monotonicMillis = { if (File(work, "artifact.part").length() > 0L) 60_000L else 0L },
                 retryDelay = { delays += it },
             ).execute(
                 command(artifactUrl = server.url, artifactSize = archive.size.toLong(), artifactSha256 = sha256(archive)),
-                PushFilesWorker.Callbacks(
-                    onTransferComplete = { callbacks += "transfer" },
-                    onValidated = { callbacks += "validated" },
-                    onApplying = { callbacks += "applying" },
-                    onValidationStart = { callbacks += "validation_start" },
-                ),
+                workerCallbacks(callbacks),
             )
             assertEquals("download_interrupted", execution.interruptionReason)
             assertTrue(callbacks.isEmpty())
@@ -1164,16 +1062,9 @@ class PushFilesWorkerTest {
             }
             val framed = (body.size.toString(16) + "\r\n").toByteArray() + body + "\r\ninvalid-chunk\r\n".toByteArray()
             OneShotServer(200, "ETag: \"v1\"\r\nTransfer-Encoding: chunked", framed).use { server ->
-                val execution = PushFilesWorker(
-                    { true }, { work }, { destination }, retryDelay = { delays += it },
-                ).execute(
+                val execution = worker(work, { destination }, retryDelay = { delays += it }).execute(
                     command(artifactUrl = server.url, artifactSize = archive.size.toLong(), artifactSha256 = sha256(archive)),
-                    PushFilesWorker.Callbacks(
-                        onTransferComplete = { callbacks += "transfer" },
-                        onValidated = { callbacks += "validated" },
-                        onApplying = { callbacks += "applying" },
-                        onValidationStart = { callbacks += "validation_start" },
-                    ),
+                    workerCallbacks(callbacks),
                 )
 
                 assertTrue(delays.isEmpty())
@@ -1205,41 +1096,12 @@ class PushFilesWorkerTest {
                 artifactSha256 = sha256(archive),
             )
             seedResume(work, command.copy(revision = command.revision + 1), archive)
-            val execution = PushFilesWorker({ true }, { work }, { destination })
-                .execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+            val execution = worker(work, { destination }).execute(command, workerCallbacks())
 
             assertEquals("success", execution.result.status)
             assertTrue(server.request.contains("GET /artifact.zip"))
             assertFalse(server.request.contains("Range:"))
             assertEquals("fresh-assignment", File(destination, "content.txt").readText())
-        }
-    }
-
-    @Test
-    fun `inconsistent 416 response retains a non-complete local artifact`() {
-        val archive = zip("content.txt" to "incomplete-416").readBytes()
-        val split = archive.size / 2
-        val work = File(tmp.root, "incomplete-416-work")
-        OneShotServer(
-            status = 416,
-            headers = "ETag: \"v1\"\r\nContent-Range: bytes */${archive.size}\r\nContent-Length: 0",
-        ).use { server ->
-            val command = command(
-                artifactUrl = server.url,
-                artifactSize = archive.size.toLong(),
-                artifactSha256 = sha256(archive),
-            ).copy(revision = 7L)
-            seedResume(work, command, archive.copyOfRange(0, split))
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
-
-            assertEquals("fail", execution.result.status)
-            assertEquals("download_failed", execution.result.failureCode)
-            assertNotNull(execution.interruptionReason)
-            assertEquals("download_interrupted", execution.interruptionReason)
-            assertArrayEquals(archive.copyOfRange(0, split), File(work, "artifact.part").readBytes())
         }
     }
 
@@ -1260,10 +1122,7 @@ class PushFilesWorkerTest {
                 artifactSha256 = sha256(archive),
             ).copy(revision = 7L)
             seedResume(work, command, archive.copyOfRange(0, split))
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+            val execution = worker(work).execute(command, workerCallbacks())
 
             assertEquals("fail", execution.result.status)
             assertEquals("artifact_identity_mismatch", execution.result.failureCode)
@@ -1286,11 +1145,7 @@ class PushFilesWorkerTest {
         File(work, "artifact.part").delete()
         File(work, "artifact.zip").writeBytes(archive)
 
-        val execution = PushFilesWorker(
-            hasExternalStorageAccess = { true },
-            attemptDirectoryProvider = { work },
-            destinationProvider = { destination },
-        ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+        val execution = worker(work, { destination }).execute(command, workerCallbacks())
 
         assertEquals("success", execution.result.status)
         assertEquals("already-complete", File(destination, "content.txt").readText())
@@ -1313,11 +1168,7 @@ class PushFilesWorkerTest {
                 artifactSha256 = sha256(archive),
             )
             seedResume(work, command, archive.copyOfRange(0, split))
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-                destinationProvider = { destination },
-            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+            val execution = worker(work, { destination }).execute(command, workerCallbacks())
 
             assertEquals("success", execution.result.status)
             assertTrue(server.request.contains("Range: bytes=$split-"))
@@ -1337,10 +1188,7 @@ class PushFilesWorkerTest {
                 artifactSha256 = sha256(archive),
             ).copy(revision = 7L)
             seedResume(work, command, archive.copyOfRange(0, split))
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+            val execution = worker(work).execute(command, workerCallbacks())
 
             assertEquals("fail", execution.result.status)
             assertEquals("artifact_identity_mismatch", execution.result.failureCode)
@@ -1384,70 +1232,7 @@ class PushFilesWorkerTest {
     }
 
     @Test
-    fun `malformed content range interrupts and retains the partial`() {
-        val archive = zip("content.txt" to "range-invalid").readBytes()
-        val split = archive.size / 2
-        val remaining = archive.copyOfRange(split, archive.size)
-        val work = File(tmp.root, "malformed-range-work")
-        OneShotServer(
-            status = 206,
-            headers = "ETag: \"v1\"\r\nContent-Range: bytes invalid\r\nContent-Length: ${remaining.size}",
-            body = remaining,
-        ).use { server ->
-            val command = command(
-                artifactUrl = server.url,
-                artifactSize = archive.size.toLong(),
-                artifactSha256 = sha256(archive),
-            ).copy(revision = 7L)
-            seedResume(work, command, archive.copyOfRange(0, split))
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
-
-            assertEquals("fail", execution.result.status)
-            assertEquals("download_failed", execution.result.failureCode)
-            assertNotNull(execution.interruptionReason)
-            assertEquals("download_interrupted", execution.interruptionReason)
-            assertArrayEquals(archive.copyOfRange(0, split), File(work, "artifact.part").readBytes())
-        }
-    }
-
-    @Test
-    fun `content range ending at or beyond total interrupts before append`() {
-        val archive = zip("content.txt" to "range-end-overflow").readBytes()
-        val split = archive.size / 2
-        val remaining = archive.copyOfRange(split, archive.size)
-        val malformedBody = remaining + byteArrayOf(0)
-        val work = File(tmp.root, "range-end-overflow-work")
-        val retryDelays = mutableListOf<Long>()
-        OneShotServer(
-            status = 206,
-            headers = "ETag: \"v1\"\r\nContent-Range: bytes $split-${archive.size}/${archive.size}\r\nContent-Length: ${malformedBody.size}",
-            body = malformedBody,
-        ).use { server ->
-            val command = command(
-                artifactUrl = server.url,
-                artifactSize = archive.size.toLong(),
-                artifactSha256 = sha256(archive),
-            ).copy(revision = 7L)
-            seedResume(work, command, archive.copyOfRange(0, split))
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-                retryDelay = { index -> retryDelays += index },
-            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
-
-            assertEquals("download_failed", execution.result.failureCode)
-            assertNotNull(execution.interruptionReason)
-            assertEquals("download_interrupted", execution.interruptionReason)
-            assertArrayEquals(archive.copyOfRange(0, split), File(work, "artifact.part").readBytes())
-            assertTrue(retryDelays.isEmpty())
-        }
-    }
-
-    @Test
-    fun `invalid resume headers keep the exact prefix and require manual resume`() {
+    fun `invalid resume responses retain the exact prefix and require manual resume`() {
         val archive = zip("content.txt" to "invalid-response-headers").readBytes()
         val split = archive.size / 2
         val prefix = archive.copyOfRange(0, split)
@@ -1455,26 +1240,42 @@ class PushFilesWorkerTest {
         val etag = "ETag: \"v1\""
         val range = "Content-Range: bytes $split-${archive.lastIndex}/${archive.size}"
         val length = "Content-Length: ${remaining.size}"
-        val responses = listOf(
-            206 to "$range\r\n$length",
-            206 to "ETag: W/\"v1\"\r\n$range\r\n$length",
-            206 to "$etag\r\n$range\r\n$length\r\nContent-Encoding: gzip",
-            206 to "$etag\r\n$range",
-            206 to "$etag\r\n$range\r\nContent-Length: ${remaining.size + 1}",
-            206 to "$etag\r\nContent-Range: bytes 0-${remaining.lastIndex}/${archive.size}\r\n$length",
-            206 to "$etag\r\nContent-Range: bytes $split-${archive.lastIndex}/${archive.size + 1}\r\n$length",
-            200 to "$etag\r\n$length",
-            416 to "$etag\r\nContent-Range: bytes invalid\r\nContent-Length: 0",
+        data class Case(val name: String, val status: Int, val headers: String, val body: ByteArray)
+        fun invalid(name: String, status: Int, headers: String, body: ByteArray = remaining) =
+            Case(name, status, headers, body)
+        val cases = listOf(
+            invalid("missing ETag", 206, "$range\r\n$length"),
+            invalid("weak ETag", 206, "ETag: W/\"v1\"\r\n$range\r\n$length"),
+            invalid("encoded body", 206, "$etag\r\n$range\r\n$length\r\nContent-Encoding: gzip"),
+            invalid("missing length", 206, "$etag\r\n$range"),
+            invalid("wrong length", 206, "$etag\r\n$range\r\nContent-Length: ${remaining.size + 1}"),
+            invalid("wrong range start", 206, "$etag\r\nContent-Range: bytes 0-${remaining.lastIndex}/${archive.size}\r\n$length"),
+            invalid("wrong range total", 206, "$etag\r\nContent-Range: bytes $split-${archive.lastIndex}/${archive.size + 1}\r\n$length"),
+            invalid("range ignored", 200, "$etag\r\n$length"),
+            invalid("malformed range", 206, "$etag\r\nContent-Range: bytes invalid\r\n$length"),
+            invalid(
+                "range ends at total",
+                206,
+                "$etag\r\nContent-Range: bytes $split-${archive.size}/${archive.size}\r\nContent-Length: ${remaining.size + 1}",
+                remaining + byteArrayOf(0),
+            ),
+            invalid(
+                "416 for incomplete prefix",
+                416,
+                "$etag\r\nContent-Range: bytes */${archive.size}\r\nContent-Length: 0",
+                byteArrayOf(),
+            ),
+            invalid("malformed 416 range", 416, "$etag\r\nContent-Range: bytes invalid\r\nContent-Length: 0", byteArrayOf()),
         )
-        responses.forEachIndexed { index, (status, headers) ->
-            val work = File(tmp.root, "invalid-headers-$index")
+        cases.forEach { case ->
+            val work = File(tmp.root, "invalid-resume-${case.name.replace(' ', '-')}")
             val command = command(
                 artifactSize = archive.size.toLong(),
                 artifactSha256 = sha256(archive),
             ).copy(revision = 7L, artifactEtag = "\"v1\"")
             seedResume(work, command, prefix)
             val retryDelays = mutableListOf<Long>()
-            OneShotServer(status = status, headers = headers, body = remaining).use { server ->
+            OneShotServer(status = case.status, headers = case.headers, body = case.body).use { server ->
                 val execution = PushFilesWorker(
                     hasExternalStorageAccess = { true },
                     attemptDirectoryProvider = { work },
@@ -1484,13 +1285,14 @@ class PushFilesWorkerTest {
                     PushFilesWorker.Callbacks({}, {}, {}),
                 )
 
-                assertEquals("Case $index", "download_failed", execution.result.failureCode)
-                assertNotNull("Case $index", execution.interruptionReason)
-                assertEquals("download_interrupted", execution.interruptionReason)
-                assertArrayEquals(prefix, File(work, "artifact.part").readBytes())
-                assertTrue(File(work, "metadata.json").isFile)
-                assertTrue(retryDelays.isEmpty())
-                assertTrue(server.request.contains("Range: bytes=$split-"))
+                assertEquals(case.name, "fail", execution.result.status)
+                assertEquals(case.name, "download_failed", execution.result.failureCode)
+                assertEquals(case.name, "download_interrupted", execution.interruptionReason)
+                assertNotNull(case.name, execution.interruptionReason)
+                assertArrayEquals(case.name, prefix, File(work, "artifact.part").readBytes())
+                assertTrue(case.name, File(work, "metadata.json").isFile)
+                assertTrue(case.name, retryDelays.isEmpty())
+                assertTrue(case.name, server.request.contains("Range: bytes=$split-"))
             }
         }
     }
@@ -1509,10 +1311,7 @@ class PushFilesWorkerTest {
                 artifactSize = archive.size.toLong(),
                 artifactSha256 = sha256(archive),
             )
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+            val execution = worker(work).execute(command, workerCallbacks())
 
             assertEquals("artifact_identity_mismatch", execution.result.failureCode)
             assertFalse(File(work, "artifact.part").exists())
@@ -1533,10 +1332,7 @@ class PushFilesWorkerTest {
                 artifactSize = archive.size.toLong(),
                 artifactSha256 = sha256(archive),
             )
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-            ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
+            val execution = worker(work).execute(command, workerCallbacks())
 
             assertEquals("fail", execution.result.status)
             assertEquals("artifact_identity_mismatch", execution.result.failureCode)
@@ -1581,11 +1377,7 @@ class PushFilesWorkerTest {
         val destination = tmp.newFolder("legacy-no-sha-destination")
 
         artifactServer(archive).use { server ->
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { File(tmp.root, "legacy-no-sha-work") },
-                destinationProvider = { destination },
-            ).execute(
+            val execution = worker(File(tmp.root, "legacy-no-sha-work"), { destination }).execute(
                 command(
                     jobId = null,
                     artifactId = null,
@@ -1593,7 +1385,7 @@ class PushFilesWorkerTest {
                     artifactSize = archive.size.toLong(),
                     artifactSha256 = null,
                 ),
-                PushFilesWorker.Callbacks({}, {}, {}),
+                workerCallbacks(),
             )
 
             assertEquals("success", execution.result.status)
@@ -1606,13 +1398,9 @@ class PushFilesWorkerTest {
         val archive = zip("content.txt" to "optional-integrity").readBytes()
         val destination = tmp.newFolder("legacy-optional-destination")
         OneShotServer(200, "Content-Type: application/zip", archive).use { server ->
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { File(tmp.root, "legacy-optional-work") },
-                destinationProvider = { destination },
-            ).execute(
+            val execution = worker(File(tmp.root, "legacy-optional-work"), { destination }).execute(
                 command(null, null, server.url, null, null).copy(revision = 0L, artifactEtag = null),
-                PushFilesWorker.Callbacks({}, {}, {}),
+                workerCallbacks(),
             )
             assertEquals("success", execution.result.status)
             assertFalse(server.request.contains("Range:"))
@@ -1629,9 +1417,8 @@ class PushFilesWorkerTest {
         val delays = mutableListOf<Long>()
         var callbackInvoked = false
         OneShotServer(200, "Content-Length: ${archive.size}", prefix).use { server ->
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
+            val execution = worker(
+                work,
                 retryDelay = { delays += it },
                 destinationProvider = { throw AssertionError("A truncated archive must not be applied") },
             ).execute(
@@ -1654,9 +1441,8 @@ class PushFilesWorkerTest {
         val work = File(tmp.root, "legacy-invalid-sha-work")
         var callbackInvoked = false
         OneShotServer(200, "Content-Length: ${archive.size}", archive).use { server ->
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
+            val execution = worker(
+                work,
                 destinationProvider = { throw AssertionError("An untrusted archive must not be applied") },
             ).execute(
                 command(null, null, server.url, archive.size.toLong(), "0".repeat(64))
@@ -1679,21 +1465,13 @@ class PushFilesWorkerTest {
         var callbackInvoked = false
 
         artifactServer(archive).use { server ->
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { work },
-                destinationProvider = { destination },
-            ).execute(
+            val execution = worker(work, { destination }).execute(
                 command(
                     artifactUrl = server.url,
                     artifactSize = archive.size.toLong(),
                     artifactSha256 = "0".repeat(64),
                 ).copy(revision = 7L),
-                PushFilesWorker.Callbacks(
-                    onTransferComplete = { callbackInvoked = true },
-                    onValidated = { callbackInvoked = true },
-                    onApplying = { callbackInvoked = true },
-                ),
+                PushFilesWorker.Callbacks({ callbackInvoked = true }, { callbackInvoked = true }, { callbackInvoked = true }),
             )
 
             assertEquals("fail", execution.result.status)
@@ -1715,9 +1493,8 @@ class PushFilesWorkerTest {
         val callbacks = mutableListOf<String>()
 
         artifactServer(archive).use { server ->
-            val execution = PushFilesWorker(
-                hasExternalStorageAccess = { true },
-                attemptDirectoryProvider = { File(tmp.root, "invalid-destination-work") },
+            val execution = worker(
+                File(tmp.root, "invalid-destination-work"),
                 destinationProvider = {
                     throw PushWorkerException("invalid_destination", "destination rejected")
                 },
@@ -1727,17 +1504,13 @@ class PushFilesWorkerTest {
                     artifactSize = archive.size.toLong(),
                     artifactSha256 = sha256(archive),
                 ),
-                PushFilesWorker.Callbacks(
-                    onTransferComplete = { callbacks += "transfer" },
-                    onValidated = { callbacks += "validated" },
-                    onApplying = { callbacks += "applying" },
-                ),
+                workerCallbacks(callbacks),
             )
 
             assertEquals("fail", execution.result.status)
             assertEquals("invalid_destination", execution.result.failureCode)
         }
-        assertEquals(listOf("transfer", "validated"), callbacks)
+        assertEquals(listOf("validation_start", "transfer", "validated"), callbacks)
         assertEquals("unchanged", sentinel.readText())
     }
 
