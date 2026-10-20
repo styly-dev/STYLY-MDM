@@ -36,7 +36,7 @@ class WifiSettingsStoreTest {
             finalStateValidated = true,
         )
         val expected = WifiLocalState(
-            connection = WifiConnectionSettings(tlsEnabled = true, deviceToken = "secret-token"),
+            connection = WifiConnectionSettings(tlsEnabled = true),
             lastApplied = WifiSavedProfile(operation.revision, listOf(profile)),
             manualOperation = operation,
             manualResults = listOf(
@@ -51,6 +51,27 @@ class WifiSettingsStoreTest {
 
         assertEquals(expected, store.read())
         assertEquals(true, file.isFile)
+    }
+
+    @Test
+    fun legacyDeviceTokenIsIgnoredAndRemovedOnNextStateWrite() {
+        val directory = temporaryFolder.newFolder("wifi-state-legacy-token")
+        val file = File(directory, "state.json")
+        file.writeText(
+            """{"version":3,"connection":{"tls_enabled":true,"device_token":"legacy-secret"},"manual_operation":{"operation_id":"a4d13b84-1bd7-4bce-bd4d-d056801d4a3f","revision":"91b831b3-884e-4e0e-8700-07d2fbe1c436","candidate":[{"ssid":"office","security":"OPEN","password":"","hidden":false}],"restore_snapshot":[],"phase":"applying","settings_changed":true}}""",
+        )
+        val store = WifiSettingsStore(file) {}
+        val decoded = store.read()
+
+        assertEquals(true, decoded.connection.tlsEnabled)
+        assertEquals(true, decoded.manualOperation?.settingsChanged)
+        assertEquals(1, decoded.manualOperation?.candidate?.size)
+        assertEquals(true, file.readText().contains("legacy-secret"))
+
+        store.write(decoded)
+
+        assertEquals(false, file.readText().contains("device_token"))
+        assertEquals(false, file.readText().contains("legacy-secret"))
     }
 
     @Test

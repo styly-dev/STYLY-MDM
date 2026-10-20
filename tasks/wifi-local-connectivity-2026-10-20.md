@@ -119,3 +119,24 @@ in-flight attempt from restoring boot management after unmanaged is received.
   existing two-member test group preserved; original Documents registry unchanged.
   TLS trust/keychain settings were not changed. Secrets remain in mode-600 temp
   config files outside the repository. No push.
+
+## Managed-LAN authentication correction
+
+The user explicitly requires no authentication. The earlier token/session and
+manual-enrollment requirements were implementation additions and are superseded.
+Remove browser login, admin/device tokens, session endpoints and client enrollment
+gates. Retain encrypted profile storage, optional transport configuration, local
+Wi-Fi recovery and explicit unmanaged deployment. No push or real-device changes.
+
+Validation: server461, console28, Android149 unit tests passed; DevDebug APK
+assembled. Staged and integrated review repaired an eager token-cleanup write
+that could suppress interrupted Wi-Fi recovery on storage failure. Decode now
+ignores the old token without writing, and normal later persistence omits it.
+A regression test preserves the TLS setting and unfinished rollback journal.
+Re-review confirmed the finding is closed.
+
+The actual HTTP console loaded all290 registry entries and the saved group,
+opened Wi-Fi settings without login, and reconnected automatically across a
+server restart without login. Local runtime admin/device token configuration
+was removed; the existing registry/profile key and data remain. No physical
+device validation, device Wi-Fi command or push was performed.

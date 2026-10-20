@@ -47,29 +47,7 @@ internal data class WifiNetworkSnapshot(
 
 internal data class WifiConnectionSettings(
     val tlsEnabled: Boolean = false,
-    val deviceToken: String? = null,
 )
-
-internal object WifiTransportAuthorization {
-    fun isAuthorizedSession(
-        url: String,
-        manuallyEnrolledEndpoint: Boolean,
-        settings: WifiConnectionSettings,
-    ): Boolean {
-        val expectedScheme = if (settings.tlsEnabled) "wss://" else "ws://"
-        return manuallyEnrolledEndpoint &&
-            url.startsWith(expectedScheme, ignoreCase = true) &&
-            !settings.deviceToken.isNullOrBlank()
-    }
-
-    fun authorizationTokenFor(
-        url: String,
-        manuallyEnrolledEndpoint: Boolean,
-        settings: WifiConnectionSettings,
-    ): String? = settings.deviceToken?.takeIf {
-        isAuthorizedSession(url, manuallyEnrolledEndpoint, settings)
-    }
-}
 
 internal enum class WifiManualPhase(val wireValue: String) {
     PREPARED("prepared"),
@@ -247,7 +225,6 @@ internal object WifiSettingsCodec {
         put("version", VERSION)
         put("connection", JSONObject().apply {
             put("tls_enabled", state.connection.tlsEnabled)
-            put("device_token", state.connection.deviceToken ?: JSONObject.NULL)
         })
         put("last_applied", state.lastApplied?.let(::encodeSavedProfile) ?: JSONObject.NULL)
         put("manual_operation", state.manualOperation?.let(::encodeManualOperation) ?: JSONObject.NULL)
@@ -269,7 +246,6 @@ internal object WifiSettingsCodec {
         val connectionJson = root.optJSONObject("connection") ?: JSONObject()
         val connection = WifiConnectionSettings(
             tlsEnabled = requiredBoolean(connectionJson, "tls_enabled", default = false),
-            deviceToken = optionalString(connectionJson, "device_token")?.takeIf { it.isNotEmpty() },
         )
         return WifiLocalState(
             connection = connection,

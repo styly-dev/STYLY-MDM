@@ -13,7 +13,7 @@ status always use saved membership, even while membership edits are unsaved.
 A device may belong to at most one group; unassigned devices are permitted.
 
 Sending freezes the saved revision and the currently online group members.
-Only compatible, enrolled clients receive credentials. Unsupported online
+Only compatible connected clients receive Wi-Fi settings. Unsupported online
 clients get a send failure; offline members are excluded, retain their previous
 send status, and do not receive queued settings when they reconnect. Sending
 again is a new operation, with a new online snapshot.
@@ -95,14 +95,13 @@ is claimed.
 
 ## Setup and secrets
 
-Configure `MDM_WIFI_ENCRYPTION_KEY`, `MDM_ADMIN_TOKEN` and `MDM_DEVICE_TOKEN`.
+Configure `MDM_WIFI_ENCRYPTION_KEY` for encrypted profile storage. No administrator
+login, session cookie or device token is required on the managed LAN.
 Choose either TLS or explicit managed-LAN HTTP:
 
 | Variable | Meaning |
 |---|---|
 | `MDM_WIFI_ENCRYPTION_KEY` | Fernet key stored separately from server data/backups |
-| `MDM_ADMIN_TOKEN` | Administrator access token |
-| `MDM_DEVICE_TOKEN` | Token provisioned into managed clients |
 | `MDM_TLS_CERT` / `MDM_TLS_KEY` | Both PEM files when using TLS |
 | `MDM_WIFI_ALLOW_HTTP` | `1` permits managed-LAN HTTP only when TLS is absent |
 
@@ -113,27 +112,24 @@ python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 ```
 
 For managed-LAN HTTP, leave TLS files unset, set `MDM_WIFI_ALLOW_HTTP=1`, open
-`http://` and disable TLS in Android Settings. Tokens and Wi-Fi credentials then
-travel without transport encryption. For TLS, configure both files, open
+`http://` and disable TLS in Android Settings. Wi-Fi credentials then travel
+without transport encryption. For TLS, configure both files, open
 `https://` and enable TLS on Android. The server advertises the matching WS/WSS
 scheme. TLS certificates must be trusted; no certificate bypass is implemented.
 
-Authenticate in the console. Its session cookie is HttpOnly and SameSite=Strict,
-with Secure set for HTTPS. Origin checks still apply. On each client, configure
-an explicit manual server URL and its device token. Discovery/cache alone never
-authorizes token transmission, even for a matching URL. Redirects cannot move
-the enrollment to another server. Shared-storage client config contains no token.
+Open the console directly. Clients receive Wi-Fi commands over their normal MDM
+WebSocket connection, whether the server was configured manually or discovered.
+The existing TLS setting selects WS or WSS. No enrollment step is required.
+Same-origin checks still apply to browser Wi-Fi mutations; native tools can omit
+Origin. These checks do not identify or authenticate an operator or device.
 
 The server encrypts `wifi_settings.enc`, including password-bearing profiles.
 Keep the key separate; losing or replacing it makes the store unreadable and
 must fail startup. Group rename/delete transaction recovery uses
 `wifi_group_mutation.txn`; keep that journal with the data directory. Logs and
-redacted APIs do not contain Wi-Fi passwords or access tokens. Android private
+redacted APIs do not contain Wi-Fi passwords. Android private
 internal storage retains restoration snapshots and successful profiles; shared
 storage, normal backups and diagnostic logs do not contain those secrets.
-
-The shared device token trusts the enrolled fleet as a unit; it is not a
-per-device identity credential. Existing Device ID identity rules still apply.
 
 ## Supported devices and networks
 
@@ -159,6 +155,11 @@ parcel fields for restoration.
 `wifi_settings_v2`. V1 clients use MDM reconnection verification and cannot run
 this revision; the server marks them unsupported without sending credentials.
 Update client and server together. Other MDM capabilities remain compatible.
+The login endpoint and admin/device-token settings have been removed. Old token
+environment variables and old session cookies are ignored. Existing Android
+private state remains readable; the obsolete device token is ignored and omitted on the
+next normal state write. Update earlier token-gated clients to enable ordinary
+manually configured and discovered Wi-Fi delivery without enrollment.
 
 `EXECUTE_WIFI_APPLY` contains operation_id, revision, mode and networks. Mode is
 managed or unmanaged. Managed lists are nonempty; unmanaged commands have an
@@ -167,7 +168,6 @@ Wi-Fi verification request/ACK, result ACK, observation or reconnect-time send.
 
 | Route | Operation |
 |---|---|
-| `POST /api/wifi/session` | Create an authenticated browser session |
 | `GET /api/wifi/state` | Read redacted revisions and per-device delivery status |
 | `GET /api/wifi/groups/{name}` | Read redacted saved form values |
 | `PUT /api/wifi/groups/{name}` | Validate/save a new managed profile revision |

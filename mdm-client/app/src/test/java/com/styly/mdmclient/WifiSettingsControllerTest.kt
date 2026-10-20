@@ -13,6 +13,23 @@ import java.util.concurrent.Executor
 
 class WifiSettingsControllerTest {
     @Test
+    fun `wifi command is ignored before canonical registration acknowledgement`() {
+        val harness = Harness()
+
+        assertTrue(
+            harness.controller.handleServerMessage(
+                "EXECUTE_WIFI_APPLY",
+                command(OPERATION_ID, REVISION, "unmanaged"),
+                canonicalRegistrationAcknowledged = false,
+            ),
+        )
+        harness.operationExecutor.runAll()
+
+        assertNull(harness.store.state.manualOperation)
+        assertTrue(harness.store.state.processedOperationIds.isEmpty())
+    }
+
+    @Test
     fun `managed apply commits after a fresh candidate Wi-Fi network receives an IP`() {
         val original = network("office-old")
         val candidate = network("office-new")
@@ -421,7 +438,11 @@ class WifiSettingsControllerTest {
         }
 
         fun enqueue(payload: JSONObject) {
-            controller.handleServerMessage("EXECUTE_WIFI_APPLY", payload, authorized = true)
+            controller.handleServerMessage(
+                "EXECUTE_WIFI_APPLY",
+                payload,
+                canonicalRegistrationAcknowledged = true,
+            )
         }
 
         fun apply(payload: JSONObject) {

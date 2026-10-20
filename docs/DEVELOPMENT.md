@@ -90,10 +90,10 @@ do not roll it back. Once per actual OS boot, after interrupted manual recovery,
 the client reapplies its last successful baseline without a connectivity probe or
 boot rollback. `wifi_settings_v2` separates this behavior from old clients.
 
-Credentials require token authentication and encrypted server persistence. TLS is
-supported; a managed-LAN server can explicitly use HTTP (`MDM_WIFI_ALLOW_HTTP=1`).
-Device credentials are sent only to the manually enrolled endpoint. Separate
-Devices and Wi-Fi tabs retain drafts during status refreshes. Deleting Wi-Fi
+The console and clients use the existing managed-LAN connections without login,
+sessions or device tokens. Wi-Fi passwords use encrypted server persistence. TLS
+is supported; a managed-LAN server can explicitly use HTTP (`MDM_WIFI_ALLOW_HTTP=1`).
+Separate Devices and Wi-Fi tabs retain drafts during status refreshes. Deleting Wi-Fi
 settings saves an unmanaged revision without sending it; explicit deployment
 disables boot reapplication while retaining the device’s existing Wi-Fi networks. Group membership
 is at most one group per device. See [`WIFI_SETTINGS.md`](WIFI_SETTINGS.md) for

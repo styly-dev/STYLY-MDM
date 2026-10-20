@@ -173,8 +173,6 @@ def test_startup_recovers_crash_between_registry_and_profile_replacements(tmp_pa
     server._wifi_group_journal_path().write_text(json.dumps(journal), encoding="ascii")
     server.REGISTRY_PATH.write_bytes(next_registry)  # crash after the first replace
 
-    monkeypatch.setenv("MDM_ADMIN_TOKEN", "admin-token")
-    monkeypatch.setenv("MDM_DEVICE_TOKEN", "device-token")
     monkeypatch.setenv("MDM_WIFI_ENCRYPTION_KEY", key.decode("ascii"))
     monkeypatch.setattr(server, "_load_tls_context", lambda: object())
     app = server.create_app()
