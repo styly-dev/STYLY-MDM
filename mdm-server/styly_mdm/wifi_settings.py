@@ -23,19 +23,6 @@ MAX_WIFI_NETWORKS = 32
 MAX_SSID_BYTES = 32
 
 DELIVERY_STATUSES = frozenset({"sent", "failed", "unknown"})
-DELIVERY_REASONS = frozenset({
-    "unsupported",
-    "permission_denied",
-    "socket_unavailable",
-    "socket_replaced",
-    "superseded",
-    "socket_send_failed",
-    "server_restarted",
-    "legacy_result_untracked",
-    "dispatch_not_confirmed",
-    "state_persist_failed",
-})
-MAX_OLD_DELIVERY_OPERATIONS = 256
 
 
 class WiFiSettingsError(ValueError):
@@ -51,7 +38,7 @@ class WiFiStoreError(RuntimeError):
 
 
 def _new_state() -> dict[str, Any]:
-    return {"version": 2, "profiles": {}, "operations": {}, "devices": {}}
+    return {"version": 3, "profiles": {}, "devices": {}}
 
 
 def normalize_revision(value: Any) -> str | None:
@@ -156,10 +143,6 @@ def public_networks(networks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def valid_uuid(value: Any) -> bool:
-    return normalize_revision(value) is not None
-
-
 class WiFiSettingsStore:
     """Encrypted profiles and bounded, delivery-only Wi-Fi command state."""
 
@@ -192,108 +175,41 @@ class WiFiSettingsStore:
             raise WiFiStoreError("encrypted Wi-Fi state failed validation") from None
         if not isinstance(parsed, dict) or type(parsed.get("version")) is not int:
             raise WiFiStoreError("encrypted Wi-Fi state has an unsupported format")
-        for key in ("profiles", "operations", "devices"):
+        for key in ("profiles", "devices"):
             if not isinstance(parsed.get(key), dict):
                 raise WiFiStoreError("encrypted Wi-Fi state failed validation")
-        if parsed["version"] == 1:
-            self.state = self._migrate_v1(parsed)
-            try:
-                self.save()
-            except WiFiStoreError:
-                raise WiFiStoreError("legacy Wi-Fi delivery state could not be migrated") from None
-        elif parsed["version"] == 2:
+        if parsed["version"] == 2:
+            operations = parsed.pop("operations", None)
+            if not isinstance(operations, dict):
+                raise WiFiStoreError("encrypted Wi-Fi state failed validation")
+            # Preserve only the latest delivery, including an interrupted socket write.
+            for record in parsed["devices"].values():
+                delivery = record.get("delivery") if isinstance(record, dict) else None
+                if isinstance(delivery, dict):
+                    operation = operations.get(delivery.get("operation_id"))
+                    if isinstance(operation, dict) and operation.get("status") == "dispatching":
+                        delivery["status"] = "dispatching"
+                        delivery["reason"] = None
+            parsed["version"] = 3
             self.state = parsed
-            if self._normalize_profiles(self.state["profiles"]):
-                try:
-                    self.save()
-                except WiFiStoreError:
-                    raise WiFiStoreError("legacy Wi-Fi profile mode could not be migrated") from None
+            self._validate_profiles()
+            self.save()
+        elif parsed["version"] == 3:
+            self.state = parsed
+            self._validate_profiles()
         else:
             raise WiFiStoreError("encrypted Wi-Fi state has an unsupported format")
 
-    @staticmethod
-    def _normalize_profiles(profiles: dict[str, Any]) -> bool:
-        """Upgrade pre-mode profiles as managed and reject invalid persisted shapes."""
-        changed = False
-        for profile in profiles.values():
+    def _validate_profiles(self) -> None:
+        for profile in self.state["profiles"].values():
             if not isinstance(profile, dict):
                 raise WiFiStoreError("encrypted Wi-Fi profile failed validation")
-            if "mode" not in profile:
-                profile["mode"] = "managed"
-                changed = True
             mode = profile.get("mode")
             networks = profile.get("networks")
-            if (
-                not isinstance(mode, str)
-                or mode not in {"managed", "unmanaged"}
-                or not isinstance(networks, list)
-            ):
+            if mode not in ("managed", "unmanaged") or not isinstance(networks, list):
                 raise WiFiStoreError("encrypted Wi-Fi profile failed validation")
             if (mode == "managed" and not networks) or (mode == "unmanaged" and networks):
                 raise WiFiStoreError("encrypted Wi-Fi profile failed validation")
-        return changed
-
-    @staticmethod
-    def _migrate_v1(parsed: dict[str, Any]) -> dict[str, Any]:
-        """Keep profiles; represent old result-tracked applies as unknown delivery."""
-        migrated = _new_state()
-        migrated["profiles"] = copy.deepcopy(parsed["profiles"])
-        WiFiSettingsStore._normalize_profiles(migrated["profiles"])
-        latest: dict[str, tuple[float, int, dict[str, Any]]] = {}
-        for index, (operation_id, old) in enumerate(parsed["operations"].items()):
-            if not isinstance(old, dict):
-                continue
-            device_id = old.get("device_id")
-            revision = old.get("revision")
-            if not isinstance(device_id, str) or not valid_uuid(operation_id) or not valid_uuid(revision):
-                continue
-            attempted_at = old.get("created_at")
-            if isinstance(attempted_at, bool) or not isinstance(attempted_at, (int, float)):
-                attempted_at = 0.0
-            record = {
-                "operation_id": operation_id,
-                "device_id": device_id,
-                "revision": revision,
-                "status": "unknown",
-                "reason": "legacy_result_untracked",
-                "attempted_at": float(attempted_at),
-                "updated_at": float(attempted_at),
-            }
-            candidate = (float(attempted_at), index, record)
-            if device_id not in latest or candidate[:2] >= latest[device_id][:2]:
-                latest[device_id] = candidate
-
-        all_device_ids = set(parsed["devices"]) | set(latest)
-        for device_id in all_device_ids:
-            if not isinstance(device_id, str):
-                continue
-            old_record = parsed["devices"].get(device_id)
-            migrated_devices: dict[str, Any] = {}
-            if device_id in latest:
-                migrated_devices["delivery"] = copy.deepcopy(latest[device_id][2])
-            else:
-                # A legacy manual result may outlive its detailed operation.
-                # Never treat its status as proof that a command was delivered.
-                manual = old_record.get("manual") if isinstance(old_record, dict) else None
-                if isinstance(manual, dict):
-                    operation_id = manual.get("operation_id")
-                    revision = manual.get("revision")
-                    if valid_uuid(operation_id) and valid_uuid(revision):
-                        migrated_devices["delivery"] = {
-                            "operation_id": operation_id,
-                            "revision": revision,
-                            "status": "unknown",
-                            "reason": "legacy_result_untracked",
-                            "attempted_at": None,
-                            "updated_at": 0.0,
-                        }
-            migrated["devices"][device_id] = migrated_devices
-
-        migrated["operations"] = {
-            item[2]["operation_id"]: copy.deepcopy(item[2])
-            for item in latest.values()
-        }
-        return migrated
 
     def encrypted_bytes(self) -> bytes:
         payload = json.dumps(
@@ -347,30 +263,20 @@ class WiFiSettingsStore:
             raise WiFiStoreError("encrypted Wi-Fi state could not be persisted") from None
 
     def mark_restart_unknown(self) -> None:
-        interrupted = [
-            operation_id
-            for operation_id, operation in self.state["operations"].items()
-            if isinstance(operation, dict) and operation.get("status") == "dispatching"
-        ]
-        if not interrupted:
+        if not any(record.get("delivery", {}).get("status") == "dispatching"
+                   for record in self.state["devices"].values()):
             return
         with self._transaction():
-            for operation_id in interrupted:
-                operation = self.state["operations"].get(operation_id)
-                if not isinstance(operation, dict) or operation.get("status") != "dispatching":
-                    continue
-                operation["status"] = "unknown"
-                operation["reason"] = "server_restarted"
-                operation["updated_at"] = time.time()
-                self._update_latest_delivery(operation)
-            self._prune_operations()
+            for record in self.state["devices"].values():
+                delivery = record.get("delivery", {})
+                if delivery.get("status") == "dispatching":
+                    delivery.update(status="unknown", reason="server_restarted", updated_at=time.time())
 
     def profile(self, group_name: str) -> dict[str, Any] | None:
         profile = self.state["profiles"].get(group_name)
         if not isinstance(profile, dict):
             return None
         result = copy.deepcopy(profile)
-        result.setdefault("mode", "managed")
         return result
 
     def put_profile(
@@ -418,54 +324,42 @@ class WiFiSettingsStore:
         revision: str,
         device_ids: list[str],
     ) -> list[dict[str, Any]]:
-        if not valid_uuid(revision):
+        if normalize_revision(revision) is None:
             raise WiFiSettingsError("invalid Wi-Fi revision")
+        if not device_ids:
+            return []
         attempts: list[dict[str, Any]] = []
         with self._transaction():
             for device_id in device_ids:
-                operation_id = str(uuid.uuid4())
                 now = time.time()
-                operation = {
-                    "operation_id": operation_id,
-                    "group": group_name,
-                    "device_id": device_id,
+                delivery = {
+                    "operation_id": str(uuid.uuid4()),
                     "revision": revision,
                     "status": "dispatching",
                     "reason": None,
                     "attempted_at": now,
                     "updated_at": now,
                 }
-                # Persist this small record before any socket write. A restart
-                # makes it unknown and never replays the command.
-                self.state["operations"][operation_id] = operation
-                self.state["devices"].setdefault(device_id, {})["delivery"] = {
-                    "operation_id": operation_id,
-                    "revision": revision,
-                    "status": "unknown",
-                    "reason": "dispatch_not_confirmed",
-                    "attempted_at": now,
-                    "updated_at": now,
-                }
-                attempts.append(copy.deepcopy(operation))
-            self._prune_operations()
+                # Persist before sending. Requests retain their own frozen attempt;
+                # the store owns only the latest delivery for each device.
+                self.state["devices"][device_id] = {"delivery": delivery}
+                attempts.append(dict(delivery, group=group_name, device_id=device_id))
         return attempts
 
-    def settle_delivery(self, operation_id: str, status: str, reason: str | None) -> bool:
-        operation = self.state["operations"].get(operation_id)
-        if not isinstance(operation, dict):
-            return False
+    def settle_delivery(self, device_id: str, operation_id: str, status: str, reason: str | None) -> bool:
         if status not in DELIVERY_STATUSES or not self._valid_delivery_reason(status, reason):
             return False
-        if operation.get("status") != "dispatching":
-            return operation.get("status") == status and operation.get("reason") == reason
-
+        if not self.is_latest_delivery(device_id, operation_id):
+            # A later request owns the durable row. The older request still returns
+            # its actual send result without overwriting the latest delivery.
+            return True
+        delivery = self.state["devices"][device_id]["delivery"]
+        if delivery["status"] != "dispatching":
+            return delivery["status"] == status and delivery["reason"] == reason
         with self._transaction():
-            operation = self.state["operations"][operation_id]
-            operation["status"] = status
-            operation["reason"] = reason
-            operation["updated_at"] = time.time()
-            self._update_latest_delivery(operation)
-            self._prune_operations()
+            self.state["devices"][device_id]["delivery"].update(
+                status=status, reason=reason, updated_at=time.time(),
+            )
         return True
 
     def is_latest_delivery(self, device_id: str, operation_id: str) -> bool:
@@ -486,43 +380,15 @@ class WiFiSettingsStore:
             "dispatch_not_confirmed", "state_persist_failed", "superseded",
         }
 
-    def _update_latest_delivery(self, operation: dict[str, Any]) -> None:
-        record = self.state["devices"].get(operation.get("device_id"))
-        delivery = record.get("delivery") if isinstance(record, dict) else None
-        if not isinstance(delivery, dict) or delivery.get("operation_id") != operation.get("operation_id"):
-            return
-        for key in ("revision", "status", "reason", "attempted_at", "updated_at"):
-            delivery[key] = operation.get(key)
-
-    def _prune_operations(self) -> None:
-        latest_ids = {
-            record.get("delivery", {}).get("operation_id")
-            for record in self.state["devices"].values()
-            if isinstance(record, dict) and isinstance(record.get("delivery"), dict)
-        }
-        def updated_at(item: tuple[str, dict[str, Any]]) -> float:
-            value = item[1].get("updated_at", 0.0)
-            return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
-
-        old_terminal = sorted(
-            (
-                (operation_id, operation)
-                for operation_id, operation in self.state["operations"].items()
-                if isinstance(operation, dict)
-                and operation_id not in latest_ids
-                and operation.get("status") != "dispatching"
-            ),
-            key=lambda item: (updated_at(item), item[0]),
-        )
-        for operation_id, _operation in old_terminal[:-MAX_OLD_DELIVERY_OPERATIONS]:
-            self.state["operations"].pop(operation_id, None)
-
     def state_view(self, device_ids: set[str], online_ids: set[str]) -> dict[str, Any]:
         rows: dict[str, Any] = {}
         for device_id in sorted(device_ids):
             record = self.state["devices"].get(device_id, {})
+            delivery = copy.deepcopy(record.get("delivery"))
+            if delivery is not None and delivery["status"] == "dispatching":
+                delivery.update(status="unknown", reason="dispatch_not_confirmed")
             rows[device_id] = {
-                "delivery": copy.deepcopy(record.get("delivery")),
+                "delivery": delivery,
                 "online": device_id in online_ids,
             }
         return rows

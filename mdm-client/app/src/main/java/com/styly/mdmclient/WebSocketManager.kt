@@ -122,11 +122,9 @@ class WebSocketManager internal constructor(
         }
 
         internal fun getManualServerUrl(context: Context): String? {
-            val configured = preferences(context)
+            return preferences(context)
                 .getString(PREF_MANUAL_SERVER_URL, null)
                 ?.takeIf(::isCanonicalManualServerUrl)
-                ?: return null
-            return effectiveUrl(configured, MdmClientApplication.wifiSettingsController().connectionSettings().tlsEnabled)
         }
 
         internal fun getManualServerAddress(context: Context): String? {
@@ -422,9 +420,9 @@ class WebSocketManager internal constructor(
                 if (discovered != null && isValidWsUrl(discovered)) {
                     Log.i(TAG, "Discovered server at: $discovered")
                     saveDiscoveredServerUrl(discovered)
-                    doConnect(effectiveUrl(discovered, wifiController.connectionSettings().tlsEnabled))
+                    doConnect(discovered)
                 } else {
-                    doConnect(effectiveUrl(getCachedServerUrl(context), wifiController.connectionSettings().tlsEnabled))
+                    doConnect(getCachedServerUrl(context))
                 }
             }
         }.start()
@@ -456,11 +454,6 @@ class WebSocketManager internal constructor(
                 Log.i(TAG, "WebSocket connected")
                 reconnectHandler.post {
                     if (this@WebSocketManager.webSocket !== webSocket) return@post
-                    if (response.request.url != request.url) {
-                        webSocket.cancel()
-                        onSocketGone(webSocket, "Rejected changed WebSocket endpoint")
-                        return@post
-                    }
                     dispatch(scheduler.onConnected())
                     socketOpen = true
                     registration.open(webSocket)

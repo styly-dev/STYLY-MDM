@@ -6,8 +6,6 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
-import android.os.Parcel
-import android.util.Base64
 import android.util.Log
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -20,8 +18,6 @@ internal data class WifiConfiguredEntry(
     val passwordReadable: Boolean,
     val hidden: Boolean,
     val enabled: Boolean,
-    val priority: Int,
-    val configurationParcel: String,
 )
 
 /** PICO can expose several security views for one saved network ID. */
@@ -47,17 +43,13 @@ internal class WifiAdapterFailure(val reason: WifiReason) : Exception()
 
 internal interface WifiSettingsAdapter {
     fun readCurrent(): List<WifiConfiguredEntry>
-    fun restorableSnapshot(): List<WifiNetworkSnapshot>
     fun applyProfile(
         target: List<WifiNetworkProfile>,
         shouldContinue: () -> Boolean = { true },
-        restoreSnapshot: List<WifiNetworkSnapshot>? = null,
         beforeFirstMutation: () -> WifiReason? = { null },
-        expectedSnapshot: List<WifiNetworkSnapshot>? = null,
         onMutationStarted: () -> WifiReason? = { null },
         onMutationFinished: () -> Unit = {},
     ): WifiReason
-    fun validateFinalState(profile: List<WifiNetworkProfile>, priorApiWriteValidated: Boolean): String
     fun disconnectCurrent(
         shouldContinue: () -> Boolean,
         onMutationStarted: () -> WifiReason?,
@@ -94,40 +86,10 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         }
     }
 
-    override fun restorableSnapshot(): List<WifiNetworkSnapshot> {
-        val current = readCurrent()
-        if (current.map { it.ssid + "\u0000" + it.security }.toSet().size != current.size) {
-            throw WifiAdapterFailure(WifiReason.RESTORE_INFO_MISSING)
-        }
-        val snapshot = ArrayList<WifiNetworkSnapshot>(current.size)
-        for (entry in current) {
-            val security = entry.security ?: throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
-            if (security == "WPA_PSK" && (!entry.passwordReadable || entry.password == null)) {
-                throw WifiAdapterFailure(WifiReason.RESTORE_INFO_MISSING)
-            }
-            try {
-                WifiSettingsProtocol.validateNetwork(entry.ssid, security, entry.password.orEmpty())
-            } catch (_: IllegalArgumentException) {
-                throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
-            }
-            snapshot.add(
-                WifiNetworkSnapshot(
-                    WifiNetworkProfile(entry.ssid, security, entry.password.orEmpty(), entry.hidden),
-                    entry.enabled,
-                    entry.priority,
-                    entry.configurationParcel,
-                ),
-            )
-        }
-        return snapshot
-    }
-
     override fun applyProfile(
         target: List<WifiNetworkProfile>,
         shouldContinue: () -> Boolean,
-        restoreSnapshot: List<WifiNetworkSnapshot>?,
         beforeFirstMutation: () -> WifiReason?,
-        expectedSnapshot: List<WifiNetworkSnapshot>?,
         onMutationStarted: () -> WifiReason?,
         onMutationFinished: () -> Unit,
     ): WifiReason {
@@ -135,9 +97,6 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             requireManagementAuthority()
             val manager = wifiManager ?: return WifiReason.UNSUPPORTED
             val initial = readCurrent()
-            if (expectedSnapshot != null && !sameSnapshot(initial, expectedSnapshot)) {
-                return WifiReason.RESTORE_INFO_MISSING
-            }
             val retainedIds = HashSet<Int>()
             val changedIdentity = HashSet<String>()
             var mutationPrepared = false
@@ -164,27 +123,18 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                 val exact = matching.firstOrNull { currentMatches(it, network) }
                 if (exact != null) {
                     retainedIds.add(exact.networkId)
-                    if (restoreSnapshot == null) {
-                        // Managed networks must be enabled so Android can reconnect automatically.
-                        if (!exact.enabled) {
-                            val (reason, enabled) = mutateApi { enableNetwork(manager, exact.networkId) }
-                            if (reason != null) return reason
-                            if (enabled != true) return WifiReason.UPDATE_FAILED
-                        }
+                    // Managed networks must be enabled so Android can reconnect automatically.
+                    if (!exact.enabled) {
+                        val (reason, enabled) = mutateApi { enableNetwork(manager, exact.networkId) }
+                        if (reason != null) return reason
+                        if (enabled != true) return WifiReason.UPDATE_FAILED
                     }
                     continue
                 }
 
                 val existing = matching.firstOrNull()
-                val restoreConfig = restoreSnapshot
-                    ?.firstOrNull { it.profile.identity == network.identity }
-                    ?.configurationParcel
-                // Only legacy recovery journals supply parcels. New MDM profiles are built
-                // explicitly so an existing SAE view cannot override the requested PSK mode.
-                val baseConfig = restoreConfig?.let(::unmarshalConfiguration)
-                val configured = toWifiConfiguration(network, baseConfig).apply {
+                val configured = toWifiConfiguration(network).apply {
                     networkId = existing?.networkId ?: -1
-                    priority = restoreSnapshot?.firstOrNull { it.profile.identity == network.identity }?.priority ?: 0
                 }
 
                 if (existing == null) {
@@ -203,12 +153,10 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                     if (updateReason != null) return updateReason
                     val networkId = id ?: return WifiReason.UPDATE_FAILED
                     if (networkId < 0) return WifiReason.UPDATE_FAILED
-                    if (restoreSnapshot == null) {
-                        val (enableReason, enabled) = mutateApi { enableNetwork(manager, networkId) }
-                        if (enableReason != null) return enableReason
-                        if (enabled != true) {
-                            return WifiReason.UPDATE_FAILED
-                        }
+                    val (enableReason, enabled) = mutateApi { enableNetwork(manager, networkId) }
+                    if (enableReason != null) return enableReason
+                    if (enabled != true) {
+                        return WifiReason.UPDATE_FAILED
                     }
                     retainedIds.add(networkId)
                 }
@@ -223,37 +171,6 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                 if (removeReason != null) return removeReason
                 if (removed != true) {
                     return WifiReason.DELETE_FAILED
-                }
-            }
-
-            if (restoreSnapshot != null) {
-                val afterRestore = readCurrent()
-                for (saved in restoreSnapshot) {
-                    if (!shouldContinue()) return WifiReason.TIMEOUT_ROLLED_BACK
-                    val current = afterRestore.firstOrNull {
-                        it.ssid == saved.profile.ssid && it.security == saved.profile.security
-                    } ?: return WifiReason.VERIFY_FAILED
-                    if (current.priority != saved.priority) {
-                        val configured = toWifiConfiguration(
-                            saved.profile,
-                            saved.configurationParcel?.let(::unmarshalConfiguration),
-                        ).apply {
-                            networkId = current.networkId
-                            priority = saved.priority
-                        }
-                        val (updateReason, updated) = mutateApi { updateNetwork(manager, configured) }
-                        if (updateReason != null) return updateReason
-                        if (updated == null || updated < 0) {
-                            return WifiReason.RESTORE_FAILED
-                        }
-                    }
-                    val enabledResult = if (saved.enabled) {
-                        mutateApi { enableNetwork(manager, current.networkId) }
-                    } else {
-                        mutateApi { disableNetwork(manager, current.networkId) }
-                    }
-                    if (enabledResult.first != null) return enabledResult.first!!
-                    if (enabledResult.second != true) return WifiReason.RESTORE_FAILED
                 }
             }
 
@@ -281,20 +198,6 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         } catch (_: Exception) {
             return WifiReason.CONFIG_READ_FAILED
         }
-    }
-
-    /** Validate visible fields after a successful API write without claiming masked PSKs match. */
-    override fun validateFinalState(profile: List<WifiNetworkProfile>, priorApiWriteValidated: Boolean): String {
-        val entries = try {
-            readCurrent()
-        } catch (_: WifiAdapterFailure) {
-            return "unknown"
-        }
-        return wifiProfileReadback(
-            entries,
-            profile,
-            if (priorApiWriteValidated) profile.map { it.identity }.toSet() else emptySet(),
-        )
     }
 
     override fun disconnectCurrent(
@@ -387,8 +290,6 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             passwordReadable = passwordReadable,
             hidden = config.hiddenSSID,
             enabled = config.status != WifiConfiguration.Status.DISABLED,
-            priority = config.priority,
-            configurationParcel = marshalConfiguration(config),
         )
     }
 
@@ -399,24 +300,9 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             current.passwordReadable &&
             current.password == requested.password
 
-    private fun sameSnapshot(current: List<WifiConfiguredEntry>, expected: List<WifiNetworkSnapshot>): Boolean {
-        if (current.size != expected.size) return false
-        return expected.all { saved ->
-            val matches = current.filter {
-                it.ssid == saved.profile.ssid && it.security == saved.profile.security
-            }
-            matches.size == 1 && currentMatches(matches.single(), saved.profile) &&
-                matches.single().enabled == saved.enabled && matches.single().priority == saved.priority
-        }
-    }
-
-    private fun toWifiConfiguration(
-        profile: WifiNetworkProfile,
-        base: WifiConfiguration? = null,
-    ) = (base ?: WifiConfiguration()).apply {
+    private fun toWifiConfiguration(profile: WifiNetworkProfile) = WifiConfiguration().apply {
         SSID = "\"${profile.ssid}\""
         hiddenSSID = profile.hidden
-        priority = 0
         allowedKeyManagement.clear()
         when (profile.security) {
             "OPEN" -> allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE)
@@ -443,9 +329,6 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
     @Suppress("DEPRECATION")
     private fun enableNetwork(manager: WifiManager, networkId: Int): Boolean = manager.enableNetwork(networkId, false)
 
-    @Suppress("DEPRECATION")
-    private fun disableNetwork(manager: WifiManager, networkId: Int): Boolean = manager.disableNetwork(networkId)
-
     private fun unquote(value: String?): String? {
         if (value == null) return null
         if (value.length >= 2 && value.first() == '"' && value.last() == '"') {
@@ -468,36 +351,4 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
     }
 
     private fun quote(value: String): String = "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
-
-    private fun marshalConfiguration(config: WifiConfiguration): String {
-        val parcel = Parcel.obtain()
-        return try {
-            config.writeToParcel(parcel, 0)
-            Base64.encodeToString(parcel.marshall(), Base64.NO_WRAP)
-        } finally {
-            parcel.recycle()
-        }
-    }
-
-    private fun unmarshalConfiguration(encoded: String): WifiConfiguration {
-        val body = Parcel.obtain()
-        val parcel = Parcel.obtain()
-        return try {
-            val bytes = Base64.decode(encoded, Base64.NO_WRAP)
-            body.unmarshall(bytes, 0, bytes.size)
-            // Legacy journals contain writeToParcel bodies without a Parcelable class header.
-            // Add that header so the public readParcelable API can use the platform creator.
-            parcel.writeString(WifiConfiguration::class.java.name)
-            parcel.appendFrom(body, 0, body.dataSize())
-            parcel.setDataPosition(0)
-            @Suppress("DEPRECATION")
-            parcel.readParcelable<WifiConfiguration>(WifiConfiguration::class.java.classLoader)
-                ?: throw WifiAdapterFailure(WifiReason.RESTORE_INFO_MISSING)
-        } catch (_: Exception) {
-            throw WifiAdapterFailure(WifiReason.RESTORE_INFO_MISSING)
-        } finally {
-            body.recycle()
-            parcel.recycle()
-        }
-    }
 }

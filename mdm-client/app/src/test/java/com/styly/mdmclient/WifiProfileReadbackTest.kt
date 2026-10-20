@@ -44,7 +44,5 @@ class WifiProfileReadbackTest {
         passwordReadable = false,
         hidden = false,
         enabled = true,
-        priority = 0,
-        configurationParcel = "unused-test-parcel",
     )
 }
