@@ -13,7 +13,7 @@
   const nativeSend = NativeWebSocket.prototype.send;
   const pushJobs = new Map();
   const jobEntries = new Map();
-  const renderedAssignments = new Map();
+  const renderedDeviceIds = new Set();
   const pendingUploads = new Map();
   const retryRequestIds = new Map();
   let currentAdminSocket = null;
@@ -156,10 +156,6 @@
       appendLog('Dispatched job ' + ready.job_id.slice(0, 8) +
         ' after immutable artifact publication', 'success');
     }).catch(function (error) {
-      const bridge = window.__stylyPushJobsV1Bridge;
-      if (bridge && typeof bridge.clearPendingRequest === 'function') {
-        bridge.clearPendingRequest(staged.requestId);
-      }
       appendLog('Push/Sync job failed before dispatch: ' + error.message, 'fail');
     });
   }
@@ -681,24 +677,17 @@
   function syncDeviceAssignments() {
     const bridge = window.__stylyPushJobsV1Bridge;
     if (!bridge) return;
-    const deviceIds = new Set(renderedAssignments.keys());
+    const deviceIds = new Set(renderedDeviceIds);
+    renderedDeviceIds.clear();
     pushJobs.forEach(function (job) {
       Object.keys(job.devices || {}).forEach(function (deviceId) {
         deviceIds.add(deviceId);
+        renderedDeviceIds.add(deviceId);
       });
     });
-    deviceIds.forEach(function (deviceId) {
-      const selected = selectedAssignmentFor(deviceId);
-      const renderedJobId = renderedAssignments.get(deviceId);
-      if (selected) {
-        if (bridge.applyAssignment(assignmentView(selected, deviceId))) {
-          renderedAssignments.set(deviceId, selected.job.job_id);
-        }
-      } else {
-        bridge.clearAssignment(deviceId, renderedJobId);
-        renderedAssignments.delete(deviceId);
-      }
-    });
+    // Invalidate removed assignments too, so a replacement snapshot reveals any
+    // independent Install/Verify result without clearing it.
+    deviceIds.forEach(function (deviceId) { bridge.invalidateDevice(deviceId); });
     if (typeof bridge.refreshAttention === 'function') bridge.refreshAttention();
   }
 
