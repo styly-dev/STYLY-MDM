@@ -157,7 +157,6 @@ function loadAdapter(options = {}) {
   const bridgeState = new Map();
   const applied = [];
   const cleared = [];
-  const clearedPendingRequests = [];
 
   global.window = global;
   global.view = 'console';
@@ -201,23 +200,16 @@ function loadAdapter(options = {}) {
   global.__stylyPushJobsV1Bridge = {
     isDeviceOnline: options.isDeviceOnline || (() => true),
     refreshAttention() { global.refreshPushJobAttention(); },
-    applyAssignment(assignment) {
-      applied.push(assignment);
-      if (options.applyAssignment && !options.applyAssignment(assignment)) {
-        return false;
+    invalidateDevice(deviceId) {
+      const assignment = window.__stylyPushJobsV1Actions.assignmentFor(deviceId);
+      if (assignment) {
+        applied.push(assignment);
+        bridgeState.set(deviceId, assignment);
+      } else {
+        const current = bridgeState.get(deviceId);
+        cleared.push({ deviceId, jobId: current && current.job_id });
+        bridgeState.delete(deviceId);
       }
-      bridgeState.set(assignment.device_id, assignment);
-      return true;
-    },
-    clearAssignment(deviceId, jobId) {
-      cleared.push({ deviceId, jobId });
-      const current = bridgeState.get(deviceId);
-      if (current && current.job_id === jobId) bridgeState.delete(deviceId);
-      return true;
-    },
-    clearPendingRequest(requestId) {
-      clearedPendingRequests.push(requestId);
-      return true;
     },
   };
 
@@ -227,7 +219,6 @@ function loadAdapter(options = {}) {
   vm.runInThisContext(fs.readFileSync(adapterPath, 'utf8'), { filename: adapterPath });
   return {
     logContainer, pushJobsAttention, pushJobsTabActions, tabAttention, bridgeState, applied, cleared,
-    clearedPendingRequests,
     setTargetTab(tab) { global.targetTab = tab; global.renderTabs(); },
   };
 }
@@ -252,36 +243,206 @@ function openConsole(options = {}) {
 function loadConsoleFunction(name, globals) {
   const source = indexSource.match(new RegExp('function ' + name + '\\([^)]*\\) \\{[\\s\\S]*?\\n      \\}'));
   assert.ok(source, 'the console exposes ' + name);
-  const context = vm.createContext(globals);
+  const context = vm.createContext({ deviceTaskState: {}, ...globals });
+  if (name === 'taskCellHtml') {
+    vm.runInContext(consoleFunctionSource('pushTaskCellHtml'), context);
+  }
   vm.runInContext(source[0], context);
   return context;
 }
 
-test('failed job creation clears the matching optimistic request', async () => {
-  const harness = loadAdapter({
-    fetch: async () => new Response(JSON.stringify({ error: 'create failed' }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    }),
+function consoleFunctionSource(name) {
+  const match = indexSource.match(new RegExp('function ' + name + '\\([^)]*\\) \\{[\\s\\S]*?\\n      \\}'));
+  assert.ok(match, 'the console exposes ' + name);
+  return match[0];
+}
+
+function openIntegratedConsole(options = {}) {
+  const harness = openConsole(options);
+  const cells = [new FakeElement('div'), new FakeElement('span')];
+  const consoleLogs = [];
+  const fields = Object.fromEntries(['files', 'folder', 'name', 'dest', 'send'].map(id => [id, new FakeElement('input')]));
+  fields.files.files = [new File(['data'], 'content.txt')];
+  fields.folder.files = [];
+  fields.dest.value = '/sdcard/job';
+  const context = vm.createContext({
+    window, WebSocket: window.WebSocket, ws: harness.socket,
+    view: 'console', targetTab: 'devices', deviceTaskState: {},
+    document: { getElementById(id) { return fields[id]; } },
+    targetsBody: { querySelectorAll() { return cells; } },
+    deviceById(id) { return { device_id: id, status: options.isDeviceOnline && !options.isDeviceOnline(id) ? 'offline' : 'online' }; },
+    pushStateUnavailable() { return false; },
+    renderTabs() {}, renderTargets() {}, updateButtons() {},
+    selectedIds: new Set(['D1']), onlineTargets(ids) { return ids; },
+    verifyDirRef: { tree_hash: 'same-hash' }, verifyApkRef: null,
+    verifyDirPath: { value: '/sdcard/job' },
+    FormData, fetch(...args) { return window.fetch(...args); },
+    formatBytes(value) { return String(value); },
+    esc(value) { return String(value || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); },
+    labelFor(id) { return id; }, addLog(message) { consoleLogs.push(message); },
   });
-  const socket = new window.WebSocket('ws://localhost/ws/admin');
-  const form = new FormData();
-  form.append('files', new File(['data'], 'content.txt'));
-  const staged = await window.fetch('/api/bundles', { method: 'POST', body: form });
-  const marker = await staged.json();
-  const requestId = marker.bundle_url.slice('push-job://pending/'.length);
+  for (const name of ['pushAssignmentFor', 'pushTaskCellHtml', 'taskCellHtml', 'progressCellHtml',
+    'updateTaskCell', 'wsSend', 'handleMessage', 'classifyDir', 'sendVerifyDir', 'createPushPanel']) {
+    vm.runInContext(consoleFunctionSource(name), context);
+  }
+  const bridge = indexSource.match(/window\.__stylyPushJobsV1Bridge = \{[\s\S]*?\n      \};/);
+  assert.ok(bridge, 'integration tests use the production bridge');
+  vm.runInContext(bridge[0], context);
+  vm.runInContext("createPushPanel({fileId:'files',folderId:'folder',nameId:'name',destId:'dest',btnId:'send',verb:'Push',deleteExtras:false,emptyLabel:'No files'})", context);
+  return {
+    ...harness, context, cells, consoleLogs,
+    html() { return cells[0].innerHTML || ''; },
+    verify() {
+      context.sendVerifyDir();
+      context.handleMessage({ type: 'VERIFY_DIR_RESULT', device_id: 'D1', status: 'ok', tree_hash: 'same-hash' });
+    },
+    async sendPush() { fields.send.click(); await new Promise(resolve => setImmediate(resolve)); },
+  };
+}
 
-  socket.send(JSON.stringify({
-    type: 'PUSH_FILES',
-    target_devices: ['D1'],
-    bundle_url: marker.bundle_url,
-    dest_path: '/sdcard/job',
-    delete_extras: false,
-  }));
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.deepEqual(harness.clearedPendingRequests, [requestId]);
+test('real bridge keeps Verify Dir alongside Push when Resume advances the canonical job', () => {
+  const h = openIntegratedConsole();
+  h.socket.snapshot(snapshot('resume-job', 7, 'D1', 'queued', 1, { resumeRequired: true, cancellable: true }));
+  h.verify();
+  assert.match(h.html(), /Push:.*Resume required/);
+  assert.match(h.html(), /Verify Dir:.*match/);
+  assert.match(h.html(), /data-job-id="resume-job"/);
+  assert.equal(window.__stylyPushJobsV1Actions.sendDeviceAction('D1', 'resume-job', 'resume'), true);
+  h.socket.update(snapshot('resume-job', 8, 'D1', 'downloading', 1));
+  assert.match(h.html(), /Push:.*Transferring/);
+  assert.match(h.html(), /Verify Dir:.*match/);
+  assert.doesNotMatch(h.html(), /data-action="resume"/);
+  assert.equal(h.context.deviceTaskState.D1.task, 'verify', 'no Push copy owns the generic task state');
+  assert.equal(h.cells[1].innerHTML, h.html(), 'all visible cells are invalidated');
 });
+
+test('real bridge selects a Retry job after Verify without comparing revisions across jobs', () => {
+  const h = openIntegratedConsole();
+  h.socket.snapshot(snapshot('failed-job', 90, 'D1', 'failed', 1, { retryable: true }));
+  h.verify();
+  findElementByText(h.pushJobsTabActions, 'Retry failed devices').click();
+  assert.equal(h.socket.sent.at(-1).type, 'RETRY_FAILED_PUSH_JOB');
+  h.socket.update(snapshot('retry-job', 1, 'D1', 'downloading', 2));
+  assert.match(h.html(), /Push:.*Transferring/);
+  assert.match(h.html(), /Verify Dir:.*match/);
+  h.socket.update(snapshot('retry-job', 2, 'D1', 'succeeded', 2));
+  assert.match(h.html(), /Push:.*pushed/);
+  assert.match(h.html(), /Verify Dir:.*match/);
+});
+
+test('late Install and Verify results never hide canonical Push status or controls', () => {
+  const h = openIntegratedConsole();
+  h.socket.snapshot(snapshot('active-job', 1, 'D1', 'queued', 1, { resumeRequired: true, cancellable: true }));
+  for (const message of [
+    { type: 'INSTALL_DEVICE_STATE', device_ids: ['D1'], state: 'installing' },
+    { type: 'INSTALL_RESULT', device_id: 'D1', status: 'success', apk_filename: 'app.apk' },
+    { type: 'VERIFY_APK_RESULT', device_id: 'D1' },
+    { type: 'VERIFY_DIR_RESULT', device_id: 'D1', status: 'ok', tree_hash: 'same-hash' },
+  ]) {
+    h.context.handleMessage(message);
+    assert.match(h.html(), /Push:.*Resume required/);
+    assert.match(h.html(), /data-action="resume".*data-job-id="active-job"/);
+    assert.match(h.html(), /data-action="cancel".*data-job-id="active-job"/);
+    assert.match(h.html(), /(?:Install|Verify APK|Verify Dir):/);
+  }
+});
+
+test('canonical refresh invalidates real cells and preserves the independent result when Push disappears', () => {
+  const h = openIntegratedConsole();
+  h.socket.snapshot(snapshot('active-job', 1, 'D1', 'downloading', 1));
+  h.verify();
+  h.socket.update(snapshot('active-job', 2, 'D1', 'validating', 1));
+  assert.match(h.html(), /Push:.*Validating/);
+  h.socket.snapshot();
+  assert.match(h.html(), /match/);
+  assert.doesNotMatch(h.html(), /Push:|Validating|data-job-id/);
+  assert.equal(h.context.deviceTaskState.D1.task, 'verify');
+});
+
+test('real cells preserve snapshot buffering, revision filtering, and retired socket ordering after Verify', () => {
+  const h = openIntegratedConsole();
+  h.verify();
+  h.socket.update(snapshot('ordered', 3, 'D1', 'validating', 1));
+  assert.doesNotMatch(h.html(), /Validating/);
+  h.socket.snapshot(snapshot('ordered', 1, 'D1', 'downloading', 1));
+  assert.match(h.html(), /Push:.*Validating.*Verify Dir:.*match/);
+  h.socket.update(snapshot('ordered', 2, 'D1', 'applying', 1));
+  assert.match(h.html(), /Validating/);
+  const replacement = new window.WebSocket('ws://localhost/ws/admin');
+  h.socket.update(snapshot('ordered', 99, 'D1', 'succeeded', 1));
+  h.socket.snapshot();
+  assert.match(h.html(), /Validating/);
+  replacement.update(snapshot('ordered', 4, 'D1', 'applying', 1));
+  assert.match(h.html(), /Validating/);
+  replacement.snapshot(snapshot('ordered', 3, 'D1', 'validating', 1));
+  assert.match(h.html(), /Push:.*Pushing.*Verify Dir:.*match/);
+});
+
+test('connectivity invalidation keeps canonical Push separate from Verify', () => {
+  let online = true;
+  const h = openIntegratedConsole({ isDeviceOnline: () => online });
+  h.socket.snapshot(snapshot('offline-job', 1, 'D1', 'queued', 1, { resumeRequired: true }));
+  h.verify();
+  online = false;
+  window.__stylyPushJobsV1Actions.refreshConnectivity();
+  assert.match(h.html(), /Resume required · offline.*Verify Dir:.*match/);
+  assert.doesNotMatch(h.html(), /data-action="resume"/);
+  online = true;
+  window.__stylyPushJobsV1Actions.refreshConnectivity();
+  assert.match(h.html(), /data-action="resume".*data-job-id="offline-job"/);
+  assert.match(h.html(), /Verify Dir:.*match/);
+});
+
+test('real bridge preserves old unresolved fence ahead of queued Retry and aligns its controls', () => {
+  const h = openIntegratedConsole();
+  const old = snapshot('old-fence', 80, 'D1', 'unconfirmed', 1, { cancellable: true });
+  old.devices.D1.device_fence = { blocking_job_id: old.job_id };
+  const retry = snapshot('retry', 1, 'D1', 'queued', 2, { resumeRequired: true });
+  h.socket.snapshot(old, retry);
+  h.verify();
+  assert.match(h.html(), /Status unknown/);
+  assert.match(h.html(), /data-action="cancel".*data-job-id="old-fence"/);
+  assert.doesNotMatch(h.html(), /data-action="resume"/);
+  h.socket.update({ ...old, revision: 81, devices: { D1: { ...old.devices.D1, device_fence: null } } });
+  assert.match(h.html(), /Resume required/);
+  assert.match(h.html(), /data-action="resume".*data-job-id="retry"/);
+  assert.doesNotMatch(h.html(), /Status unknown|data-job-id="old-fence"/);
+});
+
+for (const failure of ['create', 'upload', 'dispatch', 'disconnected']) {
+  test('failed ' + failure + ' preserves canonical Push and unrelated results through the real panel', async () => {
+    const h = openIntegratedConsole({ fetch: async url => {
+      if ((failure === 'create' && url === '/api/push-jobs') ||
+          (failure === 'upload' && url === '/upload')) throw new Error(failure + ' failed');
+      const body = url === '/api/push-jobs'
+        ? { job_id: 'new-job', state: 'created', upload_url: '/upload' }
+        : { job_id: 'new-job', state: 'ready' };
+      return new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } });
+    } });
+    h.socket.snapshot(snapshot('existing-job', 10, 'D1', 'succeeded', 1));
+    h.verify();
+    const before = h.html();
+    const other = h.context.deviceTaskState.D1;
+    if (failure === 'dispatch') h.socket.sendError = new Error('send failed');
+    if (failure === 'disconnected') h.socket.readyState = FakeWebSocket.CLOSED;
+    await h.sendPush();
+    if (failure === 'disconnected') {
+      assert.ok(h.consoleLogs.some(message => message === 'Cannot push files: not connected to server'));
+    } else {
+      assert.ok(findElementByText(h.logContainer, 'Push/Sync job failed before dispatch: ' +
+        (failure === 'dispatch' ? 'send failed' : failure + ' failed')));
+    }
+    assert.equal(h.html(), before);
+    assert.equal(h.context.deviceTaskState.D1, other);
+    assert.match(h.html(), /Push:.*pushed/);
+    assert.match(h.html(), /Verify Dir:.*match/);
+    // A failed request must also preserve unrelated state when no Push job exists.
+    h.socket.snapshot();
+    await h.sendPush();
+    assert.equal(h.context.deviceTaskState.D1, other);
+    assert.match(h.html(), /match/);
+  });
+}
 
 test('upload dispatch uses the replacement admin socket', async () => {
   let finishUpload;
@@ -328,42 +489,6 @@ test('upload dispatch uses the replacement admin socket', async () => {
     type: 'PUSH_FILES',
     job_id: '11111111-1111-4111-8111-111111111111',
   }]);
-  assert.deepEqual(harness.clearedPendingRequests, []);
-});
-
-test('a rejected canonical assignment is not recorded as rendered', () => {
-  const harness = loadAdapter({ applyAssignment: () => false });
-  const socket = new window.WebSocket('ws://localhost/ws/admin');
-  socket.emit({
-    type: 'PUSH_JOBS_SNAPSHOT',
-    jobs: [snapshot('active-job', 1, 'D1', 'downloading', 1)],
-  });
-  socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [] });
-
-  assert.equal(harness.applied.length, 1);
-  assert.deepEqual(harness.cleared, []);
-});
-
-test('optimistic paint preserves only active canonical Push assignments', () => {
-  const match = indexSource.match(
-    /function shouldPreserveCanonicalPushAssignment\(current\) \{[\s\S]*?\n        \}/,
-  );
-  assert.ok(match, 'the console exposes a testable optimistic-paint predicate');
-  const shouldPreserve = vm.runInNewContext('(' + match[0] + ')');
-
-  for (const status of ['queued', 'transferring', 'validating', 'applying', 'reconciling', 'unconfirmed', 'resume_required']) {
-    assert.equal(shouldPreserve({
-      owner: 'push-job-v1', job_id: 'active-job', status,
-    }), true, status);
-  }
-  for (const status of ['success', 'fail']) {
-    assert.equal(shouldPreserve({
-      owner: 'push-job-v1', job_id: 'terminal-job', status,
-    }), false, status);
-  }
-  assert.equal(shouldPreserve({
-    owner: 'push-job-v1', job_id: null, status: 'queued',
-  }), false);
 });
 
 test('full snapshots merge pre-snapshot updates and remove absent jobs', () => {
@@ -720,7 +845,7 @@ test('offline push rows retain unfinished jobs without claiming current executio
   assert.match(context.taskCellHtml('D1'), /failed/);
 });
 
-test('device list disconnect retains durable push assignment until authoritative snapshot', () => {
+test('device list disconnect clears only generic task state', () => {
   const match = indexSource.match(/case 'DEVICE_LIST': \{([\s\S]*?)\n            break;/);
   assert.ok(match);
   const context = vm.createContext({
@@ -730,13 +855,13 @@ test('device list disconnect retains durable push assignment until authoritative
     isOnline(device) { return device.status === 'online'; },
     getDeviceId(device) { return device.device_id; },
     deviceTaskState: {
-      D1: { task: 'push', owner: 'push-job-v1', status: 'applying' },
+      D1: { task: 'verify', kind: 'dir', status: 'match' },
       D2: { task: 'install', status: 'installing' },
     },
     syncActiveGroupSelection() {}, render() {}, window: {},
   });
   vm.runInContext(match[1], context);
-  assert.equal(context.deviceTaskState.D1.status, 'applying');
+  assert.equal(context.deviceTaskState.D1, undefined);
   assert.equal(context.deviceTaskState.D2, undefined);
 });
 
@@ -945,6 +1070,7 @@ test('Needs attention keeps canonical jobs separate from provisional power selec
 test('device progress exposes escaped inline action identities', () => {
   const context = loadConsoleFunction('progressCellHtml', {
     taskCellHtml() { return 'Resume required'; },
+    pushTaskCellHtml() { return 'Resume required'; },
     pushAssignmentFor() { return { job_id: 'job"x', canResume: true, canCancel: true }; },
     pushStateUnavailable() { return false; }, deviceById() { return {}; },
     esc(value) { return String(value).replace(/"/g, '&quot;'); },

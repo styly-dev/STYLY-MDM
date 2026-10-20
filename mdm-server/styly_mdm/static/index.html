@@ -653,7 +653,7 @@
       let userPickedTab = false;       // true once the user clicks a sub-tab (stops auto-default)
       let expandedGroups = new Set();  // group names expanded to show per-device status
       let view = 'console';            // 'console' | 'manage'
-      let deviceTaskState = {};           // id -> { task, status, filename, detail, note, verb }
+      let deviceTaskState = {};           // Latest Install/Verify or legacy Push state; job-v1 Push lives in its canonical store.
       let editingLabelId = null;
       // The rows are re-rendered from scratch on every DEVICE_LIST (a battery report from
       // any device triggers one), which destroys the open editor's <input>. Keep the typed
@@ -1018,8 +1018,7 @@
             // live socket but its Updating… cell must survive the list refresh.
             const keepTask = new Set(devices.filter(isOnline).map(getDeviceId));
             Object.keys(deviceTaskState).forEach(function (id) {
-              // Durable jobs survive disconnects; connectivity is rendered separately.
-              if (!keepTask.has(id) && deviceTaskState[id].owner !== 'push-job-v1') {
+              if (!keepTask.has(id)) {
                 delete deviceTaskState[id];
               }
             });
@@ -1493,17 +1492,8 @@
         }
       }
 
-      // The cell shows whichever job last touched the device: install, push or verify.
-      // A later job overwrites an earlier one, exactly as a second install would; the log
-      // keeps the full history either way.
-      //
-      // Install and push are both throttled against the same server-wide pool of transfer
-      // slots, so both walk the same live states, server-broadcast as the device moves: it
-      // waits for a slot (queued), pulls the file (transferring), then does its local work
-      // off the critical path — installing the APK, or validating and unzipping the
-      // bundle (validating) before mirroring it (applying) — then reports a terminal
-      // INSTALL_RESULT / PUSH_FILES_RESULT.
-      // A verify moves no bytes, so it takes no slot and has no such phases.
+      // Install/Verify and legacy Push retain their latest task result. Durable
+      // Push is rendered independently from the canonical job store below.
       function taskCellHtml(id) {
         const st = deviceTaskState[id];
         if (!st) return '<span class="ins-none">—</span>';
@@ -1519,36 +1509,7 @@
           if (st.status === 'error') return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ error</span>';
           return '<span class="ins-fail" title="' + esc(what + ': ' + (st.detail || 'mismatch')) + '">✗ mismatch</span>';
         }
-        if (st.task === 'push') {
-          // `verb` comes from the canonical job mode, so a synced device does not
-          // report itself as "pushed".
-          const verb = st.verb || 'Push';
-          const device = deviceById(id);
-          if (st.status === 'cancel_pending') return '<span class="ins-queued">Cancel pending' + ((!device || device.status !== 'online') ? ' · offline' : '') + '</span>';
-          if (st.status === 'cancelled') return '<span class="ins-none">Cancelled</span>';
-          if (st.status === 'reconciling') {
-            return '<span class="ins-queued" title="Waiting for the device to report whether the job is still running or has finished.">◦ Awaiting status confirmation' + ((!device || device.status !== 'online') ? ' · offline' : '') + '</span>';
-          }
-          if (['queued', 'transferring', 'validating', 'applying'].indexOf(st.status) >= 0 &&
-              (!device || device.status !== 'online')) {
-            return '<span class="ins-queued" title="The device is disconnected. This job is unfinished; its current execution status is unknown.">◦ Job pending · offline</span>';
-          }
-          if (st.status === 'resume_required') {
-            if (!device || device.status !== 'online') {
-              return '<span class="ins-queued" title="The device is disconnected. Resume becomes available when it reconnects.">◦ Resume required · offline</span>';
-            }
-            return '<span class="ins-queued">◦ Resume required</span>';
-          }
-          if (st.status === 'unconfirmed') {
-            return '<span class="ins-queued" title="' + esc(st.detail || 'Waiting to confirm the device result') + '">◦ Status unknown</span>';
-          }
-          if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
-          if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
-          if (st.status === 'validating') return '<span class="ins-installing" title="Checking artifact integrity and extracting the bundle"><span class="spinner">⟳</span> Validating…</span>';
-          if (st.status === 'applying') return '<span class="ins-installing"><span class="spinner">⟳</span> ' + esc(verb) + 'ing…</span>';
-          if (st.status === 'success') return '<span class="ins-success">✓ ' + esc(verb.toLowerCase()) + 'ed</span>' + (st.note ? ' <span class="ins-none">' + esc(st.note) + '</span>' : '');
-          return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
-        }
+        if (st.task === 'push') return pushTaskCellHtml(id, st);
         if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
         if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
         if (st.status === 'installing') return '<span class="ins-installing"><span class="spinner">⟳</span> Installing…</span>';
@@ -1558,9 +1519,40 @@
         return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
       }
 
+      function pushTaskCellHtml(id, st) {
+        // `verb` comes from the canonical job mode, so a synced device does not
+        // report itself as "pushed".
+        const verb = st.verb || 'Push';
+        const device = deviceById(id);
+        if (st.status === 'cancel_pending') return '<span class="ins-queued">Cancel pending' + ((!device || device.status !== 'online') ? ' · offline' : '') + '</span>';
+        if (st.status === 'cancelled') return '<span class="ins-none">Cancelled</span>';
+        if (st.status === 'reconciling') {
+          return '<span class="ins-queued" title="Waiting for the device to report whether the job is still running or has finished.">◦ Awaiting status confirmation' + ((!device || device.status !== 'online') ? ' · offline' : '') + '</span>';
+        }
+        if (['queued', 'transferring', 'validating', 'applying'].indexOf(st.status) >= 0 &&
+            (!device || device.status !== 'online')) {
+          return '<span class="ins-queued" title="The device is disconnected. This job is unfinished; its current execution status is unknown.">◦ Job pending · offline</span>';
+        }
+        if (st.status === 'resume_required') {
+          if (!device || device.status !== 'online') {
+            return '<span class="ins-queued" title="The device is disconnected. Resume becomes available when it reconnects.">◦ Resume required · offline</span>';
+          }
+          return '<span class="ins-queued">◦ Resume required</span>';
+        }
+        if (st.status === 'unconfirmed') {
+          return '<span class="ins-queued" title="' + esc(st.detail || 'Waiting to confirm the device result') + '">◦ Status unknown</span>';
+        }
+        if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
+        if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
+        if (st.status === 'validating') return '<span class="ins-installing" title="Checking artifact integrity and extracting the bundle"><span class="spinner">⟳</span> Validating…</span>';
+        if (st.status === 'applying') return '<span class="ins-installing"><span class="spinner">⟳</span> ' + esc(verb) + 'ing…</span>';
+        if (st.status === 'success') return '<span class="ins-success">✓ ' + esc(verb.toLowerCase()) + 'ed</span>' + (st.note ? ' <span class="ins-none">' + esc(st.note) + '</span>' : '');
+        return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
+      }
+
       function progressCellHtml(id) {
-        let task = taskCellHtml(id);
         const assignment = pushAssignmentFor(id);
+        let task = assignment ? pushTaskCellHtml(id, assignment) : taskCellHtml(id);
         if (assignment) {
           const actions = [];
           function button(action, label) {
@@ -1570,6 +1562,12 @@
           if (assignment.canResume) actions.push(button('resume', 'Resume'));
           if (assignment.canCancel) actions.push(button('cancel', 'Cancel'));
           if (actions.length) task += '<span class="push-job-actions">' + actions.join('') + '</span>';
+          task = '<div><span class="ins-none">' + esc(assignment.verb) + ': </span>' + task + '</div>';
+          const other = deviceTaskState[id];
+          if (other && other.task !== 'push') {
+            const label = other.task === 'verify' ? (other.kind === 'dir' ? 'Verify Dir' : 'Verify APK') : 'Install';
+            task += '<div><span class="ins-none">' + label + ': </span>' + taskCellHtml(id) + '</div>';
+          }
         }
         if (!pushStateUnavailable(deviceById(id))) return task;
         return task + '<div class="push-state-warning" title="The device retries automatically for about 5 minutes. If this remains, free device storage and reboot the device.">' +
@@ -1589,9 +1587,8 @@
         });
       }
 
-      // The job-v1 adapter owns only task states carrying this marker. A later
-      // install or verify result must not be replaced or cleared by an older Push
-      // snapshot that happens to arrive afterwards.
+      // The adapter invalidates cells after updating its canonical store. It never
+      // copies Push assignments into the independent Install/Verify task state.
       window.__stylyPushJobsV1Bridge = {
         isDeviceOnline: function (id) { const d = deviceById(id); return !!d && d.status === 'online'; },
         refreshAttention: function () {
@@ -1599,52 +1596,7 @@
           renderTabs();
           if (targetTab === 'attention') renderTargets();
         },
-        applyAssignment: function (assignment) {
-          if (!assignment || !assignment.device_id || !assignment.job_id) return false;
-          const current = deviceTaskState[assignment.device_id];
-          if (current && current.task !== 'push') return false;
-          if (current && current.owner === 'push-job-v1' &&
-              current.pending_request_id &&
-              current.pending_request_id !== assignment.client_request_id) {
-            return false;
-          }
-          deviceTaskState[assignment.device_id] = {
-            task: 'push',
-            status: assignment.status,
-            verb: assignment.verb,
-            filename: assignment.filename,
-            note: assignment.note,
-            detail: assignment.detail,
-            owner: 'push-job-v1',
-            job_id: assignment.job_id,
-            pending_request_id: null,
-            revision: assignment.revision,
-            enqueue_seq: assignment.enqueue_seq,
-          };
-          updateTaskCell(assignment.device_id);
-          return true;
-        },
-        clearAssignment: function (deviceId, jobId) {
-          const current = deviceTaskState[deviceId];
-          if (!current || current.owner !== 'push-job-v1' || current.job_id !== jobId) {
-            return false;
-          }
-          delete deviceTaskState[deviceId];
-          updateTaskCell(deviceId);
-          return true;
-        },
-        clearPendingRequest: function (requestId) {
-          let cleared = false;
-          Object.keys(deviceTaskState).forEach(function (deviceId) {
-            const current = deviceTaskState[deviceId];
-            if (!current || current.owner !== 'push-job-v1' ||
-                current.pending_request_id !== requestId) return;
-            delete deviceTaskState[deviceId];
-            updateTaskCell(deviceId);
-            cleared = true;
-          });
-          return cleared;
-        },
+        invalidateDevice: function (deviceId) { updateTaskCell(deviceId); },
       };
 
       function renderActions() {
@@ -1990,32 +1942,11 @@
               bundle_filename: bundle.bundle_filename, dest_path: dest, delete_extras: cfg.deleteExtras,
             };
             if (!wsSend(msg, cfg.verb.toLowerCase() + ' files')) return;
-            // Optimistic first paint only. The matching canonical job snapshot replaces
-            // it after create/upload/dispatch; unrelated older jobs cannot claim it.
-            online.forEach(function (id) {
-              const current = deviceTaskState[id];
-              if (shouldPreserveCanonicalPushAssignment(current)) {
-                return;
-              }
-              const pendingPrefix = 'push-job://pending/';
-              const pendingRequestId = String(bundle.bundle_url || '').indexOf(pendingPrefix) === 0
-                ? String(bundle.bundle_url).slice(pendingPrefix.length) : null;
-              deviceTaskState[id] = {
-                task: 'push', status: 'queued', verb: cfg.verb, filename: dest,
-                note: '', detail: '', owner: 'push-job-v1', job_id: null,
-                pending_request_id: pendingRequestId,
-              };
-              updateTaskCell(id);
-            });
+            // Canonical snapshots drive Push progress, including queued jobs.
             addLog(cfg.verb + 'ing ' + bundle.bundle_filename + ' → ' + dest + ' on ' + online.length + ' device(s)', 'info');
             // Force a fresh pick next time (LAN/non-secure context cannot detect a local change).
             reset();
           }).catch(function (err) { nameEl.textContent = 'Upload failed'; addLog(cfg.verb + ' files failed: ' + err.message, 'fail'); });
-        }
-
-        function shouldPreserveCanonicalPushAssignment(current) {
-          return !!(current && current.owner === 'push-job-v1' && current.job_id &&
-            ['queued', 'transferring', 'validating', 'applying', 'reconciling', 'unconfirmed', 'resume_required', 'cancel_pending'].indexOf(current.status) >= 0);
         }
 
         function hasSelection() { return selectionFiles().length > 0; }
