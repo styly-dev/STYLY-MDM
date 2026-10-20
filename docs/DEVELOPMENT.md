@@ -40,6 +40,13 @@ and sends the ACK. On Android, the coordinator's durable `state.active` is the
 sole execution owner; the actor checks incoming commands directly against that state.
 These internal changes preserve the wire protocol, SQLite schema and state JSON.
 
+Before dispatch, upload/preparation failure or expiry settles the job and its
+never-dispatched queued targets in one transaction. Startup recovery also repairs
+older failed/interrupted jobs whose targets were left queued, preserving their
+original terminal history. Dispatch evidence and exact fences exclude a job from
+this repair. Retry requires a published, retained artifact that is not known to
+be missing; the Retry endpoint still checks the physical bytes before creating work.
+
 Issue #94 adds resumable transfers, per-device Resume and Cancel controls, and
 retry of failed targets. See [Push / Sync jobs](PUSH_JOBS.md) for the recovery
 rules, protocol, operator controls, and schema-3 deployment requirements.
