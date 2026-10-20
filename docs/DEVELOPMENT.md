@@ -154,18 +154,14 @@ A consequence worth knowing: selecting a group stages every member, so a filter 
 afterwards cannot narrow it — the members stay on screen, marked. That is deliberate, since
 those members are exactly what an action would dispatch to.
 
-On the main Devices list, clicking a row checkbox toggles that device and records its stable
-device ID as the range anchor. Shift-clicking another checkbox applies that checkbox's next
-state to every visible row between it and the anchor, inclusive; selections outside the range
-stay as they were. Every valid click, including a Shift-click, becomes the next range anchor.
-The range follows the current displayed order after filtering, status filtering, or sorting, and selected rows kept
-visible by the filter participate in that order. If the anchor is no longer visible or has
-been removed, a Shift-click acts as a normal toggle and becomes the new anchor. Refreshes
-retain anchors by device ID, not row position. Select-all, clear, group selection, and crossing
-between the normal tabs reset the anchor. Shift-click selection controls do not select page
-text. Individual and range selection update checkbox controls and action summaries in place,
-removing deselected filter-kept rows without rebuilding the list. Ordinary clicks do not sort
-the device list. These rules apply only to the main Devices list.
+In the main Devices list, Shift-click applies the clicked checkbox's next state to the
+inclusive range from the last clicked device, leaving other selections unchanged. Each click
+sets the next anchor by device ID, retained across refreshes. Ranges follow the displayed
+filter/sort order, including selected rows kept visible. A hidden or removed anchor falls back
+to a single toggle. Select-all, clear, group selection, and tab changes reset the anchor.
+Selection updates controls and action summaries in place, removing deselected filter-kept
+rows without rebuilding the list. Ordinary clicks skip sorting; Shift-click prevents page
+text selection.
 
 ### Seeding dummy devices for UI testing
 
