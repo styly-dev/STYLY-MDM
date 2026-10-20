@@ -300,6 +300,34 @@ function openIntegratedConsole(options = {}) {
   };
 }
 
+test('store snapshot renders upload failure, later Resume, and unresolved fence in real cells', {
+  skip: !process.env.PUSH_LIFECYCLE_FIXTURES,
+}, () => {
+  const { failed, paused, fenced, expectedDetail } = JSON.parse(process.env.PUSH_LIFECYCLE_FIXTURES);
+  const h = openIntegratedConsole();
+  h.socket.snapshot(failed);
+  h.verify();
+  assert.match(h.html(), /Push:.*failed/);
+  assert.ok(h.html().includes(expectedDetail), 'the store failure detail reaches the real cell');
+  assert.match(h.html(), /Verify Dir:.*match/);
+  assert.doesNotMatch(h.html(), /Queued|Resume required|data-action="resume"/);
+  assert.equal(findElementByText(h.pushJobsTabActions, 'Retry failed devices'), undefined);
+  assert.equal(window.__stylyPushJobsV1Actions.assignmentFor('D1').job_id, failed.job_id);
+
+  h.socket.snapshot(failed, paused);
+  assert.match(h.html(), /Push:.*Resume required/);
+  assert.match(h.html(), new RegExp('data-action="resume".*data-job-id="' + paused.job_id + '"'));
+  assert.match(h.html(), /Verify Dir:.*match/);
+  assert.equal(findElementByText(h.pushJobsTabActions, 'Retry failed devices'), undefined);
+  assert.equal(window.__stylyPushJobsV1Actions.assignmentFor('D1').job_id, paused.job_id);
+
+  h.socket.snapshot(failed, paused, fenced);
+  assert.match(h.html(), /Push:.*Status unknown/);
+  assert.match(h.html(), new RegExp('data-action="cancel".*data-job-id="' + fenced.job_id + '"'));
+  assert.doesNotMatch(h.html(), /data-action="resume"/);
+  assert.equal(window.__stylyPushJobsV1Actions.assignmentFor('D1').job_id, fenced.job_id);
+});
+
 test('real bridge keeps Verify Dir alongside Push when Resume advances the canonical job', () => {
   const h = openIntegratedConsole();
   h.socket.snapshot(snapshot('resume-job', 7, 'D1', 'queued', 1, { resumeRequired: true, cancellable: true }));

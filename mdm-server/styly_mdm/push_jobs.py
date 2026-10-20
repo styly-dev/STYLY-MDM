@@ -149,6 +149,7 @@ def assignment_actions(
     blocking_fence: bool,
     failure_code: str | None = None,
     superseded: bool = False,
+    artifact_available: bool = False,
 ) -> AssignmentActions:
     """Single source of truth for per-assignment operator actions.
 
@@ -159,6 +160,8 @@ def assignment_actions(
     ``retryable`` is the rule ``retry_failed`` enforces before its online check.
     A ``superseded`` target already has later work for the same destination, so
     retrying it would overwrite newer content.
+    Retry also needs a published, retained artifact; its endpoint separately
+    validates the physical bytes before creating any replacement work.
     """
 
     manual_wait = (
@@ -190,10 +193,11 @@ def assignment_actions(
     )
     retryable = (
         open_for_action
+        and artifact_available
         and not superseded
         and state
         in {DeviceState.FAILED.value, DeviceState.INTERRUPTED.value, DeviceState.UNCONFIRMED.value}
-        and failure_code != "cancelled"
+        and failure_code not in {"cancelled", "artifact_missing"}
     )
     return AssignmentActions(manual_wait, resume_required, cancellable, retryable)
 

@@ -185,6 +185,16 @@ class PushJobManager:
                 ).fetchone()
                 if original is None:
                     raise StoreNotFound(job_id)
+                artifact = conn.execute(
+                    "SELECT * FROM push_artifacts WHERE artifact_id=?",
+                    (original["artifact_id"],),
+                ).fetchone()
+                if artifact is None or artifact["retention_state"] != "retained":
+                    raise StoreConflict("retry artifact is no longer available; upload a new job")
+                path = root / artifact["storage_name"]
+                if (path.resolve().parent != root or not path.is_file()
+                        or path.stat().st_size != artifact["byte_size"]):
+                    raise StoreConflict("retry artifact is missing or incomplete; upload a new job")
                 # The snapshot's retryable flag is the single eligibility rule.
                 eligible = {
                     device_id
@@ -206,16 +216,6 @@ class PushJobManager:
                 targets = [target for target in targets if target["device_id"] in online]
                 if not targets:
                     raise StoreConflict("no unsuccessful target of this job is online")
-                artifact = conn.execute(
-                    "SELECT * FROM push_artifacts WHERE artifact_id=?",
-                    (original["artifact_id"],),
-                ).fetchone()
-                if artifact is None or artifact["retention_state"] == "deleted":
-                    raise StoreConflict("retry artifact is no longer available; upload a new job")
-                path = root / artifact["storage_name"]
-                if (path.resolve().parent != root or not path.is_file()
-                        or path.stat().st_size != artifact["byte_size"]):
-                    raise StoreConflict("retry artifact is missing or incomplete; upload a new job")
                 timestamp = now_ms()
                 retry_id = str(uuid.uuid4())
                 conn.execute(
@@ -1660,6 +1660,15 @@ class PushJobManager:
                     job_id = row["job_id"]
                     state = JobState(row["state"])
                     if state is JobState.READY:
+                        try:
+                            self.store._settle_pre_dispatch_targets(
+                                conn, job_id, JobState.FAILED, "artifact_missing",
+                                f"referenced immutable artifact {row['storage_name']} is missing",
+                                terminal_at=timestamp, updated_at=timestamp,
+                            )
+                        except StoreConflict:
+                            # A READY label cannot override persisted execution evidence.
+                            continue
                         conn.execute(
                             "UPDATE push_jobs SET state=?, dispatch_enabled=0, "
                             "failure_code='artifact_missing', failure_detail=?, "
