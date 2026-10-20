@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
@@ -149,8 +150,9 @@ class MdmClientService : Service() {
         // Android 12+ when the start came from the background; startForegroundService() itself
         // can return cleanly first. Journalling only after it returns pins a failure to the
         // right call instead of leaving the two indistinguishable.
-        startForeground(NOTIFICATION_ID, buildNotification("Initializing..."))
+        promoteToForeground()
         UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_FOREGROUND_OK)
+        MdmClientApplication.wifiSettingsController().startStartupRecovery()
 
         webSocketManager = WebSocketManager(
             context = this,
@@ -171,6 +173,8 @@ class MdmClientService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // A location grant can arrive after onCreate, while this service is already running.
+        promoteToForeground()
         // A null intent is a START_STICKY redelivery; a start with no reason extra came from
         // outside our own code — the PICO keep-alive being the case the spike is looking for.
         val reason = when {
@@ -185,6 +189,14 @@ class MdmClientService : Service() {
             "reason=$reason flags=$flags"
         )
         return START_STICKY
+    }
+
+    private fun promoteToForeground() {
+        val locationGranted = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        val types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+            if (locationGranted) ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION else 0
+        startForeground(NOTIFICATION_ID, buildNotification("Initializing..."), types)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

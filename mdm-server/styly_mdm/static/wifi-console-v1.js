@@ -147,6 +147,7 @@
           loading: false,
           saving: false,
           applying: false,
+          registeringRecovery: false,
           dirty: false,
           conflicted: false,
           error: '',
@@ -269,7 +270,7 @@
       }).join('');
 
       const revisionText = model.savedRevision ? (model.savedMode === 'unmanaged' ? 'Saved: Do not manage Wi-Fi' : 'Saved profile') : 'No saved profile';
-      const busy = model.loading || model.saving || model.applying;
+      const busy = model.loading || model.saving || model.applying || model.registeringRecovery;
       const profileError = model.error ? '<div class="wifi-feedback wifi-danger" role="alert">' + escapeHtml(model.error) + '</div>' : '';
       const unavailable = enabled === false || stateUnavailable
         ? '<div class="wifi-feedback wifi-muted">Wi-Fi management is unavailable on this server.</div>' : '';
@@ -290,6 +291,8 @@
           '<div class="wifi-actions"><button class="btn-outline" type="button" data-wifi-action="add"' + (model.draftNetworks.length >= MAX_NETWORKS || busy ? ' disabled' : '') + '>Add Wi-Fi network</button>' +
           '<div class="wifi-action-right"><span class="wifi-meta">' + (model.dirty ? 'Unsaved changes' : model.savedRevision ? 'Saved' : 'Not saved') + '</span>' +
           (model.mode === 'managed' ? '<button class="btn btn-primary" type="button" data-wifi-action="save"' + (!model.dirty || busy ? ' disabled' : '') + '>Save Wi-Fi settings</button>' : '') +
+          (model.mode === 'managed' && model.savedRevision
+            ? '<button class="btn-outline" type="button" data-wifi-action="register-recovery"' + (model.dirty || busy ? ' disabled' : '') + '>Register recovery baseline</button>' : '') +
           '<button class="btn btn-success" type="button" data-wifi-action="apply"' + (model.dirty || !model.savedRevision || busy ? ' disabled' : '') + '>Send to whole group</button></div></div>' : '') +
         '<div class="wifi-device-results"><h4>Delivery status</h4><div data-wifi-device-list></div></div>' +
         '</section>';
@@ -417,7 +420,7 @@
       const input = event.target;
       if (!input || !input.matches || !input.matches('[data-wifi-row][data-wifi-field]') || !activeGroup) return;
       const model = profileFor(activeGroup);
-      if (model.loading || model.saving || model.applying || model.stale) return;
+      if (model.loading || model.saving || model.applying || model.registeringRecovery || model.stale) return;
       const row = model.draftNetworks.find(function (network) { return network.id === input.dataset.wifiRow; });
       if (!row) return;
       const field = input.dataset.wifiField;
@@ -445,9 +448,10 @@
       const model = profileFor(activeGroup);
       const save = groupPanel.querySelector('[data-wifi-action="save"]');
       const apply = groupPanel.querySelector('[data-wifi-action="apply"]');
+      const registerRecovery = groupPanel.querySelector('[data-wifi-action="register-recovery"]');
       const currentRevision = state && state.groups && state.groups[activeGroup] && state.groups[activeGroup].revision;
       model.stale = model.conflicted || !!(currentRevision && model.savedRevision && currentRevision !== model.savedRevision);
-      const busy = model.loading || model.saving || model.applying || model.stale ||
+      const busy = model.loading || model.saving || model.applying || model.registeringRecovery || model.stale ||
         enabled !== true || !transportAllowed();
       groupPanel.querySelectorAll('[data-wifi-field], [data-wifi-action="add"], [data-wifi-action="remove"], [data-wifi-action="unmanage"]').forEach(function (control) {
         const action = control.dataset && control.dataset.wifiAction;
@@ -460,6 +464,8 @@
       });
       if (save) save.disabled = model.mode !== 'managed' || !model.dirty || busy;
       if (apply) apply.disabled = model.dirty || !model.savedRevision || busy;
+      if (registerRecovery) registerRecovery.disabled = model.mode !== 'managed' ||
+        model.savedMode !== 'managed' || !model.savedRevision || model.dirty || busy;
       const stale = groupPanel.querySelector('[data-wifi-stale]');
       if (stale) stale.style.display = model.stale ? '' : 'none';
       const hint = groupPanel.querySelector('.wifi-action-right .wifi-meta');
@@ -471,7 +477,7 @@
       const name = activeGroup;
       const model = profileFor(name);
       if (enabled !== true ||
-          !model.loaded || model.stale || model.saving || model.applying) return;
+          !model.loaded || model.stale || model.saving || model.applying || model.registeringRecovery) return;
       if (!transportAllowed()) {
         model.error = 'Wi-Fi changes require HTTPS or managed-LAN HTTP enabled on the server.';
         renderProfile();
@@ -534,7 +540,7 @@
       if (!activeGroup || enabled !== true || !transportAllowed()) return;
       const name = activeGroup;
       const model = profileFor(name);
-      if (!model.loaded || model.stale || model.loading || model.saving || model.applying) return;
+      if (!model.loaded || model.stale || model.loading || model.saving || model.applying || model.registeringRecovery) return;
       if (!root.confirm('Delete Wi-Fi settings for "' + name + '"?\n\n' +
           'Existing Wi-Fi networks on devices will remain unchanged. This only saves a Do not manage Wi-Fi state on the server. You must deploy it explicitly to stop reapplying Wi-Fi settings at device startup.\n\nUnsaved Wi-Fi edits will be discarded.')) return;
       model.saving = true;
@@ -574,7 +580,7 @@
       if (!activeGroup || !state || enabled !== true) return;
       const name = activeGroup;
       const model = profileFor(name);
-      if (!model.savedRevision || model.stale || model.dirty || model.applying || model.saving) return;
+      if (!model.savedRevision || model.stale || model.dirty || model.applying || model.saving || model.registeringRecovery) return;
       if (!transportAllowed()) {
         model.error = 'Wi-Fi changes require HTTPS or managed-LAN HTTP enabled on the server.';
         renderProfile();
@@ -584,8 +590,12 @@
         const device = findDevice(memberId, getDevices());
         return device && (device.status === 'online' || device.status === 'updating');
       }).length;
-      const accepted = confirmApply('Send the saved Wi-Fi settings to the whole group "' + name + '"?\n\n' +
-        onlineCount + ' online device(s) are connected. Compatible clients check their Wi-Fi connection locally; the server does not wait for results. Offline devices are not queued. This may disconnect devices.');
+      const confirmation = model.mode === 'unmanaged'
+        ? 'Send the Do not manage Wi-Fi state to the whole group "' + name + '"?\n\n' +
+          onlineCount + ' online device(s) are connected. Existing Wi-Fi settings on devices remain unchanged. This stops reapplying managed Wi-Fi settings at startup. Offline devices are not queued. The server tracks sending only.'
+        : 'Send the saved Wi-Fi settings to the whole group "' + name + '"?\n\n' +
+          onlineCount + ' online device(s) are connected. This replaces Wi-Fi settings saved on devices. If connection fails, clients can restore only profiles held by MDM; other existing Wi-Fi settings may be lost. Compatible clients check the connection locally. Offline devices are not queued, and the server tracks sending only.';
+      const accepted = confirmApply(confirmation);
       if (!accepted) return;
       model.applying = true;
       model.error = '';
@@ -620,12 +630,58 @@
       }
     }
 
+    async function registerRecoveryBaseline() {
+      if (!activeGroup || !state || enabled !== true) return;
+      const name = activeGroup;
+      const model = profileFor(name);
+      if (!model.savedRevision || model.mode !== 'managed' || model.savedMode !== 'managed' ||
+          model.stale || model.dirty || model.registeringRecovery || model.saving || model.applying) return;
+      if (!transportAllowed()) {
+        model.error = 'Wi-Fi changes require HTTPS or managed-LAN HTTP enabled on the server.';
+        renderProfile();
+        return;
+      }
+      const accepted = confirmApply('Send the saved Wi-Fi profile to the whole group "' + name + '" as its initial recovery baseline?\n\n' +
+        'This does not change current Wi-Fi. You can update the initial baseline until a managed Wi-Fi profile connects successfully. Reachability is not checked now, and Wi-Fi settings unknown to MDM cannot be restored.');
+      if (!accepted) return;
+      model.registeringRecovery = true;
+      model.error = '';
+      updateButtons();
+      try {
+        const response = await root.fetch(apiUrl('/api/wifi/groups/' + encodeURIComponent(name) + '/recovery'), {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({ expected_revision: model.savedRevision }),
+        });
+        if (!response.ok) {
+          if (response.status === 409) model.conflicted = true;
+          model.error = response.status === 409
+            ? 'The saved profile changed or is not managed. Reload it before registering the recovery baseline.'
+            : 'Could not send the recovery baseline to the group.';
+        } else {
+          const delivery = await response.json();
+          const operations = Array.isArray(delivery.operations) ? delivery.operations : [];
+          const sent = operations.filter(function (item) { return item.status === 'sent'; }).length;
+          const failed = operations.filter(function (item) { return item.status === 'failed'; }).length;
+          const unknown = operations.length - sent - failed;
+          statusMessage = 'Recovery baseline delivery for ' + name + ': ' + sent + ' sent, ' + failed + ' failed, ' + unknown + ' unconfirmed.';
+          renderStatus();
+          await refreshState();
+        }
+      } catch (_) {
+        model.error = 'Could not send the recovery baseline to the group.';
+      } finally {
+        model.registeringRecovery = false;
+        if (name === activeGroup) renderProfile();
+      }
+    }
+
     function handleGroupClick(event) {
       const target = event.target.closest('[data-wifi-action]');
       if (!target) return;
       const action = target.dataset.wifiAction;
       const model = activeGroup ? profileFor(activeGroup) : null;
-      if (!model || model.loading || model.saving || model.applying) return;
+      if (!model || model.loading || model.saving || model.applying || model.registeringRecovery) return;
       if (action === 'reload' && model.stale) {
         if (model.dirty && !root.confirm('Discard unsaved Wi-Fi changes and reload the saved profile?')) return;
         model.dirty = false;
@@ -648,6 +704,7 @@
         renderProfile();
       } else if (action === 'save') saveProfile();
       else if (action === 'apply') applyProfile();
+      else if (action === 'register-recovery') registerRecoveryBaseline();
     }
 
     if (groupPanel) {

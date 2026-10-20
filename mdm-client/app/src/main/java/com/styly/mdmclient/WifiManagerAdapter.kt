@@ -1,12 +1,14 @@
 package com.styly.mdmclient
 
 import android.app.admin.DevicePolicyManager
+import android.app.ActivityManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
 import android.os.Parcel
 import android.util.Base64
+import android.util.Log
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -21,6 +23,25 @@ internal data class WifiConfiguredEntry(
     val priority: Int,
     val configurationParcel: String,
 )
+
+/** PICO can expose several security views for one saved network ID. */
+internal fun wifiProfileReadback(
+    entries: List<WifiConfiguredEntry>,
+    profile: List<WifiNetworkProfile>,
+    knownCredentialWrites: Set<String>,
+): String {
+    if (entries.map { it.networkId }.toSet().size != profile.size) return "mismatch"
+    val matchedIds = HashSet<Int>()
+    for (expected in profile) {
+        val actual = entries.filter {
+            it.ssid == expected.ssid && it.security == expected.security
+        }.distinctBy { it.networkId }.singleOrNull() ?: return "mismatch"
+        if (!matchedIds.add(actual.networkId) || actual.hidden != expected.hidden) return "mismatch"
+        if (actual.passwordReadable && actual.password != expected.password) return "mismatch"
+        if (!actual.passwordReadable && expected.identity !in knownCredentialWrites) return "unknown"
+    }
+    return "validated"
+}
 
 internal class WifiAdapterFailure(val reason: WifiReason) : Exception()
 
@@ -49,7 +70,7 @@ internal interface WifiSettingsAdapter {
     ): WifiReason
 }
 
-/** Uses only public Android configured-network APIs and fails closed without full-list authority. */
+/** Writes known MDM credentials using public Android configured-network APIs. */
 internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
     private val appContext = context.applicationContext
     private val wifiManager = appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
@@ -158,19 +179,12 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                 val restoreConfig = restoreSnapshot
                     ?.firstOrNull { it.profile.identity == network.identity }
                     ?.configurationParcel
-                if (restoreSnapshot != null && restoreConfig == null) return WifiReason.RESTORE_INFO_MISSING
-                val baseConfig = when {
-                    restoreConfig != null -> unmarshalConfiguration(restoreConfig)
-                    existing != null -> unmarshalConfiguration(existing.configurationParcel)
-                    else -> null
-                }
+                // Only legacy recovery journals supply parcels. New MDM profiles are built
+                // explicitly so an existing SAE view cannot override the requested PSK mode.
+                val baseConfig = restoreConfig?.let(::unmarshalConfiguration)
                 val configured = toWifiConfiguration(network, baseConfig).apply {
                     networkId = existing?.networkId ?: -1
-                    if (existing != null) {
-                        priority = if (restoreSnapshot == null) 0 else {
-                            restoreSnapshot.firstOrNull { it.profile.identity == network.identity }?.priority ?: 0
-                        }
-                    }
+                    priority = restoreSnapshot?.firstOrNull { it.profile.identity == network.identity }?.priority ?: 0
                 }
 
                 if (existing == null) {
@@ -202,7 +216,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             }
 
             // Removal happens after every desired network has a successful API result.
-            for (entry in initial) {
+            for (entry in initial.distinctBy { it.networkId }) {
                 if (!shouldContinue()) return WifiReason.TIMEOUT_ROLLED_BACK
                 if (entry.networkId in retainedIds) continue
                 val (removeReason, removed) = mutateApi { removeNetwork(manager, entry.networkId) }
@@ -220,8 +234,10 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                         it.ssid == saved.profile.ssid && it.security == saved.profile.security
                     } ?: return WifiReason.VERIFY_FAILED
                     if (current.priority != saved.priority) {
-                        val parcel = saved.configurationParcel ?: return WifiReason.RESTORE_INFO_MISSING
-                        val configured = unmarshalConfiguration(parcel).apply {
+                        val configured = toWifiConfiguration(
+                            saved.profile,
+                            saved.configurationParcel?.let(::unmarshalConfiguration),
+                        ).apply {
                             networkId = current.networkId
                             priority = saved.priority
                         }
@@ -243,23 +259,21 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
 
             if (!shouldContinue()) return WifiReason.TIMEOUT_ROLLED_BACK
             val finalEntries = readCurrent()
-            val expectedCount = target.size
-            if (finalEntries.size != expectedCount) return WifiReason.VERIFY_FAILED
-            for (network in target) {
-                val current = finalEntries.singleOrNull {
-                    it.ssid == network.ssid && it.security == network.security
-                } ?: return WifiReason.VERIFY_FAILED
-                if (current.hidden != network.hidden) return WifiReason.VERIFY_FAILED
-                if (current.passwordReadable && current.password != network.password) {
-                    return WifiReason.VERIFY_FAILED
+            val readback = wifiProfileReadback(finalEntries, target, changedIdentity)
+            return if (readback == "validated") {
+                WifiReason.NONE
+            } else {
+                val process = ActivityManager.RunningAppProcessInfo()
+                ActivityManager.getMyMemoryState(process)
+                val matches = target.mapIndexed { index, network ->
+                    val views = finalEntries.filter { it.ssid == network.ssid && it.security == network.security }
+                    "$index:views=${views.size},hidden=${views.any { it.hidden == network.hidden }}," +
+                        "readable=${views.any { it.passwordReadable }},written=${network.identity in changedIdentity}"
                 }
-                // Android may mask a PSK. The write API result plus readable fields are retained,
-                // but a masked value is never reported as a password match by observations.
-                if (!current.passwordReadable && network.identity !in changedIdentity) {
-                    return WifiReason.VERIFY_FAILED
-                }
+                Log.w("WifiSettings", "Configuration readback=$readback expected=${target.size} " +
+                    "ids=${finalEntries.map { it.networkId }.toSet().size} importance=${process.importance} matches=$matches")
+                WifiReason.VERIFY_FAILED
             }
-            return WifiReason.NONE
         } catch (failure: WifiAdapterFailure) {
             return failure.reason
         } catch (_: SecurityException) {
@@ -276,19 +290,11 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         } catch (_: WifiAdapterFailure) {
             return "unknown"
         }
-        if (entries.any { it.security == null }) return "unknown"
-        if (entries.size != profile.size) return "mismatch"
-        for (expected in profile) {
-            val actual = entries.singleOrNull {
-                it.ssid == expected.ssid && it.security == expected.security
-            } ?: return "mismatch"
-            if (actual.hidden != expected.hidden) return "mismatch"
-            if (actual.security == "WPA_PSK") {
-                if (actual.passwordReadable && actual.password != expected.password) return "mismatch"
-                if (!actual.passwordReadable && !priorApiWriteValidated) return "unknown"
-            }
-        }
-        return "validated"
+        return wifiProfileReadback(
+            entries,
+            profile,
+            if (priorApiWriteValidated) profile.map { it.identity }.toSet() else emptySet(),
+        )
     }
 
     override fun disconnectCurrent(
@@ -474,10 +480,15 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
     }
 
     private fun unmarshalConfiguration(encoded: String): WifiConfiguration {
+        val body = Parcel.obtain()
         val parcel = Parcel.obtain()
         return try {
             val bytes = Base64.decode(encoded, Base64.NO_WRAP)
-            parcel.unmarshall(bytes, 0, bytes.size)
+            body.unmarshall(bytes, 0, bytes.size)
+            // Legacy journals contain writeToParcel bodies without a Parcelable class header.
+            // Add that header so the public readParcelable API can use the platform creator.
+            parcel.writeString(WifiConfiguration::class.java.name)
+            parcel.appendFrom(body, 0, body.dataSize())
             parcel.setDataPosition(0)
             @Suppress("DEPRECATION")
             parcel.readParcelable<WifiConfiguration>(WifiConfiguration::class.java.classLoader)
@@ -485,6 +496,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         } catch (_: Exception) {
             throw WifiAdapterFailure(WifiReason.RESTORE_INFO_MISSING)
         } finally {
+            body.recycle()
             parcel.recycle()
         }
     }

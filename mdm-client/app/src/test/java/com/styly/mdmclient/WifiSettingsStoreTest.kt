@@ -1,6 +1,7 @@
 package com.styly.mdmclient
 
 import java.io.File
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Rule
@@ -38,6 +39,10 @@ class WifiSettingsStoreTest {
         val expected = WifiLocalState(
             connection = WifiConnectionSettings(tlsEnabled = true),
             lastApplied = WifiSavedProfile(operation.revision, listOf(profile)),
+            initialRecoveryProfile = WifiSavedProfile(
+                "b35a8eb2-0a20-43dc-bf2f-ec4ef66aaf49",
+                listOf(WifiNetworkProfile("recovery", "WPA_PSK", "recovery-password", hidden = false)),
+            ),
             manualOperation = operation,
             manualResults = listOf(
                 WifiManualResult(operation.operationId, operation.revision, "unknown", WifiReason.UNKNOWN, false),
@@ -51,6 +56,53 @@ class WifiSettingsStoreTest {
 
         assertEquals(expected, store.read())
         assertEquals(true, file.isFile)
+    }
+
+    @Test
+    fun `version three state upgrades without losing pending recovery journal`() {
+        val operation = WifiManualOperation(
+            operationId = "a4d13b84-1bd7-4bce-bd4d-d056801d4a3f",
+            revision = "91b831b3-884e-4e0e-8700-07d2fbe1c436",
+            candidate = listOf(WifiNetworkProfile("candidate", "OPEN", "", hidden = false)),
+            restoreSnapshot = listOf(
+                WifiNetworkSnapshot(
+                    WifiNetworkProfile("legacy-baseline", "WPA_PSK", "known-password", hidden = true),
+                    enabled = false,
+                    priority = 5,
+                    configurationParcel = "legacy-config-parcel",
+                ),
+            ),
+            phase = WifiManualPhase.ROLLING_BACK,
+            failureReason = WifiReason.TIMEOUT_ROLLED_BACK,
+            settingsChanged = true,
+            policyEpoch = 6L,
+        )
+        val legacyState = WifiLocalState(
+            connection = WifiConnectionSettings(tlsEnabled = true),
+            lastApplied = WifiSavedProfile(operation.revision, operation.candidate),
+            manualOperation = operation,
+            manualResults = listOf(
+                WifiManualResult(operation.operationId, operation.revision, "unknown", WifiReason.UNKNOWN, false),
+            ),
+            bootGeneration = "count:42",
+            bootClaimedGeneration = "count:41",
+            processedOperationIds = listOf(operation.operationId),
+            managedWifi = false,
+            policyEpoch = 6L,
+            policyRevision = operation.revision,
+        )
+        val legacyJsonObject = JSONObject(WifiSettingsCodec.encode(legacyState)).put("version", 3)
+        legacyJsonObject.remove("initial_recovery_profile")
+        val legacyJson = legacyJsonObject.toString()
+
+        val decoded = WifiSettingsCodec.decode(legacyJson)
+
+        assertEquals(legacyState, decoded)
+        assertEquals(null, decoded.initialRecoveryProfile)
+        assertEquals(operation.restoreSnapshot, decoded.manualOperation?.restoreSnapshot)
+        val upgradedJson = WifiSettingsCodec.encode(decoded)
+        assertEquals(4, JSONObject(upgradedJson).getInt("version"))
+        assertEquals(decoded, WifiSettingsCodec.decode(upgradedJson))
     }
 
     @Test

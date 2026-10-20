@@ -2,16 +2,16 @@
 
 ## Outcome
 
-**Managed Wi-Fi application failed on the real device.** The current Android
-adapter requires Device Owner or `NETWORK_SETTINGS` authority, neither of which
-the ordinary test installation has. Both managed deployment attempts that reached
-the client terminated with `PERMISSION_DENIED` before changing Wi-Fi. No actual
-connection-success or rollback claim can be made from the automated test suite
-or a server delivery status of `sent`.
+**V3 managed Wi-Fi passed the available single-AP tests on DEV-005.** Explicit
+Device Owner provisioning and the approved MDM-known recovery contract resolved
+the earlier V2 blockers. Real tests confirmed local SSID/IP settlement without an
+MDM route, wrong-password timeout recovery, process recovery and boot
+reapplication. Initial V2 failures are preserved below as historical evidence;
+they do not describe the final V3 adapter.
 
-Branch: `codex/group-wifi-settings`. Product code was not changed during these
-tests. This report and the documentation correction are committed locally only;
-no push is authorized.
+Branch: `codex/group-wifi-settings`. The initial V2 report was committed as
+`d21dee6`. This follow-up adds explicit Device Owner provisioning, the V3 recovery
+contract and corrections found by physical tests. Local commits only, no push.
 
 ## Target and preparation
 
@@ -29,14 +29,15 @@ no push is authorized.
 - Local test server: HTTP port 7086, endpoint
   `ws://127.0.0.1:7086/ws/device`, reached through USB reverse forwarding.
 - Dedicated group `Wi-Fi hardware test DEV-005` contained only the canonical
-  Device ID. The existing two-member `test` group and original Documents
-  registry file were not edited. Canonical registration added one runtime
+  Device ID. The original Documents registry file was not edited. Runtime membership was
+  changed for the dedicated test group; the existing `test` group now has one
+  member (initially two). Canonical registration added one runtime
   registry entry (290 to 291); the older legacy serial entry remains separate.
 - Candidate profile contained the user-provided office and guest networks.
   Credentials and raw diagnostics remain in private temporary files and are
   deliberately excluded from this report and Git.
 
-## Results
+## Initial ordinary-app results
 
 | Case | Result | Evidence and limits |
 |---|---|---|
@@ -67,7 +68,7 @@ Package-scoped all-files/exact-alarm AppOps were reported as `default` after
 reboot; Device ID became unavailable and registration was provisional. Restored
 the already approved grants at UID scope, restarted the client, and confirmed
 canonical online registration. Final UID-level grants read back as `allow`;
-their persistence across another reboot was not tested. Location remained
+later V3 reboots retained canonical identity and alarm access. Location remained
 granted. Do not claim that the initial permission setup survived reboot.
 
 ## Feasibility review
@@ -89,23 +90,61 @@ Owning code: `WifiManagerAdapter.requireManagementAuthority()` enforces the
 authority requirement; `restorableSnapshot()` additionally rejects unsupported
 or unreadable restoration data. Bypassing the permission check or substituting
 a single-network connect call would not satisfy the accepted complete-rollback
-contract. No Device Owner provisioning, root, firmware or overlay change was
-performed. These require a separate design decision; Device Owner is not yet
-proven sufficient for credential restoration.
+contract. No Device Owner provisioning was performed in that initial phase. The
+subsequent explicitly authorized Device Owner test is recorded below. No root,
+firmware or overlay change was performed.
 
-## Final state and evidence
+## V2 Device Owner follow-up
 
-- Device remains connected to STYLY-office with an IP address; existing saved
-  network identity/security entries were preserved.
+The user subsequently authorized Device Owner provisioning. Added a minimal
+`MdmDeviceAdminReceiver` protected by `BIND_DEVICE_ADMIN`, with empty policy
+metadata. The installed package was verified `TEST_ONLY` before
+`dpm set-device-owner`; both `dpm list-owners` and normal application execution
+confirmed ownership. No accounts, prior owner, root or factory reset were needed.
+
+An instrumentation diagnostic returned zero configurations and initially led to
+an incorrect inference about normal application access. That inference was
+withdrawn. A temporary debug Activity using the normal application context
+reported package/op-package `com.styly.mdmclient`, Device Owner true,
+24 adapter entries, 11 unreadable PSKs, 12 unsupported-security entries, and
+`RESTORE_INFO_MISSING`. These 24 API security views must not be equated to the
+12 saved network IDs in dumpsys. The different instrumentation result is not
+used as firmware evidence; its exact cause was not established.
+
+Two managed deployments after provisioning failed before mutation with
+`RESTORE_INFO_MISSING`, including one after removal of all temporary diagnostic
+code. The ordinary permission blocker was resolved; credential restoration was
+not. An experimental unconditional empty-list rejection was withdrawn because
+normal application evidence did not support it and it would reject genuinely
+empty devices. Only the provisioning receiver was retained at this checkpoint.
+
+The user then explicitly approved the MDM-known recovery contract described in
+`wifi-mdm-recovery-v3-2026-10-20.md`; completed V3 results are recorded below.
+These V2 failures remain evidence, not V3 test outcomes.
+
+## V2 checkpoint state and evidence
+
+- The final V2 readback showed an existing TP5 connection with an IP address.
+  The 12 saved network IDs and SSIDs matched the original inventory. Connection
+  status and dynamic security-view details changed, so full configuration
+  equality is not claimed. Earlier ordinary-app checks ended on STYLY-office.
 - The test debug client and guard remain installed. Local manual endpoint and
   USB forwarding remain configured; disconnecting USB removes that server path.
 - Server desired profile and client policy are both unmanaged after explicit
   deployment. The local HTTP server remains running on port 7086.
+- Device Owner remains registered, separately from unmanaged Wi-Fi policy.
+  The final debug APK is test-only and can be deprovisioned before a signing-key
+  change. Temporary instrumentation APK/Activity and private probe output were
+  removed from the device; no diagnostic code was retained in the source.
 - Private evidence and APK backups:
   `/tmp/styly-mdm-wifi-device-test-20261020/private/`.
   Important records: `state-after-first-deploy.json`, `unmanaged-results.json`,
   `offline-result.json`, boot-count/state readbacks, `final-results.json`,
   `wifi-status-final.txt`, `wifi-final.txt`, `appops-final.txt`.
+  DO follow-up evidence: `set-owner-result.txt`, `owners-final.txt`,
+  `probe-normal-owner-result.txt`, `owner-after-attempt-state.json`,
+  `owner-final-results.json`, `wifi-status-owner-final.txt` and
+  `wifi-owner-final.txt`.
 - Some exploratory script snapshot filenames were overwritten by later reads;
   they are not treated as immutable initial-state evidence. Raw files are
   temporary and are not a committed audit archive.
@@ -114,7 +153,85 @@ proven sufficient for credential restoration.
 
 - Compared local persistent state with server delivery records for each completed
   case; final network/security entries matched the pre-reboot diagnostics.
-- No product code changed, so automated suites were not rerun to imply hardware
-  coverage. Documentation links and `git diff --check` are checked separately.
+- After the receiver addition, Android JVM tests (149) and test-only DevDebug
+  APK assembly passed. Tests were not treated as proof of hardware rollback.
 - Independent read-only review found no discrepancy with the SDK investigation
   or the four primary state/result records, and no overstated hardware coverage.
+
+## V3 MDM-known recovery results
+
+The operator approved limiting rollback to MDM-held credentials. Registered an
+initial recovery profile separately; its registration made no Wi-Fi change and
+was not recorded as a successful connection. Unknown original OS configurations
+were removed during candidate replacement, as authorized. The office/guest APs
+became unavailable; the operator supplied `s-5ghz` instead. Passwords remain
+excluded from this report and Git.
+
+| Case | Result | Physical evidence and limits |
+|---|---|---|
+| Initial recovery registration | Passed | Initial baseline persisted separately; no Wi-Fi, successful baseline, boot history or management-policy change. Explicit re-registration replaced the seed before first managed success. |
+| Guest candidate with no AP available | Passed for timeout/settings only | Timed out at 60.6s and restored the registered known office configuration. Neither AP was available, so actual guest connection or fallback connectivity is not claimed. |
+| Available SSID + IP, MDM route removed | Passed | Removed USB reverse while the same operation journal remained active. `s-5ghz` obtained an IP and committed success at 3.3s without the MDM server. |
+| Same SSID, wrong password | Passed | Failed with `TIMEOUT_ROLLED_BACK` at 60.5s; restored the known successful credentials and actual SSID/IP connection. The successful baseline remained unchanged. |
+| Process death during a changed candidate | Passed | Terminated the app process. Opening the client recovered the journal and actual connection at 1.6s; result `UNKNOWN`, rolled back true. The 60-second candidate budget was not renewed. |
+| Background-only process recovery | Passed | Terminated an active attempt and started only the foreground service, with no Activity. Restored the known baseline and actual connection at 3.5s. |
+| Boot correction without MDM | Passed after repair | Externally removed the saved successful Wi-Fi, then rebooted 109 to 110. Client recreated it, recorded successful boot application and obtained an IP while USB reverse was absent. A subsequent service restart added no boot result. |
+| Delete then explicit unmanaged, populated baseline | Passed before reboot | Deletion preserved the client's state and previous server delivery. Explicit send persisted unmanaged policy while retaining the successful baseline and current connection. |
+| Unmanaged boot with externally removed Wi-Fi | Pending | Removed the test Wi-Fi to prove it would not be recreated, then requested reboot. USB did not return within the observation window. Boot count, absence of reapplication, managed re-enable and final usable Wi-Fi restoration require the device to reconnect. |
+
+### Repairs established by hardware and review
+
+- PICO returned multiple security views per saved network ID. Readback now counts
+  IDs once, selects the requested security view and removes each unneeded ID once.
+- New known-credential profiles use fresh configurations; rollback uses the
+  frozen successful/initial MDM profile rather than unreadable old OS keys.
+- Independent review found legacy parcel bodies were read as if they had a class
+  header. Corrected that format and verified a real-device round trip of the
+  adapter's existing marshal/unmarshal path. The temporary probe was removed.
+- Reboots 108 and 109 physically recreated Wi-Fi but incorrectly recorded
+  `VERIFY_FAILED`: configured-network readback was empty and FINE_LOCATION
+  AppOps recorded a rejection. The service had only `connectedDevice` type.
+  Added conditional location foreground-service promotion before startup
+  recovery; reboot 110 passed without background-location permission. The
+  controller remains process-owned, starts once and precedes WebSocket commands.
+- Review found the later location-grant callback also needed to refresh service
+  type. Added that start request without stopping/recreating the owner. This
+  permission-dialog path was code-reviewed, not separately exercised on hardware.
+
+### UI and automated checks
+
+- Actual running page with 291 runtime registry records: desktop 1280px had no
+  horizontal overflow. Existing button classes were reused; save, add, recovery
+  registration and send controls were 38px high.
+- A temporary 375px iframe displayed the complete live console. Navigation,
+  form controls and full-width stacked actions fit visually. Its unsaved draft
+  was discarded; no browser save or deploy occurred. The temporary page and tab
+  were removed. Screenshots are local task artifacts outside Git.
+- Full server suite: 461 passed. Wi-Fi/Push console tests: 31 passed. Android
+  suite: 162 passed, including deferred startup, duplicate starts and interrupted
+  journal recovery. DevDebug test-only APK assembly passed.
+- Read-only staged reviews covered the adapter/recovery contract and later
+  foreground-service lifecycle. Confirmed findings were fixed before finalizing.
+
+### Current V3 state and remaining limits
+
+The HTTP test server remains on port 7086 with the Documents-derived runtime
+registry. Desired Wi-Fi is unmanaged. The test-only Device Owner client/guard
+remain installed; their local server path requires USB reverse. The most recent
+client observation was unmanaged with its successful baseline retained. The
+`s-5ghz` OS profile was then deliberately removed for the unmanaged reboot test;
+it must be restored once USB returns. Do not describe the current headset as
+connected or final cleanup as complete until that readback succeeds.
+
+Private V3 evidence is under the existing `private/v3/` directory: `01-*`,
+`02-guest.json`, `03-success.json`, `03-without-server.json`,
+`04-wrong-password.json`, `05-process-recovery.json`,
+`06-boot-correction-110.json`, `06-service-restart-110.json`,
+`07-background-recovery.json` and `log-boot-diagnostic.txt`.
+There is no completed `08-unmanaged-reboot.json` yet. These temporary files are
+not a durable committed audit archive.
+
+Two available-AP switching, hardware duplicate-command replay, active-operation
+OS reboot, exact-alarm-only cold recovery and content-start ordering remain
+unverified. Single-AP success does not prove dual-STA or MLO support. Existing
+unknown credentials and unsupported OS configuration details were not restored.

@@ -3,9 +3,10 @@ package com.styly.mdmclient
 import org.json.JSONArray
 import org.json.JSONObject
 
-internal const val WIFI_SETTINGS_CAPABILITY = "wifi_settings_v2"
+internal const val WIFI_SETTINGS_CAPABILITY = "wifi_settings_v3"
 internal const val WIFI_MANUAL_TIMEOUT_MS = 60_000L
 internal const val WIFI_MAX_NETWORKS = 32
+internal const val WIFI_RECOVERY_SCOPE_MDM_PROFILES = "mdm_profiles"
 
 internal enum class WifiReason(val wireValue: String) {
     NONE("NONE"),
@@ -95,6 +96,7 @@ internal data class WifiBootResult(
 internal data class WifiLocalState(
     val connection: WifiConnectionSettings = WifiConnectionSettings(),
     val lastApplied: WifiSavedProfile? = null,
+    val initialRecoveryProfile: WifiSavedProfile? = null,
     val manualOperation: WifiManualOperation? = null,
     val manualResults: List<WifiManualResult> = emptyList(),
     val bootOperation: WifiBootOperation? = null,
@@ -110,6 +112,7 @@ internal data class WifiLocalState(
 internal enum class WifiApplyMode(val wireValue: String) {
     MANAGED("managed"),
     UNMANAGED("unmanaged"),
+    RECOVERY("recovery"),
 }
 
 internal data class WifiApplyCommand(
@@ -130,10 +133,20 @@ internal object WifiSettingsProtocol {
         requireUuid(revision, "revision")
         val mode = WifiApplyMode.entries.firstOrNull { it.wireValue == requiredString(payload, "mode") }
             ?: throw IllegalArgumentException("unsupported Wi-Fi apply mode")
+        if (mode != WifiApplyMode.UNMANAGED &&
+            requiredString(payload, "recovery_scope") != WIFI_RECOVERY_SCOPE_MDM_PROFILES
+        ) {
+            throw IllegalArgumentException("unsupported Wi-Fi recovery scope")
+        }
+        if (mode == WifiApplyMode.UNMANAGED && payload.has("recovery_scope") &&
+            requiredString(payload, "recovery_scope") != WIFI_RECOVERY_SCOPE_MDM_PROFILES
+        ) {
+            throw IllegalArgumentException("unsupported Wi-Fi recovery scope")
+        }
         val networkArray = payload.optJSONArray("networks")
             ?: throw IllegalArgumentException("networks must be an array")
-        if (mode == WifiApplyMode.MANAGED && networkArray.length() !in 1..WIFI_MAX_NETWORKS) {
-            throw IllegalArgumentException("managed networks must contain 1..$WIFI_MAX_NETWORKS items")
+        if (mode != WifiApplyMode.UNMANAGED && networkArray.length() !in 1..WIFI_MAX_NETWORKS) {
+            throw IllegalArgumentException("managed and recovery networks must contain 1..$WIFI_MAX_NETWORKS items")
         }
         if (mode == WifiApplyMode.UNMANAGED && networkArray.length() != 0) {
             throw IllegalArgumentException("unmanaged mode must not include networks")
@@ -219,7 +232,7 @@ internal object WifiManualStateMachine {
 }
 
 internal object WifiSettingsCodec {
-    private const val VERSION = 3
+    private const val VERSION = 4
 
     fun encode(state: WifiLocalState): String = JSONObject().apply {
         put("version", VERSION)
@@ -227,6 +240,7 @@ internal object WifiSettingsCodec {
             put("tls_enabled", state.connection.tlsEnabled)
         })
         put("last_applied", state.lastApplied?.let(::encodeSavedProfile) ?: JSONObject.NULL)
+        put("initial_recovery_profile", state.initialRecoveryProfile?.let(::encodeSavedProfile) ?: JSONObject.NULL)
         put("manual_operation", state.manualOperation?.let(::encodeManualOperation) ?: JSONObject.NULL)
         put("manual_results", JSONArray().apply { state.manualResults.forEach { put(encodeManualResult(it)) } })
         put("boot_operation", state.bootOperation?.let(::encodeBootOperation) ?: JSONObject.NULL)
@@ -250,6 +264,7 @@ internal object WifiSettingsCodec {
         return WifiLocalState(
             connection = connection,
             lastApplied = root.optJSONObject("last_applied")?.let(::decodeSavedProfile),
+            initialRecoveryProfile = root.optJSONObject("initial_recovery_profile")?.let(::decodeSavedProfile),
             manualOperation = root.optJSONObject("manual_operation")?.let { decodeManualOperation(it, version) },
             manualResults = decodeArray(root.optJSONArray("manual_results"), ::decodeManualResult),
             bootOperation = root.optJSONObject("boot_operation")?.let(::decodeBootOperation),

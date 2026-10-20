@@ -13,6 +13,32 @@ import java.util.concurrent.Executor
 
 class WifiSettingsControllerTest {
     @Test
+    fun `deferred startup waits for service readiness and duplicate starts recover only once`() {
+        val profile = network("successful-network")
+        val harness = Harness(
+            initialState = WifiLocalState(
+                lastApplied = WifiSavedProfile(REVISION, listOf(profile)),
+                bootGeneration = "previous-boot",
+            ),
+            initialNetworks = emptyList(),
+            deferStartup = true,
+        )
+        assertFalse(harness.controller.startupCompletion().isDone)
+        assertTrue(harness.adapter.applyCalls.isEmpty())
+
+        harness.controller.startStartupRecovery()
+        harness.controller.startStartupRecovery()
+        harness.operationExecutor.runAll()
+
+        assertTrue(harness.controller.startupCompletion().join())
+        assertEquals(1, harness.adapter.applyCalls.size)
+        assertEquals(1, harness.store.state.bootResults.size)
+        harness.controller.startStartupRecovery()
+        harness.operationExecutor.runAll()
+        assertEquals(1, harness.adapter.applyCalls.size)
+    }
+
+    @Test
     fun `wifi command is ignored before canonical registration acknowledgement`() {
         val harness = Harness()
 
@@ -30,10 +56,160 @@ class WifiSettingsControllerTest {
     }
 
     @Test
+    fun `managed apply without an MDM-held recovery profile fails before touching Wi-Fi`() {
+        val harness = Harness(initialNetworks = listOf(network("existing-device-network")))
+
+        harness.apply(command(OPERATION_ID, REVISION, "managed", network("candidate")))
+
+        assertEquals(WifiReason.RESTORE_INFO_MISSING, harness.store.state.manualResults.single().reason)
+        assertEquals("failed", harness.store.state.manualResults.single().status)
+        assertNull(harness.store.state.manualOperation)
+        assertNull(harness.store.state.lastApplied)
+        assertNull(harness.store.state.initialRecoveryProfile)
+        assertTrue(harness.adapter.applyCalls.isEmpty())
+        assertEquals(0, harness.adapter.readCurrentCalls)
+        assertEquals(0, harness.adapter.restorableSnapshotCalls)
+        assertEquals(0, harness.connectivity.preflightCalls)
+    }
+
+    @Test
+    fun `recovery registration stores credentials without changing Wi-Fi or boot policy and drives rollback`() {
+        val existingDeviceProfile = network("existing-device-network")
+        val recoveryProfile = network("registered-recovery-network")
+        val candidate = network("candidate")
+        val initialState = WifiLocalState(
+            managedWifi = false,
+            policyEpoch = 8L,
+            policyRevision = REVISION_2,
+            bootGeneration = "boot-a",
+        )
+        val harness = Harness(
+            initialState = initialState,
+            initialNetworks = listOf(existingDeviceProfile),
+        )
+
+        harness.apply(command(OPERATION_ID, REVISION, "recovery", recoveryProfile))
+
+        assertEquals(WifiSavedProfile(REVISION, listOf(recoveryProfile)), harness.store.state.initialRecoveryProfile)
+        assertNull(harness.store.state.lastApplied)
+        assertEquals(initialState.managedWifi, harness.store.state.managedWifi)
+        assertEquals(initialState.policyEpoch, harness.store.state.policyEpoch)
+        assertEquals(initialState.policyRevision, harness.store.state.policyRevision)
+        assertEquals(initialState.bootGeneration, harness.store.state.bootGeneration)
+        assertEquals(listOf(existingDeviceProfile), harness.adapter.current.map { it.profile })
+        assertTrue(harness.adapter.applyCalls.isEmpty())
+        assertEquals(1, harness.adapter.readCurrentCalls)
+        assertEquals(0, harness.adapter.restorableSnapshotCalls)
+
+        val correctedRecoveryProfile = network("corrected-recovery-network")
+        harness.apply(command(OPERATION_ID_2, REVISION_2, "recovery", correctedRecoveryProfile))
+        assertEquals(
+            WifiSavedProfile(REVISION_2, listOf(correctedRecoveryProfile)),
+            harness.store.state.initialRecoveryProfile,
+        )
+        assertEquals(2, harness.adapter.readCurrentCalls)
+
+        harness.adapter.afterReconnect = { harness.connectivity.update(50, "other", hasIp = true) }
+        harness.apply(command("33333333-3333-4333-8333-333333333333", REVISION, "managed", candidate))
+        harness.timeout()
+
+        assertEquals(listOf(correctedRecoveryProfile), harness.adapter.current.map { it.profile })
+        assertEquals(WifiReason.TIMEOUT_ROLLED_BACK, harness.store.state.manualResults.last().reason)
+        assertTrue(harness.store.state.manualResults.last().rolledBack)
+        assertNull(harness.store.state.lastApplied)
+        assertFalse(harness.store.state.managedWifi)
+        assertEquals(0, harness.adapter.restorableSnapshotCalls)
+        assertNull(harness.adapter.applyCalls.first().expectedSnapshot)
+        val restore = requireNotNull(harness.adapter.applyCalls.last().restoreSnapshot).single()
+        assertEquals(correctedRecoveryProfile, restore.profile)
+        assertTrue(restore.enabled)
+        assertEquals(0, restore.priority)
+        assertNull(restore.configurationParcel)
+    }
+
+    @Test
+    fun `last applied profile cannot be replaced by initial recovery registration`() {
+        val lastApplied = recoveryProfile(network("already-applied"))
+        val oldSeed = recoveryProfile(network("old-seed"))
+        val harness = Harness(initialState = WifiLocalState(
+            lastApplied = lastApplied,
+            initialRecoveryProfile = oldSeed,
+        ))
+
+        harness.apply(command(OPERATION_ID, REVISION, "recovery", network("attempted-seed")))
+
+        assertEquals(lastApplied, harness.store.state.lastApplied)
+        assertEquals(oldSeed, harness.store.state.initialRecoveryProfile)
+        assertEquals(0, harness.adapter.readCurrentCalls)
+        assertTrue(harness.adapter.applyCalls.isEmpty())
+        assertEquals("success", harness.store.state.manualResults.single().status)
+    }
+
+    @Test
+    fun `recovery registration is rejected while a managed apply is active`() {
+        val baseline = network("applied-baseline")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = recoveryProfile(baseline)),
+            initialNetworks = listOf(baseline),
+        )
+        harness.apply(command(OPERATION_ID, REVISION, "managed", network("candidate")))
+        val readCallsBeforeRecovery = harness.adapter.readCurrentCalls
+        assertNotNull(harness.store.state.manualOperation)
+
+        harness.apply(command(OPERATION_ID_2, REVISION_2, "recovery", network("attempted-seed")))
+
+        assertEquals(WifiReason.BUSY, harness.store.state.manualResults.last().reason)
+        assertEquals(recoveryProfile(baseline), harness.store.state.lastApplied)
+        assertNull(harness.store.state.initialRecoveryProfile)
+        assertNotNull(harness.store.state.manualOperation)
+        assertEquals(readCallsBeforeRecovery, harness.adapter.readCurrentCalls)
+    }
+
+    @Test
+    fun `recovery registration is rejected while a boot operation is active`() {
+        val bootOperation = WifiBootOperation(
+            bootId = "boot-operation",
+            generation = "boot-b",
+            revision = REVISION,
+            profile = listOf(network("boot-profile")),
+        )
+        val harness = Harness(
+            initialState = WifiLocalState(bootOperation = bootOperation),
+            runStartupOnInit = false,
+        )
+        harness.enqueue(command(OPERATION_ID, REVISION_2, "recovery", network("attempted-seed")))
+        harness.operationExecutor.runLast()
+
+        assertEquals(WifiReason.BUSY, harness.store.state.manualResults.last().reason)
+        assertEquals(bootOperation, harness.store.state.bootOperation)
+        assertNull(harness.store.state.initialRecoveryProfile)
+        assertEquals(0, harness.adapter.readCurrentCalls)
+    }
+
+    @Test
+    fun `managed apply requires MDM profile recovery scope`() {
+        val baseline = network("baseline")
+        val harness = Harness(
+            initialState = WifiLocalState(initialRecoveryProfile = recoveryProfile(baseline)),
+            initialNetworks = listOf(baseline),
+        )
+        val payload = command(OPERATION_ID, REVISION, "managed", network("candidate")).apply {
+            remove("recovery_scope")
+        }
+
+        harness.apply(payload)
+
+        assertEquals(WifiReason.UNSUPPORTED, harness.store.state.manualResults.single().reason)
+        assertTrue(harness.adapter.applyCalls.isEmpty())
+        assertTrue(harness.adapter.current.any { it.profile.ssid == "baseline" })
+    }
+
+    @Test
     fun `managed apply commits after a fresh candidate Wi-Fi network receives an IP`() {
         val original = network("office-old")
         val candidate = network("office-new")
         val harness = Harness(
+            initialState = WifiLocalState(initialRecoveryProfile = recoveryProfile(original)),
             initialNetworks = listOf(original),
             initialWifi = listOf(observation(10, original.ssid, hasIp = true)),
         )
@@ -54,7 +230,10 @@ class WifiSettingsControllerTest {
     @Test
     fun `old network handle with candidate SSID and IP is not fresh proof`() {
         val candidate = network("office-new")
-        val harness = Harness(initialWifi = listOf(observation(10, candidate.ssid, hasIp = true)))
+        val harness = Harness(
+            initialState = WifiLocalState(initialRecoveryProfile = recoveryProfile(network("office-old"))),
+            initialWifi = listOf(observation(10, candidate.ssid, hasIp = true)),
+        )
         harness.adapter.afterDisconnect = { harness.connectivity.lose(10) }
         harness.adapter.afterReconnect = {
             harness.connectivity.update(10, candidate.ssid, hasIp = true)
@@ -72,6 +251,7 @@ class WifiSettingsControllerTest {
     fun `new Wi-Fi network seen before the original is lost is disconnected before reconnect`() {
         val candidate = network("office-new")
         val harness = Harness(
+            initialState = WifiLocalState(initialRecoveryProfile = recoveryProfile(network("office-old"))),
             initialWifi = listOf(observation(10, "office-old", hasIp = true)),
         )
         harness.adapter.afterDisconnect = {
@@ -93,7 +273,7 @@ class WifiSettingsControllerTest {
     }
 
     @Test
-    fun `wrong SSID and missing IP both time out and restore the complete prior snapshot`() {
+    fun `wrong SSID and missing IP both time out and restore the MDM recovery profile`() {
         val original = network("office-old")
         val candidate = network("office-new")
         val notReady = listOf(
@@ -102,6 +282,7 @@ class WifiSettingsControllerTest {
         )
         for ((index, observation) in notReady.withIndex()) {
             val harness = Harness(
+                initialState = WifiLocalState(initialRecoveryProfile = recoveryProfile(original)),
                 initialNetworks = listOf(original),
                 initialWifi = listOf(observation(10, original.ssid, hasIp = true)),
             )
@@ -125,6 +306,7 @@ class WifiSettingsControllerTest {
         val original = network("office-old")
         val candidate = network("office-new")
         val harness = Harness(
+            initialState = WifiLocalState(initialRecoveryProfile = recoveryProfile(original)),
             initialNetworks = listOf(original),
             initialWifi = listOf(observation(10, original.ssid, hasIp = true)),
         )
@@ -153,7 +335,9 @@ class WifiSettingsControllerTest {
     @Test
     fun `later disconnection does not roll back a locally successful profile`() {
         val candidate = network("office-new")
-        val harness = Harness()
+        val harness = Harness(
+            initialState = WifiLocalState(initialRecoveryProfile = recoveryProfile(network("office-old"))),
+        )
         harness.adapter.afterReconnect = { harness.connectivity.update(11, candidate.ssid, hasIp = true) }
 
         harness.apply(command(OPERATION_ID, REVISION, "managed", candidate))
@@ -169,6 +353,7 @@ class WifiSettingsControllerTest {
         val original = network("office-old")
         val candidate = network("office-new")
         val harness = Harness(
+            initialState = WifiLocalState(initialRecoveryProfile = recoveryProfile(original)),
             initialNetworks = listOf(original),
             initialWifi = listOf(observation(10, original.ssid, hasIp = true)),
         )
@@ -185,8 +370,14 @@ class WifiSettingsControllerTest {
             sharedStore = harness.store,
             sharedAdapter = harness.adapter,
             sharedClock = harness.clock,
+            deferStartup = true,
         )
 
+        assertNotNull(restarted.store.state.manualOperation)
+        restarted.controller.onRollbackDeadline(OPERATION_ID, originalDeadline)
+        assertNotNull(restarted.store.state.manualOperation)
+        restarted.controller.startStartupRecovery()
+        restarted.operationExecutor.runAll()
         assertNull(restarted.store.state.manualOperation)
         assertEquals(listOf(original), restarted.adapter.current.map { it.profile })
         assertEquals(WifiReason.UNKNOWN, restarted.store.state.manualResults.single().reason)
@@ -283,7 +474,10 @@ class WifiSettingsControllerTest {
     fun `candidate API timeout does not restore concurrently with mutation`() {
         val original = network("office-old")
         val candidate = network("office-new")
-        val harness = Harness(initialNetworks = listOf(original))
+        val harness = Harness(
+            initialState = WifiLocalState(initialRecoveryProfile = recoveryProfile(original)),
+            initialNetworks = listOf(original),
+        )
         harness.adapter.afterCandidateMutationStarted = {
             harness.clock.value = WIFI_MANUAL_TIMEOUT_MS
             harness.watchdogs.single().task.run()
@@ -305,6 +499,7 @@ class WifiSettingsControllerTest {
         val original = network("office-old")
         val candidate = network("office-new")
         val harness = Harness(
+            initialState = WifiLocalState(initialRecoveryProfile = recoveryProfile(original)),
             initialNetworks = listOf(original),
             initialWifi = listOf(observation(10, original.ssid, hasIp = true)),
         )
@@ -344,7 +539,10 @@ class WifiSettingsControllerTest {
     fun `restore failure retains local fence`() {
         val original = network("office-old")
         val candidate = network("office-new")
-        val harness = Harness(initialNetworks = listOf(original))
+        val harness = Harness(
+            initialState = WifiLocalState(initialRecoveryProfile = recoveryProfile(original)),
+            initialNetworks = listOf(original),
+        )
         harness.adapter.afterCandidateMutationStarted = {
             harness.clock.value = WIFI_MANUAL_TIMEOUT_MS
             harness.watchdogs.single().task.run()
@@ -386,6 +584,18 @@ class WifiSettingsControllerTest {
         assertTrue(unmanaged.controller.startupCompletion().join())
         assertTrue(unmanaged.adapter.applyCalls.isEmpty())
         assertEquals("boot-b", unmanaged.store.state.bootGeneration)
+
+        val seedOnly = Harness(
+            initialState = WifiLocalState(
+                initialRecoveryProfile = baseline,
+                bootGeneration = "boot-a",
+            ),
+            initialNetworks = listOf(network("changed")),
+            generation = "boot-b",
+        )
+        assertTrue(seedOnly.controller.startupCompletion().join())
+        assertTrue(seedOnly.adapter.applyCalls.isEmpty())
+        assertEquals(baseline, seedOnly.store.state.initialRecoveryProfile)
     }
 
     @Test
@@ -410,6 +620,7 @@ class WifiSettingsControllerTest {
         val sharedAdapter: FakeAdapter? = null,
         val sharedClock: MutableClock? = null,
         runStartupOnInit: Boolean = true,
+        deferStartup: Boolean = false,
     ) {
         val store = sharedStore ?: MemoryStore(initialState)
         val adapter = sharedAdapter ?: FakeAdapter(initialNetworks)
@@ -431,6 +642,7 @@ class WifiSettingsControllerTest {
                 rollbackExecutor = rollbackExecutor,
                 scheduleWatchdog = { task, delay -> watchdogs += ScheduledTask(task, delay) },
             ),
+            autoStart = !deferStartup,
         )
 
         init {
@@ -464,6 +676,10 @@ class WifiSettingsControllerTest {
     private class QueueExecutor : Executor {
         private val pending = ArrayDeque<Runnable>()
         override fun execute(command: Runnable) { pending.addLast(command) }
+        fun runLast() {
+            check(pending.isNotEmpty()) { "no queued task" }
+            pending.removeLast().run()
+        }
         fun runNext() {
             check(pending.isNotEmpty()) { "no queued task" }
             pending.removeFirst().run()
@@ -529,11 +745,14 @@ class WifiSettingsControllerTest {
     private data class ApplyCall(
         val target: List<WifiNetworkProfile>,
         val restoreSnapshot: List<WifiNetworkSnapshot>?,
+        val expectedSnapshot: List<WifiNetworkSnapshot>?,
     )
 
     private class FakeAdapter(initialNetworks: List<WifiNetworkProfile>) : WifiSettingsAdapter {
         var current = initialNetworks.mapIndexed { index, profile -> snapshot(profile, priority = index) }.toMutableList()
         val applyCalls = mutableListOf<ApplyCall>()
+        var readCurrentCalls = 0
+        var restorableSnapshotCalls = 0
         var applyFailure: WifiReason? = null
         var restoreFailure: WifiReason? = null
         var afterCandidateMutationStarted: (() -> Unit)? = null
@@ -544,11 +763,17 @@ class WifiSettingsControllerTest {
         private var activeMutations = 0
         var maxConcurrentMutations = 0
 
-        override fun readCurrent(): List<WifiConfiguredEntry> = current.mapIndexed { index, entry ->
-            WifiConfiguredEntry(index, entry.profile.ssid, entry.profile.security, entry.profile.password, true,
-                entry.profile.hidden, entry.enabled, entry.priority, entry.configurationParcel ?: "fixture")
+        override fun readCurrent(): List<WifiConfiguredEntry> {
+            readCurrentCalls++
+            return current.mapIndexed { index, entry ->
+                WifiConfiguredEntry(index, entry.profile.ssid, entry.profile.security, entry.profile.password, true,
+                    entry.profile.hidden, entry.enabled, entry.priority, entry.configurationParcel ?: "fixture")
+            }
         }
-        override fun restorableSnapshot(): List<WifiNetworkSnapshot> = current.toList()
+        override fun restorableSnapshot(): List<WifiNetworkSnapshot> {
+            restorableSnapshotCalls++
+            return current.toList()
+        }
         override fun validateFinalState(profile: List<WifiNetworkProfile>, priorApiWriteValidated: Boolean): String =
             if (current.map { it.profile } == profile) "validated" else "mismatch"
 
@@ -561,7 +786,7 @@ class WifiSettingsControllerTest {
             onMutationStarted: () -> WifiReason?,
             onMutationFinished: () -> Unit,
         ): WifiReason {
-            applyCalls += ApplyCall(target.toList(), restoreSnapshot?.toList())
+            applyCalls += ApplyCall(target.toList(), restoreSnapshot?.toList(), expectedSnapshot?.toList())
             if (restoreSnapshot != null && restoreFailure != null) return requireNotNull(restoreFailure)
             applyFailure?.let { if (restoreSnapshot == null) return it }
             if (!shouldContinue()) return WifiReason.TIMEOUT_ROLLED_BACK
@@ -630,6 +855,8 @@ class WifiSettingsControllerTest {
 
         private fun network(ssid: String) = WifiNetworkProfile(ssid, "WPA_PSK", "correct-horse-battery", false)
 
+        private fun recoveryProfile(profile: WifiNetworkProfile) = WifiSavedProfile(REVISION_2, listOf(profile))
+
         private fun observation(handle: Long, ssid: String, hasIp: Boolean) =
             WifiLocalNetworkObservation(handle, ssid, hasIp, 1L)
 
@@ -645,6 +872,7 @@ class WifiSettingsControllerTest {
             put("operation_id", operationId)
             put("revision", revision)
             put("mode", mode)
+            put("recovery_scope", WIFI_RECOVERY_SCOPE_MDM_PROFILES)
             put("networks", JSONArray().apply {
                 network?.let { profile -> put(JSONObject().apply {
                     put("ssid", profile.ssid)

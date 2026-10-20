@@ -324,7 +324,13 @@ class SettingsActivity : AppCompatActivity() {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_WIFI_LOCATION_PERMISSION) updateWifiLocationUi()
+        if (requestCode == REQUEST_WIFI_LOCATION_PERMISSION) {
+            updateWifiLocationUi()
+            if (hasWifiLocationPermission()) {
+                startForegroundService(Intent(this, MdmClientService::class.java)
+                    .putExtra(MdmClientService.EXTRA_START_REASON, MdmClientService.REASON_SETTINGS))
+            }
+        }
     }
 
     private fun requestExactAlarmAccess() {
