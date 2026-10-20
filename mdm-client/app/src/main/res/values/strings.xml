@@ -5,15 +5,13 @@
     <string name="server_url_hint">192.168.1.100:7070</string>
     <string name="use_auto_discovery">Use Auto-Discovery</string>
     <string name="save_and_connect">Save &amp; Connect</string>
-    <string name="wifi_tls_enabled">Use TLS (WSS) for server connections</string>
-    <string name="wifi_settings_save_failed">Could not save Wi-Fi connection settings</string>
     <string name="wifi_exact_alarm_label">60-second Wi-Fi rollback timer</string>
     <string name="wifi_exact_alarm_granted">Exact alarm access granted</string>
     <string name="wifi_exact_alarm_missing">Exact alarm access is required before Wi-Fi changes can be applied</string>
     <string name="wifi_exact_alarm_button">Open Exact Alarm Settings</string>
     <string name="wifi_exact_alarm_unavailable">Exact alarm settings are unavailable on this device</string>
-    <string name="wifi_location_permission_granted">Wi-Fi configuration permission granted</string>
-    <string name="wifi_location_permission_missing">Location permission is required to read configured Wi-Fi networks</string>
+    <string name="wifi_location_permission_granted">Wi-Fi configuration permission granted. Restart the headset after changing permissions to resume any pending recovery.</string>
+    <string name="wifi_location_permission_missing">Allow precise location all the time in app permissions so Wi-Fi recovery works while other apps are open. Then restart the headset to resume any pending recovery.</string>
     <string name="wifi_location_services_disabled">Turn on Location services to verify the connected Wi-Fi SSID</string>
     <string name="wifi_location_settings_unavailable">Location settings are unavailable on this device</string>
     <string name="wifi_location_permission_button">Grant Wi-Fi Configuration Permission</string>

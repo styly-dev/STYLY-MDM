@@ -1,127 +1,94 @@
-# Wi-Fi hardware validation and review — 2026-10-20
+# Wi-Fi auto-join validation — 2026-10-20
 
-## Scope and final device
+## Scope
 
-- Branch `codex/group-wifi-settings`, based on pre-feature `7df0492`. Local
-  commits only; no push. The current behavior is defined in
-  [WIFI_SETTINGS.md](../docs/WIFI_SETTINGS.md).
-- DEV-005: Device ID `70a1c963-e76e-4afb-9439-aeb21784298b`, PICO 4 Ultra
-  Enterprise / A9210, PUI 5.15.7, Android 14. The ADB skill rechecks the Device ID
-  PNG before operations; USB serial/IP identify transport only.
-- The operator authorized replacing APKs, changing all saved Wi-Fi settings,
-  grants for location/storage/alarms, and explicit Device Owner provisioning.
-  No root, factory reset, account removal, firmware or overlay change occurred.
-- Test-only 0.7.0-dev client and embedded guard remain installed as Device Owner.
-  Original APK backups and password-bearing evidence are private under
-  `/tmp/styly-mdm-wifi-device-test-20261020/private/`, excluded from Git.
-- HTTP test server remains on 7086; client uses `ws://127.0.0.1:7086/ws/device`
-  through USB reverse. The Documents registry file was unchanged. Runtime
-  canonical registration increased 290 to291 records; target membership moved
-  into its dedicated one-device group, leaving the old `test` group with one.
-- At the completed pre-review checkpoint, s-5ghz had an IP, MDM was online and
-  server/client policy was explicitly unmanaged with a retained successful
-  baseline and no pending operation. Temporary restoration Activities/probes
-  and credential input/output were removed.
+- Branch `codex/group-wifi-settings`; pre-feature baseline `7df0492`.
+  Local commit only; no push. [WIFI_SETTINGS.md](../docs/WIFI_SETTINGS.md)
+  defines the current behavior. This report supersedes earlier replacement,
+  recovery-registration and prototype-migration tests.
+- DEV-005, Device ID `70a1c963-e76e-4afb-9439-aeb21784298b`:
+  PICO 4 Ultra Enterprise, PUI 5.15.7, Android 14; ADB model A9210,
+  application model A94U0. TobService 4.3.30; client SDK 4.3.16.
+  The ADB skill checks the Device ID PNG before each operation.
+- The operator authorized APK replacement, Wi-Fi changes, Device Owner and
+  test permissions. No root, factory reset or firmware modification occurred.
+  The test-only DevDebug client and guard remain installed as Device Owner.
+- HTTP server: port 7086, using a private runtime copy of the Documents TeNQ
+  registry. The original Documents file is unchanged. The dedicated hardware
+  group contains only DEV-005. USB reverse provides the test MDM route.
+- Only s-5ghz was available. Existing settings were retained throughout these
+  auto-join tests. Two deliberately unreachable test networks remain saved OFF.
+  Credentials and detailed evidence are private under
+  `/tmp/styly-wifi-autojoin-validation/private/`, excluded from Git.
 
-## Physical outcomes
+## Current physical results
 
 | Case | Observed result |
 |---|---|
-| Initial recovery registration | No Wi-Fi/policy/boot change; separate seed retained. Re-registration replaced it only before first managed success. |
-| SSID/IP success without MDM route | Removed USB reverse while the operation was active. s-5ghz committed locally at 3.3s. |
-| Same SSID, wrong password | Timeout at 60.5s; known successful credentials and actual connection restored. Baseline unchanged. |
-| No available candidate AP | Timeout at 60.6s; registered fallback configuration restored. Fallback AP was also unavailable, so connectivity was not claimed. |
-| Process death | Pending journal restored conservatively at 1.6s; UNKNOWN/rolled_back=true, no renewed candidate budget. |
-| Background-only restart | Starting only the service restored the baseline and actual connection at 3.5s. |
-| Managed boot without MDM | Removed the successful OS network, rebooted109 to 110. Network recreated, boot result successful, IP acquired without USB route. Service restart did not repeat correction. |
-| Delete without send | Client state and previous delivery remained unchanged. |
-| Explicit unmanaged, populated baseline | Policy disabled; current Wi-Fi and successful baseline retained. |
-| Unmanaged boot | Removed OS network, rebooted110 to 111. After USB reconnection, network remained absent, policy false, claimed generation110 and boot results unchanged. |
-| Managed re-enable | Separately restored connectivity, then explicit MDM deployment succeeded at 3.8s and re-enabled management. |
-| Final unmanaged deployment | Delete again preserved state/delivery; explicit send aligned server/client revision and retained s-5ghz/IP. No pending work. |
-| Offline targets | Excluded from the send; later reconnect did not replay it. |
+| Initial managed deployment | No recovery seed required. Local SSID/IP success at 3.6s; existing network IDs retained. |
+| Unreachable new SSID | Timeout/recovery at 60.7s; original auto-join flags restored, new candidate retained OFF, actual original SSID/IP restored. |
+| Same SSID with wrong password | Timeout/recovery at 60.3s; MDM-known previous password and actual SSID/IP restored. Successful baseline unchanged. |
+| Process death during mutation | Restart recovered the durable snapshot at 3.1s, restored flags and actual SSID/IP; no renewed 60s candidate budget. |
+| Managed OS boot without MDM route | Before boot, baseline auto-join OFF and test candidate ON. Boot re-enabled baseline, disabled candidates and obtained an IP. Network identities retained despite OS ID reassignment (boot 114). |
+| Service restart in the same OS boot | A manually enabled test candidate remained enabled; boot policy was not applied twice. |
+| Delete without Deploy | Client journal, management flag and OS Wi-Fi flags stayed unchanged. |
+| Explicit unmanaged Deploy | Disabled boot management while preserving current flags and the successful baseline. |
+| Unmanaged OS boot | A manually enabled test candidate stayed enabled (boot 115); no policy reapplication. Baseline retained, no pending operation. |
 
-The ordinary app initially failed PERMISSION_DENIED. Device Owner enabled
-writes but did not reveal old PSKs, so the operator approved MDM-known recovery
-instead of full OS restoration. Original unknown networks were removed and were
-not restored. Office/guest APs became unavailable; the operator supplied s-5ghz.
-Two available-AP switching and dual-STA/MLO are not established by these results.
+Final readback: s-5ghz connected with an IP, baseline auto-join ON, both test
+candidates OFF, server/client unmanaged and no pending operation. Final APK
+and server were restarted and MDM registration confirmed online. The temporary
+ADB diagnostic JAR was removed.
 
-Boot testing found empty configured-network readback despite successful writes,
-with location AppOps rejection. Location foreground-service promotion before
-recovery fixed the actual boot test; no background-location grant was added.
-An instrumentation probe's empty list differed from normal app execution and
-was not treated as firmware evidence. PICO exposes multiple security views per
-network ID; adapter readback counts IDs and checks the requested view.
+The first timeout test exposed an actual permission failure: PUI rejected
+`getConfiguredNetworks()` after disconnecting Wi-Fi despite precise location,
+Location enabled and a location foreground service. Adding and granting
+`ACCESS_BACKGROUND_LOCATION` allowed recovery with the app in the background;
+the successful timeout, wrong-password and process-recovery tests followed.
+The app now rejects managed mutation without this permission and directs the
+operator to allow precise location all the time. A blocked recovery requires a
+headset restart after fixing permissions; the UI states this explicitly.
+Unknown old passwords remain unreadable and cannot be restored after overwrite.
 
-With no OS network, the existing client waits for network availability before
-initiating its loopback USB connection. A temporary normal-app Activity restored
-basic connectivity before the managed re-enable test. This was setup, not proof
-of MDM delivery to a networkless device. The clean product APK was restored.
+## Review and automated verification
 
-## Whole-feature review and simplification
+Read-only architecture/build, lifecycle/testing and code-health reviewers were
+used at implementation checkpoints. The primary agent verified and fixed:
 
-Read-only `review_arch_build`, `review_testing` and `review_code_health` reviewed
-`7df0492...b063e28`; the primary agent verified and fixed accepted findings.
+- Restored `membershipConflict`, still used by the existing Devices editor.
+- Removed stale cached group-revision comparisons that blocked a fresh profile.
+- Discarded the actual dirty model on editor exit, including Devices-tab changes.
+- Removed unused independent profile-rename/delete save branches; group and
+  encrypted profiles have one registry-save owner.
+- Corrected the deletion warning: unmanaged Deploy also preserves OS flags.
+- Removed leftover TLS server/discovery setup, unpublished-format migrations,
+  initial baseline registration, per-device send history and detailed boot state.
+- Kept mutation ownership, fixed deadlines, local fresh-network proof, durable
+  rollback fences and operation-specific alarms. Production selection tests cover
+  network-ID reassignment, duplicate security views, missing/ambiguous originals,
+  and candidates added before an ID could be journalled.
 
-- P2, `WifiSettingsController.finishManualFailure`: older rollback completion
-  could cancel the next operation's global alarm.
-  Operation-specific alarm identity/cancellation preserves the newer deadline.
-- P2, `appendWifiOperationReceipt`: receipt retention alternated between
-  unbounded growth and500 entries.
-  One bounded policy now owns deduplication across every command path.
-- P2, `_recover_wifi_group_mutation`: group recovery removed its journal before
-  restored directory entries were
-  durable. Destination directories now sync before journal removal; failure
-  retains the recovery marker.
-- Removed unused server-ACK fields/state machine, OS snapshot/Parcel/priority
-  restoration, duplicate client restoration execution and repeated API readback.
-  Recovery represents known profiles only. Current client schema 4 is read into 5;
-  earlier unpublished prototype formats are rejected.
-- Server delivery has one latest durable record per device. Removed duplicate
-  operation history, pruning and synchronization. Current server format 2 reads
-  into 3, preserving profiles/latest deliveries and interrupted-send uncertainty.
-- P3, `buildProfilePayload`: console duplicate checks now use SSID/security
-  identity, matching the server and client instead of rejecting valid shared SSIDs.
-- Consolidated the operating contract into one guide and this validation report;
-  removed three superseded task specifications. Crash-safe paired group updates,
-  mutation fences and fresh-network checks remain because they protect verified
-  behavior, not speculative compatibility.
+Checks: full server 456 passed; Wi-Fi/Push console 24 passed; Android 166 passed,
+DevDebug test-only APK assembled and installed. `git diff --check`, SVG and
+embedded editable XML validation passed. Existing aiohttp AppKey warnings remain.
 
-Automated post-review checks: full server 464 passed, Wi-Fi/Push console 32 passed,
-Android 168 passed and test-only DevDebug APK assembled. SVG and embedded editable
-XML are valid; unchanged diagram elements retain their original formatting.
-Actual server format 2 to 3 migration preserved profiles/latest delivery. Actual
-client schema 4 to 5 migration preserved profiles, policy and boot history, then
-normal managed SSID/IP success completed at 3.9s. Actual boot 111 to 112 recreated the removed successful configuration, acquired
-an IP without MDM and did not repeat on service restart. A timed wrong-password
-attempt rolled back at 60.8s and recovered the actual SSID/IP connection.
-After reconnection, profile deletion preserved client/delivery state; explicit
-unmanaged deployment again retained the connected Wi-Fi and successful baseline.
-Compared with the pre-feature base, changed lines decreased from 9056 to 8028;
-production code decreased by 396 net lines, and the whole feature by 896 net lines.
-These counts include retained meaningful regression tests, not removal of checks.
-Existing aiohttp application-key warnings remain. No external AI was used.
+The actual 291-record console was checked at desktop and 375px widths. Existing
+button styles were retained, fields stack without horizontal overflow, password
+values are not rendered by GET, and an unsaved edit disappears after leaving and
+returning. Browser warning/error log was empty during the check.
 
-## Evidence and limits
+## Limits
 
-Private evidence includes v3 records 01–14 (initial registration, local success,
-timeout/process/boot recovery, resumed unmanaged readback and final cleanup).
-Review evidence under `private/review/` includes actual server/client format
-migration, managed success, the active exact-alarm registration and final state.
-Boot112 and timed-repeat records are under `private/v3/`. The attempted
-concurrent unmanaged test could not send once Wi-Fi closed the MDM socket;
-this path is covered by JVM policy-epoch tests, not claimed as a physical pass.
-The first unmanaged reboot script timed out while USB was absent; its result is
-supported by the resumed boot 111 readback. Temporary files are not a permanent
-committed audit archive. No passwords appear in this report or Git.
+No physical proof is claimed for two available APs, simultaneous dual-SSID
+connection, concurrent unmanaged delivery after the MDM socket closes, an OS
+reboot during an active mutation, exact-alarm-only cold recovery, permission-dialog
+interaction, power cuts, or strict before-content-start ordering. Lifecycle and
+policy-epoch races have JVM coverage. Unknown-credential overwrite is an accepted
+restoration limit. Server registry replacement is atomic but was not tested
+against physical power loss. Prototype compatibility is intentionally absent.
 
-The actual page was checked with 291 runtime records at 1280px and in a 375px frame
-of the complete live console. Existing 38px action controls and stacked narrow
-layout fit; no desktop horizontal overflow. Unsaved layout drafts were discarded.
 
-Unverified hardware cases: concurrent unmanaged delivery during an active
-connection attempt (its MDM socket closes with Wi-Fi), two available APs, duplicate-command replay,
-active-operation OS reboot, exact-alarm-only cold recovery, later location-grant
-permission dialog, and strict before-content-start ordering. Group recovery
-fsync ordering is covered by injected-failure tests, not physical power cuts.
+Compared with pre-feature `7df0492`, production additions decreased from 4530 to
+3526 lines (about 22%). Including tests/docs and removed base lines, the feature
+changed-line total decreased from 8028 to approximately 5860.
+Required rollback/lifecycle ownership remains; this is not a 50% reduction.

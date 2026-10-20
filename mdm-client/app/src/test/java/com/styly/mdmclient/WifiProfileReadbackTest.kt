@@ -1,48 +1,36 @@
 package com.styly.mdmclient
 
-import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class WifiProfileReadbackTest {
     private val office = WifiNetworkProfile("office", "WPA_PSK", "test-key-123", false)
 
     @Test
-    fun `PSK and SAE views of one network are not counted as two saved networks`() {
-        val views = listOf(entry(5), entry(5, security = null))
-        assertEquals("validated", wifiProfileReadback(views, listOf(office), setOf(office.identity)))
+    fun `multiple security views share the selected network and retain disabled unrelated settings`() {
+        val views = listOf(entry(5), entry(5, security = "SAE"), entry(7, ssid = "retained", allowed = false))
+        assertTrue(wifiProfileReadback(views, listOf(office)))
     }
 
     @Test
-    fun `masked credentials need a successful known credential write`() {
-        assertEquals("unknown", wifiProfileReadback(listOf(entry(5)), listOf(office), emptySet()))
-        assertEquals("validated", wifiProfileReadback(listOf(entry(5)), listOf(office), setOf(office.identity)))
+    fun `duplicate saved IDs for one profile are rejected`() {
+        assertFalse(wifiProfileReadback(listOf(entry(5), entry(7)), listOf(office)))
     }
 
     @Test
-    fun `a second saved ID for the same profile is not hidden by security normalization`() {
-        val views = listOf(entry(5), entry(5, security = null), entry(7))
-        assertEquals("mismatch", wifiProfileReadback(views, listOf(office), setOf(office.identity)))
+    fun `all unrelated security views must have auto join disabled`() {
+        val views = listOf(entry(5), entry(7, "SAE", "retained", false), entry(7, "WPA_PSK", "retained", true))
+        assertFalse(wifiProfileReadback(views, listOf(office)))
     }
 
     @Test
-    fun `an unrelated unsupported network still fails complete profile replacement`() {
-        val views = listOf(entry(5), entry(7, security = null, ssid = "unmanaged"))
-        assertEquals("mismatch", wifiProfileReadback(views, listOf(office), setOf(office.identity)))
+    fun `missing candidate hidden mismatch or disabled candidate fails readback`() {
+        assertFalse(wifiProfileReadback(emptyList(), listOf(office)))
+        assertFalse(wifiProfileReadback(listOf(entry(5).copy(hidden = true)), listOf(office)))
+        assertFalse(wifiProfileReadback(listOf(entry(5, allowed = false)), listOf(office)))
     }
 
-    @Test
-    fun `readable wrong credentials and hidden flag mismatch are not accepted`() {
-        assertEquals("mismatch", wifiProfileReadback(listOf(entry(5).copy(passwordReadable = true, password = "wrong-key")), listOf(office), setOf(office.identity)))
-        assertEquals("mismatch", wifiProfileReadback(listOf(entry(5).copy(hidden = true)), listOf(office), setOf(office.identity)))
-    }
-
-    private fun entry(id: Int, security: String? = "WPA_PSK", ssid: String = "office") = WifiConfiguredEntry(
-        networkId = id,
-        ssid = ssid,
-        security = security,
-        password = "",
-        passwordReadable = false,
-        hidden = false,
-        enabled = true,
-    )
+    private fun entry(id: Int, security: String = "WPA_PSK", ssid: String = "office", allowed: Boolean = true) =
+        WifiConfiguredEntry(id, ssid, security, hidden = false, autoJoinEnabled = allowed)
 }

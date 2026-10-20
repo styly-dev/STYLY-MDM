@@ -7,7 +7,6 @@ Static files for the web console are served from ./static/.
 
 import argparse
 import asyncio
-import base64
 import copy
 import json
 import logging
@@ -15,7 +14,6 @@ import os
 import re
 import shutil
 import socket
-import ssl
 import sys
 import time
 import uuid
@@ -187,7 +185,6 @@ PROTECTED_PACKAGES = {"com.styly.mdmclient", "com.styly.mdmguard"}
 
 # Persistent per-device registry: serial -> {label, model, ip, last_seen, startup_app, battery}
 REGISTRY_PATH = DATA_DIR / "device_registry.json"
-_WIFI_GROUP_RECOVERY_REQUIRED = False
 MAX_LABEL_LEN = 64
 MAX_GROUP_NAME_LEN = 64
 IDENTITY_SCHEME = "styly_device_id_v1"
@@ -223,6 +220,7 @@ device_registry: dict[str, dict] = {}
 # offline (or not-yet-registered) device can still be grouped. Persisted to
 # REGISTRY_PATH alongside the device registry.
 device_groups: dict[str, list[str]] = {}
+_wifi_profiles_encrypted: str | None = None
 
 # Connected admin WebSocket sessions
 admin_connections: set[web.WebSocketResponse] = set()
@@ -408,8 +406,10 @@ def load_registry() -> None:
     is a one-way auto-migration; an older server reading a new file would mistake
     "devices"/"groups" for phantom devices (downgrade-only, acceptable).
     """
+    global _wifi_profiles_encrypted
     device_registry.clear()
     device_groups.clear()
+    _wifi_profiles_encrypted = None
     try:
         raw = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -425,6 +425,7 @@ def load_registry() -> None:
     if isinstance(raw.get("devices"), dict):
         devices_raw = raw["devices"]
         loaded_groups = _coerce_groups(raw.get("groups"))
+        _wifi_profiles_encrypted = raw.get("wifi_profiles_encrypted")
     else:
         devices_raw = raw  # legacy flat shape: the whole object is serial -> value
 
@@ -448,71 +449,22 @@ def load_registry() -> None:
 
 def _registry_bytes() -> bytes:
     payload = {"devices": device_registry, "groups": device_groups}
+    if _wifi_profiles_encrypted is not None:
+        payload["wifi_profiles_encrypted"] = _wifi_profiles_encrypted
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
 
-def _wifi_group_journal_path() -> Path:
-    return DATA_DIR / "wifi_group_mutation.txn"
-
-
-def _fsync_directory(path: Path) -> None:
-    directory_fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-
-
-def _encode_journal_bytes(content: bytes | None) -> str | None:
-    return base64.b64encode(content).decode("ascii") if content is not None else None
-
-
-def _decode_journal_bytes(content: object) -> bytes | None:
-    if content is None:
-        return None
-    if not isinstance(content, str):
-        raise ValueError("invalid transaction journal")
-    return base64.b64decode(content, validate=True)
-
-
-def _recover_wifi_group_mutation(data_dir: Path, registry_path: Path) -> bool:
-    """Restore or finish an interrupted group/profile mutation before loading state."""
-    journal_path = data_dir / "wifi_group_mutation.txn"
-    try:
-        journal_bytes = journal_path.read_bytes()
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-    try:
-        journal = json.loads(journal_bytes.decode("utf-8"))
-        if not isinstance(journal, dict) or journal.get("version") != 1:
-            return False
-        phase = journal.get("phase")
-        if phase == "rollback":
-            registry_bytes = _decode_journal_bytes(journal.get("previous_registry"))
-            wifi_bytes = _decode_journal_bytes(journal.get("previous_wifi"))
-        elif phase == "commit":
-            registry_bytes = _decode_journal_bytes(journal.get("next_registry"))
-            wifi_bytes = _decode_journal_bytes(journal.get("next_wifi"))
-        else:
-            return False
-        wifi_path = data_dir / "wifi_settings.enc"
-        _restore_file(registry_path, registry_bytes)
-        _restore_file(wifi_path, wifi_bytes, private=True)
-        for directory in {registry_path.parent, wifi_path.parent}:
-            _fsync_directory(directory)
-        journal_path.unlink(missing_ok=True)
-        _fsync_directory(data_dir)
-        return True
-    except (OSError, ValueError, UnicodeDecodeError):
-        return False
+def _persist_wifi_profiles(encrypted_state: str) -> None:
+    global _wifi_profiles_encrypted
+    previous = _wifi_profiles_encrypted
+    _wifi_profiles_encrypted = encrypted_state
+    if not save_registry():
+        _wifi_profiles_encrypted = previous
+        raise WiFiStoreError("Wi-Fi profiles could not be persisted")
 
 
 def save_registry() -> bool:
     """Persist the per-device registry and groups atomically (temp file + replace)."""
-    if _WIFI_GROUP_RECOVERY_REQUIRED:
-        return False
     tmp = REGISTRY_PATH.with_suffix(".json.tmp")
     try:
         tmp.write_bytes(_registry_bytes())
@@ -524,130 +476,23 @@ def save_registry() -> bool:
         return False
 
 
-def _stage_bytes(path: Path, content: bytes, *, private: bool = False) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary = Path(temp_name)
-    try:
-        if private:
-            os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except OSError:
-        temporary.unlink(missing_ok=True)
-        raise
-    return temporary
-
-
-def _restore_file(path: Path, previous: bytes | None, *, private: bool = False) -> None:
-    if previous is None:
-        path.unlink(missing_ok=True)
-        return
-    temporary = _stage_bytes(path, previous, private=private)
-    os.replace(temporary, path)
-
-
 def _persist_group_registry_mutation(
     store: WiFiSettingsStore | None,
     previous_groups: dict[str, list[str]],
     previous_wifi_state: dict | None,
 ) -> bool:
-    """Commit a group rename/delete with a durable rollback journal.
-
-    The journal contains the previous registry and encrypted-store bytes. Startup
-    restores both before loading either, so a crash between replacements cannot
-    leave group membership and its profile under different names.
-    """
-    global _WIFI_GROUP_RECOVERY_REQUIRED
-    if _WIFI_GROUP_RECOVERY_REQUIRED:
-        device_groups.clear()
-        device_groups.update(previous_groups)
-        if store is not None and previous_wifi_state is not None:
-            store.state = previous_wifi_state
-        return False
-    previous_registry_bytes: bytes | None = None
-    previous_store_bytes: bytes | None = None
-    registry_temp: Path | None = None
-    store_temp: Path | None = None
-    journal_temp: Path | None = None
-    journal_committed = False
-    commit_phase_written = False
-    journal_path = _wifi_group_journal_path()
+    """Save a group rename/delete and its encrypted profile in one registry replace."""
     try:
-        try:
-            previous_registry_bytes = REGISTRY_PATH.read_bytes()
-        except FileNotFoundError:
-            pass
         if store is not None:
-            try:
-                previous_store_bytes = store.path.read_bytes()
-            except FileNotFoundError:
-                pass
-        next_registry_bytes = _registry_bytes()
-        next_store_bytes = store.encrypted_bytes() if store is not None else None
-        registry_temp = _stage_bytes(REGISTRY_PATH, next_registry_bytes)
-        if store is not None:
-            store_temp = _stage_bytes(store.path, next_store_bytes, private=True)
-        journal = json.dumps({
-            "version": 1,
-            "phase": "rollback",
-            "previous_registry": _encode_journal_bytes(previous_registry_bytes),
-            "previous_wifi": _encode_journal_bytes(previous_store_bytes),
-            "next_registry": _encode_journal_bytes(next_registry_bytes),
-            "next_wifi": _encode_journal_bytes(next_store_bytes),
-        }, separators=(",", ":")).encode("ascii")
-        journal_temp = _stage_bytes(journal_path, journal, private=True)
-        os.replace(journal_temp, journal_path)
-        journal_temp = None
-        journal_committed = True
-        _fsync_directory(journal_path.parent)
-        os.replace(registry_temp, REGISTRY_PATH)
-        registry_temp = None
-        if store_temp is not None and store is not None:
-            os.replace(store_temp, store.path)
-            store_temp = None
-            try:
-                store.path.chmod(0o600)
-            except OSError:
-                pass
-        _fsync_directory(REGISTRY_PATH.parent)
-        if store is not None and store.path.parent != REGISTRY_PATH.parent:
-            _fsync_directory(store.path.parent)
-
-        committed_journal = json.dumps({
-            "version": 1,
-            "phase": "commit",
-            "previous_registry": _encode_journal_bytes(previous_registry_bytes),
-            "previous_wifi": _encode_journal_bytes(previous_store_bytes),
-            "next_registry": _encode_journal_bytes(next_registry_bytes),
-            "next_wifi": _encode_journal_bytes(next_store_bytes),
-        }, separators=(",", ":")).encode("ascii")
-        journal_temp = _stage_bytes(journal_path, committed_journal, private=True)
-        os.replace(journal_temp, journal_path)
-        journal_temp = None
-        commit_phase_written = True
-        _fsync_directory(journal_path.parent)
-        journal_path.unlink()
-        _fsync_directory(journal_path.parent)
-        journal_committed = False
+            store.persist()
+        elif not save_registry():
+            raise OSError("registry write failed")
         return True
     except (OSError, WiFiStoreError):
-        if journal_committed:
-            if not _recover_wifi_group_mutation(DATA_DIR, REGISTRY_PATH):
-                _WIFI_GROUP_RECOVERY_REQUIRED = True
-                log.critical("Could not recover a partial Wi-Fi group metadata update")
-            elif commit_phase_written:
-                # The commit marker is durable, so recovery finishes the new pair.
-                return True
         device_groups.clear()
         device_groups.update(previous_groups)
         if store is not None and previous_wifi_state is not None:
             store.state = previous_wifi_state
-        for temporary in (registry_temp, store_temp, journal_temp):
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
         return False
 
 
@@ -1424,53 +1269,29 @@ def zip_tree(root: Path, dest_zip: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Wi-Fi settings API and transport security
+# Wi-Fi settings API
 # ---------------------------------------------------------------------------
 
 WIFI_REQUEST_MAX_BYTES = 256 * 1024
 WIFI_SEND_TIMEOUT = 5.0
 
 
-def _load_tls_context() -> ssl.SSLContext | None:
-    cert_path = os.environ.get("MDM_TLS_CERT")
-    key_path = os.environ.get("MDM_TLS_KEY")
-    if not cert_path and not key_path:
-        return None
-    if not cert_path or not key_path:
-        raise RuntimeError("both MDM_TLS_CERT and MDM_TLS_KEY are required when configuring TLS")
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    try:
-        context.load_cert_chain(certfile=cert_path, keyfile=key_path)
-    except (OSError, ssl.SSLError):
-        raise RuntimeError("the configured TLS certificate could not be loaded") from None
-    return context
-
-
-def _load_wifi_store(
-    data_dir: Path,
-    tls_context: ssl.SSLContext | None,
-    *,
-    allow_http: bool = False,
-) -> tuple[bool, WiFiSettingsStore | None]:
+def _load_wifi_store() -> tuple[bool, WiFiSettingsStore | None]:
     encryption_key = os.environ.get("MDM_WIFI_ENCRYPTION_KEY")
-    store_path = data_dir / "wifi_settings.enc"
-    state_exists = store_path.exists()
-    if not encryption_key and not state_exists:
+    if not encryption_key and _wifi_profiles_encrypted is None:
         return False, None
-    if not (encryption_key and (tls_context is not None or allow_http)):
-        raise RuntimeError(
-            "Wi-Fi state requires MDM_WIFI_ENCRYPTION_KEY and either TLS credentials "
-            "or MDM_WIFI_ALLOW_HTTP=1"
-        )
+    if not encryption_key:
+        raise RuntimeError("MDM_WIFI_ENCRYPTION_KEY is required to read saved Wi-Fi profiles")
+    if _wifi_profiles_encrypted is not None and not isinstance(_wifi_profiles_encrypted, str):
+        raise RuntimeError("saved Wi-Fi profiles are malformed")
     try:
-        return True, WiFiSettingsStore(store_path, encryption_key)
+        return True, WiFiSettingsStore(
+            encryption_key,
+            _wifi_profiles_encrypted,
+            persist=_persist_wifi_profiles,
+        )
     except WiFiStoreError:
         raise RuntimeError("the encrypted Wi-Fi settings store could not be opened safely") from None
-
-
-def _wifi_transport_allowed(request: web.Request) -> bool:
-    """Require TLS unless this managed-LAN server explicitly opted into HTTP."""
-    return request.secure or request.app.get("wifi_allow_http") is True
 
 
 def _wifi_origin_allowed(request: web.Request) -> bool:
@@ -1524,10 +1345,6 @@ def _wifi_api_unavailable() -> web.Response:
     return web.json_response({"error": "Wi-Fi settings are not enabled"}, status=503)
 
 
-def _wifi_recovery_required_response() -> web.Response:
-    return web.json_response({"error": "Wi-Fi state recovery is required"}, status=503)
-
-
 def _wifi_name_from_request(request: web.Request) -> str:
     name = request.match_info.get("name", "")
     if not name or name != name.strip() or len(name) > MAX_GROUP_NAME_LEN:
@@ -1535,7 +1352,7 @@ def _wifi_name_from_request(request: web.Request) -> str:
     return name
 
 
-def _wifi_state_payload(store: WiFiSettingsStore, *, allow_http: bool) -> dict:
+def _wifi_state_payload(store: WiFiSettingsStore) -> dict:
     groups = {}
     for name in sorted(device_groups):
         profile = store.profile(name)
@@ -1543,50 +1360,24 @@ def _wifi_state_payload(store: WiFiSettingsStore, *, allow_http: bool) -> dict:
             "revision": profile.get("revision") if profile else None,
             "mode": profile.get("mode") if profile else None,
         }
-    online_ids = {
-        device_id for device_id, entry in devices.items()
-        if entry.get("status") == "online"
-    }
-    known_ids = set(device_registry) | online_ids
     return {
         "enabled": True,
-        "allow_http": allow_http,
         "groups": groups,
-        "devices": store.state_view(known_ids, online_ids),
     }
 
 
 async def wifi_state_handler(request: web.Request) -> web.Response:
-    if _WIFI_GROUP_RECOVERY_REQUIRED:
-        return _wifi_recovery_required_response()
     if not request.app.get("wifi_enabled"):
-        return web.json_response({"enabled": False, "allow_http": False, "groups": {}, "devices": {}})
-    if not _wifi_transport_allowed(request):
-        return web.json_response(
-            {
-                "error": "Wi-Fi settings require HTTPS unless MDM_WIFI_ALLOW_HTTP=1",
-            },
-            status=403,
-        )
+        return web.json_response({"enabled": False, "groups": {}})
     store = _wifi_store(request)
     if store is None:
         return _wifi_api_unavailable()
-    return web.json_response(_wifi_state_payload(
-        store,
-        allow_http=request.app.get("wifi_allow_http") is True,
-    ))
+    return web.json_response(_wifi_state_payload(store))
 
 
 async def wifi_group_handler(request: web.Request) -> web.Response:
-    if _WIFI_GROUP_RECOVERY_REQUIRED:
-        return _wifi_recovery_required_response()
     if not request.app.get("wifi_enabled"):
         return _wifi_api_unavailable()
-    if not _wifi_transport_allowed(request):
-        return web.json_response(
-            {"error": "Wi-Fi settings require HTTPS unless MDM_WIFI_ALLOW_HTTP=1"},
-            status=403,
-        )
     store = _wifi_store(request)
     if store is None:
         return _wifi_api_unavailable()
@@ -1614,8 +1405,7 @@ async def wifi_group_handler(request: web.Request) -> web.Response:
             current = store.profile(name)
             _check_expected_revision(body, current, allow_new_profile=True)
             if request.method == "DELETE":
-                # Removing settings changes server policy only. It must not
-                # erase device delivery history or send a device command.
+                # Save as unmanaged; the device changes only after explicit Deploy.
                 profile = store.put_profile(name, [], mode="unmanaged")
             else:
                 networks = validate_profile_networks(
@@ -1636,23 +1426,12 @@ async def wifi_group_handler(request: web.Request) -> web.Response:
 
 
 async def wifi_deploy_handler(request: web.Request) -> web.Response:
-    return await _wifi_send_handler(request, recovery=False)
+    return await _wifi_send_handler(request)
 
 
-async def wifi_recovery_handler(request: web.Request) -> web.Response:
-    return await _wifi_send_handler(request, recovery=True)
-
-
-async def _wifi_send_handler(request: web.Request, *, recovery: bool) -> web.Response:
-    if _WIFI_GROUP_RECOVERY_REQUIRED:
-        return _wifi_recovery_required_response()
+async def _wifi_send_handler(request: web.Request) -> web.Response:
     if not request.app.get("wifi_enabled"):
         return _wifi_api_unavailable()
-    if not _wifi_transport_allowed(request):
-        return web.json_response(
-            {"error": "Wi-Fi settings require HTTPS unless MDM_WIFI_ALLOW_HTTP=1"},
-            status=403,
-        )
     if not _wifi_origin_allowed(request):
         return web.json_response({"error": "invalid request origin"}, status=403)
     store = _wifi_store(request)
@@ -1667,8 +1446,6 @@ async def _wifi_send_handler(request: web.Request, *, recovery: bool) -> web.Res
             profile = store.profile(name)
             if profile is None:
                 raise WiFiSettingsError("group has no saved Wi-Fi profile", 409)
-            if recovery and profile["mode"] != "managed":
-                raise WiFiSettingsError("a managed Wi-Fi profile is required for recovery", 409)
             _check_expected_revision(body, profile, allow_new_profile=False)
 
             # Freeze the online membership and sockets before any network write.
@@ -1679,23 +1456,17 @@ async def _wifi_send_handler(request: web.Request, *, recovery: bool) -> web.Res
                 if isinstance(devices.get(device_id), dict)
                 and devices[device_id].get("status") == "online"
             ]
-            attempts = store.create_delivery_attempts(
-                name,
-                profile["revision"],
-                [device_id for device_id, _entry, _ws in targets],
-            )
-
         results = [
             {
-                "operation_id": attempt["operation_id"],
-                "device_id": attempt["device_id"],
+                "operation_id": str(uuid.uuid4()),
+                "device_id": device_id,
                 "status": "unknown",
                 "reason": "dispatch_not_confirmed",
             }
-            for attempt in attempts
+            for device_id, _entry, _ws in targets
         ]
 
-        async def dispatch_one(target, attempt, result):
+        async def dispatch_one(target, result):
             device_id, entry, ws = target
             # Serialize commands to each device. A managed command already in
             # send may be followed by an unmanaged command, but the order must
@@ -1703,9 +1474,7 @@ async def _wifi_send_handler(request: web.Request, *, recovery: bool) -> web.Res
             # This is only a short-lived send lock, not a device operation fence.
             send_lock = request.app["wifi_send_locks"].setdefault(device_id, asyncio.Lock())
             async with send_lock:
-                if not store.is_latest_delivery(device_id, attempt["operation_id"]):
-                    status, reason = "unknown", "superseded"
-                elif entry.get("identity_kind") != "canonical" or entry.get("wifi_settings_v3") is not True:
+                if entry.get("identity_kind") != "canonical" or entry.get("wifi_settings_v4") is not True:
                     status, reason = "failed", "unsupported"
                 elif devices.get(device_id) is not entry or not _owns_device(device_id, ws):
                     status, reason = "failed", "socket_replaced"
@@ -1714,13 +1483,11 @@ async def _wifi_send_handler(request: web.Request, *, recovery: bool) -> web.Res
                 else:
                     message = {
                         "type": "EXECUTE_WIFI_APPLY",
-                        "operation_id": attempt["operation_id"],
-                        "revision": attempt["revision"],
-                        "mode": "recovery" if recovery else profile["mode"],
+                        "operation_id": result["operation_id"],
+                        "revision": profile["revision"],
+                        "mode": profile["mode"],
                         "networks": profile["networks"],
                     }
-                    if message["mode"] in {"managed", "recovery"}:
-                        message["recovery_scope"] = "mdm_profiles"
                     try:
                         await asyncio.wait_for(
                             ws.send_str(json.dumps(message, ensure_ascii=False)),
@@ -1732,21 +1499,12 @@ async def _wifi_send_handler(request: web.Request, *, recovery: bool) -> web.Res
                         # the socket, so this is never reported as non-delivery.
                         status, reason = "unknown", "socket_send_failed"
 
-                try:
-                    async with request.app["wifi_lock"]:
-                        persisted = store.settle_delivery(device_id, attempt["operation_id"], status, reason)
-                except WiFiStoreError:
-                    log.error("Wi-Fi delivery state could not be persisted")
-                    status, reason = "unknown", "state_persist_failed"
-                else:
-                    if not persisted:
-                        status, reason = "unknown", "state_persist_failed"
                 result["status"] = status
                 result["reason"] = reason
 
         await asyncio.gather(*(
-            dispatch_one(target, attempt, result)
-            for target, attempt, result in zip(targets, attempts, results)
+            dispatch_one(target, result)
+            for target, result in zip(targets, results)
         ))
         return web.json_response({
             "group": name,
@@ -1757,8 +1515,8 @@ async def _wifi_send_handler(request: web.Request, *, recovery: bool) -> web.Res
     except WiFiSettingsError as exc:
         return web.json_response({"error": str(exc)}, status=exc.status)
     except WiFiStoreError:
-        log.error("Wi-Fi delivery attempt could not be persisted")
-        return web.json_response({"error": "Wi-Fi deployment could not be recorded"}, status=500)
+        log.error("Wi-Fi profile persistence failed")
+        return web.json_response({"error": "Wi-Fi settings could not be saved"}, status=500)
 
 
 # ---------------------------------------------------------------------------
@@ -1793,7 +1551,7 @@ def _parse_registration(data: dict, remote: str | None) -> tuple[str, dict] | tu
         "ip": _bounded_registration_text(data.get("ip"), remote or "unknown", MAX_DEVICE_IP_LEN),
         "version_name": _bounded_registration_text(data.get("version_name"), "", MAX_VERSION_NAME_LEN),
         "capabilities": capabilities,
-        "wifi_settings_v3": "wifi_settings_v3" in capabilities,
+        "wifi_settings_v4": "wifi_settings_v4" in capabilities,
     }
     version_code = data.get("version_code")
     common["version_code"] = (
@@ -1994,7 +1752,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "version_code": version_code,
                         "version_name": version_name,
                         "push_state_status": push_state_status,
-                        "wifi_settings_v3": registration["wifi_settings_v3"],
+                        "wifi_settings_v4": registration["wifi_settings_v4"],
                     }
                     device_registry[device_id] = {
                         "label": prev.get("label", ""),
@@ -2660,7 +2418,7 @@ async def handle_rename_group(
     previous_wifi_state = copy.deepcopy(store.state) if store is not None else None
     device_groups[new_name] = device_groups.pop(name)
     if store is not None:
-        store.rename_profile(name, new_name, save=False)
+        store.rename_profile(name, new_name)
     if not _persist_group_registry_mutation(store, previous_groups, previous_wifi_state):
         await admin_ws.send_str(json.dumps({
             "type": "ERROR",
@@ -2700,7 +2458,7 @@ async def handle_delete_group(
         previous_wifi_state = copy.deepcopy(store.state) if store is not None else None
         device_groups.pop(name, None)
         if store is not None:
-            store.delete_profile(name, save=False)
+            store.delete_profile(name)
         if not _persist_group_registry_mutation(store, previous_groups, previous_wifi_state):
             await admin_ws.send_str(json.dumps({
                 "type": "ERROR",
@@ -3692,10 +3450,9 @@ def source_ip_for(peer: str) -> str | None:
 class _UdpDiscoveryProtocol(asyncio.DatagramProtocol):
     """Responds to UDP broadcast discovery requests with the server's WebSocket URL."""
 
-    def __init__(self, ws_port: int, ip_addresses: list[str], *, tls_enabled: bool = False):
+    def __init__(self, ws_port: int, ip_addresses: list[str]):
         self._ws_port = ws_port
         self._ip_addresses = ip_addresses
-        self._tls_enabled = tls_enabled
 
     def connection_made(self, transport: asyncio.DatagramTransport):
         self._transport = transport
@@ -3708,27 +3465,21 @@ class _UdpDiscoveryProtocol(asyncio.DatagramProtocol):
             server_ip = source_ip_for(addr[0])
             if server_ip is None:
                 server_ip = self._ip_addresses[0] if self._ip_addresses else "0.0.0.0"
-            scheme = "wss" if self._tls_enabled else "ws"
             response = json.dumps({
                 "service": "stylymdm",
-                "ws_url": f"{scheme}://{server_ip}:{self._ws_port}/ws/device",
+                "ws_url": f"ws://{server_ip}:{self._ws_port}/ws/device",
                 "version": "1.0",
             }).encode("utf-8")
             self._transport.sendto(response, addr)
-            log.info("Discovery request from %s:%d -> responded with %s://%s:%d",
-                     addr[0], addr[1], scheme, server_ip, self._ws_port)
+            log.info("Discovery request from %s:%d -> responded with ws://%s:%d",
+                     addr[0], addr[1], server_ip, self._ws_port)
 
 
-async def start_discovery_responder(
-    ws_port: int,
-    ip_addresses: list[str],
-    *,
-    tls_enabled: bool = False,
-):
+async def start_discovery_responder(ws_port: int, ip_addresses: list[str]):
     """Start the UDP discovery responder as an asyncio task."""
     loop = asyncio.get_running_loop()
     transport, _ = await loop.create_datagram_endpoint(
-        lambda: _UdpDiscoveryProtocol(ws_port, ip_addresses, tls_enabled=tls_enabled),
+        lambda: _UdpDiscoveryProtocol(ws_port, ip_addresses),
         local_addr=("0.0.0.0", DISCOVERY_PORT),
         family=socket.AF_INET,
         allow_broadcast=True,
@@ -3793,21 +3544,12 @@ def probe_existing_server(timeout: float = 1.0) -> str | None:
 
 def create_app() -> web.Application:
     # Ensure the writable data directory exists before loading/saving the registry.
-    global _WIFI_GROUP_RECOVERY_REQUIRED
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not _recover_wifi_group_mutation(DATA_DIR, REGISTRY_PATH):
-        _WIFI_GROUP_RECOVERY_REQUIRED = True
-        raise RuntimeError("an interrupted Wi-Fi group update could not be recovered")
-    _WIFI_GROUP_RECOVERY_REQUIRED = False
     load_registry()
-    tls_context = _load_tls_context()
-    allow_http = tls_context is None and os.environ.get("MDM_WIFI_ALLOW_HTTP") == "1"
-    wifi_enabled, wifi_store = _load_wifi_store(DATA_DIR, tls_context, allow_http=allow_http)
+    wifi_enabled, wifi_store = _load_wifi_store()
     app = web.Application(
         client_max_size=max(MAX_APK_SIZE, MAX_BUNDLE_SIZE) + 10 * 1024 * 1024)
-    app["tls_context"] = tls_context
     app["wifi_enabled"] = wifi_enabled
-    app["wifi_allow_http"] = wifi_enabled and allow_http
     app["wifi_store"] = wifi_store
     app["wifi_lock"] = asyncio.Lock()
     app["wifi_send_locks"] = {}
@@ -3820,7 +3562,6 @@ def create_app() -> web.Application:
     app.router.add_route("PUT", "/api/wifi/groups/{name}", wifi_group_handler)
     app.router.add_route("DELETE", "/api/wifi/groups/{name}", wifi_group_handler)
     app.router.add_post("/api/wifi/groups/{name}/deploy", wifi_deploy_handler)
-    app.router.add_post("/api/wifi/groups/{name}/recovery", wifi_recovery_handler)
     app.router.add_post("/api/apks", upload_apk_handler)
     app.router.add_post("/api/bundles", upload_bundle_handler)
 
@@ -3884,7 +3625,6 @@ async def run_server(port: int | None = None):
     if port is None:
         port = int(os.environ.get("MDM_WS_PORT", "7070"))
     app = create_app()
-    tls_context = app["tls_context"]
     ip_addresses = get_local_ip_addresses()
 
     # Imported lazily to avoid a circular import: __init__ defines __version__ but
@@ -3894,12 +3634,11 @@ async def run_server(port: int | None = None):
     from . import __version__
     version_label = f"{__version__} (untagged)" if __version__ == "0.0.0" else __version__
     log.info("Starting STYLY-MDM server v%s on port %d", version_label, port)
-    scheme = "https" if tls_context is not None else "http"
     if ip_addresses:
         for ip in ip_addresses:
-            log.info("  Server running at %s://%s:%d", scheme, ip, port)
+            log.info("  Server running at http://%s:%d", ip, port)
     else:
-        log.info("  Server running at %s://0.0.0.0:%d", scheme, port)
+        log.info("  Server running at http://0.0.0.0:%d", port)
 
     # Data-dir paths are CWD-relative by default (see DATA_DIR), so log the resolved
     # locations to make "where does this write" unambiguous at a glance.
@@ -3911,13 +3650,11 @@ async def run_server(port: int | None = None):
     log.info("  Discovery port:   %d", DISCOVERY_PORT)
 
     # Start UDP discovery responder alongside the HTTP server
-    discovery_transport = await start_discovery_responder(
-        port, ip_addresses, tls_enabled=tls_context is not None,
-    )
+    discovery_transport = await start_discovery_responder(port, ip_addresses)
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port, ssl_context=tls_context)
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
     try:

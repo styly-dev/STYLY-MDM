@@ -8,12 +8,8 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiInfo
-import android.net.wifi.WifiManager
-import android.os.Build
 import android.content.pm.PackageManager
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.Executors
-import java.util.concurrent.RejectedExecutionException
 
 internal data class WifiLocalNetworkObservation(
     val networkHandle: Long,
@@ -63,10 +59,11 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
     private val appContext = context.applicationContext
     private val connectivityManager = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
     private val locationManager = appContext.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
-    private val wifiManager = appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
 
     override fun preflight(): WifiReason? {
         if (appContext.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) !=
+            PackageManager.PERMISSION_GRANTED ||
+            appContext.checkSelfPermission(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION) !=
             PackageManager.PERMISSION_GRANTED
         ) return WifiReason.PERMISSION_DENIED
         if (locationManager?.isLocationEnabled != true) return WifiReason.PERMISSION_DENIED
@@ -76,7 +73,7 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
 
     override fun observe(listener: (WifiLocalConnectivityEvent) -> Unit): WifiLocalConnectivitySession {
         val manager = connectivityManager ?: throw IllegalStateException("Connectivity service unavailable")
-        val session = AndroidSession(manager, wifiManager, listener)
+        val session = AndroidSession(manager, listener)
         try {
             session.register()
             return session
@@ -88,13 +85,11 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
 
     private class AndroidSession(
         private val manager: ConnectivityManager,
-        private val wifiManager: WifiManager?,
         private val listener: (WifiLocalConnectivityEvent) -> Unit,
     ) : WifiLocalConnectivitySession {
         private data class MutableObservation(
             var ssid: String? = null,
             var hasUsableIp: Boolean = false,
-            var addresses: Set<java.net.InetAddress> = emptySet(),
             var sequence: Long = 0,
         )
 
@@ -104,23 +99,14 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
         // A seed read can race a callback delivered after registration. Retain lost handles
         // so a stale allNetworks snapshot cannot recreate an observation after onLost.
         private val lostNetworkHandles = WifiNetworkHandleTombstones()
-        private val legacySsidExecutor = Executors.newSingleThreadExecutor()
         private var sequence = 0L
 
-        private val callback: ConnectivityManager.NetworkCallback = if (networkCallbackNeedsLocationInfo(Build.VERSION.SDK_INT)) {
-            LocationAwareWifiCallback(this)
-        } else {
-            WifiCallback(this)
-        }
+        private val callback = LocationAwareWifiCallback(this)
 
         private fun onAvailable(network: Network) = emitUpdated(network)
 
         private fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                networkCapabilities.transportInfo as? WifiInfo
-            } else {
-                null
-            }
+            val info = networkCapabilities.transportInfo as? WifiInfo
             val event = synchronized(lock) {
                 if (lostNetworkHandles.isLost(network.networkHandle)) return
                 val current = observations.getOrPut(network.networkHandle) { MutableObservation() }
@@ -136,41 +122,9 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
             val event = synchronized(lock) {
                 if (lostNetworkHandles.isLost(network.networkHandle)) return
                 val current = observations.getOrPut(network.networkHandle) { MutableObservation() }
-                current.addresses = addresses
                 current.hasUsableIp = addresses.any { it.isUsableLocalAddress() }
                 current.sequence = ++sequence
                 WifiLocalConnectivityEvent.Updated(current.toObservation(network.networkHandle))
-            }
-            if (!closed.get()) listener(event)
-            if (!closed.get() && usesLegacyWifiSsidLookup(Build.VERSION.SDK_INT)) {
-                try {
-                    legacySsidExecutor.execute { updateLegacySsid(network.networkHandle) }
-                } catch (_: RejectedExecutionException) {
-                    // Completion may close the session after the callback's open check.
-                }
-            }
-        }
-
-        @Suppress("DEPRECATION")
-        private fun updateLegacySsid(networkHandle: Long) {
-            if (closed.get()) return
-            val info = try {
-                wifiManager?.connectionInfo
-            } catch (_: SecurityException) {
-                null
-            } ?: return
-            val address = info.ipAddress.toIpv4Address() ?: return
-            val ssid = info.ssid?.normalizeSsid() ?: return
-            val event = synchronized(lock) {
-                // Before Android 12, WifiInfo is device-global. Correlate it only when
-                // its IPv4 address identifies the sole observed Wi-Fi Network.
-                val current = observations[networkHandle] ?: return
-                if (!current.hasUsableIp ||
-                    !legacyWifiSsidCanIdentifyNetwork(observations.size, address in current.addresses)
-                ) return
-                current.ssid = ssid
-                current.sequence = ++sequence
-                WifiLocalConnectivityEvent.Updated(current.toObservation(networkHandle))
             }
             if (!closed.get()) listener(event)
         }
@@ -229,7 +183,6 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
 
         override fun close() {
             if (!closed.compareAndSet(false, true)) return
-            legacySsidExecutor.shutdownNow()
             try {
                 manager.unregisterNetworkCallback(callback)
             } catch (_: IllegalArgumentException) {
@@ -244,15 +197,6 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
             sequence = sequence,
         )
 
-        private class WifiCallback(private val session: AndroidSession) : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = session.onAvailable(network)
-            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) =
-                session.onCapabilitiesChanged(network, networkCapabilities)
-            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) =
-                session.onLinkPropertiesChanged(network, linkProperties)
-            override fun onLost(network: Network) = session.onLost(network)
-        }
-
         private class LocationAwareWifiCallback(private val session: AndroidSession) :
             ConnectivityManager.NetworkCallback(ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO) {
             override fun onAvailable(network: Network) = session.onAvailable(network)
@@ -265,27 +209,9 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
     }
 }
 
-internal fun networkCallbackNeedsLocationInfo(sdkInt: Int): Boolean = sdkInt >= Build.VERSION_CODES.S
-
-internal fun usesLegacyWifiSsidLookup(sdkInt: Int): Boolean = sdkInt < Build.VERSION_CODES.S
-
-internal fun legacyWifiSsidCanIdentifyNetwork(activeWifiNetworkCount: Int, ipv4Matches: Boolean): Boolean =
-    activeWifiNetworkCount == 1 && ipv4Matches
-
 private fun String.normalizeSsid(): String? = takeIf {
     it.isNotEmpty() && it != "<unknown ssid>" && it != "unknown ssid"
 }?.removeSurrounding("\"")
-
-private fun Int.toIpv4Address(): java.net.InetAddress? {
-    if (this == 0) return null
-    return try {
-        java.net.InetAddress.getByAddress(
-            byteArrayOf(toByte(), (this shr 8).toByte(), (this shr 16).toByte(), (this shr 24).toByte()),
-        )
-    } catch (_: Exception) {
-        null
-    }
-}
 
 private fun java.net.InetAddress.isUsableLocalAddress(): Boolean =
     !isAnyLocalAddress && !isLoopbackAddress && !isLinkLocalAddress && !isMulticastAddress

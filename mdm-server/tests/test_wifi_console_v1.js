@@ -3,47 +3,27 @@ const test = require('node:test');
 
 const wifi = require('../styly_mdm/static/wifi-console-v1.js');
 
-test('profile payload preserves a saved PSK when the password field is blank', () => {
-  const built = wifi.buildProfilePayload([
-    { ssid: 'Office', security: 'WPA_PSK', password: '', password_present: true, hidden: true },
-  ], [
-    { ssid: 'Office', security: 'WPA_PSK', password_present: true },
-  ]);
-
-  assert.deepEqual(built, { payload: { networks: [
-    { ssid: 'Office', security: 'WPA_PSK', password: null, hidden: true },
-  ] } });
+test('profile payload keeps a blank saved PSK and submits a replacement when entered', () => {
+  const saved = [{ ssid: 'Office', security: 'WPA_PSK', password_present: true }];
+  assert.deepEqual(wifi.buildProfilePayload([
+    { ssid: 'Office', security: 'WPA_PSK', password: '', password_present: true },
+  ], saved).payload.networks[0].password, null);
+  assert.equal(wifi.buildProfilePayload([
+    { ssid: 'Office', security: 'WPA_PSK', password: 'new-secret', password_present: true },
+  ], saved).payload.networks[0].password, 'new-secret');
 });
 
-test('profile payload requires a password for a new WPA network and rejects unsupported modes', () => {
+test('profile validation requires a PSK and accepts the same SSID with different security', () => {
   assert.match(wifi.buildProfilePayload([
     { ssid: 'New', security: 'WPA_PSK', password: '', password_present: false },
   ], []).error, /Enter a password/);
   assert.match(wifi.buildProfilePayload([
-    { ssid: 'Legacy', security: 'EAP', password: '', password_present: false },
+    { ssid: 'Legacy', security: 'EAP', password: '' },
   ], []).error, /Open or WPA\/WPA2/);
-});
-
-test('membership conflict accepts serial aliases and delivery never claims local application success', () => {
-  assert.equal(wifi.membershipConflict('device-id', 'B', { A: ['serial-1'], B: [] }, ['serial-1']), 'A');
-  assert.equal(wifi.membershipConflict('device-id', 'B', { A: ['serial-1'], B: [] }), null);
-  assert.equal(wifi.deliveryStatus({ delivery: { status: 'sent', revision: 'r1' } }, 'r1').label, 'Sent');
-  assert.equal(wifi.deliveryStatus({ delivery: { status: 'sent', revision: 'r1' } }, 'r2').label, 'Sent (previous profile)');
-  assert.equal(wifi.deliveryStatus({ manual: { status: 'success', revision: 'r1' } }, 'r1').label, 'Not sent');
-  assert.match(wifi.reasonLabel({ reason: 'unsupported' }), /Update this client/);
-});
-
-test('profile identities match server rules for shared SSIDs and different security', () => {
-  const open = { ssid: 'Studio', security: 'OPEN', password: '', hidden: false };
-  const psk = { ssid: 'Studio', security: 'WPA_PSK', password: 'studio-key', hidden: false };
-  assert.deepEqual(wifi.buildProfilePayload([open, psk], []).payload.networks, [open, psk]);
-  assert.match(wifi.buildProfilePayload([psk, psk], []).error, /combination must be unique/);
-});
-
-test('send failures and interrupted sends remain distinct from device Wi-Fi results', () => {
-  assert.equal(wifi.deliveryStatus({ delivery: { status: 'failed', reason: 'socket_send_failed' } }, 'r1').label, 'Send failed');
-  assert.equal(wifi.deliveryStatus({ delivery: { status: 'unknown', reason: 'server_restarted' } }, 'r1').label, 'Send unconfirmed');
-  assert.equal(wifi.reasonLabel({ reason: 'RESTORE_FAILED' }), '');
+  assert.equal(wifi.buildProfilePayload([
+    { ssid: 'Studio', security: 'OPEN' },
+    { ssid: 'Studio', security: 'WPA_PSK', password: 'secret' },
+  ], []).error, undefined);
 });
 
 class FakeElement {
@@ -51,24 +31,21 @@ class FakeElement {
     this.dataset = {};
     this.style = {};
     this.listeners = new Map();
-    this.renderCount = 0;
     this.controls = [];
     this.value = '';
     this.checked = false;
     this.disabled = false;
+    this.hidden = false;
     this.innerHTML = '';
-    this.deviceList = { innerHTML: '' };
     this.transient = { textContent: '', style: {} };
     this.stale = { style: {} };
     this.meta = { textContent: '' };
     this.passwordInput = null;
+    this.actionButtons = {};
+    this.secretHelp = { textContent: '' };
   }
 
-  set innerHTML(value) {
-    this._innerHTML = value;
-    this.renderCount++;
-  }
-
+  set innerHTML(value) { this._innerHTML = value; }
   get innerHTML() { return this._innerHTML; }
 
   addEventListener(type, listener) {
@@ -84,11 +61,10 @@ class FakeElement {
   querySelector(selector) {
     if (selector === '[data-wifi-transient]') return this.transient;
     if (selector === '[data-wifi-stale]') return this.stale;
-    if (selector === '[data-wifi-device-list]') return this.deviceList;
     if (selector.includes('data-wifi-field="password"')) return this.passwordInput;
     if (selector === '.wifi-action-right .wifi-meta') return this.meta;
     if (selector === 'article[data-wifi-row="wifi-0"] small') return this.secretHelp;
-    return this.actionButtons && this.actionButtons[selector] || null;
+    return this.actionButtons[selector] || null;
   }
 
   querySelectorAll() { return this.controls; }
@@ -114,503 +90,310 @@ async function tick() {
 }
 
 function withController(fetchHandler, confirmApply = () => true) {
-  const previous = {
-    fetch: global.fetch,
-    location: global.location,
-    setInterval: global.setInterval,
-    clearInterval: global.clearInterval,
-  };
-  global.location = { protocol: 'https:' };
+  const previous = { fetch: global.fetch, confirm: global.confirm };
+  global.confirm = () => true;
   global.fetch = fetchHandler;
-  global.setInterval = () => 1;
-  global.clearInterval = () => {};
   const statusPanel = new FakeElement();
   const groupPanel = new FakeElement();
   groupPanel.actionButtons = {
     '[data-wifi-action="save"]': new FakeElement(),
     '[data-wifi-action="apply"]': new FakeElement(),
-    '[data-wifi-action="register-recovery"]': new FakeElement(),
   };
   const password = new FakeInput('password');
   groupPanel.passwordInput = password;
-  groupPanel.controls = [password, new FakeElement(), new FakeElement(), new FakeElement()];
-  const controller = wifi.createController({
-    statusPanel,
-    groupPanel,
-    getGroups: () => ({}),
-    getDevices: () => [],
-    confirmApply,
-  });
+  groupPanel.controls = [password];
+  const controller = wifi.createController({ statusPanel, groupPanel, confirmApply });
   return {
     statusPanel, groupPanel, password, controller,
     restore() {
-      controller.stop();
-      global.fetch = previous.fetch;
-      if (previous.location === undefined) delete global.location;
-      else global.location = previous.location;
-      global.setInterval = previous.setInterval;
-      global.clearInterval = previous.clearInterval;
+      if (previous.fetch === undefined) delete global.fetch;
+      else global.fetch = previous.fetch;
+      if (previous.confirm === undefined) delete global.confirm;
+      else global.confirm = previous.confirm;
     },
   };
 }
 
-test('state polling updates device results without rebuilding the Wi-Fi form or losing input focus/value', async () => {
-  let stateRevision = 'r1';
-  const harness = withController(async (url) => {
-    if (url === '/api/wifi/state') return response({ enabled: true, groups: { Lab: { revision: stateRevision } }, devices: {} });
-    if (url === '/api/wifi/groups/Lab') return response({
-      revision: stateRevision,
-      networks: [{ ssid: 'Office', security: 'WPA_PSK', password_present: true, hidden: false }],
-    });
-    throw new Error('unexpected Wi-Fi route');
+test('HTTP console saves without login and does not require a transport opt-in', async () => {
+  let writes = 0;
+  const requests = [];
+  const harness = withController(async (url, init = {}) => {
+    requests.push({ url, init });
+    if (url === '/api/wifi/state') return response({ enabled: true, groups: { Lab: { revision: 'r1' } } });
+    if (url === '/api/wifi/groups/Lab' && init.method === 'PUT') {
+      writes++;
+      return response({ revision: 'r2', mode: 'managed', networks: [] });
+    }
+    if (url === '/api/wifi/groups/Lab') {
+      return response({ revision: 'r1', mode: 'managed', networks: [
+        { ssid: 'Office', security: 'WPA_PSK', password_present: true },
+      ] });
+    }
+    throw new Error('unexpected Wi-Fi route: ' + url);
   });
   try {
     await tick();
-    harness.controller.renderGroup('Lab', [], true);
+    harness.controller.renderGroup('Lab');
     await tick();
-    harness.password.value = 'typing-but-not-submitted';
+    assert.match(harness.groupPanel.innerHTML, /Save this group’s Wi-Fi policy/);
+    harness.password.value = 'new-secret';
     harness.groupPanel.dispatch('input', { target: harness.password });
-    const formRenderCount = harness.groupPanel.renderCount;
-    stateRevision = 'r1';
-    await harness.controller.refresh();
-    assert.equal(harness.groupPanel.renderCount, formRenderCount);
-    assert.equal(harness.password.value, 'typing-but-not-submitted');
-  } finally {
-    harness.restore();
-  }
+    harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'save' } }) } });
+    await tick();
+    assert.equal(writes, 1);
+    assert.equal(requests.some(({ init }) => init.headers && init.headers.Authorization), false);
+    assert.equal(requests[0].url, '/api/wifi/state');
+  } finally { harness.restore(); }
 });
 
-test('Wi-Fi key inputs avoid login semantics with a masked text field and keep a password fallback', async () => {
-  const previousCss = global.CSS;
+test('unsaved edits are discarded when switching groups and are fetched again on return', async () => {
+  const reads = { Lab: 0, Other: 0 };
+  const harness = withController(async (url) => {
+    if (url === '/api/wifi/state') return response({ enabled: true, groups: {
+      Lab: { revision: 'r1' }, Other: { revision: 'r2' },
+    } });
+    const name = decodeURIComponent(url.split('/').pop());
+    reads[name]++;
+    return response({ revision: name === 'Lab' ? 'r1' : 'r2', mode: 'managed', networks: [
+      { ssid: name, security: 'WPA_PSK', password_present: true },
+    ] });
+  });
   try {
-    for (const supported of [true, false]) {
-      global.CSS = { supports: () => supported };
-      const harness = withController(async (url) => url === '/api/wifi/state'
-        ? response({ enabled: true, groups: { Lab: { revision: 'r1' } }, devices: {} })
-        : response({ revision: 'r1', networks: [{ ssid: 'Office', security: 'WPA_PSK', password_present: true }] }));
-      try {
-        await tick();
-        harness.controller.renderGroup('Lab', [], true);
-        await tick();
-        const input = harness.groupPanel.innerHTML.match(/<input[^>]*data-wifi-field="password"[^>]*>/)[0];
-        assert.match(input, new RegExp('type="' + (supported ? 'text' : 'password') + '"'));
-        assert.match(input, /class="field wifi-secret"/);
-        assert.match(input, /autocomplete="off"/);
-        assert.match(input, /autocapitalize="off" spellcheck="false"/);
-        assert.doesNotMatch(input, /new-password|current-password/);
-      } finally { harness.restore(); }
+    await tick();
+    harness.controller.renderGroup('Lab');
+    await tick();
+    harness.password.value = 'unsaved-secret';
+    harness.groupPanel.dispatch('input', { target: harness.password });
+    harness.controller.renderGroup('Other');
+    await tick();
+    harness.controller.renderGroup('Lab');
+    await tick();
+    assert.equal(reads.Lab, 2);
+    assert.equal(harness.password.value, '');
+    assert.doesNotMatch(harness.groupPanel.innerHTML, /unsaved-secret/);
+    harness.password.value = 'discard-on-leave';
+    harness.groupPanel.dispatch('input', { target: harness.password });
+    harness.controller.renderGroup(null);
+    harness.controller.renderGroup('Lab');
+    await tick();
+    assert.equal(reads.Lab, 3);
+    assert.equal(harness.password.value, '');
+    assert.doesNotMatch(harness.groupPanel.innerHTML, /discard-on-leave/);
+  } finally { harness.restore(); }
+});
+
+test('deleting the server policy leaves device settings alone until unmanaged is deployed', async () => {
+  const requests = [];
+  let deleteWarning = '';
+  let revision = 'r1';
+  let mode = 'managed';
+  const harness = withController(async (url, init = {}) => {
+    if (url === '/api/wifi/state') return response({ enabled: true, groups: { Lab: { revision, mode } } });
+    if (url === '/api/wifi/groups/Lab' && !init.method) {
+      return response({ revision, mode, networks: mode === 'managed' ? [{ ssid: 'Office', security: 'OPEN' }] : [] });
     }
+    requests.push({ url, method: init.method, body: init.body && JSON.parse(init.body) });
+    if (init.method === 'DELETE') {
+      revision = 'r2'; mode = 'unmanaged';
+      return response({ revision, mode, networks: [] });
+    }
+    return response({ online_target_count: 1, operations: [{ status: 'sent' }] });
+  });
+  try {
+    await tick();
+    harness.controller.renderGroup('Lab');
+    await tick();
+    global.confirm = (message) => { deleteWarning = message; return true; };
+    harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'unmanage' } }) } });
+    await tick();
+    assert.match(deleteWarning, /Existing Wi-Fi networks will stay saved/);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].method, 'DELETE');
+    assert.match(harness.groupPanel.innerHTML, /Deploy this state explicitly/);
+
+    global.confirm = () => true;
+    harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'apply' } }) } });
+    await tick();
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].url, '/api/wifi/groups/Lab/deploy');
+    assert.deepEqual(requests[1].body, { expected_revision: 'r2', mode: 'unmanaged' });
+    assert.match(harness.statusPanel.innerHTML, /1 sent, 0 failed, 0 unconfirmed/);
+  } finally { harness.restore(); }
+});
+
+test('managed deployment sends only the saved profile and reports this response once', async () => {
+  let stateReads = 0;
+  let post = null;
+  let confirmation = '';
+  const harness = withController(async (url, init = {}) => {
+    if (url === '/api/wifi/state') {
+      stateReads++;
+      return response({ enabled: true, groups: { Lab: { revision: 'r1', mode: 'managed' } } });
+    }
+    if (url === '/api/wifi/groups/Lab') return response({ revision: 'r1', mode: 'managed', networks: [
+      { ssid: 'Office', security: 'WPA_PSK', password_present: true },
+    ] });
+    if (url === '/api/wifi/groups/Lab/deploy') {
+      post = { body: JSON.parse(init.body), headers: init.headers };
+      return response({ online_target_count: 2, operations: [
+        { status: 'sent' }, { status: 'failed', reason: 'unsupported' },
+      ] });
+    }
+    throw new Error('unexpected Wi-Fi route: ' + url);
+  }, (message) => { confirmation = message; return true; });
+  try {
+    await tick();
+    harness.controller.renderGroup('Lab');
+    await tick();
+    harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'apply' } }) } });
+    await tick();
+    assert.deepEqual(post.body, { expected_revision: 'r1', mode: 'managed' });
+    assert.equal(post.headers.Authorization, undefined);
+    assert.match(confirmation, /auto-connect enabled/);
+    assert.match(confirmation, /No saved networks are deleted/);
+    assert.match(confirmation, /only when it holds that password/);
+    assert.match(harness.statusPanel.innerHTML, /1 sent, 1 failed, 0 unconfirmed/);
+    assert.equal(stateReads, 1);
+    assert.doesNotMatch(harness.groupPanel.innerHTML, /Delivery status|Boot:|Device results/);
+  } finally { harness.restore(); }
+});
+
+test('saving freezes the submitted draft until the request completes', async () => {
+  let finishSave;
+  let submitted;
+  const harness = withController(async (url, init = {}) => {
+    if (url === '/api/wifi/state') return response({ enabled: true, groups: { Lab: { revision: 'r1' } } });
+    if (url === '/api/wifi/groups/Lab' && init.method === 'PUT') {
+      submitted = JSON.parse(init.body);
+      return new Promise((resolve) => { finishSave = () => resolve(response({ revision: 'r2', mode: 'managed' })); });
+    }
+    return response({ revision: 'r1', mode: 'managed', networks: [
+      { ssid: 'Office', security: 'WPA_PSK', password_present: true },
+    ] });
+  });
+  try {
+    await tick();
+    harness.controller.renderGroup('Lab');
+    await tick();
+    harness.password.value = 'submitted-secret';
+    harness.groupPanel.dispatch('input', { target: harness.password });
+    harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'save' } }) } });
+    await tick();
+    assert.equal(harness.password.disabled, true);
+    harness.password.value = 'late-edit';
+    harness.groupPanel.dispatch('input', { target: harness.password });
+    assert.equal(submitted.networks[0].password, 'submitted-secret');
+    finishSave();
+    await tick();
+    assert.equal(harness.password.value, '');
+    assert.equal(harness.groupPanel.actionButtons['[data-wifi-action="save"]'].disabled, true);
+  } finally { harness.restore(); }
+});
+
+test('a late profile response for a previous group cannot replace the active group', async () => {
+  let finishLab;
+  const harness = withController(async (url) => {
+    if (url === '/api/wifi/state') return response({ enabled: true, groups: {
+      Lab: { revision: 'r1' }, Other: { revision: 'r2' },
+    } });
+    if (url.endsWith('/Lab')) return new Promise((resolve) => {
+      finishLab = () => resolve(response({ revision: 'r1', mode: 'managed', networks: [
+        { ssid: 'Late Lab', security: 'OPEN' },
+      ] }));
+    });
+    return response({ revision: 'r2', mode: 'managed', networks: [
+      { ssid: 'Other', security: 'OPEN' },
+    ] });
+  });
+  try {
+    await tick();
+    harness.controller.renderGroup('Lab');
+    harness.controller.renderGroup('Other');
+    await tick();
+    assert.match(harness.groupPanel.innerHTML, /value="Other"/);
+    finishLab();
+    await tick();
+    assert.match(harness.groupPanel.innerHTML, /value="Other"/);
+    assert.doesNotMatch(harness.groupPanel.innerHTML, /Late Lab/);
+  } finally { harness.restore(); }
+});
+
+test('a 409 save locks the stale draft until the user explicitly reloads', async () => {
+  let profileReads = 0;
+  let writes = 0;
+  const harness = withController(async (url, init = {}) => {
+    if (url === '/api/wifi/state') return response({ enabled: true, groups: { Lab: { revision: 'r1' } } });
+    if (init.method === 'PUT') { writes++; return response({ error: 'conflict' }, 409); }
+    profileReads++;
+    return response({ revision: profileReads === 1 ? 'r1' : 'r2', mode: 'managed', networks: [
+      { ssid: 'Office', security: 'WPA_PSK', password_present: true },
+    ] });
+  });
+  try {
+    await tick();
+    harness.controller.renderGroup('Lab');
+    await tick();
+    harness.password.value = 'conflicted-edit';
+    harness.groupPanel.dispatch('input', { target: harness.password });
+    harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'save' } }) } });
+    await tick();
+    assert.equal(writes, 1);
+    assert.equal(harness.password.disabled, true);
+    assert.equal(harness.groupPanel.actionButtons['[data-wifi-action="save"]'].disabled, true);
+    assert.equal(harness.groupPanel.stale.style.display, '');
+    harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'reload' } }) } });
+    await tick();
+    assert.equal(profileReads, 2);
+    assert.equal(harness.groupPanel.stale.style.display, 'none');
+    assert.equal(harness.password.value, '');
+    assert.equal(harness.groupPanel.actionButtons['[data-wifi-action="apply"]'].disabled, false);
+  } finally { harness.restore(); }
+});
+
+test('security and network entry controls retain the existing masked style and supported options', async () => {
+  const previousCss = global.CSS;
+  global.CSS = { supports: () => true };
+  const harness = withController(async (url) => url === '/api/wifi/state'
+    ? response({ enabled: true, groups: { Lab: { revision: 'r1' } } })
+    : response({ revision: 'r1', mode: 'managed', networks: [{ ssid: 'Office', security: 'WPA_PSK', password_present: true }] }));
+  try {
+    await tick();
+    harness.controller.renderGroup('Lab');
+    await tick();
+    const input = harness.groupPanel.innerHTML.match(/<input[^>]*data-wifi-field="password"[^>]*>/)[0];
+    assert.match(input, /type="text"/);
+    assert.match(input, /class="field wifi-secret"/);
+    assert.match(input, /autocomplete="off"/);
+    assert.match(input, /autocapitalize="off" spellcheck="false"/);
+    assert.match(harness.groupPanel.innerHTML, /Remove from policy/);
+    assert.match(harness.groupPanel.innerHTML, /Device Wi-Fi networks are never deleted/);
+    assert.doesNotMatch(harness.groupPanel.innerHTML, /Register recovery baseline/);
   } finally {
+    harness.restore();
     if (previousCss === undefined) delete global.CSS;
     else global.CSS = previousCss;
   }
 });
 
-test('save freezes edits while the request is pending and submits only the captured draft', async () => {
-  let finishSave;
-  let submitted = null;
-  const harness = withController(async (url, init = {}) => {
-    if (url === '/api/wifi/state') return response({ enabled: true, groups: { Lab: { revision: 'r1' } }, devices: {} });
-    if (url === '/api/wifi/groups/Lab' && !init.method) return response({
-      revision: 'r1', networks: [{ ssid: 'Office', security: 'WPA_PSK', password_present: true, hidden: false }],
-    });
-    if (url === '/api/wifi/groups/Lab' && init.method === 'PUT') {
-      submitted = JSON.parse(init.body);
-      return new Promise((resolve) => { finishSave = () => resolve(response({ revision: 'r2' })); });
-    }
-    throw new Error('unexpected Wi-Fi route');
-  });
-  try {
-    await tick();
-    harness.controller.renderGroup('Lab', [], true);
-    await tick();
-    harness.password.value = 'new-wifi-secret';
-    harness.groupPanel.dispatch('input', { target: harness.password });
-    const saveButton = harness.groupPanel.actionButtons['[data-wifi-action="save"]'];
-    harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'save' } }) } });
-    await tick();
-    assert.equal(harness.password.disabled, true);
 
-    harness.password.value = 'late-unsent-value';
-    harness.groupPanel.dispatch('input', { target: harness.password });
-    assert.deepEqual(submitted, { expected_revision: 'r1', networks: [
-      { ssid: 'Office', security: 'WPA_PSK', password: 'new-wifi-secret', hidden: false },
-    ] });
-    finishSave();
-    await tick();
-    assert.equal(harness.password.value, '');
-    assert.equal(saveButton.disabled, true);
-  } finally {
-    harness.restore();
-  }
+test('membership checks remain available to the existing Devices editor', () => {
+  assert.equal(wifi.membershipConflict('device', 'B', { A: ['serial'], B: [] }, ['serial']), 'A');
+  assert.equal(wifi.membershipConflict('device', 'A', { A: ['device'] }), null);
 });
 
-test('the console loads profiles and saves over managed-LAN HTTP without login or credentials', async () => {
-  let writes = 0;
-  const routes = [];
-  const harness = withController(async (url, init = {}) => {
-    routes.push(url);
-    assert.equal(init.headers && init.headers.Authorization, undefined);
-    if (url === '/api/wifi/state') return response({ enabled: true, allow_http: true, groups: { Lab: { revision: 'r1' } }, devices: {} });
-    if (url === '/api/wifi/groups/Lab' && init.method === 'PUT') { writes++; return response({ revision: 'r2' }); }
-    if (url === '/api/wifi/groups/Lab') return response({ revision: 'r1', networks: [{ ssid: 'Office', security: 'WPA_PSK', password_present: true }] });
-    throw new Error('unexpected route');
-  });
-  global.location = { protocol: 'http:' };
-  try {
-    await tick();
-    harness.controller.renderGroup('Lab', [], true);
-    await tick();
-    assert.match(harness.groupPanel.innerHTML, /data-wifi-action="save"/);
-    assert.equal(harness.statusPanel.hidden, true);
-    assert.doesNotMatch(harness.statusPanel.innerHTML + harness.groupPanel.innerHTML, /login|Log in|session active|Admin token/);
-    harness.password.value = 'updated-secret';
-    harness.groupPanel.dispatch('input', { target: harness.password });
-    harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'save' } }) } });
-    await tick();
-    assert.equal(writes, 1);
-    assert.equal(routes.some((url) => url.includes('/session')), false);
-  } finally { harness.restore(); }
-});
-
-test('disabled Wi-Fi feature shows a graceful unavailable state', async () => {
-  const harness = withController(async () => response({ enabled: false }));
-  try {
-    await tick();
-    harness.controller.renderGroup('Lab', [], true);
-    assert.match(harness.groupPanel.innerHTML, /unavailable on this server/);
-    assert.equal(harness.statusPanel.hidden, true);
-  } finally {
-    harness.restore();
-  }
-});
-
-test('a temporary status failure retains the unsaved draft and recovers without a login step', async () => {
-  let unavailable = false;
-  let profileReads = 0;
-  const harness = withController(async (url) => {
-    if (url === '/api/wifi/state') return unavailable
-      ? response({ error: 'temporarily unavailable' }, 503)
-      : response({ enabled: true, groups: { Lab: { revision: 'r1' } }, devices: {} });
-    if (url === '/api/wifi/groups/Lab') {
-      profileReads++;
-      return response({ revision: 'r1', networks: [{ ssid: 'Office', security: 'WPA_PSK', password_present: true }] });
-    }
-    throw new Error('unexpected route');
-  });
-  try {
-    await tick();
-    harness.controller.renderGroup('Lab', [], true);
-    await tick();
-    harness.password.value = 'unsaved-secret';
-    harness.groupPanel.dispatch('input', { target: harness.password });
-    const renders = harness.groupPanel.renderCount;
-    unavailable = true;
-    await harness.controller.refresh();
-    assert.equal(harness.groupPanel.transient.style.display, '');
-    unavailable = false;
-    await harness.controller.refresh();
-    assert.equal(harness.groupPanel.transient.style.display, 'none');
-    assert.equal(harness.groupPanel.renderCount, renders);
-    assert.equal(harness.password.value, 'unsaved-secret');
-    assert.equal(profileReads, 1);
-    assert.equal(harness.groupPanel.actionButtons['[data-wifi-action="save"]'].disabled, false);
-  } finally { harness.restore(); }
-});
-
-test('disabling Wi-Fi removes editing controls', async () => {
-  let enabled = true;
-  const harness = withController(async (url) => {
-    if (url === '/api/wifi/state') return response({ enabled, groups: { Lab: { revision: 'r1' } }, devices: {} });
-    return response({ revision: 'r1', networks: [{ ssid: 'Office', security: 'OPEN' }] });
-  });
-  try {
-    await tick();
-    harness.controller.renderGroup('Lab', [], true);
-    await tick();
-    assert.match(harness.groupPanel.innerHTML, /data-wifi-action="save"/);
-    enabled = false;
-    await harness.controller.refresh();
-    assert.doesNotMatch(harness.groupPanel.innerHTML, /data-wifi-action="save"/);
-    assert.equal(harness.groupPanel.actionButtons['[data-wifi-action="apply"]'].disabled, true);
-  } finally { harness.restore(); }
-});
-
-test('HTTP writes remain disabled without the server managed-LAN transport opt-in', async () => {
-  let writes = 0;
-  const harness = withController(async (url, init = {}) => {
-    if (url === '/api/wifi/state') return response({ enabled: true, allow_http: false, groups: { Lab: { revision: 'r1' } }, devices: {} });
-    if (init.method === 'PUT') writes++;
-    return response({ revision: 'r1', networks: [{ ssid: 'Office', security: 'WPA_PSK', password_present: true }] });
-  });
-  global.location = { protocol: 'http:' };
-  try {
-    await tick();
-    harness.controller.renderGroup('Lab', [], true);
-    await tick();
-    harness.password.value = 'updated-secret';
-    harness.groupPanel.dispatch('input', { target: harness.password });
-    assert.equal(harness.groupPanel.actionButtons['[data-wifi-action="save"]'].disabled, true);
-    harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'save' } }) } });
-    await tick();
-    assert.equal(writes, 0);
-  } finally { harness.restore(); }
-});
-
-test('Wi-Fi header and targets use saved membership while Devices retains its draft', () => {
-  const fs = require('node:fs');
-  const vm = require('node:vm');
-  const source = fs.readFileSync(require('node:path').join(__dirname, '../styly_mdm/static/index.html'), 'utf8');
-  const renderSource = source.slice(source.indexOf('      function renderManageDetail()'), source.indexOf('      function renameInputFocused()'));
-  const mgDetail = { innerHTML: '' };
-  const panel = { hidden: true };
-  let targets;
-  const context = {
-    mgDetail, wifiGroupPanel: panel,
-    wifiController: { renderGroup(name, members) { targets = members; } },
-    groups: { Lab: ['saved-1', 'saved-2'] }, manageMembers: new Set(['saved-1']),
-    manageSelectedGroup: 'Lab', manageTab: 'wifi', manageSearch: '', manageSort: 'label-asc',
-    renamingManageGroup: false, renameInputFocused: () => false, restoreRenameGroupFocus() {},
-    deviceById: () => null, isOnline: () => false, esc: (x) => x, renderMgDevListHtml: () => '',
-  };
-  vm.runInNewContext(renderSource + '\nrenderManageDetail();', context);
-  assert.match(mgDetail.innerHTML, /0 online, 2 offline/);
-  assert.deepEqual(targets, ['saved-1', 'saved-2']);
-  assert.equal(panel.hidden, false);
-  context.manageTab = 'devices';
-  vm.runInNewContext('renderManageDetail();', context);
-  assert.match(mgDetail.innerHTML, /0 online, 1 offline/);
-  assert.equal(panel.hidden, true);
-  assert.match(mgDetail.innerHTML, /class="btn btn-primary" data-act="saveMembers"/);
-});
-
-test('send response reports delivery counts and never renders application or boot results', async () => {
-  let requests = 0;
-  const harness = withController(async (url, init = {}) => {
-    if (url === '/api/wifi/state') return response({ enabled: true, groups: { Lab: { revision: 'r1' } }, devices: {} });
-    if (url === '/api/wifi/groups/Lab') return response({ revision: 'r1', networks: [{ ssid: 'Office', security: 'OPEN' }] });
-    if (url === '/api/wifi/groups/Lab/deploy' && init.method === 'POST') {
-      requests++;
-      assert.deepEqual(JSON.parse(init.body), { expected_revision: 'r1' });
-      return response({ online_target_count: 3, operations: [
-        { status: 'sent' }, { status: 'failed', reason: 'unsupported' }, { status: 'unknown', reason: 'server_restarted' },
-      ] });
-    }
-    throw new Error('unexpected route');
-  });
-  try {
-    await tick();
-    harness.controller.renderGroup('Lab', ['offline-device'], true);
-    await tick();
-    harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'apply' } }) } });
-    await tick();
-    assert.equal(requests, 1);
-    assert.match(harness.statusPanel.innerHTML, /1 sent, 1 failed, 1 unconfirmed/);
-    assert.match(harness.groupPanel.innerHTML, /Delivery status/);
-    assert.doesNotMatch(harness.groupPanel.innerHTML, /Manual:|Boot:|Device results/);
-    assert.match(harness.groupPanel.deviceList.innerHTML, /Not sent/);
-  } finally { harness.restore(); }
-});
-
-test('a sole network cannot be removed and an open network password stays disabled after updates', async () => {
-  const harness = withController(async (url) => url === '/api/wifi/state'
-    ? response({ enabled: true, groups: { Lab: { revision: 'r1' } }, devices: {} })
-    : response({ revision: 'r1', networks: [{ ssid: 'Office', security: 'OPEN' }] }));
-  harness.groupPanel.secretHelp = { textContent: '' };
-  const remove = new FakeElement(); remove.dataset.wifiAction = 'remove';
-  const add = new FakeElement(); add.dataset.wifiAction = 'add';
-  harness.groupPanel.controls.push(remove, add);
-  try {
-    await tick();
-    harness.controller.renderGroup('Lab', [], true);
-    await tick();
-    assert.equal(remove.disabled, true);
-    assert.equal(harness.password.disabled, true);
-    assert.equal(add.disabled, false);
-    const security = new FakeInput('security');
-    security.value = 'WPA_PSK';
-    harness.groupPanel.dispatch('change', { target: security });
-    assert.equal(harness.password.disabled, false);
-    assert.match(harness.groupPanel.secretHelp.textContent, /Required for this saved network/);
-    security.value = 'OPEN';
-    harness.groupPanel.dispatch('change', { target: security });
-    assert.equal(harness.password.disabled, true);
-    assert.match(harness.groupPanel.secretHelp.textContent, /Open networks do not use a password/);
-    for (let i = 1; i < wifi.MAX_NETWORKS; i++) {
-      harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'add' } }) } });
-    }
-    assert.equal(remove.disabled, false);
-    assert.equal(add.disabled, true);
-  } finally { harness.restore(); }
-});
-
-test('a revision conflict locks the stale draft and offers immediate explicit reload without polling', async () => {
-  let writes = 0;
-  let profileReads = 0;
-  const harness = withController(async (url, init = {}) => {
-    if (url === '/api/wifi/state') return response({ enabled: true, groups: { Lab: { revision: 'r1' } }, devices: {} });
-    if (init.method === 'PUT') {
-      writes++;
-      assert.equal(JSON.parse(init.body).expected_revision, 'r1');
-      return response({ error: 'profile changed' }, 409);
-    }
-    profileReads++;
-    return response({ revision: profileReads === 1 ? 'r1' : 'r2', networks: [{ ssid: 'Office', security: 'WPA_PSK', password_present: true }] });
-  });
-  try {
-    await tick();
-    harness.controller.renderGroup('Lab', [], true);
-    await tick();
-    harness.password.value = 'conflicted-draft';
-    harness.groupPanel.dispatch('input', { target: harness.password });
-    harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'save' } }) } });
-    await tick();
-    assert.equal(writes, 1);
-    assert.equal(harness.groupPanel.actionButtons['[data-wifi-action="save"]'].disabled, true);
-    assert.equal(harness.groupPanel.actionButtons['[data-wifi-action="apply"]'].disabled, true);
-    assert.equal(harness.groupPanel.stale.style.display, '');
-    assert.equal(harness.password.value, 'conflicted-draft');
-    const previousConfirm = global.confirm;
-    global.confirm = () => true;
-    try {
-      harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'reload' } }) } });
-      await tick();
-      assert.equal(harness.groupPanel.stale.style.display, 'none');
-      assert.equal(harness.groupPanel.actionButtons['[data-wifi-action="apply"]'].disabled, false);
-      assert.equal(harness.password.value, '');
-    } finally {
-      if (previousConfirm === undefined) delete global.confirm;
-      else global.confirm = previousConfirm;
-    }
-  } finally { harness.restore(); }
-});
-
-test('deleting Wi-Fi saves unmanaged with a warning, retains delivery, and requires an explicit send', async () => {
+test('revisiting a group adopts its latest GET revision without stale initial state blocking deploy', async () => {
   let revision = 'r1';
-  let mode = 'managed';
-  const requests = [];
-  let applyConfirmation = '';
-  const previousConfirm = global.confirm;
-  let confirmed = false;
-  let warning = '';
-  global.confirm = (message) => { warning = message; return confirmed; };
-  const harness = withController(async (url, init = {}) => {
-    if (url === '/api/wifi/state') return response({ enabled: true, groups: { Lab: { revision, mode } }, devices: {
-      device: { delivery: { status: 'sent', revision: 'r1' } },
-    } });
-    if (url.endsWith('/deploy')) {
-      requests.push({ method: init.method, body: JSON.parse(init.body) });
-      return response({ operations: [{ status: 'sent' }] });
-    }
-    if (init.method === 'DELETE') {
-      requests.push({ method: init.method, body: JSON.parse(init.body) });
-      revision = 'r2'; mode = 'unmanaged';
-      return response({ revision, mode, networks: [] });
-    }
-    return response({ revision, mode, networks: [{ ssid: 'Office', security: 'OPEN' }] });
-  }, (message) => { applyConfirmation = message; return true; });
-  const click = (action) => harness.groupPanel.dispatch('click', {
-    target: { closest: () => ({ dataset: { wifiAction: action } }) },
+  const harness = withController(async (url) => {
+    if (url === '/api/wifi/state') return response({ enabled: true, groups: { Lab: { revision: 'r1' } } });
+    return response({ revision, mode: 'managed', networks: [{ ssid: 'Office', security: 'OPEN' }] });
   });
   try {
     await tick();
-    harness.controller.renderGroup('Lab', ['device'], true);
-    await tick();
-    click('unmanage');
-    await tick();
-    assert.match(warning, /Existing Wi-Fi networks on devices will remain unchanged/);
-    assert.match(warning, /deploy it explicitly/);
-    assert.equal(requests.length, 0);
-    confirmed = true;
-    click('unmanage');
-    await tick();
-    assert.deepEqual(requests, [{ method: 'DELETE', body: { expected_revision: 'r1' } }]);
-    assert.match(harness.groupPanel.innerHTML, /Saved: Do not manage Wi-Fi/);
-    assert.match(harness.groupPanel.innerHTML, /Deploy this state explicitly/);
-    assert.doesNotMatch(harness.groupPanel.innerHTML, /data-wifi-action="save"/);
-    assert.match(harness.groupPanel.deviceList.innerHTML, /Sent \(previous profile\)/);
+    harness.controller.renderGroup('Lab'); await tick();
+    harness.controller.renderGroup(null);
+    revision = 'r2';
+    harness.controller.renderGroup('Lab'); await tick();
     assert.equal(harness.groupPanel.actionButtons['[data-wifi-action="apply"]'].disabled, false);
-    click('apply');
-    await tick();
-    assert.deepEqual(requests[1], { method: 'POST', body: { expected_revision: 'r2' } });
-    assert.match(applyConfirmation, /Existing Wi-Fi settings on devices remain unchanged/);
-    assert.match(applyConfirmation, /reapplying managed Wi-Fi settings at startup/);
-    assert.doesNotMatch(applyConfirmation, /may be lost/);
-    click('add');
-    assert.match(harness.groupPanel.innerHTML, /data-wifi-action="save"/);
-    assert.equal(harness.groupPanel.actionButtons['[data-wifi-action="apply"]'].disabled, true);
-  } finally {
-    harness.restore();
-    if (previousConfirm === undefined) delete global.confirm;
-    else global.confirm = previousConfirm;
-  }
-});
-
-test('recovery baseline is an explicit delivery of the saved managed profile', async () => {
-  let confirmation = '';
-  let request = null;
-  const harness = withController(async (url, init = {}) => {
-    if (url === '/api/wifi/state') return response({ enabled: true, groups: {
-      Lab: { revision: 'r1', mode: 'managed' },
-    }, devices: {} });
-    if (url === '/api/wifi/groups/Lab') return response({
-      revision: 'r1', mode: 'managed',
-      networks: [{ ssid: 'Office', security: 'WPA_PSK', password_present: true, hidden: false }],
-    });
-    if (url === '/api/wifi/groups/Lab/recovery') {
-      request = { method: init.method, body: JSON.parse(init.body) };
-      return response({ operations: [{ status: 'sent' }] });
-    }
-    throw new Error('unexpected Wi-Fi route');
-  }, (message) => { confirmation = message; return true; });
-  const click = (action) => harness.groupPanel.dispatch('click', {
-    target: { closest: () => ({ dataset: { wifiAction: action } }) },
-  });
-  try {
-    await tick();
-    harness.controller.renderGroup('Lab', ['device'], true);
-    await tick();
-    const register = harness.groupPanel.actionButtons['[data-wifi-action="register-recovery"]'];
-    assert.match(harness.groupPanel.innerHTML, /Register recovery baseline/);
-    assert.equal(register.disabled, false);
-
-    click('register-recovery');
-    await tick();
-    assert.deepEqual(request, {
-      method: 'POST', body: { expected_revision: 'r1' },
-    });
-    assert.match(confirmation, /does not change current Wi-Fi/);
-    assert.match(confirmation, /update the initial baseline until a managed Wi-Fi profile connects successfully/);
-    assert.match(confirmation, /Reachability is not checked now/);
-    assert.match(confirmation, /unknown to MDM cannot be restored/);
-    assert.match(harness.statusPanel.innerHTML, /Recovery baseline delivery.*1 sent/);
-    assert.doesNotMatch(harness.statusPanel.innerHTML, /registered successfully/i);
-  } finally { harness.restore(); }
-});
-
-test('managed deployment confirmation warns that only MDM-held Wi-Fi can be restored', async () => {
-  let confirmation = '';
-  const harness = withController(async (url, init = {}) => {
-    if (url === '/api/wifi/state') return response({ enabled: true, groups: {
-      Lab: { revision: 'r1', mode: 'managed' },
-    }, devices: {} });
-    if (url === '/api/wifi/groups/Lab') return response({
-      revision: 'r1', mode: 'managed',
-      networks: [{ ssid: 'Office', security: 'OPEN', password_present: false, hidden: false }],
-    });
-    if (url.endsWith('/deploy') && init.method === 'POST') return response({ operations: [{ status: 'sent' }] });
-    throw new Error('unexpected Wi-Fi route');
-  }, (message) => { confirmation = message; return true; });
-  try {
-    await tick();
-    harness.controller.renderGroup('Lab', [], true);
-    await tick();
-    harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'apply' } }) } });
-    await tick();
-    assert.match(confirmation, /replaces Wi-Fi settings saved on devices/);
-    assert.match(confirmation, /restore only profiles held by MDM/);
-    assert.match(confirmation, /other existing Wi-Fi settings may be lost/);
-    assert.match(harness.statusPanel.innerHTML, /1 sent/);
-    assert.doesNotMatch(harness.statusPanel.innerHTML, /applied successfully|connected successfully/i);
+    assert.equal(harness.groupPanel.stale.style.display, 'none');
   } finally { harness.restore(); }
 });

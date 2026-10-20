@@ -156,11 +156,6 @@ class WebSocketManager internal constructor(
                 ?: DEFAULT_SERVER_URL
         }
 
-        private fun effectiveUrl(url: String, tlsEnabled: Boolean): String = when {
-            tlsEnabled && url.startsWith("ws://", true) -> "wss://${url.substring(5)}"
-            else -> url
-        }
-
         private fun preferences(context: Context) =
             context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
 
@@ -443,11 +438,10 @@ class WebSocketManager internal constructor(
     private fun doConnect(url: String) {
         if (!isRunning) return
 
-        val effective = effectiveUrl(url, wifiController.connectionSettings().tlsEnabled)
-        Log.i(TAG, "Connecting to $effective")
-        onStatusChanged(false, "Connecting to $effective...")
+        Log.i(TAG, "Connecting to $url")
+        onStatusChanged(false, "Connecting to $url...")
 
-        val request = Request.Builder().url(effective).build()
+        val request = Request.Builder().url(url).build()
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
 
             override fun onOpen(webSocket: WebSocket, response: Response) {
@@ -457,7 +451,7 @@ class WebSocketManager internal constructor(
                     dispatch(scheduler.onConnected())
                     socketOpen = true
                     registration.open(webSocket)
-                    connectedServerAddress = serverAddress(effective)
+                    connectedServerAddress = serverAddress(url)
                     val identity = identityResolver.snapshot()
                     sendRegistration(webSocket, identity)
                     publishConnectedStatus(identity)
