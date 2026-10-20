@@ -14,7 +14,6 @@ import android.os.Looper
 import android.provider.Settings
 import android.view.View
 import android.widget.Button
-import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
@@ -36,7 +35,6 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var journalText: TextView
     private lateinit var journalRefreshButton: Button
     private lateinit var journalClearButton: Button
-    private lateinit var wifiTlsEnabled: CheckBox
     private lateinit var exactAlarmStatus: TextView
     private lateinit var exactAlarmButton: Button
     private lateinit var wifiLocationStatus: TextView
@@ -93,14 +91,10 @@ class SettingsActivity : AppCompatActivity() {
         journalText = findViewById(R.id.journal_text)
         journalRefreshButton = findViewById(R.id.journal_refresh_button)
         journalClearButton = findViewById(R.id.journal_clear_button)
-        wifiTlsEnabled = findViewById(R.id.wifi_tls_enabled)
         exactAlarmStatus = findViewById(R.id.wifi_exact_alarm_status)
         exactAlarmButton = findViewById(R.id.wifi_exact_alarm_button)
         wifiLocationStatus = findViewById(R.id.wifi_location_permission_status)
         wifiLocationButton = findViewById(R.id.wifi_location_permission_button)
-
-        val connectionSettings = MdmClientApplication.wifiSettingsController().connectionSettings()
-        wifiTlsEnabled.isChecked = connectionSettings.tlsEnabled
 
         serverUrlInput.setText(WebSocketManager.getManualServerAddress(this).orEmpty())
 
@@ -179,13 +173,6 @@ class SettingsActivity : AppCompatActivity() {
             return
         }
 
-        if (!MdmClientApplication.wifiSettingsController().saveConnectionSettings(
-                WifiConnectionSettings(tlsEnabled = wifiTlsEnabled.isChecked),
-            )
-        ) {
-            Toast.makeText(this, R.string.wifi_settings_save_failed, Toast.LENGTH_LONG).show()
-            return
-        }
         restartService("Reconnecting...")
     }
 
@@ -283,6 +270,8 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun hasWifiLocationPermission(): Boolean =
         checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED &&
+            checkSelfPermission(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
             android.content.pm.PackageManager.PERMISSION_GRANTED
 
     private fun updateWifiLocationUi() {
@@ -300,7 +289,9 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun requestWifiLocationPermission() {
-        if (!hasWifiLocationPermission()) {
+        if (checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
             requestPermissions(
                 arrayOf(
                     android.Manifest.permission.ACCESS_FINE_LOCATION,
@@ -310,7 +301,9 @@ class SettingsActivity : AppCompatActivity() {
             )
         } else {
             try {
-                startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                startActivity(if (!hasWifiLocationPermission()) {
+                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null))
+                } else Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
             } catch (_: ActivityNotFoundException) {
                 Toast.makeText(this, R.string.wifi_location_settings_unavailable, Toast.LENGTH_LONG).show()
             }

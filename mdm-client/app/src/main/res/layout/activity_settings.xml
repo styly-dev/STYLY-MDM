@@ -40,13 +40,6 @@
                 android:textColor="?android:attr/textColorSecondary" />
         </LinearLayout>
 
-        <CheckBox
-            android:id="@+id/wifi_tls_enabled"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/wifi_tls_enabled"
-            android:layout_marginBottom="8dp" />
-
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

@@ -79,37 +79,24 @@ payloads and parser exception details that could contain artifact lease tokens.
 state transitions, Resume/Cancel/Retry eligibility, retention, recovery, deployment
 compatibility, and message sequences.
 
-### Group Wi-Fi profiles and boot correction
+### Group Wi-Fi auto-connect policy
 
-Group Wi-Fi settings have independent saved revisions and explicit whole-group
-sending. The server freezes online targets, records delivery only, and finishes
-without waiting for application results or MDM reconnection. The Android client
-owns a durable MDM-known recovery profile and fixed 60-second local deadline. A
-candidate SSID plus a Wi-Fi IP address commits success locally; later disconnects
-do not roll it back. Once per actual OS boot, after interrupted manual recovery,
-the client reapplies its last successful baseline without a connectivity probe or
-boot rollback. `wifi_settings_v3` and the explicit `mdm_profiles` recovery scope
-separate this behavior from old clients. Before first success, an operator sends
-the saved profile as an initial recovery baseline through the separate
-`/api/wifi/groups/{name}/recovery` action; registration does not change Wi-Fi or
-mark the profile successful. Unknown pre-existing OS credentials are not restored.
+PICO 4 Ultra Enterprise clients retain saved OS networks and apply explicit group
+policies by adding/updating credentials and switching per-network automatic
+connection. A fresh candidate SSID plus Wi-Fi IP within a fixed 60-second budget
+commits success locally. Failure restores pre-change flags and MDM-known old
+credentials; unknown overwritten passwords cannot be recovered. Precise location
+must be allowed all the time for background recovery on the tested PUI build. Interrupted work
+uses a durable journal. The successful policy is reapplied once per OS boot,
+unless explicitly deployed unmanaged. The server only sends to frozen online
+targets and returns transient delivery counts, without result ACKs or history.
 
-The console and clients use the existing managed-LAN connections without login,
-sessions or device tokens. Wi-Fi passwords use encrypted server persistence. TLS
-is supported; a managed-LAN server can explicitly use HTTP (`MDM_WIFI_ALLOW_HTTP=1`).
-Separate Devices and Wi-Fi tabs retain drafts during status refreshes. Deleting Wi-Fi
-settings saves an unmanaged revision without sending it; explicit deployment
-disables boot reapplication while retaining the device’s existing Wi-Fi networks. Group membership
-is at most one group per device. See [`WIFI_SETTINGS.md`](WIFI_SETTINGS.md) for
-local recovery, migration, setup and the physical-verification boundary.
-
-`MdmDeviceAdminReceiver` supports explicit provisioning without automatic
-ownership or extra policy. The controller starts recovery after location
-foreground-service promotion. Profiles are the sole recovery representation;
-there is no OS snapshot/Parcel restoration or server verification state machine.
-The server persists only the latest send per device. See the
-[hardware and review report](../tasks/wifi-hardware-validation-2026-10-20.md)
-for physical results and verification limits.
+Encrypted policies share `device_registry.json` with group metadata. HTTP-only
+managed-LAN operation has no authentication. The console discards unsaved edits
+on navigation. The sole current wire capability is `wifi_settings_v4`; earlier
+unpublished state/protocol formats are unsupported. See [WIFI_SETTINGS.md](WIFI_SETTINGS.md)
+for setup, ownership, persistence and the credential-restoration boundary, and
+the [hardware report](../tasks/wifi-hardware-validation-2026-10-20.md) for verification.
 
 ## Building the MDM Client
 
@@ -687,7 +674,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 
 > **Device groups** allow at most one group per `device_id`, persisted
 > server-side in `device_registry.json` (under a `groups` key). Legacy overlaps
-> migrate to the lexically first group; see [Wi-Fi migration](WIFI_SETTINGS.md#protocol-and-migration). Selecting a group
+> migrate to the lexically first group. Selecting a group
 > in the console is a client-side convenience: it sets the device selection to that
 > group's members (devices not in the group are deselected), so commands still
 > dispatch via the normal `target_devices` path (online members only). Group
@@ -1483,6 +1470,7 @@ The MDM client requires the following Android permissions:
 | `ACCESS_WIFI_STATE` | Retrieve the device IP address and read saved Wi-Fi settings with the required management authority |
 | `CHANGE_WIFI_STATE` | Apply and restore Wi-Fi profiles on authorized managed devices |
 | `ACCESS_FINE_LOCATION` / `ACCESS_COARSE_LOCATION` | Request precise location access together on Android 12+ for saved-network reads; the adapter requires the precise grant |
+| `ACCESS_BACKGROUND_LOCATION` | Keep saved-network reads and SSID observation available during background rollback and boot reapplication on PICO |
 | `SCHEDULE_EXACT_ALARM` | Wake local manual Wi-Fi rollback at its deadline; special access is checked before changing settings |
 | `MANAGE_EXTERNAL_STORAGE` | Write downloaded APKs to shared storage so the PICO ToBService can read them for silent install; read/write shared-storage directories for file/folder push (sync); and read shared storage for directory integrity checks (`VERIFY_DIR`) |
 | `QUERY_ALL_PACKAGES` | Resolve an arbitrary installed package via `PackageManager` for APK integrity checks (`VERIFY_APK`). On API 30+ package visibility is filtered; an operator may verify any package, so a `<queries>` allowlist cannot cover it. This client is privately distributed (not on Google Play), so the Play-policy restriction on this permission does not apply. |

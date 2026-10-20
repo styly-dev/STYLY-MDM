@@ -3,17 +3,6 @@
 
   const MAX_NETWORKS = 32;
   const SECURITY_MODES = ['OPEN', 'WPA_PSK'];
-  const REASON_LABELS = {
-    unsupported: 'Update this client before sending Wi-Fi settings.',
-    socket_unavailable: 'The device connection closed before sending.',
-    socket_replaced: 'The device connection changed before sending. Send again if needed.',
-    socket_send_failed: 'The server could not confirm that the send completed.',
-    dispatch_not_confirmed: 'The send is not yet confirmed.',
-    superseded: 'A newer deployment replaced this attempt before it was sent.',
-    state_persist_failed: 'The server could not save the delivery record. Delivery is unconfirmed.',
-    server_restarted: 'The server restarted before the send was confirmed. It will not retry automatically.',
-  };
-
   function normalizeNetworks(networks) {
     if (!Array.isArray(networks)) return [];
     return networks.map(function (network, index) {
@@ -85,22 +74,6 @@
     return null;
   }
 
-  function deliveryStatus(deviceState, currentRevision) {
-    const delivery = deviceState && deviceState.delivery;
-    if (!delivery) return { label: 'Not sent', icon: '○', tone: 'muted' };
-    const previous = delivery.revision && currentRevision && delivery.revision !== currentRevision;
-    if (delivery.status === 'sent') return previous
-      ? { label: 'Sent (previous profile)', icon: '○', tone: 'muted' }
-      : { label: 'Sent', icon: '↑', tone: 'info' };
-    if (delivery.status === 'failed') return { label: 'Send failed', icon: '×', tone: 'danger' };
-    return { label: 'Send unconfirmed', icon: '?', tone: 'warning' };
-  }
-
-  function reasonLabel(result) {
-    return result && Object.prototype.hasOwnProperty.call(REASON_LABELS, result.reason)
-      ? REASON_LABELS[result.reason] : '';
-  }
-
   function escapeHtml(value) {
     return String(value == null ? '' : value).replace(/[&<>"']/g, function (character) {
       return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character];
@@ -119,14 +92,11 @@
   function createController(options) {
     const statusPanel = options.statusPanel;
     const groupPanel = options.groupPanel;
-    const getGroups = options.getGroups;
-    const getDevices = options.getDevices;
     const confirmApply = options.confirmApply || root.confirm.bind(root);
     // Wi-Fi keys are configuration values, not login credentials.
     const secretInputType = root.CSS && typeof root.CSS.supports === 'function' &&
       root.CSS.supports('-webkit-text-security', 'disc') ? 'text' : 'password';
     let enabled = null;
-    let allowHttp = false;
     let accessRenderKey = null;
     let statusMessage = '';
     let state = null;
@@ -134,18 +104,16 @@
     let stateError = false;
     let stateLoading = false;
     let activeGroup = null;
-    let activeMembers = [];
-    let profiles = Object.create(null);
-    let lastRenderedMembers = '';
-    let pollHandle = null;
+    let profile = null;
 
     function isBusy(model) {
       return model.loading || model.saving || model.sending;
     }
 
     function profileFor(name) {
-      if (!profiles[name]) {
-        profiles[name] = {
+      if (!profile || profile.groupName !== name) {
+        profile = {
+          groupName: name,
           loaded: false,
           loading: false,
           saving: false,
@@ -160,19 +128,12 @@
           draftNetworks: [],
         };
       }
-      return profiles[name];
-    }
-
-    function apiUrl(path) { return path; }
-
-    function transportAllowed() {
-      return root.location && (root.location.protocol === 'https:' ||
-        (allowHttp && root.location.protocol === 'http:'));
+      return profile;
     }
 
     function renderAccess() {
       renderStatus();
-      const key = [enabled, stateUnavailable, allowHttp].join('|');
+      const key = [enabled, stateUnavailable].join('|');
       if (key !== accessRenderKey) {
         accessRenderKey = key;
         renderProfile();
@@ -191,7 +152,7 @@
       if (stateLoading) return;
       stateLoading = true;
       try {
-        const response = await root.fetch(apiUrl('/api/wifi/state'), { credentials: 'same-origin' });
+        const response = await root.fetch('/api/wifi/state');
         if (response.status === 404 || response.status === 501) {
           enabled = false;
           stateError = false;
@@ -207,15 +168,11 @@
         }
         const nextState = await response.json();
         enabled = nextState && nextState.enabled === true;
-        allowHttp = nextState && nextState.allow_http === true;
         stateUnavailable = false;
         stateError = false;
-        if (enabled) {
-          state = nextState;
-        }
+        state = nextState;
         renderAccess();
         renderTransientStatus();
-        renderDeviceResults();
         if (activeGroup && enabled && !profileFor(activeGroup).loaded) {
           await loadProfile(activeGroup, true);
         }
@@ -233,7 +190,7 @@
       let banner = groupPanel.querySelector('[data-wifi-transient]');
       if (!banner) return;
       banner.textContent = state
-        ? 'Wi-Fi status is temporarily unavailable. Showing the last received results.'
+        ? 'Wi-Fi status is temporarily unavailable. Showing the last received settings.'
         : 'Unable to load Wi-Fi status.';
       banner.style.display = stateError ? '' : 'none';
     }
@@ -246,9 +203,7 @@
       }
       const name = activeGroup;
       const model = profileFor(name);
-      const groupStatus = state && state.groups && state.groups[name];
-      const currentRevision = groupStatus && groupStatus.revision;
-      model.stale = model.conflicted || !!(currentRevision && model.savedRevision && currentRevision !== model.savedRevision);
+      model.stale = model.conflicted;
       const rowHtml = model.draftNetworks.map(function (network, index) {
         const modes = SECURITY_MODES.indexOf(network.security) < 0
           ? ['unsupported'].concat(SECURITY_MODES) : SECURITY_MODES;
@@ -263,7 +218,7 @@
         return '<article class="wifi-network" data-wifi-row="' + escapeHtml(network.id) + '">' +
           '<div class="wifi-network-head"><strong>Wi-Fi ' + (index + 1) + '</strong>' +
           '<button class="btn-outline btn-danger-outline wifi-remove" type="button" data-wifi-action="remove" data-wifi-row="' + escapeHtml(network.id) + '"' +
-          (model.draftNetworks.length <= 1 ? ' disabled' : '') + '>Remove</button></div>' +
+          (model.draftNetworks.length <= 1 ? ' disabled' : '') + '>Remove from policy</button></div>' +
           '<label>SSID<input class="field" data-wifi-row="' + escapeHtml(network.id) + '" data-wifi-field="ssid" type="text" autocomplete="off" value="' + escapeHtml(network.ssid) + '"></label>' +
           '<div class="wifi-fields"><label>Security<select class="field" data-wifi-row="' + escapeHtml(network.id) + '" data-wifi-field="security">' + securityOptions + '</select></label>' +
           '<label>Password<input class="field wifi-secret" data-wifi-row="' + escapeHtml(network.id) + '" data-wifi-field="password" type="' + secretInputType + '" autocomplete="off" autocapitalize="off" spellcheck="false" value=""></label></div>' +
@@ -279,8 +234,9 @@
       const loading = model.loading && !model.loaded ? '<div class="wifi-feedback">Loading saved Wi-Fi settings…</div>' : '';
       const editable = model.loaded && enabled === true;
       groupPanel.innerHTML = '<section class="wifi-section"><div class="wifi-section-head"><div><h3>Wi-Fi settings</h3>' +
-        '<p>Save this group’s networks, then send the profile to its online devices.</p>' +
-        '<p>Devices handle connection checks and rollback locally. The server tracks sending only.</p>' +
+        '<p>Save this group’s Wi-Fi policy, then send it to online devices.</p>' +
+        '<p>Listed networks get auto-connect enabled; other saved networks stay on the device with auto-connect disabled.</p>' +
+        '<p>If no listed network obtains an IP within 60 seconds, clients restore the previous auto-connect policy. The server does not track device results.</p>' +
         '<p class="wifi-meta">' + revisionText + '</p></div>' +
         (model.loaded && enabled === true && model.mode !== 'unmanaged'
           ? '<button class="btn-outline btn-danger-outline" type="button" data-wifi-action="unmanage">' + (model.savedRevision ? 'Delete Wi-Fi settings' : 'Do not manage Wi-Fi') + '</button>' : '') + '</div>' +
@@ -289,70 +245,27 @@
         profileError + unavailable + loading +
         (editable ? '<div class="wifi-network-list">' + (model.mode === 'unmanaged'
           ? '<div class="push-note">Existing Wi-Fi networks on devices stay in place. Deploy this state explicitly to stop reapplying Wi-Fi settings at device startup. Offline devices keep their previous management policy until you deploy to them while connected.</div>'
-          : (rowHtml || '<div class="wifi-empty">No networks saved yet.</div>')) + '</div>' +
+          : '<div class="push-note">Device Wi-Fi networks are never deleted. A listed network may have its saved password replaced. If connection fails, MDM can restore a previous password only when it already holds that password.</div>' +
+            (rowHtml || '<div class="wifi-empty">No networks saved yet.</div>')) + '</div>' +
           '<div class="wifi-actions"><button class="btn-outline" type="button" data-wifi-action="add"' + (model.draftNetworks.length >= MAX_NETWORKS || busy ? ' disabled' : '') + '>Add Wi-Fi network</button>' +
           '<div class="wifi-action-right"><span class="wifi-meta">' + (model.dirty ? 'Unsaved changes' : model.savedRevision ? 'Saved' : 'Not saved') + '</span>' +
           (model.mode === 'managed' ? '<button class="btn btn-primary" type="button" data-wifi-action="save"' + (!model.dirty || busy ? ' disabled' : '') + '>Save Wi-Fi settings</button>' : '') +
-          (model.mode === 'managed' && model.savedRevision
-            ? '<button class="btn-outline" type="button" data-wifi-action="register-recovery"' + (model.dirty || busy ? ' disabled' : '') + '>Register recovery baseline</button>' : '') +
           '<button class="btn btn-success" type="button" data-wifi-action="apply"' + (model.dirty || !model.savedRevision || busy ? ' disabled' : '') + '>Send to whole group</button></div></div>' : '') +
-        '<div class="wifi-device-results"><h4>Delivery status</h4><div data-wifi-device-list></div></div>' +
         '</section>';
       model.draftNetworks.forEach(function (network) {
         const input = groupPanel.querySelector('[data-wifi-row="' + network.id + '"][data-wifi-field="password"]');
         if (input) input.value = network.password || '';
       });
       renderTransientStatus();
-      renderDeviceResults();
       updateButtons();
     }
 
-    function findDevice(memberId, devices) {
-      return (devices || []).find(function (device) {
-        return device && (device.device_id === memberId || device.serial_number === memberId);
-      }) || null;
-    }
-
-    function renderDeviceResults() {
-      if (!groupPanel || !activeGroup) return;
-      const list = groupPanel.querySelector('[data-wifi-device-list]');
-      if (!list) return;
-      const members = activeMembers || [];
-      if (!members.length) {
-        list.innerHTML = '<div class="wifi-empty">No devices are assigned to this group.</div>';
-        updateButtons();
-        return;
-      }
-      const currentRevision = state && state.groups && state.groups[activeGroup] && state.groups[activeGroup].revision;
-      const devices = getDevices();
-      const rows = members.map(function (memberId) {
-        const device = findDevice(memberId, devices);
-        const deviceId = device ? (device.device_id || device.serial_number || memberId) : memberId;
-        const label = device && device.label ? device.label : memberId;
-        const online = device && (device.status === 'online' || device.status === 'updating');
-        const deviceState = state && state.devices && (state.devices[deviceId] || state.devices[memberId]);
-        const delivery = deliveryStatus(deviceState, currentRevision);
-        const deliveryReason = reasonLabel(deviceState && deviceState.delivery);
-        const conflict = membershipConflict(memberId, activeGroup, getGroups(), device && [device.serial_number]);
-        const membershipNote = conflict ? '<span class="wifi-membership-note">Also listed in ' + escapeHtml(conflict) + '</span>' : '';
-        return '<div class="wifi-device-row"><div class="wifi-device-title"><strong>' + escapeHtml(label) + '</strong>' +
-          '<span class="wifi-online ' + (online ? 'online' : 'offline') + '"><i></i>' + (online ? 'Online' : 'Offline') + '</span>' + membershipNote + '</div>' +
-          '<div class="wifi-device-status"><div class="wifi-result ' + delivery.tone + '"><span aria-hidden="true">' + delivery.icon + '</span><span>' + delivery.label + '</span></div>' +
-          (deliveryReason ? '<div class="wifi-reason">' + escapeHtml(deliveryReason) + '</div>' : '') +
-          '</div></div>';
-      });
-      list.innerHTML = rows.join('');
-      updateButtons();
-    }
-
-    function renderGroup(name, members, force) {
-      activeMembers = Array.isArray(members) ? members.slice() : [];
+    function renderGroup(name) {
       const changedGroup = name !== activeGroup;
       activeGroup = name || null;
-      const signature = activeMembers.slice().sort().join('\u0000');
-      if (force || changedGroup || !groupPanel.dataset.wifiRendered) {
+      if (changedGroup) profile = null;
+      if (changedGroup || !groupPanel.dataset.wifiRendered) {
         groupPanel.dataset.wifiRendered = 'true';
-        lastRenderedMembers = signature;
         const model = activeGroup && profileFor(activeGroup);
         if (activeGroup && enabled === true &&
             (!model.loaded || (changedGroup && !model.dirty))) {
@@ -360,10 +273,6 @@
         }
         renderProfile();
       } else {
-        if (signature !== lastRenderedMembers) {
-          lastRenderedMembers = signature;
-          renderDeviceResults();
-        }
         renderTransientStatus();
       }
     }
@@ -377,8 +286,7 @@
       if (!quiet && name === activeGroup) renderProfile();
       updateButtons();
       try {
-        const response = await root.fetch(apiUrl('/api/wifi/groups/' + encodeURIComponent(name)), {
-          credentials: 'same-origin',
+        const response = await root.fetch('/api/wifi/groups/' + encodeURIComponent(name), {
           headers: { Accept: 'application/json' },
         });
         if (!response.ok) {
@@ -387,17 +295,13 @@
             : 'Could not load saved Wi-Fi settings.';
           return;
         }
-        const profile = await response.json();
+        const loadedProfile = await response.json();
+        if (name !== activeGroup || profile !== model) return;
         statusMessage = '';
-        const previousRevision = model.savedRevision;
-        model.savedRevision = profile && profile.revision ? profile.revision : null;
+        model.savedRevision = loadedProfile && loadedProfile.revision ? loadedProfile.revision : null;
         model.conflicted = false;
-        // Adopt this explicit read without overwriting a newer revision observed by polling.
-        if (state && state.groups && state.groups[name] && state.groups[name].revision === previousRevision) {
-          state.groups[name].revision = model.savedRevision;
-        }
-        model.savedNetworks = normalizeNetworks(profile && profile.networks);
-        model.savedMode = profile && profile.mode === 'unmanaged' ? 'unmanaged' : 'managed';
+        model.savedNetworks = normalizeNetworks(loadedProfile && loadedProfile.networks);
+        model.savedMode = loadedProfile && loadedProfile.mode === 'unmanaged' ? 'unmanaged' : 'managed';
         if (!model.dirty) model.mode = model.savedMode;
         model.loaded = true;
         if (!model.dirty) model.draftNetworks = model.savedNetworks.map(function (network, index) {
@@ -450,11 +354,9 @@
       const model = profileFor(activeGroup);
       const save = groupPanel.querySelector('[data-wifi-action="save"]');
       const apply = groupPanel.querySelector('[data-wifi-action="apply"]');
-      const registerRecovery = groupPanel.querySelector('[data-wifi-action="register-recovery"]');
-      const currentRevision = state && state.groups && state.groups[activeGroup] && state.groups[activeGroup].revision;
-      model.stale = model.conflicted || !!(currentRevision && model.savedRevision && currentRevision !== model.savedRevision);
+      model.stale = model.conflicted;
       const busy = isBusy(model) || model.stale ||
-        enabled !== true || !transportAllowed();
+        enabled !== true;
       groupPanel.querySelectorAll('[data-wifi-field], [data-wifi-action="add"], [data-wifi-action="remove"], [data-wifi-action="unmanage"]').forEach(function (control) {
         const action = control.dataset && control.dataset.wifiAction;
         const network = control.dataset && model.draftNetworks.find(function (row) {
@@ -466,8 +368,6 @@
       });
       if (save) save.disabled = model.mode !== 'managed' || !model.dirty || busy;
       if (apply) apply.disabled = model.dirty || !model.savedRevision || busy;
-      if (registerRecovery) registerRecovery.disabled = model.mode !== 'managed' ||
-        model.savedMode !== 'managed' || !model.savedRevision || model.dirty || busy;
       const stale = groupPanel.querySelector('[data-wifi-stale]');
       if (stale) stale.style.display = model.stale ? '' : 'none';
       const hint = groupPanel.querySelector('.wifi-action-right .wifi-meta');
@@ -480,11 +380,6 @@
       const model = profileFor(name);
       if (enabled !== true ||
           !model.loaded || model.stale || isBusy(model)) return;
-      if (!transportAllowed()) {
-        model.error = 'Wi-Fi changes require HTTPS or managed-LAN HTTP enabled on the server.';
-        renderProfile();
-        return;
-      }
       const built = buildProfilePayload(model.draftNetworks, model.savedNetworks);
       if (built.error) {
         model.error = built.error;
@@ -495,9 +390,8 @@
       model.error = '';
       updateButtons();
       try {
-        const response = await root.fetch(apiUrl('/api/wifi/groups/' + encodeURIComponent(name)), {
+        const response = await root.fetch('/api/wifi/groups/' + encodeURIComponent(name), {
           method: 'PUT',
-          credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
           body: JSON.stringify(Object.assign({ expected_revision: model.savedRevision }, built.payload)),
         });
@@ -509,12 +403,6 @@
         } else {
           const saved = await response.json();
           model.savedRevision = saved && saved.revision ? saved.revision : model.savedRevision;
-          if (model.savedRevision) {
-            if (!state) state = { enabled: true, groups: {}, devices: {} };
-            if (!state.groups) state.groups = {};
-            if (!state.groups[name]) state.groups[name] = {};
-            state.groups[name].revision = model.savedRevision;
-          }
           model.savedNetworks = model.draftNetworks.map(function (network) {
             return {
               ssid: network.ssid,
@@ -539,18 +427,18 @@
     }
 
     async function unmanageProfile() {
-      if (!activeGroup || enabled !== true || !transportAllowed()) return;
+      if (!activeGroup || enabled !== true) return;
       const name = activeGroup;
       const model = profileFor(name);
       if (!model.loaded || model.stale || isBusy(model)) return;
-      if (!root.confirm('Delete Wi-Fi settings for "' + name + '"?\n\n' +
-          'Existing Wi-Fi networks on devices will remain unchanged. This only saves a Do not manage Wi-Fi state on the server. You must deploy it explicitly to stop reapplying Wi-Fi settings at device startup.\n\nUnsaved Wi-Fi edits will be discarded.')) return;
+      if (!root.confirm('Delete the Wi-Fi policy for "' + name + '"?\n\n' +
+          'Existing Wi-Fi networks will stay saved on devices, and their auto-connect settings stay unchanged. Deploy explicitly to stop boot reapplication.\n\nUnsaved edits will be discarded.')) return;
       model.saving = true;
       model.error = '';
       updateButtons();
       try {
-        const response = await root.fetch(apiUrl('/api/wifi/groups/' + encodeURIComponent(name)), {
-          method: 'DELETE', credentials: 'same-origin',
+        const response = await root.fetch('/api/wifi/groups/' + encodeURIComponent(name), {
+          method: 'DELETE',
           headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
           body: JSON.stringify({ expected_revision: model.savedRevision }),
         });
@@ -566,7 +454,6 @@
           model.savedNetworks = [];
           model.draftNetworks = [];
           model.dirty = false;
-          if (state && state.groups) state.groups[name] = { revision: saved.revision, mode: 'unmanaged' };
           statusMessage = 'Do not manage Wi-Fi saved for ' + name + '. Deploy it explicitly; existing device Wi-Fi settings remain.';
           renderStatus();
         }
@@ -578,42 +465,27 @@
       }
     }
 
-    async function sendProfile(action) {
+    async function sendProfile() {
       if (!activeGroup || !state || enabled !== true) return;
       const name = activeGroup;
       const model = profileFor(name);
-      const recovery = action === 'recovery';
       if (!model.savedRevision || model.stale || model.dirty || isBusy(model)) return;
-      if (recovery && (model.mode !== 'managed' || model.savedMode !== 'managed')) return;
-      if (!transportAllowed()) {
-        model.error = 'Wi-Fi changes require HTTPS or managed-LAN HTTP enabled on the server.';
-        renderProfile();
-        return;
-      }
-      const onlineCount = activeMembers.filter(function (memberId) {
-        const device = findDevice(memberId, getDevices());
-        return device && (device.status === 'online' || device.status === 'updating');
-      }).length;
-      const confirmation = recovery
-        ? 'Send the saved Wi-Fi profile to the whole group "' + name + '" as its initial recovery baseline?\n\n' +
-          'This does not change current Wi-Fi. You can update the initial baseline until a managed Wi-Fi profile connects successfully. Reachability is not checked now, and Wi-Fi settings unknown to MDM cannot be restored.'
-        : model.mode === 'unmanaged'
+      const confirmation = model.mode === 'unmanaged'
         ? 'Send the Do not manage Wi-Fi state to the whole group "' + name + '"?\n\n' +
-          onlineCount + ' online device(s) are connected. Existing Wi-Fi settings on devices remain unchanged. This stops reapplying managed Wi-Fi settings at startup. Offline devices are not queued. The server tracks sending only.'
-        : 'Send the saved Wi-Fi settings to the whole group "' + name + '"?\n\n' +
-          onlineCount + ' online device(s) are connected. This replaces Wi-Fi settings saved on devices. If connection fails, clients can restore only profiles held by MDM; other existing Wi-Fi settings may be lost. Compatible clients check the connection locally. Offline devices are not queued, and the server tracks sending only.';
+          'Existing Wi-Fi networks stay saved. This stops changing auto-connect settings and stops reapplying the saved Wi-Fi policy at startup. Only online devices receive this state.'
+        : 'Send the saved Wi-Fi policy to the whole group "' + name + '"?\n\n' +
+          'Listed networks get auto-connect enabled; other saved networks get auto-connect disabled. No saved networks are deleted. An existing matching SSID may have its credentials replaced. If connection fails, MDM can restore a previous password only when it holds that password. Only online devices receive this policy.';
       const accepted = confirmApply(confirmation);
       if (!accepted) return;
-      const sendError = recovery ? 'Could not send the recovery baseline to the group.' : 'Could not send Wi-Fi settings to the group.';
+      const sendError = 'Could not send Wi-Fi settings to the group.';
       model.sending = true;
       model.error = '';
       updateButtons();
       try {
-        const response = await root.fetch(apiUrl('/api/wifi/groups/' + encodeURIComponent(name) + '/' + action), {
+        const response = await root.fetch('/api/wifi/groups/' + encodeURIComponent(name) + '/deploy', {
           method: 'POST',
-          credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-          body: JSON.stringify({ expected_revision: model.savedRevision }),
+          body: JSON.stringify({ expected_revision: model.savedRevision, mode: model.mode }),
         });
         if (!response.ok) {
           if (response.status === 409) model.conflicted = true;
@@ -621,14 +493,13 @@
             ? 'The saved group or profile changed. Reload it before sending.'
             : sendError;
         } else {
-          const delivery = await response.json();
-          const operations = Array.isArray(delivery.operations) ? delivery.operations : [];
+          const result = await response.json();
+          const operations = Array.isArray(result.operations) ? result.operations : [];
           const sent = operations.filter(function (item) { return item.status === 'sent'; }).length;
           const failed = operations.filter(function (item) { return item.status === 'failed'; }).length;
           const unknown = operations.length - sent - failed;
-          statusMessage = (recovery ? 'Recovery baseline delivery for ' : 'Delivery for ') + name + ': ' + sent + ' sent, ' + failed + ' failed, ' + unknown + ' unconfirmed.';
+          statusMessage = 'Deploy sent for ' + name + ': ' + sent + ' sent, ' + failed + ' failed, ' + unknown + ' unconfirmed.';
           renderStatus();
-          await refreshState();
         }
       } catch (_) {
         model.error = sendError;
@@ -665,8 +536,7 @@
         model.error = '';
         renderProfile();
       } else if (action === 'save') saveProfile();
-      else if (action === 'apply') sendProfile('deploy');
-      else if (action === 'register-recovery') sendProfile('recovery');
+      else if (action === 'apply') sendProfile();
     }
 
     if (groupPanel) {
@@ -677,29 +547,21 @@
 
     renderStatus();
     refreshState();
-    pollHandle = root.setInterval(refreshState, 10000);
 
     return {
       renderGroup: renderGroup,
       refresh: refreshState,
       renameGroup: function (oldName, newName) {
-        if (profiles[oldName]) {
-          profiles[newName] = profiles[oldName];
-          delete profiles[oldName];
-        }
+        if (profile && profile.groupName === oldName) profile.groupName = newName;
       },
-      membershipConflict: membershipConflict,
-      stop: function () { if (pollHandle !== null) root.clearInterval(pollHandle); },
     };
   }
 
   const api = {
+    membershipConflict: membershipConflict,
     MAX_NETWORKS: MAX_NETWORKS,
     normalizeNetworks: normalizeNetworks,
     buildProfilePayload: buildProfilePayload,
-    membershipConflict: membershipConflict,
-    deliveryStatus: deliveryStatus,
-    reasonLabel: reasonLabel,
     createController: createController,
   };
 
