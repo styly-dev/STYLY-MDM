@@ -84,11 +84,15 @@ compatibility, and message sequences.
 Group Wi-Fi settings have independent saved revisions and explicit whole-group
 sending. The server freezes online targets, records delivery only, and finishes
 without waiting for application results or MDM reconnection. The Android client
-owns the durable pre-change snapshot and fixed 60-second local deadline. A
+owns a durable MDM-known recovery profile and fixed 60-second local deadline. A
 candidate SSID plus a Wi-Fi IP address commits success locally; later disconnects
 do not roll it back. Once per actual OS boot, after interrupted manual recovery,
 the client reapplies its last successful baseline without a connectivity probe or
-boot rollback. `wifi_settings_v2` separates this behavior from old clients.
+boot rollback. `wifi_settings_v3` and the explicit `mdm_profiles` recovery scope
+separate this behavior from old clients. Before first success, an operator sends
+the saved profile as an initial recovery baseline through the separate
+`/api/wifi/groups/{name}/recovery` action; registration does not change Wi-Fi or
+mark the profile successful. Unknown pre-existing OS credentials are not restored.
 
 The console and clients use the existing managed-LAN connections without login,
 sessions or device tokens. Wi-Fi passwords use encrypted server persistence. TLS
@@ -100,11 +104,18 @@ is at most one group per device. See [`WIFI_SETTINGS.md`](WIFI_SETTINGS.md) for
 local recovery, migration, setup and the physical-verification boundary.
 
 Physical testing on a PICO 4 Ultra Enterprise (PUI 5.15.7) on 2026-10-20 found
-that the current adapter rejects managed deployment with `PERMISSION_DENIED`
-before changing Wi-Fi: the ordinary installed client has neither Device Owner
-nor `NETWORK_SETTINGS` authority. Full snapshot/replace/rollback is therefore
-not validated or usable on that installation. Delivery and unmanaged-policy
-tests passed within the limits recorded in
+that the ordinary client rejects managed deployment with `PERMISSION_DENIED`.
+After explicitly authorized Device Owner provisioning, the normal client could
+read configurations but old PSKs remained masked; deployment then stopped before
+mutation with `RESTORE_INFO_MISSING`. This led to the approved v3 MDM-known
+recovery contract instead of full OS snapshots. `MdmDeviceAdminReceiver` permits explicit
+ADB provisioning; its declaration alone applies no policies or ownership.
+V3 real-device tests passed for local connection, known-credential rollback,
+process recovery and boot reapplication. Production recovery starts only after
+the service enters its location foreground-service type (when precise location
+is granted), keeping configured-network visibility available without background
+location access. Cold rollback alarms start that service before recovery.
+Individual outcomes and limits are recorded in
 [`the hardware report`](../tasks/wifi-hardware-validation-2026-10-20.md).
 
 ## Building the MDM Client
@@ -683,7 +694,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 
 > **Device groups** allow at most one group per `device_id`, persisted
 > server-side in `device_registry.json` (under a `groups` key). Legacy overlaps
-> migrate to the lexically first group; see [Wi-Fi migration](WIFI_SETTINGS.md#compatibility-and-migration). Selecting a group
+> migrate to the lexically first group; see [Wi-Fi migration](WIFI_SETTINGS.md#protocol-and-migration). Selecting a group
 > in the console is a client-side convenience: it sets the device selection to that
 > group's members (devices not in the group are deselected), so commands still
 > dispatch via the normal `target_devices` path (online members only). Group

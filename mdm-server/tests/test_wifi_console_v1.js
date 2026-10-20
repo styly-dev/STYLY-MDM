@@ -107,7 +107,7 @@ async function tick() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
-function withController(fetchHandler) {
+function withController(fetchHandler, confirmApply = () => true) {
   const previous = {
     fetch: global.fetch,
     location: global.location,
@@ -123,6 +123,7 @@ function withController(fetchHandler) {
   groupPanel.actionButtons = {
     '[data-wifi-action="save"]': new FakeElement(),
     '[data-wifi-action="apply"]': new FakeElement(),
+    '[data-wifi-action="register-recovery"]': new FakeElement(),
   };
   const password = new FakeInput('password');
   groupPanel.passwordInput = password;
@@ -132,7 +133,7 @@ function withController(fetchHandler) {
     groupPanel,
     getGroups: () => ({}),
     getDevices: () => [],
-    confirmApply: () => true,
+    confirmApply,
   });
   return {
     statusPanel, groupPanel, password, controller,
@@ -482,6 +483,7 @@ test('deleting Wi-Fi saves unmanaged with a warning, retains delivery, and requi
   let revision = 'r1';
   let mode = 'managed';
   const requests = [];
+  let applyConfirmation = '';
   const previousConfirm = global.confirm;
   let confirmed = false;
   let warning = '';
@@ -500,7 +502,7 @@ test('deleting Wi-Fi saves unmanaged with a warning, retains delivery, and requi
       return response({ revision, mode, networks: [] });
     }
     return response({ revision, mode, networks: [{ ssid: 'Office', security: 'OPEN' }] });
-  });
+  }, (message) => { applyConfirmation = message; return true; });
   const click = (action) => harness.groupPanel.dispatch('click', {
     target: { closest: () => ({ dataset: { wifiAction: action } }) },
   });
@@ -525,6 +527,9 @@ test('deleting Wi-Fi saves unmanaged with a warning, retains delivery, and requi
     click('apply');
     await tick();
     assert.deepEqual(requests[1], { method: 'POST', body: { expected_revision: 'r2' } });
+    assert.match(applyConfirmation, /Existing Wi-Fi settings on devices remain unchanged/);
+    assert.match(applyConfirmation, /reapplying managed Wi-Fi settings at startup/);
+    assert.doesNotMatch(applyConfirmation, /may be lost/);
     click('add');
     assert.match(harness.groupPanel.innerHTML, /data-wifi-action="save"/);
     assert.equal(harness.groupPanel.actionButtons['[data-wifi-action="apply"]'].disabled, true);
@@ -533,4 +538,73 @@ test('deleting Wi-Fi saves unmanaged with a warning, retains delivery, and requi
     if (previousConfirm === undefined) delete global.confirm;
     else global.confirm = previousConfirm;
   }
+});
+
+test('recovery baseline is an explicit delivery of the saved managed profile', async () => {
+  let confirmation = '';
+  let request = null;
+  const harness = withController(async (url, init = {}) => {
+    if (url === '/api/wifi/state') return response({ enabled: true, groups: {
+      Lab: { revision: 'r1', mode: 'managed' },
+    }, devices: {} });
+    if (url === '/api/wifi/groups/Lab') return response({
+      revision: 'r1', mode: 'managed',
+      networks: [{ ssid: 'Office', security: 'WPA_PSK', password_present: true, hidden: false }],
+    });
+    if (url === '/api/wifi/groups/Lab/recovery') {
+      request = { method: init.method, body: JSON.parse(init.body) };
+      return response({ operations: [{ status: 'sent' }] });
+    }
+    throw new Error('unexpected Wi-Fi route');
+  }, (message) => { confirmation = message; return true; });
+  const click = (action) => harness.groupPanel.dispatch('click', {
+    target: { closest: () => ({ dataset: { wifiAction: action } }) },
+  });
+  try {
+    await tick();
+    harness.controller.renderGroup('Lab', ['device'], true);
+    await tick();
+    const register = harness.groupPanel.actionButtons['[data-wifi-action="register-recovery"]'];
+    assert.match(harness.groupPanel.innerHTML, /Register recovery baseline/);
+    assert.equal(register.disabled, false);
+
+    click('register-recovery');
+    await tick();
+    assert.deepEqual(request, {
+      method: 'POST', body: { expected_revision: 'r1' },
+    });
+    assert.match(confirmation, /does not change current Wi-Fi/);
+    assert.match(confirmation, /update the initial baseline until a managed Wi-Fi profile connects successfully/);
+    assert.match(confirmation, /Reachability is not checked now/);
+    assert.match(confirmation, /unknown to MDM cannot be restored/);
+    assert.match(harness.statusPanel.innerHTML, /Recovery baseline delivery.*1 sent/);
+    assert.doesNotMatch(harness.statusPanel.innerHTML, /registered successfully/i);
+  } finally { harness.restore(); }
+});
+
+test('managed deployment confirmation warns that only MDM-held Wi-Fi can be restored', async () => {
+  let confirmation = '';
+  const harness = withController(async (url, init = {}) => {
+    if (url === '/api/wifi/state') return response({ enabled: true, groups: {
+      Lab: { revision: 'r1', mode: 'managed' },
+    }, devices: {} });
+    if (url === '/api/wifi/groups/Lab') return response({
+      revision: 'r1', mode: 'managed',
+      networks: [{ ssid: 'Office', security: 'OPEN', password_present: false, hidden: false }],
+    });
+    if (url.endsWith('/deploy') && init.method === 'POST') return response({ operations: [{ status: 'sent' }] });
+    throw new Error('unexpected Wi-Fi route');
+  }, (message) => { confirmation = message; return true; });
+  try {
+    await tick();
+    harness.controller.renderGroup('Lab', [], true);
+    await tick();
+    harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'apply' } }) } });
+    await tick();
+    assert.match(confirmation, /replaces Wi-Fi settings saved on devices/);
+    assert.match(confirmation, /restore only profiles held by MDM/);
+    assert.match(confirmation, /other existing Wi-Fi settings may be lost/);
+    assert.match(harness.statusPanel.innerHTML, /1 sent/);
+    assert.doesNotMatch(harness.statusPanel.innerHTML, /applied successfully|connected successfully/i);
+  } finally { harness.restore(); }
 });

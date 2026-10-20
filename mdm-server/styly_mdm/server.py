@@ -1634,6 +1634,14 @@ async def wifi_group_handler(request: web.Request) -> web.Response:
 
 
 async def wifi_deploy_handler(request: web.Request) -> web.Response:
+    return await _wifi_send_handler(request, recovery=False)
+
+
+async def wifi_recovery_handler(request: web.Request) -> web.Response:
+    return await _wifi_send_handler(request, recovery=True)
+
+
+async def _wifi_send_handler(request: web.Request, *, recovery: bool) -> web.Response:
     if _WIFI_GROUP_RECOVERY_REQUIRED:
         return _wifi_recovery_required_response()
     if not request.app.get("wifi_enabled"):
@@ -1657,6 +1665,8 @@ async def wifi_deploy_handler(request: web.Request) -> web.Response:
             profile = store.profile(name)
             if profile is None:
                 raise WiFiSettingsError("group has no saved Wi-Fi profile", 409)
+            if recovery and profile["mode"] != "managed":
+                raise WiFiSettingsError("a managed Wi-Fi profile is required for recovery", 409)
             _check_expected_revision(body, profile, allow_new_profile=False)
 
             # Freeze the online membership and sockets before any network write.
@@ -1693,7 +1703,7 @@ async def wifi_deploy_handler(request: web.Request) -> web.Response:
             async with send_lock:
                 if not store.is_latest_delivery(device_id, attempt["operation_id"]):
                     status, reason = "unknown", "superseded"
-                elif entry.get("identity_kind") != "canonical" or entry.get("wifi_settings_v2") is not True:
+                elif entry.get("identity_kind") != "canonical" or entry.get("wifi_settings_v3") is not True:
                     status, reason = "failed", "unsupported"
                 elif devices.get(device_id) is not entry or not _owns_device(device_id, ws):
                     status, reason = "failed", "socket_replaced"
@@ -1704,9 +1714,11 @@ async def wifi_deploy_handler(request: web.Request) -> web.Response:
                         "type": "EXECUTE_WIFI_APPLY",
                         "operation_id": attempt["operation_id"],
                         "revision": attempt["revision"],
-                        "mode": profile["mode"],
+                        "mode": "recovery" if recovery else profile["mode"],
                         "networks": profile["networks"],
                     }
+                    if message["mode"] in {"managed", "recovery"}:
+                        message["recovery_scope"] = "mdm_profiles"
                     try:
                         await asyncio.wait_for(
                             ws.send_str(json.dumps(message, ensure_ascii=False)),
@@ -1779,7 +1791,7 @@ def _parse_registration(data: dict, remote: str | None) -> tuple[str, dict] | tu
         "ip": _bounded_registration_text(data.get("ip"), remote or "unknown", MAX_DEVICE_IP_LEN),
         "version_name": _bounded_registration_text(data.get("version_name"), "", MAX_VERSION_NAME_LEN),
         "capabilities": capabilities,
-        "wifi_settings_v2": "wifi_settings_v2" in capabilities,
+        "wifi_settings_v3": "wifi_settings_v3" in capabilities,
     }
     version_code = data.get("version_code")
     common["version_code"] = (
@@ -1980,7 +1992,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "version_code": version_code,
                         "version_name": version_name,
                         "push_state_status": push_state_status,
-                        "wifi_settings_v2": registration["wifi_settings_v2"],
+                        "wifi_settings_v3": registration["wifi_settings_v3"],
                     }
                     device_registry[device_id] = {
                         "label": prev.get("label", ""),
@@ -3806,6 +3818,7 @@ def create_app() -> web.Application:
     app.router.add_route("PUT", "/api/wifi/groups/{name}", wifi_group_handler)
     app.router.add_route("DELETE", "/api/wifi/groups/{name}", wifi_group_handler)
     app.router.add_post("/api/wifi/groups/{name}/deploy", wifi_deploy_handler)
+    app.router.add_post("/api/wifi/groups/{name}/recovery", wifi_recovery_handler)
     app.router.add_post("/api/apks", upload_apk_handler)
     app.router.add_post("/api/bundles", upload_bundle_handler)
 

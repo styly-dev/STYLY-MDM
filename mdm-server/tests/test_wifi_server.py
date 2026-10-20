@@ -56,7 +56,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
         capable_id = "11111111-1111-4111-8111-111111111111"
         old_v1_id = "22222222-2222-4222-8222-222222222222"
         unsupported_id = "33333333-3333-4333-8333-333333333333"
-        no_capability_id = "44444444-4444-4444-8444-444444444444"
+        v2_only_id = "44444444-4444-4444-8444-444444444444"
         offline_id = "55555555-5555-4555-8555-555555555555"
         cert_path, key_path = _certificate(tmp_path)
 
@@ -74,7 +74,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
         server.DATA_DIR.mkdir(parents=True, exist_ok=True)
         server.REGISTRY_PATH.write_text(json.dumps({
             "devices": {},
-            "groups": {"Studio": [capable_id, old_v1_id, unsupported_id, no_capability_id, offline_id]},
+            "groups": {"Studio": [capable_id, old_v1_id, unsupported_id, v2_only_id, offline_id]},
         }), encoding="utf-8")
 
         app = server.create_app()
@@ -184,11 +184,21 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
                 assert response.status == 200
                 saved_profile = await response.json()
 
-            capable = await register(capable_id, ["wifi_settings_v2"])
+            capable = await register(capable_id, ["wifi_settings_v3"])
             old_v1 = await register(old_v1_id, ["wifi_settings_v1"])
             unsupported = await register(unsupported_id, [])
-            no_capability = await register(no_capability_id, [])
-            sockets.extend([capable, old_v1, unsupported, no_capability])
+            v2_only = await register(v2_only_id, ["wifi_settings_v2"])
+            sockets.extend([capable, old_v1, unsupported, v2_only])
+            assert server.devices[capable_id]["wifi_settings_v3"] is True
+            assert server.devices[v2_only_id]["wifi_settings_v3"] is False
+
+            async with session.post(
+                base_url + "/api/wifi/groups/Studio/recovery",
+                headers=good_headers,
+                json={"expected_revision": profile["revision"]},
+            ) as response:
+                assert response.status == 409
+            assert store.state["operations"] == {}
 
             stale_revision = profile["revision"]
             stale_change = {"networks": [{
@@ -206,7 +216,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             ) as response:
                 assert response.status == 409
             assert store.state["operations"] == {}
-            for ws in (capable, old_v1, unsupported, no_capability):
+            for ws in (capable, old_v1, unsupported, v2_only):
                 await assert_no_message(ws)
 
             async with session.post(
@@ -229,13 +239,14 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             }
             assert result_by_id[unsupported_id]["status"] == "failed"
             assert result_by_id[unsupported_id]["reason"] == "unsupported"
-            assert result_by_id[no_capability_id]["status"] == "failed"
-            assert result_by_id[no_capability_id]["reason"] == "unsupported"
+            assert result_by_id[v2_only_id]["status"] == "failed"
+            assert result_by_id[v2_only_id]["reason"] == "unsupported"
 
             command = await capable.receive_json(timeout=3)
             assert command["type"] == "EXECUTE_WIFI_APPLY"
-            assert set(command) == {"type", "operation_id", "revision", "mode", "networks"}
+            assert set(command) == {"type", "operation_id", "revision", "mode", "networks", "recovery_scope"}
             assert command["mode"] == "managed"
+            assert command["recovery_scope"] == "mdm_profiles"
             assert command["revision"] == deployed["revision"]
             assert command["networks"][0]["password"] == "studio-secret"
             for ws in (old_v1, unsupported):
@@ -245,7 +256,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
                 (capable_id, ("sent", None)),
                 (old_v1_id, ("failed", "unsupported")),
                 (unsupported_id, ("failed", "unsupported")),
-                (no_capability_id, ("failed", "unsupported")),
+                (v2_only_id, ("failed", "unsupported")),
             ):
                 delivery = store.state_view({device_id}, set())[device_id]["delivery"]
                 assert (delivery["status"], delivery["reason"]) == expected
@@ -258,6 +269,30 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             assert state["devices"][capable_id]["delivery"]["status"] == "sent"
             assert "applied_revision" not in state["devices"][capable_id]
             assert "manual" not in state["devices"][capable_id]
+
+            # Recovery registration is a separate, explicit delivery. It sends
+            # the saved profile without modifying the group's saved revision.
+            before_recovery_profile = store.profile("Studio")
+            async with session.post(
+                base_url + "/api/wifi/groups/Studio/recovery",
+                headers=good_headers,
+                json={"expected_revision": saved_profile["revision"]},
+            ) as response:
+                assert response.status == 200
+                recovery_delivery = await response.json()
+            assert recovery_delivery["online_target_count"] == 4
+            recovery_results = {item["device_id"]: item for item in recovery_delivery["operations"]}
+            assert recovery_results[capable_id]["status"] == "sent"
+            assert recovery_results[v2_only_id]["reason"] == "unsupported"
+            recovery_command = await capable.receive_json(timeout=3)
+            assert recovery_command["type"] == "EXECUTE_WIFI_APPLY"
+            assert recovery_command["mode"] == "recovery"
+            assert recovery_command["recovery_scope"] == "mdm_profiles"
+            assert recovery_command["revision"] == saved_profile["revision"]
+            assert recovery_command["networks"] == before_recovery_profile["networks"]
+            assert store.profile("Studio") == before_recovery_profile
+            for ws in (old_v1, unsupported, v2_only):
+                await assert_no_message(ws)
 
             # No result/verification response is required to complete this API call.
             # A late v1 result message is ignored and cannot rewrite delivery state.
@@ -296,7 +331,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             assert state_after_delete["groups"]["Studio"] == {
                 "revision": unmanaged_profile["revision"], "mode": "unmanaged",
             }
-            for ws in (capable, old_v1, unsupported, no_capability):
+            for ws in (capable, old_v1, unsupported, v2_only):
                 await assert_no_message(ws)
 
             async with session.delete(
@@ -312,7 +347,17 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             ) as response:
                 assert response.status == 409
             assert set(store.state["operations"]) == previous_operation_ids
-            for ws in (capable, old_v1, unsupported, no_capability):
+            for ws in (capable, old_v1, unsupported, v2_only):
+                await assert_no_message(ws)
+
+            async with session.post(
+                base_url + "/api/wifi/groups/Studio/recovery",
+                headers=good_headers,
+                json={"expected_revision": unmanaged_profile["revision"]},
+            ) as response:
+                assert response.status == 409
+            assert set(store.state["operations"]) == previous_operation_ids
+            for ws in (capable, old_v1, unsupported, v2_only):
                 await assert_no_message(ws)
 
             async with session.post(
@@ -329,7 +374,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             assert unmanaged_command["networks"] == []
             assert unmanaged_delivery["revision"] == unmanaged_profile["revision"]
             assert store.state["devices"][capable_id]["delivery"]["status"] == "sent"
-            for ws in (old_v1, unsupported, no_capability):
+            for ws in (old_v1, unsupported, v2_only):
                 await assert_no_message(ws)
 
             changed = {"networks": [{
@@ -342,7 +387,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
                 current_profile = await response.json()
             assert current_profile["mode"] == "managed"
             assert current_profile["revision"] != unmanaged_profile["revision"]
-            for ws in (capable, old_v1, unsupported, no_capability):
+            for ws in (capable, old_v1, unsupported, v2_only):
                 await assert_no_message(ws)
 
             # A second request exercises a send that is blocked while mutable
@@ -367,14 +412,14 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             ) as response:
                 assert response.status == 200
                 profile_during_send = await response.json()
-            offline_socket = await register(offline_id, ["wifi_settings_v2"])
+            offline_socket = await register(offline_id, ["wifi_settings_v3"])
             sockets.append(offline_socket)
             replacement_socket = ReplacementSocket()
             server.devices[capable_id]["ws"] = replacement_socket
             mutation_admin = AdminSocket()
             await server.handle_set_group_members(
                 mutation_admin,
-                {"name": "Studio", "members": [old_v1_id, unsupported_id, no_capability_id, offline_id]},
+                {"name": "Studio", "members": [old_v1_id, unsupported_id, v2_only_id, offline_id]},
                 app=app,
             )
             assert mutation_admin.messages[-1]["type"] == "GROUP_MEMBERS_SET"
@@ -406,7 +451,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             await server.handle_set_group_members(
                 mutation_admin,
                 {"name": "Studio", "members": [capable_id, old_v1_id, unsupported_id,
-                 no_capability_id, offline_id]},
+                 v2_only_id, offline_id]},
                 app=app,
             )
             stale_lock = app["wifi_send_locks"].setdefault(capable_id, asyncio.Lock())
@@ -457,7 +502,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             stale_skipped_command = await capable.receive_json(timeout=3)
             assert stale_skipped_command["mode"] == "unmanaged"
             assert stale_skipped_command["revision"] == stale_test_unmanaged["revision"]
-            for ws in (old_v1, unsupported, no_capability):
+            for ws in (old_v1, unsupported, v2_only):
                 await assert_no_message(ws)
 
             async with session.put(
@@ -527,7 +572,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             admin = AdminSocket()
             await server.handle_set_group_members(
                 admin,
-                {"name": "Studio", "members": [old_v1_id, unsupported_id, no_capability_id, offline_id]},
+                {"name": "Studio", "members": [old_v1_id, unsupported_id, v2_only_id, offline_id]},
                 app=app,
             )
             assert admin.messages[-1]["type"] == "GROUP_MEMBERS_SET"
@@ -609,7 +654,7 @@ def test_wifi_http_still_requires_explicit_opt_in_without_authentication(tmp_pat
                 "ip": "127.0.0.1",
                 "version_code": 1,
                 "version_name": "test",
-                "capabilities": ["wifi_settings_v2"],
+                "capabilities": ["wifi_settings_v3"],
             })
             assert (await ws.receive_json(timeout=3))["type"] == "REGISTERED"
             assert "wifi_authorized" not in server.devices[device_id]
@@ -712,7 +757,7 @@ def test_wifi_http_opt_in_allows_credential_free_lan_flow(tmp_path, monkeypatch)
                 "ip": "127.0.0.1",
                 "version_code": 1,
                 "version_name": "test",
-                "capabilities": ["wifi_settings_v2"],
+                "capabilities": ["wifi_settings_v3"],
             })
             assert (await device_ws.receive_json(timeout=3))["type"] == "REGISTERED"
             assert "wifi_authorized" not in server.devices[device_id]
@@ -728,6 +773,7 @@ def test_wifi_http_opt_in_allows_credential_free_lan_flow(tmp_path, monkeypatch)
             assert deployed["operations"][0]["status"] == "sent"
             command = await device_ws.receive_json(timeout=3)
             assert command["type"] == "EXECUTE_WIFI_APPLY"
+            assert command["recovery_scope"] == "mdm_profiles"
             assert command["networks"][0]["password"] == "lan-secret"
 
             async with session.post(base_url + "/api/wifi/session") as response:

@@ -1,13 +1,23 @@
 # Group Wi-Fi profiles and local recovery
 
 This implementation incorporates the operator's 2026-10-20 revision of the
-supplied v1.1 specification. MDM-server reconnection is **not** a success
-condition. The server sends settings; each client checks and recovers locally.
+supplied v1.1 specification and the later approved MDM-owned recovery contract.
+MDM-server reconnection is **not** a success condition. The server sends settings;
+each client checks and recovers locally using credentials already held by MDM.
 
 ## Operator workflow
 
 Use **Manage Groups**, select a group, and open **Wi-Fi**. Save one or more
 networks, then choose **Send to whole group**. Saving alone changes no device.
+Before a device's first managed deployment, save known recovery credentials and
+choose **Register recovery baseline** explicitly. This sends a local initial
+baseline without changing Wi-Fi, enabling startup correction or claiming the
+credentials connect. Until a successful MDM deployment exists, the initial
+baseline can be explicitly registered again to correct it. After success, the
+successful profile always takes precedence and registration cannot replace it.
+Then save the candidate settings and send them normally. Replacement may remove
+unknown existing networks; only the MDM-known recovery profile is restored on
+failure, not the complete previous OS configuration.
 The **Devices** tab edits membership separately. Target counts and delivery
 status always use saved membership, even while membership edits are unsaved.
 A device may belong to at most one group; unassigned devices are permitted.
@@ -48,10 +58,10 @@ still requires an explicit deployment to change any device.
 
 ## Manual change on the client
 
-1. Validate the command and management permissions. Read a complete, restorable
-   pre-change snapshot. Persist it and the operation identity before mutation.
-   If the current credentials or supported configuration cannot be recovered,
-   stop before making changes.
+1. Validate the command, recovery scope and management permissions. Select the
+   last locally successful MDM profile, or the explicitly registered initial
+   recovery profile before first success. Without either, stop before changing
+   Wi-Fi. Freeze those known credentials in the durable operation journal.
 2. At the first settings mutation, persist a fixed elapsed-time deadline 60
    seconds ahead and arm local rollback. An MDM service/socket restart never
    renews this budget.
@@ -65,7 +75,7 @@ still requires an explicit deployment to change any device.
    candidate as the successful baseline and finish the journal. This is a
    one-time success: later disconnects do not trigger automatic rollback.
 5. If no qualifying connection is observed before the deadline, or applying
-   fails after changes, restore the pre-change snapshot locally. MDM-server
+   fails after changes, restore the operation's MDM-known recovery profile locally. MDM-server
    availability plays no role. Restoration failure remains a local fence against
    further changes; it is not reported as restored.
 
@@ -128,13 +138,13 @@ Keep the key separate; losing or replacing it makes the store unreadable and
 must fail startup. Group rename/delete transaction recovery uses
 `wifi_group_mutation.txn`; keep that journal with the data directory. Logs and
 redacted APIs do not contain Wi-Fi passwords. Android private
-internal storage retains restoration snapshots and successful profiles; shared
+internal storage retains recovery credentials, legacy snapshots and successful profiles; shared
 storage, normal backups and diagnostic logs do not contain those secrets.
 
 ## Supported devices and networks
 
 The initial form supports Open and WPA/WPA2 Personal (PSK). Empty managed network lists,
-duplicate SSIDs and unsupported modes are rejected. SSIDs are 1–32 UTF-8 bytes;
+duplicate SSID/security pairs and unsupported modes are rejected. SSIDs are 1–32 UTF-8 bytes;
 this adapter rejects control characters, quotes and backslashes. PSKs are
 8–63 printable ASCII characters or 64 hexadecimal digits. A blank password
 field retains an existing password only for the same saved SSID/security entry.
@@ -142,22 +152,56 @@ The key editor disables autocomplete and uses a CSS-masked text input to avoid
 login-password generation/saving prompts. Browsers without CSS masking support
 fall back to a password input to keep the key hidden; those browsers or password
 manager extensions may still show their own prompts.
-WPA3/SAE, EAP certificates, WEP, proxy and static-IP configurations are not
-silently converted to supported profiles.
+Requested profiles do not support WPA3/SAE, EAP certificates, WEP, proxy or
+static-IP configuration. Existing networks using those features may be removed
+by replacement; they are not restored unless represented by a supported known
+MDM profile. Multiple PSK/SAE views for one saved network ID are counted once;
+verification selects the requested security view and removes unneeded IDs once.
 
 The client needs device-owner/system authority for configured-network management,
 precise location access for SSID identity, and exact-alarm access for local
 rollback. Ordinary runtime permission alone does not grant management authority.
-Masked/unreadable old PSKs are not reconstructed by matching an SSID to a cached
-baseline; insufficient restoration information causes a pre-mutation failure.
-The complete configuration snapshot preserves supported enabled/priority and
-parcel fields for restoration.
+Masked old PSKs are not reconstructed from SSID matches. Known candidate and
+recovery credentials are explicitly written, and fresh SSID/IP acquisition is
+required for manual success. New operations do not preserve unknown passwords,
+priority, proxy/static-IP or other OS-only configuration details. Previously
+persisted legacy recovery journals retain their parcel restoration path.
+
+### Explicit Device Owner provisioning
+
+The client declares `MdmDeviceAdminReceiver`, protected by `BIND_DEVICE_ADMIN`,
+with empty policy metadata. It does not request admin activation, provision
+ownership automatically or apply extra restrictions. Receiver identity must
+remain stable in future updates. Existing ordinary installations remain ordinary
+until an operator explicitly provisions them.
+
+For an explicitly authorized test device with no existing owner or accounts:
+
+```sh
+adb -s DEVICE_SERIAL shell dpm set-device-owner --user 0 com.styly.mdmclient/.MdmDeviceAdminReceiver
+adb -s DEVICE_SERIAL shell dpm list-owners
+```
+
+This is not sufficient to guarantee readable old credentials. Do not remove
+accounts or reset a device automatically when provisioning is refused. For a
+removable debug test installation, build with `-Pandroid.injected.testOnly=true`,
+install using `adb install -r -t`, and verify `TEST_ONLY` in the installed package
+flags before provisioning. Such a test owner can be removed explicitly with:
+
+```sh
+adb -s DEVICE_SERIAL shell dpm remove-active-admin --user 0 com.styly.mdmclient/.MdmDeviceAdminReceiver
+```
+
+Do not assume this removal command works for a normal release installation.
+Before switching signing keys or restoring a differently signed APK, remove the
+test owner first. Wi-Fi unmanaged policy and Android Device Owner are separate
+states: unmanaged deployment does not remove Device Owner.
 
 ## Protocol and migration
 
 `REGISTER.capabilities` remains a string array and advertises
-`wifi_settings_v2`. V1 clients use MDM reconnection verification and cannot run
-this revision; the server marks them unsupported without sending credentials.
+`wifi_settings_v3`. V1/V2 clients cannot run this recovery contract;
+the server marks them unsupported without sending credentials.
 Update client and server together. Other MDM capabilities remain compatible.
 The login endpoint and admin/device-token settings have been removed. Old token
 environment variables and old session cookies are ignored. Existing Android
@@ -166,8 +210,11 @@ next normal state write. Update earlier token-gated clients to enable ordinary
 manually configured and discovered Wi-Fi delivery without enrollment.
 
 `EXECUTE_WIFI_APPLY` contains operation_id, revision, mode and networks. Mode is
-managed or unmanaged. Managed lists are nonempty; unmanaged commands have an
-empty list and change only the persistent startup-management policy. There is no
+managed, unmanaged or recovery. Managed/recovery lists are nonempty and require
+`recovery_scope: mdm_profiles`, so a new client rejects an old server's destructive
+managed command. Recovery registers the initial baseline without changing Wi-Fi.
+Unmanaged commands have an empty list and change only the persistent
+startup-management policy. There is no
 Wi-Fi verification request/ACK, result ACK, observation or reconnect-time send.
 
 | Route | Operation |
@@ -177,12 +224,18 @@ Wi-Fi verification request/ACK, result ACK, observation or reconnect-time send.
 | `PUT /api/wifi/groups/{name}` | Validate/save a new managed profile revision |
 | `DELETE /api/wifi/groups/{name}` | Save an unmanaged revision; preserve device settings/delivery |
 | `POST /api/wifi/groups/{name}/deploy` | Send the frozen profile to current online members |
+| `POST /api/wifi/groups/{name}/recovery` | Send the saved managed profile as an initial recovery baseline |
 
-PUT, DELETE and deploy POST require `expected_revision`, matching the profile that the
+PUT, DELETE and both POST routes require `expected_revision`, matching the profile that the
 operator reviewed. A first PUT or DELETE explicitly uses null. Missing/malformed
 values return 400; a concurrent revision change returns 409 before saving or
 sending. The console preserves the draft and requires explicit reload. This
 Wi-Fi API change requires the accompanying updated console.
+
+Local schema4 preserves schema1–3 successful profiles and unfinished journals,
+adding a separate initial recovery profile. Existing legacy parcel bodies remain
+readable through the platform Parcelable creator; new recovery entries use known
+credentials without OS parcels. Do not downgrade after writing schema4 state.
 
 State includes `allow_http`, group revision/mode and `devices[id].delivery`. Delivery status
 is sent/failed/unknown, with fixed reasons. An internal unfinished send becomes
@@ -214,31 +267,36 @@ overlaps. Group rename preserves the saved revision; editing creates a new one.
 
 ### PICO hardware result: 2026-10-20
 
-The current adapter cannot apply managed profiles on the tested ordinary-app
-PICO 4 Ultra Enterprise installation (PUI 5.15.7, Android 14). Two real managed
-deliveries reached the client, but its management-authority preflight returned
-`PERMISSION_DENIED` before mutation. Location, all-files and exact-alarm access
-do not grant Device Owner or `NETWORK_SETTINGS` authority. Do not remove this
-preflight merely to attempt destructive writes without a restorable snapshot.
+On DEV-005, PICO 4 Ultra Enterprise / PUI 5.15.7 / Android 14, the ordinary
+client failed management preflight. Explicitly authorized Device Owner
+provisioning enabled configured-network writes but did not reveal old PSKs.
+The operator approved the v3 MDM-known recovery contract rather than full OS
+restoration. Unknown original configurations were removed during these tests.
 
-Profile deletion without dispatch, explicit unmanaged dispatch, unmanaged-policy
-persistence over a real reboot, offline-target exclusion, and preservation of
-unmanaged policy after a failed managed deployment were verified. There was no
-successful managed baseline: suppression of its boot reapplication, actual
-SSID/IP settlement and 60-second rollback remain unverified. Device Owner alone
-has not been shown to make old credentials readable/restorable. PICO connection
-APIs are not a substitute for verified complete configuration restoration.
-See the [hardware report](../tasks/wifi-hardware-validation-2026-10-20.md) for
-the tested boundaries, preparation and final device state.
+With the available `s-5ghz` test AP, v3 physically verified explicit baseline
+registration without Wi-Fi changes, fresh SSID/IP success without an MDM route,
+same-SSID wrong-password rollback after approximately 60 seconds, recovery after
+process termination, and once-per-boot recreation of an externally removed
+successful configuration. Starting only the foreground service, without opening
+an Activity, also restored a pending operation and the actual connection.
+Office/guest APs became unavailable; no successful connection to those APs or
+switching between two available APs is claimed.
 
-JVM, server and console tests cover the state machines and protocol. APK build
-success is not physical-device validation. On supported PICO hardware, confirm
-configured-network authority/readback, full credential restoration, SSID/IP
-callback visibility, same-SSID credential replacement, wrong-password timeout,
-unmanaged deployment/reboot and later managed re-enablement,
-MDM-unreachable successful Wi-Fi, process death/reboot recovery, alarm timing,
-duplicate boot notifications and content-start ordering. No physical success is
-claimed merely because implementation was requested on that assumption.
+Boot testing exposed an Android visibility failure: configured-network writes
+succeeded but readback returned an empty list and location AppOps recorded a
+rejection. The service now declares a location foreground-service type, selects
+it only after precise-location permission is granted, and starts durable Wi-Fi
+recovery only after foreground promotion. Later in-app location grants refresh
+the running service type. Cold rollback alarms start the same service so startup
+recovery can own the journal. No background-location permission is requested.
+
+The server records sending only. Actual results were checked through private
+client state and native Wi-Fi status, not inferred from delivery status or APK
+build success. See the [hardware report](../tasks/wifi-hardware-validation-2026-10-20.md)
+for individual outcomes, the final device state and untested cases. Other PICO
+firmware, WPA3/EAP/static-IP restoration, two-AP switching, hardware duplicate
+commands, exact-alarm-only recovery, active-operation reboot and content-start
+ordering remain outside this hardware evidence.
 
 References: [WifiManager](https://developer.android.com/reference/android/net/wifi/WifiManager),
 [NetworkCallback](https://developer.android.com/reference/android/net/ConnectivityManager.NetworkCallback),
