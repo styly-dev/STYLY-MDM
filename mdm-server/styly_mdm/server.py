@@ -37,14 +37,12 @@ from .device_policy import (
 from .integrity import apk_cd_digest, file_sha256, is_os_metadata
 from .push_jobs import parse_capabilities
 from .wifi_settings import (
-    RESULT_REASONS,
     WiFiSettingsError,
     WiFiSettingsStore,
     WiFiStoreError,
     normalize_revision,
     public_networks,
     validate_profile_networks,
-    valid_uuid,
 )
 
 logging.basicConfig(
@@ -1433,14 +1431,7 @@ def zip_tree(root: Path, dest_zip: Path) -> None:
 WIFI_SESSION_COOKIE = "styly_mdm_wifi_session"
 WIFI_SESSION_TTL = 12 * 60 * 60
 WIFI_REQUEST_MAX_BYTES = 256 * 1024
-def _wifi_operation_timeout_seconds() -> float:
-    try:
-        return max(1.0, float(os.environ.get("MDM_WIFI_OPERATION_TIMEOUT", "180")))
-    except ValueError:
-        return 180.0
-
-
-WIFI_OPERATION_TIMEOUT = _wifi_operation_timeout_seconds()
+WIFI_SEND_TIMEOUT = 5.0
 
 
 def _load_tls_context() -> ssl.SSLContext | None:
@@ -1566,6 +1557,21 @@ async def _small_json_body(request: web.Request) -> dict:
     return parsed
 
 
+def _check_expected_revision(body: dict, current: dict | None, *, allow_new_profile: bool) -> None:
+    if "expected_revision" not in body:
+        raise WiFiSettingsError("expected_revision is required", 400)
+    expected = body["expected_revision"]
+    if expected is None:
+        if allow_new_profile and current is None:
+            return
+        raise WiFiSettingsError("the saved Wi-Fi profile changed; reload it", 409)
+    normalized = normalize_revision(expected)
+    if normalized is None:
+        raise WiFiSettingsError("expected_revision must be a canonical revision UUID", 400)
+    if current is None or normalized != current.get("revision"):
+        raise WiFiSettingsError("the saved Wi-Fi profile changed; reload it", 409)
+
+
 def _wifi_api_unavailable() -> web.Response:
     return web.json_response({"error": "Wi-Fi settings are not enabled"}, status=503)
 
@@ -1589,7 +1595,10 @@ def _wifi_state_payload(store: WiFiSettingsStore, *, allow_http: bool) -> dict:
     groups = {}
     for name in sorted(device_groups):
         profile = store.profile(name)
-        groups[name] = {"revision": profile.get("revision") if profile else None}
+        groups[name] = {
+            "revision": profile.get("revision") if profile else None,
+            "mode": profile.get("mode") if profile else None,
+        }
     online_ids = {
         device_id for device_id, entry in devices.items()
         if entry.get("status") == "online"
@@ -1676,10 +1685,11 @@ async def wifi_group_handler(request: web.Request) -> web.Response:
             return web.json_response({
                 "name": name,
                 "revision": profile.get("revision") if profile else None,
+                "mode": profile.get("mode") if profile else None,
                 "networks": public_networks(profile["networks"]) if profile else [],
             })
 
-        if request.method == "PUT" and not _wifi_origin_allowed(request):
+        if request.method in {"PUT", "DELETE"} and not _wifi_origin_allowed(request):
             return web.json_response({"error": "invalid request origin"}, status=403)
         body = await _small_json_body(request)
         async with request.app["wifi_lock"]:
@@ -1688,11 +1698,20 @@ async def wifi_group_handler(request: web.Request) -> web.Response:
             if name not in device_groups:
                 raise WiFiSettingsError("group does not exist", 404)
             current = store.profile(name)
-            networks = validate_profile_networks(body.get("networks"), current.get("networks") if current else None)
-            profile = store.put_profile(name, networks)
+            _check_expected_revision(body, current, allow_new_profile=True)
+            if request.method == "DELETE":
+                # Removing settings changes server policy only. It must not
+                # erase device delivery history or send a device command.
+                profile = store.put_profile(name, [], mode="unmanaged")
+            else:
+                networks = validate_profile_networks(
+                    body.get("networks"), current.get("networks") if current else None,
+                )
+                profile = store.put_profile(name, networks, mode="managed")
         return web.json_response({
             "name": name,
             "revision": profile["revision"],
+            "mode": profile["mode"],
             "networks": public_networks(profile["networks"]),
         })
     except WiFiSettingsError as exc:
@@ -1700,237 +1719,6 @@ async def wifi_group_handler(request: web.Request) -> web.Response:
     except WiFiStoreError:
         log.error("Wi-Fi profile persistence failed")
         return web.json_response({"error": "Wi-Fi settings could not be saved"}, status=500)
-
-
-def _device_wifi_eligible(entry: dict | None) -> bool:
-    return bool(
-        entry
-        and entry.get("status") == "online"
-        and entry.get("registration_ready") is True
-        and entry.get("wifi_settings_v1") is True
-        and entry.get("wifi_authorized") is True
-        and entry.get("ws") is not None
-        and not entry["ws"].closed
-    )
-
-
-async def _wifi_operation_timeout(app: web.Application, operation_id: str) -> None:
-    try:
-        await asyncio.sleep(WIFI_OPERATION_TIMEOUT)
-        store = app.get("wifi_store")
-        if store is None:
-            return
-        async with app["wifi_lock"]:
-            store.mark_operation_timeout(operation_id)
-    except asyncio.CancelledError:
-        raise
-    except WiFiStoreError:
-        log.error("Wi-Fi timeout state could not be persisted")
-    finally:
-        app["wifi_tasks"].discard(asyncio.current_task())
-        if app.get("wifi_operation_tasks", {}).get(operation_id) is asyncio.current_task():
-            app["wifi_operation_tasks"].pop(operation_id, None)
-
-
-async def _cancel_wifi_tasks(app: web.Application) -> None:
-    tasks = tuple(app.get("wifi_tasks", ()))
-    for task in tasks:
-        task.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-
-def _wifi_socket_can_report(app: web.Application, device_id: str, ws: web.WebSocketResponse) -> bool:
-    entry = devices.get(device_id)
-    return bool(
-        app.get("wifi_enabled")
-        and not _WIFI_GROUP_RECOVERY_REQUIRED
-        and _owns_device(device_id, ws)
-        and _device_wifi_eligible(entry)
-    )
-
-
-async def _send_wifi_result_ack(ws: web.WebSocketResponse, payload: dict) -> None:
-    try:
-        await ws.send_str(json.dumps({"type": "WIFI_RESULT_ACK", **payload}))
-    except (ConnectionError, RuntimeError):
-        # Result state is already durable. The client will resend it after its
-        # next REGISTERED handshake and this ACK can be retried then.
-        pass
-
-
-async def _handle_wifi_device_message(
-    app: web.Application,
-    ws: web.WebSocketResponse,
-    device_id: str,
-    msg_type: str,
-    data: dict,
-) -> None:
-    if not _wifi_socket_can_report(app, device_id, ws):
-        return
-    store = app.get("wifi_store")
-    if store is None:
-        return
-
-    if msg_type == "WIFI_APPLY_ACCEPTED":
-        operation_id = data.get("operation_id")
-        if not valid_uuid(operation_id):
-            return
-        owner = app["wifi_dispatch_owners"].get(operation_id)
-        if owner != (device_id, ws):
-            return
-        try:
-            async with app["wifi_lock"]:
-                if (
-                    app["wifi_dispatch_owners"].get(operation_id) == (device_id, ws)
-                    and _wifi_socket_can_report(app, device_id, ws)
-                ):
-                    store.mark_accepted(operation_id, device_id)
-        except WiFiStoreError:
-            log.error("Wi-Fi acceptance state could not be persisted")
-        return
-
-    if msg_type == "WIFI_VERIFY_REQUEST":
-        operation_id = data.get("operation_id")
-        challenge = data.get("challenge")
-        if (
-            not valid_uuid(operation_id)
-            or not isinstance(challenge, str)
-            or not challenge
-            or len(challenge) > 128
-        ):
-            return
-        operation = store.state["operations"].get(operation_id)
-        if (
-            not isinstance(operation, dict)
-            or operation.get("device_id") != device_id
-            or operation.get("accepted") is not True
-            or operation.get("unresolved") is not True
-        ):
-            return
-        try:
-            async with app["wifi_lock"]:
-                persisted = (
-                    _wifi_socket_can_report(app, device_id, ws)
-                    and store.set_verify_challenge(operation_id, device_id, challenge)
-                )
-            if persisted and _wifi_socket_can_report(app, device_id, ws):
-                await ws.send_str(json.dumps({
-                    "type": "WIFI_VERIFY_ACK",
-                    "operation_id": operation_id,
-                    "challenge": challenge,
-                }))
-        except WiFiStoreError:
-            log.error("Wi-Fi verification state could not be persisted")
-        except (ConnectionError, RuntimeError):
-            pass
-        return
-
-    if msg_type == "WIFI_APPLY_RESULT":
-        operation_id = data.get("operation_id")
-        revision = normalize_revision(data.get("revision"))
-        status = data.get("status")
-        reason = data.get("reason")
-        rolled_back = data.get("rolled_back")
-        if (
-            not valid_uuid(operation_id)
-            or revision is None
-            or not isinstance(status, str)
-            or status not in {"success", "failed", "unknown"}
-            or not isinstance(reason, str)
-            or reason not in RESULT_REASONS
-            or not isinstance(rolled_back, bool)
-            or (status == "success" and (reason != "NONE" or rolled_back))
-            or (status == "unknown" and reason != "UNKNOWN")
-            or (status == "failed" and reason == "NONE")
-        ):
-            return
-        try:
-            async with app["wifi_lock"]:
-                settled = _wifi_socket_can_report(app, device_id, ws) and store.settle_manual(
-                    operation_id,
-                    device_id,
-                    revision,
-                    status,
-                    reason,
-                    rolled_back,
-                )
-            if not settled:
-                return
-            task = app["wifi_operation_tasks"].pop(operation_id, None)
-            if task is not None:
-                task.cancel()
-            if status != "unknown":
-                app["wifi_dispatch_owners"].pop(operation_id, None)
-            if _wifi_socket_can_report(app, device_id, ws):
-                await _send_wifi_result_ack(ws, {
-                    "kind": "manual",
-                    "operation_id": operation_id,
-                    "revision": revision,
-                    "status": status,
-                    "reason": reason,
-                    "rolled_back": rolled_back,
-                })
-        except WiFiStoreError:
-            log.error("Wi-Fi manual result could not be persisted")
-        return
-
-    if msg_type == "WIFI_BOOT_RESULT":
-        boot_id = data.get("boot_id")
-        revision = normalize_revision(data.get("revision"))
-        status = data.get("status")
-        reason = data.get("reason")
-        if (
-            not valid_uuid(boot_id)
-            or revision is None
-            or not isinstance(status, str)
-            or status not in {"success", "failed", "unknown"}
-            or not isinstance(reason, str)
-            or reason not in RESULT_REASONS
-            or (status == "success" and reason != "NONE")
-            or (status == "unknown" and reason != "UNKNOWN")
-            or (status == "failed" and reason == "NONE")
-        ):
-            return
-        try:
-            async with app["wifi_lock"]:
-                persisted = _wifi_socket_can_report(app, device_id, ws) and store.settle_boot(
-                    device_id, boot_id, revision, status, reason,
-                )
-            if persisted and _wifi_socket_can_report(app, device_id, ws):
-                await _send_wifi_result_ack(ws, {
-                    "kind": "boot",
-                    "boot_id": boot_id,
-                    "revision": revision,
-                    "status": status,
-                    "reason": reason,
-                })
-        except WiFiStoreError:
-            log.error("Wi-Fi boot result could not be persisted")
-        return
-
-    if msg_type == "WIFI_OBSERVATION":
-        revision = normalize_revision(data.get("revision"))
-        status = data.get("status")
-        if (
-            revision is None
-            or not isinstance(status, str)
-            or status not in {"match", "mismatch", "unknown"}
-        ):
-            return
-        record = store.state["devices"].get(device_id, {})
-        known_revision = record.get("applied_revision") == revision or any(
-            operation.get("device_id") == device_id and operation.get("revision") == revision
-            for operation in store.state["operations"].values()
-        )
-        if not known_revision:
-            return
-        try:
-            async with app["wifi_lock"]:
-                if _wifi_socket_can_report(app, device_id, ws):
-                    store.observe(device_id, revision, status)
-        except WiFiStoreError:
-            log.error("Wi-Fi observation could not be persisted")
 
 
 async def wifi_deploy_handler(request: web.Request) -> web.Response:
@@ -1947,92 +1735,102 @@ async def wifi_deploy_handler(request: web.Request) -> web.Response:
         return _wifi_api_unavailable()
     try:
         name = _wifi_name_from_request(request)
+        body = await _small_json_body(request)
         async with request.app["wifi_lock"]:
             if name not in device_groups:
                 raise WiFiSettingsError("group does not exist", 404)
             profile = store.profile(name)
             if profile is None:
                 raise WiFiSettingsError("group has no saved Wi-Fi profile", 409)
+            _check_expected_revision(body, profile, allow_new_profile=False)
 
-            # Capture every online group member, even one that cannot use Wi-Fi.
-            # Such a device receives a fixed failure result; offline members are
-            # excluded and never gain a reconnect-time send.
+            # Freeze the online membership and sockets before any network write.
+            # Offline devices are not queued and are never sent this revision later.
             targets = [
-                (device_id, devices.get(device_id), devices.get(device_id, {}).get("ws"))
+                (device_id, devices[device_id], devices[device_id].get("ws"))
                 for device_id in device_groups.get(name, [])
-                if devices.get(device_id, {}).get("status") == "online"
+                if isinstance(devices.get(device_id), dict)
+                and devices[device_id].get("status") == "online"
             ]
-            operations = store.create_operations(
+            attempts = store.create_delivery_attempts(
                 name,
                 profile["revision"],
-                profile["networks"],
                 [device_id for device_id, _entry, _ws in targets],
             )
 
-        by_device = {operation["device_id"]: operation for operation in operations}
-        request.app["wifi_dispatch_owners"].update({
-            operation["operation_id"]: (device_id, ws)
-            for device_id, _entry, ws in targets
-            for operation in [by_device[device_id]]
-        })
-
-        for device_id, entry, ws in targets:
-            operation = by_device[device_id]
-            operation_id = operation["operation_id"]
-            if not isinstance(entry, dict) or entry.get("wifi_settings_v1") is not True:
-                async with request.app["wifi_lock"]:
-                    store.settle_manual(
-                        operation_id, device_id, operation["revision"],
-                        "failed", "UNSUPPORTED", False,
-                    )
-                continue
-            if entry.get("wifi_authorized") is not True:
-                async with request.app["wifi_lock"]:
-                    store.settle_manual(
-                        operation_id, device_id, operation["revision"],
-                        "failed", "PERMISSION_DENIED", False,
-                    )
-                continue
-            if not _owns_device(device_id, ws) or devices.get(device_id) is not entry:
-                # The frozen target disconnected before this server sent anything;
-                # this is a known non-delivery, so it can be a terminal failure.
-                async with request.app["wifi_lock"]:
-                    store.settle_manual(
-                        operation_id, device_id, operation["revision"],
-                        "failed", "UNREACHABLE", False,
-                    )
-                continue
-            timeout_task = asyncio.create_task(_wifi_operation_timeout(request.app, operation_id))
-            request.app["wifi_tasks"].add(timeout_task)
-            request.app["wifi_operation_tasks"][operation_id] = timeout_task
-            message = {
-                "type": "EXECUTE_WIFI_APPLY",
-                "operation_id": operation_id,
-                "revision": operation["revision"],
-                "networks": operation["networks"],
+        results = [
+            {
+                "operation_id": attempt["operation_id"],
+                "device_id": attempt["device_id"],
+                "status": "unknown",
+                "reason": "dispatch_not_confirmed",
             }
-            try:
-                await asyncio.wait_for(
-                    ws.send_str(json.dumps(message, ensure_ascii=False)),
-                    timeout=5.0,
-                )
-            except (ConnectionError, RuntimeError, asyncio.TimeoutError):
-                async with request.app["wifi_lock"]:
-                    store.mark_operation_timeout(operation_id)
-                request.app["wifi_dispatch_owners"].pop(operation_id, None)
+            for attempt in attempts
+        ]
 
+        async def dispatch_one(target, attempt, result):
+            device_id, entry, ws = target
+            # Serialize commands to each device. A managed command already in
+            # send may be followed by an unmanaged command, but the order must
+            # never reverse and re-enable boot reapply after the unmanaged one.
+            # This is only a short-lived send lock, not a device operation fence.
+            send_lock = request.app["wifi_send_locks"].setdefault(device_id, asyncio.Lock())
+            async with send_lock:
+                if not store.is_latest_delivery(device_id, attempt["operation_id"]):
+                    status, reason = "unknown", "superseded"
+                elif entry.get("identity_kind") != "canonical" or entry.get("wifi_settings_v2") is not True:
+                    status, reason = "failed", "unsupported"
+                elif entry.get("wifi_authorized") is not True:
+                    status, reason = "failed", "permission_denied"
+                elif devices.get(device_id) is not entry or not _owns_device(device_id, ws):
+                    status, reason = "failed", "socket_replaced"
+                elif ws is None or ws.closed:
+                    status, reason = "failed", "socket_unavailable"
+                else:
+                    message = {
+                        "type": "EXECUTE_WIFI_APPLY",
+                        "operation_id": attempt["operation_id"],
+                        "revision": attempt["revision"],
+                        "mode": profile["mode"],
+                        "networks": profile["networks"],
+                    }
+                    try:
+                        await asyncio.wait_for(
+                            ws.send_str(json.dumps(message, ensure_ascii=False)),
+                            timeout=WIFI_SEND_TIMEOUT,
+                        )
+                        status, reason = "sent", None
+                    except (ConnectionError, RuntimeError, asyncio.TimeoutError):
+                        # A send exception can happen after some bytes reached
+                        # the socket, so this is never reported as non-delivery.
+                        status, reason = "unknown", "socket_send_failed"
+
+                try:
+                    async with request.app["wifi_lock"]:
+                        persisted = store.settle_delivery(attempt["operation_id"], status, reason)
+                except WiFiStoreError:
+                    log.error("Wi-Fi delivery state could not be persisted")
+                    status, reason = "unknown", "state_persist_failed"
+                else:
+                    if not persisted:
+                        status, reason = "unknown", "state_persist_failed"
+                result["status"] = status
+                result["reason"] = reason
+
+        await asyncio.gather(*(
+            dispatch_one(target, attempt, result)
+            for target, attempt, result in zip(targets, attempts, results)
+        ))
         return web.json_response({
             "group": name,
             "revision": profile["revision"],
-            "operations": [
-                {"operation_id": operation["operation_id"], "device_id": operation["device_id"]}
-                for operation in operations
-            ],
+            "online_target_count": len(targets),
+            "operations": results,
         })
     except WiFiSettingsError as exc:
         return web.json_response({"error": str(exc)}, status=exc.status)
     except WiFiStoreError:
-        log.error("Wi-Fi deployment snapshot could not be persisted")
+        log.error("Wi-Fi delivery attempt could not be persisted")
         return web.json_response({"error": "Wi-Fi deployment could not be recorded"}, status=500)
 
 
@@ -2062,12 +1860,13 @@ def _bounded_registration_text(value, fallback: str, limit: int) -> str:
 def _parse_registration(data: dict, remote: str | None) -> tuple[str, dict] | tuple[None, str]:
     scheme = data.get("identity_scheme")
     device_id = data.get("device_id")
+    capabilities = sorted(parse_capabilities(data.get("capabilities")))
     common = {
         "model": _bounded_registration_text(data.get("model"), "unknown", MAX_DEVICE_MODEL_LEN),
         "ip": _bounded_registration_text(data.get("ip"), remote or "unknown", MAX_DEVICE_IP_LEN),
         "version_name": _bounded_registration_text(data.get("version_name"), "", MAX_VERSION_NAME_LEN),
-        "capabilities": sorted(parse_capabilities(data.get("capabilities"))),
-        "wifi_settings_v1": "wifi_settings_v1" in parse_capabilities(data.get("capabilities")),
+        "capabilities": capabilities,
+        "wifi_settings_v2": "wifi_settings_v2" in capabilities,
     }
     version_code = data.get("version_code")
     common["version_code"] = (
@@ -2273,7 +2072,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "version_code": version_code,
                         "version_name": version_name,
                         "push_state_status": push_state_status,
-                        "wifi_settings_v1": registration["wifi_settings_v1"],
+                        "wifi_settings_v2": registration["wifi_settings_v2"],
                         "wifi_authorized": wifi_authorized,
                     }
                     device_registry[device_id] = {
@@ -2307,18 +2106,6 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     if kind == "canonical":
                         await broadcast_provisional_connection_list()
                     await broadcast_device_list()
-
-                elif msg_type in {
-                    "WIFI_APPLY_ACCEPTED",
-                    "WIFI_VERIFY_REQUEST",
-                    "WIFI_APPLY_RESULT",
-                    "WIFI_BOOT_RESULT",
-                    "WIFI_OBSERVATION",
-                }:
-                    if device_id:
-                        await _handle_wifi_device_message(
-                            request.app, ws, device_id, msg_type, data,
-                        )
 
                 elif msg_type == "BATTERY_UPDATE":
                     if not device_id:
@@ -2846,14 +2633,6 @@ async def handle_forget_device(
         }))
         return
 
-    store = app.get("wifi_store") if app is not None else None
-    if store is not None and store.unresolved_for_device(serial):
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": "Cannot forget a device with an unresolved Wi-Fi operation",
-        }))
-        return
-
     previous_devices = copy.deepcopy(device_registry)
     previous_groups = copy.deepcopy(device_groups)
     removed = device_registry.pop(serial, None) is not None
@@ -2961,15 +2740,8 @@ async def handle_rename_group(
         }))
         return
 
-    store = app.get("wifi_store") if app is not None else None
-    if new_name != name and store is not None and store.unresolved_for_group(name):
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": "Cannot rename a group with an unresolved Wi-Fi operation",
-        }))
-        return
-
     # Rebuild to preserve insertion order while swapping the key.
+    store = app.get("wifi_store") if app is not None else None
     previous_groups = copy.deepcopy(device_groups)
     previous_wifi_state = copy.deepcopy(store.state) if store is not None else None
     device_groups[new_name] = device_groups.pop(name)
@@ -3008,12 +2780,6 @@ async def handle_delete_group(
         return
 
     store = app.get("wifi_store") if app is not None else None
-    if store is not None and store.unresolved_for_group(name):
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": "Cannot delete a group with an unresolved Wi-Fi operation",
-        }))
-        return
 
     if name in device_groups:
         previous_groups = copy.deepcopy(device_groups)
@@ -3088,16 +2854,6 @@ async def handle_set_device_groups(
             "message": "A device can belong to only one group",
         }))
         return
-
-    current_names = [name for name, members in device_groups.items() if serial in members]
-    if current_names != target_names:
-        store = app.get("wifi_store") if app is not None else None
-        if store is not None and store.unresolved_for_device(serial):
-            await admin_ws.send_str(json.dumps({
-                "type": "ERROR",
-                "message": "Cannot change membership while a Wi-Fi operation is unresolved",
-            }))
-            return
 
     # Rebuild membership so the device is in exactly the requested groups.
     previous_groups = copy.deepcopy(device_groups)
@@ -3178,15 +2934,6 @@ async def handle_set_group_members(
         await admin_ws.send_str(json.dumps({
             "type": "ERROR",
             "message": "One or more devices already belong to another group",
-        }))
-        return
-
-    changed_devices = set(device_groups[name]) ^ set(members)
-    store = app.get("wifi_store") if app is not None else None
-    if store is not None and any(store.unresolved_for_device(did) for did in changed_devices):
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": "Cannot change membership while a Wi-Fi operation is unresolved",
         }))
         return
 
@@ -4152,10 +3899,7 @@ def create_app() -> web.Application:
     app["wifi_device_token"] = os.environ.get("MDM_DEVICE_TOKEN") if wifi_enabled else None
     app["wifi_sessions"] = {}
     app["wifi_lock"] = asyncio.Lock()
-    app["wifi_dispatch_owners"] = {}
-    app["wifi_tasks"] = set()
-    app["wifi_operation_tasks"] = {}
-    app.on_cleanup.append(_cancel_wifi_tasks)
+    app["wifi_send_locks"] = {}
 
     # WebSocket endpoints
     app.router.add_get("/ws/device", device_ws_handler)
@@ -4164,6 +3908,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/wifi/state", wifi_state_handler)
     app.router.add_route("GET", "/api/wifi/groups/{name}", wifi_group_handler)
     app.router.add_route("PUT", "/api/wifi/groups/{name}", wifi_group_handler)
+    app.router.add_route("DELETE", "/api/wifi/groups/{name}", wifi_group_handler)
     app.router.add_post("/api/wifi/groups/{name}/deploy", wifi_deploy_handler)
     app.router.add_post("/api/apks", upload_apk_handler)
     app.router.add_post("/api/bundles", upload_bundle_handler)

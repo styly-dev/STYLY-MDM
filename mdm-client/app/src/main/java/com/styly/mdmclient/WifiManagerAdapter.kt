@@ -36,8 +36,17 @@ internal interface WifiSettingsAdapter {
         onMutationStarted: () -> WifiReason? = { null },
         onMutationFinished: () -> Unit = {},
     ): WifiReason
-    fun compareTo(profile: List<WifiNetworkProfile>): String
     fun validateFinalState(profile: List<WifiNetworkProfile>, priorApiWriteValidated: Boolean): String
+    fun disconnectCurrent(
+        shouldContinue: () -> Boolean,
+        onMutationStarted: () -> WifiReason?,
+        onMutationFinished: () -> Unit,
+    ): WifiReason
+    fun reconnect(
+        shouldContinue: () -> Boolean,
+        onMutationStarted: () -> WifiReason?,
+        onMutationFinished: () -> Unit,
+    ): WifiReason
 }
 
 /** Uses only public Android configured-network APIs and fails closed without full-list authority. */
@@ -260,24 +269,6 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         }
     }
 
-    override fun compareTo(profile: List<WifiNetworkProfile>): String {
-        val entries = try {
-            readCurrent()
-        } catch (_: WifiAdapterFailure) {
-            return "unknown"
-        }
-        if (entries.any { it.security == null }) return "unknown"
-        if (entries.any { it.security == "WPA_PSK" && !it.passwordReadable }) return "unknown"
-        if (entries.size != profile.size) return "mismatch"
-        for (expected in profile) {
-            val actual = entries.singleOrNull {
-                it.ssid == expected.ssid && it.security == expected.security
-            } ?: return "mismatch"
-            if (actual.hidden != expected.hidden || actual.password != expected.password) return "mismatch"
-        }
-        return "match"
-    }
-
     /** Validate visible fields after a successful API write without claiming masked PSKs match. */
     override fun validateFinalState(profile: List<WifiNetworkProfile>, priorApiWriteValidated: Boolean): String {
         val entries = try {
@@ -298,6 +289,51 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             }
         }
         return "validated"
+    }
+
+    override fun disconnectCurrent(
+        shouldContinue: () -> Boolean,
+        onMutationStarted: () -> WifiReason?,
+        onMutationFinished: () -> Unit,
+    ): WifiReason = runConnectionMutation(shouldContinue, onMutationStarted, onMutationFinished) { manager ->
+        @Suppress("DEPRECATION")
+        if (manager.disconnect()) WifiReason.NONE else WifiReason.UNREACHABLE
+    }
+
+    override fun reconnect(
+        shouldContinue: () -> Boolean,
+        onMutationStarted: () -> WifiReason?,
+        onMutationFinished: () -> Unit,
+    ): WifiReason = runConnectionMutation(shouldContinue, onMutationStarted, onMutationFinished) { manager ->
+        @Suppress("DEPRECATION")
+        if (manager.reconnect()) WifiReason.NONE else WifiReason.UNREACHABLE
+    }
+
+    private inline fun runConnectionMutation(
+        shouldContinue: () -> Boolean,
+        onMutationStarted: () -> WifiReason?,
+        onMutationFinished: () -> Unit,
+        action: (WifiManager) -> WifiReason,
+    ): WifiReason = mutationLock.withLock {
+        var started = false
+        try {
+            requireManagementAuthority()
+            val manager = wifiManager ?: return WifiReason.UNSUPPORTED
+            if (!shouldContinue()) return WifiReason.TIMEOUT_ROLLED_BACK
+            val refusal = onMutationStarted()
+            if (refusal != null) return refusal
+            started = true
+            if (!shouldContinue()) return WifiReason.TIMEOUT_ROLLED_BACK
+            action(manager)
+        } catch (failure: WifiAdapterFailure) {
+            failure.reason
+        } catch (_: SecurityException) {
+            WifiReason.PERMISSION_DENIED
+        } catch (_: Exception) {
+            WifiReason.UNREACHABLE
+        } finally {
+            if (started) onMutationFinished()
+        }
     }
 
     private fun requireManagementAuthority() {

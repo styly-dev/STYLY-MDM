@@ -315,12 +315,16 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun updateWifiLocationUi() {
         val granted = hasWifiLocationPermission()
+        val locationEnabled = (getSystemService(LOCATION_SERVICE) as? android.location.LocationManager)
+            ?.isLocationEnabled == true
+        val ready = granted && locationEnabled
         wifiLocationStatus.setText(
-            if (granted) R.string.wifi_location_permission_granted
+            if (ready) R.string.wifi_location_permission_granted
+            else if (granted) R.string.wifi_location_services_disabled
             else R.string.wifi_location_permission_missing,
         )
-        wifiLocationStatus.setTextColor(if (granted) 0xFF4CAF50.toInt() else 0xFFFF5722.toInt())
-        wifiLocationButton.visibility = if (granted) View.GONE else View.VISIBLE
+        wifiLocationStatus.setTextColor(if (ready) 0xFF4CAF50.toInt() else 0xFFFF5722.toInt())
+        wifiLocationButton.visibility = if (ready) View.GONE else View.VISIBLE
     }
 
     private fun requestWifiLocationPermission() {
@@ -332,6 +336,12 @@ class SettingsActivity : AppCompatActivity() {
                 ),
                 REQUEST_WIFI_LOCATION_PERMISSION,
             )
+        } else {
+            try {
+                startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+            } catch (_: ActivityNotFoundException) {
+                Toast.makeText(this, R.string.wifi_location_settings_unavailable, Toast.LENGTH_LONG).show()
+            }
         }
     }
 

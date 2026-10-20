@@ -6,6 +6,7 @@ import asyncio
 import ipaddress
 import json
 import ssl
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -50,13 +51,15 @@ def _certificate(tmp_path):
     return cert_path, key_path
 
 
-def test_wifi_tls_origin_dispatch_and_reconnect_verify(tmp_path, monkeypatch):
+def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypatch):
     async def body():
         admin_token = "test-admin-token"
         device_token = "test-device-token"
         capable_id = "11111111-1111-4111-8111-111111111111"
-        unsupported_id = "22222222-2222-4222-8222-222222222222"
-        offline_id = "33333333-3333-4333-8333-333333333333"
+        old_v1_id = "22222222-2222-4222-8222-222222222222"
+        unsupported_id = "33333333-3333-4333-8333-333333333333"
+        unauthorized_id = "44444444-4444-4444-8444-444444444444"
+        offline_id = "55555555-5555-4555-8555-555555555555"
         cert_path, key_path = _certificate(tmp_path)
 
         monkeypatch.setenv("MDM_ADMIN_TOKEN", admin_token)
@@ -64,7 +67,6 @@ def test_wifi_tls_origin_dispatch_and_reconnect_verify(tmp_path, monkeypatch):
         monkeypatch.setenv("MDM_WIFI_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
         monkeypatch.setenv("MDM_TLS_CERT", str(cert_path))
         monkeypatch.setenv("MDM_TLS_KEY", str(key_path))
-        monkeypatch.setenv("MDM_WIFI_OPERATION_TIMEOUT", "60")
 
         server._apply_data_dir(str(tmp_path / "data"))
         server.devices.clear()
@@ -74,7 +76,7 @@ def test_wifi_tls_origin_dispatch_and_reconnect_verify(tmp_path, monkeypatch):
         server.DATA_DIR.mkdir(parents=True, exist_ok=True)
         server.REGISTRY_PATH.write_text(json.dumps({
             "devices": {},
-            "groups": {"Studio": [capable_id, unsupported_id, offline_id]},
+            "groups": {"Studio": [capable_id, old_v1_id, unsupported_id, unauthorized_id, offline_id]},
         }), encoding="utf-8")
 
         app = server.create_app()
@@ -89,10 +91,11 @@ def test_wifi_tls_origin_dispatch_and_reconnect_verify(tmp_path, monkeypatch):
         base_url = str(test_server.make_url("/")).rstrip("/")
         origin = f"https://{test_server.host}:{test_server.port}"
 
-        async def register(device_id, capabilities):
+        async def register(device_id, capabilities, *, authenticated=True):
+            headers = {"Authorization": f"Bearer {device_token}"} if authenticated else {}
             ws = await session.ws_connect(
                 base_url + "/ws/device",
-                headers={"Authorization": f"Bearer {device_token}"},
+                headers=headers,
                 origin=origin,
             )
             await ws.send_json({
@@ -105,23 +108,67 @@ def test_wifi_tls_origin_dispatch_and_reconnect_verify(tmp_path, monkeypatch):
                 "version_name": "test",
                 "capabilities": capabilities,
             })
-            message = await ws.receive_json(timeout=3)
-            assert message["type"] == "REGISTERED"
+            assert (await ws.receive_json(timeout=3))["type"] == "REGISTERED"
             for _ in range(50):
                 if server.devices.get(device_id, {}).get("status") == "online":
                     break
                 await asyncio.sleep(0.01)
             return ws
 
+        async def assert_no_message(ws):
+            try:
+                message = await ws.receive(timeout=0.05)
+            except asyncio.TimeoutError:
+                return
+            pytest.fail(f"unexpected WebSocket message: {message.type}")
+
+        class AdminSocket:
+            def __init__(self):
+                self.messages = []
+
+            async def send_str(self, message):
+                self.messages.append(json.loads(message))
+
+        class GatedSocket:
+            def __init__(self, wrapped):
+                self.original_send = wrapped.send_str
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+                self.messages = []
+                self.error = None
+                self.call_count = 0
+
+            async def send_str(self, message):
+                self.messages.append(json.loads(message))
+                self.call_count += 1
+                if self.call_count == 1:
+                    self.started.set()
+                    await self.release.wait()
+                try:
+                    await self.original_send(message)
+                except Exception as exc:
+                    self.error = repr(exc)
+                    raise
+
+        class ReplacementSocket:
+            def __init__(self):
+                self.closed = False
+                self.messages = []
+
+            async def send_str(self, message):
+                self.messages.append(json.loads(message))
+
         sockets = []
         try:
             async with session.get(base_url + "/api/wifi/state") as response:
                 assert response.status == 401
-                assert await response.json() == {
-                    "enabled": True,
-                    "allow_http": False,
-                    "error": "authentication required",
-                }
+                assert (await response.json())["allow_http"] is False
+            async with session.delete(
+                base_url + "/api/wifi/groups/Studio",
+                headers={"Origin": origin},
+                json={"expected_revision": profile["revision"]},
+            ) as response:
+                assert response.status == 401
 
             headers = {"Authorization": f"Bearer {admin_token}"}
             bad_origin_headers = {**headers, "Origin": "https://attacker.example"}
@@ -130,6 +177,12 @@ def test_wifi_tls_origin_dispatch_and_reconnect_verify(tmp_path, monkeypatch):
             }]}
             async with session.put(
                 base_url + "/api/wifi/groups/Studio", headers=bad_origin_headers, json=payload,
+            ) as response:
+                assert response.status == 403
+            async with session.delete(
+                base_url + "/api/wifi/groups/Studio",
+                headers=bad_origin_headers,
+                json={"expected_revision": profile["revision"]},
             ) as response:
                 assert response.status == 403
             assert store.profile("Studio") == profile
@@ -147,164 +200,371 @@ def test_wifi_tls_origin_dispatch_and_reconnect_verify(tmp_path, monkeypatch):
                 assert "HttpOnly" in cookie
                 assert "Secure" in cookie
                 assert "SameSite=Strict" in cookie
-            async with session.get(base_url + "/api/wifi/groups/Studio") as response:
-                assert response.status == 200
             async with session.get(base_url + "/api/wifi/state") as response:
                 assert response.status == 200
                 assert (await response.json())["allow_http"] is False
-            # Cookie-authenticated browser mutations still require a same-origin
-            # Origin header; an origin-less request cannot reuse the cookie.
             async with session.put(base_url + "/api/wifi/groups/Studio", json=payload) as response:
                 assert response.status == 403
-
             async with session.put(
-                base_url + "/api/wifi/groups/Studio", headers=good_headers, json=payload,
+                base_url + "/api/wifi/groups/Studio", headers=good_headers,
+                json={**payload, "expected_revision": profile["revision"]},
             ) as response:
                 assert response.status == 200
-                saved = await response.json()
-            assert saved["revision"] != profile["revision"]
-            assert "password" not in saved["networks"][0]
+                saved_profile = await response.json()
 
-            capable = await register(capable_id, ["wifi_settings_v1"])
-            sockets.append(capable)
+            capable = await register(capable_id, ["wifi_settings_v2"])
+            old_v1 = await register(old_v1_id, ["wifi_settings_v1"])
             unsupported = await register(unsupported_id, [])
-            sockets.append(unsupported)
+            unauthorized = await register(unauthorized_id, ["wifi_settings_v2"], authenticated=False)
+            sockets.extend([capable, old_v1, unsupported, unauthorized])
+
+            stale_revision = profile["revision"]
+            stale_change = {"networks": [{
+                "ssid": "Stale overwrite", "security": "OPEN", "password": "", "hidden": False,
+            }], "expected_revision": stale_revision}
+            async with session.put(
+                base_url + "/api/wifi/groups/Studio", headers=good_headers, json=stale_change,
+            ) as response:
+                assert response.status == 409
+            assert store.profile("Studio")["revision"] == saved_profile["revision"]
+            async with session.post(
+                base_url + "/api/wifi/groups/Studio/deploy",
+                headers=good_headers,
+                json={"expected_revision": stale_revision},
+            ) as response:
+                assert response.status == 409
+            assert store.state["operations"] == {}
+            for ws in (capable, old_v1, unsupported, unauthorized):
+                await assert_no_message(ws)
 
             async with session.post(
-                base_url + "/api/wifi/groups/Studio/deploy", headers=good_headers,
+                base_url + "/api/wifi/groups/Studio/deploy",
+                headers=good_headers,
+                json={"expected_revision": saved_profile["revision"]},
             ) as response:
                 assert response.status == 200
                 deployed = await response.json()
-            assert {item["device_id"] for item in deployed["operations"]} == {capable_id, unsupported_id}
-            capable_command = await capable.receive_json(timeout=3)
-            assert capable_command["type"] == "EXECUTE_WIFI_APPLY"
-            assert capable_command["networks"][0]["password"] == "studio-secret"
-
-            ops_by_device = {item["device_id"]: item["operation_id"] for item in deployed["operations"]}
-            unsupported_op = store.state["operations"][ops_by_device[unsupported_id]]
-            assert unsupported_op["status"] == "failed"
-            assert unsupported_op["reason"] == "UNSUPPORTED"
-            try:
-                unexpected = await unsupported.receive(timeout=0.05)
-                assert unexpected.type == aiohttp.WSMsgType.TIMEOUT
-            except asyncio.TimeoutError:
-                pass
-
-            operation_id = ops_by_device[capable_id]
-            operation = store.state["operations"][operation_id]
-            frozen_networks = operation["networks"]
-            await capable.send_json({
-                "type": "WIFI_APPLY_ACCEPTED",
-                "operation_id": operation["operation_id"],
-            })
-            for _ in range(50):
-                if store.state["operations"][operation_id]["accepted"]:
-                    break
-                await asyncio.sleep(0.01)
-            assert store.state["operations"][operation_id]["accepted"] is True, {
-                "entry_flags": {
-                    key: server.devices.get(capable_id, {}).get(key)
-                    for key in ("status", "registration_ready", "wifi_settings_v1", "wifi_authorized")
-                },
-                "ws_closed": capable.closed,
-                "dispatch_owner_exists": operation_id in app["wifi_dispatch_owners"],
-                "operation": store.state["operations"][operation_id],
+            assert deployed["online_target_count"] == 4
+            assert len(deployed["operations"]) == 4
+            result_by_id = {item["device_id"]: item for item in deployed["operations"]}
+            assert result_by_id[capable_id]["status"] == "sent"
+            assert result_by_id[capable_id]["reason"] is None
+            assert result_by_id[old_v1_id] == {
+                "operation_id": result_by_id[old_v1_id]["operation_id"],
+                "device_id": old_v1_id,
+                "status": "failed",
+                "reason": "unsupported",
             }
+            assert result_by_id[unsupported_id]["status"] == "failed"
+            assert result_by_id[unsupported_id]["reason"] == "unsupported"
+            assert result_by_id[unauthorized_id]["status"] == "failed"
+            assert result_by_id[unauthorized_id]["reason"] == "permission_denied"
 
-            # A later profile edit changes the current revision but cannot mutate
-            # the already persisted operation payload.
+            command = await capable.receive_json(timeout=3)
+            assert command["type"] == "EXECUTE_WIFI_APPLY"
+            assert set(command) == {"type", "operation_id", "revision", "mode", "networks"}
+            assert command["mode"] == "managed"
+            assert command["revision"] == deployed["revision"]
+            assert command["networks"][0]["password"] == "studio-secret"
+            for ws in (old_v1, unsupported, unauthorized):
+                await assert_no_message(ws)
+
+            for device_id, expected in (
+                (capable_id, ("sent", None)),
+                (old_v1_id, ("failed", "unsupported")),
+                (unsupported_id, ("failed", "unsupported")),
+                (unauthorized_id, ("failed", "permission_denied")),
+            ):
+                delivery = store.state_view({device_id}, set())[device_id]["delivery"]
+                assert (delivery["status"], delivery["reason"]) == expected
+                operation = store.state["operations"][result_by_id[device_id]["operation_id"]]
+                assert "networks" not in operation
+                assert "password" not in operation
+
+            async with session.get(base_url + "/api/wifi/state") as response:
+                state = await response.json()
+            assert state["devices"][capable_id]["delivery"]["status"] == "sent"
+            assert "applied_revision" not in state["devices"][capable_id]
+            assert "manual" not in state["devices"][capable_id]
+
+            # No result/verification response is required to complete this API call.
+            # A late v1 result message is ignored and cannot rewrite delivery state.
+            await capable.send_json({
+                "type": "WIFI_APPLY_RESULT",
+                "operation_id": command["operation_id"],
+                "revision": command["revision"],
+                "status": "success",
+                "reason": "NONE",
+                "rolled_back": False,
+            })
+            await assert_no_message(capable)
+            assert store.state_view({capable_id}, set())[capable_id]["delivery"]["status"] == "sent"
+
+            previous_devices = json.loads(json.dumps(store.state["devices"]))
+            previous_operation_ids = set(store.state["operations"])
+            async with session.delete(
+                base_url + "/api/wifi/groups/Studio",
+                headers=good_headers,
+                json={"expected_revision": deployed["revision"]},
+            ) as response:
+                assert response.status == 200
+                unmanaged_profile = await response.json()
+            assert unmanaged_profile["mode"] == "unmanaged"
+            assert unmanaged_profile["networks"] == []
+            assert unmanaged_profile["revision"] != deployed["revision"]
+            assert store.profile("Studio") == {
+                "revision": unmanaged_profile["revision"], "mode": "unmanaged", "networks": [],
+            }
+            assert store.state["devices"] == previous_devices
+            assert set(store.state["operations"]) == previous_operation_ids
+            async with session.get(base_url + "/api/wifi/groups/Studio") as response:
+                assert (await response.json())["mode"] == "unmanaged"
+            async with session.get(base_url + "/api/wifi/state") as response:
+                state_after_delete = await response.json()
+            assert state_after_delete["groups"]["Studio"] == {
+                "revision": unmanaged_profile["revision"], "mode": "unmanaged",
+            }
+            for ws in (capable, old_v1, unsupported, unauthorized):
+                await assert_no_message(ws)
+
+            async with session.delete(
+                base_url + "/api/wifi/groups/Studio",
+                headers=good_headers,
+                json={"expected_revision": deployed["revision"]},
+            ) as response:
+                assert response.status == 409
+            async with session.post(
+                base_url + "/api/wifi/groups/Studio/deploy",
+                headers=good_headers,
+                json={"expected_revision": deployed["revision"]},
+            ) as response:
+                assert response.status == 409
+            assert set(store.state["operations"]) == previous_operation_ids
+            for ws in (capable, old_v1, unsupported, unauthorized):
+                await assert_no_message(ws)
+
+            async with session.post(
+                base_url + "/api/wifi/groups/Studio/deploy",
+                headers=good_headers,
+                json={"expected_revision": unmanaged_profile["revision"]},
+            ) as response:
+                assert response.status == 200
+                unmanaged_delivery = await response.json()
+            unmanaged_command = await capable.receive_json(timeout=3)
+            assert unmanaged_command["type"] == "EXECUTE_WIFI_APPLY"
+            assert unmanaged_command["mode"] == "unmanaged"
+            assert unmanaged_command["revision"] == unmanaged_profile["revision"]
+            assert unmanaged_command["networks"] == []
+            assert unmanaged_delivery["revision"] == unmanaged_profile["revision"]
+            assert store.state["devices"][capable_id]["delivery"]["status"] == "sent"
+            for ws in (old_v1, unsupported, unauthorized):
+                await assert_no_message(ws)
+
             changed = {"networks": [{
-                "ssid": "Studio Net", "security": "WPA_PSK", "password": None, "hidden": True,
-            }]}
+                "ssid": "Studio Net", "security": "WPA_PSK", "password": "studio-secret", "hidden": True,
+            }], "expected_revision": unmanaged_profile["revision"]}
             async with session.put(
                 base_url + "/api/wifi/groups/Studio", headers=good_headers, json=changed,
             ) as response:
                 assert response.status == 200
                 current_profile = await response.json()
-            assert current_profile["revision"] != operation["revision"]
-            assert store.state["operations"][operation_id]["networks"] == frozen_networks
+            assert current_profile["mode"] == "managed"
+            assert current_profile["revision"] != unmanaged_profile["revision"]
+            for ws in (capable, old_v1, unsupported, unauthorized):
+                await assert_no_message(ws)
 
-            await capable.close()
-            sockets.remove(capable)
-            for _ in range(50):
-                if capable_id not in server.devices:
+            # A second request exercises a send that is blocked while mutable
+            # group/profile/socket state changes. It must retain the captured
+            # profile and socket and must not retry against a replacement.
+            original_socket = server.devices[capable_id]["ws"]
+            gated_socket = GatedSocket(original_socket)
+            original_socket.send_str = gated_socket.send_str
+            blocked_deploy = asyncio.create_task(session.post(
+                base_url + "/api/wifi/groups/Studio/deploy",
+                headers=good_headers,
+                json={"expected_revision": current_profile["revision"]},
+            ))
+            await asyncio.wait_for(gated_socket.started.wait(), timeout=3)
+
+            changed_during_send = {"networks": [{
+                "ssid": "Studio Net", "security": "WPA_PSK", "password": None, "hidden": False,
+            }], "expected_revision": current_profile["revision"]}
+            async with session.put(
+                base_url + "/api/wifi/groups/Studio", headers=good_headers,
+                json=changed_during_send,
+            ) as response:
+                assert response.status == 200
+                profile_during_send = await response.json()
+            offline_socket = await register(offline_id, ["wifi_settings_v2"])
+            sockets.append(offline_socket)
+            replacement_socket = ReplacementSocket()
+            server.devices[capable_id]["ws"] = replacement_socket
+            mutation_admin = AdminSocket()
+            await server.handle_set_group_members(
+                mutation_admin,
+                {"name": "Studio", "members": [old_v1_id, unsupported_id, unauthorized_id, offline_id]},
+                app=app,
+            )
+            assert mutation_admin.messages[-1]["type"] == "GROUP_MEMBERS_SET"
+
+            gated_socket.release.set()
+            blocked_response = await blocked_deploy
+            async with blocked_response:
+                assert blocked_response.status == 200
+                blocked_result = await blocked_response.json()
+            assert blocked_result["online_target_count"] == 4
+            assert blocked_result["revision"] != profile_during_send["revision"]
+            blocked_target = next(
+                item for item in blocked_result["operations"] if item["device_id"] == capable_id
+            )
+            assert (blocked_target["status"], blocked_target["reason"]) == (
+                "unknown", "socket_send_failed",
+            )
+            assert gated_socket.messages[0]["networks"][0]["hidden"] is True
+            assert gated_socket.error is not None
+            assert replacement_socket.messages == []
+            await assert_no_message(capable)
+            await assert_no_message(offline_socket)
+            del original_socket.send_str
+
+            # If a newer attempt exists before an older dispatcher obtains the
+            # per-device send lock, the stale command must be skipped.
+            server.devices[capable_id]["ws"] = original_socket
+            mutation_admin = AdminSocket()
+            await server.handle_set_group_members(
+                mutation_admin,
+                {"name": "Studio", "members": [capable_id, old_v1_id, unsupported_id,
+                 unauthorized_id, offline_id]},
+                app=app,
+            )
+            stale_lock = app["wifi_send_locks"].setdefault(capable_id, asyncio.Lock())
+            await stale_lock.acquire()
+            stale_deploy = asyncio.create_task(session.post(
+                base_url + "/api/wifi/groups/Studio/deploy",
+                headers=good_headers,
+                json={"expected_revision": profile_during_send["revision"]},
+            ))
+            for _ in range(200):
+                stale_record = store.state["devices"].get(capable_id, {}).get("delivery", {})
+                if stale_record.get("revision") == profile_during_send["revision"]:
                     break
-                await asyncio.sleep(0.01)
-            assert store.mark_operation_timeout(operation_id)
-            assert store.state["operations"][operation_id]["status"] == "unknown"
-            assert store.state["operations"][operation_id]["unresolved"] is True
+                await asyncio.sleep(0.005)
+            else:
+                raise AssertionError("stale deployment attempt was not persisted")
+            async with session.delete(
+                base_url + "/api/wifi/groups/Studio",
+                headers=good_headers,
+                json={"expected_revision": profile_during_send["revision"]},
+            ) as response:
+                assert response.status == 200
+                stale_test_unmanaged = await response.json()
+            newer_deploy = asyncio.create_task(session.post(
+                base_url + "/api/wifi/groups/Studio/deploy",
+                headers=good_headers,
+                json={"expected_revision": stale_test_unmanaged["revision"]},
+            ))
+            for _ in range(200):
+                newer_record = store.state["devices"].get(capable_id, {}).get("delivery", {})
+                if newer_record.get("revision") == stale_test_unmanaged["revision"]:
+                    break
+                await asyncio.sleep(0.005)
+            else:
+                stale_lock.release()
+                raise AssertionError("newer deployment attempt was not persisted")
+            stale_lock.release()
+            stale_response = await stale_deploy
+            async with stale_response:
+                assert stale_response.status == 200
+                stale_result = await stale_response.json()
+            newer_response = await newer_deploy
+            async with newer_response:
+                assert newer_response.status == 200
+                newer_result = await newer_response.json()
+            stale_target = next(item for item in stale_result["operations"] if item["device_id"] == capable_id)
+            assert (stale_target["status"], stale_target["reason"]) == ("unknown", "superseded")
+            stale_skipped_command = await capable.receive_json(timeout=3)
+            assert stale_skipped_command["mode"] == "unmanaged"
+            assert stale_skipped_command["revision"] == stale_test_unmanaged["revision"]
+            for ws in (old_v1, unsupported, unauthorized):
+                await assert_no_message(ws)
 
-            reconnected = await register(capable_id, ["wifi_settings_v1"])
-            sockets.append(reconnected)
-            await reconnected.send_json({
-                "type": "WIFI_VERIFY_REQUEST",
-                "operation_id": operation_id,
-                "challenge": "reconnected-challenge",
-            })
-            verify_ack = await reconnected.receive_json(timeout=3)
-            assert verify_ack == {
-                "type": "WIFI_VERIFY_ACK",
-                "operation_id": operation_id,
-                "challenge": "reconnected-challenge",
-            }
-            await reconnected.send_json({
-                "type": "WIFI_APPLY_RESULT",
-                "operation_id": operation_id,
-                "revision": operation["revision"],
-                "status": "unknown",
-                "reason": "UNKNOWN",
-                "rolled_back": False,
-            })
-            intermediate_ack = await reconnected.receive_json(timeout=3)
-            assert intermediate_ack == {
-                "type": "WIFI_RESULT_ACK",
-                "kind": "manual",
-                "operation_id": operation_id,
-                "revision": operation["revision"],
-                "status": "unknown",
-                "reason": "UNKNOWN",
-                "rolled_back": False,
-            }
-            assert store.state["operations"][operation_id]["unresolved"] is True
-            await reconnected.send_json({
-                "type": "WIFI_APPLY_RESULT",
-                "operation_id": operation_id,
-                "revision": operation["revision"],
-                "status": "success",
-                "reason": "NONE",
-                "rolled_back": False,
-            })
-            result_ack = await reconnected.receive_json(timeout=3)
-            assert result_ack == {
-                "type": "WIFI_RESULT_ACK",
-                "kind": "manual",
-                "operation_id": operation_id,
-                "revision": operation["revision"],
-                "status": "success",
-                "reason": "NONE",
-                "rolled_back": False,
-            }
-            assert store.state["operations"][operation_id]["unresolved"] is False
-            assert store.state["devices"][capable_id]["applied_revision"] == operation["revision"]
+            async with session.put(
+                base_url + "/api/wifi/groups/Studio", headers=good_headers,
+                json={"expected_revision": stale_test_unmanaged["revision"], "networks": [{
+                    "ssid": "Studio Net", "security": "WPA_PSK", "password": "studio-secret", "hidden": False,
+                }]},
+            ) as response:
+                assert response.status == 200
+                managed_before_race = await response.json()
 
-            boot_id = "44444444-4444-4444-8444-444444444444"
-            await reconnected.send_json({
-                "type": "WIFI_BOOT_RESULT",
-                "boot_id": boot_id,
-                "revision": operation["revision"],
-                "status": "failed",
-                "reason": "ADD_FAILED",
-            })
-            boot_ack = await reconnected.receive_json(timeout=3)
-            assert boot_ack == {
-                "type": "WIFI_RESULT_ACK",
-                "kind": "boot",
-                "boot_id": boot_id,
-                "revision": operation["revision"],
-                "status": "failed",
-                "reason": "ADD_FAILED",
-            }
-            assert offline_id not in {item["device_id"] for item in deployed["operations"]}
+            # If a managed send is already in progress, a newer unmanaged send
+            # waits for it and is the last command delivered to this device.
+            gated_socket = GatedSocket(original_socket)
+            original_socket.send_str = gated_socket.send_str
+            managed_deploy = asyncio.create_task(session.post(
+                base_url + "/api/wifi/groups/Studio/deploy",
+                headers=good_headers,
+                json={"expected_revision": managed_before_race["revision"]},
+            ))
+            await asyncio.wait_for(gated_socket.started.wait(), timeout=3)
+            async with session.delete(
+                base_url + "/api/wifi/groups/Studio",
+                headers=good_headers,
+                json={"expected_revision": managed_before_race["revision"]},
+            ) as response:
+                assert response.status == 200
+                unmanaged_after_race = await response.json()
+            unmanaged_deploy = asyncio.create_task(session.post(
+                base_url + "/api/wifi/groups/Studio/deploy",
+                headers=good_headers,
+                json={"expected_revision": unmanaged_after_race["revision"]},
+            ))
+            for _ in range(200):
+                latest_record = store.state["devices"].get(capable_id, {}).get("delivery", {})
+                if latest_record.get("revision") == unmanaged_after_race["revision"]:
+                    break
+                await asyncio.sleep(0.005)
+            else:
+                gated_socket.release.set()
+                raise AssertionError("unmanaged deployment attempt was not persisted")
+            assert len(gated_socket.messages) == 1
+            gated_socket.release.set()
+            managed_response = await managed_deploy
+            async with managed_response:
+                assert managed_response.status == 200
+                managed_result = await managed_response.json()
+            unmanaged_response = await unmanaged_deploy
+            async with unmanaged_response:
+                assert unmanaged_response.status == 200
+                unmanaged_result = await unmanaged_response.json()
+            managed_command = await capable.receive_json(timeout=3)
+            unmanaged_command = await capable.receive_json(timeout=3)
+            managed_target = next(item for item in managed_result["operations"] if item["device_id"] == capable_id)
+            unmanaged_target = next(item for item in unmanaged_result["operations"] if item["device_id"] == capable_id)
+            assert managed_command["mode"] == "managed"
+            assert managed_command["revision"] == managed_before_race["revision"]
+            assert managed_command["operation_id"] == managed_target["operation_id"]
+            assert unmanaged_command["mode"] == "unmanaged"
+            assert unmanaged_command["revision"] == unmanaged_after_race["revision"]
+            assert unmanaged_command["networks"] == []
+            assert unmanaged_command["operation_id"] == unmanaged_target["operation_id"]
+            assert (managed_target["status"], unmanaged_target["status"]) == ("sent", "sent")
+            del original_socket.send_str
+
+            # Delivery does not fence later membership, rename, or delete edits.
+            admin = AdminSocket()
+            await server.handle_set_group_members(
+                admin,
+                {"name": "Studio", "members": [old_v1_id, unsupported_id, unauthorized_id, offline_id]},
+                app=app,
+            )
+            assert admin.messages[-1]["type"] == "GROUP_MEMBERS_SET"
+            await server.handle_rename_group(
+                admin, {"name": "Studio", "new_name": "Renamed"}, app=app,
+            )
+            assert admin.messages[-1]["type"] == "GROUP_RENAMED"
+            assert store.state_view({capable_id}, set())[capable_id]["delivery"]["status"] == "sent"
+            assert store.profile("Renamed") is not None
         finally:
             for ws in sockets:
                 await ws.close()
@@ -366,7 +626,7 @@ def test_wifi_http_requires_explicit_opt_in_and_preserves_bearer_gates(tmp_path,
                 headers={"Authorization": f"Bearer {admin_token}", "Origin": origin},
                 json={"networks": [{
                     "ssid": "LAN Wi-Fi", "security": "OPEN", "password": "", "hidden": False,
-                }]},
+                }], "expected_revision": None},
             ) as response:
                 assert response.status == 401
             with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
@@ -386,7 +646,7 @@ def test_wifi_http_requires_explicit_opt_in_and_preserves_bearer_gates(tmp_path,
                 "ip": "127.0.0.1",
                 "version_code": 1,
                 "version_name": "test",
-                "capabilities": ["wifi_settings_v1"],
+                "capabilities": ["wifi_settings_v2"],
             })
             assert (await ws.receive_json(timeout=3))["type"] == "REGISTERED"
             assert server.devices[device_id]["wifi_authorized"] is False
@@ -421,7 +681,7 @@ def test_wifi_http_opt_in_allows_authenticated_lan_flow(tmp_path, monkeypatch):
         server.admin_connections.clear()
         server.DATA_DIR.mkdir(parents=True, exist_ok=True)
         server.REGISTRY_PATH.write_text(json.dumps({
-            "devices": {}, "groups": {"Studio": [device_id]},
+            "devices": {}, "groups": {"Studio": [device_id], "Blank": []},
         }), encoding="utf-8")
 
         app = server.create_app()
@@ -452,12 +712,25 @@ def test_wifi_http_opt_in_allows_authenticated_lan_flow(tmp_path, monkeypatch):
                 assert response.status == 200
                 state = await response.json()
                 assert state["allow_http"] is True
-                assert state["groups"] == {"Studio": {"revision": None}}
+                assert state["groups"] == {
+                    "Blank": {"revision": None, "mode": None},
+                    "Studio": {"revision": None, "mode": None},
+                }
+
+            async with session.delete(
+                base_url + "/api/wifi/groups/Blank",
+                headers={"Origin": origin},
+                json={"expected_revision": None},
+            ) as response:
+                assert response.status == 200
+                blank_unmanaged = await response.json()
+            assert blank_unmanaged["mode"] == "unmanaged"
+            assert blank_unmanaged["networks"] == []
 
             profile = {"networks": [{
                 "ssid": "LAN Wi-Fi", "security": "WPA_PSK",
                 "password": "lan-secret", "hidden": False,
-            }]}
+            }], "expected_revision": None}
             async with session.put(
                 base_url + "/api/wifi/groups/Studio",
                 headers={
@@ -473,6 +746,7 @@ def test_wifi_http_opt_in_allows_authenticated_lan_flow(tmp_path, monkeypatch):
             ) as response:
                 assert response.status == 200
                 saved = await response.json()
+            assert saved["mode"] == "managed"
             assert saved["networks"][0]["password_present"] is True
             assert "password" not in saved["networks"][0]
 
@@ -491,7 +765,7 @@ def test_wifi_http_opt_in_allows_authenticated_lan_flow(tmp_path, monkeypatch):
                 "ip": "127.0.0.1",
                 "version_code": 1,
                 "version_name": "test",
-                "capabilities": ["wifi_settings_v1"],
+                "capabilities": ["wifi_settings_v2"],
             })
             assert (await device_ws.receive_json(timeout=3))["type"] == "REGISTERED"
             assert server.devices[device_id]["wifi_authorized"] is True
