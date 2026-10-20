@@ -79,6 +79,21 @@ payloads and parser exception details that could contain artifact lease tokens.
 state transitions, Resume/Cancel/Retry eligibility, retention, recovery, deployment
 compatibility, and message sequences.
 
+### Group Wi-Fi profiles and boot correction
+
+Group Wi-Fi settings have independent saved revisions and explicit whole-group
+application. Deployment freezes online targets; the Android client owns a durable
+manual rollback journal and the last successful boot baseline. OS boot correction
+runs once per boot generation, after interrupted manual recovery, without a
+connectivity test or the manual 60-second rollback. Manual and boot results remain
+separate. Wi-Fi credentials require authenticated TLS and encrypted server
+persistence; legacy cleartext connections cannot receive them.
+
+See [`WIFI_SETTINGS.md`](WIFI_SETTINGS.md) for lifecycle, migration, security,
+supported authentication modes and the physical-verification boundary. Group
+membership is now at most one group per device; overlapping legacy memberships
+are resolved deterministically during migration.
+
 ## Building the MDM Client
 
 ### Build from CLI
@@ -653,8 +668,9 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > means sideloading or hand-installing a client never requires reaching this
 > repository's GitHub Releases page — the console alone is enough.
 
-> **Device groups** are a many-to-many grouping keyed by `device_id`, persisted
-> server-side in `device_registry.json` (under a `groups` key). Selecting a group
+> **Device groups** allow at most one group per `device_id`, persisted
+> server-side in `device_registry.json` (under a `groups` key). Legacy overlaps
+> migrate to the lexically first group; see [Wi-Fi migration](WIFI_SETTINGS.md#compatibility-and-migration). Selecting a group
 > in the console is a client-side convenience: it sets the device selection to that
 > group's members (devices not in the group are deselected), so commands still
 > dispatch via the normal `target_devices` path (online members only). Group
@@ -1447,7 +1463,10 @@ The MDM client requires the following Android permissions:
 | `FOREGROUND_SERVICE` | Run as a persistent background service |
 | `RECEIVE_BOOT_COMPLETED` | Auto-start on device boot |
 | `ACCESS_NETWORK_STATE` | Monitor network connectivity |
-| `ACCESS_WIFI_STATE` | Retrieve the device IP address |
+| `ACCESS_WIFI_STATE` | Retrieve the device IP address and read saved Wi-Fi settings with the required management authority |
+| `CHANGE_WIFI_STATE` | Apply and restore Wi-Fi profiles on authorized managed devices |
+| `ACCESS_FINE_LOCATION` / `ACCESS_COARSE_LOCATION` | Request precise location access together on Android 12+ for saved-network reads; the adapter requires the precise grant |
+| `SCHEDULE_EXACT_ALARM` | Wake local manual Wi-Fi rollback at its deadline; special access is checked before changing settings |
 | `MANAGE_EXTERNAL_STORAGE` | Write downloaded APKs to shared storage so the PICO ToBService can read them for silent install; read/write shared-storage directories for file/folder push (sync); and read shared storage for directory integrity checks (`VERIFY_DIR`) |
 | `QUERY_ALL_PACKAGES` | Resolve an arbitrary installed package via `PackageManager` for APK integrity checks (`VERIFY_APK`). On API 30+ package visibility is filtered; an operator may verify any package, so a `<queries>` allowlist cannot cover it. This client is privately distributed (not on Google Play), so the Play-policy restriction on this permission does not apply. |
 

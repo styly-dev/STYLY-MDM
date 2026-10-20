@@ -121,6 +121,9 @@ class MdmClientService : Service() {
     @Volatile
     private var retireInProgress = false
 
+    @Volatile
+    private var serviceDestroyed = false
+
     // package -> the token of the EXECUTE_UNINSTALL (#63) attempt that owns it. A
     // re-sent command must not start a second uninstall of the same package while
     // the first is between the startup-app clear and its callback, or the
@@ -156,7 +159,11 @@ class MdmClientService : Service() {
         )
         webSocketManager.connect()
 
-        launchStartupAppIfConfigured()
+        MdmClientApplication.wifiSettingsController().startupCompletion().whenComplete { recovered, _ ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                if (!serviceDestroyed && recovered == true) launchStartupAppIfConfigured()
+            }
+        }
 
         guardEnsureThread = HandlerThread("guard-ensure").apply { start() }
         guardEnsure = Handler(guardEnsureThread.looper)
@@ -183,6 +190,7 @@ class MdmClientService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        serviceDestroyed = true
         Log.i(TAG, "MdmClientService destroyed")
         UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_DESTROYED)
         guardEnsureThread.quitSafely()

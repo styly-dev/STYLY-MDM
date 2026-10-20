@@ -7,12 +7,18 @@ Static files for the web console are served from ./static/.
 
 import argparse
 import asyncio
+import base64
+import copy
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import socket
+import ssl
 import sys
 import time
 import uuid
@@ -30,6 +36,16 @@ from .device_policy import (
 )
 from .integrity import apk_cd_digest, file_sha256, is_os_metadata
 from .push_jobs import parse_capabilities
+from .wifi_settings import (
+    RESULT_REASONS,
+    WiFiSettingsError,
+    WiFiSettingsStore,
+    WiFiStoreError,
+    normalize_revision,
+    public_networks,
+    validate_profile_networks,
+    valid_uuid,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -176,6 +192,7 @@ PROTECTED_PACKAGES = {"com.styly.mdmclient", "com.styly.mdmguard"}
 
 # Persistent per-device registry: serial -> {label, model, ip, last_seen, startup_app, battery}
 REGISTRY_PATH = DATA_DIR / "device_registry.json"
+_WIFI_GROUP_RECOVERY_REQUIRED = False
 MAX_LABEL_LEN = 64
 MAX_GROUP_NAME_LEN = 64
 IDENTITY_SCHEME = "styly_device_id_v1"
@@ -206,8 +223,8 @@ provisional_connections: dict[web.WebSocketResponse, dict] = {}
 # while offline. Survives restarts (persisted to REGISTRY_PATH).
 device_registry: dict[str, dict] = {}
 
-# Named device groups (many-to-many): group name -> list of member serials. A
-# device can belong to zero or more groups; membership is keyed by serial so an
+# Named device groups: group name -> list of member serials. A device can
+# belong to at most one group; membership is keyed by serial so an
 # offline (or not-yet-registered) device can still be grouped. Persisted to
 # REGISTRY_PATH alongside the device registry.
 device_groups: dict[str, list[str]] = {}
@@ -371,6 +388,18 @@ def _coerce_groups(value) -> dict[str, list[str]]:
     return result
 
 
+def _normalize_single_membership(groups: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Keep the lexically first legacy group when a device was in several groups."""
+    normalized = {name: [] for name in sorted(groups)}
+    assigned: set[str] = set()
+    for name in sorted(groups):
+        for device_id in groups[name]:
+            if device_id not in assigned:
+                normalized[name].append(device_id)
+                assigned.add(device_id)
+    return normalized
+
+
 def load_registry() -> None:
     """Load the per-device registry and groups from disk, tolerating a missing/corrupt file.
 
@@ -413,21 +442,216 @@ def load_registry() -> None:
             loaded_devices[serial] = record
 
     device_registry.update(loaded_devices)
-    device_groups.update(loaded_groups)
+    normalized_groups = _normalize_single_membership(loaded_groups)
+    device_groups.update(normalized_groups)
+    if normalized_groups != loaded_groups:
+        # The one-time migration is deterministic: sorted group name wins.
+        save_registry()
     log.info("Loaded %d device(s) and %d group(s) from registry",
              len(device_registry), len(device_groups))
 
 
-def save_registry() -> None:
-    """Persist the per-device registry and groups atomically (temp file + replace)."""
-    tmp = REGISTRY_PATH.with_suffix(".json.tmp")
+def _registry_bytes() -> bytes:
     payload = {"devices": device_registry, "groups": device_groups}
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _wifi_group_journal_path() -> Path:
+    return DATA_DIR / "wifi_group_mutation.txn"
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
     try:
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _encode_journal_bytes(content: bytes | None) -> str | None:
+    return base64.b64encode(content).decode("ascii") if content is not None else None
+
+
+def _decode_journal_bytes(content: object) -> bytes | None:
+    if content is None:
+        return None
+    if not isinstance(content, str):
+        raise ValueError("invalid transaction journal")
+    return base64.b64decode(content, validate=True)
+
+
+def _recover_wifi_group_mutation(data_dir: Path, registry_path: Path) -> bool:
+    """Restore or finish an interrupted group/profile mutation before loading state."""
+    journal_path = data_dir / "wifi_group_mutation.txn"
+    try:
+        journal_bytes = journal_path.read_bytes()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        journal = json.loads(journal_bytes.decode("utf-8"))
+        if not isinstance(journal, dict) or journal.get("version") != 1:
+            return False
+        phase = journal.get("phase")
+        if phase == "rollback":
+            registry_bytes = _decode_journal_bytes(journal.get("previous_registry"))
+            wifi_bytes = _decode_journal_bytes(journal.get("previous_wifi"))
+        elif phase == "commit":
+            registry_bytes = _decode_journal_bytes(journal.get("next_registry"))
+            wifi_bytes = _decode_journal_bytes(journal.get("next_wifi"))
+        else:
+            return False
+        wifi_path = data_dir / "wifi_settings.enc"
+        _restore_file(registry_path, registry_bytes)
+        _restore_file(wifi_path, wifi_bytes, private=True)
+        journal_path.unlink(missing_ok=True)
+        _fsync_directory(data_dir)
+        return True
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+
+
+def save_registry() -> bool:
+    """Persist the per-device registry and groups atomically (temp file + replace)."""
+    if _WIFI_GROUP_RECOVERY_REQUIRED:
+        return False
+    tmp = REGISTRY_PATH.with_suffix(".json.tmp")
+    try:
+        tmp.write_bytes(_registry_bytes())
         tmp.replace(REGISTRY_PATH)
+        return True
     except OSError as e:
         log.error("Failed to persist device registry: %s", e)
         tmp.unlink(missing_ok=True)
+        return False
+
+
+def _stage_bytes(path: Path, content: bytes, *, private: bool = False) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temp_name)
+    try:
+        if private:
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        raise
+    return temporary
+
+
+def _restore_file(path: Path, previous: bytes | None, *, private: bool = False) -> None:
+    if previous is None:
+        path.unlink(missing_ok=True)
+        return
+    temporary = _stage_bytes(path, previous, private=private)
+    os.replace(temporary, path)
+
+
+def _persist_group_registry_mutation(
+    store: WiFiSettingsStore | None,
+    previous_groups: dict[str, list[str]],
+    previous_wifi_state: dict | None,
+) -> bool:
+    """Commit a group rename/delete with a durable rollback journal.
+
+    The journal contains the previous registry and encrypted-store bytes. Startup
+    restores both before loading either, so a crash between replacements cannot
+    leave group membership and its profile under different names.
+    """
+    global _WIFI_GROUP_RECOVERY_REQUIRED
+    if _WIFI_GROUP_RECOVERY_REQUIRED:
+        device_groups.clear()
+        device_groups.update(previous_groups)
+        if store is not None and previous_wifi_state is not None:
+            store.state = previous_wifi_state
+        return False
+    previous_registry_bytes: bytes | None = None
+    previous_store_bytes: bytes | None = None
+    registry_temp: Path | None = None
+    store_temp: Path | None = None
+    journal_temp: Path | None = None
+    journal_committed = False
+    commit_phase_written = False
+    journal_path = _wifi_group_journal_path()
+    try:
+        try:
+            previous_registry_bytes = REGISTRY_PATH.read_bytes()
+        except FileNotFoundError:
+            pass
+        if store is not None:
+            try:
+                previous_store_bytes = store.path.read_bytes()
+            except FileNotFoundError:
+                pass
+        next_registry_bytes = _registry_bytes()
+        next_store_bytes = store.encrypted_bytes() if store is not None else None
+        registry_temp = _stage_bytes(REGISTRY_PATH, next_registry_bytes)
+        if store is not None:
+            store_temp = _stage_bytes(store.path, next_store_bytes, private=True)
+        journal = json.dumps({
+            "version": 1,
+            "phase": "rollback",
+            "previous_registry": _encode_journal_bytes(previous_registry_bytes),
+            "previous_wifi": _encode_journal_bytes(previous_store_bytes),
+            "next_registry": _encode_journal_bytes(next_registry_bytes),
+            "next_wifi": _encode_journal_bytes(next_store_bytes),
+        }, separators=(",", ":")).encode("ascii")
+        journal_temp = _stage_bytes(journal_path, journal, private=True)
+        os.replace(journal_temp, journal_path)
+        journal_temp = None
+        journal_committed = True
+        _fsync_directory(journal_path.parent)
+        os.replace(registry_temp, REGISTRY_PATH)
+        registry_temp = None
+        if store_temp is not None and store is not None:
+            os.replace(store_temp, store.path)
+            store_temp = None
+            try:
+                store.path.chmod(0o600)
+            except OSError:
+                pass
+        _fsync_directory(REGISTRY_PATH.parent)
+        if store is not None and store.path.parent != REGISTRY_PATH.parent:
+            _fsync_directory(store.path.parent)
+
+        committed_journal = json.dumps({
+            "version": 1,
+            "phase": "commit",
+            "previous_registry": _encode_journal_bytes(previous_registry_bytes),
+            "previous_wifi": _encode_journal_bytes(previous_store_bytes),
+            "next_registry": _encode_journal_bytes(next_registry_bytes),
+            "next_wifi": _encode_journal_bytes(next_store_bytes),
+        }, separators=(",", ":")).encode("ascii")
+        journal_temp = _stage_bytes(journal_path, committed_journal, private=True)
+        os.replace(journal_temp, journal_path)
+        journal_temp = None
+        commit_phase_written = True
+        _fsync_directory(journal_path.parent)
+        journal_path.unlink()
+        _fsync_directory(journal_path.parent)
+        journal_committed = False
+        return True
+    except (OSError, WiFiStoreError):
+        if journal_committed:
+            if not _recover_wifi_group_mutation(DATA_DIR, REGISTRY_PATH):
+                _WIFI_GROUP_RECOVERY_REQUIRED = True
+                log.critical("Could not recover a partial Wi-Fi group metadata update")
+            elif commit_phase_written:
+                # The commit marker is durable, so recovery finishes the new pair.
+                return True
+        device_groups.clear()
+        device_groups.update(previous_groups)
+        if store is not None and previous_wifi_state is not None:
+            store.state = previous_wifi_state
+        for temporary in (registry_temp, store_temp, journal_temp):
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1203,6 +1427,595 @@ def zip_tree(root: Path, dest_zip: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Wi-Fi settings API and transport security
+# ---------------------------------------------------------------------------
+
+WIFI_SESSION_COOKIE = "styly_mdm_wifi_session"
+WIFI_SESSION_TTL = 12 * 60 * 60
+WIFI_REQUEST_MAX_BYTES = 256 * 1024
+def _wifi_operation_timeout_seconds() -> float:
+    try:
+        return max(1.0, float(os.environ.get("MDM_WIFI_OPERATION_TIMEOUT", "180")))
+    except ValueError:
+        return 180.0
+
+
+WIFI_OPERATION_TIMEOUT = _wifi_operation_timeout_seconds()
+
+
+def _load_tls_context() -> ssl.SSLContext | None:
+    cert_path = os.environ.get("MDM_TLS_CERT")
+    key_path = os.environ.get("MDM_TLS_KEY")
+    if not cert_path and not key_path:
+        return None
+    if not cert_path or not key_path:
+        raise RuntimeError("both MDM_TLS_CERT and MDM_TLS_KEY are required when configuring TLS")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    except (OSError, ssl.SSLError):
+        raise RuntimeError("the configured TLS certificate could not be loaded") from None
+    return context
+
+
+def _load_wifi_store(data_dir: Path, tls_context: ssl.SSLContext | None) -> tuple[bool, WiFiSettingsStore | None]:
+    admin_token = os.environ.get("MDM_ADMIN_TOKEN")
+    device_token = os.environ.get("MDM_DEVICE_TOKEN")
+    encryption_key = os.environ.get("MDM_WIFI_ENCRYPTION_KEY")
+    store_path = data_dir / "wifi_settings.enc"
+    state_exists = store_path.exists()
+    any_wifi_config = bool(admin_token or device_token or encryption_key)
+    if not any_wifi_config and not state_exists:
+        return False, None
+    if not (admin_token and device_token and encryption_key and tls_context is not None):
+        raise RuntimeError(
+            "Wi-Fi state requires MDM_ADMIN_TOKEN, MDM_DEVICE_TOKEN, "
+            "MDM_WIFI_ENCRYPTION_KEY, MDM_TLS_CERT, and MDM_TLS_KEY"
+        )
+    try:
+        return True, WiFiSettingsStore(store_path, encryption_key)
+    except WiFiStoreError:
+        raise RuntimeError("the encrypted Wi-Fi settings store could not be opened safely") from None
+
+
+def _wifi_bearer(request: web.Request) -> str | None:
+    authorization = request.headers.get("Authorization", "")
+    scheme, separator, value = authorization.partition(" ")
+    if separator and scheme.lower() == "bearer" and value:
+        return value.strip()
+    return None
+
+
+def _token_matches(request: web.Request, expected: str | None) -> bool:
+    presented = _wifi_bearer(request)
+    return bool(
+        request.secure
+        and expected
+        and presented
+        and hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
+    )
+
+
+def _session_key(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _valid_wifi_session(request: web.Request) -> bool:
+    token = request.cookies.get(WIFI_SESSION_COOKIE)
+    if not request.secure or not token:
+        return False
+    key = _session_key(token)
+    expires = request.app["wifi_sessions"].get(key)
+    if not isinstance(expires, (int, float)) or expires <= time.time():
+        request.app["wifi_sessions"].pop(key, None)
+        return False
+    return True
+
+
+def _wifi_admin_authorized(request: web.Request) -> bool:
+    return (
+        _token_matches(request, request.app.get("wifi_admin_token"))
+        or _valid_wifi_session(request)
+    )
+
+
+def _wifi_origin_allowed(request: web.Request) -> bool:
+    origin = request.headers.get("Origin")
+    if origin is None:
+        # Native clients and scripts using a bearer token may omit Origin. A
+        # cookie alone never authorizes an origin-less mutation.
+        return not _valid_wifi_session(request)
+    expected = f"{'https' if request.secure else 'http'}://{request.host}"
+    return hmac.compare_digest(origin, expected)
+
+
+def _wifi_device_authorized(request: web.Request) -> bool:
+    return _token_matches(request, request.app.get("wifi_device_token"))
+
+
+def _wifi_store(request: web.Request) -> WiFiSettingsStore | None:
+    return request.app.get("wifi_store")
+
+
+async def _small_json_body(request: web.Request) -> dict:
+    if request.content_length is not None and request.content_length > WIFI_REQUEST_MAX_BYTES:
+        raise WiFiSettingsError("request body is too large", 413)
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.content.iter_chunked(8192):
+        size += len(chunk)
+        if size > WIFI_REQUEST_MAX_BYTES:
+            raise WiFiSettingsError("request body is too large", 413)
+        chunks.append(chunk)
+    try:
+        parsed = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise WiFiSettingsError("request body must be a JSON object") from None
+    if not isinstance(parsed, dict):
+        raise WiFiSettingsError("request body must be a JSON object")
+    return parsed
+
+
+def _wifi_api_unavailable() -> web.Response:
+    return web.json_response({"error": "Wi-Fi settings are not enabled"}, status=503)
+
+
+def _wifi_recovery_required_response() -> web.Response:
+    return web.json_response({"error": "Wi-Fi state recovery is required"}, status=503)
+
+
+def _wifi_api_unauthorized() -> web.Response:
+    return web.json_response({"error": "authentication required"}, status=401)
+
+
+def _wifi_name_from_request(request: web.Request) -> str:
+    name = request.match_info.get("name", "")
+    if not name or name != name.strip() or len(name) > MAX_GROUP_NAME_LEN:
+        raise WiFiSettingsError("invalid group name", 400)
+    return name
+
+
+def _wifi_state_payload(store: WiFiSettingsStore) -> dict:
+    groups = {}
+    for name in sorted(device_groups):
+        profile = store.profile(name)
+        groups[name] = {"revision": profile.get("revision") if profile else None}
+    online_ids = {
+        device_id for device_id, entry in devices.items()
+        if entry.get("status") == "online"
+    }
+    known_ids = set(device_registry) | online_ids
+    return {
+        "enabled": True,
+        "groups": groups,
+        "devices": store.state_view(known_ids, online_ids),
+    }
+
+
+async def wifi_session_handler(request: web.Request) -> web.Response:
+    if _WIFI_GROUP_RECOVERY_REQUIRED:
+        return _wifi_recovery_required_response()
+    if not request.app.get("wifi_enabled"):
+        return _wifi_api_unavailable()
+    if not request.secure:
+        return web.json_response({"error": "Wi-Fi authentication requires TLS"}, status=403)
+    if not _token_matches(request, request.app.get("wifi_admin_token")):
+        return _wifi_api_unauthorized()
+    if not _wifi_origin_allowed(request):
+        return web.json_response({"error": "invalid request origin"}, status=403)
+    token = secrets.token_urlsafe(32)
+    request.app["wifi_sessions"][_session_key(token)] = time.time() + WIFI_SESSION_TTL
+    response = web.json_response({"authenticated": True})
+    response.set_cookie(
+        WIFI_SESSION_COOKIE,
+        token,
+        max_age=WIFI_SESSION_TTL,
+        httponly=True,
+        secure=True,
+        samesite="Strict",
+        path="/",
+    )
+    return response
+
+
+async def wifi_state_handler(request: web.Request) -> web.Response:
+    if _WIFI_GROUP_RECOVERY_REQUIRED:
+        return _wifi_recovery_required_response()
+    if not request.app.get("wifi_enabled"):
+        return web.json_response({"enabled": False, "groups": {}, "devices": {}})
+    if not _wifi_admin_authorized(request):
+        # The unauthenticated payload is deliberately minimal so the UI can show
+        # its token form without revealing device or group metadata.
+        return web.json_response(
+            {"enabled": True, "error": "authentication required"},
+            status=401,
+        )
+    store = _wifi_store(request)
+    if store is None:
+        return _wifi_api_unavailable()
+    return web.json_response(_wifi_state_payload(store))
+
+
+async def wifi_group_handler(request: web.Request) -> web.Response:
+    if _WIFI_GROUP_RECOVERY_REQUIRED:
+        return _wifi_recovery_required_response()
+    if not request.app.get("wifi_enabled"):
+        return _wifi_api_unavailable()
+    if not _wifi_admin_authorized(request):
+        return _wifi_api_unauthorized()
+    store = _wifi_store(request)
+    if store is None:
+        return _wifi_api_unavailable()
+    try:
+        name = _wifi_name_from_request(request)
+        if name not in device_groups:
+            raise WiFiSettingsError("group does not exist", 404)
+        if request.method == "GET":
+            profile = store.profile(name)
+            return web.json_response({
+                "name": name,
+                "revision": profile.get("revision") if profile else None,
+                "networks": public_networks(profile["networks"]) if profile else [],
+            })
+
+        if request.method == "PUT" and not _wifi_origin_allowed(request):
+            return web.json_response({"error": "invalid request origin"}, status=403)
+        body = await _small_json_body(request)
+        async with request.app["wifi_lock"]:
+            # The request body read above yields to the event loop. A concurrent
+            # rename/delete may have removed this group in the meantime.
+            if name not in device_groups:
+                raise WiFiSettingsError("group does not exist", 404)
+            current = store.profile(name)
+            networks = validate_profile_networks(body.get("networks"), current.get("networks") if current else None)
+            profile = store.put_profile(name, networks)
+        return web.json_response({
+            "name": name,
+            "revision": profile["revision"],
+            "networks": public_networks(profile["networks"]),
+        })
+    except WiFiSettingsError as exc:
+        return web.json_response({"error": str(exc)}, status=exc.status)
+    except WiFiStoreError:
+        log.error("Wi-Fi profile persistence failed")
+        return web.json_response({"error": "Wi-Fi settings could not be saved"}, status=500)
+
+
+def _device_wifi_eligible(entry: dict | None) -> bool:
+    return bool(
+        entry
+        and entry.get("status") == "online"
+        and entry.get("registration_ready") is True
+        and entry.get("wifi_settings_v1") is True
+        and entry.get("wifi_authorized") is True
+        and entry.get("ws") is not None
+        and not entry["ws"].closed
+    )
+
+
+async def _wifi_operation_timeout(app: web.Application, operation_id: str) -> None:
+    try:
+        await asyncio.sleep(WIFI_OPERATION_TIMEOUT)
+        store = app.get("wifi_store")
+        if store is None:
+            return
+        async with app["wifi_lock"]:
+            store.mark_operation_timeout(operation_id)
+    except asyncio.CancelledError:
+        raise
+    except WiFiStoreError:
+        log.error("Wi-Fi timeout state could not be persisted")
+    finally:
+        app["wifi_tasks"].discard(asyncio.current_task())
+        if app.get("wifi_operation_tasks", {}).get(operation_id) is asyncio.current_task():
+            app["wifi_operation_tasks"].pop(operation_id, None)
+
+
+async def _cancel_wifi_tasks(app: web.Application) -> None:
+    tasks = tuple(app.get("wifi_tasks", ()))
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _wifi_socket_can_report(app: web.Application, device_id: str, ws: web.WebSocketResponse) -> bool:
+    entry = devices.get(device_id)
+    return bool(
+        app.get("wifi_enabled")
+        and not _WIFI_GROUP_RECOVERY_REQUIRED
+        and _owns_device(device_id, ws)
+        and _device_wifi_eligible(entry)
+    )
+
+
+async def _send_wifi_result_ack(ws: web.WebSocketResponse, payload: dict) -> None:
+    try:
+        await ws.send_str(json.dumps({"type": "WIFI_RESULT_ACK", **payload}))
+    except (ConnectionError, RuntimeError):
+        # Result state is already durable. The client will resend it after its
+        # next REGISTERED handshake and this ACK can be retried then.
+        pass
+
+
+async def _handle_wifi_device_message(
+    app: web.Application,
+    ws: web.WebSocketResponse,
+    device_id: str,
+    msg_type: str,
+    data: dict,
+) -> None:
+    if not _wifi_socket_can_report(app, device_id, ws):
+        return
+    store = app.get("wifi_store")
+    if store is None:
+        return
+
+    if msg_type == "WIFI_APPLY_ACCEPTED":
+        operation_id = data.get("operation_id")
+        if not valid_uuid(operation_id):
+            return
+        owner = app["wifi_dispatch_owners"].get(operation_id)
+        if owner != (device_id, ws):
+            return
+        try:
+            async with app["wifi_lock"]:
+                if (
+                    app["wifi_dispatch_owners"].get(operation_id) == (device_id, ws)
+                    and _wifi_socket_can_report(app, device_id, ws)
+                ):
+                    store.mark_accepted(operation_id, device_id)
+        except WiFiStoreError:
+            log.error("Wi-Fi acceptance state could not be persisted")
+        return
+
+    if msg_type == "WIFI_VERIFY_REQUEST":
+        operation_id = data.get("operation_id")
+        challenge = data.get("challenge")
+        if (
+            not valid_uuid(operation_id)
+            or not isinstance(challenge, str)
+            or not challenge
+            or len(challenge) > 128
+        ):
+            return
+        operation = store.state["operations"].get(operation_id)
+        if (
+            not isinstance(operation, dict)
+            or operation.get("device_id") != device_id
+            or operation.get("accepted") is not True
+            or operation.get("unresolved") is not True
+        ):
+            return
+        try:
+            async with app["wifi_lock"]:
+                persisted = (
+                    _wifi_socket_can_report(app, device_id, ws)
+                    and store.set_verify_challenge(operation_id, device_id, challenge)
+                )
+            if persisted and _wifi_socket_can_report(app, device_id, ws):
+                await ws.send_str(json.dumps({
+                    "type": "WIFI_VERIFY_ACK",
+                    "operation_id": operation_id,
+                    "challenge": challenge,
+                }))
+        except WiFiStoreError:
+            log.error("Wi-Fi verification state could not be persisted")
+        except (ConnectionError, RuntimeError):
+            pass
+        return
+
+    if msg_type == "WIFI_APPLY_RESULT":
+        operation_id = data.get("operation_id")
+        revision = normalize_revision(data.get("revision"))
+        status = data.get("status")
+        reason = data.get("reason")
+        rolled_back = data.get("rolled_back")
+        if (
+            not valid_uuid(operation_id)
+            or revision is None
+            or not isinstance(status, str)
+            or status not in {"success", "failed", "unknown"}
+            or not isinstance(reason, str)
+            or reason not in RESULT_REASONS
+            or not isinstance(rolled_back, bool)
+            or (status == "success" and (reason != "NONE" or rolled_back))
+            or (status == "unknown" and reason != "UNKNOWN")
+            or (status == "failed" and reason == "NONE")
+        ):
+            return
+        try:
+            async with app["wifi_lock"]:
+                settled = _wifi_socket_can_report(app, device_id, ws) and store.settle_manual(
+                    operation_id,
+                    device_id,
+                    revision,
+                    status,
+                    reason,
+                    rolled_back,
+                )
+            if not settled:
+                return
+            task = app["wifi_operation_tasks"].pop(operation_id, None)
+            if task is not None:
+                task.cancel()
+            if status != "unknown":
+                app["wifi_dispatch_owners"].pop(operation_id, None)
+            if _wifi_socket_can_report(app, device_id, ws):
+                await _send_wifi_result_ack(ws, {
+                    "kind": "manual",
+                    "operation_id": operation_id,
+                    "revision": revision,
+                    "status": status,
+                    "reason": reason,
+                    "rolled_back": rolled_back,
+                })
+        except WiFiStoreError:
+            log.error("Wi-Fi manual result could not be persisted")
+        return
+
+    if msg_type == "WIFI_BOOT_RESULT":
+        boot_id = data.get("boot_id")
+        revision = normalize_revision(data.get("revision"))
+        status = data.get("status")
+        reason = data.get("reason")
+        if (
+            not valid_uuid(boot_id)
+            or revision is None
+            or not isinstance(status, str)
+            or status not in {"success", "failed", "unknown"}
+            or not isinstance(reason, str)
+            or reason not in RESULT_REASONS
+            or (status == "success" and reason != "NONE")
+            or (status == "unknown" and reason != "UNKNOWN")
+            or (status == "failed" and reason == "NONE")
+        ):
+            return
+        try:
+            async with app["wifi_lock"]:
+                persisted = _wifi_socket_can_report(app, device_id, ws) and store.settle_boot(
+                    device_id, boot_id, revision, status, reason,
+                )
+            if persisted and _wifi_socket_can_report(app, device_id, ws):
+                await _send_wifi_result_ack(ws, {
+                    "kind": "boot",
+                    "boot_id": boot_id,
+                    "revision": revision,
+                    "status": status,
+                    "reason": reason,
+                })
+        except WiFiStoreError:
+            log.error("Wi-Fi boot result could not be persisted")
+        return
+
+    if msg_type == "WIFI_OBSERVATION":
+        revision = normalize_revision(data.get("revision"))
+        status = data.get("status")
+        if (
+            revision is None
+            or not isinstance(status, str)
+            or status not in {"match", "mismatch", "unknown"}
+        ):
+            return
+        record = store.state["devices"].get(device_id, {})
+        known_revision = record.get("applied_revision") == revision or any(
+            operation.get("device_id") == device_id and operation.get("revision") == revision
+            for operation in store.state["operations"].values()
+        )
+        if not known_revision:
+            return
+        try:
+            async with app["wifi_lock"]:
+                if _wifi_socket_can_report(app, device_id, ws):
+                    store.observe(device_id, revision, status)
+        except WiFiStoreError:
+            log.error("Wi-Fi observation could not be persisted")
+
+
+async def wifi_deploy_handler(request: web.Request) -> web.Response:
+    if _WIFI_GROUP_RECOVERY_REQUIRED:
+        return _wifi_recovery_required_response()
+    if not request.app.get("wifi_enabled"):
+        return _wifi_api_unavailable()
+    if not _wifi_admin_authorized(request):
+        return _wifi_api_unauthorized()
+    if not _wifi_origin_allowed(request):
+        return web.json_response({"error": "invalid request origin"}, status=403)
+    store = _wifi_store(request)
+    if store is None:
+        return _wifi_api_unavailable()
+    try:
+        name = _wifi_name_from_request(request)
+        async with request.app["wifi_lock"]:
+            if name not in device_groups:
+                raise WiFiSettingsError("group does not exist", 404)
+            profile = store.profile(name)
+            if profile is None:
+                raise WiFiSettingsError("group has no saved Wi-Fi profile", 409)
+
+            # Capture every online group member, even one that cannot use Wi-Fi.
+            # Such a device receives a fixed failure result; offline members are
+            # excluded and never gain a reconnect-time send.
+            targets = [
+                (device_id, devices.get(device_id), devices.get(device_id, {}).get("ws"))
+                for device_id in device_groups.get(name, [])
+                if devices.get(device_id, {}).get("status") == "online"
+            ]
+            operations = store.create_operations(
+                name,
+                profile["revision"],
+                profile["networks"],
+                [device_id for device_id, _entry, _ws in targets],
+            )
+
+        by_device = {operation["device_id"]: operation for operation in operations}
+        request.app["wifi_dispatch_owners"].update({
+            operation["operation_id"]: (device_id, ws)
+            for device_id, _entry, ws in targets
+            for operation in [by_device[device_id]]
+        })
+
+        for device_id, entry, ws in targets:
+            operation = by_device[device_id]
+            operation_id = operation["operation_id"]
+            if not isinstance(entry, dict) or entry.get("wifi_settings_v1") is not True:
+                async with request.app["wifi_lock"]:
+                    store.settle_manual(
+                        operation_id, device_id, operation["revision"],
+                        "failed", "UNSUPPORTED", False,
+                    )
+                continue
+            if entry.get("wifi_authorized") is not True:
+                async with request.app["wifi_lock"]:
+                    store.settle_manual(
+                        operation_id, device_id, operation["revision"],
+                        "failed", "PERMISSION_DENIED", False,
+                    )
+                continue
+            if not _owns_device(device_id, ws) or devices.get(device_id) is not entry:
+                # The frozen target disconnected before this server sent anything;
+                # this is a known non-delivery, so it can be a terminal failure.
+                async with request.app["wifi_lock"]:
+                    store.settle_manual(
+                        operation_id, device_id, operation["revision"],
+                        "failed", "UNREACHABLE", False,
+                    )
+                continue
+            timeout_task = asyncio.create_task(_wifi_operation_timeout(request.app, operation_id))
+            request.app["wifi_tasks"].add(timeout_task)
+            request.app["wifi_operation_tasks"][operation_id] = timeout_task
+            message = {
+                "type": "EXECUTE_WIFI_APPLY",
+                "operation_id": operation_id,
+                "revision": operation["revision"],
+                "networks": operation["networks"],
+            }
+            try:
+                await asyncio.wait_for(
+                    ws.send_str(json.dumps(message, ensure_ascii=False)),
+                    timeout=5.0,
+                )
+            except (ConnectionError, RuntimeError, asyncio.TimeoutError):
+                async with request.app["wifi_lock"]:
+                    store.mark_operation_timeout(operation_id)
+                request.app["wifi_dispatch_owners"].pop(operation_id, None)
+
+        return web.json_response({
+            "group": name,
+            "revision": profile["revision"],
+            "operations": [
+                {"operation_id": operation["operation_id"], "device_id": operation["device_id"]}
+                for operation in operations
+            ],
+        })
+    except WiFiSettingsError as exc:
+        return web.json_response({"error": str(exc)}, status=exc.status)
+    except WiFiStoreError:
+        log.error("Wi-Fi deployment snapshot could not be persisted")
+        return web.json_response({"error": "Wi-Fi deployment could not be recorded"}, status=500)
+
+
+# ---------------------------------------------------------------------------
 # Device WebSocket handler  (/ws/device)
 # ---------------------------------------------------------------------------
 
@@ -1233,6 +2046,7 @@ def _parse_registration(data: dict, remote: str | None) -> tuple[str, dict] | tu
         "ip": _bounded_registration_text(data.get("ip"), remote or "unknown", MAX_DEVICE_IP_LEN),
         "version_name": _bounded_registration_text(data.get("version_name"), "", MAX_VERSION_NAME_LEN),
         "capabilities": sorted(parse_capabilities(data.get("capabilities"))),
+        "wifi_settings_v1": "wifi_settings_v1" in parse_capabilities(data.get("capabilities")),
     }
     version_code = data.get("version_code")
     common["version_code"] = (
@@ -1311,6 +2125,10 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
     device_id: str | None = None
     socket_identity_kind: str | None = None
+    wifi_authorized = bool(
+        request.app.get("wifi_enabled")
+        and _wifi_device_authorized(request)
+    )
 
     try:
         async for raw_msg in ws:
@@ -1434,6 +2252,8 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "version_code": version_code,
                         "version_name": version_name,
                         "push_state_status": push_state_status,
+                        "wifi_settings_v1": registration["wifi_settings_v1"],
+                        "wifi_authorized": wifi_authorized,
                     }
                     device_registry[device_id] = {
                         "label": prev.get("label", ""),
@@ -1466,6 +2286,18 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     if kind == "canonical":
                         await broadcast_provisional_connection_list()
                     await broadcast_device_list()
+
+                elif msg_type in {
+                    "WIFI_APPLY_ACCEPTED",
+                    "WIFI_VERIFY_REQUEST",
+                    "WIFI_APPLY_RESULT",
+                    "WIFI_BOOT_RESULT",
+                    "WIFI_OBSERVATION",
+                }:
+                    if device_id:
+                        await _handle_wifi_device_message(
+                            request.app, ws, device_id, msg_type, data,
+                        )
 
                 elif msg_type == "BATTERY_UPDATE":
                     if not device_id:
@@ -1795,6 +2627,13 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
 # ---------------------------------------------------------------------------
 
 async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
+    if request.app.get("wifi_enabled") and (
+        not request.secure
+        or not _valid_wifi_session(request)
+        or not request.headers.get("Origin")
+        or not _wifi_origin_allowed(request)
+    ):
+        return web.Response(status=401, text="authentication required")
     # On aiohttp 3.14.3, the server-side reader rejected Chrome's first PUSH_FILES
     # text frame after a long upload with "Received frame with non-zero reserved
     # bits". The failure was observed only on the inbound Chrome admin frame.
@@ -1881,7 +2720,7 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     await handle_set_device_label(ws, data)
 
                 elif msg_type == "FORGET_DEVICE":
-                    await handle_forget_device(ws, data)
+                    await handle_forget_device(ws, data, app=request.app)
 
                 elif msg_type == "RETIRE_DEVICE":
                     await handle_retire_device(ws, data)
@@ -1890,16 +2729,16 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     await handle_create_group(ws, data)
 
                 elif msg_type == "RENAME_GROUP":
-                    await handle_rename_group(ws, data)
+                    await handle_rename_group(ws, data, app=request.app)
 
                 elif msg_type == "DELETE_GROUP":
-                    await handle_delete_group(ws, data)
+                    await handle_delete_group(ws, data, app=request.app)
 
                 elif msg_type == "SET_DEVICE_GROUPS":
-                    await handle_set_device_groups(ws, data)
+                    await handle_set_device_groups(ws, data, app=request.app)
 
                 elif msg_type == "SET_GROUP_MEMBERS":
-                    await handle_set_group_members(ws, data)
+                    await handle_set_group_members(ws, data, app=request.app)
 
                 else:
                     log.warning("Unknown message type from admin: %s", msg_type)
@@ -1959,7 +2798,12 @@ async def handle_set_device_label(admin_ws: web.WebSocketResponse, data: dict):
     await broadcast_device_list()
 
 
-async def handle_forget_device(admin_ws: web.WebSocketResponse, data: dict):
+async def handle_forget_device(
+    admin_ws: web.WebSocketResponse,
+    data: dict,
+    *,
+    app: web.Application | None = None,
+):
     """Remove a decommissioned device from the persistent registry.
 
     Only offline devices can be forgotten; an online device would immediately
@@ -1981,12 +2825,17 @@ async def handle_forget_device(admin_ws: web.WebSocketResponse, data: dict):
         }))
         return
 
+    store = app.get("wifi_store") if app is not None else None
+    if store is not None and store.unresolved_for_device(serial):
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "Cannot forget a device with an unresolved Wi-Fi operation",
+        }))
+        return
+
+    previous_devices = copy.deepcopy(device_registry)
+    previous_groups = copy.deepcopy(device_groups)
     removed = device_registry.pop(serial, None) is not None
-    # A forget mid-"retiring" must also drop the pending retire, or its timeout
-    # would later report a result for a device the operator already removed.
-    pend = pending_retires.pop(serial, None)
-    if pend is not None and pend.get("timeout_task"):
-        pend["timeout_task"].cancel()
     # Decommission cleanly: drop the serial from every group so no group keeps a
     # dangling reference to a device that is no longer known.
     groups_changed = False
@@ -1996,7 +2845,21 @@ async def handle_forget_device(admin_ws: web.WebSocketResponse, data: dict):
             groups_changed = True
 
     if removed or groups_changed:
-        save_registry()
+        if not save_registry():
+            device_registry.clear()
+            device_registry.update(previous_devices)
+            device_groups.clear()
+            device_groups.update(previous_groups)
+            await admin_ws.send_str(json.dumps({
+                "type": "ERROR",
+                "message": "Could not persist the device change",
+            }))
+            return
+    # A forget mid-"retiring" must also drop the pending retire, or its timeout
+    # would later report a result for a device the operator already removed.
+    pend = pending_retires.pop(serial, None)
+    if pend is not None and pend.get("timeout_task"):
+        pend["timeout_task"].cancel()
     if removed:
         log.info("Device forgotten: %s", serial)
 
@@ -2027,8 +2890,16 @@ async def handle_create_group(admin_ws: web.WebSocketResponse, data: dict):
         }))
         return
 
+    previous_groups = copy.deepcopy(device_groups)
     device_groups[name] = []
-    save_registry()
+    if not save_registry():
+        device_groups.clear()
+        device_groups.update(previous_groups)
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "Could not persist the group change",
+        }))
+        return
     log.info("Group created: %r", name)
 
     await admin_ws.send_str(json.dumps({
@@ -2038,7 +2909,12 @@ async def handle_create_group(admin_ws: web.WebSocketResponse, data: dict):
     await broadcast_group_list()
 
 
-async def handle_rename_group(admin_ws: web.WebSocketResponse, data: dict):
+async def handle_rename_group(
+    admin_ws: web.WebSocketResponse,
+    data: dict,
+    *,
+    app: web.Application | None = None,
+):
     """Rename an existing group, preserving its membership."""
     name: str = (data.get("name") or "").strip()[:MAX_GROUP_NAME_LEN]
     new_name: str = (data.get("new_name") or "").strip()[:MAX_GROUP_NAME_LEN]
@@ -2064,9 +2940,26 @@ async def handle_rename_group(admin_ws: web.WebSocketResponse, data: dict):
         }))
         return
 
+    store = app.get("wifi_store") if app is not None else None
+    if new_name != name and store is not None and store.unresolved_for_group(name):
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "Cannot rename a group with an unresolved Wi-Fi operation",
+        }))
+        return
+
     # Rebuild to preserve insertion order while swapping the key.
+    previous_groups = copy.deepcopy(device_groups)
+    previous_wifi_state = copy.deepcopy(store.state) if store is not None else None
     device_groups[new_name] = device_groups.pop(name)
-    save_registry()
+    if store is not None:
+        store.rename_profile(name, new_name, save=False)
+    if not _persist_group_registry_mutation(store, previous_groups, previous_wifi_state):
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "Could not persist the group change",
+        }))
+        return
     log.info("Group renamed: %r -> %r", name, new_name)
 
     await admin_ws.send_str(json.dumps({
@@ -2077,7 +2970,12 @@ async def handle_rename_group(admin_ws: web.WebSocketResponse, data: dict):
     await broadcast_group_list()
 
 
-async def handle_delete_group(admin_ws: web.WebSocketResponse, data: dict):
+async def handle_delete_group(
+    admin_ws: web.WebSocketResponse,
+    data: dict,
+    *,
+    app: web.Application | None = None,
+):
     """Delete a group. Devices are never affected, only the grouping is removed."""
     name: str = (data.get("name") or "").strip()[:MAX_GROUP_NAME_LEN]
 
@@ -2088,8 +2986,26 @@ async def handle_delete_group(admin_ws: web.WebSocketResponse, data: dict):
         }))
         return
 
-    if device_groups.pop(name, None) is not None:
-        save_registry()
+    store = app.get("wifi_store") if app is not None else None
+    if store is not None and store.unresolved_for_group(name):
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "Cannot delete a group with an unresolved Wi-Fi operation",
+        }))
+        return
+
+    if name in device_groups:
+        previous_groups = copy.deepcopy(device_groups)
+        previous_wifi_state = copy.deepcopy(store.state) if store is not None else None
+        device_groups.pop(name, None)
+        if store is not None:
+            store.delete_profile(name, save=False)
+        if not _persist_group_registry_mutation(store, previous_groups, previous_wifi_state):
+            await admin_ws.send_str(json.dumps({
+                "type": "ERROR",
+                "message": "Could not persist the group change",
+            }))
+            return
         log.info("Group deleted: %r", name)
 
     await admin_ws.send_str(json.dumps({
@@ -2099,7 +3015,12 @@ async def handle_delete_group(admin_ws: web.WebSocketResponse, data: dict):
     await broadcast_group_list()
 
 
-async def handle_set_device_groups(admin_ws: web.WebSocketResponse, data: dict):
+async def handle_set_device_groups(
+    admin_ws: web.WebSocketResponse,
+    data: dict,
+    *,
+    app: web.Application | None = None,
+):
     """Set the exact set of groups a device belongs to.
 
     Every named group must already exist (created via CREATE_GROUP); unknown names
@@ -2140,7 +3061,25 @@ async def handle_set_device_groups(admin_ws: web.WebSocketResponse, data: dict):
         }))
         return
 
+    if len(target_names) > 1:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "A device can belong to only one group",
+        }))
+        return
+
+    current_names = [name for name, members in device_groups.items() if serial in members]
+    if current_names != target_names:
+        store = app.get("wifi_store") if app is not None else None
+        if store is not None and store.unresolved_for_device(serial):
+            await admin_ws.send_str(json.dumps({
+                "type": "ERROR",
+                "message": "Cannot change membership while a Wi-Fi operation is unresolved",
+            }))
+            return
+
     # Rebuild membership so the device is in exactly the requested groups.
+    previous_groups = copy.deepcopy(device_groups)
     target_set = set(target_names)
     for name, members in device_groups.items():
         in_group = serial in members
@@ -2149,7 +3088,14 @@ async def handle_set_device_groups(admin_ws: web.WebSocketResponse, data: dict):
         elif name not in target_set and in_group:
             members.remove(serial)
 
-    save_registry()
+    if not save_registry():
+        device_groups.clear()
+        device_groups.update(previous_groups)
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "Could not persist the membership change",
+        }))
+        return
     log.info("Device groups set: %s -> %s", serial, target_names)
 
     await admin_ws.send_str(json.dumps({
@@ -2160,7 +3106,12 @@ async def handle_set_device_groups(admin_ws: web.WebSocketResponse, data: dict):
     await broadcast_group_list()
 
 
-async def handle_set_group_members(admin_ws: web.WebSocketResponse, data: dict):
+async def handle_set_group_members(
+    admin_ws: web.WebSocketResponse,
+    data: dict,
+    *,
+    app: web.Application | None = None,
+):
     """Set the exact member list of a group (group-centric assignment).
 
     The group must already exist. Members are stored as serials; offline or
@@ -2196,8 +3147,38 @@ async def handle_set_group_members(admin_ws: web.WebSocketResponse, data: dict):
         if isinstance(serial, str) and serial and serial not in members:
             members.append(serial)
 
+    conflicts = sorted({
+        serial
+        for serial in members
+        for other_name, other_members in device_groups.items()
+        if other_name != name and serial in other_members
+    })
+    if conflicts:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "One or more devices already belong to another group",
+        }))
+        return
+
+    changed_devices = set(device_groups[name]) ^ set(members)
+    store = app.get("wifi_store") if app is not None else None
+    if store is not None and any(store.unresolved_for_device(did) for did in changed_devices):
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "Cannot change membership while a Wi-Fi operation is unresolved",
+        }))
+        return
+
+    previous_groups = copy.deepcopy(device_groups)
     device_groups[name] = members
-    save_registry()
+    if not save_registry():
+        device_groups.clear()
+        device_groups.update(previous_groups)
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "Could not persist the membership change",
+        }))
+        return
     log.info("Group members set: %r -> %d member(s)", name, len(members))
 
     await admin_ws.send_str(json.dumps({
@@ -3029,9 +4010,10 @@ def source_ip_for(peer: str) -> str | None:
 class _UdpDiscoveryProtocol(asyncio.DatagramProtocol):
     """Responds to UDP broadcast discovery requests with the server's WebSocket URL."""
 
-    def __init__(self, ws_port: int, ip_addresses: list[str]):
+    def __init__(self, ws_port: int, ip_addresses: list[str], *, tls_enabled: bool = False):
         self._ws_port = ws_port
         self._ip_addresses = ip_addresses
+        self._tls_enabled = tls_enabled
 
     def connection_made(self, transport: asyncio.DatagramTransport):
         self._transport = transport
@@ -3044,21 +4026,27 @@ class _UdpDiscoveryProtocol(asyncio.DatagramProtocol):
             server_ip = source_ip_for(addr[0])
             if server_ip is None:
                 server_ip = self._ip_addresses[0] if self._ip_addresses else "0.0.0.0"
+            scheme = "wss" if self._tls_enabled else "ws"
             response = json.dumps({
                 "service": "stylymdm",
-                "ws_url": f"ws://{server_ip}:{self._ws_port}/ws/device",
+                "ws_url": f"{scheme}://{server_ip}:{self._ws_port}/ws/device",
                 "version": "1.0",
             }).encode("utf-8")
             self._transport.sendto(response, addr)
-            log.info("Discovery request from %s:%d -> responded with ws://%s:%d",
-                     addr[0], addr[1], server_ip, self._ws_port)
+            log.info("Discovery request from %s:%d -> responded with %s://%s:%d",
+                     addr[0], addr[1], scheme, server_ip, self._ws_port)
 
 
-async def start_discovery_responder(ws_port: int, ip_addresses: list[str]):
+async def start_discovery_responder(
+    ws_port: int,
+    ip_addresses: list[str],
+    *,
+    tls_enabled: bool = False,
+):
     """Start the UDP discovery responder as an asyncio task."""
     loop = asyncio.get_running_loop()
     transport, _ = await loop.create_datagram_endpoint(
-        lambda: _UdpDiscoveryProtocol(ws_port, ip_addresses),
+        lambda: _UdpDiscoveryProtocol(ws_port, ip_addresses, tls_enabled=tls_enabled),
         local_addr=("0.0.0.0", DISCOVERY_PORT),
         family=socket.AF_INET,
         allow_broadcast=True,
@@ -3123,14 +4111,37 @@ def probe_existing_server(timeout: float = 1.0) -> str | None:
 
 def create_app() -> web.Application:
     # Ensure the writable data directory exists before loading/saving the registry.
+    global _WIFI_GROUP_RECOVERY_REQUIRED
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not _recover_wifi_group_mutation(DATA_DIR, REGISTRY_PATH):
+        _WIFI_GROUP_RECOVERY_REQUIRED = True
+        raise RuntimeError("an interrupted Wi-Fi group update could not be recovered")
+    _WIFI_GROUP_RECOVERY_REQUIRED = False
     load_registry()
+    tls_context = _load_tls_context()
+    wifi_enabled, wifi_store = _load_wifi_store(DATA_DIR, tls_context)
     app = web.Application(
         client_max_size=max(MAX_APK_SIZE, MAX_BUNDLE_SIZE) + 10 * 1024 * 1024)
+    app["tls_context"] = tls_context
+    app["wifi_enabled"] = wifi_enabled
+    app["wifi_store"] = wifi_store
+    app["wifi_admin_token"] = os.environ.get("MDM_ADMIN_TOKEN") if wifi_enabled else None
+    app["wifi_device_token"] = os.environ.get("MDM_DEVICE_TOKEN") if wifi_enabled else None
+    app["wifi_sessions"] = {}
+    app["wifi_lock"] = asyncio.Lock()
+    app["wifi_dispatch_owners"] = {}
+    app["wifi_tasks"] = set()
+    app["wifi_operation_tasks"] = {}
+    app.on_cleanup.append(_cancel_wifi_tasks)
 
     # WebSocket endpoints
     app.router.add_get("/ws/device", device_ws_handler)
     app.router.add_get("/ws/admin", admin_ws_handler)
+    app.router.add_post("/api/wifi/session", wifi_session_handler)
+    app.router.add_get("/api/wifi/state", wifi_state_handler)
+    app.router.add_route("GET", "/api/wifi/groups/{name}", wifi_group_handler)
+    app.router.add_route("PUT", "/api/wifi/groups/{name}", wifi_group_handler)
+    app.router.add_post("/api/wifi/groups/{name}/deploy", wifi_deploy_handler)
     app.router.add_post("/api/apks", upload_apk_handler)
     app.router.add_post("/api/bundles", upload_bundle_handler)
 
@@ -3194,6 +4205,7 @@ async def run_server(port: int | None = None):
     if port is None:
         port = int(os.environ.get("MDM_WS_PORT", "7070"))
     app = create_app()
+    tls_context = app["tls_context"]
     ip_addresses = get_local_ip_addresses()
 
     # Imported lazily to avoid a circular import: __init__ defines __version__ but
@@ -3203,11 +4215,12 @@ async def run_server(port: int | None = None):
     from . import __version__
     version_label = f"{__version__} (untagged)" if __version__ == "0.0.0" else __version__
     log.info("Starting STYLY-MDM server v%s on port %d", version_label, port)
+    scheme = "https" if tls_context is not None else "http"
     if ip_addresses:
         for ip in ip_addresses:
-            log.info("  Server running at http://%s:%d", ip, port)
+            log.info("  Server running at %s://%s:%d", scheme, ip, port)
     else:
-        log.info("  Server running at http://0.0.0.0:%d", port)
+        log.info("  Server running at %s://0.0.0.0:%d", scheme, port)
 
     # Data-dir paths are CWD-relative by default (see DATA_DIR), so log the resolved
     # locations to make "where does this write" unambiguous at a glance.
@@ -3219,11 +4232,13 @@ async def run_server(port: int | None = None):
     log.info("  Discovery port:   %d", DISCOVERY_PORT)
 
     # Start UDP discovery responder alongside the HTTP server
-    discovery_transport = await start_discovery_responder(port, ip_addresses)
+    discovery_transport = await start_discovery_responder(
+        port, ip_addresses, tls_enabled=tls_context is not None,
+    )
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", port, ssl_context=tls_context)
     await site.start()
 
     try:

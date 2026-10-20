@@ -1,0 +1,81 @@
+package com.styly.mdmclient
+
+import java.io.File
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
+import org.junit.Rule
+import org.junit.Test
+import org.junit.rules.TemporaryFolder
+
+class WifiSettingsStoreTest {
+    @get:Rule
+    val temporaryFolder = TemporaryFolder()
+
+    @Test
+    fun roundTripPreservesRestorationJournalAndOperationReceipts() {
+        val directory = temporaryFolder.newFolder("wifi-state")
+        val file = File(directory, "state.json")
+        val store = WifiSettingsStore(file) {}
+        val profile = WifiNetworkProfile("office", "WPA_PSK", "correcthorsebattery", hidden = true)
+        val operation = WifiManualOperation(
+            operationId = "a4d13b84-1bd7-4bce-bd4d-d056801d4a3f",
+            revision = "91b831b3-884e-4e0e-8700-07d2fbe1c436",
+            candidate = listOf(profile),
+            restoreSnapshot = listOf(
+                WifiNetworkSnapshot(
+                    WifiNetworkProfile("old-network", "OPEN", "", hidden = false),
+                    enabled = false,
+                    priority = 7,
+                    configurationParcel = "serialized-config",
+                ),
+            ),
+            phase = WifiManualPhase.VERIFYING,
+            challenge = "b12b4fcb-90b4-4a07-a3a8-e9775e804fe5",
+            deadlineElapsedMillis = 60_000L,
+            settingsChanged = true,
+            finalStateValidated = true,
+        )
+        val expected = WifiLocalState(
+            connection = WifiConnectionSettings(tlsEnabled = true, deviceToken = "secret-token"),
+            lastApplied = WifiSavedProfile(operation.revision, listOf(profile)),
+            manualOperation = operation,
+            manualResults = listOf(
+                WifiManualResult(operation.operationId, operation.revision, "unknown", WifiReason.UNKNOWN, false),
+            ),
+            bootGeneration = "count:42",
+            bootClaimedGeneration = "count:41",
+            processedOperationIds = listOf(operation.operationId),
+        )
+
+        store.write(expected)
+
+        assertEquals(expected, store.read())
+        assertEquals(true, file.isFile)
+    }
+
+    @Test
+    fun directorySyncFailureIsReportedAndDoesNotLeaveTemporaryFile() {
+        val directory = temporaryFolder.newFolder("wifi-state-sync-failure")
+        val file = File(directory, "state.json")
+        val store = WifiSettingsStore(file) { throw IllegalStateException("directory sync failed") }
+
+        assertThrows(IllegalStateException::class.java) {
+            store.write(WifiLocalState(bootGeneration = "count:1"))
+        }
+
+        assertEquals(false, File(directory, "state.json.tmp").exists())
+    }
+
+    @Test
+    fun corruptStateIsNotSilentlyReset() {
+        val directory = temporaryFolder.newFolder("wifi-state-corrupt")
+        val file = File(directory, "state.json")
+        val corrupt = "{not-json"
+        file.writeText(corrupt)
+        val store = WifiSettingsStore(file) {}
+
+        assertThrows(Exception::class.java) { store.read() }
+
+        assertEquals(corrupt, file.readText())
+    }
+}
