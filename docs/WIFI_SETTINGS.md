@@ -138,6 +138,10 @@ duplicate SSIDs and unsupported modes are rejected. SSIDs are 1–32 UTF-8 bytes
 this adapter rejects control characters, quotes and backslashes. PSKs are
 8–63 printable ASCII characters or 64 hexadecimal digits. A blank password
 field retains an existing password only for the same saved SSID/security entry.
+The key editor disables autocomplete and uses a CSS-masked text input to avoid
+login-password generation/saving prompts. Browsers without CSS masking support
+fall back to a password input to keep the key hidden; those browsers or password
+manager extensions may still show their own prompts.
 WPA3/SAE, EAP certificates, WEP, proxy and static-IP configurations are not
 silently converted to supported profiles.
 

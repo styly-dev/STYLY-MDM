@@ -108,12 +108,24 @@
     });
   }
 
+  function passwordHelp(network) {
+    if (network.security === 'WPA_PSK') return network.password_present
+      ? 'Leave blank to keep the saved password. Enter a new password to replace it.'
+      : 'Required for this saved network.';
+    return network.security === 'OPEN'
+      ? 'Open networks do not use a password.'
+      : 'This saved security type is unsupported. Choose a supported type before saving.';
+  }
+
   function createController(options) {
     const statusPanel = options.statusPanel;
     const groupPanel = options.groupPanel;
     const getGroups = options.getGroups;
     const getDevices = options.getDevices;
     const confirmApply = options.confirmApply || root.confirm.bind(root);
+    // Wi-Fi keys are configuration values, not login credentials.
+    const secretInputType = root.CSS && typeof root.CSS.supports === 'function' &&
+      root.CSS.supports('-webkit-text-security', 'disc') ? 'text' : 'password';
     let enabled = null;
     let allowHttp = false;
     let accessRenderKey = null;
@@ -244,20 +256,14 @@
           return '<option value="' + mode + '"' + (network.security === mode ? ' selected' : '') + '>' +
             (mode === 'OPEN' ? 'Open' : 'WPA/WPA2 Personal (PSK)') + '</option>';
         }).join('');
-        const secretHelp = network.security === 'WPA_PSK'
-          ? (network.password_present
-            ? '<small>Leave blank to keep the saved password. Enter a new password to replace it.</small>'
-            : '<small>Required for this saved network.</small>')
-          : network.security === 'OPEN'
-            ? '<small>Open networks do not use a password.</small>'
-            : '<small>This saved security type is unsupported. Choose a supported type before saving.</small>';
+        const secretHelp = '<small>' + escapeHtml(passwordHelp(network)) + '</small>';
         return '<article class="wifi-network" data-wifi-row="' + escapeHtml(network.id) + '">' +
           '<div class="wifi-network-head"><strong>Wi-Fi ' + (index + 1) + '</strong>' +
           '<button class="btn-outline btn-danger-outline wifi-remove" type="button" data-wifi-action="remove" data-wifi-row="' + escapeHtml(network.id) + '"' +
           (model.draftNetworks.length <= 1 ? ' disabled' : '') + '>Remove</button></div>' +
           '<label>SSID<input class="field" data-wifi-row="' + escapeHtml(network.id) + '" data-wifi-field="ssid" type="text" autocomplete="off" value="' + escapeHtml(network.ssid) + '"></label>' +
           '<div class="wifi-fields"><label>Security<select class="field" data-wifi-row="' + escapeHtml(network.id) + '" data-wifi-field="security">' + securityOptions + '</select></label>' +
-          '<label>Password<input class="field" data-wifi-row="' + escapeHtml(network.id) + '" data-wifi-field="password" type="password" autocomplete="new-password" value=""></label></div>' +
+          '<label>Password<input class="field wifi-secret" data-wifi-row="' + escapeHtml(network.id) + '" data-wifi-field="password" type="' + secretInputType + '" autocomplete="off" autocapitalize="off" spellcheck="false" value=""></label></div>' +
           '<div class="wifi-row-foot">' + secretHelp + '<label class="wifi-check"><input type="checkbox" data-wifi-row="' + escapeHtml(network.id) + '" data-wifi-field="hidden"' +
           (network.hidden ? ' checked' : '') + '> Hidden network</label></div></article>';
       }).join('');
@@ -427,6 +433,10 @@
       } else row[field] = input.value;
       model.dirty = true;
       model.error = '';
+      if (field === 'security') {
+        const help = groupPanel.querySelector('article[data-wifi-row="' + row.id + '"] small');
+        if (help) help.textContent = passwordHelp(row);
+      }
       updateButtons();
     }
 
