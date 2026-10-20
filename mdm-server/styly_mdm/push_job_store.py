@@ -420,6 +420,62 @@ class PushJobStore:
         )
 
     @staticmethod
+    def _settle_pre_dispatch_targets(
+        conn: sqlite3.Connection,
+        job_id: str,
+        state: JobState,
+        code: str | None,
+        detail: str | None,
+        *,
+        terminal_at: int,
+        updated_at: int,
+    ) -> int:
+        """Settle queued targets inside the caller's job-failure transaction.
+
+        A terminal job alone is not proof of absence. Refuse the entire change
+        if any target has execution evidence or an exact fence. Startup repair
+        uses the original job timestamps and leaves existing terminal rows alone.
+        """
+        if state not in {JobState.FAILED, JobState.INTERRUPTED}:
+            raise ValueError("pre-dispatch failure must be failed or interrupted")
+        job = conn.execute(
+            "SELECT dispatch_started_at, dispatch_enabled FROM push_jobs WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        if job is None:
+            raise StoreNotFound(job_id)
+        protected = conn.execute(
+            """
+            SELECT 1 FROM push_job_devices d
+            WHERE d.job_id=? AND (
+                d.state NOT IN ('queued','failed','interrupted')
+                OR d.dispatch_revision IS NOT NULL
+                OR d.dispatch_capability_snapshot_json IS NOT NULL
+                OR d.accepted_at IS NOT NULL OR d.accept_deadline IS NOT NULL
+                OR d.validated_offset <> 0 OR d.transfer_completed_at IS NOT NULL
+                OR d.validation_started_at IS NOT NULL OR d.validation_completed_at IS NOT NULL
+                OR d.apply_started_at IS NOT NULL
+                OR EXISTS (
+                    SELECT 1 FROM push_device_fences f
+                    WHERE f.device_id=d.device_id AND f.blocking_job_id=d.job_id
+                      AND f.blocking_attempt=d.attempt
+                )
+            ) LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+        if job["dispatch_started_at"] is not None or job["dispatch_enabled"] or protected:
+            raise StoreConflict("job has dispatch evidence; cannot settle it as pre-dispatch")
+        return conn.execute(
+            """
+            UPDATE push_job_devices SET state=?, queue_reason=NULL, failure_code=?,
+                failure_detail=?, terminal_at=?, updated_at=?
+            WHERE job_id=? AND state='queued'
+            """,
+            (state.value, code, detail, terminal_at, updated_at, job_id),
+        ).rowcount
+
+    @staticmethod
     def _fence_visible_job_ids(conn: sqlite3.Connection, device_id: str) -> list[str]:
         rows = conn.execute(
             """
@@ -497,7 +553,8 @@ class PushJobStore:
         job = conn.execute(
             """
             SELECT j.*, a.storage_name, a.display_filename, a.byte_size, a.sha256,
-                   a.entry_count, a.created_at AS artifact_created_at
+                   a.entry_count, a.created_at AS artifact_created_at,
+                   a.retention_state AS artifact_retention_state
             FROM push_jobs j
             LEFT JOIN push_artifacts a ON a.artifact_id=j.artifact_id
             WHERE j.job_id=?
@@ -564,6 +621,11 @@ class PushJobStore:
                 and fence["blocking_attempt"] == row["attempt"],
                 failure_code=row["failure_code"],
                 superseded=row["device_id"] in superseded,
+                artifact_available=(
+                    job["artifact_id"] is not None
+                    and job["artifact_retention_state"] == "retained"
+                    and job["failure_code"] != "artifact_missing"
+                ),
             )
             devices[row["device_id"]] = {
                 "state": row["state"],
@@ -724,6 +786,11 @@ class PushJobStore:
                 if row["state"] != JobState.CREATED.value:
                     raise StoreConflict(f"job is {row['state']}, not created")
                 if timestamp >= row["create_expires_at"]:
+                    self._settle_pre_dispatch_targets(
+                        conn, job_id, JobState.INTERRUPTED,
+                        "upload_not_started_timeout", "upload did not start before create_expires_at",
+                        terminal_at=timestamp, updated_at=timestamp,
+                    )
                     conn.execute(
                         """
                         UPDATE push_jobs SET state='interrupted', revision=revision+1,
@@ -822,8 +889,14 @@ class PushJobStore:
                 if row is None:
                     raise StoreNotFound(job_id)
                 current = JobState(row["state"])
+                if current not in {JobState.CREATED, JobState.UPLOADING, JobState.PACKAGING, JobState.READY}:
+                    raise StoreConflict(f"job is {current.value}, not pre-dispatch")
                 validate_job_transition(current, state)
                 timestamp = now_ms()
+                self._settle_pre_dispatch_targets(
+                    conn, job_id, state, code, detail,
+                    terminal_at=timestamp, updated_at=timestamp,
+                )
                 conn.execute(
                     """
                     UPDATE push_jobs SET state=?, revision=revision+1, updated_at=?,
@@ -1054,6 +1127,11 @@ class PushJobStore:
                 if timestamp < row["create_expires_at"]:
                     self._commit(conn)
                     return None
+                self._settle_pre_dispatch_targets(
+                    conn, job_id, JobState.INTERRUPTED,
+                    "upload_not_started_timeout", "upload did not start before create_expires_at",
+                    terminal_at=timestamp, updated_at=timestamp,
+                )
                 conn.execute(
                     """
                     UPDATE push_jobs SET state='interrupted', revision=revision+1,
@@ -1084,11 +1162,19 @@ class PushJobStore:
                 timestamp = now_ms()
                 cleanup_jobs: list[str] = []
                 touched: set[str] = set()
-                rows = conn.execute("SELECT job_id, state, create_expires_at FROM push_jobs").fetchall()
+                rows = conn.execute("SELECT * FROM push_jobs").fetchall()
                 for row in rows:
                     state = JobState(row["state"])
                     job_id = row["job_id"]
                     if state is JobState.CREATED and timestamp >= row["create_expires_at"]:
+                        try:
+                            self._settle_pre_dispatch_targets(
+                                conn, job_id, JobState.INTERRUPTED,
+                                "upload_not_started_timeout", "upload did not start before create_expires_at",
+                                terminal_at=timestamp, updated_at=timestamp,
+                            )
+                        except StoreConflict:
+                            continue
                         conn.execute(
                             """
                             UPDATE push_jobs SET state='interrupted', revision=revision+1,
@@ -1101,6 +1187,14 @@ class PushJobStore:
                         cleanup_jobs.append(job_id)
                         touched.add(job_id)
                     elif state in {JobState.UPLOADING, JobState.PACKAGING}:
+                        try:
+                            self._settle_pre_dispatch_targets(
+                                conn, job_id, JobState.INTERRUPTED, "server_restart",
+                                "server restarted during non-resumable upload or packaging",
+                                terminal_at=timestamp, updated_at=timestamp,
+                            )
+                        except StoreConflict:
+                            continue
                         conn.execute(
                             """
                             UPDATE push_jobs SET state='interrupted', revision=revision+1,
@@ -1112,6 +1206,22 @@ class PushJobStore:
                         )
                         cleanup_jobs.append(job_id)
                         touched.add(job_id)
+                    elif state in {JobState.FAILED, JobState.INTERRUPTED}:
+                        # Older versions could terminalize only the job. Repair
+                        # proven pre-dispatch rows once, preserving terminal history.
+                        try:
+                            changed = self._settle_pre_dispatch_targets(
+                                conn, job_id, state, row["failure_code"], row["failure_detail"],
+                                terminal_at=row["terminal_at"] if row["terminal_at"] is not None else row["updated_at"],
+                                updated_at=row["updated_at"],
+                            )
+                        except StoreConflict:
+                            continue
+                        if changed:
+                            conn.execute(
+                                "UPDATE push_jobs SET revision=revision+1 WHERE job_id=?", (job_id,)
+                            )
+                            touched.add(job_id)
                     elif state in {JobState.RUNNING, JobState.RECONCILING}:
                         conn.execute(
                             """
