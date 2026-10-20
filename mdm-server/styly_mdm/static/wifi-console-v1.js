@@ -167,6 +167,8 @@
     const getDevices = options.getDevices;
     const confirmApply = options.confirmApply || root.confirm.bind(root);
     let enabled = null;
+    let allowHttp = false;
+    let accessRenderKey = null;
     let authState = 'unknown';
     let authMessage = '';
     let state = null;
@@ -200,9 +202,24 @@
 
     function apiUrl(path) { return path; }
 
+    function transportAllowed() {
+      return root.location && (root.location.protocol === 'https:' ||
+        (allowHttp && root.location.protocol === 'http:'));
+    }
+
+    function renderAccess() {
+      renderAuth();
+      const key = [enabled, stateUnavailable, authState, allowHttp].join('|');
+      if (key !== accessRenderKey) {
+        accessRenderKey = key;
+        renderProfile();
+      }
+      updateButtons();
+    }
+
     function renderAuth() {
       if (!authPanel) return;
-      const secure = root.location && root.location.protocol === 'https:';
+      const secure = transportAllowed();
       const key = [enabled, stateUnavailable, authState, authMessage, secure].join('|');
       if (authPanel.dataset.wifiAuthKey === key) return;
       authPanel.dataset.wifiAuthKey = key;
@@ -224,12 +241,12 @@
       }
 
       authPanel.innerHTML = '<section class="wifi-auth"><div><strong>Wi-Fi administrator login</strong>' +
-        '<p>Enter the admin token. It is sent only over HTTPS and cleared after the login request.</p></div>' +
+        '<p>Enter the admin token. It is cleared after the login request.</p></div>' +
         '<form data-wifi-login-form>' +
         '<input class="field wifi-token" data-wifi-token type="password" autocomplete="current-password" aria-label="Admin token" placeholder="Admin token"' +
         (secure ? '' : ' disabled') + '>' +
         '<button class="btn-mini btn-save" type="submit"' + (secure ? '' : ' disabled') + '>Log in</button></form>' +
-        (secure ? '' : '<div class="wifi-feedback wifi-danger" role="alert">Open this console over HTTPS before entering an admin token.</div>') +
+        (secure ? '' : '<div class="wifi-feedback wifi-danger" role="alert">Use HTTPS, or explicitly enable managed-LAN HTTP on the server.</div>') +
         (authMessage ? '<div class="wifi-feedback wifi-danger" role="alert">' + escapeHtml(authMessage) + '</div>' : '') +
         '</section>';
     }
@@ -237,7 +254,7 @@
     function requestLogin() {
       authState = 'required';
       if (!authMessage) authMessage = '';
-      renderAuth();
+      renderAccess();
     }
 
     async function refreshState() {
@@ -248,8 +265,11 @@
         const response = await root.fetch(apiUrl('/api/wifi/state'), { credentials: 'same-origin' });
         if (response.status === 401) {
           if (requestedAuthGeneration !== authGeneration) return;
+          const access = await response.json();
+          allowHttp = access.allow_http === true;
           enabled = true;
           stateError = false;
+          stateUnavailable = false;
           requestLogin();
           return;
         }
@@ -257,8 +277,7 @@
           enabled = false;
           stateError = false;
           stateUnavailable = true;
-          renderAuth();
-          renderGroup(activeGroup, activeMembers, true);
+          renderAccess();
           return;
         }
         if (!response.ok) {
@@ -269,6 +288,7 @@
         }
         const nextState = await response.json();
         enabled = nextState && nextState.enabled === true;
+        allowHttp = nextState && nextState.allow_http === true;
         stateUnavailable = false;
         stateError = false;
         if (enabled) {
@@ -278,7 +298,7 @@
             authState = 'authenticated';
           }
         }
-        renderAuth();
+        renderAccess();
         renderTransientStatus();
         renderDeviceResults();
         if (activeGroup && enabled && authState !== 'required' && !profileFor(activeGroup).loaded) {
@@ -333,7 +353,7 @@
             : '<small>This saved security type is unsupported. Choose a supported type before saving.</small>';
         return '<article class="wifi-network" data-wifi-row="' + escapeHtml(network.id) + '">' +
           '<div class="wifi-network-head"><strong>Wi-Fi ' + (index + 1) + '</strong>' +
-          '<button class="btn-text wifi-remove" type="button" data-wifi-action="remove" data-wifi-row="' + escapeHtml(network.id) + '"' +
+          '<button class="btn-outline btn-danger-outline wifi-remove" type="button" data-wifi-action="remove" data-wifi-row="' + escapeHtml(network.id) + '"' +
           (model.draftNetworks.length <= 1 ? ' disabled' : '') + '>Remove</button></div>' +
           '<label>SSID<input class="field" data-wifi-row="' + escapeHtml(network.id) + '" data-wifi-field="ssid" type="text" autocomplete="off" value="' + escapeHtml(network.ssid) + '"></label>' +
           '<div class="wifi-fields"><label>Security<select class="field" data-wifi-row="' + escapeHtml(network.id) + '" data-wifi-field="security">' + securityOptions + '</select></label>' +
@@ -342,7 +362,7 @@
           (network.hidden ? ' checked' : '') + '> Hidden network</label></div></article>';
       }).join('');
 
-      const revisionText = model.savedRevision ? 'Profile revision ' + escapeHtml(model.savedRevision) : 'No saved Wi-Fi revision';
+      const revisionText = model.savedRevision ? 'Saved profile' : 'No saved profile';
       const busy = model.loading || model.saving || model.applying;
       const profileError = model.error ? '<div class="wifi-feedback wifi-danger" role="alert">' + escapeHtml(model.error) + '</div>' : '';
       const unavailable = enabled === false || stateUnavailable
@@ -350,17 +370,16 @@
       const authNeeded = enabled === true && authState !== 'authenticated'
         ? '<div class="wifi-feedback wifi-muted">Log in above to view or edit this group’s Wi-Fi settings.</div>' : '';
       const loading = model.loading && !model.loaded ? '<div class="wifi-feedback">Loading saved Wi-Fi settings…</div>' : '';
-      const savedHint = model.loaded ? '<div class="wifi-meta">' + revisionText + (model.dirty ? ' · Unsaved changes' : '') + '</div>' : '';
       const editable = model.loaded && enabled === true && authState === 'authenticated';
       groupPanel.innerHTML = '<section class="wifi-section"><div class="wifi-section-head"><div><h3>Wi-Fi settings</h3>' +
-        '<p>Save changes separately from applying them. Apply targets every online device in this group.</p></div>' +
-        '<span class="wifi-revision">' + revisionText + '</span></div>' +
+        '<p>Save this group’s networks, then apply the saved profile to its online devices.</p>' +
+        '<p class="wifi-meta">' + revisionText + '</p></div></div>' +
         '<div data-wifi-transient class="wifi-feedback" role="status" style="display:none"></div>' +
         '<div data-wifi-stale class="wifi-feedback wifi-danger" role="alert" style="display:none">The saved profile changed on the server. Reload it before saving or applying. <button class="btn-text" type="button" data-wifi-action="reload">Reload saved profile</button></div>' +
         profileError + unavailable + authNeeded + loading +
         (editable ? '<div class="wifi-network-list">' + (rowHtml || '<div class="wifi-empty">No networks saved yet.</div>') + '</div>' +
           '<div class="wifi-actions"><button class="btn-outline" type="button" data-wifi-action="add"' + (model.draftNetworks.length >= MAX_NETWORKS || busy ? ' disabled' : '') + '>Add Wi-Fi network</button>' +
-          '<div class="wifi-action-right"><span class="wifi-meta">' + (model.dirty ? 'Unsaved changes' : 'Saved') + '</span>' +
+          '<div class="wifi-action-right"><span class="wifi-meta">' + (model.dirty ? 'Unsaved changes' : model.savedRevision ? 'Saved' : 'Not saved') + '</span>' +
           '<button class="btn btn-primary" type="button" data-wifi-action="save"' + (!model.dirty || busy ? ' disabled' : '') + '>Save Wi-Fi settings</button>' +
           '<button class="btn btn-success" type="button" data-wifi-action="apply"' + (model.dirty || !model.savedRevision || busy ? ' disabled' : '') + '>Apply to whole group</button></div></div>' : '') +
         '<div class="wifi-device-results"><h4>Device results</h4><div data-wifi-device-list></div></div>' +
@@ -407,12 +426,12 @@
         const membershipNote = conflict ? '<span class="wifi-membership-note">Also listed in ' + escapeHtml(conflict) + '</span>' : '';
         return '<div class="wifi-device-row"><div class="wifi-device-title"><strong>' + escapeHtml(label) + '</strong>' +
           '<span class="wifi-online ' + (online ? 'online' : 'offline') + '"><i></i>' + (online ? 'Online' : 'Offline') + '</span>' + membershipNote + '</div>' +
-          '<div class="wifi-result ' + manual.tone + '"><span aria-hidden="true">' + manual.icon + '</span><span>Manual: ' + manual.label + '</span></div>' +
+          '<div class="wifi-device-status"><div class="wifi-result ' + manual.tone + '"><span aria-hidden="true">' + manual.icon + '</span><span>Manual: ' + manual.label + '</span></div>' +
           (manualReason ? '<div class="wifi-reason">' + escapeHtml(manualReason) + '</div>' : '') +
           (observationView ? '<div class="wifi-result wifi-observation ' + observationView.tone + '"><span aria-hidden="true">' + observationView.icon + '</span><span>' + observationView.label + '</span></div>' : '') +
           (boot ? '<div class="wifi-result wifi-boot ' + boot.tone + '"><span aria-hidden="true">' + boot.icon + '</span><span>Boot: ' + boot.label + '</span></div>' : '') +
           (bootReason ? '<div class="wifi-reason wifi-boot-reason">' + escapeHtml(bootReason) + '</div>' : '') +
-          '</div>';
+          '</div></div>';
       });
       list.innerHTML = rows.join('');
       updateButtons();
@@ -524,25 +543,33 @@
       const apply = groupPanel.querySelector('[data-wifi-action="apply"]');
       const currentRevision = state && state.groups && state.groups[activeGroup] && state.groups[activeGroup].revision;
       model.stale = !!(currentRevision && model.savedRevision && currentRevision !== model.savedRevision);
-      const busy = model.loading || model.saving || model.applying || model.stale;
+      const busy = model.loading || model.saving || model.applying || model.stale ||
+        enabled !== true || authState !== 'authenticated' || !transportAllowed();
       groupPanel.querySelectorAll('[data-wifi-field], [data-wifi-action="add"], [data-wifi-action="remove"]').forEach(function (control) {
-        control.disabled = busy;
+        const action = control.dataset && control.dataset.wifiAction;
+        const network = control.dataset && model.draftNetworks.find(function (row) {
+          return row.id === control.dataset.wifiRow;
+        });
+        control.disabled = busy || (action === 'remove' && model.draftNetworks.length <= 1) ||
+          (action === 'add' && model.draftNetworks.length >= MAX_NETWORKS) ||
+          (control.dataset && control.dataset.wifiField === 'password' && network && network.security === 'OPEN');
       });
       if (save) save.disabled = !model.dirty || busy;
       if (apply) apply.disabled = model.dirty || !model.savedRevision || busy;
       const stale = groupPanel.querySelector('[data-wifi-stale]');
       if (stale) stale.style.display = model.stale ? '' : 'none';
       const hint = groupPanel.querySelector('.wifi-action-right .wifi-meta');
-      if (hint) hint.textContent = model.dirty ? 'Unsaved changes' : 'Saved';
+      if (hint) hint.textContent = model.dirty ? 'Unsaved changes' : model.savedRevision ? 'Saved' : 'Not saved';
     }
 
     async function saveProfile() {
       if (!activeGroup) return;
       const name = activeGroup;
       const model = profileFor(name);
-      if (!model.loaded || model.stale || model.saving || model.applying) return;
-      if (!root.location || root.location.protocol !== 'https:') {
-        model.error = 'Wi-Fi changes require an HTTPS connection.';
+      if (enabled !== true || authState !== 'authenticated' ||
+          !model.loaded || model.stale || model.saving || model.applying) return;
+      if (!transportAllowed()) {
+        model.error = 'Wi-Fi changes require HTTPS or managed-LAN HTTP enabled on the server.';
         renderProfile();
         return;
       }
@@ -608,8 +635,8 @@
       const name = activeGroup;
       const model = profileFor(name);
       if (!model.savedRevision || model.stale || model.dirty || model.applying || model.saving) return;
-      if (!root.location || root.location.protocol !== 'https:') {
-        model.error = 'Wi-Fi changes require an HTTPS connection.';
+      if (!transportAllowed()) {
+        model.error = 'Wi-Fi changes require HTTPS or managed-LAN HTTP enabled on the server.';
         renderProfile();
         return;
       }
@@ -655,9 +682,9 @@
       const input = form.querySelector('[data-wifi-token]');
       let token = input ? input.value : '';
       if (input) input.value = '';
-      if (!root.location || root.location.protocol !== 'https:') {
+      if (!transportAllowed()) {
         token = '';
-        authMessage = 'Open this console over HTTPS before entering an admin token.';
+        authMessage = 'Use HTTPS, or explicitly enable managed-LAN HTTP on the server.';
         renderAuth();
         return;
       }
@@ -682,16 +709,16 @@
         }
         authState = 'authenticated';
         authMessage = '';
-        renderAuth();
+        renderAccess();
         if (typeof options.onAuthenticated === 'function') options.onAuthenticated();
-        if (activeGroup) await loadProfile(activeGroup, false);
+        if (activeGroup && !profileFor(activeGroup).dirty) await loadProfile(activeGroup, false);
         await refreshState();
       } catch (_) {
         authState = 'required';
         authMessage = 'Could not start a Wi-Fi administrator session.';
       } finally {
         token = '';
-        renderAuth();
+        renderAccess();
       }
     }
 

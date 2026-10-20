@@ -50,6 +50,27 @@ internal data class WifiConnectionSettings(
     val deviceToken: String? = null,
 )
 
+internal object WifiTransportAuthorization {
+    fun isAuthorizedSession(
+        url: String,
+        manuallyEnrolledEndpoint: Boolean,
+        settings: WifiConnectionSettings,
+    ): Boolean {
+        val expectedScheme = if (settings.tlsEnabled) "wss://" else "ws://"
+        return manuallyEnrolledEndpoint &&
+            url.startsWith(expectedScheme, ignoreCase = true) &&
+            !settings.deviceToken.isNullOrBlank()
+    }
+
+    fun authorizationTokenFor(
+        url: String,
+        manuallyEnrolledEndpoint: Boolean,
+        settings: WifiConnectionSettings,
+    ): String? = settings.deviceToken?.takeIf {
+        isAuthorizedSession(url, manuallyEnrolledEndpoint, settings)
+    }
+}
+
 internal enum class WifiManualPhase(val wireValue: String) {
     PREPARED("prepared"),
     APPLYING("applying"),

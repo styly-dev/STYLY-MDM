@@ -214,7 +214,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun useAutoDiscovery() {
         val settings = MdmClientApplication.wifiSettingsController().connectionSettings()
-        if (settings.tlsEnabled && settings.deviceToken != null) {
+        if (settings.deviceToken != null) {
             Toast.makeText(this, R.string.wifi_token_requires_manual_server, Toast.LENGTH_LONG).show()
             return
         }

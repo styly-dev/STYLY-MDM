@@ -432,7 +432,7 @@ class WifiSettingsControllerTest {
         }
 
         fun register() {
-            controller.onCanonicalRegistered(secure = true) { message ->
+            controller.onCanonicalRegistered(authorized = true) { message ->
                 messages += JSONObject(message.toString())
                 true
             }
@@ -440,7 +440,7 @@ class WifiSettingsControllerTest {
         }
 
         fun enqueueApply(payload: JSONObject) {
-            controller.handleServerMessage("EXECUTE_WIFI_APPLY", payload, secure = true) { message ->
+            controller.handleServerMessage("EXECUTE_WIFI_APPLY", payload, authorized = true) { message ->
                 messages += JSONObject(message.toString())
                 true
             }
@@ -453,7 +453,7 @@ class WifiSettingsControllerTest {
 
         fun sendVerifyAck(operationId: String, challenge: String) {
             val payload = JSONObject().put("operation_id", operationId).put("challenge", challenge)
-            controller.handleServerMessage("WIFI_VERIFY_ACK", payload, secure = true) { message ->
+            controller.handleServerMessage("WIFI_VERIFY_ACK", payload, authorized = true) { message ->
                 messages += JSONObject(message.toString())
                 true
             }
@@ -475,7 +475,7 @@ class WifiSettingsControllerTest {
                 put("reason", reason.wireValue)
                 put("rolled_back", rolledBack)
             }
-            controller.handleServerMessage("WIFI_RESULT_ACK", payload, secure = true) { true }
+            controller.handleServerMessage("WIFI_RESULT_ACK", payload, authorized = true) { true }
             operationExecutor.runAll()
         }
     }

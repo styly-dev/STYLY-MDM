@@ -129,12 +129,11 @@ class WebSocketManager internal constructor(
             return effectiveUrl(configured, MdmClientApplication.wifiSettingsController().connectionSettings().tlsEnabled)
         }
 
-        private fun isTrustedWifiEndpoint(context: Context, url: String): Boolean {
+        private fun isTrustedWifiEndpoint(context: Context, url: String, selectedManually: Boolean): Boolean {
             val configured = preferences(context)
                 .getString(PREF_MANUAL_SERVER_URL, null)
-                ?.takeIf(::isCanonicalManualServerUrl)
-                ?: return false
-            return url == effectiveUrl(configured, tlsEnabled = true)
+            val settings = MdmClientApplication.wifiSettingsController().connectionSettings()
+            return isTrustedManualWifiEndpoint(configured, url, settings.tlsEnabled, selectedManually)
         }
 
         internal fun getManualServerAddress(context: Context): String? {
@@ -157,6 +156,18 @@ class WebSocketManager internal constructor(
                 host
             }
             return "$formattedHost:${httpUrl.port}"
+        }
+
+        internal fun isTrustedManualWifiEndpoint(
+            configuredManualUrl: String?,
+            candidateUrl: String,
+            tlsEnabled: Boolean,
+            selectedManually: Boolean,
+        ): Boolean {
+            val configured = configuredManualUrl?.takeIf(::isCanonicalManualServerUrl) ?: return false
+            val expectedScheme = if (tlsEnabled) "wss://" else "ws://"
+            return selectedManually && candidateUrl == effectiveUrl(configured, tlsEnabled) &&
+                candidateUrl.startsWith(expectedScheme, ignoreCase = true)
         }
 
         private fun getCachedServerUrl(context: Context): String {
@@ -273,7 +284,7 @@ class WebSocketManager internal constructor(
     @Volatile private var socketOpen = false
     private val registration = ConnectionRegistration<WebSocket>()
     @Volatile private var connectedServerAddress: String? = null
-    @Volatile private var connectedSecureWifiSession = false
+    @Volatile private var connectedAuthorizedWifiSession = false
     private val identityListener: (DeviceIdentityState) -> Unit = { state ->
         reconnectHandler.post {
             val current = webSocket
@@ -338,7 +349,7 @@ class WebSocketManager internal constructor(
         socketOpen = false
         registration.clear()
         connectedServerAddress = null
-        connectedSecureWifiSession = false
+        connectedAuthorizedWifiSession = false
         wifiController.onTransportDisconnected()
     }
 
@@ -416,7 +427,7 @@ class WebSocketManager internal constructor(
     /** Starts an attempt using the connection mode fixed when the window opened. */
     private fun startAttempt() {
         when (val target = connectionAttemptPolicy.targetForAttempt()) {
-            is ConnectionAttemptPolicy.Target.Manual -> doConnect(target.url)
+            is ConnectionAttemptPolicy.Target.Manual -> doConnect(target.url, selectedManually = true)
             ConnectionAttemptPolicy.Target.AutoDiscovery -> startAutoDiscoveryAttempt()
         }
     }
@@ -433,9 +444,15 @@ class WebSocketManager internal constructor(
                 if (discovered != null && isValidWsUrl(discovered)) {
                     Log.i(TAG, "Discovered server at: $discovered")
                     saveDiscoveredServerUrl(discovered)
-                    doConnect(effectiveUrl(discovered, wifiController.connectionSettings().tlsEnabled))
+                    doConnect(
+                        effectiveUrl(discovered, wifiController.connectionSettings().tlsEnabled),
+                        selectedManually = false,
+                    )
                 } else {
-                    doConnect(effectiveUrl(getCachedServerUrl(context), wifiController.connectionSettings().tlsEnabled))
+                    doConnect(
+                        effectiveUrl(getCachedServerUrl(context), wifiController.connectionSettings().tlsEnabled),
+                        selectedManually = false,
+                    )
                 }
             }
         }.start()
@@ -453,26 +470,32 @@ class WebSocketManager internal constructor(
         stopBatteryTelemetry()
     }
 
-    private fun doConnect(url: String) {
+    private fun doConnect(url: String, selectedManually: Boolean) {
         if (!isRunning) return
 
         val effective = effectiveUrl(url, wifiController.connectionSettings().tlsEnabled)
         Log.i(TAG, "Connecting to $effective")
         onStatusChanged(false, "Connecting to $effective...")
 
-        val trustedWifiEndpoint = isTrustedWifiEndpoint(context, effective)
+        val trustedManualWifiEndpoint = isTrustedWifiEndpoint(context, effective, selectedManually)
         val requestBuilder = Request.Builder().url(effective)
-        wifiController.authorizationTokenFor(effective, trustedWifiEndpoint)?.let { token ->
+        wifiController.authorizationTokenFor(effective, trustedManualWifiEndpoint)?.let { token ->
             requestBuilder.header("Authorization", "Bearer $token")
         }
         val request = requestBuilder.build()
-        connectedSecureWifiSession = wifiController.supportsWifiOn(effective, trustedWifiEndpoint)
+        connectedAuthorizedWifiSession = wifiController.supportsWifiOn(effective, trustedManualWifiEndpoint)
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
 
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.i(TAG, "WebSocket connected")
                 reconnectHandler.post {
                     if (this@WebSocketManager.webSocket !== webSocket) return@post
+                    if (response.request.url != request.url) {
+                        connectedAuthorizedWifiSession = false
+                        webSocket.cancel()
+                        onSocketGone(webSocket, "Rejected changed WebSocket endpoint")
+                        return@post
+                    }
                     dispatch(scheduler.onConnected())
                     socketOpen = true
                     registration.open(webSocket)
@@ -500,9 +523,9 @@ class WebSocketManager internal constructor(
                         }
                         pushCoordinator.onRegistered(webSocket)
                         if (registration.isCanonicalAcknowledged(webSocket)) {
-                            wifiController.onCanonicalRegistered(connectedSecureWifiSession) { message ->
+                            wifiController.onCanonicalRegistered(connectedAuthorizedWifiSession) { message ->
                                 this@WebSocketManager.webSocket === webSocket &&
-                                    connectedSecureWifiSession &&
+                                    connectedAuthorizedWifiSession &&
                                     registration.isCanonicalAcknowledged(webSocket) &&
                                     webSocket.send(message.toString())
                             }
@@ -540,10 +563,10 @@ class WebSocketManager internal constructor(
                         wifiController.handleServerMessage(
                             type,
                             json,
-                            connectedSecureWifiSession && registration.isCanonicalAcknowledged(webSocket),
+                            connectedAuthorizedWifiSession && registration.isCanonicalAcknowledged(webSocket),
                         ) { message ->
                             this@WebSocketManager.webSocket === webSocket &&
-                                connectedSecureWifiSession &&
+                                connectedAuthorizedWifiSession &&
                                 registration.isCanonicalAcknowledged(webSocket) &&
                                 webSocket.send(message.toString())
                         }
@@ -663,7 +686,7 @@ class WebSocketManager internal constructor(
                 put("device_id", identity.deviceId)
                 put("process_instance_id", pushFields!!.getString("process_instance_id"))
                 val capabilities = JSONArray(pushFields.getJSONArray("capabilities").toString())
-                if (connectedSecureWifiSession &&
+                if (connectedAuthorizedWifiSession &&
                     (0 until capabilities.length()).none { capabilities.optString(it) == WIFI_SETTINGS_CAPABILITY }
                 ) capabilities.put(WIFI_SETTINGS_CAPABILITY)
                 put("capabilities", capabilities)
