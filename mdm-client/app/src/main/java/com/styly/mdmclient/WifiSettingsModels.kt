@@ -6,7 +6,13 @@ import org.json.JSONObject
 internal const val WIFI_SETTINGS_CAPABILITY = "wifi_settings_v3"
 internal const val WIFI_MANUAL_TIMEOUT_MS = 60_000L
 internal const val WIFI_MAX_NETWORKS = 32
+internal const val WIFI_MAX_OPERATION_RECEIPTS = 500
 internal const val WIFI_RECOVERY_SCOPE_MDM_PROFILES = "mdm_profiles"
+
+internal fun appendWifiOperationReceipt(existing: List<String>, operationId: String): List<String> =
+    (existing.filterNot { it == operationId } + operationId)
+        .distinct()
+        .takeLast(WIFI_MAX_OPERATION_RECEIPTS)
 
 internal enum class WifiReason(val wireValue: String) {
     NONE("NONE"),
@@ -39,13 +45,6 @@ internal data class WifiSavedProfile(
     val networks: List<WifiNetworkProfile>,
 )
 
-internal data class WifiNetworkSnapshot(
-    val profile: WifiNetworkProfile,
-    val enabled: Boolean,
-    val priority: Int,
-    val configurationParcel: String? = null,
-)
-
 internal data class WifiConnectionSettings(
     val tlsEnabled: Boolean = false,
 )
@@ -53,7 +52,6 @@ internal data class WifiConnectionSettings(
 internal enum class WifiManualPhase(val wireValue: String) {
     PREPARED("prepared"),
     APPLYING("applying"),
-    VERIFYING("verifying"),
     ROLLING_BACK("rolling_back"),
 }
 
@@ -61,13 +59,11 @@ internal data class WifiManualOperation(
     val operationId: String,
     val revision: String,
     val candidate: List<WifiNetworkProfile>,
-    val restoreSnapshot: List<WifiNetworkSnapshot>,
+    val recoveryNetworks: List<WifiNetworkProfile>,
     val phase: WifiManualPhase,
-    val challenge: String? = null,
     val deadlineElapsedMillis: Long? = null,
     val failureReason: WifiReason? = null,
     val settingsChanged: Boolean = false,
-    val finalStateValidated: Boolean = false,
     val policyEpoch: Long = 0L,
 )
 
@@ -207,32 +203,8 @@ internal object WifiSettingsProtocol {
     }
 }
 
-/** Pure state decisions used by the Android coordinator and host-side tests. */
-internal object WifiManualStateMachine {
-    fun beginVerify(operation: WifiManualOperation, challenge: String, deadlineElapsedMillis: Long): WifiManualOperation =
-        operation.copy(
-            phase = WifiManualPhase.VERIFYING,
-            challenge = challenge,
-            deadlineElapsedMillis = deadlineElapsedMillis,
-        )
-
-    fun acceptsVerifyAck(
-        operation: WifiManualOperation?,
-        operationId: String,
-        challenge: String,
-        nowElapsedMillis: Long,
-    ): Boolean = operation != null &&
-        operation.phase == WifiManualPhase.VERIFYING &&
-        operation.operationId == operationId &&
-        operation.challenge == challenge &&
-        (operation.deadlineElapsedMillis == null || nowElapsedMillis < operation.deadlineElapsedMillis)
-
-    fun isExpired(operation: WifiManualOperation, nowElapsedMillis: Long): Boolean =
-        operation.deadlineElapsedMillis?.let { nowElapsedMillis >= it } ?: false
-}
-
 internal object WifiSettingsCodec {
-    private const val VERSION = 4
+    private const val VERSION = 5
 
     fun encode(state: WifiLocalState): String = JSONObject().apply {
         put("version", VERSION)
@@ -256,7 +228,7 @@ internal object WifiSettingsCodec {
     fun decode(text: String): WifiLocalState {
         val root = JSONObject(text)
         val version = root.optInt("version", -1)
-        if (version !in 1..VERSION) throw IllegalArgumentException("unsupported Wi-Fi state version")
+        if (version !in 4..VERSION) throw IllegalArgumentException("unsupported Wi-Fi state version")
         val connectionJson = root.optJSONObject("connection") ?: JSONObject()
         val connection = WifiConnectionSettings(
             tlsEnabled = requiredBoolean(connectionJson, "tls_enabled", default = false),
@@ -292,33 +264,37 @@ internal object WifiSettingsCodec {
         put("operation_id", operation.operationId)
         put("revision", operation.revision)
         put("candidate", encodeNetworks(operation.candidate))
-        put("restore_snapshot", encodeSnapshot(operation.restoreSnapshot))
+        put("recovery_networks", encodeNetworks(operation.recoveryNetworks))
         put("phase", operation.phase.wireValue)
-        put("challenge", operation.challenge ?: JSONObject.NULL)
         put("deadline_elapsed_ms", operation.deadlineElapsedMillis ?: JSONObject.NULL)
         put("failure_reason", operation.failureReason?.wireValue ?: JSONObject.NULL)
         put("settings_changed", operation.settingsChanged)
-        put("final_state_validated", operation.finalStateValidated)
         put("policy_epoch", operation.policyEpoch)
     }
 
     private fun decodeManualOperation(json: JSONObject, version: Int): WifiManualOperation {
-        val phase = WifiManualPhase.entries.firstOrNull { it.wireValue == json.getString("phase") }
-            ?: throw IllegalArgumentException("unknown Wi-Fi manual phase")
+        val storedPhase = json.getString("phase")
+        val phase = if (version == 4 && storedPhase == "verifying") {
+            WifiManualPhase.ROLLING_BACK
+        } else {
+            WifiManualPhase.entries.firstOrNull { it.wireValue == storedPhase }
+                ?: throw IllegalArgumentException("unknown Wi-Fi manual phase")
+        }
         val settingsChanged = requiredBoolean(json, "settings_changed", default = false)
+        val recoveryNetworks = if (version == 4) {
+            decodeV4RecoveryNetworks(json.getJSONArray("restore_snapshot"))
+        } else {
+            decodeNetworks(json.getJSONArray("recovery_networks"))
+        }
         return WifiManualOperation(
             operationId = json.getString("operation_id"),
             revision = json.getString("revision"),
             candidate = decodeNetworks(json.getJSONArray("candidate")),
-            restoreSnapshot = decodeSnapshot(json.getJSONArray("restore_snapshot")),
+            recoveryNetworks = recoveryNetworks,
             phase = phase,
-            challenge = optionalString(json, "challenge"),
             deadlineElapsedMillis = optionalLong(json, "deadline_elapsed_ms"),
             failureReason = optionalString(json, "failure_reason")?.let(::reasonFromWire),
-            // A v1 VERIFYING record was written after a candidate had been checked and
-            // must restore on upgrade; it must never wait for the removed server ACK.
-            settingsChanged = settingsChanged || (version == 1 && phase == WifiManualPhase.VERIFYING),
-            finalStateValidated = requiredBoolean(json, "final_state_validated", default = false),
+            settingsChanged = settingsChanged || (version == 4 && storedPhase == "verifying"),
             policyEpoch = json.optLong("policy_epoch", 0L).coerceAtLeast(0L),
         )
     }
@@ -378,30 +354,17 @@ internal object WifiSettingsCodec {
         }
     }
 
-    private fun encodeSnapshot(snapshot: List<WifiNetworkSnapshot>) = JSONArray().apply {
-        snapshot.forEach { entry ->
-            put(JSONObject().apply {
-                put("network", encodeNetworks(listOf(entry.profile)).getJSONObject(0))
-                put("enabled", entry.enabled)
-                put("priority", entry.priority)
-                put("configuration_parcel", entry.configurationParcel ?: JSONObject.NULL)
-            })
+    private fun decodeV4RecoveryNetworks(array: JSONArray): List<WifiNetworkProfile> = buildList {
+        if (array.length() !in 1..WIFI_MAX_NETWORKS) {
+            throw IllegalArgumentException("invalid Wi-Fi recovery profile")
         }
-    }
-
-    private fun decodeSnapshot(array: JSONArray): List<WifiNetworkSnapshot> = buildList {
-        if (array.length() > 256) throw IllegalArgumentException("too many Wi-Fi snapshot entries")
         for (index in 0 until array.length()) {
             val item = array.getJSONObject(index)
             val network = decodeNetworks(JSONArray().put(item.getJSONObject("network"))).single()
-            add(
-                WifiNetworkSnapshot(
-                    network,
-                    item.getBoolean("enabled"),
-                    item.getInt("priority"),
-                    optionalString(item, "configuration_parcel"),
-                ),
-            )
+            if (!item.getBoolean("enabled") || item.getInt("priority") != 0 ||
+                optionalString(item, "configuration_parcel") != null
+            ) throw IllegalArgumentException("unsupported legacy Wi-Fi recovery snapshot")
+            add(network)
         }
     }
 
@@ -435,7 +398,7 @@ internal object WifiSettingsCodec {
                 }
                 add(item)
             }
-        }.distinct()
+        }.distinct().takeLast(WIFI_MAX_OPERATION_RECEIPTS)
     }
 
     private fun reasonFromWire(value: String): WifiReason =

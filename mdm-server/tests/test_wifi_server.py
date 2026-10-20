@@ -198,7 +198,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
                 json={"expected_revision": profile["revision"]},
             ) as response:
                 assert response.status == 409
-            assert store.state["operations"] == {}
+            assert store.state["devices"] == {}
 
             stale_revision = profile["revision"]
             stale_change = {"networks": [{
@@ -215,7 +215,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
                 json={"expected_revision": stale_revision},
             ) as response:
                 assert response.status == 409
-            assert store.state["operations"] == {}
+            assert store.state["devices"] == {}
             for ws in (capable, old_v1, unsupported, v2_only):
                 await assert_no_message(ws)
 
@@ -260,7 +260,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             ):
                 delivery = store.state_view({device_id}, set())[device_id]["delivery"]
                 assert (delivery["status"], delivery["reason"]) == expected
-                operation = store.state["operations"][result_by_id[device_id]["operation_id"]]
+                operation = store.state["devices"][device_id]["delivery"]
                 assert "networks" not in operation
                 assert "password" not in operation
 
@@ -308,7 +308,6 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             assert store.state_view({capable_id}, set())[capable_id]["delivery"]["status"] == "sent"
 
             previous_devices = json.loads(json.dumps(store.state["devices"]))
-            previous_operation_ids = set(store.state["operations"])
             async with session.delete(
                 base_url + "/api/wifi/groups/Studio",
                 headers=good_headers,
@@ -323,7 +322,6 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
                 "revision": unmanaged_profile["revision"], "mode": "unmanaged", "networks": [],
             }
             assert store.state["devices"] == previous_devices
-            assert set(store.state["operations"]) == previous_operation_ids
             async with session.get(base_url + "/api/wifi/groups/Studio") as response:
                 assert (await response.json())["mode"] == "unmanaged"
             async with session.get(base_url + "/api/wifi/state") as response:
@@ -346,7 +344,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
                 json={"expected_revision": deployed["revision"]},
             ) as response:
                 assert response.status == 409
-            assert set(store.state["operations"]) == previous_operation_ids
+            assert store.state["devices"] == previous_devices
             for ws in (capable, old_v1, unsupported, v2_only):
                 await assert_no_message(ws)
 
@@ -356,7 +354,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
                 json={"expected_revision": unmanaged_profile["revision"]},
             ) as response:
                 assert response.status == 409
-            assert set(store.state["operations"]) == previous_operation_ids
+            assert store.state["devices"] == previous_devices
             for ws in (capable, old_v1, unsupported, v2_only):
                 await assert_no_message(ws)
 

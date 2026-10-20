@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import json
-import time
 import uuid
 
 import pytest
@@ -51,7 +50,7 @@ def test_profile_and_delivery_state_are_encrypted_without_snapshot_password_dupl
         "operation_id", "group", "device_id", "revision", "status", "reason",
         "attempted_at", "updated_at",
     }
-    assert store.state["devices"]["device-1"]["delivery"]["status"] == "unknown"
+    assert store.state_view({"device-1"}, set())["device-1"]["delivery"]["status"] == "unknown"
     assert public_networks(changed["networks"]) == [{
         "ssid": "Studio Wi-Fi",
         "security": "WPA_PSK",
@@ -61,7 +60,7 @@ def test_profile_and_delivery_state_are_encrypted_without_snapshot_password_dupl
 
     restored = WiFiSettingsStore(path, key.decode("ascii"))
     assert restored.profile("Studio") == changed
-    operation = restored.state["operations"][attempt["operation_id"]]
+    operation = restored.state["devices"]["device-1"]["delivery"]
     assert operation["status"] == "unknown"
     assert operation["reason"] == "server_restarted"
     assert "networks" not in operation
@@ -96,13 +95,13 @@ def test_restart_marks_interrupted_send_unknown_and_does_not_replay(tmp_path):
     attempt = store.create_delivery_attempts("Studio", profile["revision"], ["device-1"])[0]
 
     restored = WiFiSettingsStore(path, key.decode("ascii"))
-    operation = restored.state["operations"][attempt["operation_id"]]
+    operation = restored.state["devices"]["device-1"]["delivery"]
     delivery = restored.state["devices"]["device-1"]["delivery"]
     assert operation["status"] == "unknown"
     assert operation["reason"] == "server_restarted"
     assert delivery["status"] == "unknown"
     assert delivery["reason"] == "server_restarted"
-    assert not any(item.get("status") == "dispatching" for item in restored.state["operations"].values())
+    assert delivery["operation_id"] == attempt["operation_id"]
 
 
 @pytest.mark.parametrize("transition", ["create", "settle"])
@@ -123,96 +122,59 @@ def test_failed_persistence_rolls_back_delivery_state(tmp_path, transition):
         if transition == "create":
             store.create_delivery_attempts("Studio", profile["revision"], ["device-1"])
         else:
-            store.settle_delivery(attempt["operation_id"], "sent", None)
+            store.settle_delivery(attempt["device_id"], attempt["operation_id"], "sent", None)
     assert store.state == before
 
 
-def test_v1_success_result_migrates_to_unknown_delivery_without_network_snapshot(tmp_path):
-    path = tmp_path / "wifi_settings.enc"
-    key = Fernet.generate_key()
-    fernet = Fernet(key)
-    revision = str(uuid.uuid4())
-    operation_id = str(uuid.uuid4())
-    legacy = {
-        "version": 1,
-        "profiles": {
-            "Studio": {
-                "revision": revision,
-                "networks": [{
-                    "ssid": "Studio Wi-Fi",
-                    "security": "WPA_PSK",
-                    "password": "correct-horse",
-                    "hidden": False,
-                }],
-            },
-        },
-        "operations": {
-            operation_id: {
-                "operation_id": operation_id,
-                "device_id": "device-1",
-                "revision": revision,
-                "status": "success",
-                "reason": "NONE",
-                "networks": [{
-                    "ssid": "Studio Wi-Fi",
-                    "security": "WPA_PSK",
-                    "password": "correct-horse",
-                    "hidden": False,
-                }],
-                "created_at": time.time(),
-            },
-        },
-        "devices": {
-            "device-1": {
-                "manual": {
-                    "operation_id": operation_id,
-                    "revision": revision,
-                    "status": "success",
-                    "reason": "NONE",
-                    "rolled_back": False,
-                },
-                "applied_revision": revision,
-            },
-        },
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(fernet.encrypt(json.dumps(legacy).encode("utf-8")))
-
-    migrated = WiFiSettingsStore(path, key)
-    delivery = migrated.state["devices"]["device-1"]["delivery"]
-    assert migrated.state["version"] == 2
-    assert migrated.profile("Studio")["revision"] == revision
-    assert migrated.profile("Studio")["mode"] == "managed"
-    assert delivery["operation_id"] == operation_id
-    assert delivery["revision"] == revision
-    assert delivery["status"] == "unknown"
-    assert delivery["reason"] == "legacy_result_untracked"
-    assert migrated.state["operations"][operation_id]["status"] == "unknown"
-    assert "networks" not in migrated.state["operations"][operation_id]
-    assert b"correct-horse" not in path.read_bytes()
-
-
-def test_v2_profile_without_mode_migrates_to_managed(tmp_path):
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_current_v2_migration_preserves_latest_delivery_and_discards_duplicate_history(tmp_path, interrupted):
     path = tmp_path / "wifi_settings.enc"
     store, key = _store(path)
     profile = store.put_profile("Studio", validate_profile_networks(_profile()))
-    legacy_v2 = copy.deepcopy(store.state)
-    del legacy_v2["profiles"]["Studio"]["mode"]
-    path.write_bytes(Fernet(key).encrypt(json.dumps(legacy_v2).encode("utf-8")))
+    attempt = store.create_delivery_attempts("Studio", profile["revision"], ["device-1"])[0]
+    operation = dict(attempt, status="dispatching" if interrupted else "sent")
+    delivery = {k: v for k, v in attempt.items() if k not in {"group", "device_id"}}
+    delivery.update(status="unknown" if interrupted else "sent",
+                    reason="dispatch_not_confirmed" if interrupted else None)
+    old_id = str(uuid.uuid4())
+    old_state = {
+        "version": 2,
+        "profiles": copy.deepcopy(store.state["profiles"]),
+        "devices": {"device-1": {"delivery": delivery}},
+        "operations": {attempt["operation_id"]: operation, old_id: dict(operation, operation_id=old_id)},
+    }
+    path.write_bytes(Fernet(key).encrypt(json.dumps(old_state).encode()))
 
     restored = WiFiSettingsStore(path, key)
 
-    assert restored.profile("Studio")["revision"] == profile["revision"]
-    assert restored.profile("Studio")["mode"] == "managed"
-    payload = Fernet(key).decrypt(path.read_bytes())
-    assert json.loads(payload)["profiles"]["Studio"]["mode"] == "managed"
+    assert restored.state["version"] == 3
+    assert "operations" not in restored.state
+    assert restored.profile("Studio") == profile
+    latest = restored.state["devices"]["device-1"]["delivery"]
+    assert latest["operation_id"] == attempt["operation_id"]
+    assert latest["revision"] == profile["revision"]
+    assert latest["status"] == ("unknown" if interrupted else "sent")
+    assert latest["reason"] == ("server_restarted" if interrupted else None)
+    assert WiFiSettingsStore(path, key).state == restored.state
+
+
+def test_unsupported_local_prototype_format_is_not_silently_reinterpreted(tmp_path):
+    path = tmp_path / "wifi_settings.enc"
+    key = Fernet.generate_key()
+    path.write_bytes(Fernet(key).encrypt(json.dumps({
+        "version": 1, "profiles": {}, "devices": {}, "operations": {},
+    }).encode()))
+    original = path.read_bytes()
+    with pytest.raises(WiFiStoreError, match="unsupported format"):
+        WiFiSettingsStore(path, key)
+    assert path.read_bytes() == original
 
 
 def test_unmanaged_profile_has_empty_networks_and_preserves_delivery(tmp_path):
     store, _key = _store(tmp_path / "wifi_settings.enc")
     managed = store.put_profile("Studio", validate_profile_networks(_profile()))
     attempt = store.create_delivery_attempts("Studio", managed["revision"], ["device-1"])[0]
-    assert store.settle_delivery(attempt["operation_id"], "sent", None)
+    assert store.settle_delivery(attempt["device_id"], attempt["operation_id"], "sent", None)
     previous_delivery = copy.deepcopy(store.state["devices"]["device-1"]["delivery"])
 
     unmanaged = store.put_profile("Studio", [], mode="unmanaged")
@@ -232,12 +194,12 @@ def test_superseded_send_settlement_does_not_replace_newer_device_delivery(tmp_p
     first = store.create_delivery_attempts("Studio", revision_a, ["device-1"])[0]
     second = store.create_delivery_attempts("Studio", revision_b, ["device-1"])[0]
 
-    assert store.settle_delivery(first["operation_id"], "sent", None)
+    assert store.settle_delivery(first["device_id"], first["operation_id"], "sent", None)
     current = store.state["devices"]["device-1"]["delivery"]
     assert current["operation_id"] == second["operation_id"]
     assert current["revision"] == revision_b
-    assert current["status"] == "unknown"
-    assert store.settle_delivery(second["operation_id"], "sent", None)
+    assert store.state_view({"device-1"}, set())["device-1"]["delivery"]["status"] == "unknown"
+    assert store.settle_delivery(second["device_id"], second["operation_id"], "sent", None)
     assert store.state["devices"]["device-1"]["delivery"]["status"] == "sent"
 
 
@@ -245,7 +207,7 @@ def test_state_view_exposes_only_latest_delivery(tmp_path):
     store, _key = _store(tmp_path / "wifi_settings.enc")
     profile = store.put_profile("Studio", validate_profile_networks(_profile()))
     attempt = store.create_delivery_attempts("Studio", profile["revision"], ["device-1"])[0]
-    assert store.settle_delivery(attempt["operation_id"], "sent", None)
+    assert store.settle_delivery(attempt["device_id"], attempt["operation_id"], "sent", None)
     assert store.state_view({"device-1", "device-2"}, {"device-1"}) == {
         "device-1": {
             "delivery": {

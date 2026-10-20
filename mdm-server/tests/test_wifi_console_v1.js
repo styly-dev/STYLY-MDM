@@ -31,7 +31,13 @@ test('membership conflict accepts serial aliases and delivery never claims local
   assert.equal(wifi.deliveryStatus({ delivery: { status: 'sent', revision: 'r1' } }, 'r2').label, 'Sent (previous profile)');
   assert.equal(wifi.deliveryStatus({ manual: { status: 'success', revision: 'r1' } }, 'r1').label, 'Not sent');
   assert.match(wifi.reasonLabel({ reason: 'unsupported' }), /Update this client/);
-  assert.match(wifi.reasonLabel({ reason: 'permission_denied' }), /earlier deployment/);
+});
+
+test('profile identities match server rules for shared SSIDs and different security', () => {
+  const open = { ssid: 'Studio', security: 'OPEN', password: '', hidden: false };
+  const psk = { ssid: 'Studio', security: 'WPA_PSK', password: 'studio-key', hidden: false };
+  assert.deepEqual(wifi.buildProfilePayload([open, psk], []).payload.networks, [open, psk]);
+  assert.match(wifi.buildProfilePayload([psk, psk], []).error, /combination must be unique/);
 });
 
 test('send failures and interrupted sends remain distinct from device Wi-Fi results', () => {

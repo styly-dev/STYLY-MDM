@@ -103,20 +103,13 @@ disables boot reapplication while retaining the device’s existing Wi-Fi networ
 is at most one group per device. See [`WIFI_SETTINGS.md`](WIFI_SETTINGS.md) for
 local recovery, migration, setup and the physical-verification boundary.
 
-Physical testing on a PICO 4 Ultra Enterprise (PUI 5.15.7) on 2026-10-20 found
-that the ordinary client rejects managed deployment with `PERMISSION_DENIED`.
-After explicitly authorized Device Owner provisioning, the normal client could
-read configurations but old PSKs remained masked; deployment then stopped before
-mutation with `RESTORE_INFO_MISSING`. This led to the approved v3 MDM-known
-recovery contract instead of full OS snapshots. `MdmDeviceAdminReceiver` permits explicit
-ADB provisioning; its declaration alone applies no policies or ownership.
-V3 real-device tests passed for local connection, known-credential rollback,
-process recovery and boot reapplication. Production recovery starts only after
-the service enters its location foreground-service type (when precise location
-is granted), keeping configured-network visibility available without background
-location access. Cold rollback alarms start that service before recovery.
-Individual outcomes and limits are recorded in
-[`the hardware report`](../tasks/wifi-hardware-validation-2026-10-20.md).
+`MdmDeviceAdminReceiver` supports explicit provisioning without automatic
+ownership or extra policy. The controller starts recovery after location
+foreground-service promotion. Profiles are the sole recovery representation;
+there is no OS snapshot/Parcel restoration or server verification state machine.
+The server persists only the latest send per device. See the
+[hardware and review report](../tasks/wifi-hardware-validation-2026-10-20.md)
+for physical results and verification limits.
 
 ## Building the MDM Client
 

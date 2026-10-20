@@ -80,7 +80,7 @@
   <rect x="20" y="200" width="900" height="130" rx="8" fill="#fff2cc" stroke="#d6b656"/>
   <text x="470" y="224" text-anchor="middle" font-size="14" font-weight="bold" fill="#333">Wi-Fi settings ownership</text>
   <text x="470" y="247" text-anchor="middle" font-size="12" fill="#555">Console: save / register initial recovery / send whole group on the managed LAN</text>
-  <text x="470" y="267" text-anchor="middle" font-size="12" fill="#555">Server: encrypted profiles + frozen online delivery; no application-result tracking</text>
+  <text x="470" y="267" text-anchor="middle" font-size="12" fill="#555">Server: encrypted profiles + latest delivery per device; frozen online sends</text>
   <text x="470" y="287" text-anchor="middle" font-size="12" fill="#555">Android: location FGS before recovery; local SSID/IP check + 60s rollback + successful boot baseline</text>
   <text x="470" y="307" text-anchor="middle" font-size="12" fill="#555">HTTP/TLS connection; unmanaged deployment keeps Wi-Fi and disables boot correction.</text>
 </svg>

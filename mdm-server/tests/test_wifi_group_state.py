@@ -8,6 +8,8 @@ import copy
 import json
 from pathlib import Path
 
+import pytest
+
 from cryptography.fernet import Fernet
 
 from styly_mdm import server
@@ -59,7 +61,7 @@ def test_group_members_reject_cross_group_assignments_but_allow_changes_after_di
 
         profile = store.put_profile("Alpha", _networks())
         operation = store.create_delivery_attempts("Alpha", profile["revision"], ["device-a"])[0]
-        assert store.settle_delivery(operation["operation_id"], "sent", None)
+        assert store.settle_delivery(operation["device_id"], operation["operation_id"], "sent", None)
         await server.handle_set_group_members(
             admin, {"name": "Alpha", "members": []}, app=fake_app,
         )
@@ -181,3 +183,43 @@ def test_startup_recovers_crash_between_registry_and_profile_replacements(tmp_pa
     assert app["wifi_store"].profile("Old") is not None
     assert app["wifi_store"].profile("New") is None
     assert not server._wifi_group_journal_path().exists()
+
+
+@pytest.mark.parametrize("sync_fails", [False, True])
+def test_recovery_syncs_restored_directories_before_removing_journal(tmp_path, monkeypatch, sync_fails):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    registry_dir = tmp_path / "registry"
+    registry_dir.mkdir()
+    registry_path = registry_dir / "devices.json"
+    journal_path = data_dir / "wifi_group_mutation.txn"
+    journal_path.write_text(json.dumps({
+        "version": 1, "phase": "rollback", "previous_registry": None, "previous_wifi": None,
+    }))
+    events = []
+    monkeypatch.setattr(server, "_restore_file", lambda path, *_args, **_kwargs: events.append(("restore", path)))
+
+    def sync(directory):
+        events.append(("sync", directory))
+        if sync_fails:
+            raise OSError("injected recovery sync failure")
+
+    original_unlink = Path.unlink
+    def unlink(path, **kwargs):
+        if path == journal_path:
+            events.append(("unlink", path))
+        return original_unlink(path, **kwargs)
+
+    monkeypatch.setattr(server, "_fsync_directory", sync)
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+    assert server._recover_wifi_group_mutation(data_dir, registry_path) is not sync_fails
+    if sync_fails:
+        assert journal_path.exists()
+        assert not any(kind == "unlink" for kind, _ in events)
+    else:
+        removed_at = events.index(("unlink", journal_path))
+        assert ("sync", registry_dir) in events[:removed_at]
+        assert ("sync", data_dir) in events[:removed_at]
+        assert events[-1] == ("sync", data_dir)
+        assert not journal_path.exists()

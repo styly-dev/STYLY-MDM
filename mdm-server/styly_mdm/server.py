@@ -500,6 +500,8 @@ def _recover_wifi_group_mutation(data_dir: Path, registry_path: Path) -> bool:
         wifi_path = data_dir / "wifi_settings.enc"
         _restore_file(registry_path, registry_bytes)
         _restore_file(wifi_path, wifi_bytes, private=True)
+        for directory in {registry_path.parent, wifi_path.parent}:
+            _fsync_directory(directory)
         journal_path.unlink(missing_ok=True)
         _fsync_directory(data_dir)
         return True
@@ -1732,7 +1734,7 @@ async def _wifi_send_handler(request: web.Request, *, recovery: bool) -> web.Res
 
                 try:
                     async with request.app["wifi_lock"]:
-                        persisted = store.settle_delivery(attempt["operation_id"], status, reason)
+                        persisted = store.settle_delivery(device_id, attempt["operation_id"], status, reason)
                 except WiFiStoreError:
                     log.error("Wi-Fi delivery state could not be persisted")
                     status, reason = "unknown", "state_persist_failed"
