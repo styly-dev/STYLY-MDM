@@ -35,11 +35,14 @@ function makeHarness({ order = [], selected = [], devices = null } = {}) {
     powerConfirm: { checked: true },
     deviceTaskState: {},
     render() {},
+    refreshDeviceSelection() {},
+    renderActions() {},
     addLog() {},
     getDeviceId(d) { return d.device_id; },
     isOnline(d) { return d.status === 'online'; },
   });
   // Keep this accessor live when DEVICE_LIST replaces the module's device array.
+  context.deviceById = (id) => context.devices.find((d) => d.device_id === id);
   context.knownIds = () => new Set(context.devices.map((d) => d.device_id));
   vm.runInContext(listHelpers, context);
   for (const name of ['toggleDevice', 'toggleSelectAll', 'clearSelection', 'selectGroupAsTarget',
@@ -56,7 +59,7 @@ test('forward and reverse ranges include both endpoints and preserve outside sel
   forward.toggleDevice('b', false);
   forward.toggleDevice('d', true);
   assert.deepEqual(selected(forward), ['b', 'c', 'd', 'e']);
-  assert.equal(forward.deviceSelectionAnchorId, 'b');
+  assert.equal(forward.deviceSelectionAnchorId, 'd');
 
   const reverse = makeHarness({ order: ['a', 'b', 'c', 'd', 'e'], selected: ['a'] });
   reverse.toggleDevice('d', false);
@@ -64,15 +67,16 @@ test('forward and reverse ranges include both endpoints and preserve outside sel
   assert.deepEqual(selected(reverse), ['a', 'b', 'c', 'd']);
 });
 
-test('repeated Shift uses the original anchor and clicked next state selects or clears a range', () => {
+test('repeated Shift advances the anchor and clicked next state selects or clears a range', () => {
   const context = makeHarness({ order: ['a', 'b', 'c', 'd', 'e'] });
   context.toggleDevice('b', false);
   context.toggleDevice('d', true);
-  context.toggleDevice('c', true); // c was selected, so clear b..c; d remains selected.
-  assert.deepEqual(selected(context), ['d']);
-  context.toggleDevice('d', true); // d was selected, so clear b..d.
-  assert.deepEqual(selected(context), []);
-  assert.equal(context.deviceSelectionAnchorId, 'b');
+  context.toggleDevice('c', true); // c was selected, so clear c..d; b remains selected.
+  assert.deepEqual(selected(context), ['b']);
+  assert.equal(context.deviceSelectionAnchorId, 'c');
+  context.toggleDevice('e', true); // e was unselected, so select c..e from the new anchor.
+  assert.deepEqual(selected(context), ['b', 'c', 'd', 'e']);
+  assert.equal(context.deviceSelectionAnchorId, 'e');
 });
 
 test('real filters and sorting define range order; kept selected rows participate, hidden rows do not', () => {
@@ -92,12 +96,12 @@ test('real filters and sorting define range order; kept selected rows participat
   assert.deepEqual(selected(context), ['id-1', 'id-10', 'id-2']);
   assert.equal(context.selectedIds.has('other'), false, 'nonmatching unselected device stays unselected');
 
-  // A refreshed label changes actual sort order; the stable anchor ID is looked up in it.
+  // A refreshed label changes actual sort order; the latest clicked anchor ID is looked up in it.
   context.devices.find((d) => d.device_id === 'id-1').label = 'Room 20';
   context.deviceSort = 'label-asc';
   assert.deepEqual(context.visibleDevices().map((d) => d.device_id), ['id-2', 'id-10', 'id-1']);
-  context.toggleDevice('id-2', true); // selected -> deselect along the current order to id-10
-  assert.deepEqual(selected(context), ['id-1']);
+  context.toggleDevice('id-2', true); // selected -> deselect along the current order to id-1
+  assert.deepEqual(selected(context), []);
 });
 
 test('hidden anchor falls back to a single toggle and stale clicked IDs are ignored', () => {
@@ -207,4 +211,58 @@ test('actual delegated handlers toggle once and prevent selection only for Shift
   const shiftLabel = event('editLabel', true);
   handlers.get('mousedown')(shiftLabel);
   assert.equal(shiftLabel.prevented, 0);
+});
+
+test('ordinary selection at 300 devices does not sort or rebuild the list and refreshes actions', () => {
+  const context = makeHarness({ order: Array.from({ length: 300 }, (_, i) => 'device-' + i) });
+  let controls = 0, actions = 0;
+  context.visibleDevices = () => { throw new Error('ordinary selection must not sort'); };
+  context.render = () => { throw new Error('selection must not rebuild the list'); };
+  context.refreshDeviceSelection = () => { controls++; };
+  context.renderActions = () => { actions++; };
+  context.activeGroup = 'Old group';
+  context.toggleDevice('device-250', false);
+  assert.deepEqual(selected(context), ['device-250']);
+  assert.equal(context.activeGroup, null);
+  assert.equal(context.deviceSelectionAnchorId, 'device-250');
+  context.toggleDevice('device-250', false);
+  assert.deepEqual(selected(context), []);
+  assert.equal(controls, 2);
+  assert.equal(actions, 2);
+});
+
+test('in-place checkbox refresh preserves rows, removes deselected kept rows and updates the header', () => {
+  const header = {};
+  const rowsContainer = {};
+  function checkbox(id, kept = false) {
+    const classes = new Set(kept ? ['kept'] : []);
+    const row = { removed: false, classList: { contains: (name) => classes.has(name) }, remove() { this.removed = true; } };
+    return { dataset: { id }, textContent: '', row,
+      closest: () => row,
+      classList: { toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); }, contains: (name) => classes.has(name) } };
+  }
+  const boxes = [checkbox('a'), checkbox('b'), checkbox('kept', true)];
+  const context = vm.createContext({ selectedIds: new Set(['a']), targetsBody: {
+    querySelectorAll: () => boxes.filter((box) => !box.row.removed),
+    querySelector: (selector) => selector === '#devRows' ? rowsContainer : header,
+  } });
+  vm.runInContext(functionSource('refreshDeviceSelection'), context);
+  context.refreshDeviceSelection();
+  assert.equal(boxes[0].textContent, '✓');
+  assert.equal(boxes[0].classList.contains('on'), true);
+  assert.equal(boxes[1].classList.contains('on'), false);
+  assert.equal(boxes[2].row.removed, true);
+  assert.equal(header.className, 'selbox mixed');
+  assert.equal(header.textContent, '–');
+  assert.equal(rowsContainer.innerHTML, undefined, 'matching rows are preserved');
+  context.selectedIds.add('b');
+  context.refreshDeviceSelection();
+  assert.equal(header.className, 'selbox on');
+  context.selectedIds.clear();
+  context.refreshDeviceSelection();
+  assert.equal(header.className, 'selbox ');
+  assert.equal(header.textContent, '');
+  boxes[0].row.removed = boxes[1].row.removed = true;
+  context.refreshDeviceSelection();
+  assert.match(rowsContainer.innerHTML, /No matching devices/);
 });

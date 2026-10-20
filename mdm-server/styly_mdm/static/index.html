@@ -1636,9 +1636,11 @@
         selectedIds = new Set((groups[activeGroup] || []).filter(function (s) { return known.has(s); }));
       }
       function toggleDevice(id, shiftKey) {
-        const visible = visibleDevices().map(getDeviceId);
+        const device = deviceById(id);
+        const query = deviceSearch.trim().toLowerCase();
+        if (!device || (!selectedIds.has(id) && !deviceMatchesFilter(device, query))) return;
+        const visible = shiftKey ? visibleDevices().map(getDeviceId) : [];
         const clickedIndex = visible.indexOf(id);
-        if (clickedIndex < 0) return;
         const anchorIndex = deviceSelectionAnchorId ? visible.indexOf(deviceSelectionAnchorId) : -1;
         if (shiftKey && anchorIndex >= 0) {
           const select = !selectedIds.has(id);
@@ -1650,10 +1652,40 @@
           }
         } else {
           if (selectedIds.has(id)) selectedIds.delete(id); else selectedIds.add(id);
-          deviceSelectionAnchorId = id;
         }
+        deviceSelectionAnchorId = id;
         activeGroup = null;
-        render();
+        refreshDeviceSelection();
+        renderActions();
+      }
+
+      // Selection cannot add hidden rows. Update existing controls in place and remove
+      // filter-kept rows when deselected, preserving row DOM, focus, and scroll position.
+      function refreshDeviceSelection() {
+        let visibleCount = 0, selectedCount = 0;
+        targetsBody.querySelectorAll('[data-act="toggleDevice"]').forEach(function (box) {
+          const checked = selectedIds.has(box.dataset.id);
+          const row = box.closest('[data-row-id]');
+          if (!checked && row.classList.contains('kept')) {
+            row.remove();
+            return;
+          }
+          visibleCount++;
+          if (checked) selectedCount++;
+          box.classList.toggle('on', checked);
+          const glyph = checked ? '✓' : '';
+          if (box.textContent !== glyph) box.textContent = glyph;
+        });
+        const header = targetsBody.querySelector('[data-act="selectAll"]');
+        if (header) {
+          const state = selectedCount === 0 ? '' : selectedCount === visibleCount ? 'on' : 'mixed';
+          header.className = 'selbox ' + state;
+          header.textContent = state === 'on' ? '✓' : state === 'mixed' ? '–' : '';
+        }
+        if (!visibleCount) {
+          const rows = targetsBody.querySelector('#devRows');
+          if (rows) rows.innerHTML = '<div class="empty small">No matching devices</div>';
+        }
       }
       function toggleSelectAll() {
         deviceSelectionAnchorId = null;

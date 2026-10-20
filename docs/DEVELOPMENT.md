@@ -157,13 +157,15 @@ those members are exactly what an action would dispatch to.
 On the main Devices list, clicking a row checkbox toggles that device and records its stable
 device ID as the range anchor. Shift-clicking another checkbox applies that checkbox's next
 state to every visible row between it and the anchor, inclusive; selections outside the range
-stay as they were. Repeated Shift-clicks keep using the original anchor. The range follows the
-current displayed order after filtering, status filtering, or sorting, and selected rows kept
+stay as they were. Every valid click, including a Shift-click, becomes the next range anchor.
+The range follows the current displayed order after filtering, status filtering, or sorting, and selected rows kept
 visible by the filter participate in that order. If the anchor is no longer visible or has
 been removed, a Shift-click acts as a normal toggle and becomes the new anchor. Refreshes
 retain anchors by device ID, not row position. Select-all, clear, group selection, and crossing
 between the normal tabs reset the anchor. Shift-click selection controls do not select page
-text. These rules apply only to the main Devices list.
+text. Individual and range selection update checkbox controls and action summaries in place,
+removing deselected filter-kept rows without rebuilding the list. Ordinary clicks do not sort
+the device list. These rules apply only to the main Devices list.
 
 ### Seeding dummy devices for UI testing
 
