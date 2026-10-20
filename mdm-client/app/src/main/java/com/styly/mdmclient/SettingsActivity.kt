@@ -37,9 +37,6 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var journalRefreshButton: Button
     private lateinit var journalClearButton: Button
     private lateinit var wifiTlsEnabled: CheckBox
-    private lateinit var wifiTokenInput: EditText
-    private lateinit var clearWifiToken: CheckBox
-    private lateinit var wifiTokenStatus: TextView
     private lateinit var exactAlarmStatus: TextView
     private lateinit var exactAlarmButton: Button
     private lateinit var wifiLocationStatus: TextView
@@ -97,9 +94,6 @@ class SettingsActivity : AppCompatActivity() {
         journalRefreshButton = findViewById(R.id.journal_refresh_button)
         journalClearButton = findViewById(R.id.journal_clear_button)
         wifiTlsEnabled = findViewById(R.id.wifi_tls_enabled)
-        wifiTokenInput = findViewById(R.id.wifi_device_token_input)
-        clearWifiToken = findViewById(R.id.wifi_clear_device_token)
-        wifiTokenStatus = findViewById(R.id.wifi_device_token_status)
         exactAlarmStatus = findViewById(R.id.wifi_exact_alarm_status)
         exactAlarmButton = findViewById(R.id.wifi_exact_alarm_button)
         wifiLocationStatus = findViewById(R.id.wifi_location_permission_status)
@@ -107,7 +101,6 @@ class SettingsActivity : AppCompatActivity() {
 
         val connectionSettings = MdmClientApplication.wifiSettingsController().connectionSettings()
         wifiTlsEnabled.isChecked = connectionSettings.tlsEnabled
-        updateWifiTokenStatus(connectionSettings.deviceToken != null)
 
         serverUrlInput.setText(WebSocketManager.getManualServerAddress(this).orEmpty())
 
@@ -132,9 +125,6 @@ class SettingsActivity : AppCompatActivity() {
             refreshJournal()
         }
 
-        clearWifiToken.setOnCheckedChangeListener { _, checked ->
-            wifiTokenInput.isEnabled = !checked
-        }
         exactAlarmButton.setOnClickListener { requestExactAlarmAccess() }
         wifiLocationButton.setOnClickListener { requestWifiLocationPermission() }
 
@@ -189,35 +179,17 @@ class SettingsActivity : AppCompatActivity() {
             return
         }
 
-        val oldSettings = MdmClientApplication.wifiSettingsController().connectionSettings()
-        val typedToken = wifiTokenInput.text.toString()
-        val token = when {
-            clearWifiToken.isChecked -> null
-            typedToken.isNotBlank() -> typedToken
-            else -> oldSettings.deviceToken
-        }
-        if (token != null && url.isBlank()) {
-            Toast.makeText(this, R.string.wifi_token_requires_manual_server, Toast.LENGTH_LONG).show()
-            return
-        }
         if (!MdmClientApplication.wifiSettingsController().saveConnectionSettings(
-                WifiConnectionSettings(wifiTlsEnabled.isChecked, token),
+                WifiConnectionSettings(tlsEnabled = wifiTlsEnabled.isChecked),
             )
         ) {
             Toast.makeText(this, R.string.wifi_settings_save_failed, Toast.LENGTH_LONG).show()
             return
         }
-        updateWifiTokenStatus(token != null)
-
         restartService("Reconnecting...")
     }
 
     private fun useAutoDiscovery() {
-        val settings = MdmClientApplication.wifiSettingsController().connectionSettings()
-        if (settings.deviceToken != null) {
-            Toast.makeText(this, R.string.wifi_token_requires_manual_server, Toast.LENGTH_LONG).show()
-            return
-        }
         WebSocketManager.clearServerUrlsForAutoDiscovery(this)
         serverUrlInput.text.clear()
         restartService("Discovering...")
@@ -362,10 +334,6 @@ class SettingsActivity : AppCompatActivity() {
         } catch (_: ActivityNotFoundException) {
             Toast.makeText(this, R.string.wifi_exact_alarm_unavailable, Toast.LENGTH_LONG).show()
         }
-    }
-
-    private fun updateWifiTokenStatus(configured: Boolean) {
-        wifiTokenStatus.setText(if (configured) R.string.wifi_device_token_configured else R.string.wifi_device_token_not_configured)
     }
 
     companion object {

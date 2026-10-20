@@ -6,14 +6,7 @@
     <string name="use_auto_discovery">Use Auto-Discovery</string>
     <string name="save_and_connect">Save &amp; Connect</string>
     <string name="wifi_tls_enabled">Use TLS (WSS) for server connections</string>
-    <string name="wifi_device_token_label">Wi-Fi device token</string>
-    <string name="wifi_device_token_hint">Enter a new token; leave blank to keep the saved token</string>
-    <string name="wifi_clear_device_token">Clear saved device token</string>
-    <string name="wifi_device_token_configured">A device token is saved. Its value is hidden.</string>
-    <string name="wifi_device_token_not_configured">No device token is saved.</string>
-    <string name="wifi_token_requires_manual_server">A device token requires a saved manual server address. Auto-Discovery will not receive the token.</string>
     <string name="wifi_settings_save_failed">Could not save Wi-Fi connection settings</string>
-    <string name="wifi_token_required_for_feature">Save a device token to enable Wi-Fi settings</string>
     <string name="wifi_exact_alarm_label">60-second Wi-Fi rollback timer</string>
     <string name="wifi_exact_alarm_granted">Exact alarm access granted</string>
     <string name="wifi_exact_alarm_missing">Exact alarm access is required before Wi-Fi changes can be applied</string>

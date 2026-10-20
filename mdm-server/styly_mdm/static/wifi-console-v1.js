@@ -5,7 +5,7 @@
   const SECURITY_MODES = ['OPEN', 'WPA_PSK'];
   const REASON_LABELS = {
     unsupported: 'Update this client before sending Wi-Fi settings.',
-    permission_denied: 'This connection is not authorized to receive Wi-Fi settings.',
+    permission_denied: 'An earlier deployment was blocked by the previous authentication requirement.',
     socket_unavailable: 'The device connection closed before sending.',
     socket_replaced: 'The device connection changed before sending. Send again if needed.',
     socket_send_failed: 'The server could not confirm that the send completed.',
@@ -109,7 +109,7 @@
   }
 
   function createController(options) {
-    const authPanel = options.authPanel;
+    const statusPanel = options.statusPanel;
     const groupPanel = options.groupPanel;
     const getGroups = options.getGroups;
     const getDevices = options.getDevices;
@@ -117,8 +117,7 @@
     let enabled = null;
     let allowHttp = false;
     let accessRenderKey = null;
-    let authState = 'unknown';
-    let authMessage = '';
+    let statusMessage = '';
     let state = null;
     let stateUnavailable = false;
     let stateError = false;
@@ -128,8 +127,6 @@
     let profiles = Object.create(null);
     let lastRenderedMembers = '';
     let pollHandle = null;
-    let authRenderKey = null;
-    let authGeneration = 0;
 
     function profileFor(name) {
       if (!profiles[name]) {
@@ -159,8 +156,8 @@
     }
 
     function renderAccess() {
-      renderAuth();
-      const key = [enabled, stateUnavailable, authState, allowHttp].join('|');
+      renderStatus();
+      const key = [enabled, stateUnavailable, allowHttp].join('|');
       if (key !== accessRenderKey) {
         accessRenderKey = key;
         renderProfile();
@@ -168,63 +165,18 @@
       updateButtons();
     }
 
-    function renderAuth() {
-      if (!authPanel) return;
-      authPanel.hidden = enabled !== true;
-      const secure = transportAllowed();
-      const key = [enabled, stateUnavailable, authState, authMessage, secure].join('|');
-      if (authPanel.dataset.wifiAuthKey === key) return;
-      authPanel.dataset.wifiAuthKey = key;
-      if (enabled === false || stateUnavailable) {
-        authPanel.innerHTML = '<div class="wifi-banner wifi-muted"><span class="wifi-symbol">○</span>' +
-          '<span>Wi-Fi management is unavailable on this server.</span></div>';
-        return;
-      }
-      if (enabled !== true) {
-        authPanel.innerHTML = '<div class="wifi-banner wifi-muted"><span class="wifi-symbol">○</span>' +
-          '<span>Checking Wi-Fi management availability…</span></div>';
-        return;
-      }
-      if (authState === 'authenticated') {
-        authPanel.innerHTML = '<div class="wifi-banner wifi-success"><span class="wifi-symbol">✓</span>' +
-          '<span>Wi-Fi management session active</span></div>' +
-          (authMessage ? '<div class="wifi-feedback" role="status">' + escapeHtml(authMessage) + '</div>' : '');
-        return;
-      }
-
-      authPanel.innerHTML = '<section class="wifi-auth"><div><strong>Administrator login</strong>' +
-        '<p>Enter the admin token. It is cleared after the login request.</p></div>' +
-        '<form data-wifi-login-form>' +
-        '<input class="field wifi-token" data-wifi-token type="password" autocomplete="current-password" aria-label="Admin token" placeholder="Admin token"' +
-        (secure ? '' : ' disabled') + '>' +
-        '<button class="btn-mini btn-save" type="submit"' + (secure ? '' : ' disabled') + '>Log in</button></form>' +
-        (secure ? '' : '<div class="wifi-feedback wifi-danger" role="alert">Use HTTPS, or explicitly enable managed-LAN HTTP on the server.</div>') +
-        (authMessage ? '<div class="wifi-feedback wifi-danger" role="alert">' + escapeHtml(authMessage) + '</div>' : '') +
-        '</section>';
-    }
-
-    function requestLogin() {
-      authState = 'required';
-      if (!authMessage) authMessage = '';
-      renderAccess();
+    function renderStatus() {
+      if (!statusPanel) return;
+      statusPanel.hidden = !statusMessage;
+      statusPanel.innerHTML = statusMessage
+        ? '<div class="wifi-feedback" role="status">' + escapeHtml(statusMessage) + '</div>' : '';
     }
 
     async function refreshState() {
       if (stateLoading) return;
       stateLoading = true;
       try {
-        const requestedAuthGeneration = authGeneration;
         const response = await root.fetch(apiUrl('/api/wifi/state'), { credentials: 'same-origin' });
-        if (response.status === 401) {
-          if (requestedAuthGeneration !== authGeneration) return;
-          const access = await response.json();
-          allowHttp = access.allow_http === true;
-          enabled = true;
-          stateError = false;
-          stateUnavailable = false;
-          requestLogin();
-          return;
-        }
         if (response.status === 404 || response.status === 501) {
           enabled = false;
           stateError = false;
@@ -245,15 +197,11 @@
         stateError = false;
         if (enabled) {
           state = nextState;
-          if (Object.prototype.hasOwnProperty.call(nextState, 'groups') ||
-              Object.prototype.hasOwnProperty.call(nextState, 'devices')) {
-            authState = 'authenticated';
-          }
         }
         renderAccess();
         renderTransientStatus();
         renderDeviceResults();
-        if (activeGroup && enabled && authState !== 'required' && !profileFor(activeGroup).loaded) {
+        if (activeGroup && enabled && !profileFor(activeGroup).loaded) {
           await loadProfile(activeGroup, true);
         }
       } catch (_) {
@@ -319,19 +267,17 @@
       const profileError = model.error ? '<div class="wifi-feedback wifi-danger" role="alert">' + escapeHtml(model.error) + '</div>' : '';
       const unavailable = enabled === false || stateUnavailable
         ? '<div class="wifi-feedback wifi-muted">Wi-Fi management is unavailable on this server.</div>' : '';
-      const authNeeded = enabled === true && authState !== 'authenticated'
-        ? '<div class="wifi-feedback wifi-muted">Log in above to view or edit this group’s Wi-Fi settings.</div>' : '';
       const loading = model.loading && !model.loaded ? '<div class="wifi-feedback">Loading saved Wi-Fi settings…</div>' : '';
-      const editable = model.loaded && enabled === true && authState === 'authenticated';
+      const editable = model.loaded && enabled === true;
       groupPanel.innerHTML = '<section class="wifi-section"><div class="wifi-section-head"><div><h3>Wi-Fi settings</h3>' +
         '<p>Save this group’s networks, then send the profile to its online devices.</p>' +
         '<p>Devices handle connection checks and rollback locally. The server tracks sending only.</p>' +
         '<p class="wifi-meta">' + revisionText + '</p></div>' +
-        (model.loaded && enabled === true && authState === 'authenticated' && model.mode !== 'unmanaged'
+        (model.loaded && enabled === true && model.mode !== 'unmanaged'
           ? '<button class="btn-outline btn-danger-outline" type="button" data-wifi-action="unmanage">' + (model.savedRevision ? 'Delete Wi-Fi settings' : 'Do not manage Wi-Fi') + '</button>' : '') + '</div>' +
         '<div data-wifi-transient class="wifi-feedback" role="status" style="display:none"></div>' +
         '<div data-wifi-stale class="wifi-feedback wifi-danger" role="alert" style="display:none">The saved profile changed on the server. Reload it before saving or sending. <button class="btn-text" type="button" data-wifi-action="reload">Reload saved profile</button></div>' +
-        profileError + unavailable + authNeeded + loading +
+        profileError + unavailable + loading +
         (editable ? '<div class="wifi-network-list">' + (model.mode === 'unmanaged'
           ? '<div class="push-note">Existing Wi-Fi networks on devices stay in place. Deploy this state explicitly to stop reapplying Wi-Fi settings at device startup. Offline devices keep their previous management policy until you deploy to them while connected.</div>'
           : (rowHtml || '<div class="wifi-empty">No networks saved yet.</div>')) + '</div>' +
@@ -397,7 +343,7 @@
         groupPanel.dataset.wifiRendered = 'true';
         lastRenderedMembers = signature;
         const model = activeGroup && profileFor(activeGroup);
-        if (activeGroup && enabled === true && authState !== 'required' &&
+        if (activeGroup && enabled === true &&
             (!model.loaded || (changedGroup && !model.dirty))) {
           loadProfile(activeGroup, false);
         }
@@ -412,10 +358,9 @@
     }
 
     async function loadProfile(name, quiet) {
-      if (enabled !== true || authState === 'required' || !name) return;
+      if (enabled !== true || !name) return;
       const model = profileFor(name);
       if (model.loading) return;
-      const requestedAuthGeneration = authGeneration;
       model.loading = true;
       model.error = '';
       if (!quiet && name === activeGroup) renderProfile();
@@ -425,14 +370,6 @@
           credentials: 'same-origin',
           headers: { Accept: 'application/json' },
         });
-        if (response.status === 401) {
-          if (requestedAuthGeneration !== authGeneration) return;
-          authState = 'required';
-          authMessage = '';
-          requestLogin();
-          if (name === activeGroup) renderProfile();
-          return;
-        }
         if (!response.ok) {
           model.error = response.status === 404
             ? 'This group has no Wi-Fi profile or is no longer available.'
@@ -440,9 +377,7 @@
           return;
         }
         const profile = await response.json();
-        authState = 'authenticated';
-        authGeneration++;
-        authMessage = '';
+        statusMessage = '';
         const previousRevision = model.savedRevision;
         model.savedRevision = profile && profile.revision ? profile.revision : null;
         model.conflicted = false;
@@ -458,7 +393,7 @@
           return Object.assign({}, network, { id: 'wifi-' + index });
         });
         if (name === activeGroup) {
-          renderAuth();
+          renderStatus();
           renderProfile();
         }
       } catch (_) {
@@ -466,7 +401,7 @@
       } finally {
         model.loading = false;
         if (name === activeGroup) {
-          renderAuth();
+          renderStatus();
           renderProfile();
         }
       }
@@ -503,7 +438,7 @@
       const currentRevision = state && state.groups && state.groups[activeGroup] && state.groups[activeGroup].revision;
       model.stale = model.conflicted || !!(currentRevision && model.savedRevision && currentRevision !== model.savedRevision);
       const busy = model.loading || model.saving || model.applying || model.stale ||
-        enabled !== true || authState !== 'authenticated' || !transportAllowed();
+        enabled !== true || !transportAllowed();
       groupPanel.querySelectorAll('[data-wifi-field], [data-wifi-action="add"], [data-wifi-action="remove"], [data-wifi-action="unmanage"]').forEach(function (control) {
         const action = control.dataset && control.dataset.wifiAction;
         const network = control.dataset && model.draftNetworks.find(function (row) {
@@ -525,7 +460,7 @@
       if (!activeGroup) return;
       const name = activeGroup;
       const model = profileFor(name);
-      if (enabled !== true || authState !== 'authenticated' ||
+      if (enabled !== true ||
           !model.loaded || model.stale || model.saving || model.applying) return;
       if (!transportAllowed()) {
         model.error = 'Wi-Fi changes require HTTPS or managed-LAN HTTP enabled on the server.';
@@ -548,12 +483,7 @@
           headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
           body: JSON.stringify(Object.assign({ expected_revision: model.savedRevision }, built.payload)),
         });
-        if (response.status === 401) {
-          authState = 'required';
-          authMessage = '';
-          requestLogin();
-          model.error = 'Your Wi-Fi administrator session expired. Log in again.';
-        } else if (!response.ok) {
+        if (!response.ok) {
           if (response.status === 409) model.conflicted = true;
           model.error = response.status === 409
             ? 'The Wi-Fi profile changed elsewhere. Reload the group before saving again.'
@@ -581,7 +511,6 @@
           });
           model.mode = model.savedMode = 'managed';
           model.dirty = false;
-          authState = 'authenticated';
         }
       } catch (_) {
         model.error = 'Could not save Wi-Fi settings.';
@@ -592,7 +521,7 @@
     }
 
     async function unmanageProfile() {
-      if (!activeGroup || enabled !== true || authState !== 'authenticated' || !transportAllowed()) return;
+      if (!activeGroup || enabled !== true || !transportAllowed()) return;
       const name = activeGroup;
       const model = profileFor(name);
       if (!model.loaded || model.stale || model.loading || model.saving || model.applying) return;
@@ -607,10 +536,7 @@
           headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
           body: JSON.stringify({ expected_revision: model.savedRevision }),
         });
-        if (response.status === 401) {
-          requestLogin();
-          model.error = 'Your Wi-Fi administrator session expired. Log in again.';
-        } else if (!response.ok) {
+        if (!response.ok) {
           if (response.status === 409) model.conflicted = true;
           model.error = response.status === 409
             ? 'The Wi-Fi profile changed elsewhere. Reload it before deleting.'
@@ -623,8 +549,8 @@
           model.draftNetworks = [];
           model.dirty = false;
           if (state && state.groups) state.groups[name] = { revision: saved.revision, mode: 'unmanaged' };
-          authMessage = 'Do not manage Wi-Fi saved for ' + name + '. Deploy it explicitly; existing device Wi-Fi settings remain.';
-          renderAuth();
+          statusMessage = 'Do not manage Wi-Fi saved for ' + name + '. Deploy it explicitly; existing device Wi-Fi settings remain.';
+          renderStatus();
         }
       } catch (_) {
         model.error = 'Could not save the unmanaged Wi-Fi state.';
@@ -635,7 +561,7 @@
     }
 
     async function applyProfile() {
-      if (!activeGroup || !state || enabled !== true || authState !== 'authenticated') return;
+      if (!activeGroup || !state || enabled !== true) return;
       const name = activeGroup;
       const model = profileFor(name);
       if (!model.savedRevision || model.stale || model.dirty || model.applying || model.saving) return;
@@ -661,11 +587,7 @@
           headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
           body: JSON.stringify({ expected_revision: model.savedRevision }),
         });
-        if (response.status === 401) {
-          authState = 'required';
-          requestLogin();
-          model.error = 'Your Wi-Fi administrator session expired. Log in again.';
-        } else if (!response.ok) {
+        if (!response.ok) {
           if (response.status === 409) model.conflicted = true;
           model.error = response.status === 409
             ? 'The saved group or profile changed. Reload it before sending.'
@@ -676,8 +598,8 @@
           const sent = operations.filter(function (item) { return item.status === 'sent'; }).length;
           const failed = operations.filter(function (item) { return item.status === 'failed'; }).length;
           const unknown = operations.length - sent - failed;
-          authMessage = 'Delivery for ' + name + ': ' + sent + ' sent, ' + failed + ' failed, ' + unknown + ' unconfirmed.';
-          renderAuth();
+          statusMessage = 'Delivery for ' + name + ': ' + sent + ' sent, ' + failed + ' failed, ' + unknown + ' unconfirmed.';
+          renderStatus();
           await refreshState();
         }
       } catch (_) {
@@ -685,50 +607,6 @@
       } finally {
         model.applying = false;
         if (name === activeGroup) renderProfile();
-      }
-    }
-
-    async function login(form) {
-      const input = form.querySelector('[data-wifi-token]');
-      let token = input ? input.value : '';
-      if (input) input.value = '';
-      if (!transportAllowed()) {
-        token = '';
-        authMessage = 'Use HTTPS, or explicitly enable managed-LAN HTTP on the server.';
-        renderAuth();
-        return;
-      }
-      if (!token) {
-        authMessage = 'Enter the admin token.';
-        renderAuth();
-        return;
-      }
-      authMessage = '';
-      try {
-        const response = await root.fetch(apiUrl('/api/wifi/session'), {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { Authorization: 'Bearer ' + token },
-        });
-        if (!response.ok) {
-          authState = 'required';
-          authMessage = response.status === 401 || response.status === 403
-            ? 'The admin token was not accepted.'
-            : 'Could not start a Wi-Fi administrator session.';
-          return;
-        }
-        authState = 'authenticated';
-        authMessage = '';
-        renderAccess();
-        if (typeof options.onAuthenticated === 'function') options.onAuthenticated();
-        if (activeGroup && !profileFor(activeGroup).dirty) await loadProfile(activeGroup, false);
-        await refreshState();
-      } catch (_) {
-        authState = 'required';
-        authMessage = 'Could not start a Wi-Fi administrator session.';
-      } finally {
-        token = '';
-        renderAccess();
       }
     }
 
@@ -762,20 +640,13 @@
       else if (action === 'apply') applyProfile();
     }
 
-    if (authPanel) {
-      authPanel.addEventListener('submit', function (event) {
-        if (!event.target.matches('[data-wifi-login-form]')) return;
-        event.preventDefault();
-        login(event.target);
-      });
-    }
     if (groupPanel) {
       groupPanel.addEventListener('click', handleGroupClick);
       groupPanel.addEventListener('input', updateDraftFromInput);
       groupPanel.addEventListener('change', updateDraftFromInput);
     }
 
-    renderAuth();
+    renderStatus();
     refreshState();
     pollHandle = root.setInterval(refreshState, 10000);
 

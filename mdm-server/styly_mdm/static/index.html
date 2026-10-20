@@ -404,19 +404,9 @@
     .mg-footer .btn-primary { width: auto; margin: 0; padding: 9px 20px; font-size: 13px; }
 
     /* Keep the Wi-Fi form stable while membership and device status refresh. */
-    .wifi-auth-slot { flex: 0 0 auto; }
-    .wifi-admin-area { padding: 12px 20px; }
-    .wifi-banner, .wifi-feedback { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 12px; }
-    .wifi-banner { padding: 9px 11px; background: var(--bg-actions); border: 1px solid var(--border-soft); border-radius: 7px; }
-    .wifi-banner.wifi-success { color: var(--success); }
-    .wifi-banner.wifi-muted, .wifi-feedback.wifi-muted { color: var(--text-muted); }
-    .wifi-symbol { font-size: 15px; }
-    .wifi-auth { display: flex; align-items: center; gap: 14px; padding: 11px 13px; background: var(--bg-actions); border: 1px solid var(--border); border-radius: 8px; }
-    .wifi-auth > div:first-child { flex: 1; min-width: 0; }
-    .wifi-auth strong { font-size: 13px; }
-    .wifi-auth p { color: var(--text-secondary); font-size: 11px; margin-top: 2px; }
-    .wifi-auth form { display: flex; align-items: center; gap: 8px; }
-    .wifi-token { width: min(330px, 42vw); }
+    .wifi-status-area { padding: 12px 20px; }
+    .wifi-feedback { color: var(--text-secondary); font-size: 12px; }
+    .wifi-feedback.wifi-muted { color: var(--text-muted); }
     .wifi-feedback { display: block; margin: 8px 0; }
     .wifi-feedback.wifi-danger { color: var(--danger); }
     #wifiGroupPanel { padding: 18px 20px 22px; border-top: 1px solid var(--border); }
@@ -488,9 +478,6 @@
       .subtab { padding-left: 10px; padding-right: 10px; }
       .manage-grid { grid-template-columns: 1fr; }
       .mg-sidebar { border-right: none; border-bottom: 1px solid var(--border); }
-      .wifi-auth { align-items: stretch; flex-direction: column; }
-      .wifi-auth form { width: 100%; }
-      .wifi-token { width: auto; flex: 1; min-width: 0; }
       .wifi-fields { grid-template-columns: 1fr; }
       .wifi-actions, .wifi-action-right { align-items: stretch; flex-direction: column; }
       .wifi-device-row { grid-template-columns: 1fr; }
@@ -513,7 +500,6 @@
         </div>
       </div>
 
-      <div class="wifi-auth-slot" id="consoleAuthSlot"><div class="wifi-admin-area" id="wifiAuthPanel"></div></div>
       <div class="zones">
         <!-- (1) Targets -->
         <div class="targets">
@@ -705,7 +691,7 @@
         <span class="bar-sep"></span>
         <span class="bar-title">Manage Groups</span>
       </div>
-      <div class="wifi-auth-slot" id="manageAuthSlot"></div>
+      <div class="wifi-status-area" id="wifiStatusPanel" hidden></div>
       <div class="manage-grid">
         <div class="mg-sidebar" id="mgSidebar"></div>
         <div class="mg-main">
@@ -833,20 +819,12 @@
       const mgSidebar = document.getElementById('mgSidebar');
       const mgDetail = document.getElementById('mgDetail');
       const wifiGroupPanel = document.getElementById('wifiGroupPanel');
-      const wifiAuthPanel = document.getElementById('wifiAuthPanel');
+      const wifiStatusPanel = document.getElementById('wifiStatusPanel');
       const wifiController = window.MdmWifiConsole.createController({
-        authPanel: wifiAuthPanel,
+        statusPanel: wifiStatusPanel,
         groupPanel: wifiGroupPanel,
         getGroups: function () { return groups; },
         getDevices: function () { return devices; },
-        onAuthenticated: function () {
-          if (reconnectTimer) return;
-          if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
-            ws.close(4001, 'Wi-Fi admin session established');
-          } else {
-            connect();
-          }
-        },
       });
 
       // ---------------- Helpers ----------------
@@ -1260,8 +1238,6 @@
         // The top-bar version's red state depends on the device list, so refresh it
         // on every render (device rows below carry the reverse, client-behind flag).
         updateServerVersionBadge();
-        const authSlot = document.getElementById(view === 'manage' ? 'manageAuthSlot' : 'consoleAuthSlot');
-        if (wifiAuthPanel.parentElement !== authSlot) authSlot.appendChild(wifiAuthPanel);
         if (view === 'manage') {
           manageView.style.display = '';
           consoleView.style.display = 'none';

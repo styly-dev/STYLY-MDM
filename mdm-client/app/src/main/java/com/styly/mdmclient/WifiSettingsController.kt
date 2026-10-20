@@ -120,30 +120,16 @@ internal class WifiSettingsController internal constructor(
     }
 
     fun saveConnectionSettings(settings: WifiConnectionSettings): Boolean = persist { old ->
-        old.copy(connection = settings.copy(deviceToken = settings.deviceToken?.takeIf { it.isNotBlank() }))
+        old.copy(connection = settings)
     }
-
-    fun authorizationTokenFor(url: String, manuallyEnrolledEndpoint: Boolean): String? =
-        WifiTransportAuthorization.authorizationTokenFor(
-            url,
-            manuallyEnrolledEndpoint,
-            connectionSettings(),
-        )
-
-    fun supportsWifiOn(url: String, manuallyEnrolledEndpoint: Boolean): Boolean =
-        WifiTransportAuthorization.isAuthorizedSession(
-            url,
-            manuallyEnrolledEndpoint,
-            connectionSettings(),
-        )
 
     fun handleServerMessage(
         type: String,
         payload: JSONObject,
-        authorized: Boolean,
+        canonicalRegistrationAcknowledged: Boolean,
     ): Boolean {
         if (type != "EXECUTE_WIFI_APPLY") return type.startsWith("WIFI_")
-        if (!authorized) return true
+        if (!canonicalRegistrationAcknowledged) return true
         operationExecutor.execute { acceptManualCommand(payload) }
         return true
     }

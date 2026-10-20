@@ -50,36 +50,6 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="@string/wifi_device_token_label"
-            android:textSize="14sp"
-            android:layout_marginBottom="8dp" />
-
-        <EditText
-            android:id="@+id/wifi_device_token_input"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="@string/wifi_device_token_hint"
-            android:inputType="textPassword"
-            android:singleLine="true"
-            android:layout_marginBottom="8dp" />
-
-        <CheckBox
-            android:id="@+id/wifi_clear_device_token"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/wifi_clear_device_token"
-            android:layout_marginBottom="8dp" />
-
-        <TextView
-            android:id="@+id/wifi_device_token_status"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:textSize="14sp"
-            android:layout_marginBottom="8dp" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
             android:text="@string/wifi_exact_alarm_label"
             android:textSize="14sp"
             android:layout_marginTop="8dp"

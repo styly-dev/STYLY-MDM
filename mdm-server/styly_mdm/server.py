@@ -9,13 +9,10 @@ import argparse
 import asyncio
 import base64
 import copy
-import hashlib
-import hmac
 import json
 import logging
 import os
 import re
-import secrets
 import shutil
 import socket
 import ssl
@@ -1428,8 +1425,6 @@ def zip_tree(root: Path, dest_zip: Path) -> None:
 # Wi-Fi settings API and transport security
 # ---------------------------------------------------------------------------
 
-WIFI_SESSION_COOKIE = "styly_mdm_wifi_session"
-WIFI_SESSION_TTL = 12 * 60 * 60
 WIFI_REQUEST_MAX_BYTES = 256 * 1024
 WIFI_SEND_TIMEOUT = 5.0
 
@@ -1455,18 +1450,15 @@ def _load_wifi_store(
     *,
     allow_http: bool = False,
 ) -> tuple[bool, WiFiSettingsStore | None]:
-    admin_token = os.environ.get("MDM_ADMIN_TOKEN")
-    device_token = os.environ.get("MDM_DEVICE_TOKEN")
     encryption_key = os.environ.get("MDM_WIFI_ENCRYPTION_KEY")
     store_path = data_dir / "wifi_settings.enc"
     state_exists = store_path.exists()
-    any_wifi_config = bool(admin_token or device_token or encryption_key)
-    if not any_wifi_config and not state_exists:
+    if not encryption_key and not state_exists:
         return False, None
-    if not (admin_token and device_token and encryption_key and (tls_context is not None or allow_http)):
+    if not (encryption_key and (tls_context is not None or allow_http)):
         raise RuntimeError(
-            "Wi-Fi state requires MDM_ADMIN_TOKEN, MDM_DEVICE_TOKEN, "
-            "MDM_WIFI_ENCRYPTION_KEY, and either TLS credentials or MDM_WIFI_ALLOW_HTTP=1"
+            "Wi-Fi state requires MDM_WIFI_ENCRYPTION_KEY and either TLS credentials "
+            "or MDM_WIFI_ALLOW_HTTP=1"
         )
     try:
         return True, WiFiSettingsStore(store_path, encryption_key)
@@ -1474,64 +1466,18 @@ def _load_wifi_store(
         raise RuntimeError("the encrypted Wi-Fi settings store could not be opened safely") from None
 
 
-def _wifi_bearer(request: web.Request) -> str | None:
-    authorization = request.headers.get("Authorization", "")
-    scheme, separator, value = authorization.partition(" ")
-    if separator and scheme.lower() == "bearer" and value:
-        return value.strip()
-    return None
-
-
-def _token_matches(request: web.Request, expected: str | None) -> bool:
-    presented = _wifi_bearer(request)
-    return bool(
-        _wifi_transport_allowed(request)
-        and expected
-        and presented
-        and hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
-    )
-
-
 def _wifi_transport_allowed(request: web.Request) -> bool:
     """Require TLS unless this managed-LAN server explicitly opted into HTTP."""
     return request.secure or request.app.get("wifi_allow_http") is True
 
 
-def _session_key(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def _valid_wifi_session(request: web.Request) -> bool:
-    token = request.cookies.get(WIFI_SESSION_COOKIE)
-    if not _wifi_transport_allowed(request) or not token:
-        return False
-    key = _session_key(token)
-    expires = request.app["wifi_sessions"].get(key)
-    if not isinstance(expires, (int, float)) or expires <= time.time():
-        request.app["wifi_sessions"].pop(key, None)
-        return False
-    return True
-
-
-def _wifi_admin_authorized(request: web.Request) -> bool:
-    return (
-        _token_matches(request, request.app.get("wifi_admin_token"))
-        or _valid_wifi_session(request)
-    )
-
-
 def _wifi_origin_allowed(request: web.Request) -> bool:
     origin = request.headers.get("Origin")
     if origin is None:
-        # Native clients and scripts using a bearer token may omit Origin. A
-        # cookie alone never authorizes an origin-less mutation.
-        return not _valid_wifi_session(request)
+        # Browsers send Origin for mutations. Native clients may omit it.
+        return True
     expected = f"{'https' if request.secure else 'http'}://{request.host}"
-    return hmac.compare_digest(origin, expected)
-
-
-def _wifi_device_authorized(request: web.Request) -> bool:
-    return _token_matches(request, request.app.get("wifi_device_token"))
+    return origin == expected
 
 
 def _wifi_store(request: web.Request) -> WiFiSettingsStore | None:
@@ -1580,10 +1526,6 @@ def _wifi_recovery_required_response() -> web.Response:
     return web.json_response({"error": "Wi-Fi state recovery is required"}, status=503)
 
 
-def _wifi_api_unauthorized() -> web.Response:
-    return web.json_response({"error": "authentication required"}, status=401)
-
-
 def _wifi_name_from_request(request: web.Request) -> str:
     name = request.match_info.get("name", "")
     if not name or name != name.strip() or len(name) > MAX_GROUP_NAME_LEN:
@@ -1612,50 +1554,17 @@ def _wifi_state_payload(store: WiFiSettingsStore, *, allow_http: bool) -> dict:
     }
 
 
-async def wifi_session_handler(request: web.Request) -> web.Response:
-    if _WIFI_GROUP_RECOVERY_REQUIRED:
-        return _wifi_recovery_required_response()
-    if not request.app.get("wifi_enabled"):
-        return _wifi_api_unavailable()
-    if not _wifi_transport_allowed(request):
-        return web.json_response(
-            {"error": "Wi-Fi authentication requires HTTPS unless MDM_WIFI_ALLOW_HTTP=1"},
-            status=403,
-        )
-    if not _token_matches(request, request.app.get("wifi_admin_token")):
-        return _wifi_api_unauthorized()
-    if not _wifi_origin_allowed(request):
-        return web.json_response({"error": "invalid request origin"}, status=403)
-    token = secrets.token_urlsafe(32)
-    request.app["wifi_sessions"][_session_key(token)] = time.time() + WIFI_SESSION_TTL
-    response = web.json_response({"authenticated": True})
-    response.set_cookie(
-        WIFI_SESSION_COOKIE,
-        token,
-        max_age=WIFI_SESSION_TTL,
-        httponly=True,
-        secure=request.secure,
-        samesite="Strict",
-        path="/",
-    )
-    return response
-
-
 async def wifi_state_handler(request: web.Request) -> web.Response:
     if _WIFI_GROUP_RECOVERY_REQUIRED:
         return _wifi_recovery_required_response()
     if not request.app.get("wifi_enabled"):
         return web.json_response({"enabled": False, "allow_http": False, "groups": {}, "devices": {}})
-    if not _wifi_admin_authorized(request):
-        # The unauthenticated payload is deliberately minimal so the UI can show
-        # its token form without revealing device or group metadata.
+    if not _wifi_transport_allowed(request):
         return web.json_response(
             {
-                "enabled": True,
-                "allow_http": request.app.get("wifi_allow_http") is True,
-                "error": "authentication required",
+                "error": "Wi-Fi settings require HTTPS unless MDM_WIFI_ALLOW_HTTP=1",
             },
-            status=401,
+            status=403,
         )
     store = _wifi_store(request)
     if store is None:
@@ -1671,8 +1580,11 @@ async def wifi_group_handler(request: web.Request) -> web.Response:
         return _wifi_recovery_required_response()
     if not request.app.get("wifi_enabled"):
         return _wifi_api_unavailable()
-    if not _wifi_admin_authorized(request):
-        return _wifi_api_unauthorized()
+    if not _wifi_transport_allowed(request):
+        return web.json_response(
+            {"error": "Wi-Fi settings require HTTPS unless MDM_WIFI_ALLOW_HTTP=1"},
+            status=403,
+        )
     store = _wifi_store(request)
     if store is None:
         return _wifi_api_unavailable()
@@ -1726,8 +1638,11 @@ async def wifi_deploy_handler(request: web.Request) -> web.Response:
         return _wifi_recovery_required_response()
     if not request.app.get("wifi_enabled"):
         return _wifi_api_unavailable()
-    if not _wifi_admin_authorized(request):
-        return _wifi_api_unauthorized()
+    if not _wifi_transport_allowed(request):
+        return web.json_response(
+            {"error": "Wi-Fi settings require HTTPS unless MDM_WIFI_ALLOW_HTTP=1"},
+            status=403,
+        )
     if not _wifi_origin_allowed(request):
         return web.json_response({"error": "invalid request origin"}, status=403)
     store = _wifi_store(request)
@@ -1780,8 +1695,6 @@ async def wifi_deploy_handler(request: web.Request) -> web.Response:
                     status, reason = "unknown", "superseded"
                 elif entry.get("identity_kind") != "canonical" or entry.get("wifi_settings_v2") is not True:
                     status, reason = "failed", "unsupported"
-                elif entry.get("wifi_authorized") is not True:
-                    status, reason = "failed", "permission_denied"
                 elif devices.get(device_id) is not entry or not _owns_device(device_id, ws):
                     status, reason = "failed", "socket_replaced"
                 elif ws is None or ws.closed:
@@ -1945,11 +1858,6 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
     device_id: str | None = None
     socket_identity_kind: str | None = None
-    wifi_authorized = bool(
-        request.app.get("wifi_enabled")
-        and _wifi_device_authorized(request)
-    )
-
     try:
         async for raw_msg in ws:
             if raw_msg.type == web.WSMsgType.TEXT:
@@ -2073,7 +1981,6 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "version_name": version_name,
                         "push_state_status": push_state_status,
                         "wifi_settings_v2": registration["wifi_settings_v2"],
-                        "wifi_authorized": wifi_authorized,
                     }
                     device_registry[device_id] = {
                         "label": prev.get("label", ""),
@@ -2435,13 +2342,6 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
 # ---------------------------------------------------------------------------
 
 async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
-    if request.app.get("wifi_enabled") and (
-        not _wifi_transport_allowed(request)
-        or not _valid_wifi_session(request)
-        or not request.headers.get("Origin")
-        or not _wifi_origin_allowed(request)
-    ):
-        return web.Response(status=401, text="authentication required")
     # On aiohttp 3.14.3, the server-side reader rejected Chrome's first PUSH_FILES
     # text frame after a long upload with "Received frame with non-zero reserved
     # bits". The failure was observed only on the inbound Chrome admin frame.
@@ -3895,16 +3795,12 @@ def create_app() -> web.Application:
     app["wifi_enabled"] = wifi_enabled
     app["wifi_allow_http"] = wifi_enabled and allow_http
     app["wifi_store"] = wifi_store
-    app["wifi_admin_token"] = os.environ.get("MDM_ADMIN_TOKEN") if wifi_enabled else None
-    app["wifi_device_token"] = os.environ.get("MDM_DEVICE_TOKEN") if wifi_enabled else None
-    app["wifi_sessions"] = {}
     app["wifi_lock"] = asyncio.Lock()
     app["wifi_send_locks"] = {}
 
     # WebSocket endpoints
     app.router.add_get("/ws/device", device_ws_handler)
     app.router.add_get("/ws/admin", admin_ws_handler)
-    app.router.add_post("/api/wifi/session", wifi_session_handler)
     app.router.add_get("/api/wifi/state", wifi_state_handler)
     app.router.add_route("GET", "/api/wifi/groups/{name}", wifi_group_handler)
     app.router.add_route("PUT", "/api/wifi/groups/{name}", wifi_group_handler)

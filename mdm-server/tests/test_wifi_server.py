@@ -53,17 +53,15 @@ def _certificate(tmp_path):
 
 def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypatch):
     async def body():
-        admin_token = "test-admin-token"
-        device_token = "test-device-token"
         capable_id = "11111111-1111-4111-8111-111111111111"
         old_v1_id = "22222222-2222-4222-8222-222222222222"
         unsupported_id = "33333333-3333-4333-8333-333333333333"
-        unauthorized_id = "44444444-4444-4444-8444-444444444444"
+        no_capability_id = "44444444-4444-4444-8444-444444444444"
         offline_id = "55555555-5555-4555-8555-555555555555"
         cert_path, key_path = _certificate(tmp_path)
 
-        monkeypatch.setenv("MDM_ADMIN_TOKEN", admin_token)
-        monkeypatch.setenv("MDM_DEVICE_TOKEN", device_token)
+        monkeypatch.delenv("MDM_ADMIN_TOKEN", raising=False)
+        monkeypatch.delenv("MDM_DEVICE_TOKEN", raising=False)
         monkeypatch.setenv("MDM_WIFI_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
         monkeypatch.setenv("MDM_TLS_CERT", str(cert_path))
         monkeypatch.setenv("MDM_TLS_KEY", str(key_path))
@@ -76,7 +74,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
         server.DATA_DIR.mkdir(parents=True, exist_ok=True)
         server.REGISTRY_PATH.write_text(json.dumps({
             "devices": {},
-            "groups": {"Studio": [capable_id, old_v1_id, unsupported_id, unauthorized_id, offline_id]},
+            "groups": {"Studio": [capable_id, old_v1_id, unsupported_id, no_capability_id, offline_id]},
         }), encoding="utf-8")
 
         app = server.create_app()
@@ -91,11 +89,9 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
         base_url = str(test_server.make_url("/")).rstrip("/")
         origin = f"https://{test_server.host}:{test_server.port}"
 
-        async def register(device_id, capabilities, *, authenticated=True):
-            headers = {"Authorization": f"Bearer {device_token}"} if authenticated else {}
+        async def register(device_id, capabilities):
             ws = await session.ws_connect(
                 base_url + "/ws/device",
-                headers=headers,
                 origin=origin,
             )
             await ws.send_json({
@@ -161,17 +157,10 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
         sockets = []
         try:
             async with session.get(base_url + "/api/wifi/state") as response:
-                assert response.status == 401
+                assert response.status == 200
                 assert (await response.json())["allow_http"] is False
-            async with session.delete(
-                base_url + "/api/wifi/groups/Studio",
-                headers={"Origin": origin},
-                json={"expected_revision": profile["revision"]},
-            ) as response:
-                assert response.status == 401
 
-            headers = {"Authorization": f"Bearer {admin_token}"}
-            bad_origin_headers = {**headers, "Origin": "https://attacker.example"}
+            bad_origin_headers = {"Origin": "https://attacker.example"}
             payload = {"networks": [{
                 "ssid": "Studio Net", "security": "WPA_PSK", "password": "studio-secret", "hidden": False,
             }]}
@@ -187,24 +176,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
                 assert response.status == 403
             assert store.profile("Studio") == profile
 
-            good_headers = {**headers, "Origin": origin}
-            async with session.post(
-                base_url + "/api/wifi/session", headers=bad_origin_headers,
-            ) as response:
-                assert response.status == 403
-            async with session.post(
-                base_url + "/api/wifi/session", headers=good_headers,
-            ) as response:
-                assert response.status == 200
-                cookie = response.headers["Set-Cookie"]
-                assert "HttpOnly" in cookie
-                assert "Secure" in cookie
-                assert "SameSite=Strict" in cookie
-            async with session.get(base_url + "/api/wifi/state") as response:
-                assert response.status == 200
-                assert (await response.json())["allow_http"] is False
-            async with session.put(base_url + "/api/wifi/groups/Studio", json=payload) as response:
-                assert response.status == 403
+            good_headers = {"Origin": origin}
             async with session.put(
                 base_url + "/api/wifi/groups/Studio", headers=good_headers,
                 json={**payload, "expected_revision": profile["revision"]},
@@ -215,8 +187,8 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             capable = await register(capable_id, ["wifi_settings_v2"])
             old_v1 = await register(old_v1_id, ["wifi_settings_v1"])
             unsupported = await register(unsupported_id, [])
-            unauthorized = await register(unauthorized_id, ["wifi_settings_v2"], authenticated=False)
-            sockets.extend([capable, old_v1, unsupported, unauthorized])
+            no_capability = await register(no_capability_id, [])
+            sockets.extend([capable, old_v1, unsupported, no_capability])
 
             stale_revision = profile["revision"]
             stale_change = {"networks": [{
@@ -234,7 +206,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             ) as response:
                 assert response.status == 409
             assert store.state["operations"] == {}
-            for ws in (capable, old_v1, unsupported, unauthorized):
+            for ws in (capable, old_v1, unsupported, no_capability):
                 await assert_no_message(ws)
 
             async with session.post(
@@ -257,8 +229,8 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             }
             assert result_by_id[unsupported_id]["status"] == "failed"
             assert result_by_id[unsupported_id]["reason"] == "unsupported"
-            assert result_by_id[unauthorized_id]["status"] == "failed"
-            assert result_by_id[unauthorized_id]["reason"] == "permission_denied"
+            assert result_by_id[no_capability_id]["status"] == "failed"
+            assert result_by_id[no_capability_id]["reason"] == "unsupported"
 
             command = await capable.receive_json(timeout=3)
             assert command["type"] == "EXECUTE_WIFI_APPLY"
@@ -266,14 +238,14 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             assert command["mode"] == "managed"
             assert command["revision"] == deployed["revision"]
             assert command["networks"][0]["password"] == "studio-secret"
-            for ws in (old_v1, unsupported, unauthorized):
+            for ws in (old_v1, unsupported):
                 await assert_no_message(ws)
 
             for device_id, expected in (
                 (capable_id, ("sent", None)),
                 (old_v1_id, ("failed", "unsupported")),
                 (unsupported_id, ("failed", "unsupported")),
-                (unauthorized_id, ("failed", "permission_denied")),
+                (no_capability_id, ("failed", "unsupported")),
             ):
                 delivery = store.state_view({device_id}, set())[device_id]["delivery"]
                 assert (delivery["status"], delivery["reason"]) == expected
@@ -324,7 +296,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             assert state_after_delete["groups"]["Studio"] == {
                 "revision": unmanaged_profile["revision"], "mode": "unmanaged",
             }
-            for ws in (capable, old_v1, unsupported, unauthorized):
+            for ws in (capable, old_v1, unsupported, no_capability):
                 await assert_no_message(ws)
 
             async with session.delete(
@@ -340,7 +312,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             ) as response:
                 assert response.status == 409
             assert set(store.state["operations"]) == previous_operation_ids
-            for ws in (capable, old_v1, unsupported, unauthorized):
+            for ws in (capable, old_v1, unsupported, no_capability):
                 await assert_no_message(ws)
 
             async with session.post(
@@ -357,7 +329,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             assert unmanaged_command["networks"] == []
             assert unmanaged_delivery["revision"] == unmanaged_profile["revision"]
             assert store.state["devices"][capable_id]["delivery"]["status"] == "sent"
-            for ws in (old_v1, unsupported, unauthorized):
+            for ws in (old_v1, unsupported, no_capability):
                 await assert_no_message(ws)
 
             changed = {"networks": [{
@@ -370,7 +342,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
                 current_profile = await response.json()
             assert current_profile["mode"] == "managed"
             assert current_profile["revision"] != unmanaged_profile["revision"]
-            for ws in (capable, old_v1, unsupported, unauthorized):
+            for ws in (capable, old_v1, unsupported, no_capability):
                 await assert_no_message(ws)
 
             # A second request exercises a send that is blocked while mutable
@@ -402,7 +374,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             mutation_admin = AdminSocket()
             await server.handle_set_group_members(
                 mutation_admin,
-                {"name": "Studio", "members": [old_v1_id, unsupported_id, unauthorized_id, offline_id]},
+                {"name": "Studio", "members": [old_v1_id, unsupported_id, no_capability_id, offline_id]},
                 app=app,
             )
             assert mutation_admin.messages[-1]["type"] == "GROUP_MEMBERS_SET"
@@ -434,7 +406,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             await server.handle_set_group_members(
                 mutation_admin,
                 {"name": "Studio", "members": [capable_id, old_v1_id, unsupported_id,
-                 unauthorized_id, offline_id]},
+                 no_capability_id, offline_id]},
                 app=app,
             )
             stale_lock = app["wifi_send_locks"].setdefault(capable_id, asyncio.Lock())
@@ -485,7 +457,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             stale_skipped_command = await capable.receive_json(timeout=3)
             assert stale_skipped_command["mode"] == "unmanaged"
             assert stale_skipped_command["revision"] == stale_test_unmanaged["revision"]
-            for ws in (old_v1, unsupported, unauthorized):
+            for ws in (old_v1, unsupported, no_capability):
                 await assert_no_message(ws)
 
             async with session.put(
@@ -555,7 +527,7 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
             admin = AdminSocket()
             await server.handle_set_group_members(
                 admin,
-                {"name": "Studio", "members": [old_v1_id, unsupported_id, unauthorized_id, offline_id]},
+                {"name": "Studio", "members": [old_v1_id, unsupported_id, no_capability_id, offline_id]},
                 app=app,
             )
             assert admin.messages[-1]["type"] == "GROUP_MEMBERS_SET"
@@ -578,15 +550,13 @@ def test_wifi_tls_delivery_only_frozen_snapshot_and_reconnect(tmp_path, monkeypa
     asyncio.run(body())
 
 
-def test_wifi_http_requires_explicit_opt_in_and_preserves_bearer_gates(tmp_path, monkeypatch):
+def test_wifi_http_still_requires_explicit_opt_in_without_authentication(tmp_path, monkeypatch):
     async def body():
-        admin_token = "test-admin-token"
-        device_token = "test-device-token"
         device_id = "55555555-5555-4555-8555-555555555555"
         cert_path, key_path = _certificate(tmp_path)
 
-        monkeypatch.setenv("MDM_ADMIN_TOKEN", admin_token)
-        monkeypatch.setenv("MDM_DEVICE_TOKEN", device_token)
+        monkeypatch.delenv("MDM_ADMIN_TOKEN", raising=False)
+        monkeypatch.delenv("MDM_DEVICE_TOKEN", raising=False)
         monkeypatch.setenv("MDM_WIFI_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
         monkeypatch.setenv("MDM_TLS_CERT", str(cert_path))
         monkeypatch.setenv("MDM_TLS_KEY", str(key_path))
@@ -608,34 +578,27 @@ def test_wifi_http_requires_explicit_opt_in_and_preserves_bearer_gates(tmp_path,
         assert app["wifi_allow_http"] is False
         test_server = TestServer(app)
         await test_server.start_server()
-        session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True))
+        session = aiohttp.ClientSession()
         base_url = str(test_server.make_url("/")).rstrip("/")
         origin = f"http://{test_server.host}:{test_server.port}"
         ws = None
+        admin_ws = None
         try:
             async with session.get(base_url + "/api/wifi/state") as response:
-                assert response.status == 401
-                assert (await response.json())["allow_http"] is False
-            async with session.post(
-                base_url + "/api/wifi/session",
-                headers={"Authorization": f"Bearer {admin_token}", "Origin": origin},
-            ) as response:
                 assert response.status == 403
             async with session.put(
                 base_url + "/api/wifi/groups/Studio",
-                headers={"Authorization": f"Bearer {admin_token}", "Origin": origin},
+                headers={"Origin": origin},
                 json={"networks": [{
                     "ssid": "LAN Wi-Fi", "security": "OPEN", "password": "", "hidden": False,
                 }], "expected_revision": None},
             ) as response:
-                assert response.status == 401
-            with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
-                await session.ws_connect(base_url + "/ws/admin", origin=origin)
-            assert exc.value.status == 401
+                assert response.status == 403
+            admin_ws = await session.ws_connect(base_url + "/ws/admin")
+            assert (await admin_ws.receive_json(timeout=3))["type"] == "SERVER_INFO"
 
             ws = await session.ws_connect(
                 base_url + "/ws/device",
-                headers={"Authorization": f"Bearer {device_token}"},
                 origin=origin,
             )
             await ws.send_json({
@@ -649,8 +612,10 @@ def test_wifi_http_requires_explicit_opt_in_and_preserves_bearer_gates(tmp_path,
                 "capabilities": ["wifi_settings_v2"],
             })
             assert (await ws.receive_json(timeout=3))["type"] == "REGISTERED"
-            assert server.devices[device_id]["wifi_authorized"] is False
+            assert "wifi_authorized" not in server.devices[device_id]
         finally:
+            if admin_ws is not None:
+                await admin_ws.close()
             if ws is not None:
                 await ws.close()
             await session.close()
@@ -663,13 +628,11 @@ def test_wifi_http_requires_explicit_opt_in_and_preserves_bearer_gates(tmp_path,
     asyncio.run(body())
 
 
-def test_wifi_http_opt_in_allows_authenticated_lan_flow(tmp_path, monkeypatch):
+def test_wifi_http_opt_in_allows_credential_free_lan_flow(tmp_path, monkeypatch):
     async def body():
-        admin_token = "test-admin-token"
-        device_token = "test-device-token"
         device_id = "66666666-6666-4666-8666-666666666666"
-        monkeypatch.setenv("MDM_ADMIN_TOKEN", admin_token)
-        monkeypatch.setenv("MDM_DEVICE_TOKEN", device_token)
+        monkeypatch.delenv("MDM_ADMIN_TOKEN", raising=False)
+        monkeypatch.delenv("MDM_DEVICE_TOKEN", raising=False)
         monkeypatch.setenv("MDM_WIFI_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
         monkeypatch.delenv("MDM_TLS_CERT", raising=False)
         monkeypatch.delenv("MDM_TLS_KEY", raising=False)
@@ -690,24 +653,12 @@ def test_wifi_http_opt_in_allows_authenticated_lan_flow(tmp_path, monkeypatch):
         assert app["tls_context"] is None
         test_server = TestServer(app)
         await test_server.start_server()
-        session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True))
+        session = aiohttp.ClientSession()
         base_url = str(test_server.make_url("/")).rstrip("/")
         origin = f"http://{test_server.host}:{test_server.port}"
         device_ws = None
         admin_ws = None
         try:
-            async with session.get(base_url + "/api/wifi/state") as response:
-                assert response.status == 401
-                assert (await response.json())["allow_http"] is True
-            async with session.post(
-                base_url + "/api/wifi/session",
-                headers={"Authorization": f"Bearer {admin_token}", "Origin": origin},
-            ) as response:
-                assert response.status == 200
-                cookie = response.headers["Set-Cookie"]
-                assert "HttpOnly" in cookie
-                assert "SameSite=Strict" in cookie
-                assert "Secure" not in cookie
             async with session.get(base_url + "/api/wifi/state") as response:
                 assert response.status == 200
                 state = await response.json()
@@ -733,16 +684,13 @@ def test_wifi_http_opt_in_allows_authenticated_lan_flow(tmp_path, monkeypatch):
             }], "expected_revision": None}
             async with session.put(
                 base_url + "/api/wifi/groups/Studio",
-                headers={
-                    "Authorization": f"Bearer {admin_token}",
-                    "Origin": "http://attacker.example",
-                },
+                headers={"Origin": "http://attacker.example"},
                 json=profile,
             ) as response:
                 assert response.status == 403
             async with session.put(
                 base_url + "/api/wifi/groups/Studio",
-                headers={"Origin": origin}, json=profile,
+                headers={"Origin": origin, "Cookie": "styly_mdm_wifi_session=expired"}, json=profile,
             ) as response:
                 assert response.status == 200
                 saved = await response.json()
@@ -750,13 +698,12 @@ def test_wifi_http_opt_in_allows_authenticated_lan_flow(tmp_path, monkeypatch):
             assert saved["networks"][0]["password_present"] is True
             assert "password" not in saved["networks"][0]
 
-            admin_ws = await session.ws_connect(base_url + "/ws/admin", origin=origin)
+            admin_ws = await session.ws_connect(base_url + "/ws/admin")
             assert (await admin_ws.receive_json(timeout=3))["type"] == "SERVER_INFO"
-            device_ws = await session.ws_connect(
-                base_url + "/ws/device",
-                headers={"Authorization": f"Bearer {device_token}"},
-                origin=origin,
-            )
+            await admin_ws.close()
+            admin_ws = await session.ws_connect(base_url + "/ws/admin")
+            assert (await admin_ws.receive_json(timeout=3))["type"] == "SERVER_INFO"
+            device_ws = await session.ws_connect(base_url + "/ws/device")
             await device_ws.send_json({
                 "type": "REGISTER",
                 "identity_scheme": server.IDENTITY_SCHEME,
@@ -768,7 +715,23 @@ def test_wifi_http_opt_in_allows_authenticated_lan_flow(tmp_path, monkeypatch):
                 "capabilities": ["wifi_settings_v2"],
             })
             assert (await device_ws.receive_json(timeout=3))["type"] == "REGISTERED"
-            assert server.devices[device_id]["wifi_authorized"] is True
+            assert "wifi_authorized" not in server.devices[device_id]
+
+            async with session.post(
+                base_url + "/api/wifi/groups/Studio/deploy",
+                headers={"Origin": origin},
+                json={"expected_revision": saved["revision"]},
+            ) as response:
+                assert response.status == 200
+                deployed = await response.json()
+            assert deployed["online_target_count"] == 1
+            assert deployed["operations"][0]["status"] == "sent"
+            command = await device_ws.receive_json(timeout=3)
+            assert command["type"] == "EXECUTE_WIFI_APPLY"
+            assert command["networks"][0]["password"] == "lan-secret"
+
+            async with session.post(base_url + "/api/wifi/session") as response:
+                assert response.status == 404
         finally:
             if device_ws is not None:
                 await device_ws.close()
