@@ -177,7 +177,9 @@ excluded from this report and Git.
 | Background-only process recovery | Passed | Terminated an active attempt and started only the foreground service, with no Activity. Restored the known baseline and actual connection at 3.5s. |
 | Boot correction without MDM | Passed after repair | Externally removed the saved successful Wi-Fi, then rebooted 109 to 110. Client recreated it, recorded successful boot application and obtained an IP while USB reverse was absent. A subsequent service restart added no boot result. |
 | Delete then explicit unmanaged, populated baseline | Passed before reboot | Deletion preserved the client's state and previous server delivery. Explicit send persisted unmanaged policy while retaining the successful baseline and current connection. |
-| Unmanaged boot with externally removed Wi-Fi | Pending | Removed the test Wi-Fi to prove it would not be recreated, then requested reboot. USB did not return within the observation window. Boot count, absence of reapplication, managed re-enable and final usable Wi-Fi restoration require the device to reconnect. |
+| Unmanaged boot with externally removed Wi-Fi | Passed after USB reconnection | Boot count advanced 110 to 111. Management stayed disabled, successful baseline and boot results were unchanged, claimed generation stayed 110, and the removed Wi-Fi was not recreated. |
+| Managed re-enable after unmanaged | Passed | After separately restoring basic connectivity, explicit valid MDM deployment completed fresh SSID/IP settlement at 3.8s and re-enabled management. This case does not demonstrate delivery to a device with no network. |
+| Final delete/explicit unmanaged deployment | Passed | Saving unmanaged again preserved client state and previous delivery. Explicit deployment disabled management while retaining the successful baseline and actual s-5ghz/IP connection; server and client policy revision matched. No pending operation remained. |
 
 ### Repairs established by hardware and review
 
@@ -217,18 +219,34 @@ excluded from this report and Git.
 
 The HTTP test server remains on port 7086 with the Documents-derived runtime
 registry. Desired Wi-Fi is unmanaged. The test-only Device Owner client/guard
-remain installed; their local server path requires USB reverse. The most recent
-client observation was unmanaged with its successful baseline retained. The
-`s-5ghz` OS profile was then deliberately removed for the unmanaged reboot test;
-it must be restored once USB returns. Do not describe the current headset as
-connected or final cleanup as complete until that readback succeeds.
+remain installed; their local server path requires USB reverse. After USB
+reconnection, actual boot111 readback confirmed unmanaged policy with the
+successful baseline retained and no recreation of the externally removed Wi-Fi.
+
+With no OS network, the existing client waits for a default-network callback and
+does not initiate the loopback USB server connection. A temporary normal-app
+debug Activity restored the supplied s-5ghz connection through the authorized
+Device Owner APIs. Its credential input/output and Activity were removed, and
+the clean product APK was rebuilt and reinstalled before normal MDM testing.
+This restoration was test setup, not proof of MDM delivery without a network.
+
+The subsequent explicit managed deployment succeeded with SSID/IP at 3.8s.
+Finally saved and explicitly deployed unmanaged again. Final native readback
+confirmed s-5ghz, supplicant completed and an assigned IP. Client policy revision
+matched the server unmanaged revision, the successful baseline remained and no
+manual/boot operation was pending. USB reverse and canonical online registration
+were restored. Original unknown OS networks were not restored.
 
 Private V3 evidence is under the existing `private/v3/` directory: `01-*`,
 `02-guest.json`, `03-success.json`, `03-without-server.json`,
 `04-wrong-password.json`, `05-process-recovery.json`,
 `06-boot-correction-110.json`, `06-service-restart-110.json`,
-`07-background-recovery.json` and `log-boot-diagnostic.txt`.
-There is no completed `08-unmanaged-reboot.json` yet. These temporary files are
+`07-background-recovery.json`, `log-boot-diagnostic.txt`,
+`08-resumed-readback.json`, `08-unmanaged-reboot-resumed.json`,
+`09-managed-reenable.json`, `10-final-unmanaged.json` and
+`12-rescue-connect.json` and `13-final-readback.json`. The first unmanaged reboot script timed out while USB
+was absent; its result is established by the separately recorded resumed
+readback, not an invented completed original script. These temporary files are
 not a durable committed audit archive.
 
 Two available-AP switching, hardware duplicate-command replay, active-operation

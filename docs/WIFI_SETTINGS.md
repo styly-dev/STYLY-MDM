@@ -279,6 +279,9 @@ same-SSID wrong-password rollback after approximately 60 seconds, recovery after
 process termination, and once-per-boot recreation of an externally removed
 successful configuration. Starting only the foreground service, without opening
 an Activity, also restored a pending operation and the actual connection.
+A subsequent unmanaged boot did not recreate an externally removed network.
+Explicit managed re-enable succeeded after restoring basic connectivity; final
+unmanaged deployment retained the connected Wi-Fi and successful baseline.
 Office/guest APs became unavailable; no successful connection to those APs or
 switching between two available APs is claimed.
 

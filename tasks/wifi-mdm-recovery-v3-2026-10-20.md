@@ -64,7 +64,9 @@ Device Owner provisioning on DEV-005 is explicitly authorized and completed.
 
 V3 implementation and automated checks completed. Hardware passed single-AP
 SSID/IP success, MDM-independent settlement, 60-second wrong-password recovery,
-process/foreground-service recovery and boot recreation (109 to 110). The later
-unmanaged reboot test is pending USB reconnection; its test Wi-Fi was deliberately
-removed and must be restored before final cleanup. See the hardware report for
-precise outcomes and exclusions. No push.
+process/foreground-service recovery and boot recreation (109 to 110). Resumed
+USB readback verified unmanaged boot110 to111 did not recreate externally
+removed Wi-Fi. Separately restored basic connectivity, then verified explicit
+managed re-enable and final unmanaged deployment. Final s-5ghz/IP connection,
+retained baseline and matching server/client unmanaged policy were confirmed.
+See the hardware report for exact outcomes and exclusions. No push.
