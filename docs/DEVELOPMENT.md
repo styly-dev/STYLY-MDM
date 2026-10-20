@@ -154,6 +154,17 @@ A consequence worth knowing: selecting a group stages every member, so a filter 
 afterwards cannot narrow it — the members stay on screen, marked. That is deliberate, since
 those members are exactly what an action would dispatch to.
 
+On the main Devices list, clicking a row checkbox toggles that device and records its stable
+device ID as the range anchor. Shift-clicking another checkbox applies that checkbox's next
+state to every visible row between it and the anchor, inclusive; selections outside the range
+stay as they were. Repeated Shift-clicks keep using the original anchor. The range follows the
+current displayed order after filtering, status filtering, or sorting, and selected rows kept
+visible by the filter participate in that order. If the anchor is no longer visible or has
+been removed, a Shift-click acts as a normal toggle and becomes the new anchor. Refreshes
+retain anchors by device ID, not row position. Select-all, clear, group selection, and crossing
+between the normal tabs reset the anchor. Shift-click selection controls do not select page
+text. These rules apply only to the main Devices list.
+
 ### Seeding dummy devices for UI testing
 
 `mdm-server/scripts/seed_dummy_devices.py` populates a **running** server with fake
