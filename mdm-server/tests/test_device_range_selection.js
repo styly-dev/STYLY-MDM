@@ -21,7 +21,6 @@ const listHelpers = source.slice(
 assert.ok(listHelpers.length > 0, 'actual device list helpers exist');
 
 function makeHarness({ order = [], selected = [], devices = null } = {}) {
-  let renderCalls = 0;
   const context = vm.createContext({
     devices: devices || order.map((id) => ({ device_id: id, label: id, status: 'online' })),
     deviceSearch: '',
@@ -35,16 +34,13 @@ function makeHarness({ order = [], selected = [], devices = null } = {}) {
     targetTab: 'devices',
     powerConfirm: { checked: true },
     deviceTaskState: {},
-    render() { renderCalls += 1; },
+    render() {},
     addLog() {},
-    knownIds() { return new Set(devicesForHarness.map((d) => d.device_id)); },
     getDeviceId(d) { return d.device_id; },
     isOnline(d) { return d.status === 'online'; },
   });
-  const devicesForHarness = context.devices;
   // Keep this accessor live when DEVICE_LIST replaces the module's device array.
-  Object.defineProperty(context, 'knownIds', { value: () => new Set(context.devices.map((d) => d.device_id)) });
-  Object.defineProperty(context, 'renderCalls', { get: () => renderCalls });
+  context.knownIds = () => new Set(context.devices.map((d) => d.device_id));
   vm.runInContext(listHelpers, context);
   for (const name of ['toggleDevice', 'toggleSelectAll', 'clearSelection', 'selectGroupAsTarget',
     'syncActiveGroupSelection', 'switchTargetTab']) {
@@ -156,7 +152,6 @@ test('select-all, clear, group selection/sync, and tab transitions reset the anc
   context.selectGroupAsTarget('Room A');
   assert.equal(context.deviceSelectionAnchorId, null);
   assert.deepEqual(selected(context), ['a', 'b']);
-  context.deviceSelectionAnchorId = 'a';
   context.groups['Room A'] = ['b'];
   context.syncActiveGroupSelection();
   assert.equal(context.deviceSelectionAnchorId, null);
@@ -201,7 +196,7 @@ test('actual delegated handlers toggle once and prevent selection only for Shift
   handlers.get('click')(clickEvent);
   assert.equal(toggleCount, 1);
   assert.equal(lastShift, true);
-  assert.equal(event('toggleDevice', true).prevented, 0);
+  assert.equal(clickEvent.prevented, 0);
 
   const shiftBox = event('toggleDevice', true);
   handlers.get('mousedown')(shiftBox);

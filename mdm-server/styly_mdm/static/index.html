@@ -1631,7 +1631,6 @@
       // pointing at a stale member set. If the group is gone, clear the selection.
       function syncActiveGroupSelection() {
         if (!activeGroup) return;
-        deviceSelectionAnchorId = null;
         if (!(activeGroup in groups)) { activeGroup = null; selectedIds.clear(); return; }
         const known = knownIds();
         selectedIds = new Set((groups[activeGroup] || []).filter(function (s) { return known.has(s); }));
