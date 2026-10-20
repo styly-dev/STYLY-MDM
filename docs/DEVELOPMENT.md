@@ -99,6 +99,14 @@ disables boot reapplication while retaining the device’s existing Wi-Fi networ
 is at most one group per device. See [`WIFI_SETTINGS.md`](WIFI_SETTINGS.md) for
 local recovery, migration, setup and the physical-verification boundary.
 
+Physical testing on a PICO 4 Ultra Enterprise (PUI 5.15.7) on 2026-10-20 found
+that the current adapter rejects managed deployment with `PERMISSION_DENIED`
+before changing Wi-Fi: the ordinary installed client has neither Device Owner
+nor `NETWORK_SETTINGS` authority. Full snapshot/replace/rollback is therefore
+not validated or usable on that installation. Delivery and unmanaged-policy
+tests passed within the limits recorded in
+[`the hardware report`](../tasks/wifi-hardware-validation-2026-10-20.md).
+
 ## Building the MDM Client
 
 ### Build from CLI

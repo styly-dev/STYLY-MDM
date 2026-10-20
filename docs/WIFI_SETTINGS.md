@@ -212,6 +212,25 @@ overlaps. Group rename preserves the saved revision; editing creates a new one.
 
 ## Verification boundary
 
+### PICO hardware result: 2026-10-20
+
+The current adapter cannot apply managed profiles on the tested ordinary-app
+PICO 4 Ultra Enterprise installation (PUI 5.15.7, Android 14). Two real managed
+deliveries reached the client, but its management-authority preflight returned
+`PERMISSION_DENIED` before mutation. Location, all-files and exact-alarm access
+do not grant Device Owner or `NETWORK_SETTINGS` authority. Do not remove this
+preflight merely to attempt destructive writes without a restorable snapshot.
+
+Profile deletion without dispatch, explicit unmanaged dispatch, unmanaged-policy
+persistence over a real reboot, offline-target exclusion, and preservation of
+unmanaged policy after a failed managed deployment were verified. There was no
+successful managed baseline: suppression of its boot reapplication, actual
+SSID/IP settlement and 60-second rollback remain unverified. Device Owner alone
+has not been shown to make old credentials readable/restorable. PICO connection
+APIs are not a substitute for verified complete configuration restoration.
+See the [hardware report](../tasks/wifi-hardware-validation-2026-10-20.md) for
+the tested boundaries, preparation and final device state.
+
 JVM, server and console tests cover the state machines and protocol. APK build
 success is not physical-device validation. On supported PICO hardware, confirm
 configured-network authority/readback, full credential restoration, SSID/IP
