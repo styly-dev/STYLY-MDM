@@ -404,7 +404,8 @@
     .mg-footer .btn-primary { width: auto; margin: 0; padding: 9px 20px; font-size: 13px; }
 
     /* Keep the Wi-Fi form stable while membership and device status refresh. */
-    .wifi-admin-area { padding: 12px 20px 0; }
+    .wifi-auth-slot { flex: 0 0 auto; }
+    .wifi-admin-area { padding: 12px 20px; }
     .wifi-banner, .wifi-feedback { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 12px; }
     .wifi-banner { padding: 9px 11px; background: var(--bg-actions); border: 1px solid var(--border-soft); border-radius: 7px; }
     .wifi-banner.wifi-success { color: var(--success); }
@@ -457,14 +458,13 @@
     .wifi-result.danger { color: var(--danger); }
     .wifi-result.muted { color: var(--text-muted); }
     .wifi-device-status { min-width: 0; display: flex; flex-direction: column; gap: 6px; overflow-wrap: anywhere; }
-    .wifi-boot.danger { padding: 5px 8px; background: var(--bg-actions); border: 1px solid var(--danger); border-radius: 6px; font-weight: 700; }
     .wifi-reason { color: var(--text-secondary); font-size: 11px; padding-left: 18px; }
-    .wifi-boot-reason { color: var(--danger); }
     .wifi-membership-note { color: var(--warning); font-size: 10px; }
     .wifi-member-locked { opacity: .55; cursor: not-allowed; }
 
     @container (max-width: 600px) {
       .wifi-fields, .wifi-device-row { grid-template-columns: minmax(0, 1fr); }
+      .wifi-section-head { flex-direction: column; }
       .wifi-actions, .wifi-action-right { align-items: stretch; flex-direction: column; }
       .wifi-actions .btn, .wifi-actions .btn-outline { width: 100%; }
       .wifi-row-foot { align-items: flex-start; flex-direction: column; }
@@ -513,6 +513,7 @@
         </div>
       </div>
 
+      <div class="wifi-auth-slot" id="consoleAuthSlot"><div class="wifi-admin-area" id="wifiAuthPanel"></div></div>
       <div class="zones">
         <!-- (1) Targets -->
         <div class="targets">
@@ -704,7 +705,7 @@
         <span class="bar-sep"></span>
         <span class="bar-title">Manage Groups</span>
       </div>
-      <div class="wifi-admin-area" id="wifiAuthPanel"></div>
+      <div class="wifi-auth-slot" id="manageAuthSlot"></div>
       <div class="manage-grid">
         <div class="mg-sidebar" id="mgSidebar"></div>
         <div class="mg-main">
@@ -724,6 +725,7 @@
       let serverVersion = null;        // STYLY-MDM server version, from SERVER_INFO
       let clientApk = null;            // newest styly-mdm-client APK on the server, from CLIENT_APK_INFO ({filename,url,version} or null)
       let groups = {};                 // name -> [serials]
+      let groupsLoaded = false;
       let selectedIds = new Set();
       let deviceSelectionAnchorId = null;
       let selectedConnectionIds = new Set();
@@ -831,8 +833,9 @@
       const mgSidebar = document.getElementById('mgSidebar');
       const mgDetail = document.getElementById('mgDetail');
       const wifiGroupPanel = document.getElementById('wifiGroupPanel');
+      const wifiAuthPanel = document.getElementById('wifiAuthPanel');
       const wifiController = window.MdmWifiConsole.createController({
-        authPanel: document.getElementById('wifiAuthPanel'),
+        authPanel: wifiAuthPanel,
         groupPanel: wifiGroupPanel,
         getGroups: function () { return groups; },
         getDevices: function () { return devices; },
@@ -1141,6 +1144,7 @@
           }
           case 'GROUP_LIST': {
             groups = msg.groups || {};
+            groupsLoaded = true;
             if (pendingSelectGroup && (pendingSelectGroup in groups)) { selectManageGroup(pendingSelectGroup); pendingSelectGroup = null; }
             else if (manageSelectedGroup && !(manageSelectedGroup in groups)) { manageSelectedGroup = null; manageMembers = new Set(); }
             // Keep the active-group selection current: a group whose membership was
@@ -1256,6 +1260,8 @@
         // The top-bar version's red state depends on the device list, so refresh it
         // on every render (device rows below carry the reverse, client-behind flag).
         updateServerVersionBadge();
+        const authSlot = document.getElementById(view === 'manage' ? 'manageAuthSlot' : 'consoleAuthSlot');
+        if (wifiAuthPanel.parentElement !== authSlot) authSlot.appendChild(wifiAuthPanel);
         if (view === 'manage') {
           manageView.style.display = '';
           consoleView.style.display = 'none';
@@ -2365,7 +2371,7 @@
               '<span class="mg-item-name">' + esc(n) + '</span>' +
               '<span class="mg-item-count">' + (groups[n] || []).length + '</span></div>';
           }).join('')
-          : '<div class="empty small">No groups — create one</div>';
+          : '<div class="empty small">' + (groupsLoaded ? 'No groups — create one' : 'Waiting for server…') + '</div>';
         mgSidebar.innerHTML =
           '<div class="mg-create"><input class="mg-new" data-mg-new placeholder="New group name…" maxlength="64">' +
           '<button class="btn-mini btn-save" data-act="addGroup">Add</button></div>' +
@@ -3232,7 +3238,7 @@
         else if (act === 'renameGroup') openRenameGroupEditor();
         else if (act === 'saveRename') commitRenameGroup();
         else if (act === 'cancelRename') closeRenameGroupEditor();
-        else if (act === 'deleteGroup') { const name = t.dataset.group; if (confirm('Delete group "' + name + '"?\nDevices are not removed, only the group.')) sendDeleteGroup(name); }
+        else if (act === 'deleteGroup') { const name = t.dataset.group; if (confirm('Delete group "' + name + '"?\nDevices are not removed, only the group.\n\nExisting device Wi-Fi settings and startup policies stay unchanged. To stop startup reapplication, first deploy Do not manage Wi-Fi.')) sendDeleteGroup(name); }
       });
       // Manage search + keyboard
       manageView.addEventListener('input', function (e) {

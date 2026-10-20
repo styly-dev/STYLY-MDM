@@ -40,7 +40,7 @@ def test_legacy_many_to_many_migration_is_deterministic():
     }
 
 
-def test_group_members_reject_cross_group_assignments_and_unresolved_moves(tmp_path, monkeypatch):
+def test_group_members_reject_cross_group_assignments_but_allow_changes_after_dispatch(tmp_path, monkeypatch):
     async def body():
         server._apply_data_dir(str(tmp_path))
         server._WIFI_GROUP_RECOVERY_REQUIRED = False
@@ -58,16 +58,25 @@ def test_group_members_reject_cross_group_assignments_and_unresolved_moves(tmp_p
         assert server.device_groups == {"Alpha": ["device-a"], "Beta": []}
 
         profile = store.put_profile("Alpha", _networks())
-        operation = store.create_operations(
-            "Alpha", profile["revision"], profile["networks"], ["device-a"],
-        )[0]
+        operation = store.create_delivery_attempts("Alpha", profile["revision"], ["device-a"])[0]
+        assert store.settle_delivery(operation["operation_id"], "sent", None)
         await server.handle_set_group_members(
             admin, {"name": "Alpha", "members": []}, app=fake_app,
         )
-        assert admin.messages[-1]["type"] == "ERROR"
-        assert server.device_groups["Alpha"] == ["device-a"]
-        assert store.unresolved_for_device("device-a")
+        assert admin.messages[-1]["type"] == "GROUP_MEMBERS_SET"
+        assert server.device_groups["Alpha"] == []
+        assert store.state["devices"]["device-a"]["delivery"]["status"] == "sent"
         assert operation["device_id"] == "device-a"
+
+        await server.handle_rename_group(
+            admin, {"name": "Alpha", "new_name": "Gamma"}, app=fake_app,
+        )
+        assert admin.messages[-1]["type"] == "GROUP_RENAMED"
+        assert store.profile("Gamma") is not None
+
+        await server.handle_delete_group(admin, {"name": "Gamma"}, app=fake_app)
+        assert admin.messages[-1]["type"] == "GROUP_DELETED"
+        assert store.profile("Gamma") is None
 
     asyncio.run(body())
 

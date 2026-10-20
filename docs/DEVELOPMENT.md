@@ -82,20 +82,22 @@ compatibility, and message sequences.
 ### Group Wi-Fi profiles and boot correction
 
 Group Wi-Fi settings have independent saved revisions and explicit whole-group
-application. Deployment freezes online targets; the Android client owns a durable
-manual rollback journal and the last successful boot baseline. OS boot correction
-runs once per boot generation, after interrupted manual recovery, without a
-connectivity test or the manual 60-second rollback. Manual and boot results remain
-separate. Wi-Fi credentials require token authentication and encrypted server
-persistence. TLS is supported; an explicitly configured managed-LAN server can
-use HTTP (`MDM_WIFI_ALLOW_HTTP=1`). Device credentials are sent only to the
-manually enrolled endpoint. The console uses separate Devices and Wi-Fi tabs
-inside the selected group and retains Wi-Fi drafts during status refreshes.
+sending. The server freezes online targets, records delivery only, and finishes
+without waiting for application results or MDM reconnection. The Android client
+owns the durable pre-change snapshot and fixed 60-second local deadline. A
+candidate SSID plus a Wi-Fi IP address commits success locally; later disconnects
+do not roll it back. Once per actual OS boot, after interrupted manual recovery,
+the client reapplies its last successful baseline without a connectivity probe or
+boot rollback. `wifi_settings_v2` separates this behavior from old clients.
 
-See [`WIFI_SETTINGS.md`](WIFI_SETTINGS.md) for lifecycle, migration, security,
-supported authentication modes and the physical-verification boundary. Group
-membership is now at most one group per device; overlapping legacy memberships
-are resolved deterministically during migration.
+Credentials require token authentication and encrypted server persistence. TLS is
+supported; a managed-LAN server can explicitly use HTTP (`MDM_WIFI_ALLOW_HTTP=1`).
+Device credentials are sent only to the manually enrolled endpoint. Separate
+Devices and Wi-Fi tabs retain drafts during status refreshes. Deleting Wi-Fi
+settings saves an unmanaged revision without sending it; explicit deployment
+disables boot reapplication while retaining the device’s existing Wi-Fi networks. Group membership
+is at most one group per device. See [`WIFI_SETTINGS.md`](WIFI_SETTINGS.md) for
+local recovery, migration, setup and the physical-verification boundary.
 
 ## Building the MDM Client
 

@@ -21,6 +21,8 @@
     <string name="wifi_exact_alarm_unavailable">Exact alarm settings are unavailable on this device</string>
     <string name="wifi_location_permission_granted">Wi-Fi configuration permission granted</string>
     <string name="wifi_location_permission_missing">Location permission is required to read configured Wi-Fi networks</string>
+    <string name="wifi_location_services_disabled">Turn on Location services to verify the connected Wi-Fi SSID</string>
+    <string name="wifi_location_settings_unavailable">Location settings are unavailable on this device</string>
     <string name="wifi_location_permission_button">Grant Wi-Fi Configuration Permission</string>
     <string name="connection_status_label">Connection Status</string>
     <string name="status_unknown">Not connected</string>

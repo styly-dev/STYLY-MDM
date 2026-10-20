@@ -350,7 +350,6 @@ class WebSocketManager internal constructor(
         registration.clear()
         connectedServerAddress = null
         connectedAuthorizedWifiSession = false
-        wifiController.onTransportDisconnected()
     }
 
     fun sendMessage(json: JSONObject) {
@@ -522,14 +521,6 @@ class WebSocketManager internal constructor(
                             return
                         }
                         pushCoordinator.onRegistered(webSocket)
-                        if (registration.isCanonicalAcknowledged(webSocket)) {
-                            wifiController.onCanonicalRegistered(connectedAuthorizedWifiSession) { message ->
-                                this@WebSocketManager.webSocket === webSocket &&
-                                    connectedAuthorizedWifiSession &&
-                                    registration.isCanonicalAcknowledged(webSocket) &&
-                                    webSocket.send(message.toString())
-                            }
-                        }
                         reconnectHandler.post {
                             if (this@WebSocketManager.webSocket === webSocket &&
                                 registration.isCanonicalAcknowledged(webSocket)
@@ -564,12 +555,7 @@ class WebSocketManager internal constructor(
                             type,
                             json,
                             connectedAuthorizedWifiSession && registration.isCanonicalAcknowledged(webSocket),
-                        ) { message ->
-                            this@WebSocketManager.webSocket === webSocket &&
-                                connectedAuthorizedWifiSession &&
-                                registration.isCanonicalAcknowledged(webSocket) &&
-                                webSocket.send(message.toString())
-                        }
+                        )
                     } else if (type.isNotEmpty() && !pushCoordinator.handleServerMessage(type, json)) {
                         onCommand(type, json, commandContext(webSocket))
                     }

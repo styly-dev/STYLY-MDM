@@ -1,235 +1,223 @@
-# Group Wi-Fi settings (v1)
+# Group Wi-Fi profiles and local recovery
 
-This feature implements the Wi-Fi portion of the supplied 2026-10-20 v1.1
-settings-deployment specification. Saving a profile and applying it are separate
-operations. A device belongs to at most one group, or remains unassigned.
-Brightness, volume and LBE settings are outside this implementation.
+This implementation incorporates the operator's 2026-10-20 revision of the
+supplied v1.1 specification. MDM-server reconnection is **not** a success
+condition. The server sends settings; each client checks and recovers locally.
 
-## Ownership and lifecycle
+## Operator workflow
 
-The server owns the latest group profile, its immutable revision, the deployment
-snapshot and each device's reported results. The Android application owns actual
-Wi-Fi changes, rollback, the last successfully committed profile and boot claims.
-The server never infers rollback success from a disconnected socket.
+Use **Manage Groups**, select a group, and open **Wi-Fi**. Save one or more
+networks, then choose **Send to whole group**. Saving alone changes no device.
+The **Devices** tab edits membership separately. Target counts and delivery
+status always use saved membership, even while membership edits are unsaved.
+A device may belong to at most one group; unassigned devices are permitted.
 
-A manual deployment freezes group membership, profile revision and online socket
-identities before dispatch. Every online member is included, even if a previous
-attempt succeeded. Offline members retain their existing state. No command queue
-is retained for reconnecting devices. A command already received by the client can
-recover locally and resend its result, without starting the settings operation
-again.
+Sending freezes the saved revision and the currently online group members.
+Only compatible, enrolled clients receive credentials. Unsupported online
+clients get a send failure; offline members are excluded, retain their previous
+send status, and do not receive queued settings when they reconnect. Sending
+again is a new operation, with a new online snapshot.
 
-Before making any manual changes, the client reads all existing configurations
-and obtains complete supported restoration information. Unknown credentials,
-unsupported security or insufficient privileges stop the operation before its
-first mutation. Merely knowing an SSID does not establish recoverability.
-The restoration snapshot and operation journal are persisted in private,
-backup-excluded storage before the first mutation. A local monotonic 60-second
-deadline covers changes, final readback and an operation-specific MDM challenge.
-The deadline initiates restoration; it does not promise restoration completes
-within 60 seconds. The successful profile is durably committed before publishing
-success. An unconfirmed candidate never replaces the boot baseline.
+The console reports **Not sent**, **Sent**, **Send failed** or **Send unconfirmed**,
+with text/icons and color. An older successful send is **Sent (previous profile)**.
+Online/offline is separate. **Sent** means the server completed a WebSocket send;
+it does not prove receipt, successful Wi-Fi connection, application or rollback.
+The server does not collect local manual, boot, mismatch or restoration results.
+No last-checked timestamp is shown.
 
-On an OS boot, a durable boot-generation claim permits one local correction to
-the last successful profile. Service restarts, reopening Settings, screen-on and
-server reconnects do not initiate correction. PICO's `SERVICE_AUTO_BOOT` is not
-accepted as proof of an OS boot. Recovery of an unfinished manual operation takes
-precedence over ordinary correction and blocks overlapping changes if restoration
-fails. Boot correction checks API results/readable values, but does not test
-connectivity, wait for MDM or schedule manual-deployment rollback.
+## Do not manage Wi-Fi
 
-The MDM client's own content autostart is ordered after local initialization and
-recovery/correction. Other launchers or OS content autostart are independent; this
-feature cannot guarantee it finishes before externally launched content starts.
-No continuous settings-enforcement loop is installed.
+**Delete Wi-Fi settings** saves a new **Do not manage Wi-Fi** revision for the
+group. The confirmation explicitly states that existing device Wi-Fi networks
+remain, and that a separate explicit deployment is required. Deletion sends no
+command, clears no device settings, and preserves prior delivery records.
 
-## Security and supported devices
+Choose **Send to whole group** to send this unmanaged state. Receiving clients
+persistently disable startup reapplication while retaining their existing Android
+Wi-Fi networks and historical successful profile. Offline clients keep their old
+policy until a later explicit deployment while connected; nothing is queued.
+The server records sending this policy without claiming that a device applied it.
 
-Wi-Fi credentials use administrator/device access control and encrypted server
-storage. HTTPS is supported. A server restricted to a managed LAN can explicitly
-allow HTTP with `MDM_WIFI_ALLOW_HTTP=1` when TLS is not configured; tokens and
-Wi-Fi passwords then travel without transport encryption. The browser session is
-HttpOnly and SameSite=Strict, with Secure set on HTTPS. Tokens must not be put in
-URLs or shared-storage client configuration. When TLS is used, certificates must
-be trusted by Android; no permissive trust manager or hostname bypass is provided.
+If a local connection attempt is already running, it can finish or restore for
+safety. A newer unmanaged policy prevents that older attempt from re-enabling
+startup reapplication or promoting an old managed baseline. A later managed
+profile re-enables boot correction only after its own local connection succeeds.
+Failed attempts do not re-enable management. Adding and saving a network after
+an unmanaged revision returns the group's desired profile to managed mode, but
+still requires an explicit deployment to change any device.
 
-Precise location permission and exact-alarm access are requested from the existing
-Android Settings screen. The client checks both before a manual mutation, along
-with device-owner/system authority; granting ordinary runtime permissions alone
-does not grant Wi-Fi management authority.
+## Manual change on the client
 
-The initial form supports open networks and WPA/WPA2 personal PSK networks. It
-rejects empty lists, duplicate SSID/security pairs and unsupported authentication
-methods. SSIDs contain 1–32 UTF-8 bytes; control characters, double quotes and
-backslashes are rejected by this adapter. PSKs contain 8–63 ASCII characters or
-64 hexadecimal digits.
-WPA3/SAE, EAP/enterprise certificates, WEP and custom proxy/static-IP profiles are
-not silently converted to supported profiles. API availability and permission
-checks are required: a successful compile does not grant Android device-owner or
-privileged Wi-Fi access.
+1. Validate the command and management permissions. Read a complete, restorable
+   pre-change snapshot. Persist it and the operation identity before mutation.
+   If the current credentials or supported configuration cannot be recovered,
+   stop before making changes.
+2. At the first settings mutation, persist a fixed elapsed-time deadline 60
+   seconds ahead and arm local rollback. An MDM service/socket restart never
+   renews this budget.
+3. Apply the candidate list and verify supported configuration API results.
+   Observe the actual Wi-Fi network's SSID and assigned IP address locally.
+   A default mobile/VPN network and internet validation do not qualify.
+   Android 12+ uses per-network Wi-Fi identity. Android 10/11 correlates legacy
+   Wi-Fi identity with the sole Wi-Fi network's IPv4 address; IPv6-only or
+   ambiguous legacy observations fail closed instead of claiming success.
+4. If a distributed SSID obtains an IP within the budget, atomically retain the
+   candidate as the successful baseline and finish the journal. This is a
+   one-time success: later disconnects do not trigger automatic rollback.
+5. If no qualifying connection is observed before the deadline, or applying
+   fails after changes, restore the pre-change snapshot locally. MDM-server
+   availability plays no role. Restoration failure remains a local fence against
+   further changes; it is not reported as restored.
 
-`MDM_DEVICE_TOKEN` is a shared fleet credential. Every holder is trusted for the
-entire fleet, including any group's Wi-Fi secrets. A self-reported Device ID is
-not cryptographic device authentication: a token holder can impersonate another
-fleet member. Do not use this mode for mutually untrusted devices or tenants.
-Per-device enrollment credentials/certificates and authorization bound to the
-registered Device ID are required before claiming isolation between groups.
+No HTTP request, ping, DNS lookup or MDM handshake is used as a connectivity
+probe. The server may legitimately be unreachable from the new Wi-Fi network.
+Normal client reconnect behavior remains separate from the Wi-Fi transaction.
+Duplicate operation identities cannot execute settings mutations twice.
 
-Passwords live only in the encrypted server state and Android private
-`noBackupFilesDir` storage. Neither raw WebSocket frames nor credential values
-belong in logs, diagnostics, shared storage or backup. Read APIs redact passwords;
-retaining an existing password uses an explicit unchanged-password representation
-rather than returning it to the form.
+An interrupted durable manual journal is recovered before ordinary startup
+work. A process restart conservatively restores unfinished changes rather than
+waiting for a server response. Successful local state is committed before the
+journal is cleared, so a late alarm cannot undo an already committed operation.
 
-PICO's documented default-auto-connect API alone does not establish saved-network
-listing, deletion, restoration or password-readback support. The Android adapter
-must fail closed when a complete, authoritative configuration list and restoration
-snapshot are unavailable. Do not assume a previously successful SSID still has
-the same password after another application or operator changes it.
+## Once-per-OS-boot correction
 
-## Server and client setup
+After recovering unfinished manual work, reapply the device's last locally
+successful profile once per actual OS boot generation while management is enabled. Persist the claimed
+boot generation to avoid duplicates from BOOT_COMPLETED and PICO service-boot
+notifications. Service restart, screen-on, and reconnect do not trigger another
+boot correction. Failed manual candidates never become the boot baseline.
 
-The Wi-Fi feature is opt-in. Configure the encryption key and both tokens, then
-choose TLS or explicit managed-LAN HTTP:
+Normal boot correction has no connectivity test, 60-second rollback, continuous
+enforcement or unlimited retry loop. An old AP may have disappeared; boot
+correction does not guarantee connectivity. Content auto-launch ordering still
+requires physical-device validation; no strict before-content-start guarantee
+is claimed.
 
-| Variable | Value |
+## Setup and secrets
+
+Configure `MDM_WIFI_ENCRYPTION_KEY`, `MDM_ADMIN_TOKEN` and `MDM_DEVICE_TOKEN`.
+Choose either TLS or explicit managed-LAN HTTP:
+
+| Variable | Meaning |
 |---|---|
-| `MDM_TLS_CERT` | PEM certificate chain file when using TLS |
-| `MDM_TLS_KEY` | PEM private-key file when using TLS |
-| `MDM_WIFI_ALLOW_HTTP` | `1` enables managed-LAN HTTP only when TLS is absent |
-| `MDM_WIFI_ENCRYPTION_KEY` | Fernet key, kept outside the data directory/backups |
-| `MDM_ADMIN_TOKEN` | Secret administrator access token |
-| `MDM_DEVICE_TOKEN` | Secret token provisioned into managed clients |
+| `MDM_WIFI_ENCRYPTION_KEY` | Fernet key stored separately from server data/backups |
+| `MDM_ADMIN_TOKEN` | Administrator access token |
+| `MDM_DEVICE_TOKEN` | Token provisioned into managed clients |
+| `MDM_TLS_CERT` / `MDM_TLS_KEY` | Both PEM files when using TLS |
+| `MDM_WIFI_ALLOW_HTTP` | `1` permits managed-LAN HTTP only when TLS is absent |
 
-Generate a Fernet key with the installed Python environment:
+Generate the encryption key with the installed environment:
 
 ```bash
 python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
 ```
 
-The encrypted store is `MDM_DATA_DIR/wifi_settings.enc`. Group rename/delete
-uses `wifi_group_mutation.txn`, recovered before either group or Wi-Fi state is
-loaded. Keep that journal with the data directory when recovering an interrupted
-server. An unrecoverable metadata transaction blocks Wi-Fi work rather than
-letting inconsistent state deploy credentials.
+For managed-LAN HTTP, leave TLS files unset, set `MDM_WIFI_ALLOW_HTTP=1`, open
+`http://` and disable TLS in Android Settings. Tokens and Wi-Fi credentials then
+travel without transport encryption. For TLS, configure both files, open
+`https://` and enable TLS on Android. The server advertises the matching WS/WSS
+scheme. TLS certificates must be trusted; no certificate bypass is implemented.
 
-`MDM_WIFI_OPERATION_TIMEOUT` optionally controls when the server marks missing
-results unknown (default 180 seconds). It does not change the device's local
-60-second manual rollback deadline or imply a completed restoration.
+Authenticate in the console. Its session cookie is HttpOnly and SameSite=Strict,
+with Secure set for HTTPS. Origin checks still apply. On each client, configure
+an explicit manual server URL and its device token. Discovery/cache alone never
+authorizes token transmission, even for a matching URL. Redirects cannot move
+the enrollment to another server. Shared-storage client config contains no token.
 
-Retain the encryption key separately: losing it makes saved profiles and deployment
-history unreadable. Restarting with another key must fail rather than silently
-resetting the store. Back up the encrypted data together with the normal device
-registry, and keep the token/key material out of source control. `cryptography`
-is the additional server runtime dependency for authenticated encryption.
+The server encrypts `wifi_settings.enc`, including password-bearing profiles.
+Keep the key separate; losing or replacing it makes the store unreadable and
+must fail startup. Group rename/delete transaction recovery uses
+`wifi_group_mutation.txn`; keep that journal with the data directory. Logs and
+redacted APIs do not contain Wi-Fi passwords or access tokens. Android private
+internal storage retains restoration snapshots and successful profiles; shared
+storage, normal backups and diagnostic logs do not contain those secrets.
 
-The console and device connections use the configured MDM HTTP/WebSocket port.
-For managed-LAN HTTP, set `MDM_WIFI_ALLOW_HTTP=1` and leave TLS certificate/key
-unset; use `http://` in the browser and disable TLS in Android Settings. For TLS,
-configure both certificate files, use `https://` and enable TLS in Settings.
-Discovery advertises the matching `ws://` or `wss://` scheme. Authenticate in the
-console access form. On each client, set an explicit manual server address and
-provision the device token. The token and Wi-Fi capability are bound to that
-manually selected endpoint; UDP discovery/cache alone never authorizes credential
-transmission, even when the discovered URL matches the saved address.
+The shared device token trusts the enrolled fleet as a unit; it is not a
+per-device identity credential. Existing Device ID identity rules still apply.
 
-The shared-storage `styly-mdm/config.json` remains limited to non-secret
-connection tunables.
+## Supported devices and networks
 
-## Console behavior
+The initial form supports Open and WPA/WPA2 Personal (PSK). Empty managed network lists,
+duplicate SSIDs and unsupported modes are rejected. SSIDs are 1–32 UTF-8 bytes;
+this adapter rejects control characters, quotes and backslashes. PSKs are
+8–63 printable ASCII characters or 64 hexadecimal digits. A blank password
+field retains an existing password only for the same saved SSID/security entry.
+WPA3/SAE, EAP certificates, WEP, proxy and static-IP configurations are not
+silently converted to supported profiles.
 
-Use **Manage Groups**, choose a group, open its **Wi-Fi** tab, edit the network
-rows, then save. The **Devices** tab edits membership separately; Wi-Fi target
-counts and results always use saved membership. Saving does
-not send settings to devices. **Apply to whole group** takes a new online snapshot;
-there is no individual-device apply action. Saving again creates a new revision.
-Moving membership during an unresolved operation is rejected.
+The client needs device-owner/system authority for configured-network management,
+precise location access for SSID identity, and exact-alarm access for local
+rollback. Ordinary runtime permission alone does not grant management authority.
+Masked/unreadable old PSKs are not reconstructed by matching an SSID to a cached
+baseline; insufficient restoration information causes a pre-mutation failure.
+The complete configuration snapshot preserves supported enabled/priority and
+parcel fields for restoration.
 
-The console keeps online/offline status separate from settings status. It shows
-text and icons as well as colors: not applied (gray), applying (blue), success
-(green), mismatch (yellow), failed/unknown (red). A successful old revision is
-shown as **Not applied (previous settings applied)** after the group changes.
-Switching the active AP within the specified Wi-Fi list is not a mismatch.
-Unreadable credentials do not prove a complete match.
+## Protocol and migration
 
-Manual and boot results are stored separately. Successful correction to an older
-baseline does not turn a failed manual deployment into success. A boot-operation
-failure is shown explicitly while keeping manual history. No result is fabricated
-before the client reports it, and no last-checked timestamp is displayed.
+`REGISTER.capabilities` remains a string array and advertises
+`wifi_settings_v2`. V1 clients use MDM reconnection verification and cannot run
+this revision; the server marks them unsupported without sending credentials.
+Update client and server together. Other MDM capabilities remain compatible.
 
-## Wire and HTTP contract
-
-`REGISTER.capabilities` keeps the existing string-array format and adds
-`wifi_settings_v1`. A dictionary would break Push/Sync capability negotiation.
-Only canonical identities on authorized enrolled connections qualify for Wi-Fi
-commands; provisional identities never receive settings credentials.
+`EXECUTE_WIFI_APPLY` contains operation_id, revision, mode and networks. Mode is
+managed or unmanaged. Managed lists are nonempty; unmanaged commands have an
+empty list and change only the persistent startup-management policy. There is no
+Wi-Fi verification request/ACK, result ACK, observation or reconnect-time send.
 
 | Route | Operation |
 |---|---|
-| `POST /api/wifi/session` | Authenticate a browser using its bearer token |
-| `GET /api/wifi/state` | Read redacted group revisions and separate device result states |
-| `GET /api/wifi/groups/{name}` | Read redacted saved Wi-Fi form values |
-| `PUT /api/wifi/groups/{name}` | Validate and save a new profile revision |
-| `POST /api/wifi/groups/{name}/deploy` | Freeze online membership and apply the saved revision |
+| `POST /api/wifi/session` | Create an authenticated browser session |
+| `GET /api/wifi/state` | Read redacted revisions and per-device delivery status |
+| `GET /api/wifi/groups/{name}` | Read redacted saved form values |
+| `PUT /api/wifi/groups/{name}` | Validate/save a new managed profile revision |
+| `DELETE /api/wifi/groups/{name}` | Save an unmanaged revision; preserve device settings/delivery |
+| `POST /api/wifi/groups/{name}/deploy` | Send the frozen profile to current online members |
 
-Profiles contain nonempty `networks` lists. Each entry has `ssid`, `security`
-(`OPEN` or `WPA_PSK`), `password` and `hidden`. Read responses replace the password
-with `password_present`; a null/omitted password on update retains the saved PSK
-for the same SSID/security identity. Unsupported values are rejected before save.
-Group names in routes are URL-encoded.
+PUT, DELETE and deploy POST require `expected_revision`, matching the profile that the
+operator reviewed. A first PUT or DELETE explicitly uses null. Missing/malformed
+values return 400; a concurrent revision change returns 409 before saving or
+sending. The console preserves the draft and requires explicit reload. This
+Wi-Fi API change requires the accompanying updated console.
 
-| Message | Purpose |
-|---|---|
-| `EXECUTE_WIFI_APPLY` | New operation UUID, frozen revision UUID and network list |
-| `WIFI_APPLY_ACCEPTED` | Device has durably received this operation |
-| `WIFI_VERIFY_REQUEST` / `WIFI_VERIFY_ACK` | Exact-operation challenge after final settings verification |
-| `WIFI_APPLY_RESULT` | Durable manual result with fixed reason and rollback indication |
-| `WIFI_BOOT_RESULT` | Separate boot result, keyed by boot-result UUID and baseline revision |
-| `WIFI_OBSERVATION` | Readable-value observation: match, mismatch or unknown |
-| `WIFI_RESULT_ACK` | Server has durably stored the matching manual or boot result |
+State includes `allow_http`, group revision/mode and `devices[id].delivery`. Delivery status
+is sent/failed/unknown, with fixed reasons. An internal unfinished send becomes
+unknown on restart and is never replayed. Socket writes are serialized briefly per device so an older managed send cannot
+arrive after a newer unmanaged send. Superseded attempts that have not started
+are skipped; this is not a reconnect queue or a device-result wait.
+The deploy response includes
+`online_target_count` and per-device `operations`; it makes no application claim.
+A socket send has a bounded five-second timeout, separate from the client’s
+60-second connection budget. The old `MDM_WIFI_OPERATION_TIMEOUT` result-wait
+setting is no longer used. No server-side device-operation fence waits for a
+client that has changed LAN.
 
-A result ACK echoes its exact revision, status and reason (plus `rolled_back`
-for manual results). A delayed ACK for an intermediate unknown/restore-failed
-result must not acknowledge a later, different result for the same operation.
-A conclusive restoration failure remains fenced until verified recovery settles
-the same operation.
+Older encrypted profiles/revisions survive migration. Earlier application results
+are not reinterpreted as proof of a v2 send. Legacy unfinished delivery becomes
+unconfirmed; stale result messages cannot change the new delivery status.
+Older saved profiles without mode remain managed. Older Android state defaults
+to management enabled; receiving an unmanaged command is what disables it.
+Client recovery preserves existing baselines and interrupted restoration journals;
+old server-verification journals recover locally instead of waiting for an ACK.
+Downgrading after a server-store format migration is unsupported; retain a backup
+and its matching encryption key when switching builds.
 
-A reconnected canonical socket can finish a received operation and resend its
-result; this does not authorize redelivery of a new application command. A server
-restart marks unresolved operations unknown. It cannot declare success or a
-completed restoration without an exact client result. Unknown ownership remains
-fenced against overlapping deployments and membership changes.
-
-## Compatibility and migration
-
-This is an additive Wi-Fi wire protocol. Older clients retain existing MDM
-commands but cannot receive Wi-Fi credentials without the new capability and
-authenticated enrolled connection. Enable the feature after provisioning its
-server credentials and device token, with either TLS or explicit managed-LAN HTTP.
-The state API adds `allow_http`; clients that do not recognize it continue to
-require HTTPS. Existing TLS configurations retain their transport requirements.
-
-Legacy registry files may contain overlapping group membership. Migration assigns
-a device to the first group in sorted name order and removes later duplicates;
-unassigned devices remain unassigned. Back up the registry before upgrading if
-an existing workflow relies on overlapping groups. The new single-membership rule
-is intentional; downgrading does not reconstruct discarded overlaps. A profile's
-revision follows group rename; edits create a new revision. Device deployment
-history must retain its original operation/revision identity.
+Legacy overlapping membership migrates to the first group in sorted name order;
+unassigned devices remain unassigned. Downgrading cannot reconstruct the removed
+overlaps. Group rename preserves the saved revision; editing creates a new one.
 
 ## Verification boundary
 
-Host-side tests cover lifecycle boundaries with fake Wi-Fi adapters and transports.
-They do not validate PICO firmware privileges, real saved-network/password
-visibility, broadcast delivery, API blocking behavior, connectivity loss,
-restoration on physical reboot, or ordering relative to external content launch.
-No physical device was exercised for this implementation. The request's assumption
-that physical checks succeed is an implementation premise, not recorded evidence
-of a completed acceptance test.
+JVM, server and console tests cover the state machines and protocol. APK build
+success is not physical-device validation. On supported PICO hardware, confirm
+configured-network authority/readback, full credential restoration, SSID/IP
+callback visibility, same-SSID credential replacement, wrong-password timeout,
+unmanaged deployment/reboot and later managed re-enablement,
+MDM-unreachable successful Wi-Fi, process death/reboot recovery, alarm timing,
+duplicate boot notifications and content-start ordering. No physical success is
+claimed merely because implementation was requested on that assumption.
 
-Reference documentation:
-
-- [PICO Enterprise API introduction](https://business.picoxr.com/us/doc/EnterpriseAPI-Intro)
-- [Android WifiManager](https://developer.android.com/reference/android/net/wifi/WifiManager)
-- [Android WifiConfiguration](https://developer.android.com/reference/android/net/wifi/WifiConfiguration)
-- [Android broadcast exceptions](https://developer.android.com/develop/background-work/background-tasks/broadcasts/broadcast-exceptions)
+References: [WifiManager](https://developer.android.com/reference/android/net/wifi/WifiManager),
+[NetworkCallback](https://developer.android.com/reference/android/net/ConnectivityManager.NetworkCallback),
+[Android 12 Wi-Fi identity changes](https://developer.android.com/about/versions/12/behavior-changes-12),
+[PICO Enterprise API](https://business.picoxr.com/us/doc/EnterpriseAPI-Intro).

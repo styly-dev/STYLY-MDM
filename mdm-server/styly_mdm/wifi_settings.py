@@ -1,7 +1,7 @@
 """Encrypted durable state and validation for the opt-in Wi-Fi settings feature.
 
 This module contains no HTTP or WebSocket code. Password-bearing profiles and
-operation snapshots are encrypted as one Fernet payload before they reach disk.
+delivery metadata are encrypted as one Fernet payload before they reach disk.
 """
 
 from __future__ import annotations
@@ -22,22 +22,20 @@ from cryptography.fernet import Fernet, InvalidToken
 MAX_WIFI_NETWORKS = 32
 MAX_SSID_BYTES = 32
 
-RESULT_REASONS = frozenset({
-    "NONE",
-    "RESTORE_INFO_MISSING",
-    "PERMISSION_DENIED",
-    "UNSUPPORTED",
-    "CONFIG_READ_FAILED",
-    "ADD_FAILED",
-    "UPDATE_FAILED",
-    "DELETE_FAILED",
-    "VERIFY_FAILED",
-    "TIMEOUT_ROLLED_BACK",
-    "RESTORE_FAILED",
-    "BUSY",
-    "UNREACHABLE",
-    "UNKNOWN",
+DELIVERY_STATUSES = frozenset({"sent", "failed", "unknown"})
+DELIVERY_REASONS = frozenset({
+    "unsupported",
+    "permission_denied",
+    "socket_unavailable",
+    "socket_replaced",
+    "superseded",
+    "socket_send_failed",
+    "server_restarted",
+    "legacy_result_untracked",
+    "dispatch_not_confirmed",
+    "state_persist_failed",
 })
+MAX_OLD_DELIVERY_OPERATIONS = 256
 
 
 class WiFiSettingsError(ValueError):
@@ -53,7 +51,7 @@ class WiFiStoreError(RuntimeError):
 
 
 def _new_state() -> dict[str, Any]:
-    return {"version": 1, "profiles": {}, "operations": {}, "devices": {}}
+    return {"version": 2, "profiles": {}, "operations": {}, "devices": {}}
 
 
 def normalize_revision(value: Any) -> str | None:
@@ -163,7 +161,7 @@ def valid_uuid(value: Any) -> bool:
 
 
 class WiFiSettingsStore:
-    """A small encrypted JSON store with atomic replacement and fixed result enums."""
+    """Encrypted profiles and bounded, delivery-only Wi-Fi command state."""
 
     def __init__(self, path: Path, encryption_key: str | bytes):
         self.path = Path(path)
@@ -192,12 +190,110 @@ class WiFiSettingsStore:
             parsed = json.loads(payload)
         except (InvalidToken, json.JSONDecodeError, UnicodeDecodeError):
             raise WiFiStoreError("encrypted Wi-Fi state failed validation") from None
-        if not isinstance(parsed, dict) or parsed.get("version") != 1:
+        if not isinstance(parsed, dict) or type(parsed.get("version")) is not int:
             raise WiFiStoreError("encrypted Wi-Fi state has an unsupported format")
         for key in ("profiles", "operations", "devices"):
             if not isinstance(parsed.get(key), dict):
                 raise WiFiStoreError("encrypted Wi-Fi state failed validation")
-        self.state = parsed
+        if parsed["version"] == 1:
+            self.state = self._migrate_v1(parsed)
+            try:
+                self.save()
+            except WiFiStoreError:
+                raise WiFiStoreError("legacy Wi-Fi delivery state could not be migrated") from None
+        elif parsed["version"] == 2:
+            self.state = parsed
+            if self._normalize_profiles(self.state["profiles"]):
+                try:
+                    self.save()
+                except WiFiStoreError:
+                    raise WiFiStoreError("legacy Wi-Fi profile mode could not be migrated") from None
+        else:
+            raise WiFiStoreError("encrypted Wi-Fi state has an unsupported format")
+
+    @staticmethod
+    def _normalize_profiles(profiles: dict[str, Any]) -> bool:
+        """Upgrade pre-mode profiles as managed and reject invalid persisted shapes."""
+        changed = False
+        for profile in profiles.values():
+            if not isinstance(profile, dict):
+                raise WiFiStoreError("encrypted Wi-Fi profile failed validation")
+            if "mode" not in profile:
+                profile["mode"] = "managed"
+                changed = True
+            mode = profile.get("mode")
+            networks = profile.get("networks")
+            if (
+                not isinstance(mode, str)
+                or mode not in {"managed", "unmanaged"}
+                or not isinstance(networks, list)
+            ):
+                raise WiFiStoreError("encrypted Wi-Fi profile failed validation")
+            if (mode == "managed" and not networks) or (mode == "unmanaged" and networks):
+                raise WiFiStoreError("encrypted Wi-Fi profile failed validation")
+        return changed
+
+    @staticmethod
+    def _migrate_v1(parsed: dict[str, Any]) -> dict[str, Any]:
+        """Keep profiles; represent old result-tracked applies as unknown delivery."""
+        migrated = _new_state()
+        migrated["profiles"] = copy.deepcopy(parsed["profiles"])
+        WiFiSettingsStore._normalize_profiles(migrated["profiles"])
+        latest: dict[str, tuple[float, int, dict[str, Any]]] = {}
+        for index, (operation_id, old) in enumerate(parsed["operations"].items()):
+            if not isinstance(old, dict):
+                continue
+            device_id = old.get("device_id")
+            revision = old.get("revision")
+            if not isinstance(device_id, str) or not valid_uuid(operation_id) or not valid_uuid(revision):
+                continue
+            attempted_at = old.get("created_at")
+            if isinstance(attempted_at, bool) or not isinstance(attempted_at, (int, float)):
+                attempted_at = 0.0
+            record = {
+                "operation_id": operation_id,
+                "device_id": device_id,
+                "revision": revision,
+                "status": "unknown",
+                "reason": "legacy_result_untracked",
+                "attempted_at": float(attempted_at),
+                "updated_at": float(attempted_at),
+            }
+            candidate = (float(attempted_at), index, record)
+            if device_id not in latest or candidate[:2] >= latest[device_id][:2]:
+                latest[device_id] = candidate
+
+        all_device_ids = set(parsed["devices"]) | set(latest)
+        for device_id in all_device_ids:
+            if not isinstance(device_id, str):
+                continue
+            old_record = parsed["devices"].get(device_id)
+            migrated_devices: dict[str, Any] = {}
+            if device_id in latest:
+                migrated_devices["delivery"] = copy.deepcopy(latest[device_id][2])
+            else:
+                # A legacy manual result may outlive its detailed operation.
+                # Never treat its status as proof that a command was delivered.
+                manual = old_record.get("manual") if isinstance(old_record, dict) else None
+                if isinstance(manual, dict):
+                    operation_id = manual.get("operation_id")
+                    revision = manual.get("revision")
+                    if valid_uuid(operation_id) and valid_uuid(revision):
+                        migrated_devices["delivery"] = {
+                            "operation_id": operation_id,
+                            "revision": revision,
+                            "status": "unknown",
+                            "reason": "legacy_result_untracked",
+                            "attempted_at": None,
+                            "updated_at": 0.0,
+                        }
+            migrated["devices"][device_id] = migrated_devices
+
+        migrated["operations"] = {
+            item[2]["operation_id"]: copy.deepcopy(item[2])
+            for item in latest.values()
+        }
+        return migrated
 
     def encrypted_bytes(self) -> bytes:
         payload = json.dumps(
@@ -251,38 +347,49 @@ class WiFiSettingsStore:
             raise WiFiStoreError("encrypted Wi-Fi state could not be persisted") from None
 
     def mark_restart_unknown(self) -> None:
-        if any(
-            operation.get("unresolved") is True
-            and (operation.get("status") != "unknown" or not operation.get("server_restarted"))
-            for operation in self.state["operations"].values()
-        ):
-            with self._transaction():
-                for operation in self.state["operations"].values():
-                    if operation.get("unresolved") is True:
-                        if operation.get("status") == "unknown" and operation.get("server_restarted"):
-                            continue
-                        operation["status"] = "unknown"
-                        operation["reason"] = "UNKNOWN"
-                        operation["server_restarted"] = True
-                        operation["updated_at"] = time.time()
-                        device_id = operation.get("device_id")
-                        if isinstance(device_id, str):
-                            record = self.state["devices"].setdefault(device_id, {})
-                            record["manual"] = {
-                                "operation_id": operation.get("operation_id"),
-                                "revision": operation.get("revision"),
-                                "status": "unknown",
-                                "reason": "UNKNOWN",
-                                "rolled_back": False,
-                            }
+        interrupted = [
+            operation_id
+            for operation_id, operation in self.state["operations"].items()
+            if isinstance(operation, dict) and operation.get("status") == "dispatching"
+        ]
+        if not interrupted:
+            return
+        with self._transaction():
+            for operation_id in interrupted:
+                operation = self.state["operations"].get(operation_id)
+                if not isinstance(operation, dict) or operation.get("status") != "dispatching":
+                    continue
+                operation["status"] = "unknown"
+                operation["reason"] = "server_restarted"
+                operation["updated_at"] = time.time()
+                self._update_latest_delivery(operation)
+            self._prune_operations()
 
     def profile(self, group_name: str) -> dict[str, Any] | None:
         profile = self.state["profiles"].get(group_name)
-        return copy.deepcopy(profile) if isinstance(profile, dict) else None
+        if not isinstance(profile, dict):
+            return None
+        result = copy.deepcopy(profile)
+        result.setdefault("mode", "managed")
+        return result
 
-    def put_profile(self, group_name: str, networks: list[dict[str, Any]]) -> dict[str, Any]:
+    def put_profile(
+        self,
+        group_name: str,
+        networks: list[dict[str, Any]],
+        *,
+        mode: str = "managed",
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(mode, str)
+            or mode not in {"managed", "unmanaged"}
+            or not isinstance(networks, list)
+        ):
+            raise WiFiSettingsError("invalid Wi-Fi profile mode or networks")
+        if (mode == "managed" and not networks) or (mode == "unmanaged" and networks):
+            raise WiFiSettingsError("Wi-Fi networks do not match the profile mode")
         revision = str(uuid.uuid4())
-        profile = {"revision": revision, "networks": copy.deepcopy(networks)}
+        profile = {"revision": revision, "mode": mode, "networks": copy.deepcopy(networks)}
         with self._transaction():
             self.state["profiles"][group_name] = profile
         return copy.deepcopy(profile)
@@ -305,228 +412,117 @@ class WiFiSettingsStore:
         else:
             self.state["profiles"].pop(group_name)
 
-    def unresolved_for_device(self, device_id: str) -> bool:
-        return any(
-            item.get("device_id") == device_id and item.get("unresolved") is True
-            for item in self.state["operations"].values()
-        )
-
-    def unresolved_for_group(self, group_name: str) -> bool:
-        return any(
-            item.get("group") == group_name and item.get("unresolved") is True
-            for item in self.state["operations"].values()
-        )
-
-    def create_operations(
+    def create_delivery_attempts(
         self,
         group_name: str,
         revision: str,
-        networks: list[dict[str, Any]],
         device_ids: list[str],
     ) -> list[dict[str, Any]]:
-        busy = [device_id for device_id in device_ids if self.unresolved_for_device(device_id)]
-        if busy:
-            raise WiFiSettingsError("one or more devices already have an unresolved Wi-Fi operation", 409)
-
-        operations: list[dict[str, Any]] = []
+        if not valid_uuid(revision):
+            raise WiFiSettingsError("invalid Wi-Fi revision")
+        attempts: list[dict[str, Any]] = []
         with self._transaction():
             for device_id in device_ids:
                 operation_id = str(uuid.uuid4())
+                now = time.time()
                 operation = {
                     "operation_id": operation_id,
                     "group": group_name,
                     "device_id": device_id,
                     "revision": revision,
-                    "networks": copy.deepcopy(networks),
-                    "status": "running",
-                    "reason": "UNKNOWN",
-                    "rolled_back": False,
-                    "accepted": False,
-                    "verify_challenge": None,
-                    "verify_acknowledged": False,
-                    "unresolved": True,
-                    "server_restarted": False,
-                    "created_at": time.time(),
-                    "updated_at": time.time(),
+                    "status": "dispatching",
+                    "reason": None,
+                    "attempted_at": now,
+                    "updated_at": now,
                 }
+                # Persist this small record before any socket write. A restart
+                # makes it unknown and never replays the command.
                 self.state["operations"][operation_id] = operation
-                record = self.state["devices"].setdefault(device_id, {})
-                record["manual"] = {
+                self.state["devices"].setdefault(device_id, {})["delivery"] = {
                     "operation_id": operation_id,
                     "revision": revision,
-                    "status": "running",
-                    "reason": "UNKNOWN",
-                    "rolled_back": False,
+                    "status": "unknown",
+                    "reason": "dispatch_not_confirmed",
+                    "attempted_at": now,
+                    "updated_at": now,
                 }
-                operations.append(copy.deepcopy(operation))
-        return operations
+                attempts.append(copy.deepcopy(operation))
+            self._prune_operations()
+        return attempts
 
-    def mark_accepted(self, operation_id: str, device_id: str) -> bool:
+    def settle_delivery(self, operation_id: str, status: str, reason: str | None) -> bool:
         operation = self.state["operations"].get(operation_id)
-        if not self._matches(operation, device_id) or operation.get("unresolved") is not True:
+        if not isinstance(operation, dict):
             return False
-        if operation.get("accepted") is True:
-            return True
-        with self._transaction():
-            operation = self.state["operations"][operation_id]
-            operation["accepted"] = True
-            operation["updated_at"] = time.time()
-        return True
-
-    def set_verify_challenge(self, operation_id: str, device_id: str, challenge: str) -> bool:
-        operation = self.state["operations"].get(operation_id)
-        if not self._matches(operation, device_id) or operation.get("unresolved") is not True:
+        if status not in DELIVERY_STATUSES or not self._valid_delivery_reason(status, reason):
             return False
-        with self._transaction():
-            operation = self.state["operations"][operation_id]
-            operation["verify_challenge"] = challenge
-            operation["verify_acknowledged"] = True
-            operation["updated_at"] = time.time()
-        return True
-
-    @staticmethod
-    def _matches(operation: Any, device_id: str) -> bool:
-        return isinstance(operation, dict) and operation.get("device_id") == device_id
-
-    def settle_manual(
-        self,
-        operation_id: str,
-        device_id: str,
-        revision: str,
-        status: str,
-        reason: str,
-        rolled_back: bool,
-    ) -> bool:
-        operation = self.state["operations"].get(operation_id)
-        if (
-            not self._matches(operation, device_id)
-            or operation.get("revision") != revision
-            or status not in {"success", "failed", "unknown"}
-            or reason not in RESULT_REASONS
-        ):
-            return False
-
-        # A previously settled operation is idempotent only for the exact same
-        # durable result. Conflicting resends must not be acknowledged.
-        if operation.get("unresolved") is not True:
-            return (
-                operation.get("status") == status
-                and operation.get("reason") == reason
-                and operation.get("rolled_back") is rolled_back
-            )
-        if status == "success" and operation.get("verify_acknowledged") is not True:
-            return False
+        if operation.get("status") != "dispatching":
+            return operation.get("status") == status and operation.get("reason") == reason
 
         with self._transaction():
             operation = self.state["operations"][operation_id]
             operation["status"] = status
             operation["reason"] = reason
-            operation["rolled_back"] = rolled_back
             operation["updated_at"] = time.time()
-            # A confirmed failure to restore the previous Wi-Fi configuration
-            # still leaves the device in an unresolved state. Keep its operation
-            # fence until a later result proves restoration completed.
-            restoration_unresolved = status == "failed" and reason == "RESTORE_FAILED" and not rolled_back
-            if status != "unknown" and not restoration_unresolved:
-                operation["unresolved"] = False
-            record = self.state["devices"].setdefault(device_id, {})
-            record["manual"] = {
-                "operation_id": operation_id,
-                "revision": revision,
-                "status": status,
-                "reason": reason,
-                "rolled_back": rolled_back,
-            }
-            if status == "success":
-                record["applied_revision"] = revision
+            self._update_latest_delivery(operation)
+            self._prune_operations()
         return True
 
-    def settle_boot(
-        self,
-        device_id: str,
-        boot_id: str,
-        revision: str,
-        status: str,
-        reason: str,
-    ) -> bool:
-        if (
-            not valid_uuid(boot_id)
-            or not valid_uuid(revision)
-            or status not in {"success", "failed", "unknown"}
-            or reason not in RESULT_REASONS
-        ):
-            return False
-        record = self.state["devices"].get(device_id, {})
-        history = record.get("boot_history", {}) if isinstance(record, dict) else {}
-        previous = history.get(boot_id) if isinstance(history, dict) else None
-        if not isinstance(previous, dict):
-            latest = record.get("boot") if isinstance(record, dict) else None
-            previous = latest if isinstance(latest, dict) and latest.get("boot_id") == boot_id else None
-        if previous is not None:
-            return (
-                previous.get("revision") == revision
-                and previous.get("status") == status
-                and previous.get("reason") == reason
-            )
-        with self._transaction():
-            record = self.state["devices"].setdefault(device_id, {})
-            result = {
-                "boot_id": boot_id,
-                "revision": revision,
-                "status": status,
-                "reason": reason,
-            }
-            history = record.setdefault("boot_history", {})
-            if not isinstance(history, dict):
-                history = {}
-                record["boot_history"] = history
-            history[boot_id] = result
-            record["boot"] = result
-        return True
+    def is_latest_delivery(self, device_id: str, operation_id: str) -> bool:
+        record = self.state["devices"].get(device_id)
+        delivery = record.get("delivery") if isinstance(record, dict) else None
+        return isinstance(delivery, dict) and delivery.get("operation_id") == operation_id
 
-    def observe(self, device_id: str, revision: str, status: str) -> bool:
-        if not valid_uuid(revision) or status not in {"match", "mismatch", "unknown"}:
-            return False
-        with self._transaction():
-            self.state["devices"].setdefault(device_id, {})["observation"] = {
-                "revision": revision,
-                "status": status,
+    @staticmethod
+    def _valid_delivery_reason(status: str, reason: str | None) -> bool:
+        if status == "sent":
+            return reason is None
+        if status == "failed":
+            return reason in {
+                "unsupported", "permission_denied", "socket_unavailable", "socket_replaced",
             }
-        return True
+        return reason in {
+            "socket_send_failed", "server_restarted", "legacy_result_untracked",
+            "dispatch_not_confirmed", "state_persist_failed", "superseded",
+        }
+
+    def _update_latest_delivery(self, operation: dict[str, Any]) -> None:
+        record = self.state["devices"].get(operation.get("device_id"))
+        delivery = record.get("delivery") if isinstance(record, dict) else None
+        if not isinstance(delivery, dict) or delivery.get("operation_id") != operation.get("operation_id"):
+            return
+        for key in ("revision", "status", "reason", "attempted_at", "updated_at"):
+            delivery[key] = operation.get(key)
+
+    def _prune_operations(self) -> None:
+        latest_ids = {
+            record.get("delivery", {}).get("operation_id")
+            for record in self.state["devices"].values()
+            if isinstance(record, dict) and isinstance(record.get("delivery"), dict)
+        }
+        def updated_at(item: tuple[str, dict[str, Any]]) -> float:
+            value = item[1].get("updated_at", 0.0)
+            return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+        old_terminal = sorted(
+            (
+                (operation_id, operation)
+                for operation_id, operation in self.state["operations"].items()
+                if isinstance(operation, dict)
+                and operation_id not in latest_ids
+                and operation.get("status") != "dispatching"
+            ),
+            key=lambda item: (updated_at(item), item[0]),
+        )
+        for operation_id, _operation in old_terminal[:-MAX_OLD_DELIVERY_OPERATIONS]:
+            self.state["operations"].pop(operation_id, None)
 
     def state_view(self, device_ids: set[str], online_ids: set[str]) -> dict[str, Any]:
         rows: dict[str, Any] = {}
-        # A forgotten device's encrypted history remains available for audit, but
-        # it no longer appears in the admin's currently known-device view.
         for device_id in sorted(device_ids):
             record = self.state["devices"].get(device_id, {})
             rows[device_id] = {
-                "manual": copy.deepcopy(record.get("manual")),
-                "boot": copy.deepcopy(record.get("boot")),
-                "applied_revision": record.get("applied_revision"),
-                "observation": copy.deepcopy(record.get("observation")),
+                "delivery": copy.deepcopy(record.get("delivery")),
                 "online": device_id in online_ids,
             }
         return rows
-
-    def mark_operation_timeout(self, operation_id: str) -> bool:
-        operation = self.state["operations"].get(operation_id)
-        if not isinstance(operation, dict) or operation.get("unresolved") is not True:
-            return False
-        if operation.get("status") == "unknown":
-            return True
-        with self._transaction():
-            operation = self.state["operations"][operation_id]
-            operation["status"] = "unknown"
-            operation["reason"] = "UNKNOWN"
-            operation["updated_at"] = time.time()
-            operation["server_restarted"] = False
-            record = self.state["devices"].setdefault(operation["device_id"], {})
-            record["manual"] = {
-                "operation_id": operation_id,
-                "revision": operation["revision"],
-                "status": "unknown",
-                "reason": "UNKNOWN",
-                "rolled_back": False,
-            }
-        return True
