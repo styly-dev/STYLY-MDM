@@ -14,6 +14,7 @@ import android.os.Looper
 import android.provider.Settings
 import android.view.View
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
@@ -35,6 +36,14 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var journalText: TextView
     private lateinit var journalRefreshButton: Button
     private lateinit var journalClearButton: Button
+    private lateinit var wifiTlsEnabled: CheckBox
+    private lateinit var wifiTokenInput: EditText
+    private lateinit var clearWifiToken: CheckBox
+    private lateinit var wifiTokenStatus: TextView
+    private lateinit var exactAlarmStatus: TextView
+    private lateinit var exactAlarmButton: Button
+    private lateinit var wifiLocationStatus: TextView
+    private lateinit var wifiLocationButton: Button
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -87,6 +96,18 @@ class SettingsActivity : AppCompatActivity() {
         journalText = findViewById(R.id.journal_text)
         journalRefreshButton = findViewById(R.id.journal_refresh_button)
         journalClearButton = findViewById(R.id.journal_clear_button)
+        wifiTlsEnabled = findViewById(R.id.wifi_tls_enabled)
+        wifiTokenInput = findViewById(R.id.wifi_device_token_input)
+        clearWifiToken = findViewById(R.id.wifi_clear_device_token)
+        wifiTokenStatus = findViewById(R.id.wifi_device_token_status)
+        exactAlarmStatus = findViewById(R.id.wifi_exact_alarm_status)
+        exactAlarmButton = findViewById(R.id.wifi_exact_alarm_button)
+        wifiLocationStatus = findViewById(R.id.wifi_location_permission_status)
+        wifiLocationButton = findViewById(R.id.wifi_location_permission_button)
+
+        val connectionSettings = MdmClientApplication.wifiSettingsController().connectionSettings()
+        wifiTlsEnabled.isChecked = connectionSettings.tlsEnabled
+        updateWifiTokenStatus(connectionSettings.deviceToken != null)
 
         serverUrlInput.setText(WebSocketManager.getManualServerAddress(this).orEmpty())
 
@@ -111,6 +132,12 @@ class SettingsActivity : AppCompatActivity() {
             refreshJournal()
         }
 
+        clearWifiToken.setOnCheckedChangeListener { _, checked ->
+            wifiTokenInput.isEnabled = !checked
+        }
+        exactAlarmButton.setOnClickListener { requestExactAlarmAccess() }
+        wifiLocationButton.setOnClickListener { requestWifiLocationPermission() }
+
         // Start the service if not already running
         startForegroundService(
             Intent(this, MdmClientService::class.java)
@@ -124,6 +151,8 @@ class SettingsActivity : AppCompatActivity() {
         registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         // Re-check here so returning from the system settings screen refreshes the UI.
         updateStoragePermissionUi()
+        updateExactAlarmUi()
+        updateWifiLocationUi()
         permissionRecoveryPending = hasAllFilesAccess()
         MdmClientApplication.deviceIdentityResolver().addListener(identityListener)
         refreshJournal()
@@ -160,10 +189,35 @@ class SettingsActivity : AppCompatActivity() {
             return
         }
 
+        val oldSettings = MdmClientApplication.wifiSettingsController().connectionSettings()
+        val typedToken = wifiTokenInput.text.toString()
+        val token = when {
+            clearWifiToken.isChecked -> null
+            typedToken.isNotBlank() -> typedToken
+            else -> oldSettings.deviceToken
+        }
+        if (token != null && url.isBlank()) {
+            Toast.makeText(this, R.string.wifi_token_requires_manual_server, Toast.LENGTH_LONG).show()
+            return
+        }
+        if (!MdmClientApplication.wifiSettingsController().saveConnectionSettings(
+                WifiConnectionSettings(wifiTlsEnabled.isChecked, token),
+            )
+        ) {
+            Toast.makeText(this, R.string.wifi_settings_save_failed, Toast.LENGTH_LONG).show()
+            return
+        }
+        updateWifiTokenStatus(token != null)
+
         restartService("Reconnecting...")
     }
 
     private fun useAutoDiscovery() {
+        val settings = MdmClientApplication.wifiSettingsController().connectionSettings()
+        if (settings.tlsEnabled && settings.deviceToken != null) {
+            Toast.makeText(this, R.string.wifi_token_requires_manual_server, Toast.LENGTH_LONG).show()
+            return
+        }
         WebSocketManager.clearServerUrlsForAutoDiscovery(this)
         serverUrlInput.text.clear()
         restartService("Discovering...")
@@ -240,6 +294,72 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
         Toast.makeText(this, R.string.storage_permission_settings_unavailable, Toast.LENGTH_LONG).show()
+    }
+
+    private fun hasExactAlarmAccess(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+        val manager = getSystemService(ALARM_SERVICE) as? android.app.AlarmManager ?: return false
+        return manager.canScheduleExactAlarms()
+    }
+
+    private fun updateExactAlarmUi() {
+        val granted = hasExactAlarmAccess()
+        exactAlarmStatus.setText(if (granted) R.string.wifi_exact_alarm_granted else R.string.wifi_exact_alarm_missing)
+        exactAlarmStatus.setTextColor(if (granted) 0xFF4CAF50.toInt() else 0xFFFF5722.toInt())
+        exactAlarmButton.visibility = if (granted) View.GONE else View.VISIBLE
+    }
+
+    private fun hasWifiLocationPermission(): Boolean =
+        checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    private fun updateWifiLocationUi() {
+        val granted = hasWifiLocationPermission()
+        wifiLocationStatus.setText(
+            if (granted) R.string.wifi_location_permission_granted
+            else R.string.wifi_location_permission_missing,
+        )
+        wifiLocationStatus.setTextColor(if (granted) 0xFF4CAF50.toInt() else 0xFFFF5722.toInt())
+        wifiLocationButton.visibility = if (granted) View.GONE else View.VISIBLE
+    }
+
+    private fun requestWifiLocationPermission() {
+        if (!hasWifiLocationPermission()) {
+            requestPermissions(
+                arrayOf(
+                    android.Manifest.permission.ACCESS_FINE_LOCATION,
+                    android.Manifest.permission.ACCESS_COARSE_LOCATION,
+                ),
+                REQUEST_WIFI_LOCATION_PERMISSION,
+            )
+        }
+    }
+
+    @Deprecated("Use the activity result API when migrating the settings screen")
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_WIFI_LOCATION_PERMISSION) updateWifiLocationUi()
+    }
+
+    private fun requestExactAlarmAccess() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+        try {
+            startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.fromParts("package", packageName, null)))
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, R.string.wifi_exact_alarm_unavailable, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun updateWifiTokenStatus(configured: Boolean) {
+        wifiTokenStatus.setText(if (configured) R.string.wifi_device_token_configured else R.string.wifi_device_token_not_configured)
+    }
+
+    companion object {
+        private const val REQUEST_WIFI_LOCATION_PERMISSION = 8702
     }
 
     private fun updateStatusDisplay(connected: Boolean, message: String) {

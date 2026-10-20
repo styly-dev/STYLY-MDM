@@ -40,6 +40,81 @@
                 android:textColor="?android:attr/textColorSecondary" />
         </LinearLayout>
 
+        <CheckBox
+            android:id="@+id/wifi_tls_enabled"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/wifi_tls_enabled"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/wifi_device_token_label"
+            android:textSize="14sp"
+            android:layout_marginBottom="8dp" />
+
+        <EditText
+            android:id="@+id/wifi_device_token_input"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/wifi_device_token_hint"
+            android:inputType="textPassword"
+            android:singleLine="true"
+            android:layout_marginBottom="8dp" />
+
+        <CheckBox
+            android:id="@+id/wifi_clear_device_token"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/wifi_clear_device_token"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:id="@+id/wifi_device_token_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="14sp"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/wifi_exact_alarm_label"
+            android:textSize="14sp"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:id="@+id/wifi_exact_alarm_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:id="@+id/wifi_location_permission_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp" />
+
+        <Button
+            android:id="@+id/wifi_location_permission_button"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/wifi_location_permission_button"
+            android:layout_marginBottom="8dp" />
+
+        <Button
+            android:id="@+id/wifi_exact_alarm_button"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/wifi_exact_alarm_button"
+            android:layout_marginBottom="24dp" />
+
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

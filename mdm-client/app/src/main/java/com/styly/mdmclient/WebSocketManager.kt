@@ -122,9 +122,19 @@ class WebSocketManager internal constructor(
         }
 
         internal fun getManualServerUrl(context: Context): String? {
-            return preferences(context)
+            val configured = preferences(context)
                 .getString(PREF_MANUAL_SERVER_URL, null)
                 ?.takeIf(::isCanonicalManualServerUrl)
+                ?: return null
+            return effectiveUrl(configured, MdmClientApplication.wifiSettingsController().connectionSettings().tlsEnabled)
+        }
+
+        private fun isTrustedWifiEndpoint(context: Context, url: String): Boolean {
+            val configured = preferences(context)
+                .getString(PREF_MANUAL_SERVER_URL, null)
+                ?.takeIf(::isCanonicalManualServerUrl)
+                ?: return false
+            return url == effectiveUrl(configured, tlsEnabled = true)
         }
 
         internal fun getManualServerAddress(context: Context): String? {
@@ -154,6 +164,11 @@ class WebSocketManager internal constructor(
                 .getString(PREF_SERVER_URL, null)
                 ?.takeIf(::isValidWsUrl)
                 ?: DEFAULT_SERVER_URL
+        }
+
+        private fun effectiveUrl(url: String, tlsEnabled: Boolean): String = when {
+            tlsEnabled && url.startsWith("ws://", true) -> "wss://${url.substring(5)}"
+            else -> url
         }
 
         private fun preferences(context: Context) =
@@ -229,9 +244,12 @@ class WebSocketManager internal constructor(
         .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .pingInterval(PING_INTERVAL_SECONDS, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
+        .followRedirects(false)
+        .followSslRedirects(false)
         .build()
 
     private val pushCoordinator = MdmClientApplication.pushJobCoordinator()
+    private val wifiController = MdmClientApplication.wifiSettingsController()
     @Volatile
     private var webSocket: WebSocket? = null
     private var isRunning = false
@@ -255,6 +273,7 @@ class WebSocketManager internal constructor(
     @Volatile private var socketOpen = false
     private val registration = ConnectionRegistration<WebSocket>()
     @Volatile private var connectedServerAddress: String? = null
+    @Volatile private var connectedSecureWifiSession = false
     private val identityListener: (DeviceIdentityState) -> Unit = { state ->
         reconnectHandler.post {
             val current = webSocket
@@ -319,6 +338,8 @@ class WebSocketManager internal constructor(
         socketOpen = false
         registration.clear()
         connectedServerAddress = null
+        connectedSecureWifiSession = false
+        wifiController.onTransportDisconnected()
     }
 
     fun sendMessage(json: JSONObject) {
@@ -412,9 +433,9 @@ class WebSocketManager internal constructor(
                 if (discovered != null && isValidWsUrl(discovered)) {
                     Log.i(TAG, "Discovered server at: $discovered")
                     saveDiscoveredServerUrl(discovered)
-                    doConnect(discovered)
+                    doConnect(effectiveUrl(discovered, wifiController.connectionSettings().tlsEnabled))
                 } else {
-                    doConnect(getCachedServerUrl(context))
+                    doConnect(effectiveUrl(getCachedServerUrl(context), wifiController.connectionSettings().tlsEnabled))
                 }
             }
         }.start()
@@ -435,10 +456,17 @@ class WebSocketManager internal constructor(
     private fun doConnect(url: String) {
         if (!isRunning) return
 
-        Log.i(TAG, "Connecting to $url")
-        onStatusChanged(false, "Connecting to $url...")
+        val effective = effectiveUrl(url, wifiController.connectionSettings().tlsEnabled)
+        Log.i(TAG, "Connecting to $effective")
+        onStatusChanged(false, "Connecting to $effective...")
 
-        val request = Request.Builder().url(url).build()
+        val trustedWifiEndpoint = isTrustedWifiEndpoint(context, effective)
+        val requestBuilder = Request.Builder().url(effective)
+        wifiController.authorizationTokenFor(effective, trustedWifiEndpoint)?.let { token ->
+            requestBuilder.header("Authorization", "Bearer $token")
+        }
+        val request = requestBuilder.build()
+        connectedSecureWifiSession = wifiController.supportsWifiOn(effective, trustedWifiEndpoint)
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
 
             override fun onOpen(webSocket: WebSocket, response: Response) {
@@ -448,7 +476,7 @@ class WebSocketManager internal constructor(
                     dispatch(scheduler.onConnected())
                     socketOpen = true
                     registration.open(webSocket)
-                    connectedServerAddress = serverAddress(url)
+                    connectedServerAddress = serverAddress(effective)
                     val identity = identityResolver.snapshot()
                     sendRegistration(webSocket, identity)
                     publishConnectedStatus(identity)
@@ -471,6 +499,14 @@ class WebSocketManager internal constructor(
                             return
                         }
                         pushCoordinator.onRegistered(webSocket)
+                        if (registration.isCanonicalAcknowledged(webSocket)) {
+                            wifiController.onCanonicalRegistered(connectedSecureWifiSession) { message ->
+                                this@WebSocketManager.webSocket === webSocket &&
+                                    connectedSecureWifiSession &&
+                                    registration.isCanonicalAcknowledged(webSocket) &&
+                                    webSocket.send(message.toString())
+                            }
+                        }
                         reconnectHandler.post {
                             if (this@WebSocketManager.webSocket === webSocket &&
                                 registration.isCanonicalAcknowledged(webSocket)
@@ -500,6 +536,17 @@ class WebSocketManager internal constructor(
                         json.optString("connection_id", "") != registration.provisionalConnectionId(webSocket)
                     ) {
                         Log.w(TAG, "Ignoring $logType for a different provisional connection")
+                    } else if (type == "EXECUTE_WIFI_APPLY" || type.startsWith("WIFI_")) {
+                        wifiController.handleServerMessage(
+                            type,
+                            json,
+                            connectedSecureWifiSession && registration.isCanonicalAcknowledged(webSocket),
+                        ) { message ->
+                            this@WebSocketManager.webSocket === webSocket &&
+                                connectedSecureWifiSession &&
+                                registration.isCanonicalAcknowledged(webSocket) &&
+                                webSocket.send(message.toString())
+                        }
                     } else if (type.isNotEmpty() && !pushCoordinator.handleServerMessage(type, json)) {
                         onCommand(type, json, commandContext(webSocket))
                     }
@@ -615,7 +662,11 @@ class WebSocketManager internal constructor(
             if (identity is DeviceIdentityState.Ready) {
                 put("device_id", identity.deviceId)
                 put("process_instance_id", pushFields!!.getString("process_instance_id"))
-                put("capabilities", pushFields.getJSONArray("capabilities"))
+                val capabilities = JSONArray(pushFields.getJSONArray("capabilities").toString())
+                if (connectedSecureWifiSession &&
+                    (0 until capabilities.length()).none { capabilities.optString(it) == WIFI_SETTINGS_CAPABILITY }
+                ) capabilities.put(WIFI_SETTINGS_CAPABILITY)
+                put("capabilities", capabilities)
                 put("push_state", pushFields.getJSONObject("push_state"))
                 put("push_runtime", pushFields.getJSONObject("push_runtime"))
                 val startupConfig = getStartupAppConfig()

@@ -401,7 +401,64 @@
     .btn-text { background: none; border: none; color: var(--text-secondary); font-size: 13px; cursor: pointer; font-family: inherit; padding: 9px 16px; }
     .mg-footer .btn-primary { width: auto; margin: 0; padding: 9px 20px; font-size: 13px; }
 
-    input[type="checkbox"] { accent-color: var(--accent); }
+    /* Wi-Fi group settings are kept outside the frequently refreshed membership editor. */
+    .wifi-admin-area { padding: 12px 20px 0; }
+    .wifi-banner, .wifi-feedback { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 12px; }
+    .wifi-banner { padding: 9px 11px; background: var(--bg-actions); border: 1px solid var(--border-soft); border-radius: 7px; }
+    .wifi-banner.wifi-success { color: var(--success); }
+    .wifi-banner.wifi-muted, .wifi-feedback.wifi-muted { color: var(--text-muted); }
+    .wifi-symbol { font-size: 15px; }
+    .wifi-auth { display: flex; align-items: center; gap: 14px; padding: 11px 13px; background: var(--bg-actions); border: 1px solid var(--border); border-radius: 8px; }
+    .wifi-auth > div:first-child { flex: 1; min-width: 0; }
+    .wifi-auth strong { font-size: 13px; }
+    .wifi-auth p { color: var(--text-secondary); font-size: 11px; margin-top: 2px; }
+    .wifi-auth form { display: flex; align-items: center; gap: 8px; }
+    .wifi-token { width: min(330px, 42vw); }
+    .wifi-feedback { display: block; margin: 8px 0; }
+    .wifi-feedback.wifi-danger { color: var(--danger); }
+    #wifiGroupPanel { padding: 18px 20px 22px; border-top: 1px solid var(--border); }
+    .wifi-section { max-width: 980px; }
+    .wifi-section h3 { font-size: 16px; }
+    .wifi-section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 14px; }
+    .wifi-section-head p { color: var(--text-secondary); font-size: 12px; margin-top: 3px; }
+    .wifi-revision, .wifi-meta { color: var(--text-muted); font-size: 11px; white-space: nowrap; }
+    .wifi-network-list { display: flex; flex-direction: column; gap: 9px; }
+    .wifi-network { padding: 12px; background: var(--bg-actions); border: 1px solid var(--border-soft); border-radius: 8px; }
+    .wifi-network-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+    .wifi-network-head strong { font-size: 12px; color: var(--text-secondary); }
+    .wifi-remove { width: auto; margin: 0; padding: 2px 8px; color: var(--danger); }
+    .wifi-remove:disabled { opacity: .4; cursor: not-allowed; }
+    .wifi-network label { display: block; color: var(--text-secondary); font-size: 11px; }
+    .wifi-network label .field { display: block; margin-top: 4px; }
+    .wifi-fields { display: grid; grid-template-columns: minmax(180px, .8fr) minmax(220px, 1.2fr); gap: 10px; margin-top: 8px; }
+    .wifi-row-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 5px; }
+    .wifi-row-foot small { color: var(--text-muted); font-size: 10px; }
+    .wifi-check { display: inline-flex !important; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer; }
+    .wifi-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
+    .wifi-action-right { display: flex; align-items: center; gap: 8px; }
+    .wifi-actions .btn { width: auto; margin: 0; padding: 9px 20px; font-size: 13px; }
+    .wifi-empty { padding: 14px; color: var(--text-muted); font-size: 12px; }
+    .wifi-device-results { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 13px; }
+    .wifi-device-results h4 { font-size: 12px; color: var(--text-secondary); margin-bottom: 7px; }
+    .wifi-device-row { display: grid; grid-template-columns: minmax(170px, 1.2fr) minmax(180px, 1fr) minmax(180px, 1fr); align-items: center; gap: 8px 14px; padding: 9px 0; border-top: 1px solid var(--border-soft); font-size: 12px; }
+    .wifi-device-title { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+    .wifi-device-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .wifi-online { display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); font-size: 10px; white-space: nowrap; }
+    .wifi-online i { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--text-muted); }
+    .wifi-online.online { color: var(--success); }
+    .wifi-online.online i { background: var(--success); }
+    .wifi-result { display: flex; align-items: flex-start; gap: 6px; }
+    .wifi-result.success { color: var(--success); }
+    .wifi-result.info { color: var(--info); }
+    .wifi-result.warning { color: var(--warning); }
+    .wifi-result.danger { color: var(--danger); }
+    .wifi-result.muted { color: var(--text-muted); }
+    .wifi-boot { grid-column: 3; }
+    .wifi-boot.danger { padding: 5px 8px; background: var(--bg-actions); border: 1px solid var(--danger); border-radius: 6px; font-weight: 700; }
+    .wifi-reason { grid-column: 2 / 4; color: var(--text-secondary); font-size: 10px; margin-top: -5px; }
+    .wifi-boot-reason { color: var(--danger); grid-column: 3; margin-top: -4px; }
+    .wifi-membership-note { color: var(--warning); font-size: 10px; }
+    .wifi-member-locked { opacity: .55; cursor: not-allowed; }
 
     /* Responsive */
     @media (max-width: 640px) {
@@ -421,9 +478,18 @@
       .subtab { padding-left: 10px; padding-right: 10px; }
       .manage-grid { grid-template-columns: 1fr; }
       .mg-sidebar { border-right: none; border-bottom: 1px solid var(--border); }
+      .wifi-auth { align-items: stretch; flex-direction: column; }
+      .wifi-auth form { width: 100%; }
+      .wifi-token { width: auto; flex: 1; min-width: 0; }
+      .wifi-fields { grid-template-columns: 1fr; }
+      .wifi-actions, .wifi-action-right { align-items: stretch; flex-direction: column; }
+      .wifi-device-row { grid-template-columns: 1fr; }
+      .wifi-boot { grid-column: auto; }
+      .wifi-section-head { flex-direction: column; }
     }
   </style>
   <script src="/static/push-jobs-v1.js"></script>
+  <script src="/static/wifi-console-v1.js"></script>
 </head>
 
 <body>
@@ -629,10 +695,12 @@
         <span class="bar-sep"></span>
         <span class="bar-title">Manage Groups</span>
       </div>
+      <div class="wifi-admin-area" id="wifiAuthPanel"></div>
       <div class="manage-grid">
         <div class="mg-sidebar" id="mgSidebar"></div>
         <div id="mgDetail"></div>
       </div>
+      <div id="wifiGroupPanel"></div>
     </div>
   </div>
 
@@ -750,6 +818,20 @@
       const btnClearLog = document.getElementById('btnClearLog');
       const mgSidebar = document.getElementById('mgSidebar');
       const mgDetail = document.getElementById('mgDetail');
+      const wifiController = window.MdmWifiConsole.createController({
+        authPanel: document.getElementById('wifiAuthPanel'),
+        groupPanel: document.getElementById('wifiGroupPanel'),
+        getGroups: function () { return groups; },
+        getDevices: function () { return devices; },
+        onAuthenticated: function () {
+          if (reconnectTimer) return;
+          if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+            ws.close(4001, 'Wi-Fi admin session established');
+          } else {
+            connect();
+          }
+        },
+      });
 
       // ---------------- Helpers ----------------
       // textContent -> innerHTML escapes & < > but leaves quotes alone, and most callers
@@ -1101,6 +1183,7 @@
           case 'GROUP_CREATED': addLog('Group created: ' + (msg.name || '-'), 'success'); if (view === 'manage') pendingSelectGroup = msg.name; break;
           case 'GROUP_RENAMED':
             addLog('Group renamed: ' + (msg.name || '-') + ' -> ' + (msg.new_name || '-'), 'success');
+            wifiController.renameGroup(msg.name, msg.new_name);
             if (manageSelectedGroup === msg.name) pendingSelectGroup = msg.new_name;
             if (activeGroup === msg.name) activeGroup = msg.new_name;
             break;
@@ -2280,6 +2363,7 @@
         const hadRenameFocus = renameInputFocused();
         if (!manageSelectedGroup || !(manageSelectedGroup in groups)) {
           mgDetail.innerHTML = '<div class="mg-detail-empty">Select a group, or create one.</div>';
+          wifiController.renderGroup(null, [], true);
           return;
         }
         const name = manageSelectedGroup;
@@ -2303,6 +2387,7 @@
           '<button class="btn-text" data-act="cancelMembers">Cancel</button>' +
           '<button class="btn-primary" data-act="saveMembers">Save</button></div>';
         restoreRenameGroupFocus(hadRenameFocus);
+        wifiController.renderGroup(name, memArr, false);
       }
 
       function renameInputFocused() {
@@ -2357,11 +2442,15 @@
         if (!list.length) return '<div class="empty small">No matching devices</div>';
         return list.map(function (d) {
           const id = getDeviceId(d); const mem = manageMembers.has(id); const off = !isOnline(d);
-          return '<div class="mg-dev" data-act="toggleMember" data-id="' + esc(id) + '">' +
-            '<div class="selbox ' + (mem ? 'on' : '') + '">' + (mem ? '✓' : '') + '</div>' +
+          const assignedElsewhere = window.MdmWifiConsole.membershipConflict(id, manageSelectedGroup, groups, [d.serial_number]);
+          const locked = !!assignedElsewhere && !mem;
+          return '<div class="mg-dev' + (locked ? ' wifi-member-locked' : '') + '" data-act="toggleMember" data-id="' + esc(id) + '"' +
+            (locked ? ' title="Assigned to ' + esc(assignedElsewhere) + '; remove it there before adding it here."' : '') + '>' +
+            '<div class="selbox ' + (mem ? 'on' : '') + (locked ? ' disabled' : '') + '">' + (mem ? '✓' : '') + '</div>' +
             '<div class="mg-dev-main">' +
             '<div>' + (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') + '</div>' +
-            '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') + '</div></div>' +
+            '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') +
+            (locked ? ' · Assigned to ' + esc(assignedElsewhere) : '') + '</div></div>' +
             '<div class="mg-dev-status"><span class="dot ' + (off ? 'off' : '') + '"></span>' + (off ? 'Offline' : 'Online') + '</div>' +
             '</div>';
         }).join('');
@@ -3098,13 +3187,26 @@
         else if (act === 'toggleMember') {
           const id = t.dataset.id;
           const nowMember = !manageMembers.has(id);
+          const device = deviceById(id);
+          const assignedElsewhere = window.MdmWifiConsole.membershipConflict(id, manageSelectedGroup, groups, device && [device.serial_number]);
+          if (nowMember && assignedElsewhere) {
+            addLog('Device ' + labelFor(id) + ' is already assigned to "' + assignedElsewhere + '". Remove it from that group before adding it here.', 'warn');
+            return;
+          }
           if (nowMember) manageMembers.add(id); else manageMembers.delete(id);
           // Update only the clicked row + counts so the list keeps its scroll position.
           const box = t.querySelector('.selbox');
           if (box) { box.classList.toggle('on', nowMember); box.textContent = nowMember ? '✓' : ''; }
           updateMgCounts();
         }
-        else if (act === 'saveMembers') sendSetGroupMembers(manageSelectedGroup, Array.from(manageMembers));
+        else if (act === 'saveMembers') {
+          const conflict = Array.from(manageMembers).map(function (id) {
+            const device = deviceById(id);
+            return { id: id, group: window.MdmWifiConsole.membershipConflict(id, manageSelectedGroup, groups, device && [device.serial_number]) };
+          }).find(function (item) { return item.group; });
+          if (conflict) addLog('Cannot save membership: ' + labelFor(conflict.id) + ' is already assigned to "' + conflict.group + '". Remove it from that group first.', 'warn');
+          else sendSetGroupMembers(manageSelectedGroup, Array.from(manageMembers));
+        }
         else if (act === 'cancelMembers') { manageMembers = new Set(groups[manageSelectedGroup] || []); renderManageDetail(); }
         else if (act === 'renameGroup') openRenameGroupEditor();
         else if (act === 'saveRename') commitRenameGroup();

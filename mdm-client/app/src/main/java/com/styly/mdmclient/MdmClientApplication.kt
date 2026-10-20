@@ -25,11 +25,17 @@ class MdmClientApplication : Application() {
         @Volatile
         private var identityResolver: DeviceIdentityResolver? = null
 
+        @Volatile
+        private var wifiController: WifiSettingsController? = null
+
         fun pushJobCoordinator(): PushJobCoordinator =
             coordinator ?: throw IllegalStateException("PushJobCoordinator is not initialized")
 
         fun deviceIdentityResolver(): DeviceIdentityResolver =
             identityResolver ?: throw IllegalStateException("DeviceIdentityResolver is not initialized")
+
+        internal fun wifiSettingsController(): WifiSettingsController =
+            wifiController ?: throw IllegalStateException("WifiSettingsController is not initialized")
     }
 
     override fun onCreate() {
@@ -46,6 +52,7 @@ class MdmClientApplication : Application() {
                 }
             }
         }, IntentFilter(Intent.ACTION_SHUTDOWN))
+        wifiController = WifiSettingsController(this)
         identityResolver = DeviceIdentityResolver.create(this).also {
             it.startInitialLookup()
         }

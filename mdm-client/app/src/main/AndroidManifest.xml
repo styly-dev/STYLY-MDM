@@ -7,6 +7,10 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <!-- Required so the PICO ToBService (a separate system-user process) can read the
          downloaded APK. App-scoped external storage is unreadable across UIDs, so the APK
          must be written to shared public storage that the privileged installer can access. -->
@@ -60,6 +64,10 @@
                 <action android:name="com.pvr.tobservice.SERVICE_AUTO_BOOT" />
             </intent-filter>
         </receiver>
+
+        <receiver
+            android:name=".WifiRollbackReceiver"
+            android:exported="false" />
 
     </application>
 
