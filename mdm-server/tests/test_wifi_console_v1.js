@@ -81,6 +81,7 @@ class FakeElement {
     if (selector === '[data-wifi-device-list]') return this.deviceList;
     if (selector.includes('data-wifi-field="password"')) return this.passwordInput;
     if (selector === '.wifi-action-right .wifi-meta') return this.meta;
+    if (selector === 'article[data-wifi-row="wifi-0"] small') return this.secretHelp;
     return this.actionButtons && this.actionButtons[selector] || null;
   }
 
@@ -169,6 +170,32 @@ test('state polling updates device results without rebuilding the Wi-Fi form or 
     assert.equal(harness.password.value, 'typing-but-not-submitted');
   } finally {
     harness.restore();
+  }
+});
+
+test('Wi-Fi key inputs avoid login semantics with a masked text field and keep a password fallback', async () => {
+  const previousCss = global.CSS;
+  try {
+    for (const supported of [true, false]) {
+      global.CSS = { supports: () => supported };
+      const harness = withController(async (url) => url === '/api/wifi/state'
+        ? response({ enabled: true, groups: { Lab: { revision: 'r1' } }, devices: {} })
+        : response({ revision: 'r1', networks: [{ ssid: 'Office', security: 'WPA_PSK', password_present: true }] }));
+      try {
+        await tick();
+        harness.controller.renderGroup('Lab', [], true);
+        await tick();
+        const input = harness.groupPanel.innerHTML.match(/<input[^>]*data-wifi-field="password"[^>]*>/)[0];
+        assert.match(input, new RegExp('type="' + (supported ? 'text' : 'password') + '"'));
+        assert.match(input, /class="field wifi-secret"/);
+        assert.match(input, /autocomplete="off"/);
+        assert.match(input, /autocapitalize="off" spellcheck="false"/);
+        assert.doesNotMatch(input, /new-password|current-password/);
+      } finally { harness.restore(); }
+    }
+  } finally {
+    if (previousCss === undefined) delete global.CSS;
+    else global.CSS = previousCss;
   }
 });
 
@@ -382,6 +409,7 @@ test('a sole network cannot be removed and an open network password stays disabl
   const harness = withController(async (url) => url === '/api/wifi/state'
     ? response({ enabled: true, groups: { Lab: { revision: 'r1' } }, devices: {} })
     : response({ revision: 'r1', networks: [{ ssid: 'Office', security: 'OPEN' }] }));
+  harness.groupPanel.secretHelp = { textContent: '' };
   const remove = new FakeElement(); remove.dataset.wifiAction = 'remove';
   const add = new FakeElement(); add.dataset.wifiAction = 'add';
   harness.groupPanel.controls.push(remove, add);
@@ -392,6 +420,15 @@ test('a sole network cannot be removed and an open network password stays disabl
     assert.equal(remove.disabled, true);
     assert.equal(harness.password.disabled, true);
     assert.equal(add.disabled, false);
+    const security = new FakeInput('security');
+    security.value = 'WPA_PSK';
+    harness.groupPanel.dispatch('change', { target: security });
+    assert.equal(harness.password.disabled, false);
+    assert.match(harness.groupPanel.secretHelp.textContent, /Required for this saved network/);
+    security.value = 'OPEN';
+    harness.groupPanel.dispatch('change', { target: security });
+    assert.equal(harness.password.disabled, true);
+    assert.match(harness.groupPanel.secretHelp.textContent, /Open networks do not use a password/);
     for (let i = 1; i < wifi.MAX_NETWORKS; i++) {
       harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'add' } }) } });
     }

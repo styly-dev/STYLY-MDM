@@ -140,3 +140,20 @@ opened Wi-Fi settings without login, and reconnected automatically across a
 server restart without login. Local runtime admin/device token configuration
 was removed; the existing registry/profile key and data remain. No physical
 device validation, device Wi-Fi command or push was performed.
+
+## Wi-Fi key input correction
+
+Replace autocomplete=new-password with autocomplete=off and a masked text input
+where CSS masking is supported. Keep type=password as a fallback so unsupported
+browsers do not show keys in plain text. Disable capitalization and spellcheck.
+Also refresh the existing security-help text in place when switching Open/PSK,
+without replacing the focused editor. No new dependency or network behavior.
+
+Focused simple-review found no remaining issue; console29 tests passed. Actual
+browser input with an unsaved dummy key stayed masked and showed no credential
+suggestion on focus. No browser save/deploy was performed in this check; browser
+extensions and fallback browsers may still provide their own prompts.
+
+The operator also asked about connection priority: there is no configurable SSID
+priority or ordered connection-attempt policy. The list is not a priority order;
+selection remains with the device OS. No priority feature was added.
