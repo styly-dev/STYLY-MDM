@@ -71,3 +71,33 @@ No real device, live server data or live Wi-Fi credentials were used. No device
 installation, release build, deployment or push was performed. The existing
 untracked `uv.lock` and historical task artifacts are retained and excluded from
 the implementation commit.
+
+## Integrated console and managed-LAN follow-up
+
+The original supplied specification did not require TLS. The initial mandatory
+TLS policy was an implementation choice and was corrected after the operator
+confirmed managed-LAN-only use. `MDM_WIFI_ALLOW_HTTP=1` explicitly enables HTTP
+when TLS is absent. Token/Origin checks, encrypted persistence and manual endpoint
+provenance remain; discovery/cache cannot authorize token transmission.
+
+The selected group now has Devices / Wi-Fi tabs. Existing group Save/Delete
+buttons include their base styles. Result rows and network controls respond to
+the actual detail-column width. Wi-Fi counts use saved membership; device drafts
+remain separate. Expired/disabled access hides editing controls without discarding
+unsaved drafts, and reauthentication restores them.
+
+Live browser verification used the 290-device runtime registry: HTTP admin login,
+Open and PSK profile save in a temporary empty group, password redaction after
+save, network add/remove, group/tab switching, membership draft cancellation,
+and 375 / 820 / 1280 pixel layouts. Measured page width equals viewport width
+at 375 and 820 pixels. An empty-group apply was accepted (zero device targets);
+no physical device command was delivered.
+
+The next requested revision replaces MDM-reconnection verification with local
+SSID+IP success within 60 seconds. It is not implemented in this checkpoint.
+
+Checkpoint validation: server 460 passed, console 24 passed, Android JVM 145
+passed and DevDebug APK assembled. Independent testing review findings were
+fixed; security review found no confirmed issue in HTTP opt-in/enrollment changes.
+Temporary UI group removed; the imported 290 records and existing two test-group
+members remain. No push or physical-device operations.

@@ -368,7 +368,9 @@
     .empty.small { padding: 18px 10px; font-size: 13px; }
 
     /* Manage Groups */
-    .manage-grid { display: grid; grid-template-columns: 280px 1fr; }
+    .manage-grid { display: grid; grid-template-columns: 240px minmax(0, 1fr); }
+    .mg-main { min-width: 0; container-type: inline-size; }
+    .mg-tabs { padding-top: 0; }
     .mg-sidebar { background: var(--bg-actions); border-right: 1px solid var(--border); padding: 14px 12px; }
     .mg-create { display: flex; gap: 8px; margin-bottom: 12px; }
     .mg-new { flex: 1; padding: 9px 11px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; color: var(--text-primary); font-size: 13px; font-family: inherit; min-width: 0; }
@@ -380,8 +382,8 @@
     .mg-item-name { flex: 1; font-weight: 600; }
     .mg-item-count { font-size: 11px; color: #8b91a8; background: var(--bg-card); border-radius: 9px; padding: 1px 8px; }
     .mg-detail-empty { padding: 48px 24px; text-align: center; color: var(--text-muted); }
-    .mg-detail-head { display: flex; align-items: center; justify-content: space-between; padding: 15px 20px; border-bottom: 1px solid var(--border); gap: 12px; }
-    .mg-title { font-size: 18px; font-weight: 700; }
+    .mg-detail-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; padding: 15px 20px; border-bottom: 1px solid var(--border); gap: 12px; }
+    .mg-title { font-size: 18px; font-weight: 700; overflow-wrap: anywhere; }
     .mg-sub { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
     .mg-head-actions { display: flex; gap: 8px; font-size: 12px; }
     .btn-outline { padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px; color: #cfd3e3; background: none; cursor: pointer; font-family: inherit; font-size: 12px; }
@@ -401,7 +403,7 @@
     .btn-text { background: none; border: none; color: var(--text-secondary); font-size: 13px; cursor: pointer; font-family: inherit; padding: 9px 16px; }
     .mg-footer .btn-primary { width: auto; margin: 0; padding: 9px 20px; font-size: 13px; }
 
-    /* Wi-Fi group settings are kept outside the frequently refreshed membership editor. */
+    /* Keep the Wi-Fi form stable while membership and device status refresh. */
     .wifi-admin-area { padding: 12px 20px 0; }
     .wifi-banner, .wifi-feedback { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 12px; }
     .wifi-banner { padding: 9px 11px; background: var(--bg-actions); border: 1px solid var(--border-soft); border-radius: 7px; }
@@ -421,26 +423,27 @@
     .wifi-section h3 { font-size: 16px; }
     .wifi-section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 14px; }
     .wifi-section-head p { color: var(--text-secondary); font-size: 12px; margin-top: 3px; }
-    .wifi-revision, .wifi-meta { color: var(--text-muted); font-size: 11px; white-space: nowrap; }
+    .wifi-meta { color: var(--text-muted); font-size: 11px; }
     .wifi-network-list { display: flex; flex-direction: column; gap: 9px; }
     .wifi-network { padding: 12px; background: var(--bg-actions); border: 1px solid var(--border-soft); border-radius: 8px; }
     .wifi-network-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
     .wifi-network-head strong { font-size: 12px; color: var(--text-secondary); }
-    .wifi-remove { width: auto; margin: 0; padding: 2px 8px; color: var(--danger); }
+    .wifi-remove { width: auto; margin: 0; }
     .wifi-remove:disabled { opacity: .4; cursor: not-allowed; }
-    .wifi-network label { display: block; color: var(--text-secondary); font-size: 11px; }
+    .wifi-network label { min-width: 0; display: block; color: var(--text-secondary); font-size: 11px; }
     .wifi-network label .field { display: block; margin-top: 4px; }
-    .wifi-fields { display: grid; grid-template-columns: minmax(180px, .8fr) minmax(220px, 1.2fr); gap: 10px; margin-top: 8px; }
+    .wifi-fields { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); gap: 10px; margin-top: 8px; }
     .wifi-row-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 5px; }
     .wifi-row-foot small { color: var(--text-muted); font-size: 10px; }
     .wifi-check { display: inline-flex !important; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer; }
-    .wifi-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
-    .wifi-action-right { display: flex; align-items: center; gap: 8px; }
-    .wifi-actions .btn { width: auto; margin: 0; padding: 9px 20px; font-size: 13px; }
+    .wifi-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
+    .wifi-action-right { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .wifi-actions .btn, .wifi-actions .btn-outline { width: auto; margin: 0; padding: 9px 14px; font-size: 13px; font-weight: 600; line-height: 18px; }
+    .wifi-actions .btn { border: 1px solid transparent; }
     .wifi-empty { padding: 14px; color: var(--text-muted); font-size: 12px; }
     .wifi-device-results { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 13px; }
     .wifi-device-results h4 { font-size: 12px; color: var(--text-secondary); margin-bottom: 7px; }
-    .wifi-device-row { display: grid; grid-template-columns: minmax(170px, 1.2fr) minmax(180px, 1fr) minmax(180px, 1fr); align-items: center; gap: 8px 14px; padding: 9px 0; border-top: 1px solid var(--border-soft); font-size: 12px; }
+    .wifi-device-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); align-items: center; gap: 8px 14px; padding: 9px 0; border-top: 1px solid var(--border-soft); font-size: 12px; }
     .wifi-device-title { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
     .wifi-device-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .wifi-online { display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); font-size: 10px; white-space: nowrap; }
@@ -453,12 +456,19 @@
     .wifi-result.warning { color: var(--warning); }
     .wifi-result.danger { color: var(--danger); }
     .wifi-result.muted { color: var(--text-muted); }
-    .wifi-boot { grid-column: 3; }
+    .wifi-device-status { min-width: 0; display: flex; flex-direction: column; gap: 6px; overflow-wrap: anywhere; }
     .wifi-boot.danger { padding: 5px 8px; background: var(--bg-actions); border: 1px solid var(--danger); border-radius: 6px; font-weight: 700; }
-    .wifi-reason { grid-column: 2 / 4; color: var(--text-secondary); font-size: 10px; margin-top: -5px; }
-    .wifi-boot-reason { color: var(--danger); grid-column: 3; margin-top: -4px; }
+    .wifi-reason { color: var(--text-secondary); font-size: 11px; padding-left: 18px; }
+    .wifi-boot-reason { color: var(--danger); }
     .wifi-membership-note { color: var(--warning); font-size: 10px; }
     .wifi-member-locked { opacity: .55; cursor: not-allowed; }
+
+    @container (max-width: 600px) {
+      .wifi-fields, .wifi-device-row { grid-template-columns: minmax(0, 1fr); }
+      .wifi-actions, .wifi-action-right { align-items: stretch; flex-direction: column; }
+      .wifi-actions .btn, .wifi-actions .btn-outline { width: 100%; }
+      .wifi-row-foot { align-items: flex-start; flex-direction: column; }
+    }
 
     /* Responsive */
     @media (max-width: 640px) {
@@ -484,7 +494,6 @@
       .wifi-fields { grid-template-columns: 1fr; }
       .wifi-actions, .wifi-action-right { align-items: stretch; flex-direction: column; }
       .wifi-device-row { grid-template-columns: 1fr; }
-      .wifi-boot { grid-column: auto; }
       .wifi-section-head { flex-direction: column; }
     }
   </style>
@@ -698,9 +707,11 @@
       <div class="wifi-admin-area" id="wifiAuthPanel"></div>
       <div class="manage-grid">
         <div class="mg-sidebar" id="mgSidebar"></div>
-        <div id="mgDetail"></div>
+        <div class="mg-main">
+          <div id="mgDetail"></div>
+          <div id="wifiGroupPanel" hidden></div>
+        </div>
       </div>
-      <div id="wifiGroupPanel"></div>
     </div>
   </div>
 
@@ -755,6 +766,7 @@
       let deviceStatusFilter = 'any';  // 'any' | 'online' | 'offline'
       // Manage view
       let manageSelectedGroup = null;
+      let manageTab = 'devices';
       let manageMembers = new Set();
       let manageSearch = '';
       let manageSort = 'label-asc';
@@ -818,9 +830,10 @@
       const btnClearLog = document.getElementById('btnClearLog');
       const mgSidebar = document.getElementById('mgSidebar');
       const mgDetail = document.getElementById('mgDetail');
+      const wifiGroupPanel = document.getElementById('wifiGroupPanel');
       const wifiController = window.MdmWifiConsole.createController({
         authPanel: document.getElementById('wifiAuthPanel'),
-        groupPanel: document.getElementById('wifiGroupPanel'),
+        groupPanel: wifiGroupPanel,
         getGroups: function () { return groups; },
         getDevices: function () { return devices; },
         onAuthenticated: function () {
@@ -2363,11 +2376,12 @@
         const hadRenameFocus = renameInputFocused();
         if (!manageSelectedGroup || !(manageSelectedGroup in groups)) {
           mgDetail.innerHTML = '<div class="mg-detail-empty">Select a group, or create one.</div>';
+          wifiGroupPanel.hidden = true;
           wifiController.renderGroup(null, [], true);
           return;
         }
         const name = manageSelectedGroup;
-        const memArr = Array.from(manageMembers);
+        const memArr = manageTab === 'wifi' ? (groups[name] || []) : Array.from(manageMembers);
         const offCount = memArr.filter(function (s) { const d = deviceById(s); return !d || !isOnline(d); }).length;
         const onCount = memArr.length - offCount;
         const head = renamingManageGroup
@@ -2376,18 +2390,21 @@
             '<button class="btn-mini btn-cancel" data-act="cancelRename">Cancel</button></div>'
           : '<div><div class="mg-title">' + esc(name) + '</div><div class="mg-sub">' + onCount + ' online, ' + offCount + ' offline</div></div>' +
             '<div class="mg-head-actions"><button class="btn-outline" data-act="renameGroup">Rename</button>' +
-            '<button class="btn-danger-outline" data-act="deleteGroup" data-group="' + esc(name) + '">Delete</button></div>';
+            '<button class="btn btn-danger-outline" data-act="deleteGroup" data-group="' + esc(name) + '">Delete</button></div>';
         mgDetail.innerHTML =
           '<div class="mg-detail-head">' + head + '</div>' +
-          '<div class="mg-search"><input class="mg-search-input" data-mg-search placeholder="⌕ Search devices to add…" value="' + esc(manageSearch) + '">' +
+          '<div class="subtabs mg-tabs"><button class="subtab' + (manageTab === 'devices' ? ' active' : '') + '" data-act="manageTab" data-manage-tab="devices" aria-pressed="' + (manageTab === 'devices') + '">Devices</button>' +
+          '<button class="subtab' + (manageTab === 'wifi' ? ' active' : '') + '" data-act="manageTab" data-manage-tab="wifi" aria-pressed="' + (manageTab === 'wifi') + '">Wi-Fi</button><div class="subtabs-fill"></div></div>' +
+          '<div' + (manageTab === 'wifi' ? ' hidden' : '') + '><div class="mg-search"><input class="mg-search-input" data-mg-search placeholder="⌕ Search devices to add…" value="' + esc(manageSearch) + '">' +
           '<button class="mg-sort-btn" data-act="sortManage" title="Sort by name">Name<span class="sort-arrow">' + (manageSort === 'label-desc' ? '▼' : '▲') + '</span></button></div>' +
           '<div class="mg-dev-list" id="mgDevList">' + renderMgDevListHtml() + '</div>' +
           '<div class="mg-footer"><span class="mg-foot-count">' + manageMembers.size + ' selected</span>' +
           '<div class="spacer"></div>' +
           '<button class="btn-text" data-act="cancelMembers">Cancel</button>' +
-          '<button class="btn-primary" data-act="saveMembers">Save</button></div>';
+          '<button class="btn btn-primary" data-act="saveMembers">Save</button></div></div>';
+        wifiGroupPanel.hidden = manageTab !== 'wifi';
         restoreRenameGroupFocus(hadRenameFocus);
-        wifiController.renderGroup(name, memArr, false);
+        wifiController.renderGroup(name, groups[name] || [], false);
       }
 
       function renameInputFocused() {
@@ -3172,6 +3189,10 @@
         const act = t.dataset.act;
         if (act === 'copyDeviceId') { e.stopPropagation(); copyDeviceId(t); }
         else if (act === 'back') backToConsole();
+        else if (act === 'manageTab') {
+          manageTab = t.dataset.manageTab;
+          renderManageDetail();
+        }
         else if (act === 'sortManage') {
           // Toggle sort direction and refresh only the list (keeps search focus/scroll).
           manageSort = manageSort === 'label-asc' ? 'label-desc' : 'label-asc';

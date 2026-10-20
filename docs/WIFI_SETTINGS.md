@@ -45,12 +45,13 @@ No continuous settings-enforcement loop is installed.
 
 ## Security and supported devices
 
-Wi-Fi credentials are secrets. The feature requires TLS, administrator/device
-access control and encryption of server-side settings. Existing plain LAN MDM
-connections do not qualify for Wi-Fi deployment. The browser sends the admin
-token only over HTTPS to obtain an HttpOnly, Secure, SameSite session. Tokens must
-not be put in URLs or shared-storage client configuration. Certificates must be
-trusted by Android; no permissive trust manager or hostname bypass is provided.
+Wi-Fi credentials use administrator/device access control and encrypted server
+storage. HTTPS is supported. A server restricted to a managed LAN can explicitly
+allow HTTP with `MDM_WIFI_ALLOW_HTTP=1` when TLS is not configured; tokens and
+Wi-Fi passwords then travel without transport encryption. The browser session is
+HttpOnly and SameSite=Strict, with Secure set on HTTPS. Tokens must not be put in
+URLs or shared-storage client configuration. When TLS is used, certificates must
+be trusted by Android; no permissive trust manager or hostname bypass is provided.
 
 Precise location permission and exact-alarm access are requested from the existing
 Android Settings screen. The client checks both before a manual mutation, along
@@ -88,12 +89,14 @@ the same password after another application or operator changes it.
 
 ## Server and client setup
 
-The Wi-Fi feature is opt-in. Configure all five server environment variables:
+The Wi-Fi feature is opt-in. Configure the encryption key and both tokens, then
+choose TLS or explicit managed-LAN HTTP:
 
 | Variable | Value |
 |---|---|
-| `MDM_TLS_CERT` | PEM certificate chain file |
-| `MDM_TLS_KEY` | PEM private-key file |
+| `MDM_TLS_CERT` | PEM certificate chain file when using TLS |
+| `MDM_TLS_KEY` | PEM private-key file when using TLS |
+| `MDM_WIFI_ALLOW_HTTP` | `1` enables managed-LAN HTTP only when TLS is absent |
 | `MDM_WIFI_ENCRYPTION_KEY` | Fernet key, kept outside the data directory/backups |
 | `MDM_ADMIN_TOKEN` | Secret administrator access token |
 | `MDM_DEVICE_TOKEN` | Secret token provisioned into managed clients |
@@ -120,19 +123,24 @@ resetting the store. Back up the encrypted data together with the normal device
 registry, and keep the token/key material out of source control. `cryptography`
 is the additional server runtime dependency for authenticated encryption.
 
-Native TLS runs on the configured MDM HTTP/WebSocket port; discovery advertises
-`wss://`. The browser must open `https://` and authenticate in the Wi-Fi access
-form. On each client, set an explicit manual server address, enable secure transport
-and provision the device token in Settings. The token and Wi-Fi capability are
-bound to that enrolled endpoint. UDP discovery/cache alone cannot authorize
-credential transmission, even when the discovered URL uses WSS and a valid public
-certificate. Provision trusted server certificates before using real credentials.
+The console and device connections use the configured MDM HTTP/WebSocket port.
+For managed-LAN HTTP, set `MDM_WIFI_ALLOW_HTTP=1` and leave TLS certificate/key
+unset; use `http://` in the browser and disable TLS in Android Settings. For TLS,
+configure both certificate files, use `https://` and enable TLS in Settings.
+Discovery advertises the matching `ws://` or `wss://` scheme. Authenticate in the
+console access form. On each client, set an explicit manual server address and
+provision the device token. The token and Wi-Fi capability are bound to that
+manually selected endpoint; UDP discovery/cache alone never authorizes credential
+transmission, even when the discovered URL matches the saved address.
+
 The shared-storage `styly-mdm/config.json` remains limited to non-secret
 connection tunables.
 
 ## Console behavior
 
-Use **Manage Groups**, choose a group, edit the Wi-Fi rows, then save. Saving does
+Use **Manage Groups**, choose a group, open its **Wi-Fi** tab, edit the network
+rows, then save. The **Devices** tab edits membership separately; Wi-Fi target
+counts and results always use saved membership. Saving does
 not send settings to devices. **Apply to whole group** takes a new online snapshot;
 there is no individual-device apply action. Saving again creates a new revision.
 Moving membership during an unresolved operation is rejected.
@@ -153,7 +161,7 @@ before the client reports it, and no last-checked timestamp is displayed.
 
 `REGISTER.capabilities` keeps the existing string-array format and adds
 `wifi_settings_v1`. A dictionary would break Push/Sync capability negotiation.
-Only canonical identities on authenticated secure connections qualify for Wi-Fi
+Only canonical identities on authorized enrolled connections qualify for Wi-Fi
 commands; provisional identities never receive settings credentials.
 
 | Route | Operation |
@@ -196,8 +204,10 @@ fenced against overlapping deployments and membership changes.
 
 This is an additive Wi-Fi wire protocol. Older clients retain existing MDM
 commands but cannot receive Wi-Fi credentials without the new capability and
-secure authenticated connection. Enable the feature only after provisioning its
-server credentials, TLS certificates and device token.
+authenticated enrolled connection. Enable the feature after provisioning its
+server credentials and device token, with either TLS or explicit managed-LAN HTTP.
+The state API adds `allow_http`; clients that do not recognize it continue to
+require HTTPS. Existing TLS configurations retain their transport requirements.
 
 Legacy registry files may contain overlapping group membership. Migration assigns
 a device to the first group in sorted name order and removes later duplicates;

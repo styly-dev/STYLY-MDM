@@ -94,26 +94,27 @@ internal class WifiSettingsController internal constructor(
         old.copy(connection = settings.copy(deviceToken = settings.deviceToken?.takeIf { it.isNotBlank() }))
     }
 
-    fun isSecureSession(url: String): Boolean {
-        val settings = connectionSettings()
-        return settings.tlsEnabled && !settings.deviceToken.isNullOrBlank() && url.startsWith("wss://", true)
-    }
+    fun authorizationTokenFor(url: String, manuallyEnrolledEndpoint: Boolean): String? =
+        WifiTransportAuthorization.authorizationTokenFor(
+            url,
+            manuallyEnrolledEndpoint,
+            connectionSettings(),
+        )
 
-    fun authorizationTokenFor(url: String, trustedEndpoint: Boolean): String? {
-        if (!trustedEndpoint || !url.startsWith("wss://", true)) return null
-        return connectionSettings().takeIf { it.tlsEnabled }?.deviceToken?.takeIf { it.isNotBlank() }
-    }
-
-    fun supportsWifiOn(url: String, trustedEndpoint: Boolean): Boolean =
-        trustedEndpoint && isSecureSession(url)
+    fun supportsWifiOn(url: String, manuallyEnrolledEndpoint: Boolean): Boolean =
+        WifiTransportAuthorization.isAuthorizedSession(
+            url,
+            manuallyEnrolledEndpoint,
+            connectionSettings(),
+        )
 
     fun onTransportDisconnected() {
         activeSender = null
     }
 
     /** Called only after the server has acknowledged canonical REGISTERED. */
-    fun onCanonicalRegistered(secure: Boolean, send: (JSONObject) -> Boolean) {
-        if (!secure) return
+    fun onCanonicalRegistered(authorized: Boolean, send: (JSONObject) -> Boolean) {
+        if (!authorized) return
         activeSender = send
         operationExecutor.execute {
             startup.join()
@@ -146,11 +147,11 @@ internal class WifiSettingsController internal constructor(
     fun handleServerMessage(
         type: String,
         payload: JSONObject,
-        secure: Boolean,
+        authorized: Boolean,
         send: (JSONObject) -> Boolean,
     ): Boolean {
         if (type != "EXECUTE_WIFI_APPLY" && !type.startsWith("WIFI_")) return false
-        if (!secure) return true
+        if (!authorized) return true
         when (type) {
             "EXECUTE_WIFI_APPLY" -> operationExecutor.execute { acceptManualCommand(payload, send) }
             "WIFI_VERIFY_ACK" -> operationExecutor.execute { acceptVerifyAck(payload, send) }

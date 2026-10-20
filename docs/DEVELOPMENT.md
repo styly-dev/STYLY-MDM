@@ -86,8 +86,11 @@ application. Deployment freezes online targets; the Android client owns a durabl
 manual rollback journal and the last successful boot baseline. OS boot correction
 runs once per boot generation, after interrupted manual recovery, without a
 connectivity test or the manual 60-second rollback. Manual and boot results remain
-separate. Wi-Fi credentials require authenticated TLS and encrypted server
-persistence; legacy cleartext connections cannot receive them.
+separate. Wi-Fi credentials require token authentication and encrypted server
+persistence. TLS is supported; an explicitly configured managed-LAN server can
+use HTTP (`MDM_WIFI_ALLOW_HTTP=1`). Device credentials are sent only to the
+manually enrolled endpoint. The console uses separate Devices and Wi-Fi tabs
+inside the selected group and retains Wi-Fi drafts during status refreshes.
 
 See [`WIFI_SETTINGS.md`](WIFI_SETTINGS.md) for lifecycle, migration, security,
 supported authentication modes and the physical-verification boundary. Group

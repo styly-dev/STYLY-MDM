@@ -1458,7 +1458,12 @@ def _load_tls_context() -> ssl.SSLContext | None:
     return context
 
 
-def _load_wifi_store(data_dir: Path, tls_context: ssl.SSLContext | None) -> tuple[bool, WiFiSettingsStore | None]:
+def _load_wifi_store(
+    data_dir: Path,
+    tls_context: ssl.SSLContext | None,
+    *,
+    allow_http: bool = False,
+) -> tuple[bool, WiFiSettingsStore | None]:
     admin_token = os.environ.get("MDM_ADMIN_TOKEN")
     device_token = os.environ.get("MDM_DEVICE_TOKEN")
     encryption_key = os.environ.get("MDM_WIFI_ENCRYPTION_KEY")
@@ -1467,10 +1472,10 @@ def _load_wifi_store(data_dir: Path, tls_context: ssl.SSLContext | None) -> tupl
     any_wifi_config = bool(admin_token or device_token or encryption_key)
     if not any_wifi_config and not state_exists:
         return False, None
-    if not (admin_token and device_token and encryption_key and tls_context is not None):
+    if not (admin_token and device_token and encryption_key and (tls_context is not None or allow_http)):
         raise RuntimeError(
             "Wi-Fi state requires MDM_ADMIN_TOKEN, MDM_DEVICE_TOKEN, "
-            "MDM_WIFI_ENCRYPTION_KEY, MDM_TLS_CERT, and MDM_TLS_KEY"
+            "MDM_WIFI_ENCRYPTION_KEY, and either TLS credentials or MDM_WIFI_ALLOW_HTTP=1"
         )
     try:
         return True, WiFiSettingsStore(store_path, encryption_key)
@@ -1489,11 +1494,16 @@ def _wifi_bearer(request: web.Request) -> str | None:
 def _token_matches(request: web.Request, expected: str | None) -> bool:
     presented = _wifi_bearer(request)
     return bool(
-        request.secure
+        _wifi_transport_allowed(request)
         and expected
         and presented
         and hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
     )
+
+
+def _wifi_transport_allowed(request: web.Request) -> bool:
+    """Require TLS unless this managed-LAN server explicitly opted into HTTP."""
+    return request.secure or request.app.get("wifi_allow_http") is True
 
 
 def _session_key(token: str) -> str:
@@ -1502,7 +1512,7 @@ def _session_key(token: str) -> str:
 
 def _valid_wifi_session(request: web.Request) -> bool:
     token = request.cookies.get(WIFI_SESSION_COOKIE)
-    if not request.secure or not token:
+    if not _wifi_transport_allowed(request) or not token:
         return False
     key = _session_key(token)
     expires = request.app["wifi_sessions"].get(key)
@@ -1575,7 +1585,7 @@ def _wifi_name_from_request(request: web.Request) -> str:
     return name
 
 
-def _wifi_state_payload(store: WiFiSettingsStore) -> dict:
+def _wifi_state_payload(store: WiFiSettingsStore, *, allow_http: bool) -> dict:
     groups = {}
     for name in sorted(device_groups):
         profile = store.profile(name)
@@ -1587,6 +1597,7 @@ def _wifi_state_payload(store: WiFiSettingsStore) -> dict:
     known_ids = set(device_registry) | online_ids
     return {
         "enabled": True,
+        "allow_http": allow_http,
         "groups": groups,
         "devices": store.state_view(known_ids, online_ids),
     }
@@ -1597,8 +1608,11 @@ async def wifi_session_handler(request: web.Request) -> web.Response:
         return _wifi_recovery_required_response()
     if not request.app.get("wifi_enabled"):
         return _wifi_api_unavailable()
-    if not request.secure:
-        return web.json_response({"error": "Wi-Fi authentication requires TLS"}, status=403)
+    if not _wifi_transport_allowed(request):
+        return web.json_response(
+            {"error": "Wi-Fi authentication requires HTTPS unless MDM_WIFI_ALLOW_HTTP=1"},
+            status=403,
+        )
     if not _token_matches(request, request.app.get("wifi_admin_token")):
         return _wifi_api_unauthorized()
     if not _wifi_origin_allowed(request):
@@ -1611,7 +1625,7 @@ async def wifi_session_handler(request: web.Request) -> web.Response:
         token,
         max_age=WIFI_SESSION_TTL,
         httponly=True,
-        secure=True,
+        secure=request.secure,
         samesite="Strict",
         path="/",
     )
@@ -1622,18 +1636,25 @@ async def wifi_state_handler(request: web.Request) -> web.Response:
     if _WIFI_GROUP_RECOVERY_REQUIRED:
         return _wifi_recovery_required_response()
     if not request.app.get("wifi_enabled"):
-        return web.json_response({"enabled": False, "groups": {}, "devices": {}})
+        return web.json_response({"enabled": False, "allow_http": False, "groups": {}, "devices": {}})
     if not _wifi_admin_authorized(request):
         # The unauthenticated payload is deliberately minimal so the UI can show
         # its token form without revealing device or group metadata.
         return web.json_response(
-            {"enabled": True, "error": "authentication required"},
+            {
+                "enabled": True,
+                "allow_http": request.app.get("wifi_allow_http") is True,
+                "error": "authentication required",
+            },
             status=401,
         )
     store = _wifi_store(request)
     if store is None:
         return _wifi_api_unavailable()
-    return web.json_response(_wifi_state_payload(store))
+    return web.json_response(_wifi_state_payload(
+        store,
+        allow_http=request.app.get("wifi_allow_http") is True,
+    ))
 
 
 async def wifi_group_handler(request: web.Request) -> web.Response:
@@ -2628,7 +2649,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
 async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
     if request.app.get("wifi_enabled") and (
-        not request.secure
+        not _wifi_transport_allowed(request)
         or not _valid_wifi_session(request)
         or not request.headers.get("Origin")
         or not _wifi_origin_allowed(request)
@@ -4119,11 +4140,13 @@ def create_app() -> web.Application:
     _WIFI_GROUP_RECOVERY_REQUIRED = False
     load_registry()
     tls_context = _load_tls_context()
-    wifi_enabled, wifi_store = _load_wifi_store(DATA_DIR, tls_context)
+    allow_http = tls_context is None and os.environ.get("MDM_WIFI_ALLOW_HTTP") == "1"
+    wifi_enabled, wifi_store = _load_wifi_store(DATA_DIR, tls_context, allow_http=allow_http)
     app = web.Application(
         client_max_size=max(MAX_APK_SIZE, MAX_BUNDLE_SIZE) + 10 * 1024 * 1024)
     app["tls_context"] = tls_context
     app["wifi_enabled"] = wifi_enabled
+    app["wifi_allow_http"] = wifi_enabled and allow_http
     app["wifi_store"] = wifi_store
     app["wifi_admin_token"] = os.environ.get("MDM_ADMIN_TOKEN") if wifi_enabled else None
     app["wifi_device_token"] = os.environ.get("MDM_DEVICE_TOKEN") if wifi_enabled else None

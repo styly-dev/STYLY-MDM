@@ -9,6 +9,7 @@ import ssl
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
+import pytest
 from aiohttp.test_utils import TestServer
 from cryptography import x509
 from cryptography.fernet import Fernet
@@ -118,6 +119,7 @@ def test_wifi_tls_origin_dispatch_and_reconnect_verify(tmp_path, monkeypatch):
                 assert response.status == 401
                 assert await response.json() == {
                     "enabled": True,
+                    "allow_http": False,
                     "error": "authentication required",
                 }
 
@@ -147,6 +149,9 @@ def test_wifi_tls_origin_dispatch_and_reconnect_verify(tmp_path, monkeypatch):
                 assert "SameSite=Strict" in cookie
             async with session.get(base_url + "/api/wifi/groups/Studio") as response:
                 assert response.status == 200
+            async with session.get(base_url + "/api/wifi/state") as response:
+                assert response.status == 200
+                assert (await response.json())["allow_http"] is False
             # Cookie-authenticated browser mutations still require a same-origin
             # Origin header; an origin-less request cannot reuse the cookie.
             async with session.put(base_url + "/api/wifi/groups/Studio", json=payload) as response:
@@ -303,6 +308,198 @@ def test_wifi_tls_origin_dispatch_and_reconnect_verify(tmp_path, monkeypatch):
         finally:
             for ws in sockets:
                 await ws.close()
+            await session.close()
+            await test_server.close()
+            server.devices.clear()
+            server.device_registry.clear()
+            server.device_groups.clear()
+            server.admin_connections.clear()
+
+    asyncio.run(body())
+
+
+def test_wifi_http_requires_explicit_opt_in_and_preserves_bearer_gates(tmp_path, monkeypatch):
+    async def body():
+        admin_token = "test-admin-token"
+        device_token = "test-device-token"
+        device_id = "55555555-5555-4555-8555-555555555555"
+        cert_path, key_path = _certificate(tmp_path)
+
+        monkeypatch.setenv("MDM_ADMIN_TOKEN", admin_token)
+        monkeypatch.setenv("MDM_DEVICE_TOKEN", device_token)
+        monkeypatch.setenv("MDM_WIFI_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+        monkeypatch.setenv("MDM_TLS_CERT", str(cert_path))
+        monkeypatch.setenv("MDM_TLS_KEY", str(key_path))
+        monkeypatch.delenv("MDM_WIFI_ALLOW_HTTP", raising=False)
+        server._apply_data_dir(str(tmp_path / "data"))
+        server.devices.clear()
+        server.device_registry.clear()
+        server.device_groups.clear()
+        server.admin_connections.clear()
+        server.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        server.REGISTRY_PATH.write_text(json.dumps({
+            "devices": {}, "groups": {"Studio": [device_id]},
+        }), encoding="utf-8")
+
+        # Run the configured TLS app over a deliberately cleartext test listener
+        # to verify all Wi-Fi routes fail closed when request.secure is false.
+        app = server.create_app()
+        assert app["wifi_enabled"] is True
+        assert app["wifi_allow_http"] is False
+        test_server = TestServer(app)
+        await test_server.start_server()
+        session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True))
+        base_url = str(test_server.make_url("/")).rstrip("/")
+        origin = f"http://{test_server.host}:{test_server.port}"
+        ws = None
+        try:
+            async with session.get(base_url + "/api/wifi/state") as response:
+                assert response.status == 401
+                assert (await response.json())["allow_http"] is False
+            async with session.post(
+                base_url + "/api/wifi/session",
+                headers={"Authorization": f"Bearer {admin_token}", "Origin": origin},
+            ) as response:
+                assert response.status == 403
+            async with session.put(
+                base_url + "/api/wifi/groups/Studio",
+                headers={"Authorization": f"Bearer {admin_token}", "Origin": origin},
+                json={"networks": [{
+                    "ssid": "LAN Wi-Fi", "security": "OPEN", "password": "", "hidden": False,
+                }]},
+            ) as response:
+                assert response.status == 401
+            with pytest.raises(aiohttp.WSServerHandshakeError) as exc:
+                await session.ws_connect(base_url + "/ws/admin", origin=origin)
+            assert exc.value.status == 401
+
+            ws = await session.ws_connect(
+                base_url + "/ws/device",
+                headers={"Authorization": f"Bearer {device_token}"},
+                origin=origin,
+            )
+            await ws.send_json({
+                "type": "REGISTER",
+                "identity_scheme": server.IDENTITY_SCHEME,
+                "device_id": device_id,
+                "model": "Test headset",
+                "ip": "127.0.0.1",
+                "version_code": 1,
+                "version_name": "test",
+                "capabilities": ["wifi_settings_v1"],
+            })
+            assert (await ws.receive_json(timeout=3))["type"] == "REGISTERED"
+            assert server.devices[device_id]["wifi_authorized"] is False
+        finally:
+            if ws is not None:
+                await ws.close()
+            await session.close()
+            await test_server.close()
+            server.devices.clear()
+            server.device_registry.clear()
+            server.device_groups.clear()
+            server.admin_connections.clear()
+
+    asyncio.run(body())
+
+
+def test_wifi_http_opt_in_allows_authenticated_lan_flow(tmp_path, monkeypatch):
+    async def body():
+        admin_token = "test-admin-token"
+        device_token = "test-device-token"
+        device_id = "66666666-6666-4666-8666-666666666666"
+        monkeypatch.setenv("MDM_ADMIN_TOKEN", admin_token)
+        monkeypatch.setenv("MDM_DEVICE_TOKEN", device_token)
+        monkeypatch.setenv("MDM_WIFI_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+        monkeypatch.delenv("MDM_TLS_CERT", raising=False)
+        monkeypatch.delenv("MDM_TLS_KEY", raising=False)
+        monkeypatch.setenv("MDM_WIFI_ALLOW_HTTP", "1")
+        server._apply_data_dir(str(tmp_path / "data"))
+        server.devices.clear()
+        server.device_registry.clear()
+        server.device_groups.clear()
+        server.admin_connections.clear()
+        server.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        server.REGISTRY_PATH.write_text(json.dumps({
+            "devices": {}, "groups": {"Studio": [device_id]},
+        }), encoding="utf-8")
+
+        app = server.create_app()
+        assert app["wifi_enabled"] is True
+        assert app["wifi_allow_http"] is True
+        assert app["tls_context"] is None
+        test_server = TestServer(app)
+        await test_server.start_server()
+        session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True))
+        base_url = str(test_server.make_url("/")).rstrip("/")
+        origin = f"http://{test_server.host}:{test_server.port}"
+        device_ws = None
+        admin_ws = None
+        try:
+            async with session.get(base_url + "/api/wifi/state") as response:
+                assert response.status == 401
+                assert (await response.json())["allow_http"] is True
+            async with session.post(
+                base_url + "/api/wifi/session",
+                headers={"Authorization": f"Bearer {admin_token}", "Origin": origin},
+            ) as response:
+                assert response.status == 200
+                cookie = response.headers["Set-Cookie"]
+                assert "HttpOnly" in cookie
+                assert "SameSite=Strict" in cookie
+                assert "Secure" not in cookie
+            async with session.get(base_url + "/api/wifi/state") as response:
+                assert response.status == 200
+                state = await response.json()
+                assert state["allow_http"] is True
+                assert state["groups"] == {"Studio": {"revision": None}}
+
+            profile = {"networks": [{
+                "ssid": "LAN Wi-Fi", "security": "WPA_PSK",
+                "password": "lan-secret", "hidden": False,
+            }]}
+            async with session.put(
+                base_url + "/api/wifi/groups/Studio",
+                headers={
+                    "Authorization": f"Bearer {admin_token}",
+                    "Origin": "http://attacker.example",
+                },
+                json=profile,
+            ) as response:
+                assert response.status == 403
+            async with session.put(
+                base_url + "/api/wifi/groups/Studio",
+                headers={"Origin": origin}, json=profile,
+            ) as response:
+                assert response.status == 200
+                saved = await response.json()
+            assert saved["networks"][0]["password_present"] is True
+            assert "password" not in saved["networks"][0]
+
+            admin_ws = await session.ws_connect(base_url + "/ws/admin", origin=origin)
+            assert (await admin_ws.receive_json(timeout=3))["type"] == "SERVER_INFO"
+            device_ws = await session.ws_connect(
+                base_url + "/ws/device",
+                headers={"Authorization": f"Bearer {device_token}"},
+                origin=origin,
+            )
+            await device_ws.send_json({
+                "type": "REGISTER",
+                "identity_scheme": server.IDENTITY_SCHEME,
+                "device_id": device_id,
+                "model": "Test headset",
+                "ip": "127.0.0.1",
+                "version_code": 1,
+                "version_name": "test",
+                "capabilities": ["wifi_settings_v1"],
+            })
+            assert (await device_ws.receive_json(timeout=3))["type"] == "REGISTERED"
+            assert server.devices[device_id]["wifi_authorized"] is True
+        finally:
+            if device_ws is not None:
+                await device_ws.close()
+            if admin_ws is not None:
+                await admin_ws.close()
             await session.close()
             await test_server.close()
             server.devices.clear()
