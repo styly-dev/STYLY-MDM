@@ -44,6 +44,13 @@ Issue #94 adds resumable transfers, per-device Resume and Cancel controls, and
 retry of failed targets. See [Push / Sync jobs](PUSH_JOBS.md) for the recovery
 rules, protocol, operator controls, and schema-3 deployment requirements.
 
+The console renders Push progress and Resume/Cancel controls directly from the
+same selected canonical assignment. The adapter invalidates device cells when
+snapshots or connectivity change; it does not copy Push into the generic task
+state or paint optimistic Push assignments. The latest Install/Verify result
+appears on a separate labeled line alongside Push. Install/Verify still share
+their existing latest-result state and have no per-operation response ordering.
+
 Push runs only between a server and client of the same version; see
 [Push / Sync jobs](PUSH_JOBS.md) for how the worker shares download code with
 standalone bundles, where partial files are discarded, and how interrupted
