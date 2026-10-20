@@ -773,6 +773,25 @@ class PushJobStore:
     async def get_snapshot(self, job_id: str) -> dict[str, Any]:
         return await self._call(lambda conn: self._snapshot(conn, job_id))
 
+    def _expire_created_in_transaction(
+        self, conn: sqlite3.Connection, job_id: str, timestamp: int
+    ) -> None:
+        """The caller checks state/deadline and owns the transaction."""
+        self._settle_pre_dispatch_targets(
+            conn, job_id, JobState.INTERRUPTED,
+            "upload_not_started_timeout", "upload did not start before create_expires_at",
+            terminal_at=timestamp, updated_at=timestamp,
+        )
+        conn.execute(
+            """
+            UPDATE push_jobs SET state='interrupted', revision=revision+1,
+                updated_at=?, terminal_at=?, failure_code='upload_not_started_timeout',
+                failure_detail='upload did not start before create_expires_at'
+            WHERE job_id=?
+            """,
+            (timestamp, timestamp, job_id),
+        )
+
     async def start_upload(self, job_id: str) -> dict[str, Any]:
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
             self._begin(conn)
@@ -786,20 +805,7 @@ class PushJobStore:
                 if row["state"] != JobState.CREATED.value:
                     raise StoreConflict(f"job is {row['state']}, not created")
                 if timestamp >= row["create_expires_at"]:
-                    self._settle_pre_dispatch_targets(
-                        conn, job_id, JobState.INTERRUPTED,
-                        "upload_not_started_timeout", "upload did not start before create_expires_at",
-                        terminal_at=timestamp, updated_at=timestamp,
-                    )
-                    conn.execute(
-                        """
-                        UPDATE push_jobs SET state='interrupted', revision=revision+1,
-                            updated_at=?, terminal_at=?, failure_code='upload_not_started_timeout',
-                            failure_detail='upload did not start before create_expires_at'
-                        WHERE job_id=?
-                        """,
-                        (timestamp, timestamp, job_id),
-                    )
+                    self._expire_created_in_transaction(conn, job_id, timestamp)
                     snapshot = self._snapshot(conn, job_id)
                     self._commit(conn)
                     raise UploadDeadlineExpired(snapshot)
@@ -1127,20 +1133,7 @@ class PushJobStore:
                 if timestamp < row["create_expires_at"]:
                     self._commit(conn)
                     return None
-                self._settle_pre_dispatch_targets(
-                    conn, job_id, JobState.INTERRUPTED,
-                    "upload_not_started_timeout", "upload did not start before create_expires_at",
-                    terminal_at=timestamp, updated_at=timestamp,
-                )
-                conn.execute(
-                    """
-                    UPDATE push_jobs SET state='interrupted', revision=revision+1,
-                        updated_at=?, terminal_at=?, failure_code='upload_not_started_timeout',
-                        failure_detail='upload did not start before create_expires_at'
-                    WHERE job_id=?
-                    """,
-                    (timestamp, timestamp, job_id),
-                )
+                self._expire_created_in_transaction(conn, job_id, timestamp)
                 snapshot = self._snapshot(conn, job_id)
                 self._commit(conn)
                 return snapshot
@@ -1168,22 +1161,9 @@ class PushJobStore:
                     job_id = row["job_id"]
                     if state is JobState.CREATED and timestamp >= row["create_expires_at"]:
                         try:
-                            self._settle_pre_dispatch_targets(
-                                conn, job_id, JobState.INTERRUPTED,
-                                "upload_not_started_timeout", "upload did not start before create_expires_at",
-                                terminal_at=timestamp, updated_at=timestamp,
-                            )
+                            self._expire_created_in_transaction(conn, job_id, timestamp)
                         except StoreConflict:
                             continue
-                        conn.execute(
-                            """
-                            UPDATE push_jobs SET state='interrupted', revision=revision+1,
-                                updated_at=?, terminal_at=?, failure_code='upload_not_started_timeout',
-                                failure_detail='upload did not start before create_expires_at'
-                            WHERE job_id=?
-                            """,
-                            (timestamp, timestamp, job_id),
-                        )
                         cleanup_jobs.append(job_id)
                         touched.add(job_id)
                     elif state in {JobState.UPLOADING, JobState.PACKAGING}:
