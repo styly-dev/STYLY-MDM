@@ -8,7 +8,6 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
-import java.net.URI
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -180,7 +179,6 @@ class PushFilesWorker internal constructor(
             "All files access (MANAGE_EXTERNAL_STORAGE) is not granted on this device"
         private const val PUSH_LEASE_REVOKED = "push_lease_revoked"
         private const val CONNECT_TIMEOUT_MS = 15_000
-        private const val READ_TIMEOUT_MS = 120_000
         internal const val DOWNLOAD_NO_PROGRESS_TIMEOUT_MS = 60_000L
         private const val INITIAL_RETRY_BACKOFF_MS = 1_000L
         private const val MAX_RETRY_BACKOFF_MS = 8_000L
@@ -193,9 +191,14 @@ class PushFilesWorker internal constructor(
         )
 
         internal fun defaultAttemptDirectory(command: PushProtocol.Command): File {
-            val key = command.jobId?.let { UUID.fromString(it).toString() } ?: "legacy"
             val downloads =
                 Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            return attemptDirectoryUnder(downloads, command)
+        }
+
+        internal fun attemptDirectoryUnder(downloads: File, command: PushProtocol.Command): File {
+            // Historical identity-less active state still owns this directory for cleanup.
+            val key = command.jobId?.let { UUID.fromString(it).toString() } ?: "legacy"
             return File(downloads, "styly-mdm/.push-tmp/jobs/$key/${command.attempt}")
         }
 
@@ -212,10 +215,9 @@ class PushFilesWorker internal constructor(
     data class Callbacks(
         val onTransferComplete: (Long) -> Unit,
         val onValidated: () -> Unit,
-        val onApplying: () -> Unit,
-        val onValidationStart: () -> Unit = {},
         /** A false result prevents destination mutation and returns a terminal failure. */
-        val beforeApply: () -> Boolean = { true },
+        val beforeApply: () -> Boolean,
+        val onValidationStart: () -> Unit = {},
     )
 
     sealed class Outcome {
@@ -259,7 +261,7 @@ class PushFilesWorker internal constructor(
         val work = attemptDirectoryProvider(command)
         var interruptionReason: String? = null
         val result = try {
-            if (command.isJobV1) prepareResumableDirectory(command, work) else recreateDirectory(work)
+            prepareResumableDirectory(command, work)
             val bundle = download(command, work, callbacks.onValidationStart)
             callbacks.onTransferComplete(bundle.length())
             val staging = File(work, "staging")
@@ -273,7 +275,6 @@ class PushFilesWorker internal constructor(
                     "Could not persist the applying phase before changing the destination",
                 )
             }
-            callbacks.onApplying()
             val applied = BundleSync.apply(staging, destination, command.deleteExtras)
             PushProtocol.Result(
                 jobId = command.jobId,
@@ -526,7 +527,6 @@ class PushFilesWorker internal constructor(
         work: File,
         onValidationStart: () -> Unit,
     ): File {
-        if (!command.isJobV1) return downloadLegacy(command, work)
         val expectedSize = requireNotNull(command.artifactSize)
         val partial = File(work, "artifact.part")
         val completed = File(work, "artifact.zip")
@@ -595,12 +595,6 @@ class PushFilesWorker internal constructor(
             retryInWorker = error is IOException,
         )
         val retainPartial = failure.code == "artifact_unavailable"
-        if (!command.isJobV1) {
-            return FailurePolicy(
-                retainPartial = retainPartial,
-                retryInWorker = failure.retryable,
-            )
-        }
         return when (failure.code) {
             "download_failed" -> if (failure.retryable) {
                 FailurePolicy(
@@ -640,38 +634,8 @@ class PushFilesWorker internal constructor(
     ) {
         if (policy.retainPartial) return
         partial.deleteRecursively()
-        if (invalidateMetadata && command.isJobV1) File(partial.parentFile, "metadata.json").delete()
+        if (invalidateMetadata) File(partial.parentFile, "metadata.json").delete()
     }
-
-    private fun downloadLegacy(command: PushProtocol.Command, work: File): File {
-        val partial = File(work, "artifact.part")
-        val completed = File(work, "artifact.zip")
-        val connection = openConnection(command)
-        try {
-            if (connection.responseCode !in 200..299) throw PushWorkerException("download_failed", "artifact download returned HTTP ${connection.responseCode}")
-            val digest = PartialFileDigest(partial)
-            val declared = connection.contentLengthLong
-            if (command.artifactSize != null && declared >= 0L && declared != command.artifactSize) {
-                throw PushWorkerException("artifact_identity_mismatch", "HTTP body length does not match the expected range")
-            }
-            writeDownloadBody(connection.inputStream, partial, false, command.artifactSize, digest)
-            verifyAndFinalize(command, partial, completed, digest)
-            return completed
-        } catch (error: IOException) {
-            throw PushWorkerException("download_failed", error.message ?: "I/O error", error, true)
-        } finally {
-            connection.disconnect()
-        }
-    }
-
-    private fun openConnection(command: PushProtocol.Command): HttpURLConnection =
-        (URI(command.artifactUrl).toURL().openConnection() as HttpURLConnection).apply {
-            connectTimeout = CONNECT_TIMEOUT_MS
-            readTimeout = READ_TIMEOUT_MS
-            requestMethod = "GET"
-            instanceFollowRedirects = true
-            setRequestProperty("Accept-Encoding", "identity")
-        }
 
     private val resumableHttpClient = OkHttpClient.Builder()
         .connectTimeout(CONNECT_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
@@ -869,13 +833,12 @@ class PushFilesWorker internal constructor(
         completed: File,
         digest: PartialFileDigest,
     ) {
-        // Job-v1 size and SHA-256 are required by PushProtocol; standalone bundles may omit them.
-        val expectedSize = command.artifactSize
-        if (!partial.isFile || (expectedSize != null && partial.length() != expectedSize)) {
+        val expectedSize = requireNotNull(command.artifactSize)
+        if (!partial.isFile || partial.length() != expectedSize) {
             throw PushWorkerException("artifact_identity_mismatch", "received size did not match the declared size")
         }
-        val expectedSha = command.artifactSha256
-        if (expectedSha != null && !digest.finishHex().equals(expectedSha, ignoreCase = true)) {
+        val expectedSha = requireNotNull(command.artifactSha256)
+        if (!digest.finishHex().equals(expectedSha, ignoreCase = true)) {
             val failure = PushWorkerException("artifact_identity_mismatch", "artifact SHA-256 did not match its declared identity")
             discardPartialOnFailure(command, partial, failure, invalidateMetadata = true)
             throw failure
@@ -884,9 +847,9 @@ class PushFilesWorker internal constructor(
     }
 
     private fun matchesArtifactIdentity(command: PushProtocol.Command, file: File): Boolean {
-        if (!file.isFile || file.length() != command.artifactSize) return false
+        if (!file.isFile || file.length() != requireNotNull(command.artifactSize)) return false
         val digest = MessageDigest.getInstance("SHA-256").apply { updateWithFile(file) }
-        return digest.hexDigest().equals(command.artifactSha256, ignoreCase = true)
+        return digest.hexDigest().equals(requireNotNull(command.artifactSha256), ignoreCase = true)
     }
 
     internal fun validateAndExtract(bundle: File, staging: File) {

@@ -451,3 +451,69 @@ async def test_slow_artifact_gc_does_not_delay_reconciliation_deadline(
         gc_task.cancel()
         housekeeping_task.cancel()
         await asyncio.gather(gc_task, housekeeping_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_artifact_gc_thread_before_closing_store(
+    tmp_path, monkeypatch
+):
+    runtime = PushRuntime(types.SimpleNamespace(ADMIN_SEND_TIMEOUT=1), tmp_path)
+    runtime.artifact_gc_interval = 0
+    gc_started = threading.Event()
+    release_gc = threading.Event()
+    gc_finished = threading.Event()
+
+    def block_gc(*_args, **_kwargs):
+        gc_started.set()
+        try:
+            if not release_gc.wait(timeout=30):
+                raise AssertionError("test did not release the artifact GC worker")
+            return []
+        finally:
+            gc_finished.set()
+
+    runtime.manager.gc_artifacts_sync = block_gc
+    store_closed_after_gc = []
+    original_close = runtime.store.close
+    original_shield = asyncio.shield
+    cancellation_delivered = asyncio.Event()
+
+    async def observe_gc_cancellation(work):
+        try:
+            return await original_shield(work)
+        except asyncio.CancelledError:
+            cancellation_delivered.set()
+            raise
+
+    def observe_close():
+        store_closed_after_gc.append(gc_finished.is_set())
+        original_close()
+
+    monkeypatch.setattr(asyncio, "shield", observe_gc_cancellation)
+    monkeypatch.setattr(runtime.store, "close", observe_close)
+    runtime.artifact_gc_task = asyncio.create_task(runtime._artifact_gc_loop())
+
+    cleanup_task = None
+    try:
+        assert await asyncio.to_thread(gc_started.wait, 5)
+
+        cleanup_task = asyncio.create_task(runtime.on_cleanup(None))
+        # Wait until cancellation reaches the GC loop while the worker is blocked.
+        await asyncio.wait_for(cancellation_delivered.wait(), timeout=5)
+        assert not runtime.artifact_gc_task.done()
+        assert not cleanup_task.done()
+        assert store_closed_after_gc == []
+        assert not gc_finished.is_set()
+
+        release_gc.set()
+        await asyncio.wait_for(cleanup_task, timeout=5)
+
+        assert gc_finished.is_set()
+        assert store_closed_after_gc == [True]
+    finally:
+        release_gc.set()
+        if cleanup_task is not None and not cleanup_task.done():
+            await asyncio.gather(cleanup_task, return_exceptions=True)
+        elif not runtime.artifact_gc_task.done():
+            runtime.artifact_gc_task.cancel()
+            await asyncio.gather(runtime.artifact_gc_task, return_exceptions=True)

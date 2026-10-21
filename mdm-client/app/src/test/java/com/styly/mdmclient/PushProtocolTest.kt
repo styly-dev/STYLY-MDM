@@ -37,7 +37,7 @@ class PushProtocolTest {
     }
 
     @Test
-    fun `live job v1 requires artifact url and prefers it over bundle url`() {
+    fun `live job v1 requires artifact url even when bundle url is present`() {
         val value = payload().apply { remove("artifact_url") }
         assertThrows(IllegalArgumentException::class.java) {
             PushProtocol.parseWireCommand(value)
@@ -55,8 +55,20 @@ class PushProtocolTest {
     }
 
     @Test
-    fun `identity-less legacy command accepts bundle url`() {
-        val command = PushProtocol.parseWireCommand(
+    fun `live wire rejects identity-less legacy command`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            PushProtocol.parseWireCommand(
+                JSONObject().apply {
+                    put("bundle_url", "http://server/legacy.zip")
+                    put("dest_path", "/sdcard/STYLY/content")
+                },
+            )
+        }
+    }
+
+    @Test
+    fun `stored legacy command remains readable`() {
+        val command = PushProtocol.parseStoredCommand(
             JSONObject().apply {
                 put("bundle_url", "http://server/legacy.zip")
                 put("dest_path", "/sdcard/STYLY/content")
@@ -65,6 +77,26 @@ class PushProtocolTest {
 
         assertEquals("http://server/legacy.zip", command.artifactUrl)
         assertEquals(null, command.jobId)
+    }
+
+    @Test
+    fun `stored job-v1 commands require complete artifact identity and artifact url`() {
+        val invalidRecords = listOf(
+            payload().apply { remove("attempt") },
+            payload().apply { remove("artifact_id") },
+            payload().apply { remove("artifact_size") },
+            payload().apply { remove("artifact_sha256") },
+            payload().apply {
+                remove("artifact_url")
+                put("bundle_url", "http://server/legacy.zip")
+            },
+        )
+
+        invalidRecords.forEach { record ->
+            assertThrows(IllegalArgumentException::class.java) {
+                PushProtocol.parseStoredCommand(record)
+            }
+        }
     }
 
     @Test

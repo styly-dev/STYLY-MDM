@@ -175,165 +175,76 @@ object PushProtocol {
         val artifactId: String?,
     )
 
-    /** Parses a command received from the server using the current wire contract. */
-    fun parseWireCommand(payload: JSONObject): Command =
-        validateWireCommand(decodeCommandFields(payload))
-
-    /** Parses a command stored by this client, including the pre-revision Issue #91 form. */
-    fun parseStoredCommand(payload: JSONObject): Command =
-        validateStoredCommand(decodeCommandFields(payload))
-
-    /** Typed JSON fields only; each boundary owns its own semantic validation rules. */
-    private data class CommandFields(
-        val jobId: String?,
-        val attemptValue: Any?,
-        val artifactId: String?,
-        val artifactUrl: String?,
-        val hasArtifactUrl: Boolean,
-        val bundleUrl: String?,
-        val artifactSize: Long?,
-        val artifactSha256: String?,
-        val revisionValue: Any?,
-        val artifactEtag: String?,
-        val bundleFilename: String?,
-        val destPath: String,
-        val deleteExtras: Boolean,
-    )
-
-    private fun decodeCommandFields(payload: JSONObject): CommandFields {
-        val jobId = optionalString(payload, "job_id")
-        val hasArtifactUrl = payload.has("artifact_url")
-        return CommandFields(
-            jobId = jobId,
-            attemptValue = payload.opt("attempt"),
-            artifactId = optionalString(payload, "artifact_id"),
-            artifactUrl = if (hasArtifactUrl) optionalString(payload, "artifact_url") else null,
-            hasArtifactUrl = hasArtifactUrl,
-            bundleUrl = if (!hasArtifactUrl && jobId == null) {
-                optionalString(payload, "bundle_url")
-            } else {
-                null
-            },
-            artifactSize = optionalLong(payload, "artifact_size"),
-            artifactSha256 = optionalString(payload, "artifact_sha256"),
-            revisionValue = payload.opt("revision"),
-            artifactEtag = optionalString(payload, "artifact_etag"),
-            bundleFilename = optionalString(payload, "bundle_filename"),
-            destPath = requiredString(payload, "dest_path").trim(),
-            deleteExtras = strictBoolean(payload, "delete_extras", false),
-        )
+    /** Parses a command received from the server using the current job-v1 wire contract. */
+    fun parseWireCommand(payload: JSONObject): Command {
+        val command = decodeCommonCommand(payload, requiredString(payload, "artifact_url"))
+        if (command.jobId == null) throw malformed("job_id is required")
+        if (!payload.has("revision") || command.revision == 0L) {
+            throw malformed("job-v1 revision is required")
+        }
+        if (command.artifactEtag == null) {
+            throw malformed("job-v1 artifact_etag is required")
+        }
+        return command
     }
 
-    private fun validateWireCommand(fields: CommandFields): Command {
-        val jobId = fields.jobId?.also {
-            if (it.isBlank()) throw malformed("job_id must not be blank")
-            requireUuidV4(it, "job_id")
+    /** Parses durable state, including unversioned Issue #91 records. */
+    fun parseStoredCommand(payload: JSONObject): Command {
+        val artifactUrl = if (payload.has("artifact_url")) {
+            requiredString(payload, "artifact_url")
+        } else if (!payload.has("job_id") || payload.isNull("job_id")) {
+            // Identity-less stored rows may have been written by the old flat-bundle path.
+            requiredString(payload, "bundle_url")
+        } else {
+            throw malformed("artifact_url is required for job-v1 state")
         }
-        val attempt = if (jobId == null) ATTEMPT_V1 else strictIntValue(fields.attemptValue, "attempt")
+        return decodeCommonCommand(payload, artifactUrl)
+    }
+
+    /** Validates fields shared by live and durable commands; each boundary adds its required fields. */
+    private fun decodeCommonCommand(payload: JSONObject, artifactUrl: String): Command {
+        val jobId = optionalUuid(payload, "job_id")
+        val artifactId = optionalUuid(payload, "artifact_id")
+        if (jobId != null && (!payload.has("attempt") || payload.isNull("attempt"))) {
+            throw malformed("attempt is required")
+        }
+        val attempt = optionalInt(payload, "attempt") ?: ATTEMPT_V1
         if (attempt != ATTEMPT_V1) {
             throw IllegalArgumentException("stale_attempt: only attempt=1 is supported")
-        }
-        val artifactId = fields.artifactId?.also {
-            if (it.isBlank()) throw malformed("artifact_id must not be blank")
-            requireUuidV4(it, "artifact_id")
         }
         if (jobId != null && artifactId == null) {
             throw malformed("artifact_id is required")
         }
-
-        val artifactUrl = when {
-            fields.hasArtifactUrl -> fields.artifactUrl ?: throw malformed("artifact_url is required")
-            jobId != null -> throw malformed("artifact_url is required")
-            else -> fields.bundleUrl ?: throw malformed("bundle_url is required")
-        }
         validateArtifactUrl(artifactUrl)
-        if (fields.destPath.isBlank()) {
+        val destPath = requiredString(payload, "dest_path").trim()
+        if (destPath.isBlank()) {
             throw IllegalArgumentException("invalid_destination: destination is required")
         }
-        if (fields.artifactSize != null && fields.artifactSize < 0L) {
+        val artifactSize = optionalLong(payload, "artifact_size")
+        if (artifactSize != null && artifactSize < 0L) {
             throw malformed("artifact_size must be non-negative")
         }
-        val artifactSha256 = fields.artifactSha256?.ifBlank { null }
+        val artifactSha256 = optionalString(payload, "artifact_sha256")?.ifBlank { null }
         if (artifactSha256 != null && !SHA256.matches(artifactSha256)) {
             throw malformed("artifact_sha256 must be 64 hexadecimal characters")
         }
-        if (jobId != null && (fields.artifactSize == null || artifactSha256 == null)) {
+        if (jobId != null && (artifactSize == null || artifactSha256 == null)) {
             throw malformed("job-v1 artifact size and SHA-256 are required")
         }
-        val revision = if (jobId == null) 0L else optionalLongValue(fields.revisionValue, "revision") ?: 0L
+        val revision = optionalLong(payload, "revision") ?: 0L
         if (revision < 0L) throw malformed("revision must be non-negative")
-        val artifactEtag = fields.artifactEtag?.also { validateStrongEtag(it) }
-        if (jobId != null && (revision == 0L || artifactEtag == null)) {
-            throw malformed("job-v1 revision and artifact_etag are required")
-        }
-        return buildCommand(fields, jobId, attempt, artifactId, artifactUrl, artifactSha256, revision, artifactEtag)
-    }
-
-    /**
-     * Stored-state rules are versioned independently from the wire contract. In
-     * particular, Issue #91 active records may omit revision and artifact_etag.
-     */
-    private fun validateStoredCommand(fields: CommandFields): Command {
-        val jobId = fields.jobId?.also {
-            if (it.isBlank()) throw malformed("job_id must not be blank")
-            requireUuidV4(it, "job_id")
-        }
-        val attempt = if (jobId == null) ATTEMPT_V1 else strictIntValue(fields.attemptValue, "attempt")
-        if (attempt != ATTEMPT_V1) {
-            throw IllegalArgumentException("stale_attempt: only attempt=1 is supported")
-        }
-        val artifactId = fields.artifactId?.also {
-            if (it.isBlank()) throw malformed("artifact_id must not be blank")
-            requireUuidV4(it, "artifact_id")
-        }
-        if (jobId != null && artifactId == null) {
-            throw malformed("artifact_id is required")
-        }
-        val artifactUrl = when {
-            fields.hasArtifactUrl -> fields.artifactUrl ?: throw malformed("artifact_url is required")
-            jobId != null -> throw malformed("artifact_url is required")
-            else -> fields.bundleUrl ?: throw malformed("bundle_url is required")
-        }
-        validateArtifactUrl(artifactUrl)
-        if (fields.destPath.isBlank()) {
-            throw IllegalArgumentException("invalid_destination: destination is required")
-        }
-        if (fields.artifactSize != null && fields.artifactSize < 0L) {
-            throw malformed("artifact_size must be non-negative")
-        }
-        val artifactSha256 = fields.artifactSha256?.ifBlank { null }
-        if (artifactSha256 != null && !SHA256.matches(artifactSha256)) {
-            throw malformed("artifact_sha256 must be 64 hexadecimal characters")
-        }
-        if (jobId != null && (fields.artifactSize == null || artifactSha256 == null)) {
-            throw malformed("job-v1 artifact size and SHA-256 are required")
-        }
-        val revision = if (jobId == null) 0L else optionalLongValue(fields.revisionValue, "revision") ?: 0L
-        if (revision < 0L) throw malformed("revision must be non-negative")
-        val artifactEtag = fields.artifactEtag?.also { validateStrongEtag(it) }
-        return buildCommand(fields, jobId, attempt, artifactId, artifactUrl, artifactSha256, revision, artifactEtag)
-    }
-
-    private fun buildCommand(
-        fields: CommandFields,
-        jobId: String?,
-        attempt: Int,
-        artifactId: String?,
-        artifactUrl: String,
-        artifactSha256: String?,
-        revision: Long,
-        artifactEtag: String?,
-    ): Command {
+        val artifactEtag = optionalString(payload, "artifact_etag")?.also { validateStrongEtag(it) }
         return Command(
             jobId = jobId,
             attempt = attempt,
             artifactId = artifactId,
             artifactUrl = artifactUrl,
-            artifactSize = fields.artifactSize,
+            artifactSize = artifactSize,
             artifactSha256 = artifactSha256?.lowercase(),
-            bundleFilename = fields.bundleFilename?.takeIf { it.isNotBlank() } ?: "bundle.zip",
-            destPath = fields.destPath,
-            deleteExtras = fields.deleteExtras,
+            bundleFilename = optionalString(payload, "bundle_filename")
+                ?.takeIf { it.isNotBlank() } ?: "bundle.zip",
+            destPath = destPath,
+            deleteExtras = strictBoolean(payload, "delete_extras", false),
             revision = revision,
             artifactEtag = artifactEtag,
         )
@@ -478,6 +389,14 @@ object PushProtocol {
         return strictIntValue(payload.opt(field), field)
     }
 
+    private fun optionalInt(payload: JSONObject, field: String): Int? =
+        optionalLong(payload, field)?.let { value ->
+            if (value !in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()) {
+                throw malformed("$field is outside the supported integer range")
+            }
+            value.toInt()
+        }
+
     private fun strictIntValue(value: Any?, field: String): Int {
         val longValue = when (value) {
             is Byte -> value.toLong()
@@ -535,6 +454,12 @@ object PushProtocol {
         }
         return parsed.toString()
     }
+
+    private fun optionalUuid(payload: JSONObject, field: String): String? =
+        optionalString(payload, field)?.let { value ->
+            if (value.isBlank()) throw malformed("$field must not be blank")
+            requireUuidV4(value, field)
+        }
 
     private fun validateArtifactUrl(value: String) {
         val uri = try {

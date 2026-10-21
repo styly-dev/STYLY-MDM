@@ -231,7 +231,7 @@ same ID keep their groups even if they are offline during the server move. This
 does not migrate groups from a legacy serial ID to a new Provider GUID when the
 client is upgraded.
 
-Uploaded APKs (`<data-dir>/apks/`) and pushed file bundles (`<data-dir>/bundles/`) are not part of the registry. Copy those directories separately with `rsync` or `scp` if the new server needs them — a single APK can be up to 2 GiB, so they are not worth moving through a browser.
+Uploaded APKs (`<data-dir>/apks/`) and Push metadata/artifacts (`push_jobs.sqlite3`, `push-artifacts/`, and `push-work/` below the data directory) are not part of the registry export. Stop the server before copying its full data directory if the new server must retain job ownership and artifacts; copy job metadata and artifact bytes together. Historical `<data-dir>/bundles/` files are no longer served.
 
 ## Documentation
 

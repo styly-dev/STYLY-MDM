@@ -8,6 +8,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -24,10 +25,13 @@ class PushJobCoordinatorIntegrationTest {
         retryDelayMs: Long = 10_000L,
         recoveryMaxAttempts: Int = 5,
         private val loadStateOverride: (() -> PushStateLoadResult)? = null,
+        private val attemptDirectoryOverride: ((PushProtocol.Command) -> File)? = null,
+        private val cleanupOverride: ((File) -> Unit)? = null,
     ) {
         val durableState = AtomicReference(initialState)
         val messages = CopyOnWriteArrayList<JSONObject>()
         val events = CopyOnWriteArrayList<String>()
+        val cleanedDirectories = CopyOnWriteArrayList<File>()
         val workerRuns = AtomicInteger()
         val cleanupCalls = AtomicInteger()
         val discardCalls = AtomicInteger()
@@ -69,11 +73,14 @@ class PushJobCoordinatorIntegrationTest {
                     runExecution(command, callbacks)
                 },
                 cleanup = {
+                    cleanedDirectories.add(it)
                     cleanupCalls.incrementAndGet()
                     events.add("cleanup")
+                    cleanupOverride?.invoke(it)
                 },
                 validatedResumeOffset = { 0L },
-                attemptDirectory = { File("/tmp/push-coordinator-${it.identity}") },
+                attemptDirectory = attemptDirectoryOverride
+                    ?: { File("/tmp/push-coordinator-${it.identity}") },
                 actor = actor,
                 workerExecutor = workerExecutor,
                 log = { _, _, _ -> },
@@ -424,49 +431,111 @@ class PushJobCoordinatorIntegrationTest {
     }
 
     @Test
-    fun `active job and legacy ownership reject conflicting and unrelated commands`() {
-        for (legacyOwner in listOf(false, true)) {
-            val releaseWorker = CountDownLatch(1)
-            val harness = Harness().apply {
-                runExecution = { command, _ ->
-                    releaseWorker.await()
-                    execution(command)
-                }
+    fun `active job rejects conflicting and unrelated job-v1 commands`() {
+        val releaseWorker = CountDownLatch(1)
+        val harness = Harness().apply {
+            runExecution = { command, _ ->
+                releaseWorker.await()
+                execution(command)
             }
+        }
+        harness.attach()
+        val current = command()
+        harness.send(current)
+        await { harness.workerRuns.get() == 1 }
+
+        harness.send(current.copy(deleteExtras = !current.deleteExtras))
+        harness.snapshot()
+        val rejection = harness.messages.last()
+        assertEquals("artifact_identity_mismatch", rejection.getString("reason"))
+        assertFalse(rejection.getBoolean("retryable"))
+
+        val other = command()
+        harness.send(other)
+        harness.snapshot()
+        val busy = harness.messages.last()
+        assertEquals("device_busy", busy.getString("reason"))
+        assertEquals(other.jobId, busy.getString("job_id"))
+        assertEquals(current.jobId, busy.getJSONObject("active_job").getString("job_id"))
+        assertEquals(1, harness.workerRuns.get())
+        assertEquals(current, harness.durableState.get().active?.command)
+
+        releaseWorker.countDown()
+        await { harness.cleanupCalls.get() == 1 }
+    }
+
+    @Test
+    fun `identity-less live command cannot start a worker`() {
+        val harness = Harness()
+        harness.attach()
+
+        harness.send(command().copy(jobId = null, revision = 0L))
+        val state = harness.snapshot()
+
+        assertEquals(0, harness.workerRuns.get())
+        assertTrue(state.isNull("active"))
+        assertTrue(harness.messages.none { it.optString("type") == "PUSH_FILES_RESULT" })
+    }
+
+    @Test
+    fun `recovering stored identity-less active state keeps service available and cleans legacy files`() {
+        val downloads = Files.createTempDirectory("push-legacy-recovery").toFile()
+        try {
+            val legacy = PushProtocol.parseStoredCommand(
+                JSONObject().apply {
+                    put("bundle_url", "http://server/legacy.zip")
+                    put("dest_path", "/sdcard/STYLY/content")
+                },
+            )
+            val legacyDirectory = PushFilesWorker.attemptDirectoryUnder(downloads, legacy)
+            val partial = File(legacyDirectory, "artifact.part").apply {
+                parentFile?.mkdirs()
+                writeText("old partial")
+            }
+            val existingCommand = command()
+            val existingReceipt = PushProtocol.Receipt(
+                existingCommand,
+                PushProtocol.Result(
+                    jobId = existingCommand.jobId,
+                    attempt = existingCommand.attempt,
+                    status = "fail",
+                    destPath = existingCommand.destPath,
+                    failureCode = "validation_failed",
+                    detail = "previous durable result",
+                    completedAt = 1L,
+                ),
+            )
+            val initialState = PushProtocol.State(
+                active = PushProtocol.Active(legacy, PushProtocol.PHASE_DOWNLOADING),
+                pendingResults = listOf(existingReceipt),
+                completedReceipts = listOf(existingReceipt),
+            )
+            val harness = Harness(
+                initialState = initialState,
+                attemptDirectoryOverride = {
+                    PushFilesWorker.attemptDirectoryUnder(downloads, it)
+                },
+                cleanupOverride = { it.deleteRecursively() },
+            )
+
             harness.attach()
-            val current = command().let {
-                if (legacyOwner) it.copy(jobId = null, revision = 0L) else it
-            }
-            harness.send(current)
-            await { harness.workerRuns.get() == 1 }
+            val registration = harness.snapshot()
+            await { harness.cleanupCalls.get() == 1 && !partial.exists() }
 
-            if (!legacyOwner) {
-                harness.send(current.copy(deleteExtras = !current.deleteExtras))
-                harness.snapshot()
-                val rejection = harness.messages.last()
-                assertEquals("artifact_identity_mismatch", rejection.getString("reason"))
-                assertFalse(rejection.getBoolean("retryable"))
-            }
-
-            val other = command()
-            harness.send(other)
-            harness.snapshot()
-            val busy = harness.messages.last()
-            assertEquals("device_busy", busy.getString("reason"))
-            assertEquals(other.jobId, busy.getString("job_id"))
-            if (legacyOwner) assertTrue(busy.getJSONObject("active_job").getBoolean("legacy"))
-            else assertEquals(current.jobId, busy.getJSONObject("active_job").getString("job_id"))
-
-            harness.send(current.copy(jobId = null, revision = 0L))
-            harness.snapshot()
-            val legacyBusy = harness.messages.last()
-            assertEquals("PUSH_FILES_RESULT", legacyBusy.getString("type"))
-            assertEquals("device_busy", legacyBusy.getString("failure_code"))
-            assertEquals(1, harness.workerRuns.get())
-            assertEquals(current, harness.durableState.get().active?.command)
-
-            releaseWorker.countDown()
-            await { harness.cleanupCalls.get() == 1 }
+            assertEquals("available", registration.getJSONObject("push_state").getString("status"))
+            assertEquals(2, registration.getJSONArray("capabilities").length())
+            assertTrue(registration.getJSONObject("push_runtime").isNull("active"))
+            assertEquals(null, harness.durableState.get().active)
+            assertEquals(listOf(existingReceipt), harness.durableState.get().pendingResults)
+            assertTrue(harness.durableState.get().completedReceipts.contains(existingReceipt))
+            val recoveredLegacyReceipt = harness.durableState.get().completedReceipts
+                .single { it.command.jobId == null }
+            assertEquals("client_restarted", recoveredLegacyReceipt.result.failureCode)
+            assertEquals(listOf(legacyDirectory), harness.cleanedDirectories)
+            assertFalse(partial.exists())
+            assertEquals(0, harness.workerRuns.get())
+        } finally {
+            downloads.deleteRecursively()
         }
     }
 
