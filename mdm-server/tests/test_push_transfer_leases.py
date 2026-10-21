@@ -9,33 +9,69 @@ from styly_mdm.push_transfer_leases import PushTransferLeases
 from styly_mdm.transfer_registry import TransferKey, TransferRegistry
 
 
-def test_transfer_with_progress_is_not_capped_at_ten_minutes(monkeypatch):
-    async def scenario():
-        monkeypatch.setattr(push_scheduler, "TRANSFER_IDLE_SECONDS", 0.05)
-        monkeypatch.setattr(push_scheduler, "_TRANSFER_IDLE_POLL_INTERVAL", 0.01)
+@pytest.mark.asyncio
+async def test_transfer_with_progress_is_not_capped_at_ten_minutes(tmp_path, monkeypatch):
+    from test_push_acceptance_transport_failure import _ready, _scheduler
+    from styly_mdm import push_transfer_leases
+    from styly_mdm.push_scheduler import LiveSession
+    import json
+
+    async with _ready(tmp_path) as (manager, capabilities, snapshot, claimed):
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        clock = SimpleNamespace(now=started_at)
+        real_loop_time = loop.time
+        monkeypatch.setattr(loop, "time", lambda: clock.now)
+        clock_source = SimpleNamespace(monotonic=lambda: clock.now)
+        monkeypatch.setattr(push_scheduler, "time", clock_source)
+        monkeypatch.setattr(push_transfer_leases, "time", clock_source)
         leases = PushTransferLeases()
-        key = TransferKey("push", "D1", "job", 1)
-        lease = leases.issue(key, "artifact")
-        future = asyncio.get_running_loop().create_future()
-        scheduler = object.__new__(PushScheduler)
-        scheduler.leases = leases
+        registry = TransferRegistry(leases.revoke_now)
+        sessions = {}
+        scheduler = _scheduler(manager, registry, leases, sessions, asyncio.Semaphore(1))
+        waiting = asyncio.Event()
+        original_wait = scheduler._wait_for_transfer_or_stall
 
-        waiting = asyncio.create_task(
-            scheduler._wait_for_transfer_or_stall(lease, future)
+        async def observe_wait(lease, future):
+            waiting.set()
+            return await original_wait(lease, future)
+        scheduler._wait_for_transfer_or_stall = observe_wait
+
+        class Ws:
+            async def send_str(self, text):
+                message = json.loads(text)
+                if message["type"] == "EXECUTE_PUSH_FILES":
+                    scheduler.command_response(
+                        job_id=message["job_id"], device_id="D1", attempt=1,
+                        outcome="accepted", payload={},
+                    )
+
+        sessions["D1"] = LiveSession(
+            "D1", "session", Ws(), capabilities, "process", asyncio.Lock(), "http://localhost",
         )
-        await asyncio.sleep(0)
-
-        # Scale the idle window down for the test. Repeated progress keeps a
-        # lease-owned transfer alive beyond a fixed total-duration cap.
-        for _ in range(8):
-            await asyncio.sleep(0.015)
-            leases.progress(lease.token, 1024)
-        assert not waiting.done()
-
-        future.set_result("download_complete")
-        assert await asyncio.wait_for(waiting, timeout=0.5) is False
-
-    asyncio.run(scenario())
+        dispatch = asyncio.create_task(scheduler._dispatch_assignment_inner(claimed))
+        try:
+            await waiting.wait()
+            key = TransferKey("push", "D1", snapshot["job_id"], 1)
+            token = leases.token(key)
+            future = registry.get(key)
+            for _ in range(12):
+                clock.now += 55
+                leases.progress(token, 1024)
+                # Drive real event-loop timers, including any accidental outer
+                # 600-second cap, without waiting ten minutes in wall-clock time.
+                for _ in range(12):
+                    await asyncio.sleep(0)
+                assert not dispatch.done()
+                assert not future.done()
+                assert leases.token(key) == token
+            assert clock.now - started_at > 600
+            registry.release_exact(key, "download_complete")
+            await dispatch
+        finally:
+            dispatch.cancel()
+            await asyncio.gather(dispatch, return_exceptions=True)
+            monkeypatch.setattr(loop, "time", real_loop_time)
 
 
 def test_stalled_transfer_stops_http_stream_before_releasing_its_slot(monkeypatch):

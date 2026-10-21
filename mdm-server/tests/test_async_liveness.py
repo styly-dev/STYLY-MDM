@@ -627,6 +627,9 @@ async def test_created_deadline_loop_survives_unexpected_publish_error(monkeypat
             self.wake_count += 1
 
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.manager = Manager()
     runtime.store = Store()
     runtime.artifacts = Artifacts()
@@ -683,6 +686,9 @@ class _PublicationLegacy:
 
 def _publication_runtime(legacy):
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.legacy = legacy
     runtime.pending_publications = {}
     runtime.publication_revisions = {}
@@ -826,6 +832,9 @@ async def test_housekeeping_recovers_expired_acceptance_waiter(monkeypatch):
             self.wake_count += 1
 
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     # Artifact GC is covered separately; keep it out of this housekeeping loop.
     runtime._next_artifact_gc_at = float("inf")
     runtime.manager = Manager()
@@ -890,6 +899,9 @@ async def test_housekeeping_leaves_live_acceptance_waiter_to_dispatch_task(monke
             raise AssertionError("a skipped live waiter must not wake the scheduler")
 
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     # Artifact GC is covered separately; keep it out of this housekeeping loop.
     runtime._next_artifact_gc_at = float("inf")
     runtime.manager = Manager()
@@ -968,6 +980,9 @@ async def test_reconciliation_housekeeping_isolates_query_and_row_errors(monkeyp
             self.wake_count += 1
 
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     # Artifact GC is covered separately; keep it out of this housekeeping loop.
     runtime._next_artifact_gc_at = float("inf")
     runtime.manager = Manager()

@@ -1553,12 +1553,16 @@
         let task = assignment ? pushTaskCellHtml(id, assignment) : taskCellHtml(id);
         if (assignment) {
           const actions = [];
-          function button(action, label) {
+          function button(action, label, pending) {
+            const pendingLabel = action === 'resume' ? 'Resuming…' : 'Cancelling…';
             return '<button class="push-job-action" data-act="pushDeviceAction" data-action="' + action +
-              '" data-id="' + esc(id) + '" data-job-id="' + esc(assignment.job_id) + '">' + label + '</button>';
+              '" data-id="' + esc(id) + '" data-job-id="' + esc(assignment.job_id) + '"' +
+              (pending ? ' disabled' : '') + '>' + (pending ? pendingLabel : label) + '</button>';
           }
-          if (assignment.canResume) actions.push(button('resume', 'Resume'));
-          if (assignment.canCancel) actions.push(button('cancel', 'Cancel'));
+          if (assignment.resumePending) actions.push(button('resume', 'Resume', true));
+          else if (assignment.canResume) actions.push(button('resume', 'Resume', false));
+          if (assignment.cancelPending) actions.push(button('cancel', 'Cancel', true));
+          else if (assignment.canCancel) actions.push(button('cancel', 'Cancel', false));
           if (actions.length) task += '<span class="push-job-actions">' + actions.join('') + '</span>';
           task = '<div><span class="ins-none">' + esc(assignment.verb) + ': </span>' + task + '</div>';
           const other = deviceTaskState[id];
@@ -1822,8 +1826,10 @@
         const destEl = document.getElementById(cfg.destId);
         const confirmEl = cfg.confirmId ? document.getElementById(cfg.confirmId) : null;
         const btn = document.getElementById(cfg.btnId);
-        let uploaded = null;
-        let uploading = false;
+        const pendingRequestIds = new Set();
+        let selectionRevision = 0;
+        let operationKey = null;
+        let operationRequestId = null;
 
         function selectionFiles() {
           if (folderInput.files.length) return Array.from(folderInput.files);
@@ -1847,66 +1853,103 @@
         function reset() {
           if (fileInput) fileInput.value = '';
           folderInput.value = '';
-          uploaded = null;
+          selectionRevision += 1;
+          operationKey = null;
+          operationRequestId = null;
           if (confirmEl) confirmEl.checked = false;
           nameEl.textContent = cfg.emptyLabel;
           updateButtons();
         }
 
-        function ensureUploaded() {
-          if (uploaded) return Promise.resolve(uploaded);
+        function currentOperation() {
           const files = selectionFiles();
-          if (!files.length) return Promise.reject(new Error(cfg.emptyLabel));
-          const fd = new FormData();
-          // Send each file's relative path as its multipart filename so the server can rebuild
-          // the folder tree; webkitRelativePath is set for folder picks, empty for single files.
-          files.forEach(function (f) { fd.append('files', f, f.webkitRelativePath || f.name); });
-          uploading = true; nameEl.textContent = 'Uploading ' + files.length + ' file(s)...'; updateButtons();
-          return fetch('/api/bundles', { method: 'POST', body: fd })
-            .then(function (r) { return r.json().catch(function () { return {}; }).then(function (p) { if (!r.ok) throw new Error(p.error || r.statusText); return p; }); })
-            .then(function (p) {
-              uploaded = p;
-              nameEl.innerHTML = 'Uploaded: <strong>' + esc(p.bundle_filename) + '</strong> (' + p.entry_count + ' file(s), ' + formatBytes(p.size) + ')';
-              addLog('Uploaded bundle: ' + p.bundle_filename + ' (' + p.entry_count + ' file(s))', 'success');
-              // The picked-file count above the button counts what the OS handed the browser;
-              // the server drops its own metadata. Say so, rather than let the numbers differ.
-              if (p.skipped_count) addLog('Excluded ' + p.skipped_count + ' OS metadata file(s) (e.g. .DS_Store) from the bundle', 'info');
-              return p;
-            })
-            .finally(function () { uploading = false; updateButtons(); });
+          const targets = onlineTargets(Array.from(selectedIds));
+          const destPath = destEl.value.trim();
+          if (!files.length || !targets.length || !destPath) return null;
+          const key = JSON.stringify({
+            revision: selectionRevision,
+            files: files.map(function (file) {
+              return [file.webkitRelativePath || file.name, file.size, file.lastModified];
+            }),
+            targets: targets,
+            destPath: destPath,
+            mode: cfg.deleteExtras ? 'sync' : 'push',
+          });
+          if (key !== operationKey) {
+            operationKey = key;
+            operationRequestId = window.__stylyPushJobsV1Actions.newSubmissionId();
+          }
+          return {
+            key: key,
+            requestId: operationRequestId,
+            files: files,
+            targets: targets,
+            destPath: destPath,
+          };
         }
 
         function send() {
-          if (uploading) return;
-          const dest = destEl.value.trim();
-          if (!dest) { addLog('Enter a destination path to ' + cfg.verb.toLowerCase() + ' files', 'warn'); return; }
+          const operation = currentOperation();
+          if (!operation) {
+            if (!destEl.value.trim()) addLog('Enter a destination path to ' + cfg.verb.toLowerCase() + ' files', 'warn');
+            else if (!selectionFiles().length) addLog(cfg.emptyLabel, 'warn');
+            else addLog('No online devices selected to ' + cfg.verb.toLowerCase() + ' files', 'warn');
+            return Promise.resolve(false);
+          }
           if (confirmEl && !confirmEl.checked) { addLog('Confirm the delete warning before syncing', 'warn'); return; }
-          const online = onlineTargets(Array.from(selectedIds));
-          if (!online.length) { addLog('No online devices selected to ' + cfg.verb.toLowerCase() + ' files', 'warn'); return; }
-          ensureUploaded().then(function (bundle) {
-            const msg = {
-              type: 'PUSH_FILES', target_devices: online, bundle_url: bundle.bundle_url,
-              bundle_filename: bundle.bundle_filename, dest_path: dest, delete_extras: cfg.deleteExtras,
-            };
-            if (!wsSend(msg, cfg.verb.toLowerCase() + ' files')) return;
-            // Canonical snapshots drive Push progress, including queued jobs.
-            addLog(cfg.verb + 'ing ' + bundle.bundle_filename + ' → ' + dest + ' on ' + online.length + ' device(s)', 'info');
-            // Force a fresh pick next time (LAN/non-secure context cannot detect a local change).
-            reset();
-          }).catch(function (err) { nameEl.textContent = 'Upload failed'; addLog(cfg.verb + ' files failed: ' + err.message, 'fail'); });
+          if (pendingRequestIds.has(operation.requestId)) return Promise.resolve(false);
+          const startedRevision = selectionRevision;
+          pendingRequestIds.add(operation.requestId);
+          nameEl.textContent = 'Creating ' + cfg.verb + ' job…';
+          updateButtons();
+          return window.__stylyPushJobsV1Actions.submitPushJob({
+            files: operation.files,
+            targets: operation.targets,
+            destPath: operation.destPath,
+            mode: cfg.deleteExtras ? 'sync' : 'push',
+            clientRequestId: operation.requestId,
+          }).then(function (result) {
+            if (operation.key === (currentOperation() || {}).key &&
+                operation.requestId === operationRequestId && startedRevision === selectionRevision) {
+              addLog(cfg.verb + ' job ' + result.job_id.slice(0, 8) +
+                ' dispatched to ' + operation.targets.length + ' device(s)', 'success');
+              reset();
+            }
+            return result;
+          }).catch(function (error) {
+            const isCurrentOperation = operation.key === (currentOperation() || {}).key &&
+              operation.requestId === operationRequestId;
+            if (isCurrentOperation) {
+              if (error.retryWithNewRequestId) {
+                operationKey = null;
+                operationRequestId = null;
+              }
+              nameEl.textContent = cfg.verb + ' failed; selection retained for retry';
+              addLog(cfg.verb + ' files failed: ' + error.message, 'fail');
+            }
+            return false;
+          }).finally(function () {
+            pendingRequestIds.delete(operation.requestId);
+            updateButtons();
+          });
         }
 
         function hasSelection() { return selectionFiles().length > 0; }
 
         function refreshButton(anySelected) {
-          btn.disabled = uploading || !hasSelection() || destEl.value.trim() === '' ||
+          const operation = currentOperation();
+          btn.disabled = !hasSelection() || destEl.value.trim() === '' ||
             (confirmEl ? !confirmEl.checked : false) || !anySelected;
+          if (operation && pendingRequestIds.has(operation.requestId)) btn.disabled = true;
         }
 
         function onPick(input, other) {
           input.addEventListener('change', function () {
             if (input.files.length && other) other.value = '';
-            uploaded = null; nameEl.textContent = describeSelection(); updateButtons();
+            selectionRevision += 1;
+            operationKey = null;
+            operationRequestId = null;
+            nameEl.textContent = describeSelection(); updateButtons();
           });
         }
         if (fileInput) onPick(fileInput, folderInput);
@@ -1915,7 +1958,7 @@
         if (confirmEl) confirmEl.addEventListener('change', updateButtons);
         btn.addEventListener('click', send);
 
-        return { refreshButton: refreshButton };
+        return { refreshButton: refreshButton, send: send, reset: reset };
       }
 
       const pushPanel = createPushPanel({
@@ -2826,10 +2869,7 @@
         else if (act === 'update') sendClientUpdate(t.dataset.id);
         else if (act === 'pushDeviceAction') {
           const actions = window.__stylyPushJobsV1Actions;
-          if (actions && actions.sendDeviceAction(t.dataset.id, t.dataset.jobId, t.dataset.action)) {
-            t.disabled = true;
-            setTimeout(function () { if (t.isConnected) t.disabled = false; }, 5000);
-          }
+          if (actions) actions.sendDeviceAction(t.dataset.id, t.dataset.jobId, t.dataset.action);
         }
       });
       // Targets label-edit keyboard
