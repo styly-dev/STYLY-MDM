@@ -62,7 +62,11 @@ rules, protocol, operator controls, and schema-3 deployment requirements.
 
 The file panel calls an explicit asynchronous Push submission API. It retains its
 selection on failure and resets only the submitted selection after successful upload
-and dispatch. Pending Resume/Cancel/Retry operations survive redraws and resolve from
+and dispatch. A submission captures its targets on the first send and keeps the
+same request ID through connectivity changes and retries. Explicit selection,
+destination, or mode changes create a new intent. Completed or abandoned submission
+metadata is released after pending work settles. Pending Resume/Cancel/Retry
+operations survive redraws and resolve from
 canonical updates, action replies, connection changes, or a bounded fallback timer.
 Untyped server errors remain visible without clearing an unrelated pending action.
 
@@ -74,9 +78,11 @@ appears on a separate labeled line alongside Push. Install/Verify still share
 their existing latest-result state and have no per-operation response ordering.
 
 Push runs only between a server and client of the same version; see
-[Push / Sync jobs](PUSH_JOBS.md) for how the worker shares download code with
-standalone bundles, where partial files are discarded, and how interrupted
-ownership expires. The guide also covers local validation of complete partials,
+[Push / Sync jobs](PUSH_JOBS.md) for partial-file retention and interrupted
+ownership expiry. PICO 4 Ultra Enterprise is the supported headset; live Push
+requires job identity and resumable artifact metadata. Historical durable records
+and receipts remain readable to prevent duplicate execution. The guide also covers
+local validation of complete partials,
 the dedicated HTTP request format, and interruption reasons.
 
 Management connection loss leaves healthy HTTP transfers under their existing
@@ -518,7 +524,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename`, plus `full_sha256` + `cd_sha256` (reference hashes of the file being dispatched; present only when the APK is a local upload in `apks/`). The client verifies the download against `full_sha256` before installing; a **self**-update is refused outright when the hashes are absent. |
 | `REGISTERED` | Server acknowledgement after ownership/capability processing. Field: `session_id`. The client then enables command handling, starts battery telemetry, and replays its durable pending terminal outbox. |
 | `REGISTERED_PROVISIONAL` | Acknowledges a provisional registration or status update. Fields: server-issued `connection_id`. After this ACK, a client with `provisional_power_control_v1` may accept only `EXECUTE_REBOOT` and `EXECUTE_POWER_OFF` carrying the same ID; battery telemetry, Push, and all other commands remain disabled until canonical registration completes. |
-| `EXECUTE_PUSH_FILES` | Push-job fields: `job_id`, fixed `attempt=1`, immutable per-device dispatch `revision`, immutable `artifact_id`, absolute `artifact_url` with an in-memory assignment `lease` token, exact size/SHA-256/strong-ETag metadata, destination, and server-derived `delete_extras`. Every job target must advertise `push_job_id_v1` and `push_resume_v1`, regardless of artifact size. A resumed command keeps the original dispatch revision and gets a new lease token. Commands without job-v1 identity are not admitted as job targets. The standalone `/api/bundles` Push flow still uses the separate legacy command format. Safety-critical fields that are present require their exact JSON types. |
+| `EXECUTE_PUSH_FILES` | Push-job fields: `job_id`, fixed `attempt=1`, immutable per-device dispatch `revision`, immutable `artifact_id`, absolute `artifact_url` with an in-memory assignment `lease` token, exact size/SHA-256/strong-ETag metadata, destination, and server-derived `delete_extras`. Every job target must advertise `push_job_id_v1` and `push_resume_v1`, regardless of artifact size. A resumed command keeps the original dispatch revision and gets a new lease token. Commands without job-v1 identity are not admitted as job targets. Identity-less live Push commands are rejected. Safety-critical fields that are present require their exact JSON types. |
 | `PUSH_RESULT_ACK` | Terminal-result disposition. Fields: exact identity, `accepted`, committed `revision` when a local canonical job exists, and on rejection `reason` plus `retryable`. The client retains retryable results; accepted or permanently rejected results leave the pending outbox while remaining in bounded dedupe receipts. |
 | `PUSH_RECONCILE_REQUEST` | Requests exact status for one or more `{job_id, attempt, artifact_id}` identities. It never directly clears a fence. |
 | `PUSH_RESUME_REJECTED` | Permanently rejects one exact interrupted resume identity (`job_id`, `attempt`, `artifact_id`, immutable dispatch `revision`). The client durably clears only that matching active record, removes its job-owned work, and replies with an `absent` reconciliation report. |
@@ -534,7 +540,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `DELETE_APP` | Uninstall an app from target devices (the console gates it behind a confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only), `package_name`. STYLY-MDM's own packages are rejected — `RETIRE_DEVICE` is the only sanctioned way to remove the client. See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_DEVICE` / `POWER_OFF_DEVICE` | Reboot or power off target devices (the console gates both behind a shared confirmation). Normal targets use `target_devices` (list of device IDs or `["*"]`; online devices only). Need attention targets use `target_connections` (a non-empty list of server-issued connection IDs) instead. The two fields cannot be combined; `target_connections` rejects empty arrays, duplicates, and wildcards, and never falls back to normal-device resolution. Only these two message types may contain `target_connections`. See [Remote Power Control](#remote-power-control). |
 | `INSTALL_APK` | Install an uploaded APK on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `apk_url`, `apk_filename` |
-| `PUSH_FILES` | Push-job flow: `job_id` and optional `target_devices` for scoped Resume; the server reads mode, destination, and immutable artifact metadata from SQLite. Every target must support `push_job_id_v1`; the legacy job fallback is disabled. The separate standalone `/api/bundles` Push flow still sends the older bundle-shaped message. |
+| `PUSH_FILES` | Push-job flow: `job_id` and optional `target_devices` for scoped Resume; the server reads mode, destination, and immutable artifact metadata from SQLite. Every target must support `push_job_id_v1`; the legacy job fallback is disabled. Identity-less requests receive an explicit error. |
 | `CANCEL_PUSH_JOB` | Persist cancellation for eligible interrupted or unresolved assignments. Fields: `job_id`, optional `target_devices`; missing targets means all applicable assignments. A live HTTP lease is revoked, while device ownership remains until exact cleanup or terminal evidence. |
 | `RETRY_FAILED_PUSH_JOB` | Create a new job for failed targets that are currently online, using the retained artifact. Offline targets are skipped and stay eligible for a later retry. Fields: `job_id`, idempotent `client_request_id`. |
 | `RECONCILE_PUSH_DEVICE` | Re-requests exact reconciliation for a fenced device. Field: `device_id`. It cannot force-clear state or a fence without matching client/process evidence. |
@@ -557,7 +563,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `POST /api/push-jobs` | Validate a canonical request and commit `job_id` + per-device rows before any upload bytes. `client_request_id` makes identical replay idempotent; conflicting reuse is 409. |
 | `POST /api/push-jobs/{job_id}/upload` | Job-owned multipart upload, measured limits, packaging, fsync + atomic immutable artifact publication, then `ready`. |
 | `GET /artifacts/{artifact_id}?lease=...` | DB-resolved immutable job-v1 ZIP with identity encoding, `Accept-Ranges: bytes`, stable SHA-256 strong ETag, and an in-memory token scoped to the assignment's transfer slot. Supports full `200`, open-ended `Range: bytes=N-` as `206`, exact-ETag `If-Match` failure `412`, and `416` with `Content-Range: bytes */T` for an unsatisfiable range. The job client never sends a range from a complete local file, so it always rejects `416`. A missing or revoked job-v1 token returns `409` with `X-Push-Lease-Status: revoked`; server restart invalidates all such tokens. An expired tombstoned identity remains unavailable and is never reused. |
-| `POST /api/bundles` / `GET /bundles/{filename}` | Legacy compatibility only. The new console Push/Sync flow does not use these routes. |
+| `POST /api/bundles` | Removed upload flow: returns HTTP 410; use the Push job API. `/bundles/` is no longer served. |
 
 ### Server → Admin
 
@@ -684,8 +690,8 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > would strand the coroutines already parked on the old object and briefly allow twice
 > the cap.
 >
-> APK install and standalone `/api/bundles` Push retain their existing completion
-> and `MDM_TRANSFER_TIMEOUT` (default **600 seconds**) handling. Every job-v1 Push
+> APK installation retains its existing completion and `MDM_TRANSFER_TIMEOUT`
+> (default **600 seconds**) handling. Every job-v1 Push
 > download requires an assignment-scoped HTTP lease. Its transfer slot ends before
 > validation or when the HTTP watchdog stops a stalled transfer; WebSocket loss
 > alone does not release it. See [Push ownership](PUSH_JOBS.md#ownership-model) and
@@ -697,28 +703,25 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > install slot and a push slot at once. Each terminal message frees only its own task's
 > slot. A disconnect still releases Install ownership.
 >
-> Admins see install aggregate progress via `INSTALL_PROGRESS`. `PUSH_PROGRESS` is
-> retained only for the standalone `/api/bundles` Push path; the current job-v1 console
-> uses full `PUSH_JOB_UPDATED` snapshots instead.
+> Admins see install aggregate progress via `INSTALL_PROGRESS`. The Push console
+> uses full `PUSH_JOB_UPDATED` snapshots.
 
 > **Per-device transfer state.** `INSTALL_PROGRESS` carries only aggregate counts, so
-> install also broadcasts `INSTALL_DEVICE_STATE`. The standalone `/api/bundles` Push path
-> retains its corresponding `PUSH_PROGRESS` / `PUSH_DEVICE_STATE`; job-v1 derives the
+> install also broadcasts `INSTALL_DEVICE_STATE`. Job-v1 derives the
 > same `Waiting…` → `Transferring…` → `Pushing…` / `Syncing…` → terminal display from
 > canonical assignment states in each full job snapshot.
 >
-> Which side emits which state is deliberate:
+> For APK installation, state publication is ordered as follows:
 >
 > | State | Emitted by |
 > |---|---|
 > | `queued` | the job, once for the whole target list |
-> | `transferring` | the dispatcher, right after `EXECUTE_INSTALL` / `EXECUTE_PUSH_FILES` is sent |
-> | `installing` / `applying` | the `DOWNLOAD_COMPLETE` **message handler** |
+> | `transferring` | the dispatcher, right after `EXECUTE_INSTALL` is sent |
+> | `installing` | the `DOWNLOAD_COMPLETE` **message handler** |
 > | `fail` | the dispatcher (offline before its turn, failed dispatch, timeout) |
-> | `success` / `fail` | the forwarded terminal `INSTALL_RESULT` / `PUSH_FILES_RESULT` |
+> | `success` / `fail` | the forwarded terminal `INSTALL_RESULT` |
 >
-> `installing` (and its push twin `applying`, which covers the client's local unzip and
-> mirror) must come from the message handler rather than the dispatcher coroutine
+> `installing` must come from the message handler rather than the dispatcher coroutine
 > resuming from its released future: the coroutine's resumption would race the receive
 > loop processing the client's subsequent terminal result, and if `installing` landed
 > last the row would spin forever. Handling it in the receive loop makes the order
@@ -727,13 +730,12 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > `DOWNLOAD_COMPLETE` arriving after a transfer already timed out cannot resurrect
 > `installing` on a device the job has written off.
 
-> **Push files: two actions, one transport.** The console uploads a file or a whole
-> folder to `POST /api/bundles`; the server reconstructs the tree and zips it into a
-> single bundle served from `/bundles/`, dropping OS-generated metadata on the way in
-> (see below). `PUSH_FILES` carries the bundle URL, a
-> destination directory, and `delete_extras`. The client downloads the bundle, unzips
-> it (with a zip-slip guard), and applies it to the destination — how it applies is
-> the whole distinction:
+> **Push files: two actions, one transport.** The console creates a job, uploads
+> files to `POST /api/push-jobs/{job_id}/upload`, and dispatches with `PUSH_FILES`
+> carrying the job ID. The server packages the immutable artifact and supplies
+> assignment-scoped download authorization. The client verifies size and SHA-256,
+> extracts safely, and waits for the required durable `beforeApply` checkpoint
+> before destination mutation. Both actions use this execution path:
 >
 > | Console action | `delete_extras` | Semantics |
 > |---|---|---|
@@ -745,13 +747,10 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > warning and requires the "extras will be deleted" confirmation.
 >
 > The delete lives in exactly one place: `BundleSync.apply` in the client, gated on
-> `deleteExtras`. Everything else — the server's `handle_push_files`, the bundle
-> build — is identical for both actions and merely passes the flag through. That flag
-> is decoded defensively at both boundaries: the server treats only a literal `true`
-> as a delete request (`data.get("delete_extras") is True`), and the client reads it
-> with `optBoolean(..., false)`. **A missing or malformed field can only ever copy.**
-> Since the delete is client-side, the non-destructive Push only exists on devices
-> running an APK that has this change — an older client mirrors whatever it is sent.
+> `deleteExtras`. The server derives this flag from the canonical job mode; the
+> client accepts `delete_extras` only as a JSON Boolean (default false when absent)
+> and rejects malformed live commands.
+> There is no standalone upload/download fallback.
 > `BundleSync` is deliberately Android-free so `app/src/test/.../BundleSyncTest.kt`
 > can prove both branches on the host JVM (`./gradlew :app:testProdDebugUnitTest`).
 >
@@ -868,7 +867,7 @@ trees can omit the per-file `manifest` (a cap on entry count) and still compare 
 **OS metadata is not content.** `integrity.is_os_metadata()` — mirrored as `isOsMetadata()`
 in the console — matches `.DS_Store`, `Thumbs.db`, `desktop.ini`, AppleDouble `._*` sidecars,
 `__MACOSX/`, `.Spotlight-V100/` and friends on *any* path segment, case-insensitively. It is
-applied in exactly two places, and they are the same place conceptually: `POST /api/bundles`
+applied in exactly two places, and they are the same place conceptually: `POST /api/push-jobs/{job_id}/upload`
 drops these files on the way into a push bundle, so a device never receives them; and the
 **reference builders** (browser and `styly-mdm hash`) drop them too, so a reference describes
 what push actually delivers. Without the second half a macOS reference folder reports a

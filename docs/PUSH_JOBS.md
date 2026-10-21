@@ -46,7 +46,9 @@ artifact size; there is no non-resumable fallback. Job creation rejects other
 targets, and dispatch rechecks the live session, failing the assignment with
 `capability_changed_before_dispatch` if it no longer qualifies. A device on an
 older APK must take the client self-update before it can receive Push/Sync jobs.
-Standalone Push through `/api/bundles` remains a separate legacy flow.
+The supported headset is PICO 4 Ultra Enterprise. Identity-less live Push commands
+are rejected; the obsolete `/api/bundles` upload returns HTTP 410 and `/bundles/`
+is no longer served. Use the job creation/upload/dispatch API.
 
 Each job-v1 artifact URL includes a random, in-memory `lease` token scoped to its
 exact assignment. The server accepts the URL only while that assignment owns a
@@ -95,11 +97,10 @@ Registration and reconciliation report a nonzero `validated_offset` only when
 the same worker metadata checks accept the partial identity and its length is
 within the expected artifact size. This is a resume
 offset, not a completed SHA-256 verification. The server sends unencoded bytes
-without a `Content-Encoding` header; the client still accepts older servers that
-explicitly send `Content-Encoding: identity`.
+without a `Content-Encoding` header; an explicit `Content-Encoding: identity`
+is also accepted as an unencoded response.
 
-Body writing and final size/SHA validation are shared with standalone bundles,
-which still allow omitted size, SHA, and ETag and do not enter the job retry loop.
+All live Push downloads require exact size, SHA-256, and strong ETag metadata.
 Partial-file deletion is decided in the worker, before terminal state persistence:
 retryable failures, unavailable artifacts, revoked leases, and storage failures
 with a validated prefix retain their bytes. A definitive response identity failure discards
@@ -149,9 +150,8 @@ the matching HTTP handler, then releases that assignment's slot. A healthy trans
 can continue beyond the previous 600-second timeout. Once revoked, the old URL cannot
 reconnect without a new operator-authorized Resume, so it cannot restart outside the
 slot limit. The accepted-work reconciliation deadline defers while this exact
-HTTP lease is live; the watchdog owns stalled-stream recovery. APK install and
-standalone Push through `/api/bundles` retain their
-existing timeout behavior; neither is a job-v1 fallback.
+HTTP lease is live; the watchdog owns stalled-stream recovery. APK installation
+retains its existing timeout behavior.
 
 If no artifact bytes arrive for 60 seconds, a resumable client persists interrupted
 ownership with `reason: download_interrupted` instead of creating a terminal
@@ -175,8 +175,7 @@ they neither re-pause the job nor release the replacement transfer slot.
 Deploy the server and matching client update together. This rollout assumes there is
 no active Push/Sync transfer on the old APK; old unscoped job-v1 artifact URLs are
 intentionally invalid after cutover. No compatibility machinery is kept for an
-in-flight old job-v1 download. APK install and standalone `/api/bundles` Push are
-unchanged. Cancellation intent requires schema 3 as described below; no new device
+in-flight old job-v1 download. APK installation is unchanged. Cancellation intent requires schema 3 as described below; no new device
 WebSocket message type is required.
 
 Malformed response headers rejected before writing do not invalidate an existing
@@ -212,13 +211,13 @@ Push runs only between a server and client of the same version; a newer server
 only updates an older client's APK. The client therefore rejects a live job-v1
 command without `artifact_url`, a positive `revision`, and a strong `artifact_etag`
 as malformed, and compares replays by exact execution fields. Job-v1 commands no
-longer duplicate `artifact_url` as `bundle_url`; the latter remains the URL field
-for standalone `/api/bundles` commands. Saved job-v1 commands also require
+longer duplicate `artifact_url` as `bundle_url`. Live identity-less commands are
+rejected. Saved job-v1 commands also require
 `artifact_url`, which the released Issue #91 client (v0.6.0) already persisted.
 Durable state written by that client still loads: its active work, which has no revision, closes as
 `client_restarted` instead of resuming, and its receipts still answer result
-acknowledgements and reconciliation. Standalone `/api/bundles` Push remains a
-separate path.
+acknowledgements and reconciliation. Historical standalone receipts remain
+readable and replayable; they do not enable new standalone execution.
 
 Interrupted client ownership uses a local deadline whose default is 24 hours,
 measured from the first interruption rather than the start of a long download.
@@ -338,7 +337,7 @@ Push/Sync uses three independent ownership mechanisms:
 - **Global transfer slot** is independent of the device WebSocket. It is released on `PUSH_PHASE validating` before SHA-256, a matching terminal result, or an exact `validating`/`applying` registration after offline download completion. `PUSH_TRANSFER_COMPLETE` remains the post-SHA-256 checkpoint. The [HTTP lease watchdog](#resumable-artifact-transfer) bounds stalled transfers.
 - **Persistent device fence** blocks later jobs after an `unconfirmed` outcome until exact evidence proves the old worker is gone.
 
-The transfer registry uses typed keys. A job-v1 slot is addressed by `(job_id, device_id, attempt=1)`; a stale result cannot release a different job's slot. Job-v1 uses the existing server-wide transfer semaphore. APK install and standalone `/api/bundles` Push keep their separate legacy slot handling.
+The transfer registry uses typed keys. A job-v1 slot is addressed by `(job_id, device_id, attempt=1)`; a stale result cannot release a different job's slot. Job-v1 uses the existing server-wide transfer semaphore. APK installation keeps its existing slot handling.
 
 The device queue is ordered by the server-wide monotonic `enqueue_seq`. A later enabled job cannot jump over an older non-terminal queued assignment merely because the older job is still uploading or has its dispatch gate paused. The console therefore keeps every dispatchable `ready`, `running`, or `reconciling` job with a closed gate in a stable attention panel; an uploaded `ready` job can be dispatched with its existing `job_id` even if the original browser send was lost.
 
@@ -358,7 +357,7 @@ New clients register:
 `PushJobCoordinator` is owned by `MdmClientApplication`, not by a Service instance. It serializes commands on one actor, permits one active Push/Sync worker, persists active state before `PUSH_JOB_ACCEPTED`, and stores terminal results in an outbox until a matching `PUSH_RESULT_ACK` either accepts the result or marks its rejection as permanent with `retryable: false`. An older server that omits `retryable` is treated as retryable. Completed receipts retain the original command metadata for at most 256 entries and seven days. A missing state file is initialized as an empty state. If durable state cannot be loaded or saved, the coordinator keeps the rest of the MDM client alive but rejects new work with `client_persistence_unavailable`; it never starts a worker, publishes a phase, releases an execution lease, or sends a terminal result whose required state was not persisted.
 
 The worker's phase callbacks report observations. Before destination mutation,
-`beforeApply` is an explicit checkpoint: the worker waits for the actor to save
+The required `beforeApply` callback is an explicit checkpoint: the worker waits for the actor to save
 `applying`, and a rejected or failed checkpoint returns
 `client_persistence_unavailable` without applying files. Worker outcomes distinguish
 terminal results from interrupted ownership; an interruption is never sent as a
@@ -372,7 +371,9 @@ its terminal failure is serialized after any already-running phase save.
 
 State JSON now carries `state_version: 1`; existing unversioned Issue #91/94
 records remain readable. Earlier readers ignore this extra root property.
-Wire-command validation and stored-command decoding have separate contracts.
+Wire-command validation and stored-command decoding share value invariants while
+retaining separate required-field contracts. Only the stored reader accepts
+historical commands without current execution identity.
 Unsupported future versions are retained as unavailable, never reset.
 
 The client recovers its durable Push state (`files/push-jobs/state.json`) by itself;
@@ -421,7 +422,13 @@ error.
 
 The worker validates destination paths on the device as well as the server. It accepts only a shared-storage subdirectory, rejects protected top-level media/app directories, does not traverse destination symlinks, bounds ZIP entry count and expanded bytes, rejects duplicate or conflicting archive paths, and validates the exact job-v1 artifact size and SHA-256 before publishing the downloaded ZIP or touching the destination. Destination validation completes before the client reports `applying`.
 
-Push jobs require a registered GUID client advertising `push_job_id_v1` and `push_resume_v1`. The legacy job fallback is disabled. The standalone `/api/bundles` Push flow still uses the legacy `EXECUTE_PUSH_FILES` format and has no job-v1 exact-size, resume, or HTTP-lease guarantees. Legacy serial-ID clients remain eligible only for APK installation/update. Consistent with the standalone flow's prior behavior, its 2 GiB bundle limit applies to uploaded source bytes and extracted content, not the ZIP artifact; container overhead may make the downloaded artifact slightly larger.
+Push jobs require a registered GUID client advertising `push_job_id_v1` and
+`push_resume_v1` on PICO 4 Ultra Enterprise. There is one live job-based Push
+execution path. Identity-less requests receive an explicit error; the old upload
+endpoint returns HTTP 410. Historical durable execution records and receipts are
+retained to prevent duplicate execution. Legacy serial-ID clients remain eligible
+only for APK installation/update. The 2 GiB content limit applies to uploaded
+source bytes and extracted content; ZIP overhead may make the artifact larger.
 
 Finish pending serial-ID Push/Sync jobs with the previous server before upgrading
 to GUID identity. Old assignments are not migrated or resumed on serial clients;
@@ -535,7 +542,7 @@ An exact terminal result from the current owner settles any dispatched active ph
 | `MDM_PUSH_RECENT_JOB_DAYS` | `30` | Recent terminal metadata window |
 | `MDM_ADMIN_SEND_TIMEOUT` | `5` | Per-browser WebSocket send timeout in seconds |
 
-`MDM_MAX_CONCURRENT_TRANSFERS` controls the shared network resource. `MDM_TRANSFER_TIMEOUT` (default 600 seconds) remains the fallback for APK install and standalone `/api/bundles` Push. Job-v1 Push instead releases a stalled slot only after 60 seconds without successful HTTP response writes, after revoking the URL and stopping the exact handler; successful writes keep healthy transfers alive beyond 600 seconds.
+`MDM_MAX_CONCURRENT_TRANSFERS` controls the shared network resource. `MDM_TRANSFER_TIMEOUT` (default 600 seconds) remains the timeout for APK installation. Job-v1 Push instead releases a stalled slot only after 60 seconds without successful HTTP response writes, after revoking the URL and stopping the exact handler; successful writes keep healthy transfers alive beyond 600 seconds.
 
 ## Deliberate file-layout differences from the proposal
 

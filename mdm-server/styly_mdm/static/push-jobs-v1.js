@@ -132,7 +132,6 @@
         phase: 'new',
         jobId: null,
         promise: null,
-        dispatchPromise: null,
         dispatchResolve: null,
         dispatchReject: null,
         dispatchTimer: null,
@@ -163,22 +162,15 @@
         throw error;
       }
       return new Promise(function (resolve, reject) {
-        submission.dispatchPromise = true;
         submission.dispatchResolve = resolve;
         submission.dispatchReject = reject;
         submission.dispatchSocket = currentAdminSocket;
         pendingDispatches.set(submission.jobId, submission);
         submission.dispatchTimer = setTimeout(function () {
-          if (pendingDispatches.get(submission.jobId) !== submission) return;
-          pendingDispatches.delete(submission.jobId);
-          submission.dispatchPromise = null;
-          submission.dispatchResolve = null;
-          submission.dispatchReject = null;
-          submission.dispatchSocket = null;
-          const error = new Error('Dispatch was sent but no server acknowledgement arrived. Retry to dispatch the same ready job without uploading again.');
-          error.code = 'dispatch_unconfirmed';
-          error.job_id = submission.jobId;
-          reject(error);
+          settleDispatch(submission, {
+            message: 'Dispatch was sent but no server acknowledgement arrived. Retry to dispatch the same ready job without uploading again.',
+            code: 'dispatch_unconfirmed',
+          });
         }, 15000);
         if (submission.dispatchTimer && typeof submission.dispatchTimer.unref === 'function') {
           submission.dispatchTimer.unref();
@@ -189,14 +181,7 @@
             job_id: submission.jobId,
           }));
         } catch (error) {
-          clearTimeout(submission.dispatchTimer);
-          pendingDispatches.delete(submission.jobId);
-          submission.dispatchPromise = null;
-          submission.dispatchResolve = null;
-          submission.dispatchReject = null;
-          submission.dispatchSocket = null;
-          error.job_id = submission.jobId;
-          reject(error);
+          settleDispatch(submission, error);
         }
       });
     }
@@ -279,8 +264,6 @@
       }).then(checkedJson).then(reconcileCreateState);
     }).then(function () {
       return dispatchReady();
-    }).then(function (result) {
-      return result;
     }).catch(function (error) {
       appendLog('Push/Sync job ' + (submission.jobId ? '#' + submission.jobId.slice(0, 8) : 'request') +
         ' failed: ' + error.message, 'fail');
@@ -290,19 +273,24 @@
       // retry can rebuild FormData from the panel's retained selection.
       submission.formData = null;
       submission.promise = null;
+      if (submission.released && submissions.get(requestId) === submission) {
+        submissions.delete(requestId);
+      }
     });
     return submission.promise;
   }
 
   function settleDispatch(submission, error) {
-    if (!submission || !submission.dispatchPromise) return false;
+    if (!submission || typeof submission.dispatchResolve !== 'function') return false;
     if (submission.dispatchTimer) clearTimeout(submission.dispatchTimer);
-    pendingDispatches.delete(submission.jobId);
+    if (pendingDispatches.get(submission.jobId) === submission) {
+      pendingDispatches.delete(submission.jobId);
+    }
     const resolve = submission.dispatchResolve;
     const reject = submission.dispatchReject;
-    submission.dispatchPromise = null;
     submission.dispatchResolve = null;
     submission.dispatchReject = null;
+    submission.dispatchTimer = null;
     submission.dispatchSocket = null;
     if (error) {
       const dispatchError = new Error(error.message || String(error));
@@ -362,6 +350,17 @@
   function markSubmissionTerminal(submission, state) {
     submission.phase = 'terminal';
     submission.terminalState = state;
+  }
+
+  function releaseSubmission(requestId) {
+    const submission = submissions.get(requestId);
+    if (!submission) return false;
+    if (submission.promise) {
+      submission.released = true;
+      return true;
+    }
+    submissions.delete(requestId);
+    return true;
   }
 
   function setSubmissionPhase(submission, phase) {
@@ -972,6 +971,7 @@
   window.__stylyPushJobsV1Actions = {
     submitPushJob: submitPushJob,
     newSubmissionId: uuid,
+    releaseSubmission: releaseSubmission,
     actionPending: isDeviceActionPending,
     refreshConnectivity: function () { renderPausedJobs(); syncDeviceAssignments(); },
     assignmentFor: function (deviceId) {
@@ -1080,19 +1080,6 @@
       // ERROR currently contains only a message, so it cannot safely settle a
       // specific action. The legacy log handler shows the error; canonical or
       // typed acknowledgements and the timeout settle pending state.
-    } else if (message.type === 'PUSH_PROGRESS' && message.job_id) {
-      // Full revisioned snapshots already render concurrent jobs independently.
-      event.stopImmediatePropagation();
-    } else if (message.type === 'PUSH_DEVICE_STATE' && message.job_id) {
-      // Canonical device phases include waiting_transfer/downloading/validating and
-      // are rendered from PUSH_JOB_UPDATED. The legacy handler understands only
-      // queued/transferring/applying and would otherwise mislabel them as failures.
-      event.stopImmediatePropagation();
-    } else if (message.type === 'PUSH_FILES_RESULT' && message.job_id) {
-      // The terminal full snapshot is canonical. Keep identity-less old-server
-      // results on the established handler, but do not let a derived job-v1 result
-      // overwrite the revisioned device-row rendering.
-      event.stopImmediatePropagation();
     }
   }
 

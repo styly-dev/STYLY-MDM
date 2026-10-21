@@ -56,3 +56,57 @@ Unknown-version and invalid-active tests also passed: state_version=2 and a malf
 The original APK SHA-256 matches the pre-test backup (versionCode 11, versionName 0.7.0-dev). Original configuration values match; only the app's diagnostic update_journal gained its normal launch entry. Original Push state is restored with no active work and no pending/completed test receipts. Client and guard processes are running, and the client reconnected to its original server. Reboot cleared USB reverse mappings; the original localhost:7086 route was restored and the test port 17908 removed. The owned test destination and device-local backup directory were removed. All ten test jobs are terminal and the isolated server is stopped. No Wi-Fi settings were changed.
 
 Physical power loss, a ten-minute real transfer, and multiple physical devices remain untested; the long-transfer deadline regression uses a virtual clock.
+
+## Follow-up simplification after 8e3fb1b
+
+The supported headset for this change is PICO 4 Ultra Enterprise. Connectivity-only
+refreshes no longer rotate submission identity: the first send captures the target
+set, and uncertain upload/dispatch retries reuse that request and job. Dispatch
+settlement is shared, and completed or abandoned submission metadata is released.
+
+The old standalone Push upload/fanout/download/UI paths were removed. `POST /api/bundles` now returns HTTP 410 without reading the body; `/bundles/*` is no
+longer served, and identity-less `PUSH_FILES` requests receive a WebSocket error.
+Existing bundle files are retained. Current job-v1 commands and SQLite schema are
+unchanged. Historical durable active records, cleanup paths, and receipts remain
+readable; removing the old live protocol does not discard execution evidence.
+The wire/stored readers share value validation while preserving their distinct
+required fields. `beforeApply` is required and the obsolete `onApplying` callback
+is gone.
+
+Independent console, Android lifecycle/testing, and server architecture reviews
+found one removal regression: historical active recovery still needed the legacy
+attempt-directory resolver. That path is retained only for durable cleanup. A
+regression now proves first-load availability, physical cleanup, receipt retention,
+and no worker execution. Parent review also caught and corrected accidentally
+relaxed stored artifact invariants during decoder consolidation.
+
+Final automated checks: **645 Python tests passed**, **66 console tests passed / 1
+existing skip**, **212 Android tests passed**, APK build succeeded, diagram XML
+parsed, and `git diff --check` passed. Obsolete standalone tests were removed;
+packaging safety and install/Push shared-budget coverage now exercise job-v1 and
+the production transfer adapter. The added GC shutdown test blocks the real GC
+thread, delivers cancellation, and proves store close waits for thread completion;
+a temporary no-join mutation makes it fail.
+
+DEV-005 was re-identified through the Device ID PNG and tested through isolated
+loopback port 17908 and the owned destination above. The installed APK hash matched
+`0.7.0-pr108-cleanup-dev` (versionCode 11).
+
+| Follow-up scenario | Observed evidence |
+| --- | --- |
+| Push and Sync | Both succeeded; exact file sets and SHA-256 matched. Sync removed the owned extra file. |
+| Historical identity-less active | First restart remained available, removed `jobs/legacy/1`, cleared active ownership, retained a `client_restarted` receipt, and did not download or apply the historical command. |
+| Required apply checkpoint | After durable acceptance, journal writes were denied. Logs show failure in `awaitApplyingCheckpoint`; the device reported unavailable and the entire destination still matched the preceding Sync. After permissions were restored, automatic recovery settled failed/`client_persistence_unavailable`, with no active owner and no pending result. Destination hashes still matched after settlement. |
+
+The final source-only cleanup removed one unused legacy timeout constant after
+hardware testing; the complete Android tests and APK build were rerun successfully.
+No executable behavior was changed by that last deletion. Multiple physical devices
+and physical power loss were not retested; the two-target connectivity-flap/lost
+upload-response regression is covered by the console harness.
+
+Restoration was verified: original APK SHA-256 and version `0.7.0-dev`, original
+configuration values (excluding the normal diagnostic launch journal), and empty
+original Push state all match. Client and guard are running; the client reconnected
+to localhost:7086. Only that original USB reverse remains. The test destination and
+device-local backup were removed; all 13 isolated-server jobs are terminal and the
+test server is stopped. No Wi-Fi settings were changed. No push was performed.
