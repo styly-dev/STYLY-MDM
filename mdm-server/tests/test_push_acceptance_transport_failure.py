@@ -26,7 +26,7 @@ async def _ready(tmp_path):
     manager = PushJobManager(store)
     capabilities = frozenset({"push_job_id_v1", "push_resume_v1"})
     try:
-        _, job = await manager.create_job(canonicalize_create_request({
+        _, job = await manager.store.create_job(canonicalize_create_request({
             "client_request_id": str(uuid.uuid4()),
             "target_devices": ["D1"], "mode": "push",
             "dest_path": "/sdcard/STYLY/content",
@@ -41,7 +41,7 @@ async def _ready(tmp_path):
             "display_filename": "content.zip", "byte_size": 1,
             "sha256": "a" * 64, "entry_count": 1,
         })
-        await manager.enable_dispatch(job_id)
+        await manager.store.enable_dispatch(job_id)
         claimed = await manager.claim_next(["D1"])
         assert claimed is not None
         yield manager, capabilities, snapshot, claimed
@@ -83,7 +83,7 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
                 validated_offset=0, reason="download_interrupted",
             )
             assert outcome == "requeued"
-            await manager.enable_dispatch(snapshot["job_id"])
+            await manager.store.enable_dispatch(snapshot["job_id"])
             claimed = await manager.claim_next(["D1"])
             assert claimed is not None
             assert claimed["accepted_at"] is not None

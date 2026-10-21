@@ -181,7 +181,7 @@ class PushProtocolTest {
                 command,
                 PushProtocol.PHASE_DOWNLOADING,
                 interrupted = true,
-                retention = PushProtocol.Retention(PushFilesWorker.PARTIAL_RETENTION_MS, 1, 123456L),
+                retention = PushProtocol.Retention(PushProtocol.Retention.DURATION_MS, 1, 123456L),
                 interruptionReason = "download_interrupted",
             ),
             pendingResults = emptyList(),
@@ -191,7 +191,7 @@ class PushProtocolTest {
         val decoded = PushProtocol.stateFromJson(PushProtocol.stateToJson(state))
 
         assertTrue(decoded.active?.interrupted == true)
-        assertEquals(PushProtocol.Retention(PushFilesWorker.PARTIAL_RETENTION_MS, 1, 123456L), decoded.active?.retention)
+        assertEquals(PushProtocol.Retention(PushProtocol.Retention.DURATION_MS, 1, 123456L), decoded.active?.retention)
         assertEquals("download_interrupted", decoded.active?.interruptionReason)
     }
 

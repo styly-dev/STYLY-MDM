@@ -30,11 +30,13 @@ class PushJobCoordinatorIntegrationTest {
         private val attemptDirectoryOverride: ((PushProtocol.Command) -> File)? = null,
         private val cleanupOverride: ((File) -> Unit)? = null,
         initialClock: PushRetentionClock = PushRetentionClock(1, 0L),
+        manualRecovery: Boolean = false,
     ) {
         val durableState = AtomicReference(initialState)
         val clock = AtomicReference(initialClock)
         val scheduledDelays = CopyOnWriteArrayList<Long>()
         val checkpointTask = AtomicReference<Runnable?>()
+        private val recoveryTask = AtomicReference<Runnable?>()
         @Volatile var clockUnavailable = false
         val messages = CopyOnWriteArrayList<JSONObject>()
         val events = CopyOnWriteArrayList<String>()
@@ -48,7 +50,12 @@ class PushJobCoordinatorIntegrationTest {
             override fun schedule(command: Runnable, delay: Long, unit: TimeUnit): ScheduledFuture<*> {
                 scheduledDelays.add(unit.toMillis(delay))
                 if (unit.toMillis(delay) == PUSH_RETENTION_CHECKPOINT_MS) checkpointTask.set(command)
-                return super.schedule(command, delay, unit)
+                return super.schedule(command, delay, unit).also { scheduled ->
+                    if (manualRecovery && unit.toMillis(delay) == retryDelayMs) {
+                        scheduled.cancel(false)
+                        recoveryTask.set(command)
+                    }
+                }
             }
         }.apply { removeOnCancelPolicy = true }
         private val workerExecutor = Executors.newSingleThreadExecutor { runnable ->
@@ -149,6 +156,11 @@ class PushJobCoordinatorIntegrationTest {
         fun runCheckpoint() {
             actor.execute(requireNotNull(checkpointTask.get()))
             snapshot()
+        }
+
+        fun runRecovery(): JSONObject {
+            actor.execute(requireNotNull(recoveryTask.getAndSet(null)))
+            return snapshot()
         }
 
         fun blockActor(started: CountDownLatch, release: CountDownLatch) {
@@ -419,7 +431,7 @@ class PushJobCoordinatorIntegrationTest {
                 saved,
                 PushProtocol.PHASE_DOWNLOADING,
                 interrupted = true,
-                retention = PushProtocol.Retention(PushFilesWorker.PARTIAL_RETENTION_MS, 1, 0L),
+                retention = PushProtocol.Retention(PushProtocol.Retention.DURATION_MS, 1, 0L),
             ),
             pendingResults = emptyList(),
             completedReceipts = emptyList(),
@@ -732,6 +744,88 @@ class PushJobCoordinatorIntegrationTest {
     }
 
     @Test
+    fun `retention clock recovery restores availability and counts unavailable same boot time`() {
+        val harness = Harness(retainedState(600_000L), manualRecovery = true)
+        harness.attach()
+        val saved = harness.durableState.get()
+        harness.clockUnavailable = true
+        harness.clock.set(PushRetentionClock(1, 60_000L))
+        harness.runCheckpoint()
+
+        assertEquals("unavailable", harness.snapshot().getJSONObject("push_state").getString("status"))
+        assertEquals(saved, harness.durableState.get())
+        assertEquals(0, harness.cleanupCalls.get())
+
+        harness.clock.set(PushRetentionClock(1, 150_000L))
+        harness.clockUnavailable = false
+        val recovered = harness.runRecovery()
+
+        assertEquals("available", recovered.getJSONObject("push_state").getString("status"))
+        assertEquals(PushProtocol.Retention(450_000L, 1, 150_000L), harness.durableState.get().active?.retention)
+        assertTrue(requireNotNull(harness.durableState.get().active).interrupted)
+        assertEquals(0, harness.workerRuns.get())
+        assertEquals(0, harness.cleanupCalls.get())
+        assertTrue(harness.durableState.get().pendingResults.isEmpty())
+    }
+
+    @Test
+    fun `expired resumed budget preserves unsaved terminal outcome across checkpoint and recovery`() {
+        for (failureCode in listOf(null, "validation_failed")) {
+            val initial = retainedState(600_000L)
+            val command = requireNotNull(initial.active).command
+            val terminal = execution(command, failureCode = failureCode)
+            val expected = (terminal.outcome as PushFilesWorker.Outcome.Completed).result
+            val releaseWorker = CountDownLatch(1)
+            val allowTerminalSave = AtomicBoolean(false)
+            val harness = Harness(initial, manualRecovery = true).apply {
+                shouldFailSave = { next ->
+                    next.active == null && next.pendingResults.isNotEmpty() && !allowTerminalSave.get()
+                }
+                runExecution = { _, _ ->
+                    releaseWorker.await()
+                    terminal
+                }
+            }
+            harness.attach()
+            harness.clock.set(PushRetentionClock(1, 100_000L))
+            harness.send(command)
+            await { harness.workerRuns.get() == 1 }
+            harness.clock.set(PushRetentionClock(1, 700_000L))
+            releaseWorker.countDown()
+            await { harness.events.contains("save:failed") }
+
+            harness.runCheckpoint()
+            val retained = requireNotNull(harness.durableState.get().active)
+            assertEquals(command, retained.command)
+            assertFalse(retained.interrupted)
+            assertEquals(0L, retained.retention?.remainingMs)
+            assertEquals("unavailable", harness.snapshot().getJSONObject("push_state").getString("status"))
+            assertEquals(0, harness.cleanupCalls.get())
+            assertTrue(harness.durableState.get().pendingResults.isEmpty())
+            assertFalse(harness.messages.any { it.optString("type") == "PUSH_FILES_RESULT" })
+
+            allowTerminalSave.set(true)
+            val recovered = harness.runRecovery()
+            await { harness.cleanupCalls.get() == 1 && harness.events.contains("cleanup") }
+            assertEquals("available", recovered.getJSONObject("push_state").getString("status"))
+            val settled = harness.durableState.get()
+            assertEquals(null, settled.active)
+            assertEquals(expected, settled.pendingResults.single().result)
+            assertEquals(expected, settled.completedReceipts.single().result)
+            assertEquals(1, harness.workerRuns.get())
+            val results = harness.messages.filter { it.optString("type") == "PUSH_FILES_RESULT" }
+            assertEquals(1, results.size)
+            assertEquals(expected.status, results.single().getString("status"))
+            assertEquals(failureCode ?: "", results.single().optString("failure_code"))
+            assertEquals(1, harness.events.count { it == "save:result" })
+            val persisted = harness.events.indexOf("save:result")
+            assertTrue(persisted > harness.events.indexOf("save:failed"))
+            assertTrue(persisted < harness.events.indexOf("cleanup"))
+            assertTrue(persisted < harness.events.indexOf("send:PUSH_FILES_RESULT"))
+        }
+    }
+
+    @Test
     fun `legacy interrupted wall clock state gets one durable budget before registration`() {
         val legacy = PushProtocol.stateToJson(retainedState(600_000L)).apply {
             put("state_version", 1)
@@ -744,7 +838,7 @@ class PushJobCoordinatorIntegrationTest {
         val registration = harness.snapshot()
         assertEquals("available", registration.getJSONObject("push_state").getString("status"))
         assertEquals(
-            PushProtocol.Retention(PushFilesWorker.PARTIAL_RETENTION_MS, 3, 10_000L),
+            PushProtocol.Retention(PushProtocol.Retention.DURATION_MS, 3, 10_000L),
             harness.durableState.get().active?.retention,
         )
         assertEquals(2, PushProtocol.stateToJson(harness.durableState.get()).getInt("state_version"))

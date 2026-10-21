@@ -34,7 +34,9 @@ dispatch, command acceptance, transfer completion, validation/apply, terminal re
 ACK, restart recovery, and persistent device-fence reconciliation.
 
 `PushJobManager` declares its public operations explicitly; store methods are not
-automatically exposed through it. SQLite initialization executes an ordered list
+automatically exposed through it. Upload preparation, startup recovery, and artifact
+metadata access use the store directly in both runtime code and test fixtures.
+SQLite initialization executes an ordered list
 of DDL statements within the same transaction as column and metadata upgrades.
 
 Terminal results are decided by `PushJobManager.settle_result` in one SQLite

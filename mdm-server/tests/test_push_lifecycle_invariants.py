@@ -59,7 +59,7 @@ async def test_accept_timeout_and_disconnect_order_never_authorizes_absent_repla
 ):
     ready = await ready_job(manager.store, manager)
     job_id = ready["job_id"]
-    await manager.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id)
     assert await manager.claim_next(["D1"])
     await manager.prepare_dispatch(
         job_id, "D1", accept_deadline=now_ms() + 60_000,
@@ -359,7 +359,7 @@ async def test_newer_success_supersedes_retry_even_with_equal_creation_time(
         (older["job_id"], newer["job_id"]),
     ))
 
-    await manager.enable_dispatch(older["job_id"])
+    await manager.store.enable_dispatch(older["job_id"])
     assert (await manager.claim_next(["D1"]))["job"]["job_id"] == older["job_id"]
     await manager.prepare_dispatch(older["job_id"], "D1", accept_deadline=now_ms() + 60_000)
     await manager.transition_device(
@@ -370,7 +370,7 @@ async def test_newer_success_supersedes_retry_even_with_equal_creation_time(
         older["job_id"], "D1", 1, "fail", failure_code="download_failed",
     )).accepted
 
-    await manager.enable_dispatch(newer["job_id"])
+    await manager.store.enable_dispatch(newer["job_id"])
     assert (await manager.claim_next(["D1"]))["job"]["job_id"] == newer["job_id"]
     await manager.prepare_dispatch(newer["job_id"], "D1", accept_deadline=now_ms() + 60_000)
     await manager.transition_device(
@@ -379,7 +379,7 @@ async def test_newer_success_supersedes_retry_even_with_equal_creation_time(
     )
     assert (await manager.settle_result(newer["job_id"], "D1", 1, "success")).accepted
 
-    artifact = await manager.artifact_record(older["artifact"]["artifact_id"])
+    artifact = await manager.store.artifact_record(older["artifact"]["artifact_id"])
     older_path = tmp_path / artifact["storage_name"]
     older_path.write_bytes(b"x")
     original = await manager.get_snapshot(older["job_id"])

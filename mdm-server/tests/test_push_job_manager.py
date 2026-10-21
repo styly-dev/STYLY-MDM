@@ -62,8 +62,11 @@ def test_policy_mutations_have_one_owner():
     assert policy_methods.isdisjoint(PushJobStore.__dict__.keys())
 
 
-def test_store_internals_are_not_exposed_as_manager_operations(manager):
-    for name in ("_call", "_call_sync", "close", "backup_path"):
+def test_store_only_operations_are_not_exposed_on_manager(manager):
+    for name in (
+        "_call", "_call_sync", "close", "backup_path",
+        "create_job", "enable_dispatch", "recover_startup_sync",
+    ):
         with pytest.raises(AttributeError):
             getattr(manager, name)
 
@@ -71,7 +74,7 @@ def test_store_internals_are_not_exposed_as_manager_operations(manager):
 @pytest.mark.asyncio
 async def test_idempotent_lookup_does_not_depend_on_current_connection(manager):
     req = request()
-    created, snapshot = await manager.create_job(
+    created, snapshot = await manager.store.create_job(
         req, {'D1': (ProtocolMode.JOB_V1, {'push_job_id_v1'})}, 600_000,
     )
     assert created
@@ -84,11 +87,11 @@ async def test_older_nonterminal_queue_row_blocks_later_enabled_job(manager):
     # enqueue_seq is the device queue's total order. A later ready job cannot jump
     # over a job created first merely because that first job's dispatch gate is off.
     first = request()
-    _, first_snapshot = await manager.create_job(
+    _, first_snapshot = await manager.store.create_job(
         first, {'D1': (ProtocolMode.JOB_V1, {'push_job_id_v1'})}, 600_000,
     )
     second_snapshot = await ready(manager.store, request(), 'second')
-    await manager.enable_dispatch(second_snapshot['job_id'])
+    await manager.store.enable_dispatch(second_snapshot['job_id'])
 
     assert first_snapshot['devices']['D1']['enqueue_seq'] < \
         second_snapshot['devices']['D1']['enqueue_seq']
@@ -98,10 +101,10 @@ async def test_older_nonterminal_queue_row_blocks_later_enabled_job(manager):
 @pytest.mark.asyncio
 async def test_fence_mutation_revisions_every_visible_job(manager):
     first = await ready(manager.store, request(), 'first')
-    _, second = await manager.create_job(
+    _, second = await manager.store.create_job(
         request(), {'D1': (ProtocolMode.JOB_V1, {'push_job_id_v1'})}, 600_000,
     )
-    await manager.enable_dispatch(first['job_id'])
+    await manager.store.enable_dispatch(first['job_id'])
     await manager.claim_next(['D1'])
     await manager.prepare_dispatch(
         first['job_id'], 'D1',
@@ -149,7 +152,7 @@ async def test_opaque_fence_is_attributed_only_to_latest_enqueued_job(manager):
 async def test_preaccept_absent_requeues_same_attempt_only_once(manager):
     snapshot = await ready(manager.store, request(), 'replay')
     job_id = snapshot['job_id']
-    await manager.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id)
     await manager.claim_next(['D1'])
     await manager.prepare_dispatch(
         job_id, 'D1',
@@ -187,7 +190,7 @@ async def test_preaccept_absent_requeues_same_attempt_only_once(manager):
 async def test_exact_absent_clears_fence_when_reconciliation_deadline_wins(manager):
     snapshot = await ready(manager.store, request(), 'deadline-race')
     job_id = snapshot['job_id']
-    await manager.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id)
     await manager.claim_next(['D1'])
     await manager.prepare_dispatch(
         job_id, 'D1',
@@ -215,7 +218,7 @@ async def test_exact_absent_clears_fence_when_reconciliation_deadline_wins(manag
 async def test_expired_acceptance_query_tracks_only_unaccepted_dispatches(manager):
     snapshot = await ready(manager.store, request(), 'accept-deadline')
     job_id = snapshot['job_id']
-    await manager.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id)
     await manager.claim_next(['D1'])
     deadline = now_ms() - 1
     await manager.prepare_dispatch(
@@ -247,7 +250,7 @@ async def test_expired_acceptance_query_tracks_only_unaccepted_dispatches(manage
 async def test_stale_expired_acceptance_cannot_reconcile_replayed_dispatch(manager):
     snapshot = await ready(manager.store, request(), 'stale-accept-deadline')
     job_id = snapshot['job_id']
-    await manager.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id)
     await manager.claim_next(['D1'])
     first_deadline = now_ms() - 1
     await manager.prepare_dispatch(
@@ -299,7 +302,7 @@ async def test_stale_expired_acceptance_cannot_reconcile_replayed_dispatch(manag
 
 @pytest.mark.asyncio
 async def test_new_job_v1_process_safely_clears_legacy_fence(manager):
-    _, queued = await manager.create_job(
+    _, queued = await manager.store.create_job(
         request(), {'D1': (ProtocolMode.JOB_V1, {'push_job_id_v1'})}, 600_000,
     )
     snapshots = await manager.add_opaque_fence(
@@ -319,8 +322,8 @@ async def test_new_job_v1_process_safely_clears_legacy_fence(manager):
 async def test_new_job_v1_process_clears_offline_job_v1_fence(manager):
     first = await ready(manager.store, request(), 'offline-owner')
     second = await ready(manager.store, request(), 'next-job')
-    await manager.enable_dispatch(first['job_id'])
-    await manager.enable_dispatch(second['job_id'])
+    await manager.store.enable_dispatch(first['job_id'])
+    await manager.store.enable_dispatch(second['job_id'])
     await manager.claim_next(['D1'])
     await manager.prepare_dispatch(
         first['job_id'], 'D1',
@@ -346,7 +349,7 @@ async def test_new_job_v1_process_clears_offline_job_v1_fence(manager):
 async def test_stale_reconciliation_deadline_cannot_mark_recovered_assignment(manager):
     snapshot = await ready(manager.store, request(), 'deadline')
     job_id = snapshot['job_id']
-    await manager.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id)
     await manager.claim_next(['D1'])
     await manager.prepare_dispatch(
         job_id, 'D1',
@@ -383,8 +386,8 @@ async def test_stale_reconciliation_deadline_cannot_mark_recovered_assignment(ma
 async def test_active_assignment_blocks_a_second_claim(manager):
     first = await ready(manager.store, request(), 'active-first')
     second = await ready(manager.store, request(), 'active-second')
-    await manager.enable_dispatch(first['job_id'])
-    await manager.enable_dispatch(second['job_id'])
+    await manager.store.enable_dispatch(first['job_id'])
+    await manager.store.enable_dispatch(second['job_id'])
     claimed = await manager.claim_next(['D1'])
     assert claimed['job']['job_id'] == first['job_id']
     # The second row remains queued; unique-index contention is a normal no-op, not
@@ -399,7 +402,7 @@ async def test_active_assignment_blocks_a_second_claim(manager):
 async def test_exact_late_result_is_acked_after_process_replacement_cleared_fence(manager):
     snapshot = await ready(manager.store, request(), 'late-after-replacement')
     job_id = snapshot['job_id']
-    await manager.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id)
     await manager.claim_next(['D1'])
     await manager.prepare_dispatch(
         job_id,
