@@ -24,7 +24,7 @@ from .device_policy import (
     PROVISIONAL_POWER_COMMANDS,
     command_allowed,
 )
-from .push_artifacts import ArtifactStore
+from .push_artifacts import ArtifactStore, strong_etag
 from .push_job_manager import PushJobManager
 from .push_job_store import (
     PushJobStore,
@@ -763,7 +763,7 @@ class PushRuntime:
         if not await asyncio.to_thread(_is_file_of_size, path, total):
             log.error("Push artifact bytes are missing or have the wrong size: %s", path)
             raise aiohttp_web.HTTPNotFound()
-        etag = f'"{record["sha256"]}"'
+        etag = strong_etag(record["sha256"])
         headers = {
             "ETag": etag,
             "Accept-Ranges": "bytes",

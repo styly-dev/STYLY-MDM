@@ -26,6 +26,12 @@ import java.net.NetworkInterface
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
+private val LOG_MESSAGE_TYPE = Regex("[A-Z][A-Z0-9_]{0,63}")
+
+/** Logs protocol types only; payloads and parse errors may contain download leases. */
+internal fun messageTypeForLog(message: JSONObject): String =
+    (message.opt("type") as? String)?.takeIf(LOG_MESSAGE_TYPE::matches) ?: "UNKNOWN"
+
 /**
  * Manages WebSocket connection to the STYLY-MDM server: device registration,
  * dispatching received commands, and the bounded connection window (#67).
@@ -317,7 +323,7 @@ class WebSocketManager internal constructor(
 
     fun sendMessage(json: JSONObject) {
         val text = json.toString()
-        Log.d(TAG, "Sending: $text")
+        Log.d(TAG, "Sending: ${messageTypeForLog(json)}")
         webSocket?.send(text)
     }
 
@@ -454,10 +460,11 @@ class WebSocketManager internal constructor(
                     Log.w(TAG, "Ignoring message from superseded WebSocket")
                     return
                 }
-                Log.d(TAG, "Received: $text")
                 try {
                     val json = JSONObject(text)
                     val type = json.optString("type", "")
+                    val logType = messageTypeForLog(json)
+                    Log.d(TAG, "Received: $logType")
                     if (type == "REGISTERED") {
                         if (!registration.acknowledge(webSocket)) {
                             Log.w(TAG, "Ignoring REGISTERED for an unregistered or superseded WebSocket")
@@ -484,20 +491,20 @@ class WebSocketManager internal constructor(
                             }
                         }
                     } else if (!registration.isAcknowledged(webSocket)) {
-                        Log.w(TAG, "Ignoring $type before canonical registration acknowledgement")
+                        Log.w(TAG, "Ignoring $logType before canonical registration acknowledgement")
                     } else if (registration.isProvisional(webSocket) &&
                         type !in PROVISIONAL_POWER_COMMANDS
                     ) {
-                        Log.w(TAG, "Ignoring $type on a provisional connection")
+                        Log.w(TAG, "Ignoring $logType on a provisional connection")
                     } else if (registration.isProvisional(webSocket) &&
                         json.optString("connection_id", "") != registration.provisionalConnectionId(webSocket)
                     ) {
-                        Log.w(TAG, "Ignoring $type for a different provisional connection")
+                        Log.w(TAG, "Ignoring $logType for a different provisional connection")
                     } else if (type.isNotEmpty() && !pushCoordinator.handleServerMessage(type, json)) {
                         onCommand(type, json, commandContext(webSocket))
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to parse message", e)
+                    Log.e(TAG, "Failed to process message (${e.javaClass.simpleName})")
                 }
             }
 
@@ -549,7 +556,7 @@ class WebSocketManager internal constructor(
                 send = { message ->
                     if (this@WebSocketManager.webSocket === socket && registration.isCanonicalAcknowledged(socket)) {
                         val text = message.toString()
-                        Log.d(TAG, "Sending: $text")
+                        Log.d(TAG, "Sending: ${messageTypeForLog(message)}")
                         socket.send(text)
                     }
                 },
@@ -629,7 +636,7 @@ class WebSocketManager internal constructor(
             }
         }
         val text = payload.toString()
-        Log.d(TAG, "Sending: $text")
+        Log.d(TAG, "Sending: ${messageTypeForLog(payload)}")
         val canonical = identity is DeviceIdentityState.Ready
         if (canonical) registration.markSent(socket)
         if (!socket.send(text) && canonical) registration.clearSent(socket)

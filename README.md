@@ -66,7 +66,6 @@ current working directory — see the configuration table below):
 2026-02-24 [INFO] Configuration:
 2026-02-24 [INFO]   Data directory:   /srv/styly-mdm
 2026-02-24 [INFO]   APK directory:    /srv/styly-mdm/apks
-2026-02-24 [INFO]   Bundle directory: /srv/styly-mdm/bundles
 2026-02-24 [INFO]   Device registry:  /srv/styly-mdm/device_registry.json
 2026-02-24 [INFO]   WebSocket port:   7070
 2026-02-24 [INFO]   Discovery port:   7071
@@ -81,14 +80,14 @@ Open `http://<server-ip>:7070` in a browser to access the web console.
 |---------|---------|------|---------|
 | HTTP/WebSocket port | `MDM_WS_PORT` | `--port` | `7070` |
 | UDP discovery port | `MDM_DISCOVERY_PORT` | — | `7071` |
-| Data directory (uploaded APKs, pushed bundles, device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
+| Data directory (APKs, Push jobs/artifacts, device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
 | Simultaneous device downloads, server-wide | `MDM_MAX_CONCURRENT_TRANSFERS` | `--max-concurrent-transfers` | `5` |
-| Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `600` |
+| APK transfer timeout in seconds | `MDM_TRANSFER_TIMEOUT` | — | `600` |
 | Seconds a retiring device must stay silent before the retire counts as done | `MDM_RETIRE_TIMEOUT` | — | `120` |
 
-The **data directory** holds everything the server persists: uploaded APKs (`apks/`), pushed file bundles (`bundles/`), and the device registry (`device_registry.json`). It defaults to the directory the server is started from, so `uvx styly-mdm` in a fresh directory comes up with no devices or groups. Pass `--data-dir` to pin it somewhere stable.
+The **data directory** holds everything the server persists: uploaded APKs (`apks/`), Push metadata (`push_jobs.sqlite3`), artifact bytes (`push-artifacts/`), upload work (`push-work/`), and the device registry (`device_registry.json`). It defaults to the directory the server is started from, so `uvx styly-mdm` in a fresh directory comes up with no devices or groups. Pass `--data-dir` to pin it somewhere stable.
 
-**Transfer throttling** keeps a large fan-out — an APK install, a file push, or a folder sync — from making every device download at the same instant (an APK or a pushed bundle can be up to 2 GiB). All jobs share one server-wide pool: at most `--max-concurrent-transfers` devices download at once; the rest queue, and a slot frees as soon as its device reports the download finished. `MDM_TRANSFER_TIMEOUT` caps how long one device may hold a slot, so a stuck device cannot block the queue. The [Developer Guide](docs/DEVELOPMENT.md) documents the full slot-release rules.
+**Transfer throttling** keeps a large fan-out — an APK install, a file push, or a folder sync — from making every device download at the same instant (an APK or a pushed bundle can be up to 2 GiB). All jobs share one server-wide pool: at most `--max-concurrent-transfers` devices download at once; the rest queue, and a slot frees as soon as its device reports the download finished. `MDM_TRANSFER_TIMEOUT` caps APK download slots. Push slots instead use a lease that expires after 60 seconds without successful HTTP writes; validation and application do not occupy a download slot. The [Developer Guide](docs/DEVELOPMENT.md) documents the full slot-release rules.
 
 > **Only one server per discovery port.** Devices connect to whichever server answers discovery first, so two servers sharing a discovery port would split them nondeterministically. To prevent that, the server broadcasts a probe on startup and exits if another STYLY-MDM server answers:
 >

@@ -966,10 +966,10 @@ class PushJobStore:
                             # A single-device Resume must not also authorize other
                             # interrupted or queued devices after server restart.
                             conn.execute(
-                                "UPDATE push_job_devices SET queue_reason='dispatch_paused' "
+                                "UPDATE push_job_devices SET queue_reason='dispatch_paused', updated_at=? "
                                 "WHERE job_id=? AND state IN ('queued','waiting_transfer','reconciling') "
-                                "AND COALESCE(queue_reason,'') != 'download_interrupted' "
-                                f"AND device_id NOT IN ({marks})", (job_id, *target_args),
+                                f"AND COALESCE(queue_reason,'') NOT IN {MANUAL_WAIT_QUEUE_REASONS_SQL} "
+                                f"AND device_id NOT IN ({marks})", (timestamp, job_id, *target_args),
                             )
                     # Resume authorizes only currently interrupted assignments.
                     # Reconnect reports cannot clear this per-device wait.

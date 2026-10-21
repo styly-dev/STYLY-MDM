@@ -49,6 +49,9 @@ older APK must take the client self-update before it can receive Push/Sync jobs.
 The supported headset is PICO 4 Ultra Enterprise. Identity-less live Push commands
 are rejected; the obsolete `/api/bundles` upload returns HTTP 410 and `/bundles/`
 is no longer served. Use the job creation/upload/dispatch API.
+This is a breaking API change for external scripts: create a job through
+`POST /api/push-jobs`, upload to its returned `upload_url`, then dispatch
+`PUSH_FILES` with the resulting `job_id`.
 
 Each job-v1 artifact URL includes a random, in-memory `lease` token scoped to its
 exact assignment. The server accepts the URL only while that assignment owns a
@@ -222,6 +225,11 @@ readable and replayable; they do not enable new standalone execution.
 Interrupted client ownership uses a local deadline whose default is 24 hours,
 measured from the first interruption rather than the start of a long download.
 The coordinator's `interruptedAt` is the only expiration authority. Reauthorization does not reset the first interruption time.
+This persisted timestamp uses device wall-clock time so it survives a reboot.
+Clock corrections can shorten or extend retention; it is not a guaranteed 24-hour
+elapsed-time limit. A rollback cannot trigger immediate expiry. The separate
+60-second download idle deadline uses a monotonic clock. Keep the device clock
+synchronized before creating long-lived interrupted work.
 One replaceable timer checks this deadline, and command acceptance checks it again
 in case the timer is delayed. Failed expiry persistence retains ownership and is
 retried after 60 seconds; successful persistence precedes release and cleanup.
@@ -430,6 +438,12 @@ retained to prevent duplicate execution. Legacy serial-ID clients remain eligibl
 only for APK installation/update. The 2 GiB content limit applies to uploaded
 source bytes and extracted content; ZIP overhead may make the artifact larger.
 
+Historical `DATA_DIR/bundles/` files are left untouched and are not referenced by
+the job artifact store. After stopping the old server and checking that no old
+client still needs a standalone download, back up this directory and remove it
+manually if its contents are no longer needed. Do not apply this cleanup to
+`push-artifacts/`, `push-work/`, or `push_jobs.sqlite3`.
+
 Finish pending serial-ID Push/Sync jobs with the previous server before upgrading
 to GUID identity. Old assignments are not migrated or resumed on serial clients;
 queued assignments may remain pending. Retain those records and create a new job
@@ -550,7 +564,7 @@ The protocol and behavior follow the Issue #91 design. Three implementation-layo
 
 1. `PushJobManager` is in `push_job_manager.py` rather than `push_jobs.py`. `push_jobs.py` stays a dependency-free domain module used by `push_job_store.py`; importing the SQLite store back into it would create a circular dependency. The manager remains the sole policy layer above the serialized store.
 2. `push_runtime.py` is the HTTP/WebSocket compatibility adapter rather than placing all Issue #91 routing into the already-large `server.py`. It installs explicit routes and consumes only job-v1 messages while leaving unrelated and old-client commands on the established server path.
-3. The console bridge is `static/push-jobs-v1.js` rather than a large rewrite of inline `index.html`. It intercepts only the old upload/dispatch pair, reconstructs current Push/Sync rows from canonical full snapshots, and preserves the existing picker, target selection, and unrelated operation controls.
+3. The console bridge is `static/push-jobs-v1.js`. The file panels call its explicit submission API, while rendering and operator actions use canonical full snapshots. The existing picker, target selection, and unrelated operation controls remain in `index.html`.
 
 On POSIX, both the published file and artifact directory rename are fsynced. Python has no portable directory-fsync handle on Windows, so Windows fsyncs the file and uses atomic `os.replace` but skips only the directory-handle fsync. This platform limitation is explicit rather than allowing artifact publication to fail on every Windows server.
 
@@ -640,3 +654,8 @@ sequenceDiagram
 Activity log is read-only history. Needs attention contains Resume all, Cancel
 all, Retry failed devices, and Reconcile; eligible device rows have individual
 Resume and Cancel controls.
+
+## Validation
+
+See [Push/Sync validation](PUSH_VALIDATION.md) for automated checks, hardware
+evidence, and verification limits.
