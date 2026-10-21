@@ -155,7 +155,7 @@ async def test_cancel_intent_survives_exact_reconcile_send_failure(manager, tmp_
 async def test_admin_cancel_rejects_active_or_already_resumed_work(manager, tmp_path, resumed):
     original = await timed_out_job(manager) if resumed else await downloading_job(manager.store, manager)
     if resumed:
-        _, original = await manager.enable_dispatch(original["job_id"])
+        _, original = await manager.store.enable_dispatch(original["job_id"])
     runtime, session, admin = operator_runtime(manager, tmp_path)
     assert await runtime.handle_admin_message(admin, {"type": "CANCEL_PUSH_JOB", "job_id": original["job_id"]})
     assert any(message["type"] == "ERROR" for message in admin.messages)
@@ -193,19 +193,19 @@ async def two_device_job(manager, *, interrupted=False, downloading=False):
         "source": {"display_name": "content", "declared_file_count": 1,
                    "declared_total_bytes": 1},
     })
-    _, created = await manager.create_job(request, {
+    _, created = await manager.store.create_job(request, {
         device: (ProtocolMode.JOB_V1, CAPS) for device in ["D1", "D2"]
     }, 60_000)
     job_id = created["job_id"]
-    await manager.start_upload(job_id)
-    await manager.mark_packaging(job_id, 1, 1)
-    await manager.publish_artifact(job_id, {
+    await manager.store.start_upload(job_id)
+    await manager.store.mark_packaging(job_id, 1, 1)
+    await manager.store.publish_artifact(job_id, {
         "artifact_id": str(uuid.uuid4()), "storage_name": "operators.zip",
         "display_filename": "operators.zip", "byte_size": 1,
         "sha256": "a" * 64, "entry_count": 1,
     })
     if interrupted or downloading:
-        await manager.enable_dispatch(job_id)
+        await manager.store.enable_dispatch(job_id)
         for device_id in ["D1", "D2"]:
             assert (await manager.claim_next([device_id]))["device_id"] == device_id
             await manager.prepare_dispatch(job_id, device_id,
@@ -278,7 +278,7 @@ async def test_targeted_resume_preserves_non_target_manual_wait(manager, state, 
     )
     non_target_before = await manager.assignment(job_id, "D2")
 
-    enabled, resumed = await manager.enable_dispatch(job_id, target_devices=["D1"])
+    enabled, resumed = await manager.store.enable_dispatch(job_id, target_devices=["D1"])
 
     assert enabled is True
     assert resumed["devices"]["D1"]["queue_reason"] == "resumable_replay"
@@ -323,7 +323,7 @@ async def test_targeted_resume_timestamps_non_target_that_it_pauses(manager):
     )
     non_target_before = await manager.assignment(job_id, "D2")
 
-    enabled, resumed = await manager.enable_dispatch(job_id, target_devices=["D1"])
+    enabled, resumed = await manager.store.enable_dispatch(job_id, target_devices=["D1"])
 
     assert enabled is True
     assert resumed["devices"]["D2"]["queue_reason"] == "dispatch_paused"
@@ -336,8 +336,8 @@ async def test_targeted_resume_timestamps_non_target_that_it_pauses(manager):
 async def test_individual_resume_from_global_pause_keeps_other_device_paused_until_resume_all(manager, tmp_path, restart):
     original = await two_device_job(manager)
     if restart:
-        await manager.enable_dispatch(original["job_id"])
-        manager.recover_startup_sync(accept_reconciliation_timeout_ms=1000,
+        await manager.store.enable_dispatch(original["job_id"])
+        manager.store.recover_startup_sync(accept_reconciliation_timeout_ms=1000,
                                      reconciliation_timeout_ms=1000)
     runtime, _, admin = operator_runtime(manager, tmp_path)
     await admin_action(runtime, admin, "PUSH_FILES", original["job_id"], target_devices=["D1"])
@@ -366,7 +366,7 @@ async def test_invalid_explicit_targets_never_expand_to_all_devices(manager, tmp
 @pytest.mark.asyncio
 async def test_restart_individual_resume_does_not_authorize_other_reconnecting_worker(manager, tmp_path):
     original = await two_device_job(manager, downloading=True)
-    manager.recover_startup_sync(accept_reconciliation_timeout_ms=1000,
+    manager.store.recover_startup_sync(accept_reconciliation_timeout_ms=1000,
                                  reconciliation_timeout_ms=1000)
     runtime, _, admin = operator_runtime(manager, tmp_path)
     requested = []

@@ -26,18 +26,18 @@ async def _ready_job(manager, devices, *, dispatch=True):
         'mode': 'push', 'dest_path': '/sdcard/STYLY/content',
         'source': {'display_name': 'content', 'declared_file_count': 1, 'declared_total_bytes': 1},
     })
-    _, job = await manager.create_job(
+    _, job = await manager.store.create_job(
         request, {device: (ProtocolMode.JOB_V1, CAPS) for device in devices}, 600_000,
     )
     job_id = job['job_id']
-    await manager.start_upload(job_id)
-    await manager.mark_packaging(job_id, 1, 1)
-    await manager.publish_artifact(job_id, {
+    await manager.store.start_upload(job_id)
+    await manager.store.mark_packaging(job_id, 1, 1)
+    await manager.store.publish_artifact(job_id, {
         'artifact_id': str(uuid.uuid4()), 'storage_name': str(uuid.uuid4()) + '.zip',
         'display_filename': 'content.zip', 'byte_size': 1, 'sha256': 'a' * 64, 'entry_count': 1,
     })
     if dispatch:
-        await manager.enable_dispatch(job_id)
+        await manager.store.enable_dispatch(job_id)
     return job_id
 
 

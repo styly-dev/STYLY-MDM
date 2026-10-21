@@ -182,7 +182,6 @@ class PushFilesWorker internal constructor(
         internal const val DOWNLOAD_NO_PROGRESS_TIMEOUT_MS = 60_000L
         private const val INITIAL_RETRY_BACKOFF_MS = 1_000L
         private const val MAX_RETRY_BACKOFF_MS = 8_000L
-        internal const val PARTIAL_RETENTION_MS = 24L * 60 * 60 * 1000
         private const val MAX_ARCHIVE_ENTRIES = 5_000
         private const val MAX_EXTRACTED_BYTES = 2L * 1024 * 1024 * 1024
         private val PROTECTED_TOPLEVEL_DIRS = setOf(

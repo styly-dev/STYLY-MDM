@@ -95,8 +95,12 @@ object PushProtocol {
         val bootCount: Int,
         val elapsedRealtimeMs: Long,
     ) {
+        companion object {
+            const val DURATION_MS = 24L * 60 * 60 * 1000
+        }
+
         init {
-            require(remainingMs in 0L..PushFilesWorker.PARTIAL_RETENTION_MS)
+            require(remainingMs in 0L..DURATION_MS)
             require(bootCount >= 0)
             require(elapsedRealtimeMs >= 0L)
         }

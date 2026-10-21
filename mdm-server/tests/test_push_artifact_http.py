@@ -405,7 +405,7 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
         assert snapshot["dispatch_enabled"] is False
         assert snapshot["dispatch_paused_reason"] == "server_restart"
         assert await manager.claim_next(["D1"]) is None
-        await manager.enable_dispatch(job_id)
+        await manager.store.enable_dispatch(job_id)
         assert await manager.claim_next(["D1"]) is not None
         await manager.prepare_dispatch(
             job_id,

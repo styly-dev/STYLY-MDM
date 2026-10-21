@@ -38,7 +38,7 @@ def protocols():
 
 
 async def ready_job(store, manager):
-    _, created = await manager.create_job(request(), protocols(), 60_000)
+    _, created = await manager.store.create_job(request(), protocols(), 60_000)
     job_id = created["job_id"]
     await store.start_upload(job_id)
     await store.mark_packaging(job_id, 1, 1)
@@ -56,7 +56,7 @@ async def ready_job(store, manager):
 async def downloading_job(store, manager):
     ready = await ready_job(store, manager)
     job_id = ready["job_id"]
-    await manager.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id)
     claimed = await manager.claim_next(["D1"])
     assert claimed is not None
     await manager.prepare_dispatch(
@@ -226,7 +226,7 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
     assert await manager.get_snapshot(job_id) == paused
     assert runtime.scheduler.wake_count == int(reason is not None and report_path == "reconcile")
 
-    await manager.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id)
     await send_report()  # Do not re-pause after the operator authorizes Resume.
     assert (await manager.get_snapshot(job_id))["dispatch_enabled"] is True
     assert await manager.claim_next(["D1"]) is not None
@@ -474,7 +474,7 @@ async def test_retry_exhaustion_allows_another_device_waiting_for_a_slot(manager
         assert session.ws.messages[0]["type"] == "EXECUTE_PUSH_FILES"
         assert (await manager.assignment(job_id, "D2"))["state"] == "dispatching"
         assert await manager.claim_next(["D1"]) is None
-        await manager.enable_dispatch(job_id)
+        await manager.store.enable_dispatch(job_id)
         assert await manager.claim_next(["D1"]) is not None
     finally:
         task.cancel()
@@ -1071,7 +1071,7 @@ async def test_registration_active_report_preserves_offline_timeout_fence(tmp_pa
             "device stayed offline past deadline",
         )
         next_job = await ready_job(store, manager)
-        await manager.enable_dispatch(next_job["job_id"])
+        await manager.store.enable_dispatch(next_job["job_id"])
 
         ws = Ws()
         runtime = object.__new__(PushRuntime)
@@ -1466,7 +1466,7 @@ async def test_legacy_busy_report_still_creates_opaque_fence(manager):
     store = manager.store
     ready = await ready_job(store, manager)
     job_id = ready["job_id"]
-    await manager.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id)
     claimed = await manager.claim_next(["D1"])
     assert claimed is not None
     snapshot = await manager.prepare_dispatch(
@@ -1828,7 +1828,7 @@ async def test_replacement_register_withdraws_pending_resume(
             validated_offset=1,
         )
         assert outcome == "requeued"
-    await manager.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id)
     assert (await manager.assignment(job_id, "D1"))["queue_reason"] == "resumable_replay"
     runtime = runtime_for(manager)
     runtime.sessions = {}
@@ -1869,7 +1869,7 @@ async def test_replacement_register_withdraws_pending_resume(
     await runtime.disconnect_device("D1", old)
     assert await manager.get_snapshot(job_id) == paused
     assert runtime.sessions["D1"].ws is new
-    await manager.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id)
     assert await manager.claim_next(["D1"]) is not None
 
 
@@ -2026,7 +2026,7 @@ async def test_legacy_result_does_not_settle_preserved_assignment(tmp_path):
     manager = PushJobManager(store)
     try:
         legacy_request = request()
-        _, created = await manager.create_job(
+        _, created = await manager.store.create_job(
             legacy_request,
             {"D1": (ProtocolMode.LEGACY, set())},
             60_000,
@@ -2042,7 +2042,7 @@ async def test_legacy_result_does_not_settle_preserved_assignment(tmp_path):
             "sha256": "a" * 64,
             "entry_count": 1,
         })
-        await manager.enable_dispatch(job_id)
+        await manager.store.enable_dispatch(job_id)
         assert await manager.claim_next(["D1"]) is not None
         await manager.prepare_dispatch(
             job_id,
