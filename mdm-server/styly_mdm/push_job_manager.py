@@ -32,6 +32,7 @@ from .push_jobs import (
     canonicalize_create_request,
     dispatch_permission,
     interrupted_queue_reason,
+    require_uuid,
     validate_device_transition,
 )
 
@@ -77,6 +78,48 @@ class PushJobManager:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.store, name)
+
+    def _reconcile_active_assignment(
+        self,
+        conn: sqlite3.Connection,
+        device_id: str,
+        *,
+        timestamp: int,
+        accept_timeout_ms: int,
+        reconciliation_timeout_ms: int,
+        reason: str,
+        unaccepted_reason: str | None = None,
+    ) -> str | None:
+        """Move current execution evidence to reconciliation in the caller's transaction."""
+        active = conn.execute(
+            "SELECT job_id, state, accepted_at FROM push_job_devices "
+            "WHERE device_id=? AND state IN "
+            "('dispatching','downloading','validating','applying')",
+            (device_id,),
+        ).fetchone()
+        if active is None:
+            return None
+
+        unaccepted = (
+            active["state"] == DeviceState.DISPATCHING.value
+            and active["accepted_at"] is None
+        )
+        timeout = accept_timeout_ms if unaccepted else reconciliation_timeout_ms
+        conn.execute(
+            "UPDATE push_job_devices SET state='reconciling', "
+            "reconciliation_reason=?, reconciliation_deadline=?, "
+            "accept_deadline=NULL, updated_at=? WHERE job_id=? AND device_id=?",
+            (
+                unaccepted_reason if unaccepted and unaccepted_reason is not None else reason,
+                timestamp + timeout,
+                timestamp,
+                active["job_id"],
+                device_id,
+            ),
+        )
+        self.store._increment_revision(conn, active["job_id"], timestamp)
+        self.store._rederive_job(conn, active["job_id"], timestamp)
+        return active["job_id"]
 
     @staticmethod
     def canonical_opaque_job_identity(active: Mapping[str, Any]) -> str | None:
@@ -171,8 +214,6 @@ class PushJobManager:
         so a device never starts this work merely because it reconnects.
         """
         online = set(online_devices)
-        from .push_jobs import require_uuid
-
         job_id = require_uuid(job_id, "job_id")
         client_request_id = require_uuid(client_request_id, "client_request_id")
         fingerprint = "retry_failed:" + job_id
@@ -273,7 +314,8 @@ class PushJobManager:
 
     async def settle_offline_before_dispatch(
         self, device_id: str, job_id: str | None = None, *,
-        disconnect_timeouts_ms: tuple[int, int] | None = None,
+        accept_timeout_ms: int | None = None,
+        reconciliation_timeout_ms: int | None = None,
     ) -> list[dict[str, Any]]:
         """Stop queued work of an offline device from starting when it reconnects.
 
@@ -287,6 +329,8 @@ class PushJobManager:
         operator Resume returns to the manual wait and a lost acceptance is no
         longer replayable, because either would start work on reconnect.
         """
+        if (accept_timeout_ms is None) != (reconciliation_timeout_ms is None):
+            raise ValueError("Disconnect timeouts must be provided together")
 
         def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             self.store._begin(conn)
@@ -363,29 +407,20 @@ class PushJobManager:
                     self.store._increment_revision(conn, row["job_id"], timestamp)
                     if row["job_id"] not in changed:
                         changed.append(row["job_id"])
-                if disconnect_timeouts_ms is not None:
+                if accept_timeout_ms is not None and reconciliation_timeout_ms is not None:
                     # This must commit with authority withdrawal above. A separate
                     # read/update would let acceptance timeout grant replay between them.
-                    active = conn.execute(
-                        "SELECT job_id, state, accepted_at FROM push_job_devices "
-                        "WHERE device_id=? AND state IN "
-                        "('dispatching','downloading','validating','applying')",
-                        (device_id,),
-                    ).fetchone()
-                    if active is not None:
-                        short = active["state"] == DeviceState.DISPATCHING.value and active["accepted_at"] is None
-                        timeout = disconnect_timeouts_ms[0 if short else 1]
-                        conn.execute(
-                            "UPDATE push_job_devices SET state='reconciling', "
-                            "reconciliation_reason=?, reconciliation_deadline=?, "
-                            "accept_deadline=NULL, updated_at=? WHERE job_id=? AND device_id=?",
-                            ("disconnect_before_accept" if short else "device_disconnect",
-                             timestamp + timeout, timestamp, active["job_id"], device_id),
-                        )
-                        self.store._increment_revision(conn, active["job_id"], timestamp)
-                        self.store._rederive_job(conn, active["job_id"], timestamp)
-                        if active["job_id"] not in changed:
-                            changed.append(active["job_id"])
+                    active_job_id = self._reconcile_active_assignment(
+                        conn,
+                        device_id,
+                        timestamp=timestamp,
+                        accept_timeout_ms=accept_timeout_ms,
+                        reconciliation_timeout_ms=reconciliation_timeout_ms,
+                        reason="device_disconnect",
+                        unaccepted_reason="disconnect_before_accept",
+                    )
+                    if active_job_id is not None and active_job_id not in changed:
+                        changed.append(active_job_id)
                 snapshots = [self.store._snapshot(conn, changed_job) for changed_job in changed]
                 self.store._commit(conn)
                 return snapshots
@@ -400,7 +435,9 @@ class PushJobManager:
     ) -> list[dict[str, Any]]:
         """Commit an offline event, including execution recovery, as one decision."""
         return await self.settle_offline_before_dispatch(
-            device_id, disconnect_timeouts_ms=(accept_timeout_ms, reconciliation_timeout_ms),
+            device_id,
+            accept_timeout_ms=accept_timeout_ms,
+            reconciliation_timeout_ms=reconciliation_timeout_ms,
         )
 
     async def reconcile_missing_runtime(
@@ -410,27 +447,19 @@ class PushJobManager:
         def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             self.store._begin(conn)
             try:
-                row = conn.execute(
-                    "SELECT job_id, state, accepted_at FROM push_job_devices "
-                    "WHERE device_id=? AND state IN "
-                    "('dispatching','downloading','validating','applying')",
-                    (device_id,),
-                ).fetchone()
-                if row is None:
+                timestamp = now_ms()
+                job_id = self._reconcile_active_assignment(
+                    conn,
+                    device_id,
+                    timestamp=timestamp,
+                    accept_timeout_ms=accept_timeout_ms,
+                    reconciliation_timeout_ms=reconciliation_timeout_ms,
+                    reason="client_runtime_absent",
+                )
+                if job_id is None:
                     self.store._commit(conn)
                     return []
-                timestamp = now_ms()
-                short = row["state"] == DeviceState.DISPATCHING.value and row["accepted_at"] is None
-                timeout = accept_timeout_ms if short else reconciliation_timeout_ms
-                conn.execute(
-                    "UPDATE push_job_devices SET state='reconciling', "
-                    "reconciliation_reason='client_runtime_absent', reconciliation_deadline=?, "
-                    "accept_deadline=NULL, updated_at=? WHERE job_id=? AND device_id=?",
-                    (timestamp + timeout, timestamp, row["job_id"], device_id),
-                )
-                self.store._increment_revision(conn, row["job_id"], timestamp)
-                self.store._rederive_job(conn, row["job_id"], timestamp)
-                snapshot = self.store._snapshot(conn, row["job_id"])
+                snapshot = self.store._snapshot(conn, job_id)
                 self.store._commit(conn)
                 return [snapshot]
             except BaseException:
@@ -783,6 +812,14 @@ class PushJobManager:
                 if row["attempt"] != 1:
                     raise StoreConflict("stale_attempt")
                 current = DeviceState(row["state"])
+                if current is DeviceState.DISPATCHING:
+                    # A second call must stay an error: the scheduler treats a
+                    # DISPATCHING snapshot as permission to send the command.
+                    raise StoreConflict("assignment is already dispatching")
+                if current is not DeviceState.WAITING_TRANSFER:
+                    snapshot = self.store._snapshot(conn, job_id)
+                    self.store._commit(conn)
+                    return snapshot
                 validate_device_transition(current, DeviceState.DISPATCHING)
                 timestamp = now_ms()
                 if (
