@@ -16,6 +16,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.ScheduledFuture
 
 class PushJobCoordinatorIntegrationTest {
     private val harnesses = CopyOnWriteArrayList<Harness>()
@@ -27,17 +29,28 @@ class PushJobCoordinatorIntegrationTest {
         private val loadStateOverride: (() -> PushStateLoadResult)? = null,
         private val attemptDirectoryOverride: ((PushProtocol.Command) -> File)? = null,
         private val cleanupOverride: ((File) -> Unit)? = null,
+        initialClock: PushRetentionClock = PushRetentionClock(1, 0L),
     ) {
         val durableState = AtomicReference(initialState)
+        val clock = AtomicReference(initialClock)
+        val scheduledDelays = CopyOnWriteArrayList<Long>()
+        val checkpointTask = AtomicReference<Runnable?>()
+        @Volatile var clockUnavailable = false
         val messages = CopyOnWriteArrayList<JSONObject>()
         val events = CopyOnWriteArrayList<String>()
         val cleanedDirectories = CopyOnWriteArrayList<File>()
         val workerRuns = AtomicInteger()
         val cleanupCalls = AtomicInteger()
         val discardCalls = AtomicInteger()
-        private val actor = Executors.newSingleThreadScheduledExecutor { runnable ->
+        private val actor = object : ScheduledThreadPoolExecutor(1, { runnable ->
             Thread(runnable, "push-coordinator-test-actor").apply { isDaemon = true }
-        }
+        }) {
+            override fun schedule(command: Runnable, delay: Long, unit: TimeUnit): ScheduledFuture<*> {
+                scheduledDelays.add(unit.toMillis(delay))
+                if (unit.toMillis(delay) == PUSH_RETENTION_CHECKPOINT_MS) checkpointTask.set(command)
+                return super.schedule(command, delay, unit)
+            }
+        }.apply { removeOnCancelPolicy = true }
         private val workerExecutor = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "push-coordinator-test-worker").apply { isDaemon = true }
         }
@@ -84,6 +97,10 @@ class PushJobCoordinatorIntegrationTest {
                 actor = actor,
                 workerExecutor = workerExecutor,
                 log = { _, _, _ -> },
+                retentionClock = {
+                    check(!clockUnavailable) { "injected boot count lookup failure" }
+                    clock.get()
+                },
             ),
             retryDelayMs,
             recoveryMaxAttempts,
@@ -127,6 +144,11 @@ class PushJobCoordinatorIntegrationTest {
             }
             assertTrue("coordinator actor did not respond", ready.await(2, TimeUnit.SECONDS))
             return requireNotNull(result.get())
+        }
+
+        fun runCheckpoint() {
+            actor.execute(requireNotNull(checkpointTask.get()))
+            snapshot()
         }
 
         fun blockActor(started: CountDownLatch, release: CountDownLatch) {
@@ -397,7 +419,7 @@ class PushJobCoordinatorIntegrationTest {
                 saved,
                 PushProtocol.PHASE_DOWNLOADING,
                 interrupted = true,
-                interruptedAt = System.currentTimeMillis(),
+                retention = PushProtocol.Retention(PushFilesWorker.PARTIAL_RETENTION_MS, 1, 0L),
             ),
             pendingResults = emptyList(),
             completedReceipts = emptyList(),
@@ -538,6 +560,202 @@ class PushJobCoordinatorIntegrationTest {
             downloads.deleteRecursively()
         }
     }
+
+    @Test
+    fun `periodic checkpoint saves five minutes and shutdown saves the final interval`() {
+        val harness = Harness(retainedState(600_000L))
+        harness.attach()
+        assertTrue(harness.scheduledDelays.contains(5 * 60_000L))
+        harness.clock.set(PushRetentionClock(1, 300_000L))
+        harness.runCheckpoint()
+        assertEquals(300_000L, harness.durableState.get().active?.retention?.remainingMs)
+        harness.clock.set(PushRetentionClock(1, 320_000L))
+        assertTrue(harness.coordinator.checkpointBeforeShutdown())
+        assertEquals(280_000L, harness.durableState.get().active?.retention?.remainingMs)
+        assertEquals(320_000L, harness.durableState.get().active?.retention?.elapsedRealtimeMs)
+        assertEquals(0, harness.cleanupCalls.get())
+    }
+
+    @Test
+    fun `shutdown waits for the serialized write before returning`() {
+        val harness = Harness(retainedState(600_000L))
+        harness.attach()
+        harness.clock.set(PushRetentionClock(1, 10_000L))
+        val writeStarted = CountDownLatch(1)
+        val releaseWrite = CountDownLatch(1)
+        val returned = CountDownLatch(1)
+        val result = AtomicBoolean(false)
+        harness.beforeSave = {
+            writeStarted.countDown()
+            releaseWrite.await()
+        }
+        val shutdown = Thread {
+            result.set(harness.coordinator.checkpointBeforeShutdown())
+            returned.countDown()
+        }.apply { start() }
+        try {
+            assertTrue(writeStarted.await(2, TimeUnit.SECONDS))
+            assertFalse(returned.await(50, TimeUnit.MILLISECONDS))
+            assertEquals(600_000L, harness.durableState.get().active?.retention?.remainingMs)
+        } finally {
+            releaseWrite.countDown()
+            shutdown.join(2_000L)
+        }
+        assertTrue(result.get())
+        assertEquals(590_000L, harness.durableState.get().active?.retention?.remainingMs)
+    }
+
+    @Test
+    fun `shutdown timeout cancels queued checkpoint without an unsynchronized save`() {
+        val harness = Harness(retainedState(600_000L))
+        harness.attach()
+        val started = CountDownLatch(1)
+        val releaseActor = CountDownLatch(1)
+        harness.blockActor(started, releaseActor)
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+        harness.clock.set(PushRetentionClock(1, 10_000L))
+        try {
+            assertFalse(harness.coordinator.checkpointBeforeShutdown())
+            assertEquals(600_000L, harness.durableState.get().active?.retention?.remainingMs)
+        } finally {
+            releaseActor.countDown()
+        }
+        harness.snapshot()
+        assertEquals(600_000L, harness.durableState.get().active?.retention?.remainingMs)
+    }
+
+    @Test
+    fun `process restart counts same boot downtime while reboot preserves saved budget`() {
+        val saved = retainedState(600_000L)
+        val restarted = Harness(saved, initialClock = PushRetentionClock(1, 180_000L))
+        restarted.attach()
+        assertEquals(420_000L, restarted.durableState.get().active?.retention?.remainingMs)
+        val rebooted = Harness(restarted.durableState.get(), initialClock = PushRetentionClock(2, 1_000L))
+        rebooted.attach()
+        assertEquals(PushProtocol.Retention(420_000L, 2, 1_000L), rebooted.durableState.get().active?.retention)
+    }
+
+    @Test
+    fun `registration after sleep settles expired ownership before reporting it`() {
+        val harness = Harness(retainedState(600_000L))
+        harness.attach()
+        harness.clock.set(PushRetentionClock(1, 600_000L))
+        val registration = harness.snapshot()
+        assertTrue(registration.getJSONObject("push_runtime").isNull("active"))
+        assertEquals("resume_expired", harness.durableState.get().pendingResults.single().result.failureCode)
+        await { harness.cleanupCalls.get() == 1 && harness.events.contains("cleanup") }
+        assertEquals(1, harness.cleanupCalls.get())
+        assertTrue(harness.events.indexOf("save:result") < harness.events.indexOf("cleanup"))
+    }
+
+    @Test
+    fun `reconcile and exact resume recheck expiry without waiting for the timer`() {
+        for (type in listOf("PUSH_RECONCILE_REQUEST", "EXECUTE_PUSH_FILES")) {
+            val initial = retainedState(600_000L)
+            val command = requireNotNull(initial.active).command
+            val harness = Harness(initial)
+            harness.attach()
+            harness.clock.set(PushRetentionClock(1, 600_000L))
+            val payload = if (type == "EXECUTE_PUSH_FILES") command.toJson() else JSONObject().apply {
+                put("jobs", org.json.JSONArray().put(JSONObject().apply {
+                    put("job_id", command.jobId)
+                    put("attempt", command.attempt)
+                    put("artifact_id", command.artifactId)
+                }))
+            }
+            harness.coordinator.handleServerMessage(type, payload)
+            await {
+                harness.messages.any { it.optString("failure_code") == "resume_expired" } &&
+                    harness.cleanupCalls.get() == 1
+            }
+            assertEquals(0, harness.workerRuns.get())
+            assertEquals(1, harness.cleanupCalls.get())
+        }
+    }
+
+    @Test
+    fun `resume retains budget and shutdown checkpoint never cleans a running worker`() {
+        val initial = retainedState(600_000L)
+        val command = requireNotNull(initial.active).command
+        val release = CountDownLatch(1)
+        val harness = Harness(initial).apply {
+            runExecution = { current, _ ->
+                release.await()
+                execution(current, interruptionReason = "download_interrupted")
+            }
+        }
+        harness.attach()
+        harness.clock.set(PushRetentionClock(1, 100_000L))
+        harness.send(command)
+        await { harness.workerRuns.get() == 1 }
+        assertEquals(500_000L, harness.durableState.get().active?.retention?.remainingMs)
+        harness.clock.set(PushRetentionClock(1, 700_000L))
+        assertTrue(harness.coordinator.checkpointBeforeShutdown())
+        assertEquals(0L, harness.durableState.get().active?.retention?.remainingMs)
+        assertFalse(requireNotNull(harness.durableState.get().active).interrupted)
+        assertEquals(0, harness.cleanupCalls.get())
+        release.countDown()
+        await {
+            harness.durableState.get().pendingResults.any { it.result.failureCode == "resume_expired" } &&
+                harness.cleanupCalls.get() == 1
+        }
+        assertEquals(1, harness.cleanupCalls.get())
+    }
+
+    @Test
+    fun `checkpoint failure retains saved budget and expiry failure never releases ownership`() {
+        val harness = Harness(retainedState(600_000L))
+        harness.attach()
+        val saved = harness.durableState.get()
+        harness.shouldFailSave = { true }
+        harness.clock.set(PushRetentionClock(1, 300_000L))
+        harness.runCheckpoint()
+        assertEquals(saved, harness.durableState.get())
+        harness.clock.set(PushRetentionClock(1, 600_000L))
+        assertFalse(harness.coordinator.checkpointBeforeShutdown())
+        assertEquals(saved, harness.durableState.get())
+        assertEquals(0, harness.cleanupCalls.get())
+        assertFalse(harness.messages.any { it.optString("type") == "PUSH_FILES_RESULT" })
+        assertEquals("unavailable", harness.snapshot().getJSONObject("push_state").getString("status"))
+    }
+
+    @Test
+    fun `missing boot count retains existing ownership without assuming a new boot`() {
+        val harness = Harness(retainedState(600_000L))
+        harness.attach()
+        val saved = harness.durableState.get()
+        harness.clockUnavailable = true
+        assertFalse(harness.coordinator.checkpointBeforeShutdown())
+        assertEquals(saved, harness.durableState.get())
+        assertEquals(0, harness.cleanupCalls.get())
+        assertEquals("unavailable", harness.snapshot().getJSONObject("push_state").getString("status"))
+    }
+
+    @Test
+    fun `legacy interrupted wall clock state gets one durable budget before registration`() {
+        val legacy = PushProtocol.stateToJson(retainedState(600_000L)).apply {
+            put("state_version", 1)
+            getJSONObject("active").apply {
+                remove("retention")
+                put("interrupted_at", 1L)
+            }
+        }
+        val harness = Harness(PushProtocol.stateFromJson(legacy), initialClock = PushRetentionClock(3, 10_000L))
+        val registration = harness.snapshot()
+        assertEquals("available", registration.getJSONObject("push_state").getString("status"))
+        assertEquals(
+            PushProtocol.Retention(PushFilesWorker.PARTIAL_RETENTION_MS, 3, 10_000L),
+            harness.durableState.get().active?.retention,
+        )
+        assertEquals(2, PushProtocol.stateToJson(harness.durableState.get()).getInt("state_version"))
+    }
+
+    private fun retainedState(remainingMs: Long) = PushProtocol.State(
+        PushProtocol.Active(
+            command(), PushProtocol.PHASE_DOWNLOADING, interrupted = true,
+            retention = PushProtocol.Retention(remainingMs, 1, 0L),
+        ), emptyList(), emptyList(),
+    )
 
     private fun await(timeoutMs: Long = 3_000L, condition: () -> Boolean) {
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)

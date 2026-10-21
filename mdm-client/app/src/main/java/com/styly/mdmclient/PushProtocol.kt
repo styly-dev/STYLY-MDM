@@ -16,7 +16,7 @@ internal class UnsupportedPushStateVersionException(version: String) :
     IllegalArgumentException("Unsupported durable Push/Sync state version: $version")
 
 object PushProtocol {
-    const val DURABLE_STATE_VERSION = 1
+    const val DURABLE_STATE_VERSION = 2
     const val CAP_PUSH_JOB_ID_V1 = "push_job_id_v1"
     const val CAP_PUSH_RESUME_V1 = "push_resume_v1"
     const val ATTEMPT_V1 = 1
@@ -89,13 +89,40 @@ object PushProtocol {
         val artifactEtag: String?,
     )
 
+    /** A saved budget of powered-on time, including deep sleep, after the first interruption. */
+    data class Retention(
+        val remainingMs: Long,
+        val bootCount: Int,
+        val elapsedRealtimeMs: Long,
+    ) {
+        init {
+            require(remainingMs in 0L..PushFilesWorker.PARTIAL_RETENTION_MS)
+            require(bootCount >= 0)
+            require(elapsedRealtimeMs >= 0L)
+        }
+
+        fun checkpoint(bootCount: Int, elapsedRealtimeMs: Long): Retention {
+            val elapsed = if (this.bootCount == bootCount) {
+                require(elapsedRealtimeMs >= this.elapsedRealtimeMs) { "Monotonic clock moved backwards" }
+                elapsedRealtimeMs - this.elapsedRealtimeMs
+            } else 0L // Time since the last checkpoint cannot be recovered across a reboot.
+            return Retention((remainingMs - elapsed).coerceAtLeast(0L), bootCount, elapsedRealtimeMs)
+        }
+
+        fun toJson(): JSONObject = JSONObject().apply {
+            put("remaining_ms", remainingMs)
+            put("boot_count", bootCount)
+            put("elapsed_realtime_ms", elapsedRealtimeMs)
+        }
+    }
+
     data class Active(
         val command: Command,
         val phase: String,
         /** True when the process restarted while the durable worker was active. */
         val interrupted: Boolean = false,
-        /** First recovery time; bounds how long stale work can fence the device. */
-        val interruptedAt: Long? = null,
+        /** Retained across Resume; null until the first interruption. */
+        val retention: Retention? = null,
         /** Why the worker paused; retained only while [interrupted] is true. */
         val interruptionReason: String? = null,
     ) {
@@ -103,7 +130,7 @@ object PushProtocol {
             put("command", command.toJson())
             put("phase", phase)
             put("interrupted", interrupted)
-            if (interruptedAt != null) put("interrupted_at", interruptedAt)
+            if (retention != null) put("retention", retention.toJson())
             if (interruptionReason != null) put("interruption_reason", interruptionReason)
         }
     }
@@ -315,7 +342,7 @@ object PushProtocol {
                     parseStoredCommand(it.getJSONObject("command")),
                     it.getString("phase"),
                     it.optBoolean("interrupted", false),
-                    it.optLong("interrupted_at", 0L).takeIf { value -> value > 0L },
+                    parseRetention(it, json.optInt("state_version", 0)),
                     optionalString(it, "interruption_reason")?.ifBlank { null },
                 )
             }
@@ -353,6 +380,23 @@ object PushProtocol {
             throw InvalidPushReceiptsException(name, error)
         }
         return State(active, receipts("pending_results"), receipts("completed_receipts"))
+    }
+
+    private fun parseRetention(active: JSONObject, version: Int): Retention? {
+        if (version < 2) return null // Recovery grants old wall-clock records one fresh budget.
+        if (!active.has("retention")) {
+            require(!active.optBoolean("interrupted", false)) { "Interrupted state has no retention budget" }
+            return null
+        }
+        val value = active.getJSONObject("retention")
+        fun integer(name: String): Long = when (val field = value.get(name)) {
+            is Int -> field.toLong()
+            is Long -> field
+            else -> throw IllegalArgumentException("Invalid retention field: $name")
+        }
+        val bootCount = integer("boot_count")
+        require(bootCount in 0L..Int.MAX_VALUE.toLong())
+        return Retention(integer("remaining_ms"), bootCount.toInt(), integer("elapsed_realtime_ms"))
     }
 
     private fun validateStateVersion(json: JSONObject) {

@@ -11,6 +11,32 @@ import org.junit.Test
 
 class PushJobStoreLoadTest {
     @Test
+    fun `malformed retention is preserved as invalid active instead of resetting the budget`() {
+        val malformed = listOf(
+            "{}",
+            "{\"remaining_ms\":-1,\"boot_count\":1,\"elapsed_realtime_ms\":0}",
+            "{\"remaining_ms\":86400001,\"boot_count\":1,\"elapsed_realtime_ms\":0}",
+            "{\"remaining_ms\":1,\"boot_count\":-1,\"elapsed_realtime_ms\":0}",
+            "{\"remaining_ms\":1,\"boot_count\":1,\"elapsed_realtime_ms\":-1}",
+            "{\"remaining_ms\":\"1\",\"boot_count\":1,\"elapsed_realtime_ms\":0}",
+            "{\"remaining_ms\":1,\"boot_count\":1.5,\"elapsed_realtime_ms\":0}",
+        )
+        for (value in malformed + listOf("missing", "null")) {
+            val json = PushProtocol.stateToJson(PushProtocol.State(
+                PushProtocol.Active(pushTestCommand(), PushProtocol.PHASE_DOWNLOADING, interrupted = true),
+                emptyList(), emptyList(),
+            ))
+            if (value != "missing") json.getJSONObject("active").put(
+                "retention", if (value == "null") org.json.JSONObject.NULL else org.json.JSONObject(value),
+            )
+            assertTrue(
+                "must retain malformed budget: $value",
+                loadPushState({ json.toString() }, { it }, { true }) is PushStateLoadResult.InvalidActive,
+            )
+        }
+    }
+
+    @Test
     fun missingStateIsDistinctFromValidEmptyState() {
         val result = loadPushState(
             readText = { throw FileNotFoundException("missing") },
@@ -90,7 +116,7 @@ class PushJobStoreLoadTest {
     @Test
     fun unsupportedStateVersionsArePreservedAsUnavailable() {
         val examples = listOf(
-            "future integer" to "{\"state_version\":2,\"active\":null,\"pending_results\":[],\"completed_receipts\":[]}",
+            "future integer" to "{\"state_version\":3,\"active\":null,\"pending_results\":[],\"completed_receipts\":[]}",
             "unknown encoding" to "{\"state_version\":\"future\",\"active\":null,\"pending_results\":[],\"completed_receipts\":[]}",
         )
         for ((label, json) in examples) {
