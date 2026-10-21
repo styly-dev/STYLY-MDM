@@ -14,8 +14,11 @@
   const pushJobs = new Map();
   const jobEntries = new Map();
   const renderedDeviceIds = new Set();
-  const pendingUploads = new Map();
+  const submissions = new Map();
+  const pendingDispatches = new Map();
+  const pendingActions = new Map();
   const retryRequestIds = new Map();
+  const pendingActionTimeoutMs = 15000;
   let currentAdminSocket = null;
   let awaitingInitialSnapshot = false;
   let bufferedUpdates = new Map();
@@ -35,18 +38,8 @@
       hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20);
   }
 
-  function jsonResponse(body, status) {
-    return new Response(JSON.stringify(body), {
-      status: status || 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  }
-
-  function bundleInfo(formData) {
-    const files = [];
-    formData.forEach(function (value, key) {
-      if (key === 'files' && value instanceof File) files.push(value);
-    });
+  function bundleInfo(files) {
+    files = Array.from(files || []);
     const paths = files.map(function (file) {
       return file.webkitRelativePath || file.name || 'file';
     });
@@ -66,32 +59,16 @@
       }
     }
     const bytes = files.reduce(function (sum, file) { return sum + file.size; }, 0);
-    return { files: files, display: display, bytes: bytes };
+    return { fileCount: files.length, display: display, bytes: bytes };
   }
 
-  window.fetch = function (input, init) {
-    const url = typeof input === 'string' ? input : (input && input.url) || '';
-    if (url === '/api/bundles' && init && init.method === 'POST' &&
-        init.body instanceof FormData) {
-      const requestId = uuid();
-      const info = bundleInfo(init.body);
-      pendingUploads.set(requestId, {
-        requestId: requestId,
-        formData: init.body,
-        info: info,
-      });
-      // The legacy inline UI will send this opaque marker in its next PUSH_FILES
-      // frame. No bytes cross the network until the server has created a job_id.
-      return Promise.resolve(jsonResponse({
-        bundle_filename: info.display + '.zip',
-        bundle_url: 'push-job://pending/' + requestId,
-        size: info.bytes,
-        entry_count: info.files.length,
-        skipped_count: 0,
-      }));
-    }
-    return nativeFetch(input, init);
-  };
+  function formDataFor(files) {
+    const formData = new FormData();
+    files.forEach(function (file) {
+      formData.append('files', file, file.webkitRelativePath || file.name);
+    });
+    return formData;
+  }
 
   function appendLog(text, level) {
     const container = document.getElementById('logContainer');
@@ -119,67 +96,383 @@
     });
   }
 
-  function createUploadDispatch(legacyMessage, staged) {
-    const source = staged.info;
-    const createBody = {
-      client_request_id: staged.requestId,
-      target_devices: legacyMessage.target_devices || [],
-      mode: legacyMessage.delete_extras === true ? 'sync' : 'push',
-      dest_path: legacyMessage.dest_path,
-      source: {
-        display_name: source.display,
-        declared_file_count: source.files.length,
-        declared_total_bytes: source.bytes,
-      },
-    };
-    appendLog('Creating Push/Sync job before upload…', 'info');
-    nativeFetch('/api/push-jobs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(createBody),
-    }).then(checkedJson).then(function (created) {
-      appendLog('Created job ' + created.job_id.slice(0, 8) + '; uploading artifact…', 'info');
-      if (created.state !== 'created' && created.state !== 'uploading') return created;
-      return nativeFetch(created.upload_url, { method: 'POST', body: staged.formData })
-        .then(checkedJson);
-    }).then(function (ready) {
-      if (!ready || ['ready', 'running', 'reconciling'].indexOf(ready.state) < 0) {
-        throw new Error('job is not dispatchable after upload');
+  function submitPushJob(options) {
+    const files = Array.from(options && options.files || []);
+    const targets = Array.from(options && options.targets || []);
+    const mode = options && options.mode;
+    const destPath = String(options && options.destPath || '').trim();
+    const requestId = options && options.clientRequestId || uuid();
+    if (!files.length) return Promise.reject(new Error('No files selected'));
+    if (!targets.length) return Promise.reject(new Error('No online devices selected'));
+    if (!destPath) return Promise.reject(new Error('Destination path is required'));
+    if (mode !== 'push' && mode !== 'sync') return Promise.reject(new Error('Invalid Push/Sync mode'));
+
+    const info = bundleInfo(files);
+    const fingerprint = JSON.stringify({
+      files: files.map(function (file) {
+        return [file.webkitRelativePath || file.name, file.size, file.lastModified];
+      }),
+      targets: targets,
+      mode: mode,
+      destPath: destPath,
+    });
+    let submission = submissions.get(requestId);
+    if (submission && submission.fingerprint !== fingerprint) {
+      return Promise.reject(new Error('This request ID already belongs to a different Push/Sync selection'));
+    }
+    if (!submission) {
+      submission = {
+        requestId: requestId,
+        fingerprint: fingerprint,
+        formData: null,
+        info: info,
+        targets: targets,
+        mode: mode,
+        destPath: destPath,
+        phase: 'new',
+        jobId: null,
+        promise: null,
+        dispatchPromise: null,
+        dispatchResolve: null,
+        dispatchReject: null,
+        dispatchTimer: null,
+        dispatchSocket: null,
+      };
+      submissions.set(requestId, submission);
+    }
+    if (submission.phase === 'terminal') {
+      return Promise.reject(terminalSubmissionError(submission, submission.terminalState));
+    }
+    if (submission.phase === 'dispatched') {
+      return Promise.resolve({ job_id: submission.jobId, state: 'dispatched' });
+    }
+    if (submission.promise) return submission.promise;
+    if (submission.phase !== 'ready') submission.formData = formDataFor(files);
+
+    function dispatchReady() {
+      if (submission.phase === 'dispatched') {
+        return Promise.resolve({ job_id: submission.jobId, state: 'dispatched' });
+      }
+      if (submission.phase === 'terminal') {
+        throw terminalSubmissionError(submission, submission.terminalState);
       }
       if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) {
-        throw new Error('admin WebSocket is not connected');
+        const error = new Error('Push/Sync job is ready; admin WebSocket is disconnected. Reconnect and retry to dispatch without uploading again.');
+        error.code = 'dispatch_disconnected';
+        error.job_id = submission.jobId;
+        throw error;
       }
-      nativeSend.call(currentAdminSocket, JSON.stringify({
-        type: 'PUSH_FILES',
-        job_id: ready.job_id,
-      }));
-      appendLog('Dispatched job ' + ready.job_id.slice(0, 8) +
-        ' after immutable artifact publication', 'success');
+      return new Promise(function (resolve, reject) {
+        submission.dispatchPromise = true;
+        submission.dispatchResolve = resolve;
+        submission.dispatchReject = reject;
+        submission.dispatchSocket = currentAdminSocket;
+        pendingDispatches.set(submission.jobId, submission);
+        submission.dispatchTimer = setTimeout(function () {
+          if (pendingDispatches.get(submission.jobId) !== submission) return;
+          pendingDispatches.delete(submission.jobId);
+          submission.dispatchPromise = null;
+          submission.dispatchResolve = null;
+          submission.dispatchReject = null;
+          submission.dispatchSocket = null;
+          const error = new Error('Dispatch was sent but no server acknowledgement arrived. Retry to dispatch the same ready job without uploading again.');
+          error.code = 'dispatch_unconfirmed';
+          error.job_id = submission.jobId;
+          reject(error);
+        }, 15000);
+        if (submission.dispatchTimer && typeof submission.dispatchTimer.unref === 'function') {
+          submission.dispatchTimer.unref();
+        }
+        try {
+          nativeSend.call(currentAdminSocket, JSON.stringify({
+            type: 'PUSH_FILES',
+            job_id: submission.jobId,
+          }));
+        } catch (error) {
+          clearTimeout(submission.dispatchTimer);
+          pendingDispatches.delete(submission.jobId);
+          submission.dispatchPromise = null;
+          submission.dispatchResolve = null;
+          submission.dispatchReject = null;
+          submission.dispatchSocket = null;
+          error.job_id = submission.jobId;
+          reject(error);
+        }
+      });
+    }
+
+    function reconcileCreateState(created) {
+      if (submission.jobId && submission.jobId !== created.job_id) {
+        throw new Error('Idempotent Push/Sync request returned a different job ID');
+      }
+      submission.jobId = created.job_id;
+      if (submission.phase === 'dispatched') return Promise.resolve();
+      if (submission.phase === 'terminal') {
+        throw terminalSubmissionError(submission, submission.terminalState);
+      }
+      if (isTerminalJobState(created.state)) {
+        if (dispatchAccepted(created)) {
+          submission.phase = 'dispatched';
+          return Promise.resolve();
+        }
+        markSubmissionTerminal(submission, created.state);
+        throw terminalSubmissionError(submission, created.state);
+      }
+      if (submission.phase === 'ready') return Promise.resolve();
+      if (created.state === 'ready' || created.dispatch_enabled === true ||
+          created.state === 'running' || created.state === 'reconciling') {
+        setSubmissionPhase(submission, 'ready');
+        return Promise.resolve();
+      }
+      if (created.state === 'created') {
+        setSubmissionPhase(submission, 'uploading');
+        return nativeFetch(created.upload_url, {
+          method: 'POST', body: submission.formData,
+        }).then(checkedJson).then(function (uploaded) {
+          if (uploaded.state !== 'ready' && uploaded.dispatch_enabled !== true) {
+            setSubmissionPhase(submission, 'upload_unknown');
+            throw new Error('job is not ready after upload');
+          }
+          setSubmissionPhase(submission, 'ready');
+        }, function (error) {
+          // The request may have reached the server even when its response was lost.
+          // A retry re-reads the idempotent create response before sending any bytes.
+          setSubmissionPhase(submission, 'upload_unknown');
+          throw error;
+        });
+      }
+      if (created.state === 'uploading' || created.state === 'packaging') {
+        setSubmissionPhase(submission, 'upload_unknown');
+        const error = new Error('Upload is still being processed by the server. Keep the selection and retry after its job snapshot changes.');
+        error.code = 'upload_in_progress';
+        error.job_id = submission.jobId;
+        throw error;
+      }
+      const error = new Error('Push/Sync job cannot be uploaded or dispatched in state: ' + created.state);
+      error.job_id = submission.jobId;
+      error.retryWithNewRequestId = true;
+      throw error;
+    }
+
+    submission.promise = Promise.resolve().then(function () {
+      if (submission.phase === 'ready') return;
+      if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) {
+        throw new Error('Admin WebSocket is disconnected');
+      }
+      const source = submission.info;
+      const createBody = {
+        client_request_id: submission.requestId,
+        target_devices: submission.targets,
+        mode: submission.mode,
+        dest_path: submission.destPath,
+        source: {
+          display_name: source.display,
+          declared_file_count: source.fileCount,
+          declared_total_bytes: source.bytes,
+        },
+      };
+      appendLog('Creating Push/Sync job before upload…', 'info');
+      return nativeFetch('/api/push-jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(createBody),
+      }).then(checkedJson).then(reconcileCreateState);
+    }).then(function () {
+      return dispatchReady();
+    }).then(function (result) {
+      return result;
     }).catch(function (error) {
-      appendLog('Push/Sync job failed before dispatch: ' + error.message, 'fail');
+      appendLog('Push/Sync job ' + (submission.jobId ? '#' + submission.jobId.slice(0, 8) : 'request') +
+        ' failed: ' + error.message, 'fail');
+      throw error;
+    }).finally(function () {
+      // Keep selected File objects only while an upload request is active. A later
+      // retry can rebuild FormData from the panel's retained selection.
+      submission.formData = null;
+      submission.promise = null;
+    });
+    return submission.promise;
+  }
+
+  function settleDispatch(submission, error) {
+    if (!submission || !submission.dispatchPromise) return false;
+    if (submission.dispatchTimer) clearTimeout(submission.dispatchTimer);
+    pendingDispatches.delete(submission.jobId);
+    const resolve = submission.dispatchResolve;
+    const reject = submission.dispatchReject;
+    submission.dispatchPromise = null;
+    submission.dispatchResolve = null;
+    submission.dispatchReject = null;
+    submission.dispatchSocket = null;
+    if (error) {
+      const dispatchError = new Error(error.message || String(error));
+      dispatchError.code = error.code || 'dispatch_failed';
+      dispatchError.job_id = submission.jobId;
+      if (error.retryWithNewRequestId) dispatchError.retryWithNewRequestId = true;
+      reject(dispatchError);
+    } else {
+      submission.phase = 'dispatched';
+      appendLog('Dispatched job ' + submission.jobId.slice(0, 8) +
+        ' after immutable artifact publication', 'success');
+      resolve({ job_id: submission.jobId, state: 'dispatched' });
+    }
+    return true;
+  }
+
+  function settleSubmissionFromJob(job) {
+    if (!validJob(job)) return;
+    submissions.forEach(function (submission) {
+      if (submission.jobId !== job.job_id &&
+          !(submission.jobId === null && job.client_request_id === submission.requestId)) return;
+      submission.jobId = job.job_id;
+      if (isTerminalJobState(job.state)) {
+        if (dispatchAccepted(job)) {
+          submission.phase = 'dispatched';
+          settleDispatch(submission, null);
+        } else {
+          markSubmissionTerminal(submission, job.state);
+          settleDispatch(submission, {
+            message: 'Push/Sync job is already terminal (' + job.state + '). Retry as a new job.',
+            code: 'submission_terminal',
+            retryWithNewRequestId: true,
+          });
+        }
+        return;
+      }
+      if (job.state === 'ready' || job.dispatch_enabled === true ||
+          job.state === 'running' || job.state === 'reconciling') {
+        setSubmissionPhase(submission, 'ready');
+      }
+      if (job.dispatch_enabled === true || job.state === 'running' ||
+          job.state === 'reconciling') {
+        settleDispatch(submission, null);
+      }
     });
   }
 
-  NativeWebSocket.prototype.send = function (data) {
-    if (typeof data === 'string') {
-      try {
-        const message = JSON.parse(data);
-        if (message && message.type === 'PUSH_FILES' && !message.job_id) {
-          const match = /^push-job:\/\/pending\/([0-9a-f-]+)$/i.exec(
-            String(message.bundle_url || ''),
-          );
-          const requestId = match && match[1];
-          const staged = requestId ? pendingUploads.get(requestId) : null;
-          if (staged) {
-            pendingUploads.delete(requestId);
-            createUploadDispatch(message, staged);
-            return;
-          }
-        }
-      } catch (_ignored) {}
+  function isTerminalJobState(state) {
+    return ['succeeded', 'completed_with_errors', 'failed', 'interrupted'].indexOf(state) >= 0;
+  }
+
+  function dispatchAccepted(job) {
+    return job.dispatch_enabled === true ||
+      job.state === 'succeeded' || job.state === 'completed_with_errors';
+  }
+
+  function markSubmissionTerminal(submission, state) {
+    submission.phase = 'terminal';
+    submission.terminalState = state;
+  }
+
+  function setSubmissionPhase(submission, phase) {
+    if (submission.phase !== 'terminal' && submission.phase !== 'dispatched') {
+      submission.phase = phase;
     }
-    return nativeSend.call(this, data);
-  };
+  }
+
+  function terminalSubmissionError(submission, state) {
+    const error = new Error('Push/Sync job is already terminal' +
+      (state ? ' (' + state + ')' : '') + '. Retry as a new job.');
+    error.code = 'submission_terminal';
+    error.job_id = submission.jobId;
+    error.retryWithNewRequestId = true;
+    return error;
+  }
+
+  function settlePendingAction(key) {
+    const pending = pendingActions.get(key);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    pendingActions.delete(key);
+    refreshPendingActionDevices(pending.targets);
+    renderPausedJobs();
+    return true;
+  }
+
+  function refreshPendingActionDevices(deviceIds) {
+    const bridge = window.__stylyPushJobsV1Bridge;
+    if (!bridge || typeof bridge.invalidateDevice !== 'function') return;
+    Array.from(new Set(deviceIds || [])).forEach(function (deviceId) {
+      bridge.invalidateDevice(deviceId);
+    });
+  }
+
+  function actionKey(action, jobId, targets) {
+    return action + ':' + jobId + ':' + Array.from(targets || []).slice().sort().join(',');
+  }
+
+  function isActionPending(action, jobId) {
+    let found = false;
+    pendingActions.forEach(function (pending) {
+      if (pending.action === action && (!jobId || pending.jobId === jobId)) found = true;
+    });
+    return found;
+  }
+
+  function isDeviceActionPending(action, jobId, deviceId) {
+    let found = false;
+    pendingActions.forEach(function (pending) {
+      if (pending.action === action && pending.jobId === jobId &&
+          pending.targets.indexOf(deviceId) >= 0) found = true;
+    });
+    return found;
+  }
+
+  function trackAction(action, jobId, targets, clientRequestId, shouldRender) {
+    const key = actionKey(action, jobId, targets);
+    if (pendingActions.has(key)) return false;
+    const pending = {
+      key: key,
+      action: action,
+      jobId: jobId,
+      targets: Array.from(targets || []),
+      clientRequestId: clientRequestId || null,
+      socket: currentAdminSocket,
+      timer: null,
+    };
+    pending.timer = setTimeout(function () { settlePendingAction(key); }, pendingActionTimeoutMs);
+    if (pending.timer && typeof pending.timer.unref === 'function') pending.timer.unref();
+    pendingActions.set(key, pending);
+    refreshPendingActionDevices(pending.targets);
+    if (shouldRender !== false) renderPausedJobs();
+    return true;
+  }
+
+  function settleActionsFromJob(job) {
+    pendingActions.forEach(function (pending, key) {
+      if (pending.action === 'retry') {
+        if (job.client_request_id === pending.clientRequestId) settlePendingAction(key);
+        return;
+      }
+      if (pending.jobId !== job.job_id) return;
+      const assignments = pending.targets.map(function (deviceId) {
+        return job.devices && job.devices[deviceId];
+      });
+      if (pending.action === 'resume' && assignments.every(function (assignment) {
+        return !!assignment && assignment.resume_required !== true;
+      })) settlePendingAction(key);
+      else if (pending.action === 'cancel' && assignments.every(function (assignment) {
+        return !!assignment && (assignment.cancel_requested === true ||
+          ['succeeded', 'failed', 'interrupted'].indexOf(assignment.state) >= 0);
+      })) settlePendingAction(key);
+      else if (pending.action === 'reconcile' && assignments.every(function (assignment) {
+        return !!assignment && !assignment.device_fence;
+      })) settlePendingAction(key);
+    });
+  }
+
+  function clearPendingActionsOnDisconnect(socket) {
+    Array.from(pendingActions.values()).filter(function (pending) {
+      return pending.socket === socket;
+    }).forEach(function (pending) { settlePendingAction(pending.key); });
+    Array.from(pendingDispatches.values()).forEach(function (submission) {
+      if (submission.dispatchSocket !== socket) return;
+      settleDispatch(submission, {
+        message: 'Admin WebSocket disconnected before the server confirmed dispatch. The ready job is retained; retry after reconnect.',
+        code: 'dispatch_disconnected',
+      });
+    });
+  }
 
   function validJob(job) {
     return !!job && !!job.job_id && typeof job.revision === 'number';
@@ -190,10 +483,16 @@
     const current = pushJobs.get(job.job_id);
     if (current && current.revision >= job.revision) return;
     pushJobs.set(job.job_id, job);
+    settleSubmissionFromJob(job);
+    settleActionsFromJob(job);
     pruneRetryRequestIds(pushJobs);
     renderJob(job);
     renderPausedJobs();
-    syncDeviceAssignments();
+    const affectedDevices = new Set(Object.keys(job.devices || {}));
+    if (current) Object.keys(current.devices || {}).forEach(function (deviceId) {
+      affectedDevices.add(deviceId);
+    });
+    syncDeviceAssignments(affectedDevices);
   }
 
   function bufferJob(job) {
@@ -237,7 +536,11 @@
     });
     pushJobs.clear();
     replacement.forEach(function (job, jobId) { pushJobs.set(jobId, job); });
-    pushJobs.forEach(renderJob);
+    pushJobs.forEach(function (job) {
+      settleSubmissionFromJob(job);
+      settleActionsFromJob(job);
+      renderJob(job);
+    });
     renderPausedJobs();
     syncDeviceAssignments();
   }
@@ -351,6 +654,7 @@
   }
 
   function sendBulkAction(action) {
+    if (isActionPending(action)) return false;
     const groups = bulkActionGroups(action);
     if (!groups.length || !currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return false;
     const messageType = action === 'resume' ? 'PUSH_FILES' : 'CANCEL_PUSH_JOB';
@@ -363,12 +667,20 @@
         !window.confirm('Cancel Push / Sync for ' + scope + '?')) return false;
     try {
       groups.forEach(function (group) {
-        nativeSend.call(currentAdminSocket, JSON.stringify({
-          type: messageType,
-          job_id: group.job.job_id,
-          target_devices: group.targetDevices,
-        }));
+        const key = actionKey(action, group.job.job_id, group.targetDevices);
+        if (!trackAction(action, group.job.job_id, group.targetDevices, null, false)) return;
+        try {
+          nativeSend.call(currentAdminSocket, JSON.stringify({
+            type: messageType,
+            job_id: group.job.job_id,
+            target_devices: group.targetDevices,
+          }));
+        } catch (error) {
+          settlePendingAction(key);
+          throw error;
+        }
       });
+      renderPausedJobs();
     } catch (error) {
       appendLog('Could not ' + label.toLowerCase() + ': ' + error.message, 'fail');
       return false;
@@ -377,38 +689,40 @@
     return true;
   }
 
-  function sendRetryJobAction(job, button) {
+  function sendRetryJobAction(job) {
     if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return false;
+    if (isActionPending('retry')) return false;
     const key = job.job_id + ':' + job.revision;
     if (!retryRequestIds.has(key)) retryRequestIds.set(key, uuid());
+    const clientRequestId = retryRequestIds.get(key);
+    if (!trackAction('retry', job.job_id, actionTargetsForJob(job, 'retry'), clientRequestId)) return false;
     const payload = {
       type: 'RETRY_FAILED_PUSH_JOB',
       job_id: job.job_id,
-      client_request_id: retryRequestIds.get(key),
+      client_request_id: clientRequestId,
     };
     try {
       nativeSend.call(currentAdminSocket, JSON.stringify(payload));
     } catch (error) {
+      settlePendingAction(actionKey('retry', job.job_id, actionTargetsForJob(job, 'retry')));
       appendLog('Could not retry failed devices: ' + error.message, 'fail');
       return false;
     }
-    button.disabled = true;
-    setTimeout(function () {
-      if (button.isConnected) button.disabled = false;
-    }, 5000);
     return true;
   }
 
-  function renderAttentionTabActions(paused) {
+  function renderAttentionTabActions(paused, resumeGroups, cancelGroups) {
     const container = document.getElementById('pushJobsTabActions');
     if (!container) return;
     container.replaceChildren();
     if (!paused.length) return;
 
-    const resumeTargets = bulkActionGroups('resume').reduce(function (count, group) {
+    resumeGroups = resumeGroups || bulkActionGroups('resume');
+    cancelGroups = cancelGroups || bulkActionGroups('cancel');
+    const resumeTargets = resumeGroups.reduce(function (count, group) {
       return count + group.targetDevices.length;
     }, 0);
-    const cancelTargets = bulkActionGroups('cancel').reduce(function (count, group) {
+    const cancelTargets = cancelGroups.reduce(function (count, group) {
       return count + group.targetDevices.length;
     }, 0);
     const head = document.createElement('div');
@@ -433,18 +747,10 @@
       button.dataset.action = action;
       button.textContent = label;
       button.title = targetCount + ' eligible device(s)';
-      button.disabled = targetCount === 0;
+      button.disabled = targetCount === 0 || isActionPending(action);
+      if (isActionPending(action)) button.textContent = pendingLabel;
       button.addEventListener('click', function () {
         if (!sendBulkAction(action)) return;
-        button.disabled = true;
-        button.textContent = pendingLabel;
-        setTimeout(function () {
-          if (!button.isConnected) return;
-          button.disabled = action === 'resume'
-            ? bulkActionGroups('resume').length === 0
-            : bulkActionGroups('cancel').length === 0;
-          button.textContent = label;
-        }, 5000);
       });
       return button;
     }
@@ -478,7 +784,10 @@
         retry.type = 'button';
         retry.className = 'push-job-action';
         retry.textContent = 'Retry failed devices';
-        if (!hasRetryTargets(job)) {
+        if (isActionPending('retry', job.job_id)) {
+          retry.disabled = true;
+          retry.textContent = 'Retry requested…';
+        } else if (!hasRetryTargets(job)) {
           retry.disabled = true;
           retry.title = 'Every device to retry is offline';
         }
@@ -496,17 +805,27 @@
         reconcile.type = 'button';
         reconcile.className = 'push-job-action';
         reconcile.textContent = 'Reconcile';
+        if (isActionPending('reconcile', job.job_id)) {
+          reconcile.disabled = true;
+          reconcile.textContent = 'Reconciling…';
+        }
         reconcile.addEventListener('click', function () {
           if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return;
           try {
             fenced.forEach(function (deviceId) {
-              nativeSend.call(currentAdminSocket, JSON.stringify({
-                type: 'RECONCILE_PUSH_DEVICE',
-                device_id: deviceId,
-              }));
+              const key = actionKey('reconcile', job.job_id, [deviceId]);
+              if (!trackAction('reconcile', job.job_id, [deviceId], null, false)) return;
+              try {
+                nativeSend.call(currentAdminSocket, JSON.stringify({
+                  type: 'RECONCILE_PUSH_DEVICE',
+                  device_id: deviceId,
+                }));
+              } catch (error) {
+                settlePendingAction(key);
+                throw error;
+              }
             });
-            reconcile.disabled = true;
-            setTimeout(function () { if (reconcile.isConnected) reconcile.disabled = false; }, 5000);
+            renderPausedJobs();
           } catch (error) {
             appendLog('Could not reconcile: ' + error.message, 'fail');
           }
@@ -525,7 +844,9 @@
       return needsDispatchAction(job) || hasRetryableAssignments(job) ||
         Object.values(job.devices || {}).some(needsFenceReconciliation);
     });
-    renderAttentionTabActions(paused);
+    const resumeGroups = bulkActionGroups('resume');
+    const cancelGroups = bulkActionGroups('cancel');
+    renderAttentionTabActions(paused, resumeGroups, cancelGroups);
     const container = document.getElementById('pushJobsAttention');
     if (!container) return;
     container.replaceChildren();
@@ -614,6 +935,8 @@
     const cancelled = failure.code === 'cancelled';
     const resumeRequired = assignment.resume_required === true;
     const online = isDeviceOnline(deviceId);
+    const resumePending = isDeviceActionPending('resume', job.job_id, deviceId);
+    const cancelPending = isDeviceActionPending('cancel', job.job_id, deviceId);
     const canResume = resumeRequired && online;
     // The server refuses to cancel a reconciling assignment while its device is
     // online, because that device can still report its outcome.
@@ -626,6 +949,8 @@
       device_id: deviceId,
       canResume: canResume,
       canCancel: canCancel,
+      resumePending: resumePending,
+      cancelPending: cancelPending,
       needsAttention: !!needsAttention,
       job_id: job.job_id,
       client_request_id: job.client_request_id,
@@ -645,6 +970,9 @@
 
   // Read directly from canonical snapshots; no second attention-state cache.
   window.__stylyPushJobsV1Actions = {
+    submitPushJob: submitPushJob,
+    newSubmissionId: uuid,
+    actionPending: isDeviceActionPending,
     refreshConnectivity: function () { renderPausedJobs(); syncDeviceAssignments(); },
     assignmentFor: function (deviceId) {
       const selected = selectedAssignmentFor(deviceId);
@@ -657,34 +985,46 @@
       if ((action === 'resume' && !view.canResume) ||
           (action === 'cancel' && !view.canCancel) ||
           ['resume', 'cancel'].indexOf(action) < 0) return false;
+      if (isDeviceActionPending(action, jobId, deviceId)) return false;
       if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return false;
       if (action === 'cancel' && typeof window.confirm === 'function' &&
           !window.confirm('Cancel Push / Sync for ' + deviceId + '?')) return false;
+      if (!trackAction(action, jobId, [deviceId], null, false)) return false;
       try {
         nativeSend.call(currentAdminSocket, JSON.stringify({
           type: action === 'resume' ? 'PUSH_FILES' : 'CANCEL_PUSH_JOB',
           job_id: jobId,
           target_devices: [deviceId],
         }));
+        renderPausedJobs();
         return true;
       } catch (error) {
+        settlePendingAction(actionKey(action, jobId, [deviceId]));
         appendLog('Could not ' + action + ' device job: ' + error.message, 'fail');
         return false;
       }
     },
   };
 
-  function syncDeviceAssignments() {
+  function syncDeviceAssignments(affectedDeviceIds) {
     const bridge = window.__stylyPushJobsV1Bridge;
     if (!bridge) return;
-    const deviceIds = new Set(renderedDeviceIds);
-    renderedDeviceIds.clear();
-    pushJobs.forEach(function (job) {
-      Object.keys(job.devices || {}).forEach(function (deviceId) {
-        deviceIds.add(deviceId);
-        renderedDeviceIds.add(deviceId);
+    const fullRefresh = !affectedDeviceIds;
+    const deviceIds = fullRefresh ? new Set(renderedDeviceIds) : new Set(affectedDeviceIds);
+    if (fullRefresh) {
+      renderedDeviceIds.clear();
+      pushJobs.forEach(function (job) {
+        Object.keys(job.devices || {}).forEach(function (deviceId) {
+          deviceIds.add(deviceId);
+          renderedDeviceIds.add(deviceId);
+        });
       });
-    });
+    } else {
+      deviceIds.forEach(function (deviceId) {
+        if (selectedAssignmentFor(deviceId)) renderedDeviceIds.add(deviceId);
+        else renderedDeviceIds.delete(deviceId);
+      });
+    }
     // Invalidate removed assignments too, so a replacement snapshot reveals any
     // independent Install/Verify result without clearing it.
     deviceIds.forEach(function (deviceId) { bridge.invalidateDevice(deviceId); });
@@ -711,11 +1051,35 @@
       if (socket !== currentAdminSocket) return;
       const shortId = String(message.job_id || '').slice(0, 8);
       if (message.action === 'CANCEL_PUSH_JOB') {
+        const cancels = Array.from(pendingActions.values()).filter(function (pending) {
+          return pending.action === 'cancel' && pending.jobId === message.job_id;
+        });
+        if (cancels.length === 1) settlePendingAction(cancels[0].key);
         appendLog('Cancel recorded for job #' + shortId +
           '; affected devices settle once they confirm the work is absent', 'info');
       } else if (message.action === 'RETRY_FAILED_PUSH_JOB') {
+        const retries = Array.from(pendingActions.values()).filter(function (pending) {
+          return pending.action === 'retry';
+        });
+        if (retries.length === 1) settlePendingAction(retries[0].key);
         appendLog('Created retry job #' + shortId + ' for unsuccessful devices', 'info');
       }
+    } else if (message.type === 'PUSH_FILES_SENT' && message.job_id) {
+      if (socket !== currentAdminSocket) return;
+      const submission = pendingDispatches.get(message.job_id);
+      if (submission) settleDispatch(submission, null);
+      if (message.resume === true) {
+        const resumes = Array.from(pendingActions.values()).filter(function (pending) {
+          return pending.action === 'resume' && pending.jobId === message.job_id &&
+            pending.targets.length === message.target_count;
+        });
+        if (resumes.length === 1) settlePendingAction(resumes[0].key);
+      }
+    } else if (message.type === 'ERROR') {
+      if (socket !== currentAdminSocket) return;
+      // ERROR currently contains only a message, so it cannot safely settle a
+      // specific action. The legacy log handler shows the error; canonical or
+      // typed acknowledgements and the timeout settle pending state.
     } else if (message.type === 'PUSH_PROGRESS' && message.job_id) {
       // Full revisioned snapshots already render concurrent jobs independently.
       event.stopImmediatePropagation();
@@ -743,6 +1107,12 @@
     }
     socket.addEventListener('message', function (event) {
       observeMessage(socket, event);
+    });
+    socket.addEventListener('close', function () {
+      clearPendingActionsOnDisconnect(socket);
+    });
+    socket.addEventListener('open', function () {
+      if (socket === currentAdminSocket) renderPausedJobs();
     });
     return socket;
   }

@@ -353,6 +353,8 @@ class PushJobStore:
                 'waiting_transfer', 'dispatching', 'downloading',
                 'validating', 'applying', 'reconciling'
             );
+            CREATE INDEX IF NOT EXISTS ix_push_job_device_order
+            ON push_job_devices(device_id, enqueue_seq);
         """
         cls._begin(conn)
         try:
@@ -529,13 +531,15 @@ class PushJobStore:
         return {
             row["device_id"]
             for row in conn.execute(
-                "SELECT DISTINCT d.device_id FROM push_job_devices d "
-                "JOIN push_jobs j ON j.job_id=d.job_id "
-                "WHERE j.job_id<>? AND j.dest_path=? AND j.created_at>? "
-                "AND (d.dispatch_revision IS NOT NULL "
-                "OR d.state NOT IN ('succeeded','failed','interrupted','unconfirmed')) "
-                "AND d.device_id IN (SELECT device_id FROM push_job_devices WHERE job_id=?)",
-                (job["job_id"], job["dest_path"], job["created_at"], job["job_id"]),
+                "SELECT older.device_id FROM push_job_devices older "
+                "WHERE older.job_id=? AND EXISTS ("
+                "SELECT 1 FROM push_job_devices newer "
+                "JOIN push_jobs j ON j.job_id=newer.job_id "
+                "WHERE newer.device_id=older.device_id "
+                "AND newer.enqueue_seq>older.enqueue_seq AND j.dest_path=? "
+                "AND (newer.dispatch_revision IS NOT NULL "
+                "OR newer.state NOT IN ('succeeded','failed','interrupted','unconfirmed'))) ",
+                (job["job_id"], job["dest_path"]),
             )
         }
 
@@ -549,7 +553,10 @@ class PushJobStore:
         )
 
     @staticmethod
-    def _snapshot(conn: sqlite3.Connection, job_id: str) -> dict[str, Any]:
+    def _snapshot(
+        conn: sqlite3.Connection, job_id: str, *,
+        latest_work: Mapping[tuple[str, str], int] | None = None,
+    ) -> dict[str, Any]:
         job = conn.execute(
             """
             SELECT j.*, a.storage_name, a.display_filename, a.byte_size, a.sha256,
@@ -570,12 +577,21 @@ class PushJobStore:
         aggregate = aggregate_device_states(row["state"] for row in device_rows)
         devices: dict[str, Any] = {}
         retries = PushJobStore._retry_job_ids(conn, job_id)
-        superseded = PushJobStore._superseded_devices(conn, job)
-        for row in device_rows:
-            fence = conn.execute(
+        superseded = (
+            PushJobStore._superseded_devices(conn, job)
+            if latest_work is None else {
+                row["device_id"] for row in device_rows
+                if latest_work.get((job["dest_path"], row["device_id"]), 0)
+                > row["enqueue_seq"]
+            }
+        )
+        fences = {
+            fence["device_id"]: fence
+            for fence in conn.execute(
                 """
-                SELECT * FROM push_device_fences f
-                WHERE f.device_id=?
+                SELECT f.* FROM push_device_fences f
+                JOIN push_job_devices owner ON owner.device_id=f.device_id
+                WHERE owner.job_id=?
                   AND (
                     f.blocking_job_id=?
                     OR (
@@ -591,8 +607,11 @@ class PushJobStore:
                     )
                   )
                 """,
-                (row["device_id"], job_id, job_id),
-            ).fetchone()
+                (job_id, job_id, job_id),
+            )
+        }
+        for row in device_rows:
+            fence = fences.get(row["device_id"])
             fence_payload = None
             if fence is not None:
                 fence_payload = {

@@ -4,8 +4,6 @@ import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -50,8 +48,8 @@ class PushFilesWorkerTest {
             attemptDirectoryProvider = { File(tmp.root, "legacy-io") },
         ).execute(legacy, PushFilesWorker.Callbacks({}, {}, {}))
 
-        assertEquals("fail", execution.result.status)
-        assertEquals("download_failed", execution.result.failureCode)
+        assertEquals("fail", execution.completedResult().status)
+        assertEquals("download_failed", execution.completedResult().failureCode)
     }
 
     @Test
@@ -82,7 +80,7 @@ class PushFilesWorkerTest {
                 command(artifactUrl = server.url, artifactSize = archive.size.toLong(), artifactSha256 = sha256(archive)),
                 PushFilesWorker.Callbacks({}, {}, {}),
             )
-            assertEquals("success", result.result.status)
+            assertEquals("success", result.completedResult().status)
             assertEquals(8, server.requests.size)
             assertTrue(now < 60_000L)
         }
@@ -115,7 +113,7 @@ class PushFilesWorkerTest {
                     onValidated = {}, onApplying = {},
                 ),
             )
-            assertEquals("success", result.result.status)
+            assertEquals("success", result.completedResult().status)
             assertEquals(content, File(tmp.root, "long-dest/content.txt").readText())
         }
     }
@@ -140,8 +138,7 @@ class PushFilesWorkerTest {
                 command(artifactUrl = server.url, artifactSize = archive.size.toLong(), artifactSha256 = sha256(archive)).copy(revision = 1L),
                 PushFilesWorker.Callbacks({}, {}, {}),
             )
-            assertNotNull(result.interruptionReason)
-            assertEquals("download_interrupted", result.interruptionReason)
+            assertEquals("download_interrupted", result.interruptedOutcome().reason)
             assertTrue(acceptedBytes in 1 until archive.size.toLong())
             assertEquals(acceptedBytes, File(work, "artifact.part").length())
         }
@@ -174,10 +171,9 @@ class PushFilesWorkerTest {
                 workerCallbacks(),
             )
 
-            assertEquals("fail", execution.result.status)
-            assertEquals("push_lease_revoked", execution.result.failureCode)
-            assertNotNull(execution.interruptionReason)
-            assertEquals("server_lease_revoked", execution.interruptionReason)
+            val outcome = execution.interruptedOutcome()
+            assertEquals("server_lease_revoked", outcome.reason)
+            assertEquals("push_lease_revoked", outcome.failureCode)
             assertEquals(0, retryCount)
             assertTrue(server.request.contains("Range: bytes=$split-"))
             assertArrayEquals(partial, File(work, "artifact.part").readBytes())
@@ -207,9 +203,9 @@ class PushFilesWorkerTest {
                 workerCallbacks(),
             )
 
-            assertEquals("download_failed", execution.result.failureCode)
-            assertNotNull(execution.interruptionReason)
-            assertEquals("download_interrupted", execution.interruptionReason)
+            val outcome = execution.interruptedOutcome()
+            assertEquals("download_failed", outcome.failureCode)
+            assertEquals("download_interrupted", outcome.reason)
             assertEquals(0, retryCount)
             assertTrue(server.request.contains("Range: bytes=$split-"))
             assertArrayEquals(partial, File(work, "artifact.part").readBytes())
@@ -235,9 +231,9 @@ class PushFilesWorkerTest {
                 workerCallbacks(),
             )
 
-            assertEquals("fail", execution.result.status)
-            assertEquals("download_failed", execution.result.failureCode)
-            assertNull(execution.interruptionReason)
+            assertEquals("fail", execution.completedResult().status)
+            assertEquals("download_failed", execution.completedResult().failureCode)
+            assertTrue(execution.outcome is PushFilesWorker.Outcome.Completed)
             assertEquals(0, retryCount)
         }
     }
@@ -286,7 +282,7 @@ class PushFilesWorkerTest {
                 PushFilesWorker.Callbacks({}, {}, {}),
             )
 
-            assertEquals("success", execution.result.status)
+            assertEquals("success", execution.completedResult().status)
             assertEquals(listOf(1_000L, 2_000L, 4_000L, 8_000L, 1_000L, 2_000L), delays)
             assertEquals("backoff-reset", File(destination, "content.txt").readText())
         }
@@ -322,9 +318,9 @@ class PushFilesWorkerTest {
                 PushFilesWorker.Callbacks({}, {}, {}),
             )
 
-            assertEquals("fail", execution.result.status)
-            assertEquals("storage_write_failed", execution.result.failureCode)
-            assertNull(execution.interruptionReason)
+            assertEquals("fail", execution.completedResult().status)
+            assertEquals("storage_write_failed", execution.completedResult().failureCode)
+            assertTrue(execution.outcome is PushFilesWorker.Outcome.Completed)
             assertEquals(0, retryCount)
             assertFalse(partial.exists())
         }
@@ -353,7 +349,7 @@ class PushFilesWorkerTest {
                 attemptDirectoryProvider = { work },
                 destinationProvider = { tmp.newFolder("storage-resume-destination") },
             ).execute(command, PushFilesWorker.Callbacks({}, {}, {}))
-            assertEquals("success", execution.result.status)
+            assertEquals("success", execution.completedResult().status)
             assertArrayEquals(archive, File(work, "artifact.zip").readBytes())
         }
     }
@@ -390,7 +386,7 @@ class PushFilesWorkerTest {
                 artifactSize = archive.size.toLong(), artifactSha256 = sha256(archive)).copy(revision = 1L),
                 workerCallbacks())
             val elapsed = (System.nanoTime() - started) / 1_000_000L
-            assertEquals("success", result.result.status)
+            assertEquals("success", result.completedResult().status)
             assertTrue("Progressing download took ${elapsed}ms", elapsed in 700L..3_000L)
         } finally {
             release.countDown()
@@ -431,8 +427,7 @@ class PushFilesWorkerTest {
     fun `real stalled headers and stalled body are cancelled at the same deadline`() {
         for (sendHeaders in listOf(false, true)) {
             val (result, elapsed) = stalledHttpResult(sendHeaders)
-            assertNotNull(result.interruptionReason)
-            assertEquals("download_interrupted", result.interruptionReason)
+            assertEquals("download_interrupted", result.interruptedOutcome().reason)
             assertTrue("Stalled HTTP took ${elapsed}ms", elapsed in 200L..2_000L)
         }
     }
@@ -448,6 +443,14 @@ class PushFilesWorkerTest {
         }
         return archive
     }
+
+    private fun PushFilesWorker.Execution.completedResult(): PushProtocol.Result =
+        (outcome as? PushFilesWorker.Outcome.Completed)?.result
+            ?: error("Expected a completed worker outcome, got $outcome")
+
+    private fun PushFilesWorker.Execution.interruptedOutcome(): PushFilesWorker.Outcome.Interrupted =
+        outcome as? PushFilesWorker.Outcome.Interrupted
+            ?: error("Expected an interrupted worker outcome, got $outcome")
 
     private fun command(
         jobId: String? = UUID.randomUUID().toString(),
@@ -671,14 +674,14 @@ class PushFilesWorkerTest {
             ),
         )
 
-        assertEquals("fail", execution.result.status)
+        assertEquals("fail", execution.completedResult().status)
         assertEquals(
             PushFilesWorker.EXTERNAL_STORAGE_PERMISSION_FAILURE,
-            execution.result.failureCode,
+            execution.completedResult().failureCode,
         )
         assertEquals(
             PushFilesWorker.EXTERNAL_STORAGE_PERMISSION_DETAIL,
-            execution.result.detail,
+            execution.completedResult().detail,
         )
         assertFalse(callbackInvoked)
         assertFalse(work.exists())
@@ -701,7 +704,7 @@ class PushFilesWorkerTest {
                 workerCallbacks(callbacks),
             )
 
-            assertEquals("success", execution.result.status)
+            assertEquals("success", execution.completedResult().status)
         }
         assertEquals(listOf("validation_start", "transfer", "validated", "applying"), callbacks)
         assertEquals("verified", File(destination, "content.txt").readText())
@@ -726,7 +729,7 @@ class PushFilesWorkerTest {
             )
             seedResume(work, command, archive.copyOfRange(0, split))
             val execution = worker(work, { destination }).execute(command, workerCallbacks())
-            assertEquals("success", execution.result.status)
+            assertEquals("success", execution.completedResult().status)
             assertTrue(server.request.contains("Range: bytes=$split-"))
             assertTrue(server.request.contains("If-Match: \"v1\""))
             assertEquals(remaining.size, server.responseBytesWritten)
@@ -756,7 +759,7 @@ class PushFilesWorkerTest {
             val command = oldCommand.copy(artifactUrl = server.url)
             val execution = worker(work, { destination }).execute(command, workerCallbacks())
 
-            assertEquals("success", execution.result.status)
+            assertEquals("success", execution.completedResult().status)
             assertTrue(server.request.contains("Range: bytes=$split-"))
             assertEquals("new-authority", File(destination, "content.txt").readText())
             // The locator always comes from the command, so metadata never stores it.
@@ -785,7 +788,7 @@ class PushFilesWorkerTest {
                 workerCallbacks(),
             )
 
-            assertEquals("success", execution.result.status)
+            assertEquals("success", execution.completedResult().status)
             assertEquals(4, server.requests.size)
             assertEquals(listOf(1_000L, 2_000L, 4_000L), delays)
             assertEquals("retried", File(destination, "content.txt").readText())
@@ -827,7 +830,7 @@ class PushFilesWorkerTest {
                 workerCallbacks(),
             )
 
-            assertEquals("success", execution.result.status)
+            assertEquals("success", execution.completedResult().status)
             assertTrue(server.requests[1].contains("Range: bytes=$split-"))
             assertEquals(archive.size, server.responseBytesWritten)
             assertEquals(1, digests.size)
@@ -863,7 +866,7 @@ class PushFilesWorkerTest {
 
             val execution = worker(work, { destination }).execute(command, workerCallbacks())
 
-            assertEquals("success", execution.result.status)
+            assertEquals("success", execution.completedResult().status)
             assertTrue(server.request.contains("Range: bytes=$split-"))
             assertEquals("coordinator-authorized", File(destination, "content.txt").readText())
         }
@@ -892,10 +895,9 @@ class PushFilesWorkerTest {
                 monotonicMillis = { now },
             ).execute(command, workerCallbacks())
 
-            assertEquals("fail", execution.result.status)
-            assertEquals("download_failed", execution.result.failureCode)
-            assertNotNull(execution.interruptionReason)
-            assertEquals("download_interrupted", execution.interruptionReason)
+            val interrupted = execution.interruptedOutcome()
+            assertEquals("download_failed", interrupted.failureCode)
+            assertEquals("download_interrupted", interrupted.reason)
             assertEquals(split.toLong(), File(work, "artifact.part").length())
             assertEquals(listOf(1_000L, 2_000L, 4_000L, 8_000L, 8_000L, 8_000L, 8_000L, 8_000L, 8_000L, 5_000L), delays)
         }
@@ -918,7 +920,7 @@ class PushFilesWorkerTest {
                 artifactId = original.getString("artifact_id"),
             ).also { exact ->
                 val execution = worker(work, { destination }).execute(exact, workerCallbacks())
-                assertEquals("success", execution.result.status)
+                assertEquals("success", execution.completedResult().status)
             }
             assertTrue(resumed.request.contains("Range: bytes=$split-"))
             assertEquals("resumed-after-outage", File(destination, "content.txt").readText())
@@ -946,8 +948,8 @@ class PushFilesWorkerTest {
                 digestFactory = { file -> PartialFileDigest(file).also { digests += it } },
             ).execute(command, workerCallbacks(callbacks))
 
-            assertEquals("success", execution.result.status)
-            assertNull(execution.interruptionReason)
+            assertEquals("success", execution.completedResult().status)
+            assertTrue(execution.outcome is PushFilesWorker.Outcome.Completed)
             server.soTimeout = 100
             assertThrows(SocketTimeoutException::class.java) { server.accept().use {} }
             assertEquals(listOf("validation_start", "transfer", "validated", "applying"), callbacks)
@@ -973,8 +975,8 @@ class PushFilesWorkerTest {
             monotonicMillis = { error("A complete partial must not start an HTTP deadline") },
         ).execute(command, workerCallbacks(callbacks))
 
-        assertEquals("artifact_identity_mismatch", execution.result.failureCode)
-        assertNull(execution.interruptionReason)
+        assertEquals("artifact_identity_mismatch", execution.completedResult().failureCode)
+        assertTrue(execution.outcome is PushFilesWorker.Outcome.Completed)
         assertEquals(listOf("validation_start"), callbacks)
         assertFalse(File(work, "artifact.part").exists())
         assertFalse(File(work, "metadata.json").exists())
@@ -1007,17 +1009,17 @@ class PushFilesWorkerTest {
                     retryDelay = { delays += it },
                 ).execute(command, workerCallbacks(callbacks))
 
-                assertNull(execution.interruptionReason)
+                assertTrue(execution.outcome is PushFilesWorker.Outcome.Completed)
                 assertTrue(delays.isEmpty())
                 assertFalse(File(work, "artifact.part").exists())
                 if (corrupt) {
-                    assertEquals("artifact_identity_mismatch", execution.result.failureCode)
+                    assertEquals("artifact_identity_mismatch", execution.completedResult().failureCode)
                     assertEquals(listOf("validation_start"), callbacks)
                     assertFalse(File(work, "metadata.json").exists())
                     assertFalse(File(work, "artifact.zip").exists())
                     assertFalse(File(destination, "content.txt").exists())
                 } else {
-                    assertEquals("success", execution.result.status)
+                    assertEquals("success", execution.completedResult().status)
                     assertEquals(listOf("validation_start", "transfer", "validated", "applying"), callbacks)
                     assertEquals("complete-at-expiry", File(destination, "content.txt").readText())
                 }
@@ -1041,7 +1043,7 @@ class PushFilesWorkerTest {
                 command(artifactUrl = server.url, artifactSize = archive.size.toLong(), artifactSha256 = sha256(archive)),
                 workerCallbacks(callbacks),
             )
-            assertEquals("download_interrupted", execution.interruptionReason)
+            assertEquals("download_interrupted", execution.interruptedOutcome().reason)
             assertTrue(callbacks.isEmpty())
             assertTrue(delays.isEmpty())
             assertArrayEquals(prefix, File(work, "artifact.part").readBytes())
@@ -1068,15 +1070,15 @@ class PushFilesWorkerTest {
                 )
 
                 assertTrue(delays.isEmpty())
-                assertNull(execution.interruptionReason)
+                assertTrue(execution.outcome is PushFilesWorker.Outcome.Completed)
                 if (corrupt) {
-                    assertEquals("artifact_identity_mismatch", execution.result.failureCode)
+                    assertEquals("artifact_identity_mismatch", execution.completedResult().failureCode)
                     assertEquals(listOf("validation_start"), callbacks)
                     assertFalse(File(work, "artifact.part").exists())
                     assertFalse(File(work, "metadata.json").exists())
                     assertEquals("complete-before-framing-error", File(destination, "content.txt").readText())
                 } else {
-                    assertEquals("success", execution.result.status)
+                    assertEquals("success", execution.completedResult().status)
                     assertEquals(listOf("validation_start", "transfer", "validated", "applying"), callbacks)
                 }
                 callbacks.clear()
@@ -1098,7 +1100,7 @@ class PushFilesWorkerTest {
             seedResume(work, command.copy(revision = command.revision + 1), archive)
             val execution = worker(work, { destination }).execute(command, workerCallbacks())
 
-            assertEquals("success", execution.result.status)
+            assertEquals("success", execution.completedResult().status)
             assertTrue(server.request.contains("GET /artifact.zip"))
             assertFalse(server.request.contains("Range:"))
             assertEquals("fresh-assignment", File(destination, "content.txt").readText())
@@ -1124,9 +1126,9 @@ class PushFilesWorkerTest {
             seedResume(work, command, archive.copyOfRange(0, split))
             val execution = worker(work).execute(command, workerCallbacks())
 
-            assertEquals("fail", execution.result.status)
-            assertEquals("artifact_identity_mismatch", execution.result.failureCode)
-            assertNull(execution.interruptionReason)
+            assertEquals("fail", execution.completedResult().status)
+            assertEquals("artifact_identity_mismatch", execution.completedResult().failureCode)
+            assertTrue(execution.outcome is PushFilesWorker.Outcome.Completed)
             assertFalse(File(work, "artifact.part").exists())
         }
     }
@@ -1147,7 +1149,7 @@ class PushFilesWorkerTest {
 
         val execution = worker(work, { destination }).execute(command, workerCallbacks())
 
-        assertEquals("success", execution.result.status)
+        assertEquals("success", execution.completedResult().status)
         assertEquals("already-complete", File(destination, "content.txt").readText())
     }
 
@@ -1170,7 +1172,7 @@ class PushFilesWorkerTest {
             seedResume(work, command, archive.copyOfRange(0, split))
             val execution = worker(work, { destination }).execute(command, workerCallbacks())
 
-            assertEquals("success", execution.result.status)
+            assertEquals("success", execution.completedResult().status)
             assertTrue(server.request.contains("Range: bytes=$split-"))
             assertEquals("range-ignored", File(destination, "content.txt").readText())
         }
@@ -1190,9 +1192,9 @@ class PushFilesWorkerTest {
             seedResume(work, command, archive.copyOfRange(0, split))
             val execution = worker(work).execute(command, workerCallbacks())
 
-            assertEquals("fail", execution.result.status)
-            assertEquals("artifact_identity_mismatch", execution.result.failureCode)
-            assertNull(execution.interruptionReason)
+            assertEquals("fail", execution.completedResult().status)
+            assertEquals("artifact_identity_mismatch", execution.completedResult().failureCode)
+            assertTrue(execution.outcome is PushFilesWorker.Outcome.Completed)
             assertFalse(File(work, "artifact.part").exists())
             // A new worker after an unsaved terminal result must not report these bytes.
             assertEquals(0L, PushFilesWorker({ true }, { work }).validatedResumeOffset(command))
@@ -1217,12 +1219,16 @@ class PushFilesWorkerTest {
                 val worker = PushFilesWorker({ true }, { work })
                 val execution = worker.execute(command, PushFilesWorker.Callbacks({}, {}, {}))
 
-                assertEquals("fail", execution.result.status)
-                assertEquals(if (status == 409) "push_lease_revoked" else "artifact_unavailable", execution.result.failureCode)
-                assertEquals(status == 409, execution.interruptionReason != null)
                 assertArrayEquals(prefix, File(work, "artifact.part").readBytes())
                 assertEquals(prefix.size.toLong(), worker.validatedResumeOffset(command))
-                if (execution.interruptionReason == null) {
+                if (status == 409) {
+                    val interrupted = execution.interruptedOutcome()
+                    assertEquals("server_lease_revoked", interrupted.reason)
+                    assertEquals("push_lease_revoked", interrupted.failureCode)
+                } else {
+                    assertEquals("fail", execution.completedResult().status)
+                    assertEquals("artifact_unavailable", execution.completedResult().failureCode)
+                    assertTrue(execution.outcome is PushFilesWorker.Outcome.Completed)
                     worker.cleanup(execution.workDirectory)
                     assertFalse(work.exists())
                     assertEquals(0L, worker.validatedResumeOffset(command))
@@ -1285,10 +1291,9 @@ class PushFilesWorkerTest {
                     PushFilesWorker.Callbacks({}, {}, {}),
                 )
 
-                assertEquals(case.name, "fail", execution.result.status)
-                assertEquals(case.name, "download_failed", execution.result.failureCode)
-                assertEquals(case.name, "download_interrupted", execution.interruptionReason)
-                assertNotNull(case.name, execution.interruptionReason)
+                val interrupted = execution.interruptedOutcome()
+                assertEquals(case.name, "download_interrupted", interrupted.reason)
+                assertEquals(case.name, "download_failed", interrupted.failureCode)
                 assertArrayEquals(case.name, prefix, File(work, "artifact.part").readBytes())
                 assertTrue(case.name, File(work, "metadata.json").isFile)
                 assertTrue(case.name, retryDelays.isEmpty())
@@ -1313,7 +1318,7 @@ class PushFilesWorkerTest {
             )
             val execution = worker(work).execute(command, workerCallbacks())
 
-            assertEquals("artifact_identity_mismatch", execution.result.failureCode)
+            assertEquals("artifact_identity_mismatch", execution.completedResult().failureCode)
             assertFalse(File(work, "artifact.part").exists())
         }
     }
@@ -1334,8 +1339,8 @@ class PushFilesWorkerTest {
             )
             val execution = worker(work).execute(command, workerCallbacks())
 
-            assertEquals("fail", execution.result.status)
-            assertEquals("artifact_identity_mismatch", execution.result.failureCode)
+            assertEquals("fail", execution.completedResult().status)
+            assertEquals("artifact_identity_mismatch", execution.completedResult().failureCode)
             assertFalse(File(work, "artifact.part").exists())
         }
     }
@@ -1365,10 +1370,44 @@ class PushFilesWorkerTest {
                 ),
             )
 
-            assertEquals("fail", execution.result.status)
-            assertEquals("validation_failed", execution.result.failureCode)
+            assertEquals("fail", execution.completedResult().status)
+            assertEquals("validation_failed", execution.completedResult().failureCode)
         }
         assertEquals(listOf("validation_start", "transfer"), callbacks)
+    }
+
+    @Test
+    fun `failed applying checkpoint prevents destination mutation`() {
+        val archive = zip("content.txt" to "verified-but-not-applied").readBytes()
+        val destination = tmp.newFolder("apply-checkpoint-destination")
+        val sentinel = File(destination, "existing.txt").apply { writeText("unchanged") }
+        val applyingCallbacks = mutableListOf<String>()
+
+        artifactServer(archive).use { server ->
+            val execution = worker(
+                File(tmp.root, "apply-checkpoint-work"),
+                { destination },
+            ).execute(
+                command(
+                    artifactUrl = server.url,
+                    artifactSize = archive.size.toLong(),
+                    artifactSha256 = sha256(archive),
+                ),
+                PushFilesWorker.Callbacks(
+                    onTransferComplete = {},
+                    onValidated = {},
+                    onApplying = { applyingCallbacks += "applying" },
+                    beforeApply = { false },
+                ),
+            )
+
+            assertEquals("fail", execution.completedResult().status)
+            assertEquals("client_persistence_unavailable", execution.completedResult().failureCode)
+            assertTrue(execution.outcome is PushFilesWorker.Outcome.Completed)
+        }
+        assertTrue(applyingCallbacks.isEmpty())
+        assertEquals("unchanged", sentinel.readText())
+        assertFalse(File(destination, "content.txt").exists())
     }
 
     @Test
@@ -1388,7 +1427,7 @@ class PushFilesWorkerTest {
                 workerCallbacks(),
             )
 
-            assertEquals("success", execution.result.status)
+            assertEquals("success", execution.completedResult().status)
         }
         assertEquals("legacy", File(destination, "content.txt").readText())
     }
@@ -1402,7 +1441,7 @@ class PushFilesWorkerTest {
                 command(null, null, server.url, null, null).copy(revision = 0L, artifactEtag = null),
                 workerCallbacks(),
             )
-            assertEquals("success", execution.result.status)
+            assertEquals("success", execution.completedResult().status)
             assertFalse(server.request.contains("Range:"))
             assertFalse(server.request.contains("If-Match:"))
             assertEquals("optional-integrity", File(destination, "content.txt").readText())
@@ -1426,8 +1465,8 @@ class PushFilesWorkerTest {
                     .copy(revision = 0L, artifactEtag = null),
                 PushFilesWorker.Callbacks({ callbackInvoked = true }, { callbackInvoked = true }, { callbackInvoked = true }),
             )
-            assertEquals("download_failed", execution.result.failureCode)
-            assertNull(execution.interruptionReason)
+            assertEquals("download_failed", execution.completedResult().failureCode)
+            assertTrue(execution.outcome is PushFilesWorker.Outcome.Completed)
             assertFalse(callbackInvoked)
             assertTrue(delays.isEmpty())
             assertArrayEquals(prefix, File(work, "artifact.part").readBytes())
@@ -1449,7 +1488,7 @@ class PushFilesWorkerTest {
                     .copy(revision = 0L, artifactEtag = null),
                 PushFilesWorker.Callbacks({ callbackInvoked = true }, { callbackInvoked = true }, { callbackInvoked = true }),
             )
-            assertEquals("artifact_identity_mismatch", execution.result.failureCode)
+            assertEquals("artifact_identity_mismatch", execution.completedResult().failureCode)
             assertFalse(callbackInvoked)
             assertFalse(File(work, "artifact.part").exists())
             assertFalse(File(work, "artifact.zip").exists())
@@ -1474,9 +1513,9 @@ class PushFilesWorkerTest {
                 PushFilesWorker.Callbacks({ callbackInvoked = true }, { callbackInvoked = true }, { callbackInvoked = true }),
             )
 
-            assertEquals("fail", execution.result.status)
-            assertEquals("artifact_identity_mismatch", execution.result.failureCode)
-            assertNull(execution.interruptionReason)
+            assertEquals("fail", execution.completedResult().status)
+            assertEquals("artifact_identity_mismatch", execution.completedResult().failureCode)
+            assertTrue(execution.outcome is PushFilesWorker.Outcome.Completed)
         }
         assertFalse(callbackInvoked)
         assertEquals("unchanged", sentinel.readText())
@@ -1507,8 +1546,8 @@ class PushFilesWorkerTest {
                 workerCallbacks(callbacks),
             )
 
-            assertEquals("fail", execution.result.status)
-            assertEquals("invalid_destination", execution.result.failureCode)
+            assertEquals("fail", execution.completedResult().status)
+            assertEquals("invalid_destination", execution.completedResult().failureCode)
         }
         assertEquals(listOf("validation_start", "transfer", "validated"), callbacks)
         assertEquals("unchanged", sentinel.readText())

@@ -138,6 +138,9 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
             assert await leases.claim(artifact_id, token, stream, transport) == "claimed"
             if disconnect_first:
                 runtime = object.__new__(PushRuntime)
+                runtime.pending_disconnects = set()
+                runtime.disconnect_recovery_tasks = {}
+                runtime.artifact_gc_task = None
                 runtime.manager = manager
                 runtime.sessions = sessions
                 runtime.device_locks = {"D1": sessions["D1"].owner_lock}
@@ -199,6 +202,9 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
 
             if finish != "stalled":
                 runtime = object.__new__(PushRuntime)
+                runtime.pending_disconnects = set()
+                runtime.disconnect_recovery_tasks = {}
+                runtime.artifact_gc_task = None
                 runtime.manager = manager
                 runtime.store = manager.store
                 runtime.transfers = registry

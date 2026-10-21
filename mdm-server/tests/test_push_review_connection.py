@@ -121,9 +121,15 @@ class RegistrationManager:
     async def active_assignment_for_device(self, _device_id):
         return None
 
+    async def reconcile_missing_runtime(self, *_args, **_kwargs):
+        return []
+
 
 def runtime_for(manager):
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.manager = manager
     runtime.transfers = TransferRegistry()
     runtime.scheduler = None
@@ -478,6 +484,9 @@ async def test_retry_exhaustion_allows_another_device_waiting_for_a_slot(manager
 @pytest.mark.asyncio
 async def test_resume_rejection_carries_exact_cleanup_authority():
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.send_timeout = 1
     ws = Ws()
     session = live_session({"push_job_id_v1", "push_resume_v1"}, ws=ws)
@@ -505,6 +514,9 @@ async def test_resume_rejection_carries_exact_cleanup_authority():
 @pytest.mark.asyncio
 async def test_malformed_resume_identity_cannot_authorize_client_cleanup():
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.send_timeout = 1
     ws = Ws()
     session = live_session({"push_job_id_v1", "push_resume_v1"}, ws=ws)
@@ -632,6 +644,9 @@ async def test_operator_resume_reconciles_recovered_state_before_dispatch(manage
     )
 
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.store = store
     runtime.manager = manager
     runtime.scheduler = Scheduler()
@@ -678,6 +693,9 @@ async def test_initial_snapshot_failure_closes_admin_for_reconnect():
             raise RuntimeError("snapshot unavailable")
 
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.manager = Manager()
     runtime.recent_days = 30
     runtime.recent_limit = 100
@@ -704,6 +722,9 @@ async def test_initial_snapshot_send_timeout_closes_admin_for_reconnect():
             await asyncio.Future()
 
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.manager = Manager()
     runtime.recent_days = 30
     runtime.recent_limit = 100
@@ -723,6 +744,9 @@ async def test_initial_snapshot_cancellation_is_not_swallowed():
             raise asyncio.CancelledError()
 
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.manager = Manager()
     runtime.recent_days = 30
     runtime.recent_limit = 100
@@ -743,6 +767,9 @@ async def test_ready_job_can_be_dispatched_with_existing_job_id(tmp_path):
     try:
         ready = await ready_job(store, manager)
         runtime = object.__new__(PushRuntime)
+        runtime.pending_disconnects = set()
+        runtime.disconnect_recovery_tasks = {}
+        runtime.artifact_gc_task = None
         runtime.store = store
         runtime.scheduler = Scheduler()
         runtime.admin_send_timeout = 1
@@ -790,6 +817,9 @@ async def test_dispatch_ack_timeout_still_wakes_scheduler_and_closes_admin(tmp_p
     try:
         ready = await ready_job(store, manager)
         runtime = object.__new__(PushRuntime)
+        runtime.pending_disconnects = set()
+        runtime.disconnect_recovery_tasks = {}
+        runtime.artifact_gc_task = None
         runtime.store = store
         runtime.scheduler = Scheduler()
         runtime.admin_send_timeout = 0.01
@@ -832,6 +862,9 @@ async def test_dispatch_error_timeout_closes_admin_without_waking_scheduler(tmp_
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     try:
         runtime = object.__new__(PushRuntime)
+        runtime.pending_disconnects = set()
+        runtime.disconnect_recovery_tasks = {}
+        runtime.artifact_gc_task = None
         runtime.store = store
         runtime.scheduler = Scheduler()
         runtime.admin_send_timeout = 0.01
@@ -863,6 +896,9 @@ async def test_superseded_register_cannot_become_runtime_owner():
     current = Ws()
     manager = RegistrationManager()
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.legacy = types.SimpleNamespace(devices={"D1": {"ws": current}})
     runtime.manager = manager
     runtime.sessions = {}
@@ -892,12 +928,17 @@ async def test_current_register_is_bound_to_legacy_owner():
     ws = Ws()
     manager = RegistrationManager()
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.legacy = types.SimpleNamespace(devices={"D1": {"ws": ws}})
     runtime.manager = manager
     runtime.sessions = {}
     runtime.device_locks = {}
     runtime.registration_candidates = {"D1": ws}
     runtime.send_timeout = 1
+    runtime.accept_reconciliation_timeout = 60
+    runtime.reconciliation_timeout = 1800
     runtime.scheduler = Scheduler()
     published = []
 
@@ -934,6 +975,9 @@ async def test_refresh_registration_ack_requires_current_ready_owner(
     entry_owner = ws if entry_is_current else Ws()
     process_instance_id = str(uuid.uuid4())
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.sessions = {
         "D1": LiveSession(
             "D1", "session", ws, frozenset(), process_instance_id,
@@ -977,6 +1021,9 @@ async def test_unavailable_push_state_does_not_report_absence_or_request_reconci
     ws = Ws()
     manager = ReconcilingManager()
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.legacy = types.SimpleNamespace(devices={"D1": {"ws": ws}})
     runtime.manager = manager
     runtime.sessions = {}
@@ -1028,6 +1075,9 @@ async def test_registration_active_report_preserves_offline_timeout_fence(tmp_pa
 
         ws = Ws()
         runtime = object.__new__(PushRuntime)
+        runtime.pending_disconnects = set()
+        runtime.disconnect_recovery_tasks = {}
+        runtime.artifact_gc_task = None
         runtime.legacy = types.SimpleNamespace(devices={"D1": {"ws": ws}})
         runtime.manager = manager
         runtime.sessions = {}
@@ -1071,6 +1121,9 @@ async def test_registration_candidate_reconciles_replaced_active_session(tmp_pat
         job_id = active["job_id"]
         artifact_id = active["artifact"]["artifact_id"]
         runtime = object.__new__(PushRuntime)
+        runtime.pending_disconnects = set()
+        runtime.disconnect_recovery_tasks = {}
+        runtime.artifact_gc_task = None
         runtime.manager = manager
         runtime.sessions = {}
         runtime.device_locks = {}
@@ -1147,6 +1200,9 @@ async def test_unknown_exact_phase_messages_are_noops(tmp_path):
     manager = PushJobManager(store)
     try:
         runtime = object.__new__(PushRuntime)
+        runtime.pending_disconnects = set()
+        runtime.disconnect_recovery_tasks = {}
+        runtime.artifact_gc_task = None
         runtime.store = store
         runtime.manager = manager
         runtime.transfers = TransferRegistry()
@@ -1187,6 +1243,9 @@ async def test_registration_active_artifact_conflict_fails_and_fences(tmp_path):
         active = await downloading_job(store, manager)
         job_id = active["job_id"]
         runtime = object.__new__(PushRuntime)
+        runtime.pending_disconnects = set()
+        runtime.disconnect_recovery_tasks = {}
+        runtime.artifact_gc_task = None
         runtime.manager = manager
         session = LiveSession(
             device_id="D1",
@@ -1251,6 +1310,9 @@ async def test_server_restart_active_registration_does_not_reuse_revoked_http_le
             leases=leases,
         )
         runtime = object.__new__(PushRuntime)
+        runtime.pending_disconnects = set()
+        runtime.disconnect_recovery_tasks = {}
+        runtime.artifact_gc_task = None
         runtime.manager = manager
         runtime.scheduler = scheduler
         runtime.transfers = registry
@@ -1305,6 +1367,9 @@ async def test_active_registration_after_offline_download_releases_transfer_slot
     transfer = asyncio.get_running_loop().create_future()
     registry.register(key, transfer)
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.manager = manager
     runtime.scheduler = Scheduler()
     runtime.transfers = registry
@@ -1349,6 +1414,9 @@ async def test_interrupted_registration_uses_revision_without_session_resume_cap
     assignment = await manager.assignment(job_id, "D1")
     ws = Ws()
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.manager = manager
     runtime.transfers = TransferRegistry()
     runtime.send_timeout = 1
@@ -1457,6 +1525,9 @@ async def test_first_terminal_result_queues_one_canonical_update_and_duplicate_i
         )
 
         runtime = object.__new__(PushRuntime)
+        runtime.pending_disconnects = set()
+        runtime.disconnect_recovery_tasks = {}
+        runtime.artifact_gc_task = None
         runtime.store = store
         runtime.manager = manager
         runtime.transfers = TransferRegistry()
@@ -1519,6 +1590,9 @@ async def test_exact_success_settles_even_when_applying_phase_was_lost(tmp_path)
         active = await downloading_job(store, manager)
         job_id = active["job_id"]
         runtime = object.__new__(PushRuntime)
+        runtime.pending_disconnects = set()
+        runtime.disconnect_recovery_tasks = {}
+        runtime.artifact_gc_task = None
         runtime.store = store
         runtime.manager = manager
         runtime.transfers = TransferRegistry()
@@ -1579,6 +1653,9 @@ async def test_result_settlement_failure_rolls_back_without_ack_or_transfer_rele
     job_id = active["job_id"]
     before = await store.get_snapshot(job_id)
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.store = store
     runtime.manager = manager
     runtime.transfers = TransferRegistry()
@@ -1641,6 +1718,9 @@ async def test_replacement_register_preserves_healthy_download_in_either_order(
         job_id = active["job_id"]
         artifact_id = active["artifact"]["artifact_id"]
         runtime = object.__new__(PushRuntime)
+        runtime.pending_disconnects = set()
+        runtime.disconnect_recovery_tasks = {}
+        runtime.artifact_gc_task = None
         runtime.manager = manager
         runtime.sessions = {}
         runtime.device_locks = {}
@@ -1676,18 +1756,18 @@ async def test_replacement_register_preserves_healthy_download_in_either_order(
 
         entered = asyncio.Event()
         release = asyncio.Event()
-        original_active = manager.active_assignment_for_device
+        original_disconnect = manager.settle_disconnect
         first_query = True
 
-        async def blocked_active(device_id):
+        async def blocked_disconnect(device_id, **kwargs):
             nonlocal first_query
             if first_query:
                 first_query = False
                 entered.set()
                 await release.wait()
-            return await original_active(device_id)
+            return await original_disconnect(device_id, **kwargs)
 
-        manager.active_assignment_for_device = blocked_active
+        manager.settle_disconnect = blocked_disconnect
         registration_call = runtime.register_device(
             new,
             {
@@ -1811,6 +1891,9 @@ async def test_result_racing_unconfirmed_is_settled_atomically_and_acked(
             deadline=now_ms(),
         )
         runtime = object.__new__(PushRuntime)
+        runtime.pending_disconnects = set()
+        runtime.disconnect_recovery_tasks = {}
+        runtime.artifact_gc_task = None
         runtime.store = store
         runtime.manager = manager
         runtime.transfers = TransferRegistry()
@@ -1891,6 +1974,9 @@ async def test_unknown_result_receives_negative_nonretryable_ack(tmp_path):
     manager = PushJobManager(store)
     try:
         runtime = object.__new__(PushRuntime)
+        runtime.pending_disconnects = set()
+        runtime.disconnect_recovery_tasks = {}
+        runtime.artifact_gc_task = None
         runtime.store = store
         runtime.manager = manager
         runtime.transfers = TransferRegistry()
@@ -1994,6 +2080,9 @@ async def test_legacy_result_does_not_settle_preserved_assignment(tmp_path):
         )
 
         runtime = object.__new__(PushRuntime)
+        runtime.pending_disconnects = set()
+        runtime.disconnect_recovery_tasks = {}
+        runtime.artifact_gc_task = None
         runtime.store = store
         runtime.manager = manager
         runtime.transfers = TransferRegistry()

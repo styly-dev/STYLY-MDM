@@ -7,7 +7,10 @@ import org.json.JSONObject
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ScheduledThreadPoolExecutor
@@ -528,6 +531,16 @@ class PushJobCoordinator internal constructor(
                     log(Log.ERROR, "Preserving durable Push/Sync state with invalid receipts", result.error)
                     return false
                 }
+                is PushStateLoadResult.UnsupportedVersion -> {
+                    log(Log.ERROR, "Preserving unsupported durable Push/Sync state", result.error)
+                    return false
+                }
+                is PushStateLoadResult.InvalidActive -> {
+                    // The active command may already have modified its destination.
+                    // Preserve receipts and ownership evidence; never advertise absence.
+                    log(Log.ERROR, "Preserving durable Push/Sync state with invalid active command", result.error)
+                    return false
+                }
                 is PushStateLoadResult.Corrupt -> {
                     log(Log.WARN, "Discarding unparseable durable Push/Sync state", result.error)
                     dependencies.discardState()
@@ -603,7 +616,7 @@ class PushJobCoordinator internal constructor(
 
     private fun handleCommand(payload: JSONObject) {
         val command = try {
-            PushProtocol.parseCommand(payload)
+            PushProtocol.parseWireCommand(payload)
         } catch (error: IllegalArgumentException) {
             rejectMalformed(payload, error.message ?: "malformed_command")
             return
@@ -684,7 +697,8 @@ class PushJobCoordinator internal constructor(
                         actor.execute { onTransferComplete(command, received) }
                     },
                     onValidated = { actor.execute { onValidated(command) } },
-                    onApplying = { actor.execute { onApplying(command) } },
+                    onApplying = {},
+                    beforeApply = { awaitApplyingCheckpoint(command) },
                     onValidationStart = { actor.execute { onValidationStart(command) } },
                 ),
             )
@@ -853,15 +867,39 @@ class PushJobCoordinator internal constructor(
         })
     }
 
-    private fun onApplying(command: PushProtocol.Command) {
-        if (!setPhase(command, PushProtocol.PHASE_APPLYING)) return
-        if (command.isJobV1) {
-            send(JSONObject().apply {
-                put("type", "PUSH_PHASE")
-                put("job_id", command.jobId)
-                put("attempt", command.attempt)
-                put("phase", PushProtocol.PHASE_APPLYING)
-            })
+    /** The worker waits here while this actor durably records the apply boundary. */
+    private fun awaitApplyingCheckpoint(command: PushProtocol.Command): Boolean {
+        val checkpoint: Future<Boolean> = try {
+            actor.submit<Boolean> {
+                val persisted = setPhase(command, PushProtocol.PHASE_APPLYING)
+                if (persisted && command.isJobV1) {
+                    send(JSONObject().apply {
+                        put("type", "PUSH_PHASE")
+                        put("job_id", command.jobId)
+                        put("attempt", command.attempt)
+                        put("phase", PushProtocol.PHASE_APPLYING)
+                    })
+                }
+                persisted
+            }
+        } catch (error: RejectedExecutionException) {
+            log(Log.ERROR, "Could not schedule durable applying checkpoint", error)
+            return false
+        }
+
+        return try {
+            checkpoint.get()
+        } catch (error: InterruptedException) {
+            // A queued checkpoint is cancelled. If its store write is already running,
+            // cancellation does not interrupt it; its conservative phase update is
+            // serialized before the worker's terminal failure on this same actor.
+            checkpoint.cancel(false)
+            Thread.currentThread().interrupt()
+            log(Log.ERROR, "Interrupted while waiting for durable applying checkpoint", error)
+            false
+        } catch (error: ExecutionException) {
+            log(Log.ERROR, "Could not persist durable applying checkpoint", error.cause ?: error)
+            false
         }
     }
 
@@ -874,42 +912,45 @@ class PushJobCoordinator internal constructor(
             cleanupExecution(execution.workDirectory)
             return
         }
-        if (execution.interruptionReason != null) {
-            val active = state.active ?: return
-            val nextState = state.copy(
-                active = active.copy(
-                    interrupted = true,
-                    interruptedAt = active.interruptedAt ?: System.currentTimeMillis(),
-                    interruptionReason = execution.interruptionReason,
-                ),
-            )
-            // Preserve work. The durable interrupted state fences other jobs until
-            // the server authorizes an exact resume.
-            if (!persist(nextState)) {
-                unsavedTerminal = command to execution
+        val result = when (val outcome = execution.outcome) {
+            is PushFilesWorker.Outcome.Interrupted -> {
+                val active = state.active ?: return
+                val nextState = state.copy(
+                    active = active.copy(
+                        interrupted = true,
+                        interruptedAt = active.interruptedAt ?: System.currentTimeMillis(),
+                        interruptionReason = outcome.reason,
+                    ),
+                )
+                // Preserve work. The durable interrupted state fences other jobs until
+                // the server authorizes an exact resume.
+                if (!persist(nextState)) {
+                    unsavedTerminal = command to execution
+                    return
+                }
+                if (command.isJobV1) {
+                    val identity = PushProtocol.ReconcileIdentity(
+                        requireNotNull(command.jobId),
+                        command.attempt,
+                        command.artifactId,
+                    )
+                    send(buildActivePushReconcileReport(
+                        identity,
+                        requireNotNull(state.active),
+                        validatedOffset(command),
+                    ))
+                }
                 return
             }
-            if (command.isJobV1) {
-                val identity = PushProtocol.ReconcileIdentity(
-                    requireNotNull(command.jobId),
-                    command.attempt,
-                    command.artifactId,
-                )
-                send(buildActivePushReconcileReport(
-                    identity,
-                    requireNotNull(state.active),
-                    validatedOffset(command),
-                ))
-            }
-            return
+            is PushFilesWorker.Outcome.Completed -> outcome.result
         }
-        val receipt = PushProtocol.Receipt(command, execution.result)
+        val receipt = PushProtocol.Receipt(command, result)
         val pending = if (command.isJobV1) state.pendingResults + receipt else state.pendingResults
-        val completed = (state.completedReceipts + receipt).takeLast(MAX_RECEIPTS)
+        val completedReceipts = (state.completedReceipts + receipt).takeLast(MAX_RECEIPTS)
         val nextState = state.copy(
             active = null,
             pendingResults = pending,
-            completedReceipts = completed,
+            completedReceipts = completedReceipts,
         )
         // Persist the terminal outbox before clearing active state, cleaning up, or sending.
         if (!persist(nextState)) {
@@ -917,7 +958,7 @@ class PushJobCoordinator internal constructor(
             return
         }
         cleanupExecution(execution.workDirectory)
-        send(execution.result.toJson())
+        send(result.toJson())
     }
 
     private fun cleanupExecution(workDirectory: File) {

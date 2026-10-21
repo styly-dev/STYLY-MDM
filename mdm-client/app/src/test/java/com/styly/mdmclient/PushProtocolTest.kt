@@ -26,13 +26,13 @@ class PushProtocolTest {
     @Test
     fun `job v1 requires attempt one and complete artifact identity`() {
         val value = payload()
-        val command = PushProtocol.parseCommand(value)
+        val command = PushProtocol.parseWireCommand(value)
         assertEquals(1, command.attempt)
         assertNotNull(command.artifactId)
 
         value.put("attempt", 2)
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(value)
+            PushProtocol.parseWireCommand(value)
         }
     }
 
@@ -40,23 +40,23 @@ class PushProtocolTest {
     fun `live job v1 requires artifact url and prefers it over bundle url`() {
         val value = payload().apply { remove("artifact_url") }
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(value)
+            PushProtocol.parseWireCommand(value)
         }
 
         value.put("bundle_url", "http://server/legacy.zip")
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(value)
+            PushProtocol.parseWireCommand(value)
         }
 
         value.put("artifact_url", "http://server/artifacts/value")
-        assertEquals("http://server/artifacts/value", PushProtocol.parseCommand(value).artifactUrl)
+        assertEquals("http://server/artifacts/value", PushProtocol.parseWireCommand(value).artifactUrl)
         value.put("bundle_url", "http://server/legacy.zip")
-        assertEquals("http://server/artifacts/value", PushProtocol.parseCommand(value).artifactUrl)
+        assertEquals("http://server/artifacts/value", PushProtocol.parseWireCommand(value).artifactUrl)
     }
 
     @Test
     fun `identity-less legacy command accepts bundle url`() {
-        val command = PushProtocol.parseCommand(
+        val command = PushProtocol.parseWireCommand(
             JSONObject().apply {
                 put("bundle_url", "http://server/legacy.zip")
                 put("dest_path", "/sdcard/STYLY/content")
@@ -71,23 +71,23 @@ class PushProtocolTest {
     fun `job v1 rejects relative artifact URL and non-v4 UUID`() {
         val value = payload().apply { put("artifact_url", "/artifacts/value") }
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(value)
+            PushProtocol.parseWireCommand(value)
         }
         value.put("artifact_url", "http://server/artifacts/value")
         value.put("job_id", "00000000-0000-1000-8000-000000000000")
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(value)
+            PushProtocol.parseWireCommand(value)
         }
     }
 
     @Test
     fun `missing delete extras remains safe push`() {
-        assertFalse(PushProtocol.parseCommand(payload()).deleteExtras)
+        assertFalse(PushProtocol.parseWireCommand(payload()).deleteExtras)
     }
 
     @Test
     fun `durable receipt preserves failure code detail and completion time`() {
-        val command = PushProtocol.parseCommand(payload())
+        val command = PushProtocol.parseWireCommand(payload())
         val result = PushProtocol.Result(
             jobId = command.jobId,
             attempt = 1,
@@ -112,7 +112,7 @@ class PushProtocolTest {
 
     @Test
     fun `malformed active invalidates the durable snapshot even when receipts are valid`() {
-        val command = PushProtocol.parseCommand(payload())
+        val command = PushProtocol.parseWireCommand(payload())
         val result = PushProtocol.Result(
             jobId = command.jobId,
             attempt = command.attempt,
@@ -143,7 +143,7 @@ class PushProtocolTest {
 
     @Test
     fun `interrupted retention timestamp survives state round trip`() {
-        val command = PushProtocol.parseCommand(payload())
+        val command = PushProtocol.parseWireCommand(payload())
         val state = PushProtocol.State(
             active = PushProtocol.Active(
                 command,
@@ -165,7 +165,7 @@ class PushProtocolTest {
 
     @Test
     fun `durable issue 91 active command without revision remains readable`() {
-        val command = PushProtocol.parseCommand(payload()).toJson().apply { remove("revision") }
+        val command = PushProtocol.parseWireCommand(payload()).toJson().apply { remove("revision") }
         val state = JSONObject().apply {
             put("active", JSONObject().apply {
                 put("command", command)
@@ -178,5 +178,41 @@ class PushProtocolTest {
         val decoded = PushProtocol.stateFromJson(state)
 
         assertEquals(0L, decoded.active?.command?.revision)
+    }
+
+    @Test
+    fun `wire and stored command readers keep separate compatibility rules`() {
+        val issue91 = payload().apply {
+            remove("revision")
+            remove("artifact_etag")
+        }
+
+        assertThrows(IllegalArgumentException::class.java) {
+            PushProtocol.parseWireCommand(issue91)
+        }
+        val stored = PushProtocol.parseStoredCommand(issue91)
+        assertEquals(0L, stored.revision)
+        assertEquals(null, stored.artifactEtag)
+    }
+
+    @Test
+    fun `execution fingerprint allows locator refresh and compares every authorization field`() {
+        val command = PushProtocol.parseWireCommand(payload())
+        assertTrue(command.sameExecution(command.copy(artifactUrl = "http://server/new-lease")))
+
+        val changes = listOf(
+            command.copy(jobId = UUID.randomUUID().toString()),
+            command.copy(attempt = 2),
+            command.copy(artifactId = UUID.randomUUID().toString()),
+            command.copy(artifactSize = command.artifactSize!! + 1),
+            command.copy(artifactSha256 = "b".repeat(64)),
+            command.copy(bundleFilename = "other.zip"),
+            command.copy(destPath = "/sdcard/STYLY/other"),
+            command.copy(deleteExtras = true),
+            command.copy(revision = command.revision + 1),
+            command.copy(artifactEtag = "\"v2\""),
+        )
+
+        changes.forEach { assertFalse(command.sameExecution(it)) }
     }
 }

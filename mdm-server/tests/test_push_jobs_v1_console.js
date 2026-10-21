@@ -19,6 +19,7 @@ class FakeElement {
     this.style = {};
     this.textContent = '';
     this.isConnected = true;
+    this.parentNode = null;
     this.scrollHeight = 0;
     this.scrollTop = 0;
     this.listeners = new Map();
@@ -26,13 +27,26 @@ class FakeElement {
   }
 
   appendChild(child) {
+    if (child.parentNode) {
+      const previous = child.parentNode.children.indexOf(child);
+      if (previous >= 0) child.parentNode.children.splice(previous, 1);
+    }
     this.children.push(child);
-    child.isConnected = true;
+    child.parentNode = this;
+    setConnected(child, this.isConnected);
     return child;
   }
 
   replaceChildren(...children) {
+    this.children.forEach((child) => {
+      child.parentNode = null;
+      setConnected(child, false);
+    });
     this.children = children;
+    children.forEach((child) => {
+      child.parentNode = this;
+      setConnected(child, this.isConnected);
+    });
   }
 
   addEventListener(type, listener) {
@@ -42,12 +56,23 @@ class FakeElement {
   }
 
   click() {
+    if (!this.isConnected) return;
     (this.listeners.get('click') || []).forEach((listener) => listener());
   }
 
   remove() {
-    this.isConnected = false;
+    if (this.parentNode) {
+      const index = this.parentNode.children.indexOf(this);
+      if (index >= 0) this.parentNode.children.splice(index, 1);
+      this.parentNode = null;
+    }
+    setConnected(this, false);
   }
+}
+
+function setConnected(node, isConnected) {
+  node.isConnected = isConnected;
+  (node.children || []).forEach((child) => setConnected(child, isConnected));
 }
 
 class FakeWebSocket {
@@ -82,6 +107,11 @@ class FakeWebSocket {
     };
     (this.listeners.get('message') || []).forEach((listener) => listener(event));
     return event;
+  }
+
+  close() {
+    this.readyState = FakeWebSocket.CLOSED;
+    (this.listeners.get('close') || []).forEach((listener) => listener({}));
   }
 
   snapshot(...jobs) {
@@ -262,6 +292,8 @@ function openIntegratedConsole(options = {}) {
   const cells = [new FakeElement('div'), new FakeElement('span')];
   const consoleLogs = [];
   const fields = Object.fromEntries(['files', 'folder', 'name', 'dest', 'send'].map(id => [id, new FakeElement('input')]));
+  fields.files.type = 'file';
+  fields.folder.type = 'file';
   fields.files.files = [new File(['data'], 'content.txt')];
   fields.folder.files = [];
   fields.dest.value = '/sdcard/job';
@@ -288,15 +320,15 @@ function openIntegratedConsole(options = {}) {
   const bridge = indexSource.match(/window\.__stylyPushJobsV1Bridge = \{[\s\S]*?\n      \};/);
   assert.ok(bridge, 'integration tests use the production bridge');
   vm.runInContext(bridge[0], context);
-  vm.runInContext("createPushPanel({fileId:'files',folderId:'folder',nameId:'name',destId:'dest',btnId:'send',verb:'Push',deleteExtras:false,emptyLabel:'No files'})", context);
+  const panel = vm.runInContext("createPushPanel({fileId:'files',folderId:'folder',nameId:'name',destId:'dest',btnId:'send',verb:'Push',deleteExtras:false,emptyLabel:'No files'})", context);
   return {
-    ...harness, context, cells, consoleLogs,
+    ...harness, context, cells, fields, panel, consoleLogs,
     html() { return cells[0].innerHTML || ''; },
     verify() {
       context.sendVerifyDir();
       context.handleMessage({ type: 'VERIFY_DIR_RESULT', device_id: 'D1', status: 'ok', tree_hash: 'same-hash' });
     },
-    async sendPush() { fields.send.click(); await new Promise(resolve => setImmediate(resolve)); },
+    sendPush() { return panel.send(); },
   };
 }
 
@@ -455,9 +487,9 @@ for (const failure of ['create', 'upload', 'dispatch', 'disconnected']) {
     if (failure === 'disconnected') h.socket.readyState = FakeWebSocket.CLOSED;
     await h.sendPush();
     if (failure === 'disconnected') {
-      assert.ok(h.consoleLogs.some(message => message === 'Cannot push files: not connected to server'));
+      assert.ok(h.consoleLogs.some(message => message.includes('Admin WebSocket is disconnected')));
     } else {
-      assert.ok(findElementByText(h.logContainer, 'Push/Sync job failed before dispatch: ' +
+      assert.ok(h.consoleLogs.some(message => message === 'Push files failed: ' +
         (failure === 'dispatch' ? 'send failed' : failure + ' failed')));
     }
     assert.equal(h.html(), before);
@@ -475,19 +507,29 @@ for (const failure of ['create', 'upload', 'dispatch', 'disconnected']) {
 test('upload dispatch uses the replacement admin socket', async () => {
   let finishUpload;
   const uploadReady = new Promise((resolve) => { finishUpload = resolve; });
+  let uploadCount = 0;
+  let createCount = 0;
+  const clientRequestId = 'aaaaaaaa-1111-4111-8111-111111111111';
+  const jobId = '11111111-1111-4111-8111-111111111111';
+  const file = new File(['data'], 'content.txt', { lastModified: 1 });
   const harness = loadAdapter({
     fetch: async (url) => {
+      if (url === '/api/bundles') {
+        return new Response(JSON.stringify({ bundle_filename: 'legacy.zip' }), { status: 200 });
+      }
       if (url === '/api/push-jobs') {
+        createCount += 1;
         return new Response(JSON.stringify({
-          job_id: '11111111-1111-4111-8111-111111111111',
+          job_id: jobId,
           state: 'created',
           upload_url: '/api/push-jobs/upload',
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
       if (url === '/api/push-jobs/upload') {
+        uploadCount += 1;
         await uploadReady;
         return new Response(JSON.stringify({
-          job_id: '11111111-1111-4111-8111-111111111111',
+          job_id: jobId,
           state: 'ready',
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
@@ -495,18 +537,16 @@ test('upload dispatch uses the replacement admin socket', async () => {
     },
   });
   const firstSocket = new window.WebSocket('ws://localhost/ws/admin');
-  const form = new FormData();
-  form.append('files', new File(['data'], 'content.txt'));
-  const staged = await window.fetch('/api/bundles', { method: 'POST', body: form });
-  const marker = await staged.json();
-
-  firstSocket.send(JSON.stringify({
-    type: 'PUSH_FILES',
-    target_devices: ['D1'],
-    bundle_url: marker.bundle_url,
-    dest_path: '/sdcard/job',
-    delete_extras: false,
-  }));
+  const legacy = await window.fetch('/api/bundles', { method: 'POST', body: new FormData() });
+  assert.equal((await legacy.json()).bundle_filename, 'legacy.zip', 'standalone bundle uploads still use the real fetch implementation');
+  const submit = () => window.__stylyPushJobsV1Actions.submitPushJob({
+    files: [file],
+    targets: ['D1'],
+    destPath: '/sdcard/job',
+    mode: 'push',
+    clientRequestId,
+  });
+  const firstAttempt = submit();
   await new Promise((resolve) => setImmediate(resolve));
   const replacementSocket = new window.WebSocket('ws://localhost/ws/admin');
   finishUpload();
@@ -515,8 +555,311 @@ test('upload dispatch uses the replacement admin socket', async () => {
   assert.deepEqual(firstSocket.sent, []);
   assert.deepEqual(replacementSocket.sent, [{
     type: 'PUSH_FILES',
-    job_id: '11111111-1111-4111-8111-111111111111',
+    job_id: jobId,
   }]);
+  replacementSocket.close();
+  await assert.rejects(firstAttempt, /disconnected/);
+
+  const finalSocket = new window.WebSocket('ws://localhost/ws/admin');
+  const retry = submit();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(finalSocket.sent, [{ type: 'PUSH_FILES', job_id: jobId }]);
+  assert.equal(createCount, 1);
+  assert.equal(uploadCount, 1, 'a ready job is redispatched without uploading its artifact again');
+  finalSocket.emit({ type: 'PUSH_FILES_SENT', job_id: jobId });
+  assert.deepEqual(await retry, { job_id: jobId, state: 'dispatched' });
+});
+
+test('a terminal snapshot prevents redispatch of a ready job and rotates the panel request ID', async () => {
+  const requestIds = [];
+  let creates = 0;
+  let uploads = 0;
+  const firstJobId = '55555555-5555-4555-8555-555555555555';
+  const retryJobId = '66666666-6666-4666-8666-666666666666';
+  const h = openIntegratedConsole({
+    fetch: async (url, init) => {
+      if (url === '/api/push-jobs') {
+        requestIds.push(JSON.parse(init.body).client_request_id);
+        creates += 1;
+        const jobId = creates === 1 ? firstJobId : retryJobId;
+        return new Response(JSON.stringify({
+          job_id: jobId,
+          state: 'created',
+          upload_url: '/upload-' + creates,
+        }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (url === '/upload-1' || url === '/upload-2') {
+        uploads += 1;
+        const jobId = url === '/upload-1' ? firstJobId : retryJobId;
+        return new Response(JSON.stringify({ job_id: jobId, state: 'ready' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      throw new Error('unexpected URL: ' + url);
+    },
+  });
+  const selected = h.fields.files.files[0];
+  const firstAttempt = h.sendPush();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.socket.sent, [{ type: 'PUSH_FILES', job_id: firstJobId }]);
+  h.socket.close();
+  assert.equal(await firstAttempt, false);
+
+  const replacementSocket = new window.WebSocket('ws://localhost/ws/admin');
+  replacementSocket.snapshot(snapshot(firstJobId, 8, 'D1', 'failed', 1, {
+    clientRequestId: requestIds[0],
+    dispatchEnabled: false,
+    jobState: 'failed',
+  }));
+  assert.equal(await h.sendPush(), false, 'the terminal job is not redispatched under the old request ID');
+  assert.equal(h.fields.files.files[0], selected);
+  assert.equal(creates, 1, 'terminal state is surfaced before another create request');
+  assert.equal(uploads, 1);
+  assert.deepEqual(replacementSocket.sent, []);
+
+  const retryAttempt = h.sendPush();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(creates, 2);
+  assert.notEqual(requestIds[1], requestIds[0], 'the panel retries terminal work with a fresh idempotency key');
+  assert.equal(uploads, 2);
+  assert.deepEqual(replacementSocket.sent, [{ type: 'PUSH_FILES', job_id: retryJobId }]);
+  replacementSocket.emit({ type: 'PUSH_FILES_SENT', job_id: retryJobId });
+  assert.equal((await retryAttempt).job_id, retryJobId);
+});
+
+test('a terminal snapshot settles submission successfully when dispatch was accepted', async () => {
+  for (const terminal of [
+    { state: 'succeeded', dispatchEnabled: false },
+    { state: 'completed_with_errors', dispatchEnabled: false },
+    { state: 'failed', dispatchEnabled: true },
+  ]) {
+    const jobId = '77777777-7777-4777-8777-' + String(terminal.state.length).padStart(12, '0');
+    const h = loadAdapter({
+      fetch: async (url) => {
+        const body = url === '/api/push-jobs'
+          ? { job_id: jobId, state: 'created', upload_url: '/upload' }
+          : { job_id: jobId, state: 'ready' };
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      },
+    });
+    const socket = new window.WebSocket('ws://localhost/ws/admin');
+    socket.snapshot();
+    const requestId = 'bbbbbbbb-1111-4111-8111-' + String(terminal.state.length).padStart(12, '0');
+    const request = window.__stylyPushJobsV1Actions.submitPushJob({
+      files: [new File(['data'], 'content.txt', { lastModified: 1 })],
+      targets: ['D1'],
+      destPath: '/sdcard/job',
+      mode: 'push',
+      clientRequestId: requestId,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(socket.sent, [{ type: 'PUSH_FILES', job_id: jobId }]);
+    socket.update(snapshot(jobId, 9, 'D1', terminal.state === 'succeeded' ? 'succeeded' : 'failed', 1, {
+      clientRequestId: requestId,
+      dispatchEnabled: terminal.dispatchEnabled,
+      jobState: terminal.state,
+    }));
+    assert.deepEqual(await request, { job_id: jobId, state: 'dispatched' },
+      terminal.state + ' records a successful dispatch independently of its final job result');
+  }
+});
+
+test('Push panel keeps the selected files after create failure for retry', async () => {
+  const h = openIntegratedConsole({
+    fetch: async (url) => {
+      if (url === '/api/push-jobs') {
+        return new Response(JSON.stringify({ error: 'target device is not online' }), {
+          status: 422,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      throw new Error('unexpected URL: ' + url);
+    },
+  });
+  const selected = h.fields.files.files[0];
+
+  assert.equal(await h.sendPush(), false);
+  assert.equal(h.fields.files.files[0], selected);
+  assert.match(h.fields.name.textContent, /selection retained for retry/);
+  assert.ok(h.consoleLogs.some((line) => line.includes('target device is not online')));
+});
+
+test('terminal upload failure rotates the request ID while retaining the selected file', async () => {
+  const requestIds = [];
+  let creates = 0;
+  const firstJobId = '33333333-3333-4333-8333-333333333333';
+  const secondJobId = '44444444-4444-4444-8444-444444444444';
+  const h = openIntegratedConsole({
+    fetch: async (url, init) => {
+      if (url === '/api/push-jobs') {
+        const body = JSON.parse(init.body);
+        requestIds.push(body.client_request_id);
+        creates += 1;
+        if (creates === 1) {
+          return new Response(JSON.stringify({ job_id: firstJobId, state: 'created', upload_url: '/first-upload' }), {
+            status: 201, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (creates === 2) {
+          return new Response(JSON.stringify({ job_id: firstJobId, state: 'interrupted' }), {
+            status: 200, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({ job_id: secondJobId, state: 'created', upload_url: '/second-upload' }), {
+          status: 201, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url === '/first-upload') {
+        return new Response(JSON.stringify({ error: 'upload interrupted' }), {
+          status: 500, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url === '/second-upload') {
+        return new Response(JSON.stringify({ job_id: secondJobId, state: 'ready' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      throw new Error('unexpected URL: ' + url);
+    },
+  });
+  const selected = h.fields.files.files[0];
+
+  assert.equal(await h.sendPush(), false);
+  assert.equal(await h.sendPush(), false);
+  assert.equal(h.fields.files.files[0], selected);
+  const successfulAttempt = h.sendPush();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requestIds[1], requestIds[0], 'the in-flight job is looked up with its original idempotency key');
+  assert.notEqual(requestIds[2], requestIds[0], 'a terminal upload job is retried under a new key');
+  assert.deepEqual(h.socket.sent, [{ type: 'PUSH_FILES', job_id: secondJobId }]);
+  h.socket.emit({ type: 'PUSH_FILES_SENT', job_id: secondJobId });
+  assert.equal((await successfulAttempt).job_id, secondJobId);
+});
+
+test('an older async Push result does not reset a newer file selection', async () => {
+  let finishUpload;
+  const uploadReady = new Promise((resolve) => { finishUpload = resolve; });
+  const h = openIntegratedConsole({
+    fetch: async (url) => {
+      if (url === '/api/push-jobs') {
+        return new Response(JSON.stringify({
+          job_id: '22222222-2222-4222-8222-222222222222',
+          state: 'created',
+          upload_url: '/api/push-jobs/upload',
+        }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (url === '/api/push-jobs/upload') {
+        await uploadReady;
+        return new Response(JSON.stringify({ job_id: '22222222-2222-4222-8222-222222222222', state: 'ready' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      throw new Error('unexpected URL: ' + url);
+    },
+  });
+  const oldSelection = h.fields.files.files[0];
+  const request = h.sendPush();
+  await new Promise((resolve) => setImmediate(resolve));
+  const newSelection = new File(['new'], 'new.txt', { lastModified: 2 });
+  h.fields.files.files = [newSelection];
+  h.fields.files.listeners.get('change')[0]();
+  finishUpload();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.socket.sent, [{ type: 'PUSH_FILES', job_id: '22222222-2222-4222-8222-222222222222' }]);
+  h.socket.emit({ type: 'PUSH_FILES_SENT', job_id: '22222222-2222-4222-8222-222222222222' });
+  await request;
+
+  assert.notEqual(h.fields.files.files[0], oldSelection);
+  assert.equal(h.fields.files.files[0], newSelection);
+  assert.match(h.fields.name.textContent, /new\.txt/);
+});
+
+test('bulk action pending state survives redraw and clears on disconnect', () => {
+  const h = openConsole();
+  h.socket.snapshot(snapshot('pending-resume', 1, 'D1', 'queued', 1, {
+    resumeRequired: true,
+    dispatchEnabled: false,
+  }));
+  const firstButton = findElementByText(h.pushJobsTabActions, 'Resume all');
+  assert.ok(firstButton);
+  firstButton.click();
+  assert.equal(h.socket.sent.length, 1);
+
+  h.socket.update(snapshot('unrelated-job', 1, 'D2', 'downloading', 2));
+  const redrawnButton = findElementByText(h.pushJobsTabActions, 'Resuming…');
+  assert.ok(redrawnButton);
+  assert.equal(redrawnButton.disabled, true);
+  assert.equal(firstButton.isConnected, false, 'replaceChildren detaches the prior button');
+
+  h.socket.close();
+  const afterDisconnect = findElementByText(h.pushJobsTabActions, 'Resume all');
+  assert.ok(afterDisconnect);
+  assert.equal(afterDisconnect.disabled, false);
+});
+
+test('inline action pending state survives a canonical cell redraw and clears on acknowledgement', () => {
+  const h = openIntegratedConsole();
+  const job = snapshot('inline-pending-action', 1, 'D1', 'queued', 1, {
+    resumeRequired: true, dispatchEnabled: false,
+  });
+  h.socket.snapshot(job);
+  assert.match(h.html(), /data-action="resume"/);
+
+  assert.equal(window.__stylyPushJobsV1Actions.sendDeviceAction('D1', job.job_id, 'resume'), true);
+  assert.match(h.html(), /disabled>Resuming…<\/button>/);
+  assert.equal(window.__stylyPushJobsV1Actions.sendDeviceAction('D1', job.job_id, 'resume'), false);
+  assert.equal(findElementByText(h.pushJobsTabActions, 'Resuming…').title, '1 eligible device(s)',
+    'pending state does not change the underlying bulk target count');
+  h.socket.update(snapshot('unrelated-inline-job', 1, 'D2', 'downloading', 2));
+  h.socket.update({ ...job, revision: 2 });
+  assert.match(h.html(), /disabled>Resuming…<\/button>/,
+    'a later canonical redraw keeps the action pending');
+
+  h.socket.emit({ type: 'PUSH_FILES_SENT', job_id: job.job_id, resume: true, target_count: 1 });
+  assert.match(h.html(), /data-action="resume"/);
+  assert.doesNotMatch(h.html(), /Resuming…/);
+});
+
+test('a replaced socket closing settles only actions sent on that socket', () => {
+  const { socket: oldSocket, ...h } = openConsole();
+  const job = snapshot('socket-owned-action', 1, 'D1', 'queued', 1, {
+    resumeRequired: true, cancellable: true,
+  });
+  oldSocket.snapshot(job);
+  findElementByText(h.pushJobsTabActions, 'Resume all').click();
+
+  const replacementSocket = new window.WebSocket('ws://localhost/ws/admin');
+  assert.equal(window.__stylyPushJobsV1Actions.sendDeviceAction('D1', job.job_id, 'cancel'), true);
+  oldSocket.close();
+
+  assert.ok(findElementByText(h.pushJobsTabActions, 'Resume all'));
+  assert.ok(findElementByText(h.pushJobsTabActions, 'Cancelling…'),
+    'the new socket action stays pending after the old socket closes');
+  assert.deepEqual(replacementSocket.sent, [{
+    type: 'CANCEL_PUSH_JOB', job_id: job.job_id, target_devices: ['D1'],
+  }]);
+});
+
+test('an unscoped Cancel acknowledgement does not clear ambiguous same-job actions', () => {
+  const { socket, ...h } = openConsole();
+  const job = snapshot('same-job-actions', 1, 'D1', 'queued', 1, {
+    cancellable: true,
+  });
+  job.devices.D2 = { ...job.devices.D1, enqueue_seq: 2 };
+  socket.snapshot(job);
+  const api = window.__stylyPushJobsV1Actions;
+
+  assert.equal(api.sendDeviceAction('D1', job.job_id, 'cancel'), true);
+  assert.equal(api.sendDeviceAction('D2', job.job_id, 'cancel'), true);
+  socket.emit({ type: 'PUSH_JOB_ACTION_SENT', job_id: job.job_id, action: 'CANCEL_PUSH_JOB' });
+  assert.equal(api.actionPending('cancel', job.job_id, 'D1'), true);
+  assert.equal(api.actionPending('cancel', job.job_id, 'D2'), true,
+    'the acknowledgement has no target ID, so it cannot identify either request');
 });
 
 test('full snapshots merge pre-snapshot updates and remove absent jobs', () => {
@@ -665,8 +1008,10 @@ test('restart-paused jobs expose the existing operator resume command', () => {
   resume.click();
 
   assert.deepEqual(socket.sent, [{ type: 'PUSH_FILES', job_id: 'paused-job', target_devices: ['D1'] }]);
-  assert.equal(resume.disabled, true);
-  assert.equal(resume.textContent, 'Resuming…');
+  assert.equal(resume.isConnected, false);
+  const pendingResume = findElementByText(harness.pushJobsTabActions, 'Resuming…');
+  assert.ok(pendingResume);
+  assert.equal(pendingResume.disabled, true);
 });
 
 test('download retry exhaustion explains that Resume retains the partial', () => {
@@ -721,7 +1066,8 @@ test('dispatch attention includes durable ready jobs without a pause reason', ()
   assert.ok(resume);
   resume.click();
   assert.deepEqual(socket.sent, [{ type: 'PUSH_FILES', job_id: 'ready-job', target_devices: ['D1'] }]);
-  assert.equal(resume.textContent, 'Resuming…');
+  assert.equal(resume.isConnected, false);
+  assert.ok(findElementByText(harness.pushJobsTabActions, 'Resuming…'));
 });
 
 test('dispatch action becomes retryable when WebSocket send throws', () => {
@@ -954,14 +1300,21 @@ test('retry request IDs remain stable per revision and are pruned after updates 
   socket.snapshot(job(1));
   findElementByText(h.pushJobsTabActions, 'Retry failed devices').click();
   const firstId = socket.sent.at(-1).client_request_id;
+  assert.ok(findElementByText(h.pushJobsTabActions, 'Retry requested…'));
+  socket.emit({ type: 'ERROR', message: 'temporarily rejected' });
+  assert.ok(findElementByText(h.pushJobsTabActions, 'Retry requested…'),
+    'an uncorrelated ERROR must not release this pending Retry action');
+  socket.emit({ type: 'PUSH_JOB_ACTION_SENT', action: 'RETRY_FAILED_PUSH_JOB', job_id: 'created-retry-0' });
   findElementByText(h.pushJobsTabActions, 'Retry failed devices').click();
   assert.equal(socket.sent.at(-1).client_request_id, firstId);
   assert.deepEqual(socket.sent.at(-1), socket.sent[0]);
+  socket.emit({ type: 'PUSH_JOB_ACTION_SENT', action: 'RETRY_FAILED_PUSH_JOB', job_id: 'created-retry-1' });
 
   socket.update(job(2));
   findElementByText(h.pushJobsTabActions, 'Retry failed devices').click();
   const secondId = socket.sent.at(-1).client_request_id;
   assert.notEqual(secondId, firstId);
+  socket.emit({ type: 'PUSH_JOB_ACTION_SENT', action: 'RETRY_FAILED_PUSH_JOB', job_id: 'created-retry-2' });
 
   const reconnect = new window.WebSocket('ws://localhost/ws/admin');
   reconnect.update(job(2));
@@ -969,6 +1322,7 @@ test('retry request IDs remain stable per revision and are pruned after updates 
   findElementByText(h.pushJobsTabActions, 'Retry failed devices').click();
   assert.equal(reconnect.sent.at(-1).client_request_id, secondId,
     'the buffered latest revision keeps its existing idempotency key');
+  reconnect.emit({ type: 'PUSH_JOB_ACTION_SENT', action: 'RETRY_FAILED_PUSH_JOB', job_id: 'created-retry-3' });
 
   reconnect.snapshot();
   reconnect.snapshot(job(2));
@@ -989,10 +1343,12 @@ test('inline actions send only the selected device while Resume all targets elig
   assert.deepEqual(socket.sent.at(-1), {
     type: 'PUSH_FILES', job_id: job.job_id, target_devices: ['D1'],
   });
+  socket.emit({ type: 'PUSH_FILES_SENT', job_id: job.job_id, resume: true, target_count: 1 });
   assert.equal(api.sendDeviceAction('D2', job.job_id, 'cancel'), true);
   assert.deepEqual(socket.sent.at(-1), {
     type: 'CANCEL_PUSH_JOB', job_id: job.job_id, target_devices: ['D2'],
   });
+  socket.emit({ type: 'PUSH_JOB_ACTION_SENT', job_id: job.job_id, action: 'CANCEL_PUSH_JOB' });
   assert.equal(api.sendDeviceAction('D2', 'stale-job', 'cancel'), false);
   const all = findElementByText(harness.pushJobsTabActions, 'Resume all');
   assert.equal(all.textContent, 'Resume all');
@@ -1222,6 +1578,7 @@ test('offline timeout keeps attention and Cancel but excludes Resume and refresh
   assert.equal(api.sendDeviceAction('D1', job.job_id, 'resume'), false);
   findElementByText(h.pushJobsTabActions, 'Resume all').click();
   assert.deepEqual(socket.sent.at(-1).target_devices, ['D2']);
+  socket.emit({ type: 'PUSH_FILES_SENT', job_id: job.job_id, resume: true, target_count: 1 });
   online.clear();
   api.refreshConnectivity();
   assert.equal(findElementByText(h.pushJobsTabActions, 'Resume all').disabled, true);
