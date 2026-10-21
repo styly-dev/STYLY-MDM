@@ -2,6 +2,8 @@ package com.styly.mdmclient
 
 import android.content.Context
 import android.util.Log
+import android.os.SystemClock
+import android.provider.Settings
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -15,6 +17,7 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 internal fun persistPushStateBeforePublishing(
     nextState: PushProtocol.State,
@@ -143,13 +146,12 @@ internal fun applyPushResumeRejectionToState(
 
 internal fun expireInterruptedPushState(
     current: PushProtocol.State,
-    now: Long,
-    retentionMs: Long,
+    clock: PushRetentionClock,
     maxReceipts: Int,
 ): Pair<PushProtocol.State, PushProtocol.Receipt>? {
     val active = current.active?.takeIf { it.interrupted } ?: return null
-    val interruptedAt = active.interruptedAt ?: return null
-    if (now < interruptedAt || now - interruptedAt < retentionMs) return null
+    val retention = active.retention ?: return null
+    if (retention.checkpoint(clock.bootCount, clock.elapsedRealtimeMs).remainingMs > 0L) return null
     val command = active.command
     val receipt = PushProtocol.Receipt(
         command,
@@ -159,7 +161,7 @@ internal fun expireInterruptedPushState(
             status = "fail",
             destPath = command.destPath,
             failureCode = "resume_expired",
-            detail = "Interrupted Push/Sync resume expired after 24 hours",
+            detail = "Interrupted Push/Sync resume expired after 24 hours of device uptime",
         ),
     )
     return current.copy(
@@ -170,22 +172,22 @@ internal fun expireInterruptedPushState(
     ) to receipt
 }
 
-internal fun interruptedExpiryDelayMillis(
-    active: PushProtocol.Active?,
-    now: Long,
-    retentionMs: Long,
-): Long? {
-    val interruptedAt = active?.takeIf { it.interrupted }?.interruptedAt ?: return null
-    val elapsed = if (now >= interruptedAt) now - interruptedAt else 0L
-    return (retentionMs - elapsed).coerceAtLeast(0L)
+internal data class PushRetentionClock(val bootCount: Int, val elapsedRealtimeMs: Long)
+
+internal const val PUSH_RETENTION_CHECKPOINT_MS = 5 * 60_000L
+
+internal fun checkpointPushRetention(active: PushProtocol.Active, clock: PushRetentionClock): PushProtocol.Active {
+    if (active.retention == null && !active.interrupted) return active
+    val retention = active.retention?.checkpoint(clock.bootCount, clock.elapsedRealtimeMs)
+        ?: PushProtocol.Retention(PushFilesWorker.PARTIAL_RETENTION_MS, clock.bootCount, clock.elapsedRealtimeMs)
+    return active.copy(retention = retention)
 }
 
-internal fun interruptPushAfterRestart(active: PushProtocol.Active, now: Long): PushProtocol.Active =
-    active.copy(
+internal fun interruptPushAfterRestart(active: PushProtocol.Active, clock: PushRetentionClock): PushProtocol.Active =
+    checkpointPushRetention(active.copy(
         interrupted = true,
-        interruptedAt = active.interruptedAt ?: now,
         interruptionReason = active.interruptionReason ?: "client_restarted",
-    )
+    ), clock)
 
 internal fun buildPushRegistrationFields(
     state: PushProtocol.State,
@@ -342,6 +344,7 @@ internal class PushJobCoordinatorDependencies(
     val actor: ScheduledExecutorService,
     val workerExecutor: ExecutorService,
     val log: (Int, String, Throwable?) -> Unit,
+    val retentionClock: () -> PushRetentionClock,
 )
 
 /**
@@ -390,6 +393,11 @@ class PushJobCoordinator internal constructor(
                 workerExecutor = Executors.newSingleThreadExecutor { runnable ->
                     Thread(runnable, "push-job-worker")
                 },
+                retentionClock = {
+                    val bootCount = Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT)
+                    check(bootCount >= 0) { "Device boot count is unavailable" }
+                    PushRetentionClock(bootCount, SystemClock.elapsedRealtime())
+                },
                 log = { priority, message, error ->
                     when (priority) {
                         Log.ERROR -> Log.e(TAG, message, error)
@@ -403,10 +411,10 @@ class PushJobCoordinator internal constructor(
 
     private val actor = dependencies.actor
     /**
-     * The only pending interrupted-expiry check. It is replaced on the single actor
+     * The only pending retention checkpoint/expiry check. It is replaced on the single actor
      * thread, so a canceled check that has not started can never run.
      */
-    private var interruptedExpiryTimer: ScheduledFuture<*>? = null
+    private var retentionTimer: ScheduledFuture<*>? = null
     private val workerExecutor = dependencies.workerExecutor
     private val processInstanceId = UUID.randomUUID().toString()
 
@@ -460,6 +468,7 @@ class PushJobCoordinator internal constructor(
 
     fun registrationFields(onReady: (JSONObject) -> Unit) {
         actor.execute {
+            expireIfStale()
             onReady(buildRegistrationFields())
         }
     }
@@ -473,6 +482,7 @@ class PushJobCoordinator internal constructor(
         actor.execute {
             if (transportToken === token) {
                 transportRegistered = true
+                expireIfStale()
                 resetNotices.onRegistered(token)
                 replayPendingResults()
             }
@@ -674,14 +684,14 @@ class PushJobCoordinator internal constructor(
     }
 
     private fun accept(command: PushProtocol.Command) {
-        val interruptedAt = state.active
+        val retention = state.active
             ?.takeIf { it.interrupted && it.command.identity == command.identity }
-            ?.interruptedAt
+            ?.retention
         val nextState = state.copy(
             active = PushProtocol.Active(
                 command,
                 PushProtocol.PHASE_DOWNLOADING,
-                interruptedAt = interruptedAt,
+                retention = retention,
             ),
         )
         if (!persist(nextState)) { // durability before acceptance and before worker start
@@ -883,7 +893,6 @@ class PushJobCoordinator internal constructor(
                 val nextState = state.copy(
                     active = active.copy(
                         interrupted = true,
-                        interruptedAt = active.interruptedAt ?: System.currentTimeMillis(),
                         interruptionReason = outcome.reason,
                     ),
                 )
@@ -971,6 +980,7 @@ class PushJobCoordinator internal constructor(
     }
 
     private fun handleReconcileRequest(payload: JSONObject) {
+        if (expireIfStale() == ExpiredOwnership.PersistenceFailed) return
         val jobs = payload.optJSONArray("jobs") ?: JSONArray()
         for (index in 0 until jobs.length()) {
             val requested = jobs.optJSONObject(index) ?: continue
@@ -1000,18 +1010,15 @@ class PushJobCoordinator internal constructor(
         // migrated as revision=0. It cannot be resumed safely, so preserve the
         // old client_restarted terminal/cleanup behavior for that state only.
         if (active.command.isJobV1 && active.command.revision > 0L) {
-            val expired = expireInterruptedPushState(
-                loaded,
-                System.currentTimeMillis(),
-                PushFilesWorker.PARTIAL_RETENTION_MS,
-                MAX_RECEIPTS,
-            )
+            val clock = dependencies.retentionClock()
+            val recovered = loaded.copy(active = interruptPushAfterRestart(active, clock))
+            val expired = expireInterruptedPushState(recovered, clock, MAX_RECEIPTS)
             if (expired != null) {
                 log(Log.WARN, "Expired interrupted Push/Sync ${active.command.identity}", null)
                 return Recovery(expired.first, active.command)
             }
             log(Log.WARN, "Recovered resumable Push/Sync ${active.command.identity}", null)
-            return Recovery(loaded.copy(active = interruptPushAfterRestart(active, System.currentTimeMillis())))
+            return Recovery(recovered)
         }
         val interrupted = PushProtocol.Result(
             jobId = active.command.jobId,
@@ -1046,42 +1053,71 @@ class PushJobCoordinator internal constructor(
         return true
     }
 
-    private fun scheduleInterruptedExpiry(active: PushProtocol.Active?) {
-        replaceInterruptedExpiryTimer(
-            interruptedExpiryDelayMillis(
-                active,
-                System.currentTimeMillis(),
-                PushFilesWorker.PARTIAL_RETENTION_MS,
-            ),
-        )
+    private fun scheduleRetentionCheckpoint(active: PushProtocol.Active?) {
+        val retention = active?.retention
+        val delay = retention?.let {
+            if (active.interrupted) minOf(PUSH_RETENTION_CHECKPOINT_MS, it.remainingMs)
+            else if (it.remainingMs > 0L) PUSH_RETENTION_CHECKPOINT_MS else null
+        }
+        replaceRetentionTimer(delay)
     }
 
-    private fun replaceInterruptedExpiryTimer(delayMillis: Long?) {
-        interruptedExpiryTimer?.cancel(false)
-        interruptedExpiryTimer = delayMillis?.let {
-            actor.schedule({ expireInterruptedOwnership() }, it, TimeUnit.MILLISECONDS)
+    private fun replaceRetentionTimer(delayMillis: Long?) {
+        retentionTimer?.cancel(false)
+        retentionTimer = delayMillis?.let {
+            actor.schedule({ checkpointRetention() }, it, TimeUnit.MILLISECONDS)
         }
     }
 
     private enum class ExpiredOwnership { NotDue, Settled, PersistenceFailed }
 
-    private fun expireInterruptedOwnership() {
-        when (expireIfStale()) {
-            ExpiredOwnership.NotDue -> scheduleInterruptedExpiry(state.active)
-            ExpiredOwnership.PersistenceFailed ->
-                replaceInterruptedExpiryTimer(60_000L)
-            ExpiredOwnership.Settled -> Unit
+    private fun checkpointRetention(): Boolean {
+        if (!stateLoaded) return false
+        return when (expireIfStale()) {
+            ExpiredOwnership.NotDue -> if (state.active?.retention != null) persist(state) else true
+            ExpiredOwnership.PersistenceFailed -> {
+                replaceRetentionTimer(60_000L)
+                false
+            }
+            ExpiredOwnership.Settled -> true
+        }
+    }
+
+    /** Best effort final save; the broadcast receiver waits without becoming a second state owner. */
+    fun checkpointBeforeShutdown(): Boolean {
+        val checkpoint = try {
+            actor.submit<Boolean> { checkpointRetention() }
+        } catch (error: RejectedExecutionException) {
+            log(Log.WARN, "Could not schedule shutdown retention checkpoint", error)
+            return false
+        }
+        return try {
+            checkpoint.get(3L, TimeUnit.SECONDS)
+        } catch (error: InterruptedException) {
+            checkpoint.cancel(false)
+            Thread.currentThread().interrupt()
+            false
+        } catch (error: TimeoutException) {
+            checkpoint.cancel(false)
+            log(Log.WARN, "Shutdown retention checkpoint timed out", error)
+            false
+        } catch (error: ExecutionException) {
+            log(Log.WARN, "Shutdown retention checkpoint failed", error.cause ?: error)
+            false
         }
     }
 
     /** Settles only an already-expired interrupted ownership; never schedules work. */
     private fun expireIfStale(): ExpiredOwnership {
-        val settled = expireInterruptedPushState(
-            state,
-            System.currentTimeMillis(),
-            PushFilesWorker.PARTIAL_RETENTION_MS,
-            MAX_RECEIPTS,
-        )
+        if (state.active?.interrupted != true || state.active?.retention == null) return ExpiredOwnership.NotDue
+        val settled = try {
+            expireInterruptedPushState(state, dependencies.retentionClock(), MAX_RECEIPTS)
+        } catch (error: Exception) {
+            log(Log.ERROR, "Could not read Push retention clock", error)
+            setDurabilityAvailable(false)
+            beginRecovery()
+            return ExpiredOwnership.PersistenceFailed
+        }
         if (settled == null) return ExpiredOwnership.NotDue
         val (nextState, receipt) = settled
         val command = receipt.command
@@ -1098,7 +1134,13 @@ class PushJobCoordinator internal constructor(
     private fun persist(nextState: PushProtocol.State): Boolean {
         val persisted = persistPushStateBeforePublishing(
             nextState,
-            save = dependencies.saveState,
+            save = { next ->
+                val active = next.active
+                val checkpointed = if (active != null && (active.interrupted || active.retention != null)) {
+                    next.copy(active = checkpointPushRetention(active, dependencies.retentionClock()))
+                } else next
+                dependencies.saveState(checkpointed)
+            },
             onFailure = { error ->
                 log(Log.ERROR, "Could not persist durable Push/Sync state", error)
             },
@@ -1109,7 +1151,7 @@ class PushJobCoordinator internal constructor(
             setDurabilityAvailable(false)
             beginRecovery()
         } else {
-            scheduleInterruptedExpiry(state.active)
+            scheduleRetentionCheckpoint(state.active)
             if (recoveryBudget.phase == PushStateRecoveryBudget.Phase.Healthy) {
                 // While an incident is open (or exhausted), only a recovery attempt makes
                 // state available again, so the server is told through a re-registration.
