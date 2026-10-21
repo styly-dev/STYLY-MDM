@@ -15,12 +15,14 @@ Earlier checks on macOS, 2026-10-21:
 - Android: 214 unit tests passed; development APK build succeeded.
 
 The powered-on retention follow-up uses durable state version 2. Its current server
-suite passes 656 tests on Python 3.11, and console checks pass 66 with the same one
+suite passes 656 tests on both Python 3.11 and 3.12, and console checks pass 66 with the same one
 skip. Android verification uses `testProdDebugUnitTest assembleProdDebug`; the
-226-test suite passed in five consecutive runs and covers boot changes, process
+227-test suite passed in five consecutive runs and covers boot changes, process
 downtime, five-minute checkpoints, bounded shutdown saves, Resume, delayed
-entry-point expiry, invalid state, and persistence failure. The earlier repeated server results above predate the explicit
-manager API and schema-statement cleanup.
+entry-point expiry, invalid state, and persistence failure. Combined-failure checks
+also cover clock availability recovery and preserving unsaved terminal results
+when a resumed retention budget expires. The earlier repeated server results above
+predate the explicit manager API and schema-statement cleanup.
 
 The server suite runs with `python -m pytest -q` in `mdm-server`. The registration
 subset is `tests/test_self_update.py tests/test_retire.py
@@ -66,7 +68,8 @@ then used owned interrupted-state fixtures without starting a replacement worker
 
 The original APK hash, configuration, empty Push journal, USB route, running client
 and guard, and online management connection were verified after restoration. All
-owned fixture directories were removed. The physical three-second power-button
+owned fixture directories were removed. The later store-wrapper and constant-ownership cleanup did not change runtime behavior;
+hardware checks were not repeated for that cleanup. The physical three-second power-button
 operation, deep-sleep timing, and 24 hours of real elapsed operation were not tested;
 the normal shutdown receiver was exercised through the framework reboot above.
 

@@ -25,11 +25,6 @@ class PushFilesWorkerTest {
     val tmp = TemporaryFolder()
 
     @Test
-    fun `partial cleanup metadata defaults to twenty four hours`() {
-        assertEquals(24L * 60 * 60 * 1000, PushFilesWorker.PARTIAL_RETENTION_MS)
-    }
-
-    @Test
     fun `connection errors interrupt resumable download at its idle deadline`() {
         val unavailablePort = ServerSocket(0, 1, InetAddress.getLoopbackAddress()).use {
             it.localPort

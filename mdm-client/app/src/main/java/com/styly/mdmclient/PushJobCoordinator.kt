@@ -179,7 +179,7 @@ internal const val PUSH_RETENTION_CHECKPOINT_MS = 5 * 60_000L
 internal fun checkpointPushRetention(active: PushProtocol.Active, clock: PushRetentionClock): PushProtocol.Active {
     if (active.retention == null && !active.interrupted) return active
     val retention = active.retention?.checkpoint(clock.bootCount, clock.elapsedRealtimeMs)
-        ?: PushProtocol.Retention(PushFilesWorker.PARTIAL_RETENTION_MS, clock.bootCount, clock.elapsedRealtimeMs)
+        ?: PushProtocol.Retention(PushProtocol.Retention.DURATION_MS, clock.bootCount, clock.elapsedRealtimeMs)
     return active.copy(retention = retention)
 }
 

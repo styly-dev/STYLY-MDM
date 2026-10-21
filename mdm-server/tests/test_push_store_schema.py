@@ -19,15 +19,15 @@ async def _ready_job(manager: PushJobManager, root: Path, states: dict[str, str]
         'source': {'display_name': 'content', 'declared_file_count': 1, 'declared_total_bytes': 4},
     })
     capabilities = ['push_job_id_v1', 'push_resume_v1']
-    _, job = await manager.create_job(
+    _, job = await manager.store.create_job(
         request, {device: (ProtocolMode.JOB_V1, capabilities) for device in states}, 600_000,
     )
     job_id = job['job_id']
-    await manager.start_upload(job_id)
-    await manager.mark_packaging(job_id, 1, 4)
+    await manager.store.start_upload(job_id)
+    await manager.store.mark_packaging(job_id, 1, 4)
     artifact_id = str(uuid.uuid4())
     (root / (artifact_id + '.zip')).write_bytes(b'data')
-    await manager.publish_artifact(job_id, {
+    await manager.store.publish_artifact(job_id, {
         'artifact_id': artifact_id, 'storage_name': artifact_id + '.zip',
         'display_filename': 'content.zip', 'byte_size': 4, 'sha256': 'a' * 64, 'entry_count': 1,
     })

@@ -19,13 +19,13 @@ class PushJobCoordinatorStateTest {
         assertEquals("interrupted", report.getString("status"))
         assertEquals("client_restarted", report.getString("reason"))
         assertEquals(
-            PushFilesWorker.PARTIAL_RETENTION_MS - 9_000L,
+            PushProtocol.Retention.DURATION_MS - 9_000L,
             interruptPushAfterRestart(recovered, PushRetentionClock(1, 10_000L)).retention?.remainingMs,
         )
         val timedOut = recovered.copy(interruptionReason = "download_interrupted")
         val restarted = interruptPushAfterRestart(timedOut, PushRetentionClock(1, 20_000L))
         assertEquals("download_interrupted", restarted.interruptionReason)
-        assertEquals(PushFilesWorker.PARTIAL_RETENTION_MS - 19_000L, restarted.retention?.remainingMs)
+        assertEquals(PushProtocol.Retention.DURATION_MS - 19_000L, restarted.retention?.remainingMs)
         val restartedReport = buildActivePushReconcileReport(
             PushProtocol.ReconcileIdentity(requireNotNull(active.command.jobId), active.command.attempt, active.command.artifactId),
             restarted, 0L,
@@ -267,7 +267,7 @@ class PushJobCoordinatorStateTest {
                 command,
                 PushProtocol.PHASE_DOWNLOADING,
                 interrupted = true,
-                retention = PushProtocol.Retention(PushFilesWorker.PARTIAL_RETENTION_MS, 1, 123L),
+                retention = PushProtocol.Retention(PushProtocol.Retention.DURATION_MS, 1, 123L),
                 interruptionReason = "download_interrupted",
             ),
             pendingResults = emptyList(),
@@ -369,7 +369,7 @@ class PushJobCoordinatorStateTest {
             command,
             PushProtocol.PHASE_DOWNLOADING,
             interrupted = true,
-            retention = PushProtocol.Retention(PushFilesWorker.PARTIAL_RETENTION_MS, 1, 123L),
+            retention = PushProtocol.Retention(PushProtocol.Retention.DURATION_MS, 1, 123L),
             interruptionReason = "download_interrupted",
         )
         val report = buildActivePushReconcileReport(
@@ -396,13 +396,13 @@ class PushJobCoordinatorStateTest {
         val state = PushProtocol.State(
             active = PushProtocol.Active(
                 command, PushProtocol.PHASE_DOWNLOADING, interrupted = true,
-                retention = PushProtocol.Retention(PushFilesWorker.PARTIAL_RETENTION_MS, 1, 1_000L),
+                retention = PushProtocol.Retention(PushProtocol.Retention.DURATION_MS, 1, 1_000L),
                 interruptionReason = "download_interrupted",
             ),
             pendingResults = emptyList(),
             completedReceipts = emptyList(),
         )
-        val deadline = 1_000L + PushFilesWorker.PARTIAL_RETENTION_MS
+        val deadline = 1_000L + PushProtocol.Retention.DURATION_MS
         val cases = listOf("one millisecond before" to (deadline - 1L), "at deadline" to deadline)
         for ((label, now) in cases) {
             val settled = expireInterruptedPushState(
@@ -500,7 +500,7 @@ class PushJobCoordinatorStateTest {
             command(),
             PushProtocol.PHASE_DOWNLOADING,
             interrupted = true,
-            retention = PushProtocol.Retention(PushFilesWorker.PARTIAL_RETENTION_MS, 1, 1_000L),
+            retention = PushProtocol.Retention(PushProtocol.Retention.DURATION_MS, 1, 1_000L),
             interruptionReason = "download_interrupted",
         )
         val fields = buildPushRegistrationFields(

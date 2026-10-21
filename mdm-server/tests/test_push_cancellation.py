@@ -54,14 +54,14 @@ async def timed_out_job(manager):
 async def test_timeout_cancel_is_terminal_idempotent_and_unblocks_next_job(manager):
     first = await timed_out_job(manager)
     second = await ready_job(manager.store, manager)
-    await manager.enable_dispatch(second['job_id'])
+    await manager.store.enable_dispatch(second['job_id'])
     assert await manager.claim_next(['D1']) is None
     cancelled = await manager.cancel_interrupted(first['job_id'], 'D1')
     assert cancelled['devices']['D1']['state'] == 'queued'
     assert cancelled['devices']['D1']['cancel_requested']
     assert await manager.claim_next(['D1']) is None
     assert await manager.cancel_interrupted(first['job_id'], 'D1') == cancelled
-    await manager.enable_dispatch(first['job_id'])
+    await manager.store.enable_dispatch(first['job_id'])
     assert await manager.claim_next(['D1']) is None
     await manager.confirm_cancel(first['job_id'], 'D1')
     assert (await manager.claim_next(['D1']))['job']['job_id'] == second['job_id']
@@ -113,7 +113,7 @@ async def test_cancel_rejects_work_not_awaiting_timeout_resume(manager, phase):
         original = await downloading_job(manager.store, manager)
     else:
         original = await timed_out_job(manager)
-        _, original = await manager.enable_dispatch(original['job_id'])
+        _, original = await manager.store.enable_dispatch(original['job_id'])
     with pytest.raises(StoreConflict, match='Only interrupted'):
         await manager.cancel_interrupted(original['job_id'], 'D1')
     assert await manager.get_snapshot(original['job_id']) == original
@@ -146,10 +146,10 @@ async def test_offline_cancel_preserves_fence_and_artifact_until_exact_cleanup(m
                                    reason='device_disconnect', deadline=1)
     await manager.cancel_interrupted(active['job_id'], 'D1')
     await manager.mark_unconfirmed(active['job_id'], 'D1', None, 'timeout', observed_now=2)
-    assert (await manager.artifact_record(active['artifact']['artifact_id']))['retention_state'] == 'retained'
+    assert (await manager.store.artifact_record(active['artifact']['artifact_id']))['retention_state'] == 'retained'
     assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms()+1000) == []
     next_job = await ready_job(manager.store, manager)
-    await manager.enable_dispatch(next_job['job_id'])
+    await manager.store.enable_dispatch(next_job['job_id'])
     assert await manager.claim_next(['D1']) is None
     runtime, session = runtime_for(manager)
     identity = {'job_id': active['job_id'], 'attempt': 1, 'artifact_id': active['artifact']['artifact_id'],
@@ -177,7 +177,7 @@ async def test_client_restart_requires_explicit_resume_even_when_job_enabled(man
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=9999999999999)
     if resume_first:
-        await manager.enable_dispatch(active['job_id'])
+        await manager.store.enable_dispatch(active['job_id'])
     outcome, current = await manager.resume_interrupted(active['job_id'], 'D1', attempt=1,
         artifact_id=active['artifact']['artifact_id'], dispatch_revision=active['devices']['D1']['dispatch_revision'],
         validated_offset=1, reason='client_restarted')
@@ -185,7 +185,7 @@ async def test_client_restart_requires_explicit_resume_even_when_job_enabled(man
     assert current['devices']['D1']['queue_reason'] == ('resumable_replay' if resume_first else 'client_restarted')
     if not resume_first:
         assert await manager.claim_next(['D1']) is None
-        await manager.enable_dispatch(active['job_id'])
+        await manager.store.enable_dispatch(active['job_id'])
     assert await manager.claim_next(['D1']) is not None
 
 

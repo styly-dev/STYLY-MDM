@@ -25,14 +25,14 @@ async def completed(manager, root):
         'mode': 'sync', 'dest_path': '/sdcard/STYLY/content',
         'source': {'display_name': 'content', 'declared_file_count': 1, 'declared_total_bytes': 4},
     })
-    _, job = await manager.create_job(request, {
+    _, job = await manager.store.create_job(request, {
         device: (ProtocolMode.JOB_V1, ['push_job_id_v1']) for device in states}, 600_000)
     job_id = job['job_id']
-    await manager.start_upload(job_id)
-    await manager.mark_packaging(job_id, 1, 4)
+    await manager.store.start_upload(job_id)
+    await manager.store.mark_packaging(job_id, 1, 4)
     artifact_id = str(uuid.uuid4())
     (root / (artifact_id + '.zip')).write_bytes(b'data')
-    await manager.publish_artifact(job_id, {
+    await manager.store.publish_artifact(job_id, {
         'artifact_id': artifact_id, 'storage_name': artifact_id + '.zip',
         'display_filename': 'content.zip', 'byte_size': 4, 'sha256': 'a' * 64, 'entry_count': 1,
     })
@@ -123,7 +123,7 @@ async def test_shared_artifact_gc_uses_latest_reference_end(manager, tmp_path, t
         conn.execute('UPDATE push_jobs SET terminal_at=?, updated_at=200 WHERE job_id=?',
                      (terminal_at, retry['job_id']))
     await manager.store._call(finish)
-    assert (await manager.artifact_record(artifact_id))['retention_state'] == 'retained'
+    assert (await manager.store.artifact_record(artifact_id))['retention_state'] == 'retained'
     assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=100, timestamp=299) == []
     assert (tmp_path / (artifact_id + '.zip')).is_file()
     assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=100, timestamp=300) == [artifact_id]
@@ -152,7 +152,7 @@ async def test_retry_skips_targets_superseded_by_later_work_for_same_destination
         'mode': 'sync', 'dest_path': original['dest_path'],
         'source': {'display_name': 'newer', 'declared_file_count': 1, 'declared_total_bytes': 4},
     })
-    _, newer = await manager.create_job(request, {
+    _, newer = await manager.store.create_job(request, {
         device: (ProtocolMode.JOB_V1, ['push_job_id_v1']) for device in ('failed', 'interrupted')
     }, 600_000)
     await manager.store._call(lambda conn: conn.execute(
@@ -174,7 +174,7 @@ async def test_never_dispatched_later_failure_does_not_supersede_retry(manager, 
         'mode': 'sync', 'dest_path': original['dest_path'],
         'source': {'display_name': 'newer', 'declared_file_count': 1, 'declared_total_bytes': 4},
     })
-    _, newer = await manager.create_job(
+    _, newer = await manager.store.create_job(
         request, {'failed': (ProtocolMode.JOB_V1, ['push_job_id_v1'])}, 600_000)
 
     def fail_before_dispatch(conn):
