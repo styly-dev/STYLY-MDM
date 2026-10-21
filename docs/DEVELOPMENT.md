@@ -33,6 +33,10 @@ The authoritative implementation and protocol guide is
 dispatch, command acceptance, transfer completion, validation/apply, terminal result,
 ACK, restart recovery, and persistent device-fence reconciliation.
 
+`PushJobManager` declares its public operations explicitly; store methods are not
+automatically exposed through it. SQLite initialization executes an ordered list
+of DDL statements within the same transaction as column and metadata upgrades.
+
 Terminal results are decided by `PushJobManager.settle_result` in one SQLite
 transaction, including assignment/fence checks, outcome updates and revisions.
 The runtime then releases the authorized transfer, publishes changed snapshots

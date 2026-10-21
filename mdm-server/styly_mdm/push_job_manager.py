@@ -76,8 +76,90 @@ class PushJobManager:
         self.store = store
         self.verify_schema_sync()
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.store, name)
+    # Primitive operations exposed by the manager's public API. Store lifecycle
+    # and private worker access remain on the explicitly owned store.
+    async def create_job(
+        self,
+        request: Any,
+        target_protocols: Mapping[str, tuple[ProtocolMode, Iterable[str]]],
+        create_timeout_ms: int,
+    ) -> tuple[bool, dict[str, Any]]:
+        return await self.store.create_job(request, target_protocols, create_timeout_ms)
+
+    async def get_snapshot(self, job_id: str) -> dict[str, Any]:
+        return await self.store.get_snapshot(job_id)
+
+    async def start_upload(self, job_id: str) -> dict[str, Any]:
+        return await self.store.start_upload(job_id)
+
+    async def mark_packaging(
+        self, job_id: str, actual_file_count: int, actual_total_bytes: int,
+    ) -> dict[str, Any]:
+        return await self.store.mark_packaging(job_id, actual_file_count, actual_total_bytes)
+
+    async def publish_artifact(
+        self, job_id: str, artifact: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return await self.store.publish_artifact(job_id, artifact)
+
+    async def fail_pre_dispatch(
+        self, job_id: str, state: JobState, code: str, detail: str,
+    ) -> dict[str, Any]:
+        return await self.store.fail_pre_dispatch(job_id, state, code, detail)
+
+    async def enable_dispatch(
+        self, job_id: str, target_devices: list[str] | None = None,
+    ) -> tuple[bool, dict[str, Any]]:
+        return await self.store.enable_dispatch(job_id, target_devices)
+
+    async def transition_device(
+        self,
+        job_id: str,
+        device_id: str,
+        *,
+        expected: set[DeviceState] | None,
+        target: DeviceState,
+        fields: Mapping[str, Any] | None = None,
+        allow_terminal_idempotent: bool = False,
+    ) -> dict[str, Any]:
+        return await self.store.transition_device(
+            job_id, device_id, expected=expected, target=target, fields=fields,
+            allow_terminal_idempotent=allow_terminal_idempotent,
+        )
+
+    async def mark_reconciling(
+        self,
+        job_id: str,
+        device_id: str,
+        *,
+        expected: set[DeviceState],
+        reason: str,
+        deadline: int,
+    ) -> dict[str, Any]:
+        return await self.store.mark_reconciling(
+            job_id, device_id, expected=expected, reason=reason, deadline=deadline,
+        )
+
+    async def active_assignment_for_device(self, device_id: str) -> dict[str, Any] | None:
+        return await self.store.active_assignment_for_device(device_id)
+
+    def recover_startup_sync(
+        self, *, accept_reconciliation_timeout_ms: int, reconciliation_timeout_ms: int,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        return self.store.recover_startup_sync(
+            accept_reconciliation_timeout_ms=accept_reconciliation_timeout_ms,
+            reconciliation_timeout_ms=reconciliation_timeout_ms,
+        )
+
+    async def artifact_record(self, artifact_id: str) -> dict[str, Any] | None:
+        return await self.store.artifact_record(artifact_id)
+
+    def gc_artifacts_sync(
+        self, artifact_root: Path, *, retry_window_ms: int, timestamp: int | None = None,
+    ) -> list[str]:
+        return self.store.gc_artifacts_sync(
+            artifact_root, retry_window_ms=retry_window_ms, timestamp=timestamp,
+        )
 
     def _reconcile_active_assignment(
         self,

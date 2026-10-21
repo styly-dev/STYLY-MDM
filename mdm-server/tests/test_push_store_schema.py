@@ -97,6 +97,39 @@ def test_new_or_current_database_writes_no_backup(tmp_path):
     assert sorted(p.name for p in tmp_path.glob('*.bak')) == []
 
 
+@pytest.mark.parametrize('upgrade', [False, True])
+def test_initialization_failure_rolls_back_schema_changes(tmp_path, upgrade):
+    path = tmp_path / 'jobs.sqlite3'
+    if upgrade:
+        PushJobStore(path).close()
+        _downgrade_to_schema_one(path)
+
+    with sqlite3.connect(path, isolation_level=None) as conn:
+        conn.row_factory = sqlite3.Row
+        before = [tuple(row) for row in conn.execute(
+            'SELECT type, name, sql FROM sqlite_master ORDER BY type, name'
+        )]
+
+        def deny_final_index(action, name, _table, _database, _trigger):
+            if action == sqlite3.SQLITE_CREATE_INDEX and name == 'ix_push_jobs_retry_of':
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_final_index)
+        with pytest.raises(sqlite3.DatabaseError, match='not authorized'):
+            PushJobStore._initialize(conn)
+        conn.set_authorizer(None)
+
+        assert not conn.in_transaction
+        assert [tuple(row) for row in conn.execute(
+            'SELECT type, name, sql FROM sqlite_master ORDER BY type, name'
+        )] == before
+        if upgrade:
+            assert conn.execute(
+                "SELECT value FROM server_metadata WHERE key='schema_version'"
+            ).fetchone()[0] == '1'
+
+
 @pytest.mark.asyncio
 async def test_retry_job_is_linked_by_indexed_column(tmp_path):
     store = PushJobStore(tmp_path / 'jobs.sqlite3')
