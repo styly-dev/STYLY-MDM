@@ -38,7 +38,16 @@ transaction, including assignment/fence checks, outcome updates and revisions.
 The runtime then releases the authorized transfer, publishes changed snapshots
 and sends the ACK. On Android, the coordinator's durable `state.active` is the
 sole execution owner; the actor checks incoming commands directly against that state.
-These internal changes preserve the wire protocol, SQLite schema and state JSON.
+Lifecycle events (disconnect, acceptance, and transfer/apply progress) validate
+and commit their related fields in Manager operations. A failed disconnect retains
+a retry owner; replacement registration commits that event before exposing its
+new session. The transfer watchdog releases HTTP resources before handing a failed
+DB update to dispatch recovery. Deadline maintenance runs independently of artifact GC.
+Wire messages and SQLite schema 3 remain compatible; the additive device-order
+index is created for existing databases. Android writes `state_version: 1`, reads
+existing unversioned records, and preserves unsupported versions or invalid active
+ownership as unavailable instead of discarding them. The worker waits for a durable
+`applying` checkpoint before changing destination files.
 
 Before dispatch, upload/preparation failure or expiry settles the job and its
 never-dispatched queued targets in one transaction. Startup recovery also repairs
@@ -50,6 +59,12 @@ be missing; the Retry endpoint still checks the physical bytes before creating w
 Issue #94 adds resumable transfers, per-device Resume and Cancel controls, and
 retry of failed targets. See [Push / Sync jobs](PUSH_JOBS.md) for the recovery
 rules, protocol, operator controls, and schema-3 deployment requirements.
+
+The file panel calls an explicit asynchronous Push submission API. It retains its
+selection on failure and resets only the submitted selection after successful upload
+and dispatch. Pending Resume/Cancel/Retry operations survive redraws and resolve from
+canonical updates, action replies, connection changes, or a bounded fallback timer.
+Untyped server errors remain visible without clearing an unrelated pending action.
 
 The console renders Push progress and Resume/Cancel controls directly from the
 same selected canonical assignment. The adapter invalidates device cells when
@@ -66,7 +81,9 @@ the dedicated HTTP request format, and interruption reasons.
 
 Management connection loss leaves healthy HTTP transfers under their existing
 watchdog. Replacement registration withdraws unstarted Resume authorization,
-and a retained fence keeps Reconcile visible even after Retry. Artifact GC
+and a retained fence keeps Reconcile visible even after Retry. Retry supersession
+uses per-device enqueue order rather than wall-clock timestamps. Initial snapshots
+batch this eligibility lookup and each job's fence rows. Artifact GC
 retries physical cleanup of tombstoned bytes after failure or restart.
 The client refreshes registration when durable state becomes unavailable and
 again after recovery, while retaining any unsaved worker outcome in memory.

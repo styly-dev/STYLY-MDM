@@ -39,6 +39,7 @@ from .push_jobs import (
     DeviceState,
     JobState,
     ProtocolMode,
+    ProgressEvent,
     PushJobError,
     canonicalize_create_request,
     parse_capabilities,
@@ -265,14 +266,18 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
         )
 
     async def close(self, *args: Any, **kwargs: Any) -> bool:
-        if (
-            not self._push_disconnect_notified
-            and self._push_runtime is not None
-            and self._push_path == "/ws/device"
-        ):
-            self._push_disconnect_notified = True
-            await self._push_runtime.disconnect_device(self._push_device_id, self)
-        return await super().close(*args, **kwargs)
+        try:
+            if (
+                not self._push_disconnect_notified
+                and self._push_runtime is not None
+                and self._push_path == "/ws/device"
+            ):
+                self._push_disconnect_notified = True
+                await self._push_runtime.disconnect_device(self._push_device_id, self)
+        finally:
+            # Transport cleanup must not depend on durable business-state cleanup.
+            result = await super().close(*args, **kwargs)
+        return result
 
 
 class PushRuntime:
@@ -288,8 +293,11 @@ class PushRuntime:
         self.sessions: dict[str, LiveSession] = {}
         self.device_locks: dict[str, asyncio.Lock] = {}
         self.registration_candidates: dict[str, RuntimeWebSocketResponse] = {}
+        self.pending_disconnects: set[str] = set()
+        self.disconnect_recovery_tasks: dict[str, asyncio.Task[None]] = {}
         self.scheduler: PushScheduler | None = None
         self.housekeeping_task: asyncio.Task[None] | None = None
+        self.artifact_gc_task: asyncio.Task[None] | None = None
         self.created_deadline_task: asyncio.Task[None] | None = None
         self.created_deadline_wake = asyncio.Event()
         self.publication_task: asyncio.Task[None] | None = None
@@ -304,7 +312,6 @@ class PushRuntime:
         self.artifact_gc_interval = _env_seconds(
             "MDM_PUSH_ARTIFACT_GC_INTERVAL", 60
         )
-        self._next_artifact_gc_at = 0.0
         self.startup_snapshots, self.startup_cleanup = self.store.recover_startup_sync(
             accept_reconciliation_timeout_ms=int(
                 _env_seconds("MDM_PUSH_ACCEPT_RECONCILIATION_TIMEOUT", 60) * 1000
@@ -397,6 +404,9 @@ class PushRuntime:
         self.housekeeping_task = asyncio.create_task(
             self._reconciliation_housekeeping(), name="push-reconciliation-housekeeping"
         )
+        self.artifact_gc_task = asyncio.create_task(
+            self._artifact_gc_loop(), name="push-artifact-gc",
+        )
         self.arm_created_deadline()
 
     async def on_cleanup(self, _app: aiohttp_web.Application) -> None:
@@ -404,10 +414,15 @@ class PushRuntime:
             self.created_deadline_task.cancel()
         if self.housekeeping_task is not None:
             self.housekeeping_task.cancel()
+        if self.artifact_gc_task is not None:
+            self.artifact_gc_task.cancel()
+        recovery_tasks = tuple(self.disconnect_recovery_tasks.values())
+        for task in recovery_tasks:
+            task.cancel()
         await asyncio.gather(
             *(
                 task
-                for task in (self.created_deadline_task, self.housekeeping_task)
+                for task in (self.created_deadline_task, self.housekeeping_task, self.artifact_gc_task, *recovery_tasks)
                 if task is not None
             ),
             return_exceptions=True,
@@ -879,60 +894,16 @@ class PushRuntime:
             previous = self.sessions.get(device_id)
             if previous is not None and previous.ws is not ws:
                 self.sessions.pop(device_id, None)
-                # Replacement REGISTER may arrive before the old socket's close.
-                # Withdraw pending Resume exactly as a normal disconnect does.
-                snapshots.extend(
-                    await self.manager.settle_offline_before_dispatch(device_id)
-                )
-                active = await self.manager.active_assignment_for_device(device_id)
-                if active is not None:
-                    job_id = active["job_id"]
-                    attempt = active["attempt"]
-                    state = DeviceState(active["state"])
-                    try:
-                        if state is DeviceState.WAITING_TRANSFER:
-                            snapshots.append(
-                                await self.manager.transition_device(
-                                    job_id,
-                                    device_id,
-                                    expected={state},
-                                    target=DeviceState.QUEUED,
-                                    fields={"queue_reason": "awaiting_dispatch"},
-                                )
-                            )
-                        elif state in {
-                            DeviceState.DISPATCHING,
-                            DeviceState.DOWNLOADING,
-                            DeviceState.VALIDATING,
-                            DeviceState.APPLYING,
-                        }:
-                            short = (
-                                state is DeviceState.DISPATCHING
-                                and active.get("accepted_at") is None
-                            )
-                            deadline = now_ms() + int(
-                                (
-                                    self.accept_reconciliation_timeout
-                                    if short
-                                    else self.reconciliation_timeout
-                                )
-                                * 1000
-                            )
-                            snapshots.append(
-                                await self.manager.mark_reconciling(
-                                    job_id,
-                                    device_id,
-                                    expected={state},
-                                    reason=(
-                                        "disconnect_before_accept"
-                                        if short
-                                        else "device_disconnect"
-                                    ),
-                                    deadline=deadline,
-                                )
-                            )
-                    except StoreConflict:
-                        pass
+                self.pending_disconnects.add(device_id)
+            # An old offline event must commit before a new session can own work.
+            # The same lock protects the background retry, so it cannot later
+            # withdraw authority granted by this new registration.
+            if device_id in self.pending_disconnects:
+                try:
+                    snapshots.extend(await self._settle_pending_disconnect(device_id))
+                except Exception:
+                    self._start_disconnect_recovery(device_id)
+                    raise
 
             # An unavailable durable store cannot authoritatively report absence:
             # the in-memory coordinator starts empty until it recovers the state on
@@ -1009,6 +980,11 @@ class PushRuntime:
                     CAP_PUSH_JOB_ID_V1 in session.capabilities,
                 )
             )
+            snapshots.extend(await self.manager.reconcile_missing_runtime(
+                device_id,
+                accept_timeout_ms=int(self.accept_reconciliation_timeout * 1000),
+                reconciliation_timeout_ms=int(self.reconciliation_timeout * 1000),
+            ))
         active = await self.manager.active_assignment_for_device(device_id)
         return bool(active and active["state"] == DeviceState.RECONCILING.value)
 
@@ -1277,7 +1253,7 @@ class PushRuntime:
         if not device_id:
             return
         lock = self._device_lock(device_id)
-        snapshot: dict[str, Any] | None = None
+        snapshots: list[dict[str, Any]] = []
         async with lock:
             if self.registration_candidates.get(device_id) is ws:
                 self.registration_candidates.pop(device_id, None)
@@ -1287,42 +1263,54 @@ class PushRuntime:
             self.sessions.pop(device_id, None)
             if self._legacy_owns_device(device_id, ws):
                 self.legacy.devices[device_id]["registration_ready"] = False
-            # Queued work that has not started yet must not start by itself when
-            # the device reconnects (see settle_offline_before_dispatch).
-            offline_snapshots = await self.manager.settle_offline_before_dispatch(device_id)
-            active = await self.manager.active_assignment_for_device(device_id)
-            if active is not None:
-                snapshot = await self._mark_disconnected_active(device_id, active)
-        for offline_snapshot in offline_snapshots:
-            await self.publish(offline_snapshot)
-        if snapshot is not None:
+            self.pending_disconnects.add(device_id)
+            try:
+                snapshots = await self._settle_pending_disconnect(device_id)
+            except Exception:
+                log.exception("Could not persist Push disconnect for %s; retaining recovery", device_id)
+                self._start_disconnect_recovery(device_id)
+        for snapshot in snapshots:
             await self.publish(snapshot)
 
-    async def _mark_disconnected_active(
-        self, device_id: str, active: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        """Move a dispatched assignment to reconciliation after its socket closes."""
+    async def _settle_pending_disconnect(self, device_id: str) -> list[dict[str, Any]]:
+        """Called under the device lock, before any replacement session is exposed."""
+        snapshots = await self.manager.settle_disconnect(
+            device_id,
+            accept_timeout_ms=int(self.accept_reconciliation_timeout * 1000),
+            reconciliation_timeout_ms=int(self.reconciliation_timeout * 1000),
+        )
+        self.pending_disconnects.discard(device_id)
+        return snapshots
 
-        state = DeviceState(active["state"])
-        if state not in {
-            DeviceState.DISPATCHING,
-            DeviceState.DOWNLOADING,
-            DeviceState.VALIDATING,
-            DeviceState.APPLYING,
-        }:
-            return None
-        short = state is DeviceState.DISPATCHING and active.get("accepted_at") is None
-        timeout = self.accept_reconciliation_timeout if short else self.reconciliation_timeout
+    def _start_disconnect_recovery(self, device_id: str) -> None:
+        current = self.disconnect_recovery_tasks.get(device_id)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self._recover_disconnect(device_id), name=f"push-disconnect-recovery-{device_id}",
+        )
+        self.disconnect_recovery_tasks[device_id] = task
+
+    async def _recover_disconnect(self, device_id: str) -> None:
         try:
-            return await self.manager.mark_reconciling(
-                active["job_id"],
-                device_id,
-                expected={state},
-                reason="disconnect_before_accept" if short else "device_disconnect",
-                deadline=now_ms() + int(timeout * 1000),
-            )
-        except StoreConflict:
-            return None
+            while True:
+                try:
+                    async with self._device_lock(device_id):
+                        if device_id not in self.pending_disconnects:
+                            return
+                        snapshots = await self._settle_pending_disconnect(device_id)
+                    for snapshot in snapshots:
+                        await self.publish(snapshot)
+                    if self.scheduler is not None:
+                        self.scheduler.wake()
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Retrying Push disconnect settlement for %s", device_id)
+                    await asyncio.sleep(_BACKGROUND_LOOP_RETRY_DELAY)
+        finally:
+            self.disconnect_recovery_tasks.pop(device_id, None)
 
     async def handle_device_message(
         self,
@@ -1445,132 +1433,38 @@ class PushRuntime:
             return True
         return False
 
-    async def _handle_transfer_complete(
-        self, device_id: str, payload: dict[str, Any]
-    ) -> None:
-        job_id = payload.get("job_id")
-        if payload.get("attempt") != 1 or not isinstance(job_id, str):
-            return
-        try:
-            snapshot = await self.store.get_snapshot(job_id)
-        except StoreNotFound:
-            return
-        device = snapshot["devices"].get(device_id)
-        artifact = snapshot.get("artifact")
-        assignment = await self.manager.assignment(job_id, device_id)
-        received = payload.get("received_size")
-        if (
-            device is None
-            or artifact is None
-            or assignment is None
-            or assignment.get("cancel_requested_at") is not None
-            or payload.get("artifact_id") != artifact["artifact_id"]
-            or isinstance(received, bool)
-            or not isinstance(received, int)
-            or received != artifact["byte_size"]
-            or device["attempt"] != 1
-        ):
-            return
-        try:
-            next_snapshot = await self.manager.transition_device(
-                job_id,
-                device_id,
-                expected={DeviceState.DOWNLOADING, DeviceState.VALIDATING, DeviceState.RECONCILING},
-                target=DeviceState.VALIDATING,
-                fields={
-                    "transfer_completed_at": now_ms(),
-                    "accept_deadline": None,
-                    "reconciliation_reason": None,
-                    "reconciliation_deadline": None,
-                },
-            )
-        except StoreConflict:
-            return
-        self.transfers.release_exact(
-            TransferKey("push", device_id, job_id, 1), "transfer_complete"
-        )
-        await self.publish(next_snapshot)
+    async def _handle_transfer_complete(self, device_id: str, payload: dict[str, Any]) -> None:
+        await self._record_progress_payload(device_id, payload, ProgressEvent.TRANSFER_COMPLETE)
 
-    async def _handle_validation_complete(
-        self, device_id: str, payload: dict[str, Any]
-    ) -> None:
-        job_id = payload.get("job_id")
-        if payload.get("attempt") != 1 or not isinstance(job_id, str):
-            return
-        try:
-            snapshot = await self.store.get_snapshot(job_id)
-        except StoreNotFound:
-            return
-        artifact = snapshot.get("artifact")
-        device = snapshot["devices"].get(device_id)
-        assignment = await self.manager.assignment(job_id, device_id)
-        if (
-            artifact is None
-            or device is None
-            or assignment is None
-            or assignment.get("cancel_requested_at") is not None
-            or payload.get("artifact_id") != artifact["artifact_id"]
-            or device["state"] != DeviceState.VALIDATING.value
-            or assignment.get("validation_completed_at") is not None
-        ):
-            return
-        try:
-            next_snapshot = await self.manager.transition_device(
-                job_id,
-                device_id,
-                expected={DeviceState.VALIDATING},
-                target=DeviceState.VALIDATING,
-                fields={"validation_completed_at": now_ms()},
-            )
-            await self.publish(next_snapshot)
-        except StoreConflict:
-            pass
+    async def _handle_validation_complete(self, device_id: str, payload: dict[str, Any]) -> None:
+        await self._record_progress_payload(device_id, payload, ProgressEvent.VALIDATION_COMPLETE)
 
     async def _handle_phase(self, device_id: str, payload: dict[str, Any]) -> None:
-        phase = payload.get("phase")
-        if phase not in {"validating", "applying"} or payload.get("attempt") != 1:
-            return
+        event = {
+            "validating": ProgressEvent.VALIDATION_STARTED,
+            "applying": ProgressEvent.APPLYING,
+        }.get(payload.get("phase"))
+        if event is not None:
+            await self._record_progress_payload(device_id, payload, event)
+
+    async def _record_progress_payload(
+        self, device_id: str, payload: dict[str, Any], event: ProgressEvent,
+    ) -> None:
         job_id = payload.get("job_id")
-        if not isinstance(job_id, str):
-            return
-        assignment = await self.manager.assignment(job_id, device_id)
-        if assignment is None or assignment.get("cancel_requested_at") is not None:
-            return
-        if phase == "validating":
-            try:
-                snapshot = await self.store.get_snapshot(job_id)
-                artifact = snapshot.get("artifact")
-                if artifact is None or payload.get("artifact_id") != artifact["artifact_id"]:
-                    return
-                next_snapshot = await self.manager.transition_device(
-                    job_id, device_id,
-                    expected={DeviceState.DOWNLOADING, DeviceState.RECONCILING},
-                    target=DeviceState.VALIDATING,
-                    fields={"validation_started_at": now_ms(),
-                            "reconciliation_reason": None, "reconciliation_deadline": None},
-                )
-                self.transfers.release_exact(
-                    TransferKey("push", device_id, job_id, 1), "validation_started"
-                )
-                await self.publish(next_snapshot)
-            except (StoreConflict, StoreNotFound):
-                pass
+        if payload.get("attempt") != 1 or not isinstance(job_id, str):
             return
         try:
-            snapshot = await self.manager.transition_device(
-                job_id,
-                device_id,
-                expected={DeviceState.VALIDATING, DeviceState.RECONCILING},
-                target=DeviceState.APPLYING,
-                fields={
-                    "apply_started_at": now_ms(),
-                    "reconciliation_reason": None,
-                    "reconciliation_deadline": None,
-                },
+            result = await self.manager.record_progress(
+                job_id, device_id, event,
+                artifact_id=payload.get("artifact_id"), received_size=payload.get("received_size"),
             )
-            await self.publish(snapshot)
         except (StoreConflict, StoreNotFound):
-            pass
+            return
+        if result.release_transfer:
+            self.transfers.release_exact(
+                TransferKey("push", device_id, job_id, 1), event.value,
+            )
+        await self.publish(result.snapshot)
 
     async def _handle_result(
         self,
@@ -2205,6 +2099,23 @@ class PushRuntime:
                 log.exception("Unexpected failure in Push created-deadline loop")
                 await asyncio.sleep(_BACKGROUND_LOOP_RETRY_DELAY)
 
+    async def _artifact_gc_loop(self) -> None:
+        """One GC at a time; slow filesystem cleanup cannot delay deadline work."""
+        while True:
+            await asyncio.sleep(self.artifact_gc_interval)
+            work = asyncio.create_task(asyncio.to_thread(
+                self.manager.gc_artifacts_sync, self.artifacts.artifact_root,
+                retry_window_ms=int(self.artifact_retry_window * 1000),
+            ))
+            try:
+                await asyncio.shield(work)
+            except asyncio.CancelledError:
+                # The thread cannot be cancelled. Join it before closing its DB worker.
+                await work
+                raise
+            except Exception:
+                log.exception("Could not GC expired Push artifacts")
+
     async def _reconciliation_housekeeping(self) -> None:
         while True:
             await asyncio.sleep(_RECONCILIATION_POLL_INTERVAL)
@@ -2217,19 +2128,6 @@ class PushRuntime:
             except Exception:
                 log.exception("Could not query expired Push deadlines")
                 continue
-            if timestamp / 1000 >= self._next_artifact_gc_at:
-                try:
-                    await asyncio.to_thread(
-                        self.manager.gc_artifacts_sync,
-                        self.artifacts.artifact_root,
-                        retry_window_ms=int(self.artifact_retry_window * 1000),
-                        timestamp=timestamp,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    log.exception("Could not GC expired Push artifacts")
-                self._next_artifact_gc_at = timestamp / 1000 + self.artifact_gc_interval
             for row in acceptance_rows:
                 if self.scheduler is not None and self.scheduler.has_live_acceptance_waiter(
                     row["job_id"], row["device_id"], row["attempt"]

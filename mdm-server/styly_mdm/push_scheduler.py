@@ -23,6 +23,7 @@ from .push_jobs import (
     PUSH_JOB_CAPABILITIES,
     DeviceState,
     ProtocolMode,
+    ProgressEvent,
 )
 from .transfer_registry import TransferKey, TransferRegistry
 
@@ -389,6 +390,7 @@ class PushScheduler:
             return True
         if not self._transfer_is_stalled(lease):
             return False
+        persistence_error: Exception | None = None
         try:
             active = await self.manager.active_assignment_for_device(key.device_id)
             if (
@@ -425,12 +427,10 @@ class PushScheduler:
                         )
         except StoreConflict:
             pass
-        except Exception:
-            log.exception(
-                "Could not mark stalled Push transfer %s/%s for reconciliation",
-                key.job_id,
-                key.device_id,
-            )
+        except Exception as error:
+            # Cleanup still owns the HTTP stream and shared permit. After joining
+            # them, let the outer dispatch recovery retry the durable transition.
+            persistence_error = error
 
         # Keep the shared permit until the handler has stopped and released its
         # response/file resources. The registry hook below is only a fallback for
@@ -442,10 +442,14 @@ class PushScheduler:
             or not self._transfer_is_stalled(lease)
         ):
             # Settled, revoked, or resumed while marking; the next wait decides.
+            if persistence_error is not None:
+                raise persistence_error
             return future.done()
         await self.leases.expire(key, lease.token)
         if self.transfer_registry.get(key) is future and not future.done():
             self.transfer_registry.release_exact(key, "transfer_stalled")
+        if persistence_error is not None:
+            raise persistence_error
         return True
 
     def _clear_dispatch_waiters(
@@ -629,19 +633,10 @@ class PushScheduler:
 
         if outcome == "accepted":
             try:
-                next_snapshot = await self.manager.transition_device(
-                    job_id,
-                    device_id,
-                    expected={DeviceState.DISPATCHING, DeviceState.RECONCILING},
-                    target=DeviceState.DOWNLOADING,
-                    fields={
-                        "accepted_at": now_ms(),
-                        "accept_deadline": None,
-                        "reconciliation_reason": None,
-                        "reconciliation_deadline": None,
-                    },
+                progress = await self.manager.record_progress(
+                    job_id, device_id, ProgressEvent.ACCEPTED,
                 )
-                await self.publish(next_snapshot)
+                await self.publish(progress.snapshot)
             except StoreConflict:
                 pass
             return True
@@ -688,14 +683,10 @@ class PushScheduler:
             # A duplicate-safe client should normally answer ACCEPTED, but treating
             # this exact identity as accepted is safer than creating a second worker.
             try:
-                next_snapshot = await self.manager.transition_device(
-                    job_id,
-                    device_id,
-                    expected={DeviceState.DISPATCHING, DeviceState.RECONCILING},
-                    target=DeviceState.DOWNLOADING,
-                    fields={"accepted_at": now_ms(), "accept_deadline": None},
+                progress = await self.manager.record_progress(
+                    job_id, device_id, ProgressEvent.ACCEPTED,
                 )
-                await self.publish(next_snapshot)
+                await self.publish(progress.snapshot)
             except StoreConflict:
                 return False
             return True

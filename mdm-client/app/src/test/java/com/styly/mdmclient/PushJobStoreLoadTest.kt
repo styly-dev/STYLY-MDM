@@ -83,8 +83,29 @@ class PushJobStoreLoadTest {
         for ((label, prefix) in cases) {
             val json = prefix + "\"pending_results\":[],\"completed_receipts\":[]}"
             val result = loadPushState({ json }, { it }, { true })
-            assertTrue(label, result is PushStateLoadResult.Corrupt)
+            assertTrue(label, result is PushStateLoadResult.InvalidActive)
         }
+    }
+
+    @Test
+    fun unsupportedStateVersionsArePreservedAsUnavailable() {
+        val examples = listOf(
+            "future integer" to "{\"state_version\":2,\"active\":null,\"pending_results\":[],\"completed_receipts\":[]}",
+            "unknown encoding" to "{\"state_version\":\"future\",\"active\":null,\"pending_results\":[],\"completed_receipts\":[]}",
+        )
+        for ((label, json) in examples) {
+            val result = loadPushState({ json }, { it }, { true })
+            assertTrue(label, result is PushStateLoadResult.UnsupportedVersion)
+        }
+    }
+
+    @Test
+    fun `unversioned state and version one remain readable`() {
+        val legacy = "{\"active\":null,\"pending_results\":[],\"completed_receipts\":[]}"
+        val current = "{\"state_version\":1,\"active\":null,\"pending_results\":[],\"completed_receipts\":[]}"
+
+        assertTrue(loadPushState({ legacy }, { it }, { true }) is PushStateLoadResult.Valid)
+        assertTrue(loadPushState({ current }, { it }, { true }) is PushStateLoadResult.Valid)
     }
 
     @Test

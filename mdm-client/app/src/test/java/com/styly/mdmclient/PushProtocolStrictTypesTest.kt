@@ -22,59 +22,58 @@ class PushProtocolStrictTypesTest {
 
     @Test
     fun `delete extras accepts only a JSON boolean`() {
-        assertFalse(PushProtocol.parseCommand(payload()).deleteExtras)
+        assertFalse(PushProtocol.parseWireCommand(payload()).deleteExtras)
         assertTrue(
-            PushProtocol.parseCommand(payload().apply { put("delete_extras", true) })
+            PushProtocol.parseWireCommand(payload().apply { put("delete_extras", true) })
                 .deleteExtras,
         )
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(payload().apply { put("delete_extras", "true") })
+            PushProtocol.parseWireCommand(payload().apply { put("delete_extras", "true") })
         }
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(payload().apply { put("delete_extras", 1) })
+            PushProtocol.parseWireCommand(payload().apply { put("delete_extras", 1) })
         }
     }
 
     @Test
     fun `attempt and artifact size reject string coercion`() {
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(payload().apply { put("attempt", "1") })
+            PushProtocol.parseWireCommand(payload().apply { put("attempt", "1") })
         }
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(payload().apply { put("artifact_size", "42") })
+            PushProtocol.parseWireCommand(payload().apply { put("artifact_size", "42") })
         }
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(payload().apply { put("artifact_size", 42.0) })
+            PushProtocol.parseWireCommand(payload().apply { put("artifact_size", 42.0) })
         }
     }
 
     @Test
     fun `live job-v1 requires revision and strong etag but durable state does not`() {
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(payload().apply { remove("revision") })
+            PushProtocol.parseWireCommand(payload().apply { remove("revision") })
         }
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(payload().apply { put("revision", 0L) })
+            PushProtocol.parseWireCommand(payload().apply { put("revision", 0L) })
         }
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(payload().apply { remove("artifact_etag") })
+            PushProtocol.parseWireCommand(payload().apply { remove("artifact_etag") })
         }
-        val issue91 = PushProtocol.parseCommand(
+        val issue91 = PushProtocol.parseStoredCommand(
             payload().apply {
                 remove("revision")
                 remove("artifact_etag")
             },
-            durableState = true,
         )
         assertTrue(issue91.revision == 0L && issue91.artifactEtag == null)
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(payload().apply { put("revision", "1") })
+            PushProtocol.parseWireCommand(payload().apply { put("revision", "1") })
         }
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(payload().apply { put("artifact_etag", "W/\"weak\"") })
+            PushProtocol.parseWireCommand(payload().apply { put("artifact_etag", "W/\"weak\"") })
         }
         assertTrue(
-            PushProtocol.parseCommand(payload().apply { put("artifact_etag", "\"strong\"") })
+            PushProtocol.parseWireCommand(payload().apply { put("artifact_etag", "\"strong\"") })
                 .artifactEtag == "\"strong\"",
         )
         assertTrue(PushProtocol.isStrongEtag("\"\""))
@@ -82,20 +81,20 @@ class PushProtocolStrictTypesTest {
         assertFalse(PushProtocol.isStrongEtag("unquoted"))
         assertFalse(PushProtocol.isStrongEtag("W/\"weak\""))
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(payload().apply { put("artifact_etag", "\"") })
+            PushProtocol.parseWireCommand(payload().apply { put("artifact_etag", "\"") })
         }
     }
 
     @Test
     fun `identity url and destination require actual strings`() {
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(payload().apply { put("job_id", 1) })
+            PushProtocol.parseWireCommand(payload().apply { put("job_id", 1) })
         }
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(payload().apply { put("artifact_url", true) })
+            PushProtocol.parseWireCommand(payload().apply { put("artifact_url", true) })
         }
         assertThrows(IllegalArgumentException::class.java) {
-            PushProtocol.parseCommand(payload().apply { put("dest_path", 123) })
+            PushProtocol.parseWireCommand(payload().apply { put("dest_path", 123) })
         }
     }
 

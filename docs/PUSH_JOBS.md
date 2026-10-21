@@ -357,18 +357,34 @@ New clients register:
 
 `PushJobCoordinator` is owned by `MdmClientApplication`, not by a Service instance. It serializes commands on one actor, permits one active Push/Sync worker, persists active state before `PUSH_JOB_ACCEPTED`, and stores terminal results in an outbox until a matching `PUSH_RESULT_ACK` either accepts the result or marks its rejection as permanent with `retryable: false`. An older server that omits `retryable` is treated as retryable. Completed receipts retain the original command metadata for at most 256 entries and seven days. A missing state file is initialized as an empty state. If durable state cannot be loaded or saved, the coordinator keeps the rest of the MDM client alive but rejects new work with `client_persistence_unavailable`; it never starts a worker, publishes a phase, releases an execution lease, or sends a terminal result whose required state was not persisted.
 
+The worker's phase callbacks report observations. Before destination mutation,
+`beforeApply` is an explicit checkpoint: the worker waits for the actor to save
+`applying`, and a rejected or failed checkpoint returns
+`client_persistence_unavailable` without applying files. Worker outcomes distinguish
+terminal results from interrupted ownership; an interruption is never sent as a
+terminal result. Execution fingerprints list their fields explicitly; changing the
+artifact URL alone still permits exact Resume.
+An `applying` record permits destination mutation; it does not prove that mutation
+has already occurred. A worker interrupted during the checkpoint cannot apply, and
+its terminal failure is serialized after any already-running phase save.
+
 ### Durable state recovery
+
+State JSON now carries `state_version: 1`; existing unversioned Issue #91/94
+records remain readable. Earlier readers ignore this extra root property.
+Wire-command validation and stored-command decoding have separate contracts.
+Unsupported future versions are retained as unavailable, never reset.
 
 The client recovers its durable Push state (`files/push-jobs/state.json`) by itself;
 there is no operator retry command.
 
-- **Malformed receipt records or collections**: the client preserves the entire state
+- **Malformed active commands, receipt records, or collections**: the client preserves the entire state
   file and stays unavailable, rather than losing valid active work or deduplication
   evidence. It does not report absence or start another worker. The bounded load
   retries below can recover if the file is repaired or restored; reboot alone does
   not repair malformed records. After retries are exhausted, repair or restore the
   state file and restart the client.
-- **Other unparseable state** (malformed JSON or active entry): retrying cannot help, so the client
+- **Other unparseable state** (malformed JSON): retrying cannot help, so the client
   deletes the file, starts from an empty state, and continues normally. Its next
   REGISTER carries a one-shot notice,
   `push_state: {status: "available", reset: {reason: "corrupt_state_discarded", detail}}`
@@ -441,7 +457,17 @@ The server coalesces pending publication by `job_id` and sends only the newest q
 
 The exact transfer waiter is registered before `waiting_transfer -> dispatching` commits and before the command is sent. Waiter cleanup is identity-checked, so a superseded dispatch task cannot cancel a replacement task's waiter. The durable `accept_deadline` is swept into short reconciliation only when no live dispatch task still owns the exact in-memory acceptance waiter. The local waiter owns the normal timeout; the durable sweep recovers process/background-task loss. Its transition compares the exact stored deadline in the same transaction, so a stale sweep cannot capture a later replay of the same attempt. After slot acquisition, the scheduler rechecks the live connection and capability. It then holds the same per-device owner lock used by REGISTER replacement and disconnect while performing the final session check and bounded `send_str`.
 
-Job-v1 messages from a device are also checked and settled under that owner lock. Disconnect removes the old owner and commits its canonical queue/reconciliation transition before a replacement REGISTER may acquire ownership, but it does not release an active Push transfer slot because the Android HTTP worker outlives the WebSocket. An exact active `downloading` report preserves ownership of an in-process live HTTP lease and also satisfies a still-live acceptance waiter. After a server restart, no HTTP token or active stream is recovered; the old URL is rejected and the client must report interrupted work before manual Resume can issue a fresh token and slot. The server maps `server_lease_revoked` to the existing per-device `download_interrupted` Resume gate. Once a replacement REGISTER owns the device, the superseded socket cannot settle an ACK, phase, transfer completion, result, or reconciliation report. Committed admin snapshots are queued for publication and sent after this correctness path returns; browser backpressure is not part of device ownership.
+Job-v1 messages from a device are also checked and settled under that owner lock. Disconnect removes the old owner and commits its queue authority withdrawal and active reconciliation in one transaction before a replacement REGISTER may acquire ownership. A failed commit retains a per-device recovery task; registration flushes that pending event under the same owner lock before exposing the new session. Authoritative empty registration also repairs orphaned dispatched phases. It does not release an active Push transfer slot because the Android HTTP worker outlives the WebSocket. An exact active `downloading` report preserves ownership of an in-process live HTTP lease and also satisfies a still-live acceptance waiter. After a server restart, no HTTP token or active stream is recovered; the old URL is rejected and the client must report interrupted work before manual Resume can issue a fresh token and slot. The server maps `server_lease_revoked` to the existing per-device `download_interrupted` Resume gate. Once a replacement REGISTER owns the device, the superseded socket cannot settle an ACK, phase, transfer completion, result, or reconciliation report. Committed admin snapshots are queued for publication and sent after this correctness path returns; browser backpressure is not part of device ownership.
+
+The timeout watchdog must retain a recovery owner if its DB update fails: it first
+stops the HTTP handler and releases the exact transfer, then delegates the durable
+transition to dispatch recovery. Artifact GC has its own single background loop;
+a slow physical removal never holds up acceptance/reconciliation deadline processing.
+Retry supersession compares the existing per-device `enqueue_seq`, including when
+job timestamps are equal or the clock moves backward. Initial snapshots batch that
+lookup instead of repeating a cross-job query for every visible job, and retrieve
+each job's fences in one query instead of one query per device.
+
 
 A failed acceptance probe on the management WebSocket does not stop independent
 HTTP progress. If disconnect or an exact late active report wins the acceptance

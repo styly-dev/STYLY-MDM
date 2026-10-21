@@ -15,6 +15,10 @@ internal sealed class PushStateLoadResult {
     data class Unreadable(val error: IOException) : PushStateLoadResult()
     /** Preserve the snapshot: dropping receipts would lose execution evidence. */
     data class InvalidReceipts(val error: InvalidPushReceiptsException) : PushStateLoadResult()
+    /** Preserve unrecognized durable formats and keep device state unavailable. */
+    data class UnsupportedVersion(val error: UnsupportedPushStateVersionException) : PushStateLoadResult()
+    /** Preserve uncertain active ownership instead of claiming the device is idle. */
+    data class InvalidActive(val error: InvalidPushActiveException) : PushStateLoadResult()
     /** The file was read but its content is not a valid durable state. */
     data class Corrupt(val error: Exception) : PushStateLoadResult()
 }
@@ -37,6 +41,10 @@ internal fun loadPushState(
     PushStateLoadResult.Unreadable(error)
 } catch (error: InvalidPushReceiptsException) {
     PushStateLoadResult.InvalidReceipts(error)
+} catch (error: UnsupportedPushStateVersionException) {
+    PushStateLoadResult.UnsupportedVersion(error)
+} catch (error: InvalidPushActiveException) {
+    PushStateLoadResult.InvalidActive(error)
 } catch (error: Exception) {
     PushStateLoadResult.Corrupt(error)
 }

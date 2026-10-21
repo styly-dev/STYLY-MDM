@@ -214,26 +214,45 @@ class PushFilesWorker internal constructor(
         val onValidated: () -> Unit,
         val onApplying: () -> Unit,
         val onValidationStart: () -> Unit = {},
+        /** A false result prevents destination mutation and returns a terminal failure. */
+        val beforeApply: () -> Boolean = { true },
     )
 
+    sealed class Outcome {
+        /** The worker reached a terminal success or failure result. */
+        data class Completed(val result: PushProtocol.Result) : Outcome()
+
+        /** The exact job remains active and its validated partial data is retained. */
+        data class Interrupted(
+            val reason: String,
+            val failureCode: String?,
+            val detail: String?,
+        ) : Outcome()
+    }
+
     data class Execution(
-        val result: PushProtocol.Result,
+        val outcome: Outcome,
         val workDirectory: File,
+    )
+
+    private data class FailurePolicy(
         val interruptionReason: String? = null,
+        val retainPartial: Boolean = false,
+        val retryInWorker: Boolean = false,
     )
 
     fun execute(command: PushProtocol.Command, callbacks: Callbacks): Execution {
         if (!hasExternalStorageAccess()) {
             val work = attemptDirectoryProvider(command)
             return Execution(
-                PushProtocol.Result(
+                Outcome.Completed(PushProtocol.Result(
                     jobId = command.jobId,
                     attempt = command.attempt,
                     status = "fail",
                     destPath = command.destPath,
                     failureCode = EXTERNAL_STORAGE_PERMISSION_FAILURE,
                     detail = EXTERNAL_STORAGE_PERMISSION_DETAIL,
-                ),
+                )),
                 work,
             )
         }
@@ -248,6 +267,12 @@ class PushFilesWorker internal constructor(
             callbacks.onValidated()
             val destination = destinationProvider?.invoke(command.destPath)
                 ?: validateDestination(command.destPath)
+            if (!callbacks.beforeApply()) {
+                throw PushWorkerException(
+                    "client_persistence_unavailable",
+                    "Could not persist the applying phase before changing the destination",
+                )
+            }
             callbacks.onApplying()
             val applied = BundleSync.apply(staging, destination, command.deleteExtras)
             PushProtocol.Result(
@@ -263,7 +288,8 @@ class PushFilesWorker internal constructor(
             )
         } catch (error: Throwable) {
             val failure = error as? PushWorkerException
-            interruptionReason = interruptionReasonFor(command, failure)
+            val policy = failurePolicy(command, failure)
+            interruptionReason = policy.interruptionReason
             PushProtocol.Result(
                 jobId = command.jobId,
                 attempt = command.attempt,
@@ -278,7 +304,10 @@ class PushFilesWorker internal constructor(
         }
         // The coordinator persists this execution outcome before terminal cleanup;
         // interrupted downloads instead retain their durable ownership and bytes.
-        return Execution(result, work, interruptionReason)
+        val outcome = interruptionReason?.let {
+            Outcome.Interrupted(it, result.failureCode, result.detail)
+        } ?: Outcome.Completed(result)
+        return Execution(outcome, work)
     }
 
     fun cleanup(workDirectory: File) {
@@ -531,10 +560,12 @@ class PushFilesWorker internal constructor(
                 } catch (stop: PushTransferInterrupted) {
                     throw stop.failure
                 } catch (error: PushWorkerException) {
-                    discardPartialOnFailure(command, partial, error)
-                    if (!error.retryable) throw error
-                } catch (_: IOException) {
+                    val policy = failurePolicy(command, error)
+                    discardPartialOnFailure(command, partial, error, policy = policy)
+                    if (!policy.retryInWorker) throw error
+                } catch (error: IOException) {
                     // Keep the exact partial and retry only within the remaining idle window.
+                    if (!failurePolicy(command, error).retryInWorker) throw error
                 }
                 if (partial.isFile && partial.length() == expectedSize) {
                     break
@@ -554,16 +585,48 @@ class PushFilesWorker internal constructor(
         return completed
     }
 
-    private fun interruptionReasonFor(
+    private fun failurePolicy(
         command: PushProtocol.Command,
-        failure: PushWorkerException?,
-    ): String? {
-        if (!command.isJobV1) return null
-        return when (failure?.code) {
-            "download_failed" -> if (failure.retryable) "download_interrupted" else null
-            PUSH_LEASE_REVOKED -> "server_lease_revoked"
-            "storage_write_failed" -> if (validatedResumeOffset(command) > 0L) "storage_write_failed" else null
-            else -> null
+        error: Throwable?,
+    ): FailurePolicy {
+        if (error == null) return FailurePolicy()
+        val failure = error as? PushWorkerException ?: return FailurePolicy(
+            retainPartial = error is IOException,
+            retryInWorker = error is IOException,
+        )
+        val retainPartial = failure.code == "artifact_unavailable"
+        if (!command.isJobV1) {
+            return FailurePolicy(
+                retainPartial = retainPartial,
+                retryInWorker = failure.retryable,
+            )
+        }
+        return when (failure.code) {
+            "download_failed" -> if (failure.retryable) {
+                FailurePolicy(
+                    interruptionReason = "download_interrupted",
+                    retainPartial = true,
+                    retryInWorker = true,
+                )
+            } else {
+                FailurePolicy(retainPartial = retainPartial)
+            }
+            PUSH_LEASE_REVOKED -> FailurePolicy(
+                interruptionReason = "server_lease_revoked",
+                retainPartial = true,
+            )
+            "storage_write_failed" -> if (validatedResumeOffset(command) > 0L) {
+                FailurePolicy(
+                    interruptionReason = "storage_write_failed",
+                    retainPartial = true,
+                )
+            } else {
+                FailurePolicy()
+            }
+            else -> FailurePolicy(
+                retainPartial = retainPartial,
+                retryInWorker = failure.retryable,
+            )
         }
     }
 
@@ -573,8 +636,9 @@ class PushFilesWorker internal constructor(
         partial: File,
         failure: PushWorkerException,
         invalidateMetadata: Boolean = false,
+        policy: FailurePolicy = failurePolicy(command, failure),
     ) {
-        if (failure.code == "artifact_unavailable" || interruptionReasonFor(command, failure) != null) return
+        if (policy.retainPartial) return
         partial.deleteRecursively()
         if (invalidateMetadata && command.isJobV1) File(partial.parentFile, "metadata.json").delete()
     }
@@ -966,7 +1030,8 @@ class PushFilesWorker internal constructor(
         val prefix = error.message?.substringBefore(':')
         return when (prefix) {
             "invalid_destination", "artifact_identity_mismatch", "download_failed",
-            "artifact_unavailable", "storage_write_failed", "validation_failed", "apply_failed" -> prefix
+            "artifact_unavailable", "storage_write_failed", "validation_failed", "apply_failed",
+            "client_persistence_unavailable" -> prefix
             else -> "apply_failed"
         }
     }
