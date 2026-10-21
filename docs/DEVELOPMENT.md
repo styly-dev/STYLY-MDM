@@ -1107,15 +1107,82 @@ loses the entry, so a device can never be marked retired spuriously — it simpl
 `offline` and the operator re-checks it and uses Forget.
 
 What remains on the device after a retire: pushed content and the
-`Download/styly-mdm/` staging directory. **The console's Startup App feature does not
+`Download/styly-mdm/` staging directory. **The console's MDM Startup App feature does not
 survive a retire**: it is client state (the package name lives in the client's
 SharedPreferences and the launch happens when the client's own service starts), so once
 the client is gone nothing auto-launches the delivered content. A handover that needs
-boot-time auto-launch must configure the device's kiosk/boot app by other means before
-retiring. First-fleet verification checklist (once per firmware, on one unit): that the
+boot-time auto-launch can register its native Home/boot app through
+[PICO API Trigger](#pico-api-trigger) before retiring, then verify it on the headset.
+First-fleet verification checklist (once per firmware, on one unit): that the
 client and guard packages are both gone after the retire, and that no ToBService
 keep-alive or appops residue misbehaves (`MANAGE_EXTERNAL_STORAGE` pointing at a removed
 package is inert but worth a glance).
+
+## PICO API Trigger
+
+The console's **PICO API Trigger** selector exposes the allowlisted
+**Startup / Home App (`setLauncher`)** API. Enter an installed, enabled app's
+package to register it as the PICO native Home/boot app. Enter the literal **null**
+in that same field to restore the system default; the client passes a real Java
+`null`, rather than an empty string or a hardcoded Home package. There is no
+current-value query. This API changes Home behavior as well as boot behavior;
+reboot after either change and verify on the headset.
+
+This is independent of **MDM Startup App**, which launches through the client
+service. Its existing preferences and commands are unchanged. If another MDM
+startup package remains configured, that app may open over the PICO Home app
+when the service starts; clear it separately when appropriate. Native PICO
+configuration survives MDM retirement, and MDM does not track or automatically
+clear it when an app is uninstalled. Restore the default before removing a
+registered Home app. These device settings may also be changed by PICO's own
+management tools.
+
+The wire contract is additive:
+
+- Admin -> server -> device: `TRIGGER_PICO_API`, with `api: "setLauncher"`,
+  `request_id` (1-80 ASCII letters/digits/underscores/hyphens), `package_name`
+  (valid package string up to 255 characters, or explicit JSON `null`). Admin
+  requests must supply non-empty, unique `target_devices`, or `["*"]` for all
+  eligible online devices. Missing targets never default to the whole fleet.
+  No arbitrary SDK method invocation is supported.
+- Server -> admin: `PICO_API_SENT`, with `request_id`, `sent_count`, and
+  `target_count`. This acknowledges dispatch only.
+- Device -> server -> admins: `PICO_API_RESULT`, with `request_id`, `api`,
+  `package_name`, `status`, optional numeric `result_code` and `error`. The server
+  adds the actual socket owner's `device_id`. `accepted` means the API returned
+  zero; it does not establish persisted configuration or successful boot.
+  Nonzero codes and exceptions report `fail`; codes are preserved without
+  guessing their cause. An API timeout reports `unknown`.
+
+Canonical registrations from the new client advertise `pico_startup_app_v1`.
+The server retains this live capability and exposes `pico_startup_app_supported`
+on online `DEVICE_LIST` entries. The console skips unsupported clients, and
+the server's final socket guard also checks the capability. Legacy and unresolved
+identities cannot trigger the API. Update client and server before using this
+control; no version, SDK dependency, manifest permission, registry schema, or
+stored MDM startup preference migration is required.
+
+Native calls run on a single background worker with a 15-second response timeout.
+A timeout does not cancel a Binder mutation: it holds the busy slot until the
+call exits, suppresses a late second result, and performs no automatic retry.
+Service destruction stops queued work and suppresses further replies. The console
+also reports an unconfirmed result after 20 seconds without a reply, including
+when a device disconnects. Inspect the headset before retrying an unknown change.
+
+Reference: [PICO Business Enterprise API](https://business.picoxr.com/us/doc/EnterpriseAPI-Intro)
+documents `setLauncher` as the third-party Home setter, added in SDK 4.3.8 /
+PUI 5.9.0. The pinned SDK 4.3.16 contains it, so no dependency upgrade is needed.
+API availability still depends on device/firmware and management restrictions.
+Null restoration and reboot timing were reported by the supplied PICO settings
+feasibility evidence; this feature's ordinary client APK has not been validated
+on hardware as part of this change.
+
+Before promoting the draft, validate on an Enterprise headset: register an
+installed content app, confirm API acceptance, reboot, verify boot and Home,
+restore with null, reboot and verify default Home. Repeat with MDM Startup App
+configured to a different package to check the documented conflict. Verify failure
+reporting for missing packages and unavailable TobService without changing the
+prior configuration.
 
 ## Remote Power Control
 

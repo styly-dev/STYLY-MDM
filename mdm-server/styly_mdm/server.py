@@ -421,6 +421,7 @@ def build_device_list_msg() -> str:
             "ip": d["ip"],
             "status": d.get("status", "online"),
             "identity_kind": d.get("identity_kind", "legacy"),
+            "pico_startup_app_supported": command_allowed(d, "TRIGGER_PICO_API"),
             "startup_app": d.get("startup_app"),
             "battery": d.get("battery"),
             "last_seen": device_registry.get(d["device_id"], {}).get("last_seen"),
@@ -1509,6 +1510,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "ip": ip,
                         "status": "registering",
                         "startup_app": startup_app,
+                        "capabilities": registration["capabilities"],
                         "battery": prev.get("battery"),
                         "version_code": version_code,
                         "version_name": version_name,
@@ -1803,6 +1805,13 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         _clear_startup_app_record(device_id)
                         await broadcast_device_list()
 
+                elif msg_type == "PICO_API_RESULT":
+                    if not command_allowed(devices.get(device_id), "TRIGGER_PICO_API"):
+                        continue
+                    data.pop("connection_id", None)
+                    data["device_id"] = device_id
+                    await forward_to_admins(data)
+
                 elif msg_type == "STARTUP_APP_RESULT":
                     log.info("Startup app result from %s: %s", device_id, data.get("status"))
                     await forward_to_admins(data)
@@ -1951,6 +1960,9 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 elif msg_type == "CLEAR_STARTUP_APP":
                     await handle_clear_startup_app(ws, data)
+
+                elif msg_type == "TRIGGER_PICO_API":
+                    await handle_pico_api(ws, data)
 
                 elif msg_type == "GET_DEVICE_LIST":
                     await ws.send_str(build_device_list_msg())
@@ -3238,6 +3250,54 @@ def _is_within(root: Path, target: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+async def handle_pico_api(admin_ws: web.WebSocketResponse, data: dict):
+    """Dispatch native PICO Home changes without modifying MDM startup records."""
+    command = "TRIGGER_PICO_API"
+    request_id = data.get("request_id")
+    targets = data.get("target_devices")
+    package_name = data.get("package_name")
+    error = None
+    if data.get("api") != "setLauncher":
+        error = "Unsupported PICO API"
+    elif not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", request_id):
+        error = "A bounded request_id is required for PICO startup commands"
+    elif (not isinstance(targets, list) or not targets or
+          any(not isinstance(target, str) or not target for target in targets) or
+          len(set(targets)) != len(targets) or ("*" in targets and targets != ["*"])):
+        error = "target_devices must be a non-empty list of unique device IDs or ['*']"
+    elif "package_name" not in data or (package_name is not None and (
+        not isinstance(package_name, str) or len(package_name) > 255 or
+        not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+", package_name)
+    )):
+        error = "package_name must be a valid package string or explicit null for the default PICO Home"
+    if error:
+        await admin_ws.send_str(json.dumps({"type": "ERROR", "message": error, "request_id": request_id}))
+        return
+
+    target_ids = resolve_target_ids(targets)
+    payload = {"type": command, "api": "setLauncher", "request_id": request_id, "package_name": package_name}
+    sent_count = 0
+    for device_id in target_ids:
+        entry = devices.get(device_id)
+        if not command_allowed(entry, command):
+            continue
+        try:
+            await entry["ws"].send_str(json.dumps(payload))
+            sent_count += 1
+        except ConnectionResetError:
+            log.warning("PICO startup dispatch failed for %s", device_id)
+    if not sent_count:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR", "request_id": request_id,
+            "message": "No selected online devices support PICO startup commands; update the client",
+        }))
+        return
+    await admin_ws.send_str(json.dumps({
+        "type": "PICO_API_SENT", "request_id": request_id,
+        "sent_count": sent_count, "target_count": len(targets) if targets != ["*"] else len(target_ids),
+    }))
 
 
 async def handle_set_startup_app(admin_ws: web.WebSocketResponse, data: dict):

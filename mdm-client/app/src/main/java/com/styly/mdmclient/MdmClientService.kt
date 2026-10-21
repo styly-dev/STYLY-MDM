@@ -100,6 +100,7 @@ class MdmClientService : Service() {
     }
 
     private lateinit var webSocketManager: WebSocketManager
+    private lateinit var picoStartupApp: PicoStartupAppController
 
     // Mutual watch: off the main thread because each tick is a binder round-trip to
     // TobService. Journal only the down→start transition, not every tick, so a guard
@@ -149,6 +150,18 @@ class MdmClientService : Service() {
         startForeground(NOTIFICATION_ID, buildNotification("Initializing..."))
         UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_FOREGROUND_OK)
 
+        picoStartupApp = PicoStartupAppController(
+            setLauncher = { target ->
+                val proxy = ToBServiceHelper.getInstance().serviceBinder as? IToBServiceProxy
+                    ?: throw IllegalStateException("TobService not available")
+                proxy.setLauncher(target)
+            },
+            isLaunchable = { target ->
+                target != packageName && target != GuardLink.GUARD_PACKAGE &&
+                    packageManager.getApplicationInfo(target, 0).enabled &&
+                    packageManager.getLaunchIntentForPackage(target) != null
+            }
+        )
         webSocketManager = WebSocketManager(
             context = this,
             onCommand = ::handleCommand,
@@ -186,6 +199,7 @@ class MdmClientService : Service() {
         Log.i(TAG, "MdmClientService destroyed")
         UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_DESTROYED)
         guardEnsureThread.quitSafely()
+        picoStartupApp.close()
         webSocketManager.disconnect()
         super.onDestroy()
     }
@@ -322,6 +336,7 @@ class MdmClientService : Service() {
             "EXECUTE_VERIFY_DIR" -> executeVerifyDir(payload)
             "SET_STARTUP_APP" -> handleSetStartupApp(payload)
             "CLEAR_STARTUP_APP" -> handleClearStartupApp()
+            "TRIGGER_PICO_API" -> handlePicoApi(payload, commandContext)
             "EXECUTE_SELF_UNINSTALL" -> executeSelfUninstall(payload)
             "EXECUTE_REBOOT" -> executePowerControl(
                 PBS_DeviceControlEnum.DEVICE_CONTROL_REBOOT, "REBOOT_RESULT", commandContext
@@ -1183,6 +1198,34 @@ class MdmClientService : Service() {
             sanitized.isEmpty() -> ""
             sanitized.endsWith(".apk", ignoreCase = true) -> sanitized
             else -> "$sanitized.apk"
+        }
+    }
+
+    private fun handlePicoApi(payload: JSONObject, commandContext: WebSocketManager.CommandContext?) {
+        if (commandContext == null || commandContext.provisionalConnectionId != null || !commandContext.isActive()) return
+        val requestId = payload.opt("request_id") as? String ?: return
+        if (!Regex("[A-Za-z0-9_-]{1,80}").matches(requestId)) return
+        if (payload.opt("api") != "setLauncher" || !payload.has("package_name") ||
+            (payload.opt("package_name") !is String && !payload.isNull("package_name"))) {
+            webSocketManager.sendMessageForCommand(commandContext, JSONObject().apply {
+                put("type", "PICO_API_RESULT")
+                put("request_id", requestId)
+                put("status", "fail")
+                put("error", "Unsupported PICO API or invalid package_name")
+            })
+            return
+        }
+        val target = payload.opt("package_name") as? String
+        picoStartupApp.submit(target) { result ->
+            webSocketManager.sendMessageForCommand(commandContext, JSONObject().apply {
+                put("type", "PICO_API_RESULT")
+                put("request_id", requestId)
+                put("api", "setLauncher")
+                put("status", result.status)
+                put("package_name", target ?: JSONObject.NULL)
+                result.resultCode?.let { put("result_code", it) }
+                result.error?.let { put("error", it) }
+            })
         }
     }
 

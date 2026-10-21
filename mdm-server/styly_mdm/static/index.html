@@ -509,14 +509,28 @@
             </div>
             <div class="cmd-divider"></div>
             <div class="cmd-section collapsed" data-cmd="startup">
-              <div class="cmd-head" data-act="toggleCmd"><span>Startup App</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-head" data-act="toggleCmd"><span>MDM Startup App</span><span class="cmd-chevron">▾</span></div>
               <div class="cmd-body">
+                <div class="verify-hint">Launches when the MDM client starts.</div>
                 <input type="text" class="field" id="startupPkg" placeholder="com.example.app">
                 <input type="text" class="field" id="startupExtra" placeholder='{"scene":"main"} (optional)'>
                 <div class="btn-row">
                   <button class="btn btn-primary" id="btnStartupSet" disabled>Set</button>
                   <button class="btn btn-danger-outline" id="btnStartupClear" disabled>Clear</button>
                 </div>
+              </div>
+            </div>
+            <div class="cmd-divider"></div>
+            <div class="cmd-section collapsed" data-cmd="picoApi">
+              <div class="cmd-head" data-act="toggleCmd"><span>PICO API Trigger</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <select class="field" id="picoApiAction" aria-label="PICO API">
+                  <option value="setLauncher">Startup / Home App (setLauncher)</option>
+                </select>
+                <input type="text" class="field" id="picoApiPkg" placeholder="com.example.app or null (default PICO Home)">
+                <div class="verify-hint">Changes PICO's boot and Home app. Reboot after registration or restore. Clear MDM Startup App separately if configured, since it can launch another app. This PICO setting remains after retiring MDM.</div>
+                <div class="verify-hint">Requires an updated client. API acceptance does not verify boot behavior.</div>
+                <button class="btn btn-primary" id="btnPicoApi" disabled>Run on Selected</button>
               </div>
             </div>
             <div class="cmd-divider"></div>
@@ -690,6 +704,11 @@
       const startupExtra = document.getElementById('startupExtra');
       const btnStartupSet = document.getElementById('btnStartupSet');
       const btnStartupClear = document.getElementById('btnStartupClear');
+      const picoApiAction = document.getElementById('picoApiAction');
+      const picoApiPkg = document.getElementById('picoApiPkg');
+      const btnPicoApi = document.getElementById('btnPicoApi');
+      const picoStartupPending = new Map();
+      let picoStartupSequence = 0;
       const verifyApkFile = document.getElementById('verifyApkFile');
       const verifyApkName = document.getElementById('verifyApkName');
       const verifyApkPkg = document.getElementById('verifyApkPkg');
@@ -1069,6 +1088,17 @@
           case 'GROUP_DELETED': addLog('Group deleted: ' + (msg.name || '-'), 'success'); if (activeGroup === msg.name) activeGroup = null; break;
           case 'DEVICE_GROUPS_SET': addLog('Groups set for ' + labelFor(msg.device_id) + ': ' + ((msg.groups && msg.groups.length) ? msg.groups.join(', ') : '(none)'), 'success'); break;
           case 'GROUP_MEMBERS_SET': addLog('Group "' + (msg.name || '-') + '" saved: ' + ((msg.members && msg.members.length) || 0) + ' device(s)', 'success'); break;
+          case 'PICO_API_SENT':
+            addLog('PICO startup command sent (' + msg.sent_count + '/' + msg.target_count + ' devices); waiting for device results', 'info');
+            break;
+          case 'PICO_API_RESULT': {
+            settlePicoStartup(msg.request_id, msg.device_id);
+            const accepted = msg.status === 'accepted';
+            const detail = accepted ? 'API accepted; reboot and verify on the device' : (msg.error || 'No confirmed result');
+            addLog('[PICO API ' + msg.status + '] ' + (msg.api || '') + ' ' + (msg.package_name || '(default PICO Home)') + ' on ' + labelFor(msg.device_id) + ': ' + detail +
+              (typeof msg.result_code === 'number' ? ' (code ' + msg.result_code + ')' : ''), accepted ? 'info' : (msg.status === 'unknown' ? 'warn' : 'fail'));
+            break;
+          }
           case 'SET_STARTUP_APP_SENT': addLog('Startup app set: ' + msg.package_name + ' (' + msg.sent_count + '/' + msg.target_count + ' devices)', 'success'); break;
           case 'CLEAR_STARTUP_APP_SENT': addLog('Startup app cleared (' + msg.sent_count + '/' + msg.target_count + ' devices)', 'success'); break;
           case 'STARTUP_APP_RESULT': {
@@ -1112,7 +1142,10 @@
             addLog('[' + (ok ? 'OK' : 'FAIL') + '] retire ' + labelFor(msg.device_id) + (msg.detail ? ' - ' + msg.detail : ''), ok ? 'success' : 'fail');
             break;
           }
-          case 'ERROR': addLog('[ERROR] ' + (msg.message || 'Unknown error'), 'fail'); break;
+          case 'ERROR':
+            if (msg.request_id) settlePicoStartup(msg.request_id);
+            addLog('[ERROR] ' + (msg.message || 'Unknown error'), 'fail');
+            break;
           default: addLog('Received: ' + msg.type, 'info');
         }
       }
@@ -1546,6 +1579,12 @@
         btnUninstall.disabled = !uninstallConfirm.checked || uninstallPkg.value.trim() === '' || !has;
         btnStartupSet.disabled = startupPkg.value.trim() === '' || !has;
         btnStartupClear.disabled = !has;
+        const hasPicoApi = !attentionMode && Array.from(selectedIds).some(function (id) {
+          const d = deviceById(id);
+          return d && isOnline(d) && d.pico_startup_app_supported === true;
+        });
+        const picoPackage = picoApiPkg.value.trim();
+        btnPicoApi.disabled = !hasPicoApi || (picoPackage !== 'null' && !validPicoPackage(picoPackage));
         pushPanel.refreshButton(has);
         syncPanel.refreshButton(has);
         btnVerifyApk.disabled = !verifyApkRef || verifyApkPkg.value.trim() === '' || !has;
@@ -1863,6 +1902,49 @@
         btnId: 'btnSync', verb: 'Sync', deleteExtras: true,
         emptyLabel: 'No folder selected',
       });
+
+      function validPicoPackage(pkg) {
+        return pkg.length <= 255 && /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/.test(pkg);
+      }
+
+      function settlePicoStartup(requestId, deviceId) {
+        const pending = picoStartupPending.get(requestId);
+        if (!pending) return;
+        if (deviceId) pending.ids.delete(deviceId);
+        else pending.ids.clear();
+        if (!pending.ids.size) {
+          clearTimeout(pending.timer);
+          picoStartupPending.delete(requestId);
+        }
+      }
+
+      function sendPicoApi() {
+        const action = picoApiAction.value;
+        if (targetTab === 'attention' || action !== 'setLauncher') return;
+        const pkg = picoApiPkg.value.trim();
+        if (pkg !== 'null' && !validPicoPackage(pkg)) return;
+        const online = onlineTargets(Array.from(selectedIds));
+        const supported = online.filter(function (id) { return (deviceById(id) || {}).pico_startup_app_supported === true; });
+        if (supported.length !== online.length) addLog('Skipping devices without PICO startup API support; update their client', 'warn');
+        if (!supported.length) { addLog('No supported online devices selected for PICO API', 'warn'); return; }
+        const requestId = 'pico-' + Date.now() + '-' + (++picoStartupSequence);
+        const msg = { type: 'TRIGGER_PICO_API', api: action, request_id: requestId,
+          target_devices: supported, package_name: pkg === 'null' ? null : pkg };
+        try {
+          if (!wsSend(msg, 'run PICO API')) return;
+        } catch (error) {
+          addLog('Cannot run PICO API: ' + error.message, 'fail');
+          return;
+        }
+        const pending = { ids: new Set(supported), timer: null };
+        pending.timer = setTimeout(function () {
+          picoStartupPending.delete(requestId);
+          addLog('PICO startup result unconfirmed on ' + Array.from(pending.ids).map(labelFor).join(', ') +
+            '; verify on the device before retrying. The setting may have changed.', 'warn');
+        }, 20000);
+        picoStartupPending.set(requestId, pending);
+        addLog('Sending PICO startup API to ' + supported.length + ' device(s)', 'info');
+      }
 
       function sendSetStartup() {
         const pkg = startupPkg.value.trim();
@@ -2808,6 +2890,9 @@
       uninstallPkg.addEventListener('input', updateButtons);
       uninstallConfirm.addEventListener('change', updateButtons);
       startupPkg.addEventListener('input', updateButtons);
+      picoApiPkg.addEventListener('input', updateButtons);
+      picoApiAction.addEventListener('change', updateButtons);
+      btnPicoApi.addEventListener('click', sendPicoApi);
       btnInstall.addEventListener('click', sendInstall);
       btnUpdateClients.addEventListener('click', sendClientUpdateBulk);
       btnLaunch.addEventListener('click', sendLaunch);

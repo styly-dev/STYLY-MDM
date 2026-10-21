@@ -321,7 +321,7 @@ class WebSocketManager internal constructor(
         webSocket?.send(text)
     }
 
-    /** Send a power result only while the command's original registration is still active. */
+    /** Send a result only while the command's original registration is still active. */
     internal fun sendMessageForCommand(commandContext: CommandContext, json: JSONObject): Boolean {
         val sent = commandContext.sendMessage(json.toString())
         if (!sent) Log.w(TAG, "Command result was not sent on its original connection")
@@ -563,7 +563,9 @@ class WebSocketManager internal constructor(
                 put("device_id", identity.deviceId)
                 val pushFields = pushCoordinator.registrationFields()
                 put("process_instance_id", pushFields.getString("process_instance_id"))
-                put("capabilities", pushFields.getJSONArray("capabilities"))
+                put("capabilities", pushFields.getJSONArray("capabilities").apply {
+                    put(PicoStartupAppController.CAPABILITY)
+                })
                 put("push_runtime", pushFields.getJSONObject("push_runtime"))
                 val startupConfig = getStartupAppConfig()
                 if (startupConfig != null) {

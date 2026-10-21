@@ -10,6 +10,7 @@ PROVISIONAL_POWER_COMMANDS = frozenset({
     "EXECUTE_REBOOT",
     "EXECUTE_POWER_OFF",
 })
+PICO_STARTUP_CAPABILITY = "pico_startup_app_v1"
 
 
 def command_allowed(entry: dict | None, command: str | None = None) -> bool:
@@ -19,6 +20,8 @@ def command_allowed(entry: dict | None, command: str | None = None) -> bool:
 
     identity_kind = entry.get("identity_kind")
     if identity_kind == "canonical":
+        if command == "TRIGGER_PICO_API":
+            return PICO_STARTUP_CAPABILITY in entry.get("capabilities", [])
         return True
     if identity_kind == "legacy":
         return command == "EXECUTE_INSTALL"
