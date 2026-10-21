@@ -243,7 +243,17 @@ async def test_individual_action_leaves_other_interrupted_device_untouched(manag
 
 
 @pytest.mark.asyncio
-async def test_targeted_resume_preserves_non_target_interruption_reason(manager):
+@pytest.mark.parametrize(
+    ("state", "reason"),
+    [
+        ("queued", "download_interrupted"),
+        ("queued", "dispatch_paused"),
+        ("queued", "device_offline"),
+        ("queued", "client_restarted"),
+        ("reconciling", "client_restarted"),
+    ],
+)
+async def test_targeted_resume_preserves_non_target_manual_wait(manager, state, reason):
     original = await two_device_job(manager)
     job_id = original["job_id"]
     manager.store._call_sync(
@@ -255,19 +265,70 @@ async def test_targeted_resume_preserves_non_target_interruption_reason(manager)
             ),
             conn.execute(
                 "UPDATE push_job_devices SET queue_reason='download_interrupted' "
-                "WHERE job_id=?",
+                "WHERE job_id=? AND device_id='D1'",
                 (job_id,),
+            ),
+            conn.execute(
+                "UPDATE push_job_devices SET state=?, queue_reason=?, updated_at=17 "
+                "WHERE job_id=? AND device_id='D2'",
+                (state, reason, job_id),
             ),
             conn.commit(),
         )
     )
+    non_target_before = await manager.assignment(job_id, "D2")
 
     enabled, resumed = await manager.enable_dispatch(job_id, target_devices=["D1"])
 
     assert enabled is True
     assert resumed["devices"]["D1"]["queue_reason"] == "resumable_replay"
-    assert resumed["devices"]["D2"]["queue_reason"] == "download_interrupted"
+    assert resumed["devices"]["D2"]["queue_reason"] == reason
+    assert resumed["devices"]["D2"]["state"] == state
+    non_target_after = await manager.assignment(job_id, "D2")
+    assert (
+        non_target_after["state"],
+        non_target_after["queue_reason"],
+        non_target_after["updated_at"],
+    ) == (
+        non_target_before["state"],
+        non_target_before["queue_reason"],
+        non_target_before["updated_at"],
+    )
     assert resumed["devices"]["D2"]["manual_wait"] is True
+
+
+@pytest.mark.asyncio
+async def test_targeted_resume_timestamps_non_target_that_it_pauses(manager):
+    original = await two_device_job(manager)
+    job_id = original["job_id"]
+    manager.store._call_sync(
+        lambda conn: (
+            conn.execute(
+                "UPDATE push_jobs SET dispatch_enabled=0, "
+                "dispatch_paused_reason='server_restart' WHERE job_id=?",
+                (job_id,),
+            ),
+            conn.execute(
+                "UPDATE push_job_devices SET queue_reason='download_interrupted' "
+                "WHERE job_id=? AND device_id='D1'",
+                (job_id,),
+            ),
+            conn.execute(
+                "UPDATE push_job_devices SET state='reconciling', queue_reason=NULL, updated_at=17 "
+                "WHERE job_id=? AND device_id='D2'",
+                (job_id,),
+            ),
+            conn.commit(),
+        )
+    )
+    non_target_before = await manager.assignment(job_id, "D2")
+
+    enabled, resumed = await manager.enable_dispatch(job_id, target_devices=["D1"])
+
+    assert enabled is True
+    assert resumed["devices"]["D2"]["queue_reason"] == "dispatch_paused"
+    non_target_after = await manager.assignment(job_id, "D2")
+    assert non_target_after["updated_at"] != non_target_before["updated_at"]
 
 
 @pytest.mark.asyncio

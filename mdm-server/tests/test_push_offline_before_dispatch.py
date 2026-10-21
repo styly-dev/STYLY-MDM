@@ -84,6 +84,34 @@ async def test_undispatched_job_is_left_for_its_dispatch_check(manager):
 
 
 @pytest.mark.asyncio
+async def test_stale_dispatch_after_offline_settlement_returns_terminal_snapshot(manager):
+    job_id = await _ready_job(manager, ['D1'])
+    claimed = await manager.claim_next(['D1'])
+    assert claimed['state'] == 'waiting_transfer'
+
+    offline = await manager.settle_offline_before_dispatch('D1', job_id)
+    assert offline[0]['devices']['D1']['state'] == 'failed'
+
+    snapshot = await manager.prepare_dispatch(job_id, 'D1', accept_deadline=123)
+    assert snapshot == offline[0]
+    assert snapshot['devices']['D1']['failure']['code'] == 'device_offline_before_dispatch'
+
+
+@pytest.mark.asyncio
+async def test_repeated_prepare_dispatch_still_rejects_already_dispatching(manager):
+    job_id = await _ready_job(manager, ['D1'])
+    assert await manager.claim_next(['D1']) is not None
+    first = await manager.prepare_dispatch(job_id, 'D1', accept_deadline=123)
+    assert first['devices']['D1']['state'] == 'dispatching'
+
+    with pytest.raises(StoreConflict):
+        await manager.prepare_dispatch(job_id, 'D1', accept_deadline=456)
+
+    current = await manager.get_snapshot(job_id)
+    assert current == first
+
+
+@pytest.mark.asyncio
 async def test_dispatch_skips_devices_that_are_offline(manager):
     job_id = await _ready_job(manager, ['ON', 'OFF'], dispatch=False)
     runtime = object.__new__(PushRuntime)
