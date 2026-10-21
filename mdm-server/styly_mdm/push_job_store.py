@@ -254,11 +254,14 @@ class PushJobStore:
             )
         # executescript would commit implicitly, so run the upgrade as separate
         # statements inside one transaction.
-        schema = """
+        schema = (
+            """
             CREATE TABLE IF NOT EXISTS server_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS push_artifacts (
                 artifact_id TEXT PRIMARY KEY,
                 storage_name TEXT NOT NULL UNIQUE,
@@ -268,7 +271,9 @@ class PushJobStore:
                 entry_count INTEGER NOT NULL,
                 created_at INTEGER NOT NULL,
                 retention_state TEXT NOT NULL DEFAULT 'retained'
-            );
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS push_jobs (
                 job_id TEXT PRIMARY KEY,
                 client_request_id TEXT NOT NULL UNIQUE,
@@ -297,7 +302,9 @@ class PushJobStore:
                 failure_code TEXT,
                 failure_detail TEXT,
                 FOREIGN KEY (artifact_id) REFERENCES push_artifacts(artifact_id)
-            );
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS push_job_devices (
                 job_id TEXT NOT NULL,
                 device_id TEXT NOT NULL,
@@ -330,7 +337,9 @@ class PushJobStore:
                 cancel_requested_at INTEGER,
                 PRIMARY KEY (job_id, device_id),
                 FOREIGN KEY (job_id) REFERENCES push_jobs(job_id) ON DELETE CASCADE
-            );
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS push_device_fences (
                 device_id TEXT PRIMARY KEY,
                 blocking_job_id TEXT,
@@ -346,21 +355,25 @@ class PushJobStore:
                     OR (blocking_job_id IS NULL AND blocking_opaque_identity IS NOT NULL)
                 ),
                 FOREIGN KEY (blocking_job_id) REFERENCES push_jobs(job_id)
-            );
+            )
+            """,
+            """
             CREATE UNIQUE INDEX IF NOT EXISTS ux_push_job_device_active
             ON push_job_devices(device_id)
             WHERE state IN (
                 'waiting_transfer', 'dispatching', 'downloading',
                 'validating', 'applying', 'reconciling'
-            );
+            )
+            """,
+            """
             CREATE INDEX IF NOT EXISTS ix_push_job_device_order
-            ON push_job_devices(device_id, enqueue_seq);
-        """
+            ON push_job_devices(device_id, enqueue_seq)
+            """,
+        )
         cls._begin(conn)
         try:
-            for statement in schema.split(";"):
-                if statement.strip():
-                    conn.execute(statement)
+            for statement in schema:
+                conn.execute(statement)
             # Upgrade older databases in place. Column checks keep this idempotent.
             for table, (column, column_type) in (
                 ("push_jobs", ("retry_of_job_id", "TEXT")),
