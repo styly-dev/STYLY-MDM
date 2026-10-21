@@ -62,6 +62,12 @@ def test_policy_mutations_have_one_owner():
     assert policy_methods.isdisjoint(PushJobStore.__dict__.keys())
 
 
+def test_store_internals_are_not_exposed_as_manager_operations(manager):
+    for name in ("_call", "_call_sync", "close", "backup_path"):
+        with pytest.raises(AttributeError):
+            getattr(manager, name)
+
+
 @pytest.mark.asyncio
 async def test_idempotent_lookup_does_not_depend_on_current_connection(manager):
     req = request()
