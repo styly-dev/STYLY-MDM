@@ -33,12 +33,13 @@ A command-line flag overrides the corresponding environment variable.
 |--------|---------|------|---------|
 | HTTP/WebSocket port | `MDM_WS_PORT` | `--port` | `7070` |
 | UDP discovery port | `MDM_DISCOVERY_PORT` | — | `7071` |
-| Data directory (uploaded APKs, pushed bundles, device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
+| Data directory (APKs, Push jobs/artifacts, device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
 | Simultaneous device downloads, server-wide | `MDM_MAX_CONCURRENT_TRANSFERS` | `--max-concurrent-transfers` | `5` |
-| Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `600` |
+| APK transfer timeout in seconds | `MDM_TRANSFER_TIMEOUT` | — | `600` |
 
 The data directory holds everything the server persists: uploaded APKs
-(`<data-dir>/apks/`), pushed file bundles (`<data-dir>/bundles/`), and the device
+(`<data-dir>/apks/`), Push metadata (`<data-dir>/push_jobs.sqlite3`),
+artifacts (`<data-dir>/push-artifacts/`) and upload work (`<data-dir>/push-work/`), and the device
 registry (`<data-dir>/device_registry.json`). It defaults to the directory the
 server is started from, so `uvx styly-mdm` in a fresh directory comes up with no
 devices or groups.

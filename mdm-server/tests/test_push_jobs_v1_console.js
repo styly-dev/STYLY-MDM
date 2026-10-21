@@ -305,7 +305,10 @@ function openIntegratedConsole(options = {}) {
     deviceById(id) { return { device_id: id, status: options.isDeviceOnline && !options.isDeviceOnline(id) ? 'offline' : 'online' }; },
     pushStateUnavailable() { return false; },
     renderTabs() {}, renderTargets() {}, updateButtons() {},
-    selectedIds: new Set(['D1']), onlineTargets(ids) { return ids; },
+    selectedIds: new Set(options.selectedIds || ['D1']),
+    onlineTargets(ids) {
+      return options.onlineTargets ? options.onlineTargets(ids) : ids;
+    },
     verifyDirRef: { tree_hash: 'same-hash' }, verifyApkRef: null,
     verifyDirPath: { value: '/sdcard/job' },
     FormData, fetch(...args) { return window.fetch(...args); },
@@ -688,6 +691,125 @@ test('Push panel keeps the selected files after create failure for retry', async
   assert.ok(h.consoleLogs.some((line) => line.includes('target device is not online')));
 });
 
+test('target connectivity flaps during a lost upload response reuse the same request and artifact', async () => {
+  let finishLostResponse;
+  const lostResponse = new Promise((resolve) => { finishLostResponse = resolve; });
+  const online = new Set(['D1', 'D2']);
+  const jobsByRequestId = new Map();
+  const requestIds = [];
+  const targetSets = [];
+  let artifactCount = 0;
+  const h = openIntegratedConsole({
+    selectedIds: ['D1', 'D2'],
+    onlineTargets(ids) { return ids.filter((id) => online.has(id)); },
+    fetch: async (url, init) => {
+      if (url === '/api/push-jobs') {
+        const body = JSON.parse(init.body);
+        requestIds.push(body.client_request_id);
+        targetSets.push(body.target_devices);
+        const existing = jobsByRequestId.get(body.client_request_id);
+        if (existing) {
+          return new Response(JSON.stringify({ job_id: existing, state: 'ready' }), {
+            status: 200, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const jobId = 'flap-job-' + (jobsByRequestId.size + 1);
+        jobsByRequestId.set(body.client_request_id, jobId);
+        return new Response(JSON.stringify({
+          job_id: jobId, state: 'created', upload_url: '/flap-upload',
+        }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (url === '/flap-upload') {
+        artifactCount += 1;
+        await lostResponse;
+        throw new Error('upload response lost after the server stored the artifact');
+      }
+      throw new Error('unexpected URL: ' + url);
+    },
+  });
+
+  const firstAttempt = h.sendPush();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(artifactCount, 1, 'the first upload is in flight before connectivity changes');
+
+  online.delete('D2');
+  h.panel.refreshButton(true);
+  online.add('D2');
+  h.panel.refreshButton(true);
+  finishLostResponse();
+  assert.equal(await firstAttempt, false);
+
+  const retry = h.sendPush();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requestIds.length, 2);
+  assert.equal(requestIds[1], requestIds[0], 'connectivity-only redraws preserve the idempotency key');
+  assert.deepEqual(targetSets, [['D1', 'D2'], ['D1', 'D2']],
+    'the retry keeps the targets captured when the operation first started');
+  assert.equal(jobsByRequestId.size, 1, 'the retry resolves to the existing server job');
+  assert.equal(artifactCount, 1, 'the immutable artifact is not uploaded a second time');
+  assert.deepEqual(h.socket.sent, [{ type: 'PUSH_FILES', job_id: 'flap-job-1' }]);
+  h.socket.emit({ type: 'PUSH_FILES_SENT', job_id: 'flap-job-1' });
+  assert.deepEqual(await retry, { job_id: 'flap-job-1', state: 'dispatched' });
+});
+
+test('released submissions stay settleable while active and discard abandoned fingerprints afterward', async () => {
+  let finishUpload;
+  const uploadReady = new Promise((resolve) => { finishUpload = resolve; });
+  const requestId = 'eeeeeeee-1111-4111-8111-111111111111';
+  let creates = 0;
+  const h = loadAdapter({
+    fetch: async (url) => {
+      if (url === '/api/push-jobs') {
+        creates += 1;
+        const jobId = creates === 1 ? 'released-old-job' : 'released-new-job';
+        return new Response(JSON.stringify({
+          job_id: jobId, state: 'created', upload_url: '/upload-' + creates,
+        }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (url === '/upload-1') {
+        await uploadReady;
+        return new Response(JSON.stringify({ job_id: 'released-old-job', state: 'ready' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url === '/upload-2') {
+        return new Response(JSON.stringify({ job_id: 'released-new-job', state: 'ready' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      throw new Error('unexpected URL: ' + url);
+    },
+  });
+  const socket = new window.WebSocket('ws://localhost/ws/admin');
+  socket.snapshot();
+  const first = window.__stylyPushJobsV1Actions.submitPushJob({
+    files: [new File(['old'], 'old.txt', { lastModified: 1 })],
+    targets: ['D1'], destPath: '/sdcard/job', mode: 'push', clientRequestId: requestId,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(window.__stylyPushJobsV1Actions.releaseSubmission(requestId), true);
+  finishUpload();
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.update(snapshot('released-old-job', 2, 'D1', 'downloading', 1, {
+    clientRequestId: requestId, dispatchEnabled: true,
+  }));
+  assert.deepEqual(await first, { job_id: 'released-old-job', state: 'dispatched' },
+    'the active request still settles from canonical job state');
+
+  const second = window.__stylyPushJobsV1Actions.submitPushJob({
+    files: [new File(['new'], 'new.txt', { lastModified: 2 })],
+    targets: ['D1'], destPath: '/sdcard/job', mode: 'push', clientRequestId: requestId,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(creates, 2, 'the abandoned fingerprint was removed after its active promise settled');
+  assert.deepEqual(socket.sent, [
+    { type: 'PUSH_FILES', job_id: 'released-old-job' },
+    { type: 'PUSH_FILES', job_id: 'released-new-job' },
+  ]);
+  socket.emit({ type: 'PUSH_FILES_SENT', job_id: 'released-new-job' });
+  assert.deepEqual(await second, { job_id: 'released-new-job', state: 'dispatched' });
+});
+
 test('terminal upload failure rotates the request ID while retaining the selected file', async () => {
   const requestIds = [];
   let creates = 0;
@@ -958,8 +1080,7 @@ test('canonical validation renders separately from transfer and apply for Push a
   const socket = new window.WebSocket('ws://localhost/ws/admin');
   socket.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [] });
   const device = { status: 'online' };
-  const context = loadConsoleFunction('taskCellHtml', {
-    deviceTaskState: {},
+  const context = loadConsoleFunction('pushTaskCellHtml', {
     deviceById() { return device; },
     esc(value) { return String(value); },
   });
@@ -974,8 +1095,10 @@ test('canonical validation renders separately from transfer and apply for Push a
         type: 'PUSH_JOB_UPDATED',
         job: snapshot('phase-job', revision++, 'D1', state, 1, { mode }),
       });
-      context.deviceTaskState.D1 = { task: 'push', ...harness.bridgeState.get('D1') };
-      assert.match(context.taskCellHtml('D1'), new RegExp(label), mode + ': ' + state);
+      assert.match(
+        context.pushTaskCellHtml('D1', harness.bridgeState.get('D1')),
+        new RegExp(label), mode + ': ' + state,
+      );
     }
   }
 });
@@ -1185,38 +1308,37 @@ test('target tabs preserve normal selection and clear it across Need attention',
 test('offline push rows retain unfinished jobs without claiming current execution', () => {
   const device = { status: 'online' };
   const state = { task: 'push', status: 'applying', verb: 'Push', owner: 'push-job-v1' };
-  const context = loadConsoleFunction('taskCellHtml', {
-    deviceTaskState: { D1: state },
+  const context = loadConsoleFunction('pushTaskCellHtml', {
     deviceById() { return device; },
     esc(value) { return String(value); },
   });
-  assert.match(context.taskCellHtml('D1'), /Pushing/);
+  assert.match(context.pushTaskCellHtml('D1', state), /Pushing/);
   device.status = 'offline';
   for (const status of ['queued', 'transferring', 'validating', 'applying']) {
     state.status = status;
-    const html = context.taskCellHtml('D1');
+    const html = context.pushTaskCellHtml('D1', state);
     assert.match(html, /Job pending · offline/);
     assert.doesNotMatch(html, /spinner|Pushing|Transferring|Validating|failed/);
     assert.equal(state.status, status, 'rendering must not mutate canonical state');
   }
   device.status = 'online';
   state.status = 'applying';
-  assert.match(context.taskCellHtml('D1'), /Pushing/);
+  assert.match(context.pushTaskCellHtml('D1', state), /Pushing/);
   for (const connectivity of ['online', 'offline']) {
     device.status = connectivity;
     state.status = 'reconciling';
-    const html = context.taskCellHtml('D1');
+    const html = context.pushTaskCellHtml('D1', state);
     assert.match(html, /Awaiting status confirmation/);
     assert.equal(html.includes(' · offline'), connectivity === 'offline');
     assert.doesNotMatch(html, /Job pending|spinner|Pushing|failed/);
     state.status = 'unconfirmed';
-    assert.match(context.taskCellHtml('D1'), /Status unknown/);
+    assert.match(context.pushTaskCellHtml('D1', state), /Status unknown/);
   }
   device.status = 'offline';
   state.status = 'success';
-  assert.match(context.taskCellHtml('D1'), /pushed/);
+  assert.match(context.pushTaskCellHtml('D1', state), /pushed/);
   state.status = 'fail';
-  assert.match(context.taskCellHtml('D1'), /failed/);
+  assert.match(context.pushTaskCellHtml('D1', state), /failed/);
 });
 
 test('device list disconnect clears only generic task state', () => {
@@ -1248,12 +1370,11 @@ test('retry-exhausted queued assignment stays visibly paused across reconnection
   socket.snapshot(job);
   assert.equal(harness.bridgeState.get('D1').status, 'resume_required');
   for (const status of ['online', 'offline']) {
-    const context = loadConsoleFunction('taskCellHtml', {
-      deviceTaskState: { D1: { task: 'push', status: 'resume_required' } },
+    const context = loadConsoleFunction('pushTaskCellHtml', {
       deviceById() { return { status }; },
       esc(value) { return String(value); },
     });
-    const html = context.taskCellHtml('D1');
+    const html = context.pushTaskCellHtml('D1', harness.bridgeState.get('D1'));
     assert.match(html, /Resume required/);
     assert.doesNotMatch(html, /Pushing|spinner|failed/);
     assert.equal(html.includes('Resume required · offline'), status === 'offline', status);

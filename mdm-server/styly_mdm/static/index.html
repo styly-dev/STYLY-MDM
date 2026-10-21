@@ -1070,7 +1070,7 @@
           case 'REBOOT_RESULT': logPowerResult('Reboot', msg); break;
           case 'POWER_OFF_RESULT': logPowerResult('Power off', msg); break;
           case 'INSTALL_SENT': addLog('Install job queued for ' + msg.target_count + ' device(s)' + (msg.max_concurrent ? ' (max ' + msg.max_concurrent + ' concurrent transfer(s))' : ''), 'info'); break;
-          case 'INSTALL_PROGRESS': showTransferProgress('install', msg); break;
+          case 'INSTALL_PROGRESS': showTransferProgress(msg); break;
           case 'INSTALL_DEVICE_STATE': {
             // Per-device companion to INSTALL_PROGRESS: the aggregate counts cannot
             // be mapped back to rows, so the server names the devices it moved.
@@ -1092,36 +1092,6 @@
             addLog('Push state on ' + labelFor(msg.device_id) + ' was unreadable and has been reset' +
               (msg.detail ? ' - ' + msg.detail : '') + '; unfinished Push/Sync status on it may show as interrupted', 'warn');
             break;
-          case 'PUSH_PROGRESS': showTransferProgress('push', msg); break;
-          case 'PUSH_DEVICE_STATE': {
-            // Per-device companion to PUSH_PROGRESS, mirroring INSTALL_DEVICE_STATE.
-            const verb = msg.delete_extras ? 'Sync' : 'Push';
-            (msg.device_ids || []).forEach(function (id) {
-              deviceTaskState[id] = { task: 'push', status: msg.state, verb: verb, filename: msg.dest_path || '', note: '', detail: msg.detail || '' };
-              updateTaskCell(id);
-            });
-            break;
-          }
-          case 'PUSH_FILES_RESULT': {
-            const st = msg.status === 'success' ? 'success' : 'fail';
-            const summary = '+' + (msg.added || 0) + ' ~' + (msg.updated || 0) + ' -' + (msg.deleted || 0);
-            const detail = msg.error || msg.message || '';
-            // PUSH_FILES_RESULT does not name the mode, so carry the verb over from the
-            // PUSH_DEVICE_STATE transitions that preceded it.
-            const prev = msg.device_id ? deviceTaskState[msg.device_id] : null;
-            const verb = (prev && prev.task === 'push' && prev.verb) || 'Push';
-            if (msg.device_id) {
-              deviceTaskState[msg.device_id] = { task: 'push', status: st, verb: verb, filename: msg.dest_path || '', note: st === 'success' ? summary : '', detail: detail };
-              updateTaskCell(msg.device_id);
-            }
-            const what = verb.toLowerCase();
-            if (st === 'success') {
-              addLog('[OK] ' + what + ' to ' + (msg.dest_path || '-') + ' on ' + labelFor(msg.device_id) + ' (' + summary + ')', 'success');
-            } else {
-              addLog('[FAIL] ' + what + ' to ' + (msg.dest_path || '-') + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), 'fail');
-            }
-            break;
-          }
           case 'DEVICE_LABEL_SET': addLog('Label set: ' + (msg.device_id || '-') + ' -> ' + (msg.label || '(cleared)'), 'success'); break;
           case 'DEVICE_FORGOTTEN': addLog('Device forgotten: ' + (msg.device_id || '-'), 'success'); break;
           case 'GROUP_CREATED': addLog('Group created: ' + (msg.name || '-'), 'success'); if (view === 'manage') pendingSelectGroup = msg.name; break;
@@ -1492,8 +1462,8 @@
         }
       }
 
-      // Install/Verify and legacy Push retain their latest task result. Durable
-      // Push is rendered independently from the canonical job store below.
+      // Install/Verify retain their latest task result. Push is rendered from the
+      // canonical job store below.
       function taskCellHtml(id) {
         const st = deviceTaskState[id];
         if (!st) return '<span class="ins-none">—</span>';
@@ -1509,7 +1479,6 @@
           if (st.status === 'error') return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ error</span>';
           return '<span class="ins-fail" title="' + esc(what + ': ' + (st.detail || 'mismatch')) + '">✗ mismatch</span>';
         }
-        if (st.task === 'push') return pushTaskCellHtml(id, st);
         if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
         if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
         if (st.status === 'installing') return '<span class="ins-installing"><span class="spinner">⟳</span> Installing…</span>';
@@ -1568,7 +1537,7 @@
           if (actions.length) task += '<span class="push-job-actions">' + actions.join('') + '</span>';
           task = '<div><span class="ins-none">' + esc(assignment.verb) + ': </span>' + task + '</div>';
           const other = deviceTaskState[id];
-          if (other && other.task !== 'push') {
+          if (other) {
             const label = other.task === 'verify' ? (other.kind === 'dir' ? 'Verify Dir' : 'Verify APK') : 'Install';
             task += '<div><span class="ins-none">' + label + ': </span>' + taskCellHtml(id) + '</div>';
           }
@@ -1883,6 +1852,7 @@
         let selectionRevision = 0;
         let operationKey = null;
         let operationRequestId = null;
+        let operationTargets = null;
 
         function selectionFiles() {
           if (folderInput.files.length) return Array.from(folderInput.files);
@@ -1907,8 +1877,7 @@
           if (fileInput) fileInput.value = '';
           folderInput.value = '';
           selectionRevision += 1;
-          operationKey = null;
-          operationRequestId = null;
+          resetOperationIdentity();
           if (confirmEl) confirmEl.checked = false;
           nameEl.textContent = cfg.emptyLabel;
           updateButtons();
@@ -1916,33 +1885,48 @@
 
         function currentOperation() {
           const files = selectionFiles();
-          const targets = onlineTargets(Array.from(selectedIds));
+          const deviceIds = Array.from(selectedIds);
           const destPath = destEl.value.trim();
-          if (!files.length || !targets.length || !destPath) return null;
+          if (!files.length || !deviceIds.length || !destPath) return null;
           const key = JSON.stringify({
             revision: selectionRevision,
             files: files.map(function (file) {
               return [file.webkitRelativePath || file.name, file.size, file.lastModified];
             }),
-            targets: targets,
+            deviceIds: deviceIds.slice().sort(),
             destPath: destPath,
             mode: cfg.deleteExtras ? 'sync' : 'push',
           });
-          if (key !== operationKey) {
-            operationKey = key;
-            operationRequestId = window.__stylyPushJobsV1Actions.newSubmissionId();
-          }
           return {
             key: key,
-            requestId: operationRequestId,
             files: files,
-            targets: targets,
+            deviceIds: deviceIds,
             destPath: destPath,
           };
         }
 
+        function resetOperationIdentity() {
+          if (operationRequestId) {
+            window.__stylyPushJobsV1Actions.releaseSubmission(operationRequestId);
+          }
+          operationKey = null;
+          operationRequestId = null;
+          operationTargets = null;
+        }
+
+        function syncOperationIdentity(operation) {
+          const nextKey = operation ? operation.key : null;
+          if (nextKey === operationKey) return;
+          resetOperationIdentity();
+          if (operation) {
+            operationKey = operation.key;
+            operationRequestId = window.__stylyPushJobsV1Actions.newSubmissionId();
+          }
+        }
+
         function send() {
           const operation = currentOperation();
+          syncOperationIdentity(operation);
           if (!operation) {
             if (!destEl.value.trim()) addLog('Enter a destination path to ' + cfg.verb.toLowerCase() + ' files', 'warn');
             else if (!selectionFiles().length) addLog(cfg.emptyLabel, 'warn');
@@ -1950,7 +1934,13 @@
             return Promise.resolve(false);
           }
           if (confirmEl && !confirmEl.checked) { addLog('Confirm the delete warning before syncing', 'warn'); return; }
+          operation.requestId = operationRequestId;
           if (pendingRequestIds.has(operation.requestId)) return Promise.resolve(false);
+          if (!operationTargets || !operationTargets.length) {
+            operationTargets = onlineTargets(operation.deviceIds);
+          }
+          if (!operationTargets.length) return Promise.resolve(false);
+          operation.targets = operationTargets.slice();
           const startedRevision = selectionRevision;
           pendingRequestIds.add(operation.requestId);
           nameEl.textContent = 'Creating ' + cfg.verb + ' job…';
@@ -1974,8 +1964,7 @@
               operation.requestId === operationRequestId;
             if (isCurrentOperation) {
               if (error.retryWithNewRequestId) {
-                operationKey = null;
-                operationRequestId = null;
+                resetOperationIdentity();
               }
               nameEl.textContent = cfg.verb + ' failed; selection retained for retry';
               addLog(cfg.verb + ' files failed: ' + error.message, 'fail');
@@ -1991,17 +1980,17 @@
 
         function refreshButton(anySelected) {
           const operation = currentOperation();
+          syncOperationIdentity(operation);
           btn.disabled = !hasSelection() || destEl.value.trim() === '' ||
             (confirmEl ? !confirmEl.checked : false) || !anySelected;
-          if (operation && pendingRequestIds.has(operation.requestId)) btn.disabled = true;
+          if (operationRequestId && pendingRequestIds.has(operationRequestId)) btn.disabled = true;
         }
 
         function onPick(input, other) {
           input.addEventListener('change', function () {
             if (input.files.length && other) other.value = '';
             selectionRevision += 1;
-            operationKey = null;
-            operationRequestId = null;
+            resetOperationIdentity();
             nameEl.textContent = describeSelection(); updateButtons();
           });
         }
@@ -2332,32 +2321,25 @@
 
       function addLog(message, type) { makeLogEntry(message, type); }
 
-      // Throttled transfer progress: the server broadcasts INSTALL_PROGRESS / PUSH_PROGRESS
-      // on every transfer-slot transition, so instead of one log line per event we keep a
-      // single entry per job and update it in place until it is done. Kept per job kind —
-      // an install and a push draw on the same server-wide slot pool and can be in flight
-      // together, so they must not overwrite each other's line.
-      const transferProgress = { install: null, push: null }; // kind -> { label, nodes }
-      function showTransferProgress(kind, msg) {
-        const label = kind === 'push'
-          ? (msg.bundle_filename || 'bundle') + ' → ' + (msg.dest_path || '-')
-          : (msg.apk_filename || 'APK');
-        const verb = kind === 'push' ? (msg.delete_extras ? 'Sync' : 'Push') : 'Install';
-        const body = verb + ' ' + label + ': ' + (msg.transferred || 0) + ' done, ' +
+      // Throttle install transfer updates to one activity entry until completion.
+      let installProgress = null;
+      function showTransferProgress(msg) {
+        const label = msg.apk_filename || 'APK';
+        const body = 'Install ' + label + ': ' + (msg.transferred || 0) + ' done, ' +
           (msg.transferring || 0) + ' transferring, ' + (msg.queued || 0) + ' queued' +
           (msg.failed ? ', ' + msg.failed + ' failed/timed out' : '') +
           ' (of ' + (msg.total || 0) + ')' + (msg.done ? ' — done' : '');
         const type = msg.done ? (msg.failed ? 'warn' : 'success') : 'info';
-        const cur = transferProgress[kind];
+        const cur = installProgress;
         if (cur && cur.label === label && cur.nodes.entry.isConnected) {
           cur.nodes.msg.textContent = body;
           cur.nodes.msg.className = 'log-msg ' + type;
           cur.nodes.time.textContent = new Date().toLocaleTimeString();
           logContainer.scrollTop = logContainer.scrollHeight;
         } else {
-          transferProgress[kind] = { label: label, nodes: makeLogEntry(body, type) };
+          installProgress = { label: label, nodes: makeLogEntry(body, type) };
         }
-        if (msg.done) transferProgress[kind] = null;
+        if (msg.done) installProgress = null;
       }
 
       // ---------------- Formatting ----------------

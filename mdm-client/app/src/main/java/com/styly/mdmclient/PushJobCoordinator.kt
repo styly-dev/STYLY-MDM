@@ -697,7 +697,6 @@ class PushJobCoordinator internal constructor(
                         actor.execute { onTransferComplete(command, received) }
                     },
                     onValidated = { actor.execute { onValidated(command) } },
-                    onApplying = {},
                     beforeApply = { awaitApplyingCheckpoint(command) },
                     onValidationStart = { actor.execute { onValidationStart(command) } },
                 ),
@@ -714,31 +713,18 @@ class PushJobCoordinator internal constructor(
     }
 
     private fun rejectBusy(command: PushProtocol.Command, active: PushProtocol.Command) {
-        if (command.isJobV1) {
-            send(JSONObject().apply {
-                put("type", "PUSH_JOB_REJECTED")
-                put("job_id", command.jobId)
-                put("attempt", command.attempt)
-                put("reason", "device_busy")
-                put("retryable", true)
-                put("active_job", JSONObject().apply {
-                    if (active.jobId != null) put("job_id", active.jobId)
-                    else put("legacy", true)
-                    put("attempt", active.attempt)
-                })
+        send(JSONObject().apply {
+            put("type", "PUSH_JOB_REJECTED")
+            put("job_id", command.jobId)
+            put("attempt", command.attempt)
+            put("reason", "device_busy")
+            put("retryable", true)
+            put("active_job", JSONObject().apply {
+                if (active.jobId != null) put("job_id", active.jobId)
+                else put("legacy", true)
+                put("attempt", active.attempt)
             })
-        } else {
-            // Migration-only compatibility for an old server. This terminal-shaped
-            // response describes the rejected command, not the current active worker.
-            send(PushProtocol.Result(
-                jobId = null,
-                attempt = PushProtocol.ATTEMPT_V1,
-                status = "fail",
-                destPath = command.destPath,
-                failureCode = "device_busy",
-                detail = "Push/Sync already in progress",
-            ).toJson())
-        }
+        })
     }
 
     private fun rejectConflict(command: PushProtocol.Command, detail: String) {
@@ -767,25 +753,14 @@ class PushJobCoordinator internal constructor(
     }
 
     private fun rejectPersistenceUnavailable(command: PushProtocol.Command) {
-        if (command.isJobV1) {
-            send(JSONObject().apply {
-                put("type", "PUSH_JOB_REJECTED")
-                put("job_id", command.jobId)
-                put("attempt", command.attempt)
-                put("reason", "client_persistence_unavailable")
-                put("retryable", false)
-                put("detail", "Device could not save durable Push/Sync state")
-            })
-            return
-        }
-        send(PushProtocol.Result(
-            jobId = null,
-            attempt = PushProtocol.ATTEMPT_V1,
-            status = "fail",
-            destPath = command.destPath,
-            failureCode = "client_persistence_unavailable",
-            detail = "Device could not save durable Push/Sync state",
-        ).toJson())
+        send(JSONObject().apply {
+            put("type", "PUSH_JOB_REJECTED")
+            put("job_id", command.jobId)
+            put("attempt", command.attempt)
+            put("reason", "client_persistence_unavailable")
+            put("retryable", false)
+            put("detail", "Device could not save durable Push/Sync state")
+        })
     }
 
     private fun handleResumeRejected(payload: JSONObject) {
@@ -829,25 +804,15 @@ class PushJobCoordinator internal constructor(
     }
 
     private fun onTransferComplete(command: PushProtocol.Command, received: Long) {
-        if (!command.isJobV1 && !setPhase(command, PushProtocol.PHASE_VALIDATING)) return
-        if (command.isJobV1 && (state.active?.command?.identity != command.identity ||
-            state.active?.phase != PushProtocol.PHASE_VALIDATING)) return
-        if (command.isJobV1) {
-            send(JSONObject().apply {
-                put("type", "PUSH_TRANSFER_COMPLETE")
-                put("job_id", command.jobId)
-                put("attempt", command.attempt)
-                put("artifact_id", command.artifactId)
-                put("received_size", received)
-            })
-        } else {
-            send(JSONObject().apply {
-                put("type", "DOWNLOAD_COMPLETE")
-                put("task", "push")
-                put("dest_path", command.destPath)
-                put("delete_extras", command.deleteExtras)
-            })
-        }
+        if (state.active?.command?.identity != command.identity ||
+            state.active?.phase != PushProtocol.PHASE_VALIDATING) return
+        send(JSONObject().apply {
+            put("type", "PUSH_TRANSFER_COMPLETE")
+            put("job_id", command.jobId)
+            put("attempt", command.attempt)
+            put("artifact_id", command.artifactId)
+            put("received_size", received)
+        })
     }
 
     private fun onValidated(command: PushProtocol.Command) {
