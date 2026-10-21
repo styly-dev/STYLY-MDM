@@ -48,10 +48,14 @@ a retry owner; replacement registration commits that event before exposing its
 new session. The transfer watchdog releases HTTP resources before handing a failed
 DB update to dispatch recovery. Deadline maintenance runs independently of artifact GC.
 Wire messages and SQLite schema 3 remain compatible; the additive device-order
-index is created for existing databases. Android writes `state_version: 1`, reads
-existing unversioned records, and preserves unsupported versions or invalid active
-ownership as unavailable instead of discarding them. The worker waits for a durable
-`applying` checkpoint before changing destination files.
+index is created for existing databases. Android writes `state_version: 2`, reads
+existing unversioned/version-1 records, and preserves unsupported versions or invalid
+active ownership as unavailable instead of discarding them. Interrupted work uses a
+24-hour cumulative powered-on budget with five-minute atomic checkpoints and a best-effort
+normal-shutdown save. Device clock changes do not affect this budget; power-off and
+uncheckpointed time may extend retention. Legacy active work receives one fresh budget
+on migration; version-1 readers preserve version-2 state as unavailable on downgrade.
+The worker waits for a durable `applying` checkpoint before changing destination files.
 
 Before dispatch, upload/preparation failure or expiry settles the job and its
 never-dispatched queued targets in one transaction. Startup recovery also repairs

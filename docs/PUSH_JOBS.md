@@ -222,17 +222,28 @@ Durable state written by that client still loads: its active work, which has no 
 acknowledgements and reconciliation. Historical standalone receipts remain
 readable and replayable; they do not enable new standalone execution.
 
-Interrupted client ownership uses a local deadline whose default is 24 hours,
-measured from the first interruption rather than the start of a long download.
-The coordinator's `interruptedAt` is the only expiration authority. Reauthorization does not reset the first interruption time.
-This persisted timestamp uses device wall-clock time so it survives a reboot.
-Clock corrections can shorten or extend retention; it is not a guaranteed 24-hour
-elapsed-time limit. A rollback cannot trigger immediate expiry. The separate
-60-second download idle deadline uses a monotonic clock. Keep the device clock
-synchronized before creating long-lived interrupted work.
-One replaceable timer checks this deadline, and command acceptance checks it again
-in case the timer is delayed. Failed expiry persistence retains ownership and is
-retried after 60 seconds; successful persistence precedes release and cleanup.
+Interrupted client ownership expires after 24 hours of cumulative device powered-on
+time from the first interruption, including deep sleep. The coordinator stores a
+remaining budget, `Settings.Global.BOOT_COUNT`, and an `elapsedRealtime()` anchor
+in its atomic state file. Within the same boot, elapsed time includes client process
+downtime. A new boot resumes the last saved budget at client startup; power-off time
+and uncheckpointed time from the previous boot are not counted. Device wall-clock
+changes do not affect this budget. Resume consumes the existing budget without
+resetting it; an executing worker is allowed to finish and is not aborted by expiry.
+
+One replaceable actor timer checkpoints a retained budget every five minutes and
+checks interrupted expiry sooner when due. Durable state changes also checkpoint
+the budget. A context-registered `ACTION_SHUTDOWN` receiver makes a bounded final
+save attempt through the same actor before a normal shutdown completes. If the
+client is stopped, the CPU is asleep, storage fails, or power is lost, the last
+checkpoint remains authoritative and retention can extend beyond 24 hours of
+actual powered-on time. Five minutes is the normal checkpoint interval, not a
+hard maximum extension. No wakeup alarm or wake lock is used for retention.
+
+Command acceptance, registration, and reconciliation recheck interrupted expiry
+in case the timer was delayed during sleep. Failed expiry persistence retains
+ownership and is retried after 60 seconds; successful persistence precedes release
+and cleanup. Completed-receipt age and display timestamps still use wall-clock time.
 At expiry the client durably records `resume_expired`,
 releases its local execution gate, removes the exact job-owned work, and replays
 the terminal result when registered. The server remains authoritative for its
@@ -377,8 +388,14 @@ its terminal failure is serialized after any already-running phase save.
 
 ### Durable state recovery
 
-State JSON now carries `state_version: 1`; existing unversioned Issue #91/94
-records remain readable. Earlier readers ignore this extra root property.
+State JSON now carries `state_version: 2`. Existing unversioned and version-1
+Issue #91/94 records remain readable. Their wall-clock interruption timestamp cannot
+recover a reliable monotonic budget, so resumable active work receives one fresh
+24-hour budget during recovery, saved in version 2 before it is exposed. Malformed
+version-2 retention data preserves ownership as unavailable. Version-1 readers that
+honor the version field preserve version-2 state as unavailable on downgrade; restore
+a matching client instead of deleting the state. Historical readers that predate
+version validation are not supported for rollback with retained work.
 Wire-command validation and stored-command decoding share value invariants while
 retaining separate required-field contracts. Only the stored reader accepts
 historical commands without current execution identity.
