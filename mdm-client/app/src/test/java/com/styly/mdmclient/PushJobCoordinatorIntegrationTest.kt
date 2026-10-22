@@ -40,6 +40,7 @@ class PushJobCoordinatorIntegrationTest {
         @Volatile var clockUnavailable = false
         val messages = CopyOnWriteArrayList<JSONObject>()
         val events = CopyOnWriteArrayList<String>()
+        val logs = CopyOnWriteArrayList<Pair<String, Throwable?>>()
         val cleanedDirectories = CopyOnWriteArrayList<File>()
         val workerRuns = AtomicInteger()
         val cleanupCalls = AtomicInteger()
@@ -103,7 +104,7 @@ class PushJobCoordinatorIntegrationTest {
                     ?: { File("/tmp/push-coordinator-${it.identity}") },
                 actor = actor,
                 workerExecutor = workerExecutor,
-                log = { _, _, _ -> },
+                log = { _, message, error -> logs.add(message to error) },
                 retentionClock = {
                     check(!clockUnavailable) { "injected boot count lookup failure" }
                     clock.get()
@@ -226,6 +227,83 @@ class PushJobCoordinatorIntegrationTest {
         assertFalse(registration.getJSONObject("push_state").has("reset"))
         assertEquals(0, harness.discardCalls.get())
         assertEquals(0, harness.workerRuns.get())
+    }
+
+    @Test
+    fun `state load diagnostics never expose exception content in logs or reset registration`() {
+        val sensitiveInput = "https://admin:lease-secret@example.invalid/artifact?token=secret"
+        val cases = listOf(
+            Triple("unreadable", PushStateLoadResult.Unreadable(IOException(sensitiveInput)), false),
+            Triple(
+                "invalid receipts",
+                PushStateLoadResult.InvalidReceipts(
+                    InvalidPushReceiptsException("pending_results", IllegalArgumentException(sensitiveInput)),
+                ),
+                false,
+            ),
+            Triple(
+                "unsupported version",
+                PushStateLoadResult.UnsupportedVersion(UnsupportedPushStateVersionException(sensitiveInput)),
+                false,
+            ),
+            Triple(
+                "invalid active",
+                PushStateLoadResult.InvalidActive(InvalidPushActiveException(IllegalArgumentException(sensitiveInput))),
+                false,
+            ),
+            Triple(
+                "corrupt",
+                PushStateLoadResult.Corrupt(IllegalArgumentException("Invalid durable JSON near $sensitiveInput")),
+                true,
+            ),
+        )
+
+        cases.forEach { (label, loadResult, shouldDiscard) ->
+            val harness = Harness(loadStateOverride = { loadResult })
+            harness.attach()
+
+            val pushState = harness.snapshot().getJSONObject("push_state")
+
+            assertEquals(label, shouldDiscard, harness.discardCalls.get() == 1)
+            assertTrue(label, harness.logs.isNotEmpty())
+            assertTrue(label, harness.logs.all { (message, error) ->
+                error == null && !message.contains(sensitiveInput)
+            })
+            if (shouldDiscard) {
+                val reset = pushState.getJSONObject("reset")
+                assertEquals(label, "corrupt_state_discarded", reset.getString("reason"))
+                assertEquals(
+                    label,
+                    "Stored Push/Sync state was reset because its contents were invalid.",
+                    reset.getString("detail"),
+                )
+                assertTrue(label, harness.logs.any {
+                    it.first == "Discarding unparseable durable Push/Sync state" && it.second == null
+                })
+            } else {
+                assertEquals(label, "unavailable", pushState.getString("status"))
+                assertFalse(label, pushState.has("reset"))
+            }
+        }
+    }
+
+    @Test
+    fun `unexpected state load exception does not expose its message or cause`() {
+        val sensitiveInput = "https://example.invalid/artifact?lease=secret"
+        val harness = Harness(loadStateOverride = {
+            throw IllegalStateException(sensitiveInput, IOException(sensitiveInput))
+        })
+        harness.attach()
+
+        val pushState = harness.snapshot().getJSONObject("push_state")
+
+        assertEquals("unavailable", pushState.getString("status"))
+        assertFalse(pushState.has("reset"))
+        assertEquals(0, harness.discardCalls.get())
+        assertTrue(harness.logs.any { it.first == "Could not load durable Push/Sync state" })
+        assertTrue(harness.logs.all { (message, error) ->
+            error == null && !message.contains(sensitiveInput)
+        })
     }
 
     @Test

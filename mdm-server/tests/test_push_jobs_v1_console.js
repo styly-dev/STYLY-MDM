@@ -1481,10 +1481,10 @@ test('inline actions send only the selected device while Resume all targets elig
   });
 });
 
-test('never-dispatched paused device is excluded from Cancel and Cancel all', () => {
-  const { socket, ...h } = openConsole();
+test('never-dispatched paused device follows server Cancel permission without resume support', () => {
+  const { socket, ...h } = openConsole({ isDeviceOnline: () => false });
   const job = snapshot('never-dispatched', 1, 'D1', 'queued', 1, {
-    dispatchRevision: null, resumeRequired: true,
+    dispatchRevision: null, resumeSupported: false, resumeRequired: true,
   });
   job.devices.D1.queue_reason = 'dispatch_paused';
   socket.snapshot(job);
@@ -1493,6 +1493,22 @@ test('never-dispatched paused device is excluded from Cancel and Cancel all', ()
   assert.equal(api.sendDeviceAction('D1', job.job_id, 'cancel'), false);
   assert.equal(findElementByText(h.pushJobsTabActions, 'Cancel all').disabled, true);
   assert.equal(socket.sent.length, 0);
+
+  // The server can prove no command was sent, even while the target is offline.
+  job.revision++;
+  job.devices.D1.cancellable = true;
+  socket.update(job);
+  assert.equal(api.assignmentFor('D1').canResume, false);
+  assert.equal(api.assignmentFor('D1').canCancel, true);
+  assert.equal(api.sendDeviceAction('D1', job.job_id, 'cancel'), true);
+  assert.deepEqual(socket.sent.at(-1), {
+    type: 'CANCEL_PUSH_JOB', job_id: job.job_id, target_devices: ['D1'],
+  });
+  socket.emit({ type: 'PUSH_JOB_ACTION_SENT', job_id: job.job_id, action: 'CANCEL_PUSH_JOB' });
+  findElementByText(h.pushJobsTabActions, 'Cancel all').click();
+  assert.deepEqual(socket.sent.at(-1), {
+    type: 'CANCEL_PUSH_JOB', job_id: job.job_id, target_devices: ['D1'],
+  });
 });
 
 test('non-resumable dispatch never exposes Cancel', () => {

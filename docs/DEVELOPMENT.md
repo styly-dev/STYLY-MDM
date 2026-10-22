@@ -48,7 +48,9 @@ Lifecycle events (disconnect, acceptance, and transfer/apply progress) validate
 and commit their related fields in Manager operations. A failed disconnect retains
 a retry owner; replacement registration commits that event before exposing its
 new session. The transfer watchdog releases HTTP resources before handing a failed
-DB update to dispatch recovery. Deadline maintenance runs independently of artifact GC.
+DB update to dispatch recovery. The scheduler keeps one dispatch task per device,
+including slot waits; disconnect and Resume cannot create a second task for that
+same device before the first exits. Deadline maintenance runs independently of artifact GC.
 Wire messages and SQLite schema 3 remain compatible; the additive device-order
 index is created for existing databases. Android writes `state_version: 2`, reads
 existing unversioned/version-1 records, and preserves unsupported versions or invalid
@@ -65,6 +67,11 @@ older failed/interrupted jobs whose targets were left queued, preserving their
 original terminal history. Dispatch evidence and exact fences exclude a job from
 this repair. Retry requires a published, retained artifact that is not known to
 be missing; the Retry endpoint still checks the physical bytes before creating work.
+Replaying a Retry request UUID returns the existing job without changing its dispatch
+permission or manual waits. If creation committed before initial dispatch failed,
+the existing ready job can be explicitly dispatched without creating another Retry.
+Restart-paused, never-dispatched targets can be cancelled entirely on the server,
+even offline; dispatched targets still require exact client cleanup evidence.
 
 Issue #94 adds resumable transfers, per-device Resume and Cancel controls, and
 retry of failed targets. See [Push / Sync jobs](PUSH_JOBS.md) for the recovery
@@ -82,7 +89,9 @@ Untyped server errors remain visible without clearing an unrelated pending actio
 
 Client WebSocket diagnostic logs record bounded message types, not message
 payloads or parser exception text, because commands contain temporary artifact
-lease credentials. Registration acknowledgements and admin device-list updates
+lease credentials. Durable Push-state load failures also use fixed diagnostic messages
+without exception text or causes; corrupt-state reset notices sent to the server and
+admin use fixed detail text. Registration acknowledgements and admin device-list updates
 are separate events; integration tests wait for the expected snapshot contents
 with one bounded deadline. See [Push/Sync validation](PUSH_VALIDATION.md).
 
@@ -772,8 +781,8 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 >
 > **Excluded from every bundle.** A folder pick drags along whatever the OS left in it —
 > a `.DS_Store` per directory, an `._name` AppleDouble sidecar per file once the folder has
-> been through a USB stick, `Thumbs.db`, `desktop.ini`. `is_excluded_bundle_entry` drops
-> these in `upload_bundle_handler`, before anything is written to staging, so they never
+> been through a USB stick, `Thumbs.db`, `desktop.ini`. `PushRuntime.upload_handler`
+> drops these via `is_os_metadata` before anything is written to staging, so they never
 > reach the zip, never count against `MAX_BUNDLE_ENTRIES`, and never land on a device.
 > Matching is case-insensitive and applies to *any* path segment, so an excluded directory
 > (`.Spotlight-V100`, `__MACOSX`, `$RECYCLE.BIN`, `.Trash-1000`) takes its contents with it.
