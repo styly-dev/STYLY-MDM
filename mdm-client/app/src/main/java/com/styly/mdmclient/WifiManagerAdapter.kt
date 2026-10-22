@@ -54,6 +54,10 @@ internal fun wifiRecoveryAutoJoinTargets(
     return expected
 }
 
+internal fun supportsWifiSettingsPlatform(): Boolean =
+    Build.MODEL in setOf("A9210", "A94U0") &&
+        Build.MANUFACTURER.equals("Pico", ignoreCase = true) && Build.VERSION.SDK_INT >= 34
+
 internal class WifiAdapterFailure(val reason: WifiReason) : Exception()
 
 internal interface WifiSettingsAdapter {
@@ -242,11 +246,16 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         return if (result?.getInt("key_result_code", -1) == 0) WifiReason.NONE else WifiReason.UPDATE_FAILED
     }
 
+    fun readinessFailure(): WifiReason? = try {
+        requireAuthority()
+        if (manager == null || ToBServiceHelper.getInstance().serviceBinder == null) WifiReason.UNSUPPORTED else null
+    } catch (failure: WifiAdapterFailure) {
+        failure.reason
+    }
+
     private fun requireAuthority() {
         // PUI exposes A94U0 to application processes and A9210 through ADB on this device.
-        if (Build.MODEL !in setOf("A9210", "A94U0") ||
-            !Build.MANUFACTURER.equals("Pico", ignoreCase = true) || Build.VERSION.SDK_INT < 34
-        ) throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
+        if (!supportsWifiSettingsPlatform()) throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
         if (appContext.checkSelfPermission("android.permission.ACCESS_FINE_LOCATION") != PackageManager.PERMISSION_GRANTED ||
             appContext.checkSelfPermission("android.permission.ACCESS_BACKGROUND_LOCATION") != PackageManager.PERMISSION_GRANTED
         ) {

@@ -89,14 +89,19 @@ credentials; unknown overwritten passwords cannot be recovered. Precise location
 must be allowed all the time for background recovery on the tested PUI build. Interrupted work
 uses a durable journal. The successful policy is reapplied once per OS boot,
 unless explicitly deployed unmanaged. The server only sends to frozen online
-targets and returns transient delivery counts, without result ACKs or history.
+targets and returns transient delivery counts. Secret-free REGISTER/WIFI_STATE
+reports retain the latest device policy/result and receipt time for the console;
+there is no automatic replay. Unchanged verified policies avoid reconnecting.
+Content startup proceeds after Wi-Fi recovery completes or a 60-second maximum.
 
-Encrypted policies share `device_registry.json` with group metadata. HTTP-only
+Plaintext policies share `device_registry.json` with group metadata (private file
+mode; backups also contain passwords). Unreadable old encrypted profiles disable
+only Wi-Fi management; their data is retained for optional one-time migration.
+Group overlaps are allowed and warned about in the console, never auto-removed. HTTP-only
 managed-LAN operation has no authentication. The console discards unsaved edits
 on navigation. The sole current wire capability is `wifi_settings_v4`; earlier
 unpublished state/protocol formats are unsupported. See [WIFI_SETTINGS.md](WIFI_SETTINGS.md)
-for setup, ownership, persistence and the credential-restoration boundary, and
-the [hardware report](../tasks/wifi-hardware-validation-2026-10-20.md) for verification.
+for setup, ownership, persistence and the credential-restoration boundary.
 
 ## Building the MDM Client
 

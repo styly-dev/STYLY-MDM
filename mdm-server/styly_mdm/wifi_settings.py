@@ -1,4 +1,4 @@
-"""Validation and encrypted persistence for Wi-Fi profiles."""
+"""Validation and registry persistence for Wi-Fi profiles."""
 
 from __future__ import annotations
 
@@ -7,9 +7,6 @@ import json
 import uuid
 from contextlib import contextmanager
 from typing import Any, Callable
-
-from cryptography.fernet import Fernet, InvalidToken
-
 
 MAX_WIFI_NETWORKS = 32
 MAX_SSID_BYTES = 32
@@ -24,7 +21,7 @@ class WiFiSettingsError(ValueError):
 
 
 class WiFiStoreError(RuntimeError):
-    """The encrypted state could not be safely read or persisted."""
+    """The saved state could not be safely read or persisted."""
 
 
 def normalize_revision(value: Any) -> str | None:
@@ -35,6 +32,44 @@ def normalize_revision(value: Any) -> str | None:
         return value if parsed.version == 4 and str(parsed) == value else None
     except (ValueError, AttributeError):
         return None
+
+
+WIFI_REASONS = {
+    "NONE", "PERMISSION_DENIED", "UNSUPPORTED", "CONFIG_READ_FAILED",
+    "UPDATE_FAILED", "VERIFY_FAILED", "TIMEOUT_ROLLED_BACK", "RESTORE_FAILED",
+    "BUSY", "UNREACHABLE", "UNKNOWN",
+}
+
+
+def public_wifi_state(raw: Any) -> dict | None:
+    """Accept only secret-free device telemetry; never forward arbitrary fields."""
+    if not isinstance(raw, dict):
+        return None
+    if (type(raw.get("busy")) is not bool or type(raw.get("available")) is not bool or
+        (raw.get("managed") is not None and type(raw["managed"]) is not bool)):
+        return None
+    revision = raw.get("policy_revision")
+    if revision is not None and normalize_revision(revision) is None:
+        return None
+    result = raw.get("last_result")
+    if result is not None:
+        if (not isinstance(result, dict) or
+            normalize_revision(result.get("operation_id")) is None or
+            normalize_revision(result.get("revision")) is None or
+            result.get("status") not in ("success", "failed", "unknown") or
+            result.get("reason") not in tuple(WIFI_REASONS) or
+            type(result.get("rolled_back")) is not bool):
+            return None
+        result = {key: result[key] for key in (
+            "operation_id", "revision", "status", "reason", "rolled_back",
+        )}
+    reason = raw.get("unavailable_reason")
+    if reason is not None and reason not in tuple(WIFI_REASONS | {"INITIALIZING", "STORAGE_ERROR"}):
+        return None
+    return {
+        "managed": raw.get("managed"), "policy_revision": revision, "last_result": result,
+        "busy": raw["busy"], "available": raw["available"], "unavailable_reason": reason,
+    }
 
 
 def validate_profile_networks(
@@ -122,64 +157,58 @@ def public_networks(networks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def decrypt_legacy_wifi_profiles(encrypted_state: str, key: str | None) -> dict:
+    """Read the former prototype format only when its optional dependency is present."""
+    if not key or not isinstance(encrypted_state, str):
+        raise WiFiStoreError("saved encrypted Wi-Fi profiles require their original key")
+    try:
+        from cryptography.fernet import Fernet, InvalidToken
+    except ImportError:
+        raise WiFiStoreError("install cryptography once to migrate encrypted Wi-Fi profiles") from None
+    try:
+        return json.loads(Fernet(key.encode("ascii")).decrypt(encrypted_state.encode("ascii")))
+    except (InvalidToken, ValueError, TypeError, UnicodeError):
+        raise WiFiStoreError("saved encrypted Wi-Fi profiles could not be read") from None
+
+
 class WiFiSettingsStore:
-    """Encrypted profiles persisted with the device registry in one atomic file."""
+    """Profiles persisted with group metadata in one atomic registry replacement."""
 
     def __init__(
         self,
-        encryption_key: str | bytes,
-        encrypted_state: str | None = None,
-        persist: Callable[[str], None] | None = None,
+        state: dict | None = None,
+        persist: Callable[[dict], None] | None = None,
     ):
-        if isinstance(encryption_key, str):
-            try:
-                encryption_key = encryption_key.encode("ascii", errors="strict")
-            except UnicodeEncodeError:
-                raise WiFiStoreError("invalid encryption key") from None
-        try:
-            self._fernet = Fernet(encryption_key)
-        except (TypeError, ValueError):
-            raise WiFiStoreError("invalid encryption key") from None
-        self._persist = persist or (lambda _encrypted: None)
-        self.state: dict[str, Any] = {"version": 1, "profiles": {}}
-        if encrypted_state is not None:
-            self._load(encrypted_state)
-
-    def _load(self, encrypted_state: str) -> None:
-        try:
-            parsed = json.loads(self._fernet.decrypt(encrypted_state.encode("ascii")))
-        except (InvalidToken, UnicodeEncodeError, json.JSONDecodeError, UnicodeDecodeError):
-            raise WiFiStoreError("encrypted Wi-Fi state failed validation") from None
+        self._persist = persist or (lambda _state: None)
+        if state is None:
+            state = {"version": 1, "profiles": {}}
         if (
-            not isinstance(parsed, dict)
-            or type(parsed.get("version")) is not int
-            or parsed["version"] != 1
-            or not isinstance(parsed.get("profiles"), dict)
+            not isinstance(state, dict)
+            or type(state.get("version")) is not int
+            or state["version"] != 1
+            or not isinstance(state.get("profiles"), dict)
         ):
-            raise WiFiStoreError("encrypted Wi-Fi state has an unsupported format")
-        self.state = parsed
-        for profile in self.state["profiles"].values():
-            if not isinstance(profile, dict):
-                raise WiFiStoreError("encrypted Wi-Fi profile failed validation")
+            raise WiFiStoreError("Wi-Fi state has an unsupported format")
+        self.state = copy.deepcopy(state)
+        for name, profile in self.state["profiles"].items():
+            if not isinstance(name, str) or not name or not isinstance(profile, dict):
+                raise WiFiStoreError("Wi-Fi profile failed validation")
             mode = profile.get("mode")
             networks = profile.get("networks")
-            if (
-                not isinstance(mode, str)
-                or mode not in {"managed", "unmanaged"}
-                or not isinstance(networks, list)
-                or (mode == "managed" and not networks)
-                or (mode == "unmanaged" and networks)
-            ):
-                raise WiFiStoreError("encrypted Wi-Fi profile failed validation")
-
-    def encrypted_state(self) -> str:
-        payload = json.dumps(
-            self.state, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
-        ).encode("utf-8")
-        return self._fernet.encrypt(payload).decode("ascii")
+            if (mode not in ("managed", "unmanaged") or
+                not isinstance(networks, list) or
+                normalize_revision(profile.get("revision")) is None or
+                (mode == "managed" and not networks) or
+                (mode == "unmanaged" and networks)):
+                raise WiFiStoreError("Wi-Fi profile failed validation")
+            try:
+                if mode == "managed":
+                    validate_profile_networks(networks)
+            except WiFiSettingsError:
+                raise WiFiStoreError("Wi-Fi profile failed validation") from None
 
     def persist(self) -> None:
-        self._persist(self.encrypted_state())
+        self._persist(copy.deepcopy(self.state))
 
     @contextmanager
     def _transaction(self):

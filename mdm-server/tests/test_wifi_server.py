@@ -9,7 +9,6 @@ import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 import pytest
-from cryptography.fernet import Fernet
 
 from styly_mdm import server
 from styly_mdm.wifi_settings import WiFiSettingsStore, validate_profile_networks
@@ -39,18 +38,18 @@ def _networks(password="office-secret"):
     }])
 
 
-def _make_app(tmp_path, members, key):
+def _make_app(tmp_path, members):
     server._apply_data_dir(str(tmp_path))
     server.device_registry.clear()
     server.device_groups.clear()
     server.device_groups["Studio"] = list(members)
     server.devices.clear()
     server._wifi_profiles_encrypted = None
-    store = WiFiSettingsStore(key, persist=server._persist_wifi_profiles)
+    server._wifi_profiles = None
+    store = WiFiSettingsStore(persist=server._persist_wifi_profiles)
     app = web.Application()
     app["wifi_enabled"] = True
     app["wifi_store"] = store
-    app["wifi_lock"] = asyncio.Lock()
     app["wifi_send_locks"] = {}
     app.router.add_get("/api/wifi/state", server.wifi_state_handler)
     app.router.add_route("GET", "/api/wifi/groups/{name}", server.wifi_group_handler)
@@ -66,7 +65,7 @@ def _connect(device_id, socket, capability):
         "ws": socket,
         "status": "online",
         "identity_kind": "canonical",
-        "wifi_settings_v4": capability,
+        "capabilities": ["wifi_settings_v4"] if capability else [],
     }
 
 
@@ -77,20 +76,19 @@ def test_registration_advertises_new_wifi_capability_only():
         "capabilities": ["wifi_settings_v4"],
     }, "127.0.0.1")
     assert kind == "canonical"
-    assert registered["wifi_settings_v4"] is True
+    assert "wifi_settings_v4" in registered["capabilities"]
 
     _, old = server._parse_registration({
         "identity_scheme": server.IDENTITY_SCHEME,
         "device_id": DEVICE_OLD,
         "capabilities": ["wifi_settings_v3"],
     }, "127.0.0.1")
-    assert old["wifi_settings_v4"] is False
+    assert "wifi_settings_v4" not in old["capabilities"]
 
 
 def test_http_save_is_unauthenticated_and_delete_sends_only_after_explicit_deploy(tmp_path):
     async def body():
-        key = Fernet.generate_key()
-        app, store = _make_app(tmp_path, [DEVICE_V4], key)
+        app, store = _make_app(tmp_path, [DEVICE_V4])
         socket = _Socket()
         _connect(DEVICE_V4, socket, True)
         profile = store.put_profile("Studio", _networks())
@@ -105,7 +103,7 @@ def test_http_save_is_unauthenticated_and_delete_sends_only_after_explicit_deplo
                 state = await response.json()
                 assert "devices" not in state
                 assert "allow_http" not in state
-                assert state["groups"]["Studio"]["revision"] == profile["revision"]
+                assert state == {"enabled": True}
 
             async with session.delete(
                 base + "/api/wifi/groups/Studio",
@@ -143,8 +141,7 @@ def test_http_save_is_unauthenticated_and_delete_sends_only_after_explicit_deplo
 
 def test_deploy_freezes_online_targets_and_keeps_outcomes_only_in_response(tmp_path):
     async def body():
-        key = Fernet.generate_key()
-        app, store = _make_app(tmp_path, [DEVICE_V4, DEVICE_OLD, DEVICE_FAIL, "offline-device"], key)
+        app, store = _make_app(tmp_path, [DEVICE_V4, DEVICE_OLD, DEVICE_FAIL, "offline-device"])
         capable = _Socket()
         old = _Socket()
         broken = _Socket(fail=True)
@@ -173,8 +170,7 @@ def test_deploy_freezes_online_targets_and_keeps_outcomes_only_in_response(tmp_p
             assert old.messages == []
             with open(server.REGISTRY_PATH, encoding="utf-8") as handle:
                 registry = json.load(handle)
-            encrypted = registry["wifi_profiles_encrypted"]
-            saved = WiFiSettingsStore(key, encrypted)
+            saved = WiFiSettingsStore(registry["wifi_profiles"])
             assert saved.state == store.state
             assert "devices" not in saved.state
         await test_server.close()
@@ -184,7 +180,7 @@ def test_deploy_freezes_online_targets_and_keeps_outcomes_only_in_response(tmp_p
 
 def test_profile_revision_conflict_and_origin_check(tmp_path):
     async def body():
-        app, store = _make_app(tmp_path, [], Fernet.generate_key())
+        app, store = _make_app(tmp_path, [])
         profile = store.put_profile("Studio", _networks())
         test_server = TestServer(app)
         await test_server.start_server()
@@ -210,5 +206,67 @@ def test_profile_revision_conflict_and_origin_check(tmp_path):
                 assert response.status == 409
             assert store.profile("Studio")["revision"] == saved["revision"]
         await test_server.close()
+
+    asyncio.run(body())
+
+
+def test_device_wifi_reports_survive_reconnect_and_reject_stale_socket(tmp_path):
+    async def receive_type(ws, kind):
+        while True:
+            frame = await asyncio.wait_for(ws.receive_json(), 2)
+            if frame.get("type") == kind:
+                return frame
+
+    async def receive_device_list(ws, predicate):
+        async def wait_for_match():
+            while True:
+                rows = (await receive_type(ws, "DEVICE_LIST"))["devices"]
+                if rows and predicate(rows[0]):
+                    return rows
+        return await asyncio.wait_for(wait_for_match(), 2)
+
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        server.devices.clear()
+        server.admin_connections.clear()
+        test_server = TestServer(server.create_app())
+        await test_server.start_server()
+        base = str(test_server.make_url("/")).rstrip("/")
+        revision = "44444444-4444-4444-8444-444444444444"
+        state = {"managed": True, "policy_revision": revision, "last_result": None,
+                 "busy": False, "available": True, "unavailable_reason": None}
+        registration = {"type": "REGISTER", "identity_scheme": server.IDENTITY_SCHEME,
+                        "device_id": DEVICE_V4, "capabilities": ["wifi_settings_v4"],
+                        "wifi_state": state}
+        async with aiohttp.ClientSession() as session:
+            old = await session.ws_connect(base + "/ws/device")
+            await old.send_json(registration)
+            await receive_type(old, "REGISTERED")
+            admin = await session.ws_connect(base + "/ws/admin")
+            rows = (await receive_type(admin, "DEVICE_LIST"))["devices"]
+            assert rows[0]["wifi_state"] == state
+            live = await session.ws_connect(base + "/ws/device")
+            await live.send_json(registration)
+            await receive_type(live, "REGISTERED")
+            await receive_type(admin, "DEVICE_LIST")
+            failed = {**state, "last_result": {"operation_id": DEVICE_OLD, "revision": revision,
+                      "status": "failed", "reason": "PERMISSION_DENIED", "rolled_back": False}}
+            await old.send_json({"type": "WIFI_STATE", "wifi_state": {**state, "managed": False}})
+            await live.send_json({"type": "WIFI_STATE", "wifi_state": failed})
+            rows = await receive_device_list(admin, lambda row: row["wifi_state"] == failed)
+            assert rows[0]["wifi_state"] == failed
+            assert rows[0]["wifi_state_updated_at"] > 0
+            await live.send_json({"type": "WIFI_STATE", "wifi_state": {"password": "secret"}})
+            await live.send_json({"type": "BATTERY_UPDATE", "level": 55, "charging": False})
+            rows = await receive_device_list(admin, lambda row: (row.get("battery") or {}).get("level") == 55)
+            assert rows[0]["wifi_state"] == failed
+            assert "secret" not in json.dumps(rows)
+            await old.close()
+            await live.close()
+            await admin.close()
+        await test_server.close()
+        server.load_registry()
+        assert server.device_registry[DEVICE_V4]["wifi_state"] == failed
+        assert server.device_registry[DEVICE_V4]["wifi_state_updated_at"] > 0
 
     asyncio.run(body())

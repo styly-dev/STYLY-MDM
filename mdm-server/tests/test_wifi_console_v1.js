@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const test = require('node:test');
 
 const wifi = require('../styly_mdm/static/wifi-console-v1.js');
@@ -37,15 +38,17 @@ class FakeElement {
     this.disabled = false;
     this.hidden = false;
     this.innerHTML = '';
+    this.innerHTMLWrites = 0;
     this.transient = { textContent: '', style: {} };
     this.stale = { style: {} };
+    this.results = { innerHTML: '' };
     this.meta = { textContent: '' };
     this.passwordInput = null;
     this.actionButtons = {};
     this.secretHelp = { textContent: '' };
   }
 
-  set innerHTML(value) { this._innerHTML = value; }
+  set innerHTML(value) { this._innerHTML = value; this.innerHTMLWrites++; }
   get innerHTML() { return this._innerHTML; }
 
   addEventListener(type, listener) {
@@ -61,6 +64,7 @@ class FakeElement {
   querySelector(selector) {
     if (selector === '[data-wifi-transient]') return this.transient;
     if (selector === '[data-wifi-stale]') return this.stale;
+    if (selector === '[data-wifi-results]') return this.results;
     if (selector.includes('data-wifi-field="password"')) return this.passwordInput;
     if (selector === '.wifi-action-right .wifi-meta') return this.meta;
     if (selector === 'article[data-wifi-row="wifi-0"] small') return this.secretHelp;
@@ -89,7 +93,7 @@ async function tick() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
-function withController(fetchHandler, confirmApply = () => true) {
+function withController(fetchHandler, confirmApply = () => true, initialState = {}) {
   const previous = { fetch: global.fetch, confirm: global.confirm };
   global.confirm = () => true;
   global.fetch = fetchHandler;
@@ -102,7 +106,13 @@ function withController(fetchHandler, confirmApply = () => true) {
   const password = new FakeInput('password');
   groupPanel.passwordInput = password;
   groupPanel.controls = [password];
-  const controller = wifi.createController({ statusPanel, groupPanel, confirmApply });
+  const controller = wifi.createController({
+    statusPanel,
+    groupPanel,
+    confirmApply,
+    getDevices: () => initialState.devices || [],
+    getGroups: () => initialState.groups || {},
+  });
   return {
     statusPanel, groupPanel, password, controller,
     restore() {
@@ -119,7 +129,7 @@ test('HTTP console saves without login and does not require a transport opt-in',
   const requests = [];
   const harness = withController(async (url, init = {}) => {
     requests.push({ url, init });
-    if (url === '/api/wifi/state') return response({ enabled: true, groups: { Lab: { revision: 'r1' } } });
+    if (url === '/api/wifi/state') return response({ enabled: true });
     if (url === '/api/wifi/groups/Lab' && init.method === 'PUT') {
       writes++;
       return response({ revision: 'r2', mode: 'managed', networks: [] });
@@ -149,9 +159,7 @@ test('HTTP console saves without login and does not require a transport opt-in',
 test('unsaved edits are discarded when switching groups and are fetched again on return', async () => {
   const reads = { Lab: 0, Other: 0 };
   const harness = withController(async (url) => {
-    if (url === '/api/wifi/state') return response({ enabled: true, groups: {
-      Lab: { revision: 'r1' }, Other: { revision: 'r2' },
-    } });
+    if (url === '/api/wifi/state') return response({ enabled: true });
     const name = decodeURIComponent(url.split('/').pop());
     reads[name]++;
     return response({ revision: name === 'Lab' ? 'r1' : 'r2', mode: 'managed', networks: [
@@ -216,8 +224,9 @@ test('deleting the server policy leaves device settings alone until unmanaged is
     await tick();
     assert.equal(requests.length, 2);
     assert.equal(requests[1].url, '/api/wifi/groups/Lab/deploy');
-    assert.deepEqual(requests[1].body, { expected_revision: 'r2', mode: 'unmanaged' });
-    assert.match(harness.statusPanel.innerHTML, /1 sent, 0 failed, 0 unconfirmed/);
+    assert.deepEqual(requests[1].body, { expected_revision: 'r2' });
+    assert.match(harness.statusPanel.innerHTML, /Server dispatch result/);
+    assert.match(harness.statusPanel.innerHTML, /1 command\(s\) sent, 0 failed to send, 0 unconfirmed/);
   } finally { harness.restore(); }
 });
 
@@ -228,7 +237,7 @@ test('managed deployment sends only the saved profile and reports this response 
   const harness = withController(async (url, init = {}) => {
     if (url === '/api/wifi/state') {
       stateReads++;
-      return response({ enabled: true, groups: { Lab: { revision: 'r1', mode: 'managed' } } });
+      return response({ enabled: true });
     }
     if (url === '/api/wifi/groups/Lab') return response({ revision: 'r1', mode: 'managed', networks: [
       { ssid: 'Office', security: 'WPA_PSK', password_present: true },
@@ -247,14 +256,16 @@ test('managed deployment sends only the saved profile and reports this response 
     await tick();
     harness.groupPanel.dispatch('click', { target: { closest: () => ({ dataset: { wifiAction: 'apply' } }) } });
     await tick();
-    assert.deepEqual(post.body, { expected_revision: 'r1', mode: 'managed' });
+    assert.deepEqual(post.body, { expected_revision: 'r1' });
     assert.equal(post.headers.Authorization, undefined);
     assert.match(confirmation, /auto-connect enabled/);
     assert.match(confirmation, /No saved networks are deleted/);
     assert.match(confirmation, /only when it holds that password/);
-    assert.match(harness.statusPanel.innerHTML, /1 sent, 1 failed, 0 unconfirmed/);
+    assert.match(harness.statusPanel.innerHTML, /1 command\(s\) sent, 1 failed to send, 0 unconfirmed/);
     assert.equal(stateReads, 1);
-    assert.doesNotMatch(harness.groupPanel.innerHTML, /Delivery status|Boot:|Device results/);
+    assert.match(harness.groupPanel.innerHTML, /Device status/);
+    assert.match(harness.groupPanel.innerHTML, /Application results are reported by each device/);
+    assert.ok(harness.groupPanel.innerHTML.indexOf('data-wifi-action="apply"') < harness.groupPanel.innerHTML.indexOf('data-wifi-results'));
   } finally { harness.restore(); }
 });
 
@@ -262,7 +273,7 @@ test('saving freezes the submitted draft until the request completes', async () 
   let finishSave;
   let submitted;
   const harness = withController(async (url, init = {}) => {
-    if (url === '/api/wifi/state') return response({ enabled: true, groups: { Lab: { revision: 'r1' } } });
+    if (url === '/api/wifi/state') return response({ enabled: true });
     if (url === '/api/wifi/groups/Lab' && init.method === 'PUT') {
       submitted = JSON.parse(init.body);
       return new Promise((resolve) => { finishSave = () => resolve(response({ revision: 'r2', mode: 'managed' })); });
@@ -293,9 +304,7 @@ test('saving freezes the submitted draft until the request completes', async () 
 test('a late profile response for a previous group cannot replace the active group', async () => {
   let finishLab;
   const harness = withController(async (url) => {
-    if (url === '/api/wifi/state') return response({ enabled: true, groups: {
-      Lab: { revision: 'r1' }, Other: { revision: 'r2' },
-    } });
+    if (url === '/api/wifi/state') return response({ enabled: true });
     if (url.endsWith('/Lab')) return new Promise((resolve) => {
       finishLab = () => resolve(response({ revision: 'r1', mode: 'managed', networks: [
         { ssid: 'Late Lab', security: 'OPEN' },
@@ -322,7 +331,7 @@ test('a 409 save locks the stale draft until the user explicitly reloads', async
   let profileReads = 0;
   let writes = 0;
   const harness = withController(async (url, init = {}) => {
-    if (url === '/api/wifi/state') return response({ enabled: true, groups: { Lab: { revision: 'r1' } } });
+    if (url === '/api/wifi/state') return response({ enabled: true });
     if (init.method === 'PUT') { writes++; return response({ error: 'conflict' }, 409); }
     profileReads++;
     return response({ revision: profileReads === 1 ? 'r1' : 'r2', mode: 'managed', networks: [
@@ -354,7 +363,7 @@ test('security and network entry controls retain the existing masked style and s
   const previousCss = global.CSS;
   global.CSS = { supports: () => true };
   const harness = withController(async (url) => url === '/api/wifi/state'
-    ? response({ enabled: true, groups: { Lab: { revision: 'r1' } } })
+    ? response({ enabled: true })
     : response({ revision: 'r1', mode: 'managed', networks: [{ ssid: 'Office', security: 'WPA_PSK', password_present: true }] }));
   try {
     await tick();
@@ -376,15 +385,129 @@ test('security and network entry controls retain the existing masked style and s
 });
 
 
-test('membership checks remain available to the existing Devices editor', () => {
-  assert.equal(wifi.membershipConflict('device', 'B', { A: ['serial'], B: [] }, ['serial']), 'A');
-  assert.equal(wifi.membershipConflict('device', 'A', { A: ['device'] }), null);
+test('membership overlap warnings match canonical Device IDs and legacy serial aliases', () => {
+  assert.deepEqual(wifi.membershipGroups('device', { Alpha: ['serial'], Beta: ['device'] }, ['serial']), ['Alpha', 'Beta']);
+  assert.deepEqual(wifi.groupMembershipOverlaps('Alpha', {
+    Alpha: ['device'], Beta: ['legacy-serial'], Gamma: ['other'],
+  }, [{ device_id: 'device', serial_number: 'legacy-serial' }]), [
+    { deviceId: 'device', otherGroups: ['Beta'] },
+  ]);
+});
+
+test('group membership can be saved with overlapping devices', () => {
+  const index = fs.readFileSync(require.resolve('../styly_mdm/static/index.html'), 'utf8');
+  assert.doesNotMatch(index, /wifi-member-locked|Cannot save membership/);
+  assert.match(index, /sendSetGroupMembers\(manageSelectedGroup, Array\.from\(manageMembers\)\)/);
+  assert.match(index, /Also in:/);
+  assert.match(index, /also in ' \+ esc\(overlapNames\.join\(', '\)\)/);
+  assert.match(index, /Policies are not resent automatically/);
+  assert.match(index, /group-overlap-note/);
+  assert.doesNotMatch(index, /badge-overlap/);
+  assert.doesNotMatch(index, /data-wifi-overlap/);
+});
+
+test('device result summary compares applied state with saved revision independently from latest operation', () => {
+  const device = {
+    status: 'online',
+    wifi_state: {
+      managed: true,
+      policy_revision: 'revision-old',
+      last_result: { operation_id: 'op-1', revision: 'revision-old', status: 'success', reason: '', rolled_back: false },
+      busy: false,
+      available: true,
+      unavailable_reason: null,
+    },
+  };
+  assert.equal(wifi.wifiResultSummary(device, 'revision-current', true).state, 'stale');
+  assert.equal(wifi.wifiResultSummary(device, 'revision-current', true).label, 'Revision mismatch');
+  device.wifi_state.policy_revision = 'revision-current';
+  device.wifi_state.last_result = { operation_id: 'op-2', revision: 'revision-other', status: 'failed', reason: 'PERMISSION_DENIED', rolled_back: true };
+  const appliedWithLaterFailure = wifi.wifiResultSummary(device, 'revision-current', true);
+  assert.equal(appliedWithLaterFailure.state, 'success');
+  assert.equal(appliedWithLaterFailure.label, 'Applied');
+  assert.equal(appliedWithLaterFailure.latestResult.state, 'failed');
+  assert.match(appliedWithLaterFailure.latestResult.detail, /revision-other/);
+  device.wifi_state.managed = false;
+  assert.equal(wifi.wifiResultSummary(device, 'revision-current', true).state, 'stale');
+  assert.equal(wifi.wifiResultSummary(device, 'revision-current', false).state, 'success');
+});
+
+test('device result summary distinguishes recovery block, applying, busy rejection, permission failure, unavailable, offline, and unknown', () => {
+  const device = { status: 'online', wifi_state: { managed: true, policy_revision: 'r1', busy: true, available: true } };
+  device.wifi_state.last_result = { operation_id: 'restore', revision: 'r2', status: 'failed', reason: 'RESTORE_FAILED', rolled_back: false };
+  const recoveryFailed = wifi.wifiResultSummary(device, 'r1', true);
+  assert.equal(recoveryFailed.label, 'Recovery blocked');
+  assert.match(recoveryFailed.detail, /commands may remain blocked/i);
+  assert.equal(recoveryFailed.latestResult.label, 'Latest operation failed: recovery failed');
+  device.wifi_state.last_result = { operation_id: 'unknown', revision: 'r2', status: 'unknown', reason: 'UNKNOWN', rolled_back: false };
+  assert.equal(wifi.wifiResultSummary(device, 'r1', true).label, 'Recovery blocked');
+  device.wifi_state.last_result = null;
+  const applying = wifi.wifiResultSummary(device, 'r1', true);
+  assert.equal(applying.label, 'Applied');
+  assert.match(applying.detail, /operation is still in progress/i);
+  device.wifi_state.last_result = { revision: 'r2', status: 'failed', reason: 'BUSY', rolled_back: false };
+  const rejectedAsBusy = wifi.wifiResultSummary(device, 'r1', true);
+  assert.equal(rejectedAsBusy.label, 'Applied');
+  assert.equal(rejectedAsBusy.latestResult.label, 'Latest deployment rejected as busy');
+  assert.match(rejectedAsBusy.latestResult.detail, /No new operation started/);
+  device.wifi_state.busy = false;
+  device.wifi_state.last_result = { revision: 'r1', status: 'failed', reason: 'PERMISSION_DENIED', rolled_back: true };
+  const failed = wifi.wifiResultSummary(device, 'r1', true);
+  assert.equal(failed.latestResult.state, 'failed');
+  assert.match(failed.latestResult.detail, /permission is missing/i);
+  assert.match(failed.latestResult.detail, /settings were restored/i);
+  device.wifi_state.available = false;
+  device.wifi_state.unavailable_reason = 'UNSUPPORTED';
+  assert.equal(wifi.wifiResultSummary(device, 'r1', true).state, 'unavailable');
+  device.status = 'offline';
+  assert.equal(wifi.wifiResultSummary(device, 'r1', true).state, 'offline');
+  assert.match(wifi.wifiResultSummary(device, 'r1', true).detail, /out of date/);
+  assert.equal(wifi.wifiResultSummary({ status: 'online', wifi_state: null }, 'r1', true).state, 'unknown');
+});
+
+test('DEVICE_LIST result refresh preserves Wi-Fi drafts and refreshes per-device result details', async () => {
+  const device = { device_id: 'device-1', serial_number: 'legacy-serial', label: 'Headset', status: 'online' };
+  const harness = withController(async (url) => {
+    if (url === '/api/wifi/state') return response({ enabled: true });
+    return response({ revision: 'r1', mode: 'managed', networks: [
+      { ssid: 'Office', security: 'WPA_PSK', password_present: true },
+    ] });
+  }, () => true, {
+    groups: { Lab: ['legacy-serial'], Other: ['device-1'] },
+    devices: [device],
+  });
+  try {
+    await tick();
+    harness.controller.renderGroup('Lab');
+    await tick();
+    harness.password.value = 'unsaved draft';
+    harness.groupPanel.dispatch('input', { target: harness.password });
+    const panelHtml = harness.groupPanel.innerHTML;
+    const panelWrites = harness.groupPanel.innerHTMLWrites;
+    harness.controller.updateDevices([Object.assign({}, device, {
+      wifi_state: {
+        managed: true,
+        policy_revision: 'r1',
+        last_result: { operation_id: 'op-1', revision: 'r1', status: 'success', reason: '', rolled_back: false },
+        busy: false,
+        available: true,
+        unavailable_reason: null,
+      },
+      wifi_state_updated_at: '2026-10-21T00:00:00Z',
+    })]);
+    assert.equal(harness.groupPanel.innerHTML, panelHtml);
+    assert.equal(harness.groupPanel.innerHTMLWrites, panelWrites);
+    assert.equal(harness.password.value, 'unsaved draft');
+    assert.match(harness.groupPanel.results.innerHTML, /Applied/);
+    assert.match(harness.groupPanel.results.innerHTML, /Latest operation succeeded/);
+    assert.match(harness.groupPanel.results.innerHTML, /Last report/);
+  } finally { harness.restore(); }
 });
 
 test('revisiting a group adopts its latest GET revision without stale initial state blocking deploy', async () => {
   let revision = 'r1';
   const harness = withController(async (url) => {
-    if (url === '/api/wifi/state') return response({ enabled: true, groups: { Lab: { revision: 'r1' } } });
+    if (url === '/api/wifi/state') return response({ enabled: true });
     return response({ revision, mode: 'managed', networks: [{ ssid: 'Office', security: 'OPEN' }] });
   });
   try {

@@ -6,20 +6,13 @@
   Local commit only; no push. [WIFI_SETTINGS.md](../docs/WIFI_SETTINGS.md)
   defines the current behavior. This report supersedes earlier replacement,
   recovery-registration and prototype-migration tests.
-- DEV-005, Device ID `70a1c963-e76e-4afb-9439-aeb21784298b`:
-  PICO 4 Ultra Enterprise, PUI 5.15.7, Android 14; ADB model A9210,
+- One PICO 4 Ultra Enterprise, PUI 5.15.7, Android 14; ADB model A9210,
   application model A94U0. TobService 4.3.30; client SDK 4.3.16.
-  The ADB skill checks the Device ID PNG before each operation.
-- The operator authorized APK replacement, Wi-Fi changes, Device Owner and
-  test permissions. No root, factory reset or firmware modification occurred.
-  The test-only DevDebug client and guard remain installed as Device Owner.
-- HTTP server: port 7086, using a private runtime copy of the Documents TeNQ
-  registry. The original Documents file is unchanged. The dedicated hardware
-  group contains only DEV-005. USB reverse provides the test MDM route.
-- Only s-5ghz was available. Existing settings were retained throughout these
-  auto-join tests. Two deliberately unreachable test networks remain saved OFF.
-  Credentials and detailed evidence are private under
-  `/tmp/styly-wifi-autojoin-validation/private/`, excluded from Git.
+- Tests used an isolated server/group and authorized APK/Device Owner/permission
+  changes. No root, factory reset or firmware modification occurred.
+- One physical AP was available; existing settings were retained. Device identity,
+  private registry names, credentials and local evidence paths are omitted here.
+- These are historical results, not physical validation of the 2026-10-21 fixes.
 
 ## Current physical results
 
@@ -35,7 +28,7 @@
 | Explicit unmanaged Deploy | Disabled boot management while preserving current flags and the successful baseline. |
 | Unmanaged OS boot | A manually enabled test candidate stayed enabled (boot 115); no policy reapplication. Baseline retained, no pending operation. |
 
-Final readback: s-5ghz connected with an IP, baseline auto-join ON, both test
+Final historical readback: original network connected with an IP, baseline auto-join ON, both test
 candidates OFF, server/client unmanaged and no pending operation. Final APK
 and server were restarted and MDM registration confirmed online. The temporary
 ADB diagnostic JAR was removed.
@@ -59,7 +52,7 @@ used at implementation checkpoints. The primary agent verified and fixed:
 - Removed stale cached group-revision comparisons that blocked a fresh profile.
 - Discarded the actual dirty model on editor exit, including Devices-tab changes.
 - Removed unused independent profile-rename/delete save branches; group and
-  encrypted profiles have one registry-save owner.
+  profiles had one registry-save owner.
 - Corrected the deletion warning: unmanaged Deploy also preserves OS flags.
 - Removed leftover TLS server/discovery setup, unpublished-format migrations,
   initial baseline registration, per-device send history and detailed boot state.

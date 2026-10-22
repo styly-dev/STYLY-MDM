@@ -80,6 +80,7 @@ class MdmClientApplication : Application() {
         try {
             ToBServiceHelper.getInstance().bindTobService(this) { status ->
                 Log.i(TAG, "TobService bind status: $status")
+                wifiController?.refreshReadiness()
                 if (status) {
                     try {
                         ToBServiceHelper.getInstance().serviceBinder?.pbsAppKeepAlive(packageName, true, 0)
