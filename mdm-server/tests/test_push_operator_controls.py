@@ -441,3 +441,110 @@ async def test_reconcile_is_deferred_while_push_state_is_unavailable(manager, tm
     # An empty, unloaded client state would answer absent, which is not evidence.
     assert session.ws.messages == []
     assert (await manager.get_snapshot(original["job_id"]))["devices"]["D1"]["cancel_requested"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claimed", [False, True])
+@pytest.mark.parametrize("resume_online", [False, True])
+async def test_restart_unsent_offline_target_can_be_cancelled_without_client(
+    manager, tmp_path, claimed, resume_online,
+):
+    original = await two_device_job(manager)
+    job_id = original["job_id"]
+    await manager.store.enable_dispatch(job_id)
+    if claimed:
+        assert (await manager.claim_next(["D2"]))["device_id"] == "D2"
+    manager.store.recover_startup_sync(
+        accept_reconciliation_timeout_ms=1000, reconciliation_timeout_ms=1000,
+    )
+    runtime, session, admin = operator_runtime(manager, tmp_path)
+    if resume_online:
+        await admin_action(runtime, admin, "PUSH_FILES", job_id)
+    else:
+        runtime.sessions.clear()
+    before = await manager.get_snapshot(job_id)
+    offline = before["devices"]["D2"]
+    assert offline["dispatch_revision"] is None
+    assert offline["cancellable"] and not offline["resume_supported"]
+    other_before = await manager.assignment(job_id, "D1")
+
+    await admin_action(runtime, admin, "CANCEL_PUSH_JOB", job_id, target_devices=["D2"])
+    cancelled = await manager.get_snapshot(job_id)
+    target = cancelled["devices"]["D2"]
+    assert target["state"] == "failed" and target["failure"]["code"] == "cancelled"
+    assert not target["cancel_requested"] and not target["cancellable"] and not target["retryable"]
+    assert (await manager.assignment(job_id, "D2"))["terminal_at"] is not None
+    assert await manager.assignment(job_id, "D1") == other_before
+    assert session.ws.messages == []
+    await admin_action(runtime, admin, "CANCEL_PUSH_JOB", job_id, target_devices=["D2"])
+    assert await manager.get_snapshot(job_id) == cancelled
+    assert await manager.claim_next(["D2"]) is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_unsent_restart_targets_finishes_job_and_releases_artifact(manager, tmp_path):
+    original = await two_device_job(manager)
+    job_id = original["job_id"]
+    await manager.store.enable_dispatch(job_id)
+    manager.store.recover_startup_sync(
+        accept_reconciliation_timeout_ms=1000, reconciliation_timeout_ms=1000,
+    )
+    runtime, session, admin = operator_runtime(manager, tmp_path)
+    runtime.sessions.clear()
+    (tmp_path / "operators.zip").write_bytes(b"a")
+
+    await admin_action(runtime, admin, "CANCEL_PUSH_JOB", job_id)
+    finished = await manager.get_snapshot(job_id)
+    assert finished["state"] == "failed" and finished["terminal_at"] is not None
+    assert all(d["failure"]["code"] == "cancelled" for d in finished["devices"].values())
+    assert session.ws.messages == []
+    assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms() + 1) == [
+        original["artifact"]["artifact_id"]
+    ]
+    assert not (tmp_path / "operators.zip").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("paused", ["restart", "interrupted", "ready"])
+async def test_retry_request_replay_preserves_dispatch_authority(manager, tmp_path, paused):
+    original = await completed(manager, tmp_path)
+    runtime, session, admin = operator_runtime(manager, tmp_path)
+    runtime.sessions = {device: session for device in ("failed", "interrupted", "unknown")}
+    request_id = str(uuid.uuid4())
+    if paused == "ready":
+        _, retry = await manager.retry_failed(
+            original["job_id"], request_id, artifact_root=tmp_path,
+            online_devices=runtime.sessions,
+        )
+        retry_id = retry["job_id"]
+    else:
+        await admin_action(runtime, admin, "RETRY_FAILED_PUSH_JOB", original["job_id"],
+                           client_request_id=request_id)
+        retry_id = admin.messages[-1]["job_id"]
+        if paused == "restart":
+            manager.store.recover_startup_sync(
+                accept_reconciliation_timeout_ms=1000, reconciliation_timeout_ms=1000,
+            )
+        else:
+            await manager.claim_next(["failed"])
+            active = await manager.prepare_dispatch(retry_id, "failed", accept_deadline=None)
+            await manager.resume_interrupted(
+                retry_id, "failed", attempt=1, artifact_id=active["artifact"]["artifact_id"],
+                dispatch_revision=active["devices"]["failed"]["dispatch_revision"],
+                validated_offset=0, reason="download_interrupted",
+            )
+    before = await manager.get_snapshot(retry_id)
+    rows_before = {d: await manager.assignment(retry_id, d) for d in before["devices"]}
+    # A request replay must also work when none of the original targets are online.
+    runtime.sessions.clear()
+    await admin_action(runtime, admin, "RETRY_FAILED_PUSH_JOB", original["job_id"],
+                       client_request_id=request_id)
+    assert admin.messages[-1]["job_id"] == retry_id
+    assert await manager.get_snapshot(retry_id) == before
+    assert {d: await manager.assignment(retry_id, d) for d in before["devices"]} == rows_before
+
+    if paused == "ready":
+        runtime.sessions = {device: session for device in before["devices"]}
+        await admin_action(runtime, admin, "PUSH_FILES", retry_id)
+        assert (await manager.get_snapshot(retry_id))["dispatch_enabled"]
+        assert (await manager.claim_next(["failed"]))["job"]["job_id"] == retry_id

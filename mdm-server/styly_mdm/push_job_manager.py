@@ -1116,7 +1116,7 @@ class PushJobManager:
         return await self.store._call(op)
 
     async def cancel_interrupted(self, job_id: str, device_id: str) -> dict[str, Any]:
-        """Persist cancellation; retain ownership until exact cleanup evidence."""
+        """Cancel unsent work, or retain dispatched ownership until cleanup evidence."""
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
             self.store._begin(conn)
             try:
@@ -1142,13 +1142,30 @@ class PushJobManager:
                         cancel_requested=False,
                         retried=device_id in self.store._retry_job_ids(conn, job_id),
                         resume_supported=self.store._resume_supported(row),
+                        never_dispatched=(
+                            row["protocol_mode"] == ProtocolMode.JOB_V1.value
+                            and row["dispatch_revision"] is None
+                        ),
                         blocking_fence=blocking_fence,
                     )
                     if not actions.cancellable:
-                        raise StoreConflict("Only interrupted or unconfirmed transfers can be cancelled")
+                        raise StoreConflict("Only paused, interrupted or unconfirmed transfers can be cancelled")
                     timestamp = now_ms()
-                    conn.execute("UPDATE push_job_devices SET cancel_requested_at=?, updated_at=? WHERE job_id=? AND device_id=?",
-                                 (timestamp, timestamp, job_id, device_id))
+                    if row["dispatch_revision"] is None:
+                        # No command was sent, so no client cleanup evidence is needed.
+                        conn.execute(
+                            "UPDATE push_job_devices SET state='failed', queue_reason=NULL, "
+                            "failure_code='cancelled', failure_detail='Cancelled before dispatch', "
+                            "terminal_at=?, updated_at=? WHERE job_id=? AND device_id=?",
+                            (timestamp, timestamp, job_id, device_id),
+                        )
+                        self.store._rederive_job(conn, job_id, timestamp)
+                    else:
+                        conn.execute(
+                            "UPDATE push_job_devices SET cancel_requested_at=?, updated_at=? "
+                            "WHERE job_id=? AND device_id=?",
+                            (timestamp, timestamp, job_id, device_id),
+                        )
                     self.store._increment_revision(conn, job_id, timestamp)
                 snapshot = self.store._snapshot(conn, job_id)
                 self.store._commit(conn)

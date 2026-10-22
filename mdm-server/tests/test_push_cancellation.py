@@ -95,7 +95,7 @@ async def test_legacy_assignment_revision_does_not_enable_resume_or_cancel(manag
     assert legacy['devices']['D1']['resume_supported'] is False
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=1)
-    with pytest.raises(StoreConflict, match='Only interrupted'):
+    with pytest.raises(StoreConflict, match='Only paused, interrupted'):
         await manager.cancel_interrupted(active['job_id'], 'D1')
 
 
@@ -114,7 +114,7 @@ async def test_cancel_rejects_work_not_awaiting_timeout_resume(manager, phase):
     else:
         original = await timed_out_job(manager)
         _, original = await manager.store.enable_dispatch(original['job_id'])
-    with pytest.raises(StoreConflict, match='Only interrupted'):
+    with pytest.raises(StoreConflict, match='Only paused, interrupted'):
         await manager.cancel_interrupted(original['job_id'], 'D1')
     assert await manager.get_snapshot(original['job_id']) == original
 

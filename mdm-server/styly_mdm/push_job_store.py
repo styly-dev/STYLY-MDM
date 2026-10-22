@@ -648,6 +648,10 @@ class PushJobStore:
                 cancel_requested=row["cancel_requested_at"] is not None,
                 retried=row["device_id"] in retries,
                 resume_supported=resume_supported,
+                never_dispatched=(
+                    row["protocol_mode"] == ProtocolMode.JOB_V1.value
+                    and row["dispatch_revision"] is None
+                ),
                 blocking_fence=fence is not None
                 and fence["blocking_job_id"] == job_id
                 and fence["blocking_attempt"] == row["attempt"],

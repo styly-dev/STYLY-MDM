@@ -24,6 +24,17 @@ also cover clock availability recovery and preserving unsaved terminal results
 when a resumed retention budget expires. The earlier repeated server results above
 predate the explicit manager API and schema-statement cleanup.
 
+The 2026-10-22 review fixes passed the full server suite with 665 tests on each
+Python version above, console checks with 66 passed / one existing skip, and
+`testProdDebugUnitTest assembleProdDebug` with 229 Android tests and a successful
+APK build. Regression tests cover cancellation of unsent offline targets after
+restart (including artifact release), repeated Retry request IDs preserving manual
+waits and recovering a ready job through explicit Resume, one scheduler task during
+slot-wait/disconnect/Resume races, console cancellation without resume support, and
+safe durable-state diagnostics without exception messages or causes. Three
+independent reviews covered server actions, scheduler ownership, and Android
+recovery/logging. These fixes were not retested on a physical headset.
+
 The server suite runs with `python -m pytest -q` in `mdm-server`. The registration
 subset is `tests/test_self_update.py tests/test_retire.py
 tests/test_duplicate_connection.py`. Earlier Android checks used
