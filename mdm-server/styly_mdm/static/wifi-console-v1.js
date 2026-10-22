@@ -64,14 +64,148 @@
     return { payload: { networks: payload } };
   }
 
-  function membershipConflict(deviceId, groupName, groups, aliases) {
-    const identity = [deviceId].concat(aliases || []).filter(Boolean);
-    const names = Object.keys(groups || {}).sort();
-    for (let i = 0; i < names.length; i++) {
-      const name = names[i];
-      if (name !== groupName && identity.some(function (id) { return (groups[name] || []).indexOf(id) >= 0; })) return name;
+  function membershipGroups(deviceId, groups, aliases) {
+    const identity = new Set([deviceId].concat(aliases || []).filter(Boolean));
+    return Object.keys(groups || {}).filter(function (name) {
+      return (groups[name] || []).some(function (id) { return identity.has(id); });
+    }).sort();
+  }
+
+  function groupMembershipOverlaps(groupName, groups, devices) {
+    const overlaps = [];
+    const seen = new Set();
+    (groups && groups[groupName] || []).forEach(function (memberId) {
+      const device = (devices || []).find(function (candidate) {
+        return candidate && (candidate.device_id === memberId || candidate.serial_number === memberId);
+      });
+      const deviceId = device && (device.device_id || device.serial_number) || memberId;
+      const aliases = device ? [device.device_id, device.serial_number] : [];
+      const otherGroups = membershipGroups(deviceId, groups, aliases).filter(function (name) { return name !== groupName; });
+      if (!otherGroups.length || seen.has(deviceId)) return;
+      seen.add(deviceId);
+      overlaps.push({ deviceId: deviceId, otherGroups: otherGroups });
+    });
+    return overlaps;
+  }
+
+  function latestWifiResult(state) {
+    const result = state && state.last_result;
+    if (!result) return { state: 'unknown', label: 'No operation result', detail: 'The client has not reported a Wi-Fi operation result.' };
+    const revision = result.revision || 'unknown';
+    if (result.status === 'success') {
+      return { state: 'success', label: 'Latest operation succeeded', detail: 'Reported success for revision ' + revision + '.' };
     }
-    return null;
+    if (result.status === 'unknown') {
+      return {
+        state: 'unknown',
+        label: result.reason === 'RESTORE_FAILED' ? 'Recovery failed' : 'Latest operation outcome unknown',
+        detail: (humanizeWifiReason(result.reason) || 'The client could not confirm the result.') + ' Revision ' + revision + '.',
+      };
+    }
+    if (result.status === 'failed') {
+      if (result.reason === 'BUSY') {
+        return { state: 'failed', label: 'Latest deployment rejected as busy', detail: 'No new operation started because another Wi-Fi operation was in progress. Revision ' + revision + '.' };
+      }
+      const label = result.reason === 'RESTORE_FAILED'
+        ? 'Latest operation failed: recovery failed'
+        : result.rolled_back ? 'Latest operation failed and rolled back' : 'Latest operation failed';
+      const rollback = result.rolled_back ? ' The previous Wi-Fi settings were restored.' : '';
+      return {
+        state: 'failed',
+        label: label,
+        detail: (humanizeWifiReason(result.reason) || 'The last attempt failed.') + rollback + ' Revision ' + revision + '.',
+      };
+    }
+    return { state: 'unknown', label: 'Unrecognized operation result', detail: 'The client reported an unsupported result status.' };
+  }
+
+  function wifiResultSummary(device, savedRevision, savedManaged) {
+    const state = device && device.wifi_state;
+    const online = device && device.status === 'online';
+    const latestResult = latestWifiResult(state);
+    if (!device) return { state: 'unknown', label: 'Unknown device', detail: 'No device details are available for this group member.', latestResult: latestResult };
+    if (!online) {
+      return { state: 'offline', label: 'Offline', detail: 'The reported Wi-Fi state may be out of date.', latestResult: latestResult };
+    }
+    if (!state) return { state: 'unknown', label: 'Unavailable', detail: 'No Wi-Fi state is available from this client; older clients may not report it.', latestResult: latestResult };
+    const result = state.last_result;
+    if (result && (result.reason === 'RESTORE_FAILED' ||
+        (result.status === 'unknown' && state.busy === true))) {
+      return {
+        state: 'failed',
+        label: 'Recovery blocked',
+        detail: 'Wi-Fi recovery could not be confirmed. Further Wi-Fi commands may remain blocked until the device recovers.',
+        latestResult: latestResult,
+      };
+    }
+    if (state.available === false) {
+      return {
+        state: 'unavailable',
+        label: 'Unavailable',
+        detail: humanizeWifiReason(state.unavailable_reason) || 'This client cannot report Wi-Fi status.',
+        latestResult: latestResult,
+      };
+    }
+    if (savedRevision && state.policy_revision === savedRevision && state.managed === savedManaged) {
+      return {
+        state: 'success',
+        label: savedManaged ? 'Applied' : 'Unmanaged state applied',
+        detail: (savedManaged ? 'Device reports saved revision ' : 'Device reports unmanaged state for revision ') + savedRevision + '.' +
+          (state.busy === true ? ' A Wi-Fi operation is still in progress.' : ''),
+        latestResult: latestResult,
+      };
+    }
+    if (state.policy_revision !== savedRevision) {
+      return {
+        state: 'stale',
+        label: 'Revision mismatch',
+        detail: 'Device reports revision ' + (state.policy_revision || 'unknown') + '; saved revision is ' + (savedRevision || 'none') + '.' +
+          (state.busy === true ? ' A Wi-Fi operation is still in progress.' : ''),
+        latestResult: latestResult,
+      };
+    }
+    if (typeof state.managed === 'boolean' && state.managed !== savedManaged) {
+      return {
+        state: 'stale',
+        label: 'State mismatch',
+        detail: 'Device reports ' + (state.managed ? 'managed' : 'unmanaged') + ' Wi-Fi for the saved revision.' +
+          (state.busy === true ? ' A Wi-Fi operation is still in progress.' : ''),
+        latestResult: latestResult,
+      };
+    }
+    return {
+      state: 'unknown',
+      label: 'State unknown',
+      detail: 'The device has not reported a policy revision and management state that match the saved policy.' +
+        (state.busy === true ? ' A Wi-Fi operation is still in progress.' : ''),
+      latestResult: latestResult,
+    };
+  }
+
+  function humanizeWifiReason(reason) {
+    const key = typeof reason === 'string' ? reason.toUpperCase() : '';
+    const labels = {
+      NONE: 'No error.',
+      PERMISSION_DENIED: 'Required Wi-Fi permission is missing.',
+      LOCATION_PERMISSION_DENIED: 'Location permission is missing.',
+      LOCATION_DISABLED: 'Location is turned off.',
+      CONFIG_READ_FAILED: 'The device could not read its saved Wi-Fi settings.',
+      UPDATE_FAILED: 'The device could not update its Wi-Fi settings.',
+      VERIFY_FAILED: 'The device could not verify its Wi-Fi settings.',
+      TIMEOUT_ROLLED_BACK: 'Connection verification timed out.',
+      RESTORE_FAILED: 'Wi-Fi recovery failed; the device may need local recovery.',
+      BUSY: 'Another Wi-Fi operation is in progress.',
+      UNSUPPORTED: 'This client does not support Wi-Fi management.',
+      UNREACHABLE: 'The Wi-Fi network could not be reached.',
+      UNKNOWN: 'The device could not determine the Wi-Fi result.',
+    };
+    return labels[key] || reason || '';
+  }
+
+  function reportedAt(value) {
+    if (!value) return '';
+    const date = typeof value === 'number' ? new Date(value < 100000000000 ? value * 1000 : value) : new Date(value);
+    return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
   }
 
   function escapeHtml(value) {
@@ -105,6 +239,8 @@
     let stateLoading = false;
     let activeGroup = null;
     let profile = null;
+    let devices = typeof options.getDevices === 'function' ? options.getDevices() || [] : [];
+    let groups = typeof options.getGroups === 'function' ? options.getGroups() || {} : {};
 
     function isBusy(model) {
       return model.loading || model.saving || model.sending;
@@ -195,6 +331,41 @@
       banner.style.display = stateError ? '' : 'none';
     }
 
+    function renderDeviceResults() {
+      if (!groupPanel || !activeGroup) return;
+      const target = groupPanel.querySelector('[data-wifi-results]');
+      if (!target) return;
+      const members = (groups[activeGroup] || []).map(function (memberId) {
+        const device = devices.find(function (candidate) {
+          return candidate && (candidate.device_id === memberId || candidate.serial_number === memberId);
+        });
+        return { memberId: memberId, device: device || null };
+      });
+      if (!members.length) {
+        target.innerHTML = '<div class="wifi-empty">This group has no devices.</div>';
+        return;
+      }
+      const model = profileFor(activeGroup);
+      target.innerHTML = '<div class="wifi-device-results">' + members.map(function (entry) {
+        const device = entry.device;
+        const label = device && device.label || entry.memberId;
+        const summary = wifiResultSummary(device, model.savedRevision, model.savedMode !== 'unmanaged');
+        const updatedAt = device && reportedAt(device.wifi_state_updated_at);
+        const identifier = device && device.device_id ? device.device_id : entry.memberId;
+        return '<article class="wifi-device-result ' + escapeHtml(summary.state) + '">' +
+          '<div class="wifi-device-result-head"><strong>' + escapeHtml(label) + '</strong>' +
+          '<span class="wifi-result-status">' + escapeHtml(summary.label) + '</span></div>' +
+          '<div class="wifi-result-detail">' + escapeHtml(summary.detail) + '</div>' +
+          '<div class="wifi-latest-result ' + escapeHtml(summary.latestResult.state) + '"><strong>' +
+          escapeHtml(summary.latestResult.label) + ':</strong> ' + escapeHtml(summary.latestResult.detail) + '</div>' +
+          '<div class="wifi-result-meta">' + escapeHtml(identifier) +
+          (device && device.wifi_state && typeof device.wifi_state.managed === 'boolean'
+            ? ' · ' + (device.wifi_state.managed ? 'Managed' : 'Unmanaged') : '') +
+          (device && device.wifi_state ? ' · Policy revision: ' + escapeHtml(device.wifi_state.policy_revision || 'unknown') : '') +
+          (updatedAt ? ' · Last report: ' + escapeHtml(updatedAt) : '') + '</div></article>';
+      }).join('') + '</div>';
+    }
+
     function renderProfile() {
       if (!groupPanel) return;
       if (!activeGroup) {
@@ -226,7 +397,7 @@
           (network.hidden ? ' checked' : '') + '> Hidden network</label></div></article>';
       }).join('');
 
-      const revisionText = model.savedRevision ? (model.savedMode === 'unmanaged' ? 'Saved: Do not manage Wi-Fi' : 'Saved profile') : 'No saved profile';
+      const revisionText = model.savedRevision ? (model.savedMode === 'unmanaged' ? 'Saved: Do not manage Wi-Fi' : 'Saved profile') + ' · Revision ' + model.savedRevision : 'No saved profile';
       const busy = isBusy(model);
       const profileError = model.error ? '<div class="wifi-feedback wifi-danger" role="alert">' + escapeHtml(model.error) + '</div>' : '';
       const unavailable = enabled === false || stateUnavailable
@@ -236,7 +407,7 @@
       groupPanel.innerHTML = '<section class="wifi-section"><div class="wifi-section-head"><div><h3>Wi-Fi settings</h3>' +
         '<p>Save this group’s Wi-Fi policy, then send it to online devices.</p>' +
         '<p>Listed networks get auto-connect enabled; other saved networks stay on the device with auto-connect disabled.</p>' +
-        '<p>If no listed network obtains an IP within 60 seconds, clients restore the previous auto-connect policy. The server does not track device results.</p>' +
+        '<p>If no listed network obtains an IP within 60 seconds, clients restore the previous auto-connect policy.</p>' +
         '<p class="wifi-meta">' + revisionText + '</p></div>' +
         (model.loaded && enabled === true && model.mode !== 'unmanaged'
           ? '<button class="btn-outline btn-danger-outline" type="button" data-wifi-action="unmanage">' + (model.savedRevision ? 'Delete Wi-Fi settings' : 'Do not manage Wi-Fi') + '</button>' : '') + '</div>' +
@@ -251,12 +422,14 @@
           '<div class="wifi-action-right"><span class="wifi-meta">' + (model.dirty ? 'Unsaved changes' : model.savedRevision ? 'Saved' : 'Not saved') + '</span>' +
           (model.mode === 'managed' ? '<button class="btn btn-primary" type="button" data-wifi-action="save"' + (!model.dirty || busy ? ' disabled' : '') + '>Save Wi-Fi settings</button>' : '') +
           '<button class="btn btn-success" type="button" data-wifi-action="apply"' + (model.dirty || !model.savedRevision || busy ? ' disabled' : '') + '>Send to whole group</button></div></div>' : '') +
+        '<div class="wifi-results-section"><h4>Device status</h4><p>Sending a policy means the server accepted the request. Application results are reported by each device.</p><div data-wifi-results></div></div>' +
         '</section>';
       model.draftNetworks.forEach(function (network) {
         const input = groupPanel.querySelector('[data-wifi-row="' + network.id + '"][data-wifi-field="password"]');
         if (input) input.value = network.password || '';
       });
       renderTransientStatus();
+      renderDeviceResults();
       updateButtons();
     }
 
@@ -275,6 +448,16 @@
       } else {
         renderTransientStatus();
       }
+    }
+
+    function updateDevices(nextDevices) {
+      devices = Array.isArray(nextDevices) ? nextDevices : [];
+      renderDeviceResults();
+    }
+
+    function updateGroups(nextGroups) {
+      groups = nextGroups && typeof nextGroups === 'object' ? nextGroups : {};
+      renderDeviceResults();
     }
 
     async function loadProfile(name, quiet) {
@@ -485,7 +668,7 @@
         const response = await root.fetch('/api/wifi/groups/' + encodeURIComponent(name) + '/deploy', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-          body: JSON.stringify({ expected_revision: model.savedRevision, mode: model.mode }),
+          body: JSON.stringify({ expected_revision: model.savedRevision }),
         });
         if (!response.ok) {
           if (response.status === 409) model.conflicted = true;
@@ -498,7 +681,7 @@
           const sent = operations.filter(function (item) { return item.status === 'sent'; }).length;
           const failed = operations.filter(function (item) { return item.status === 'failed'; }).length;
           const unknown = operations.length - sent - failed;
-          statusMessage = 'Deploy sent for ' + name + ': ' + sent + ' sent, ' + failed + ' failed, ' + unknown + ' unconfirmed.';
+          statusMessage = 'Server dispatch result for ' + name + ': ' + sent + ' command(s) sent, ' + failed + ' failed to send, ' + unknown + ' unconfirmed. Device status below reports application results separately.';
           renderStatus();
         }
       } catch (_) {
@@ -551,14 +734,15 @@
     return {
       renderGroup: renderGroup,
       refresh: refreshState,
-      renameGroup: function (oldName, newName) {
-        if (profile && profile.groupName === oldName) profile.groupName = newName;
-      },
+      updateDevices: updateDevices,
+      updateGroups: updateGroups,
     };
   }
 
   const api = {
-    membershipConflict: membershipConflict,
+    membershipGroups: membershipGroups,
+    groupMembershipOverlaps: groupMembershipOverlaps,
+    wifiResultSummary: wifiResultSummary,
     MAX_NETWORKS: MAX_NETWORKS,
     normalizeNetworks: normalizeNetworks,
     buildProfilePayload: buildProfilePayload,

@@ -229,8 +229,6 @@ class WebSocketManager internal constructor(
         .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .pingInterval(PING_INTERVAL_SECONDS, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .followRedirects(false)
-        .followSslRedirects(false)
         .build()
 
     private val pushCoordinator = MdmClientApplication.pushJobCoordinator()
@@ -241,6 +239,18 @@ class WebSocketManager internal constructor(
     private val reconnectHandler = Handler(Looper.getMainLooper())
     private val reconnectToken = Object()
     private val batteryTelemetryToken = Object()
+    private val wifiStateListener: () -> Unit = {
+        reconnectHandler.post { publishWifiState() }
+    }
+
+    private fun publishWifiState() {
+        val socket = webSocket ?: return
+        if (!isRunning || !registration.isCanonicalAcknowledged(socket)) return
+        socket.send(JSONObject().apply {
+            put("type", "WIFI_STATE")
+            put("wifi_state", wifiController.stateSnapshot())
+        }.toString())
+    }
 
     private val scheduler = ConnectionScheduler {
         ClientConfig.load(File(Environment.getExternalStorageDirectory(), ClientConfig.CONFIG_RELATIVE_PATH))
@@ -293,6 +303,7 @@ class WebSocketManager internal constructor(
     fun connect() {
         isRunning = true
         identityResolver.addListener(identityListener)
+        wifiController.addStateListener(wifiStateListener)
         onStatusChanged(false, "Waiting for network...")
         // The connection window is anchored on network availability, not on
         // service start: the callback fires immediately when a network is
@@ -305,6 +316,7 @@ class WebSocketManager internal constructor(
     fun disconnect() {
         isRunning = false
         identityResolver.removeListener(identityListener)
+        wifiController.removeStateListener(wifiStateListener)
         if (networkCallbackRegistered) {
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             cm.unregisterNetworkCallback(networkCallback)
@@ -479,6 +491,8 @@ class WebSocketManager internal constructor(
                                 registration.isCanonicalAcknowledged(webSocket)
                             ) {
                                 startBatteryTelemetry()
+                                publishWifiState()
+                                wifiController.refreshReadiness()
                                 publishConnectedStatus(identityResolver.snapshot())
                             }
                         }
@@ -625,11 +639,14 @@ class WebSocketManager internal constructor(
                 put("device_id", identity.deviceId)
                 put("process_instance_id", pushFields!!.getString("process_instance_id"))
                 val capabilities = JSONArray(pushFields.getJSONArray("capabilities").toString())
-                if ((0 until capabilities.length()).none { capabilities.optString(it) == WIFI_SETTINGS_CAPABILITY }) {
+                if (supportsWifiSettingsPlatform() &&
+                    (0 until capabilities.length()).none { capabilities.optString(it) == WIFI_SETTINGS_CAPABILITY }
+                ) {
                     capabilities.put(WIFI_SETTINGS_CAPABILITY)
                 }
                 put("capabilities", capabilities)
                 put("push_state", pushFields.getJSONObject("push_state"))
+                put("wifi_state", wifiController.stateSnapshot())
                 put("push_runtime", pushFields.getJSONObject("push_runtime"))
                 val startupConfig = getStartupAppConfig()
                 if (startupConfig != null) {

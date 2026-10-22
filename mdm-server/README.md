@@ -44,6 +44,12 @@ registry (`<data-dir>/device_registry.json`). It defaults to the directory the
 server is started from, so `uvx styly-mdm` in a fresh directory comes up with no
 devices or groups.
 
+Group Wi-Fi policies are saved in this registry with plaintext passwords. Protect
+the registry and its backups; no encryption key is required. Existing encrypted
+prototype profiles can be migrated once using their original
+`MDM_WIFI_ENCRYPTION_KEY` and an optional `cryptography` installation. Unreadable
+Wi-Fi data is retained and disables only Wi-Fi management, not the server.
+
 Transfer throttling bounds how many devices download at once — one server-wide
 pool shared by every install and push/sync job; the rest queue until a slot
 frees.

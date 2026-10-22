@@ -23,14 +23,8 @@ class BootReceiver : BroadcastReceiver() {
             action == "com.pvr.tobservice.SERVICE_AUTO_BOOT"
         ) {
             Log.i(TAG, "Starting MdmClientService")
-            val reason = if (action == Intent.ACTION_BOOT_COMPLETED) {
-                MdmClientService.REASON_BOOT
-            } else {
-                "tob_auto_boot"
-            }
             val serviceIntent = Intent(context, MdmClientService::class.java)
-                .setAction(action)
-                .putExtra(MdmClientService.EXTRA_START_REASON, reason)
+                .putExtra(MdmClientService.EXTRA_START_REASON, MdmClientService.REASON_BOOT)
             context.startForegroundService(serviceIntent)
         }
     }

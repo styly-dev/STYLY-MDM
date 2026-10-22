@@ -100,6 +100,9 @@ class MdmClientService : Service() {
         private val HEX = "0123456789abcdef".toCharArray()
     }
 
+    private val startupLaunch = StartupLaunchGate()
+    private val startupHandler = Handler(android.os.Looper.getMainLooper())
+    @Volatile private var notificationStatus = "Initializing..."
     private lateinit var webSocketManager: WebSocketManager
 
     // Mutual watch: off the main thread because each tick is a binder round-trip to
@@ -161,11 +164,12 @@ class MdmClientService : Service() {
         )
         webSocketManager.connect()
 
-        MdmClientApplication.wifiSettingsController().startupCompletion().whenComplete { recovered, _ ->
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                if (!serviceDestroyed && recovered == true) launchStartupAppIfConfigured()
-            }
-        }
+        // Optional Wi-Fi recovery must never permanently suppress the startup application.
+        startupLaunch.start(
+            MdmClientApplication.wifiSettingsController().startupCompletion(),
+            post = { task, delay -> startupHandler.postDelayed(task, delay) },
+            launch = ::launchStartupAppIfConfigured,
+        )
 
         guardEnsureThread = HandlerThread("guard-ensure").apply { start() }
         guardEnsure = Handler(guardEnsureThread.looper)
@@ -175,6 +179,7 @@ class MdmClientService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // A location grant can arrive after onCreate, while this service is already running.
         promoteToForeground()
+        MdmClientApplication.wifiSettingsController().refreshReadiness()
         // A null intent is a START_STICKY redelivery; a start with no reason extra came from
         // outside our own code — the PICO keep-alive being the case the spike is looking for.
         val reason = when {
@@ -196,13 +201,15 @@ class MdmClientService : Service() {
             PackageManager.PERMISSION_GRANTED
         val types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
             if (locationGranted) ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION else 0
-        startForeground(NOTIFICATION_ID, buildNotification("Initializing..."), types)
+        startForeground(NOTIFICATION_ID, buildNotification(notificationStatus), types)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
         serviceDestroyed = true
+        startupLaunch.close()
+        startupHandler.removeCallbacksAndMessages(null)
         Log.i(TAG, "MdmClientService destroyed")
         UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_DESTROYED)
         guardEnsureThread.quitSafely()
@@ -1272,7 +1279,8 @@ class MdmClientService : Service() {
         Log.i(TAG, "Startup app configured: $packageName, launching after delay")
 
         // Delay to allow TobService binder to initialize
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+        startupHandler.postDelayed({
+            if (serviceDestroyed) return@postDelayed
             doLaunchApp(packageName, extra, killForeground = false) { status, error ->
                 Log.i(TAG, "Startup app launch result: $status ${if (error.isNotEmpty()) "- $error" else ""}")
             }
@@ -1712,6 +1720,7 @@ class MdmClientService : Service() {
     }
 
     private fun updateNotification(statusText: String) {
+        notificationStatus = statusText
         val manager = getSystemService(NotificationManager::class.java)
         manager.notify(NOTIFICATION_ID, buildNotification(statusText))
     }

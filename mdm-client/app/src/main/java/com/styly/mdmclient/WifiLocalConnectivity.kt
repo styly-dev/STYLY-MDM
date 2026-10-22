@@ -151,14 +151,23 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
             // Seed every existing physical Wi-Fi handle so delayed callback delivery cannot
             // make a pre-change association look fresh after the reconnect call.
             for (network in manager.allNetworks) {
+                val beforeRead = synchronized(lock) { observations[network.networkHandle]?.sequence }
                 val capabilities = manager.getNetworkCapabilities(network) ?: continue
                 if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
                     capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
                 ) continue
+                val info = capabilities.transportInfo as? WifiInfo
+                val links = manager.getLinkProperties(network)
                 synchronized(lock) {
-                    if (!lostNetworkHandles.isLost(network.networkHandle)) {
-                        val current = observations.getOrPut(network.networkHandle) { MutableObservation() }
-                        current.sequence = ++sequence
+                    // Never overwrite newer callback data with a synchronous seed read.
+                    if (!lostNetworkHandles.isLost(network.networkHandle) &&
+                        observations[network.networkHandle]?.sequence == beforeRead
+                    ) {
+                        observations[network.networkHandle] = MutableObservation(
+                            ssid = info?.ssid?.normalizeSsid(),
+                            hasUsableIp = links?.linkAddresses?.any { it.address.isUsableLocalAddress() } == true,
+                            sequence = ++sequence,
+                        )
                     }
                 }
             }

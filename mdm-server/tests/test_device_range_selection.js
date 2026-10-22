@@ -37,6 +37,7 @@ function makeHarness({ order = [], selected = [], devices = null } = {}) {
     targetTab: 'devices',
     powerConfirm: { checked: true },
     deviceTaskState: {},
+    wifiController: { updateDevices() {} },
     window: {},
     render() {},
     refreshDeviceSelection() {},

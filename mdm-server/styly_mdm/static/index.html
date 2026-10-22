@@ -172,6 +172,7 @@
     .group-name { font-weight: 600; font-size: 15px; }
     .group-count { font-size: 12px; color: var(--text-secondary); }
     .group-members { font-size: 12px; color: var(--text-secondary); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .group-overlap-note { margin-top: 3px; color: var(--warning); font-size: 11px; line-height: 1.35; white-space: normal; overflow-wrap: anywhere; }
     .group-empty { font-size: 12px; color: var(--text-muted); margin-top: 3px; font-style: italic; }
     .badge-offline { font-size: 10px; color: var(--warning); border: 1px solid #5a4a1c; border-radius: 4px; padding: 0 6px; }
     .badge-startup { font-size: 10px; color: var(--success); border: 1px solid #2c5a48; border-radius: 4px; padding: 0 5px; }
@@ -432,7 +433,24 @@
     .wifi-actions .btn, .wifi-actions .btn-outline { width: auto; margin: 0; padding: 9px 14px; font-size: 13px; font-weight: 600; line-height: 18px; }
     .wifi-actions .btn { border: 1px solid transparent; }
     .wifi-empty { padding: 14px; color: var(--text-muted); font-size: 12px; }
-    .wifi-member-locked { opacity: .55; cursor: not-allowed; }
+    .wifi-warning { color: var(--warning); border-color: #665321; background: #2a2415; }
+    .group-overlap-warning { color: var(--warning); font-size: 11px; }
+    .wifi-results-section { margin-top: 16px; }
+    .wifi-results-section h4 { margin: 0 0 4px; font-size: 13px; }
+    .wifi-results-section > p { margin: 0 0 8px; color: var(--text-muted); font-size: 11px; }
+    .wifi-device-results { display: flex; flex-direction: column; gap: 6px; }
+    .wifi-device-result { padding: 8px 10px; background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 6px; }
+    .wifi-device-result-head { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; }
+    .wifi-result-status { font-weight: 700; color: var(--text-secondary); }
+    .wifi-device-result.success .wifi-result-status { color: var(--success); }
+    .wifi-device-result.failed .wifi-result-status, .wifi-device-result.unavailable .wifi-result-status { color: var(--danger); }
+    .wifi-device-result.pending .wifi-result-status, .wifi-device-result.stale .wifi-result-status { color: var(--warning); }
+    .wifi-result-detail, .wifi-result-meta { margin-top: 3px; font-size: 11px; color: var(--text-secondary); overflow-wrap: anywhere; }
+    .wifi-result-meta { color: var(--text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .wifi-latest-result { margin-top: 4px; font-size: 11px; color: var(--text-secondary); overflow-wrap: anywhere; }
+    .wifi-latest-result.failed { color: var(--danger); }
+    .wifi-latest-result.unknown { color: var(--warning); }
+    .mg-dev-overlap { color: var(--warning); font-size: 11px; }
 
     @container (max-width: 600px) {
       .wifi-fields { grid-template-columns: minmax(0, 1fr); }
@@ -804,6 +822,8 @@
       const wifiController = window.MdmWifiConsole.createController({
         statusPanel: wifiStatusPanel,
         groupPanel: wifiGroupPanel,
+        getDevices: function () { return devices; },
+        getGroups: function () { return groups; },
       });
 
       // ---------------- Helpers ----------------
@@ -916,6 +936,7 @@
           devices.forEach(function (d) {
             const key = getDeviceId(d);
             if (!deviceIndex.has(key)) deviceIndex.set(key, d);
+            if (d.serial_number && !deviceIndex.has(d.serial_number)) deviceIndex.set(d.serial_number, d);
           });
           deviceIndexSource = devices;
         }
@@ -1006,6 +1027,11 @@
       }
       function groupNames() { return Object.keys(groups).sort(); }
       function offlineMembers(name) { return (groups[name] || []).filter(function (s) { const d = deviceById(s); return d && !isOnline(d); }).length; }
+      function manageGroupHasDevice(id) {
+        const device = deviceById(id);
+        const identities = [id, device && device.device_id, device && device.serial_number].filter(Boolean);
+        return Array.from(manageMembers).some(function (memberId) { return identities.indexOf(memberId) >= 0; });
+      }
       function batteryHtml(d) {
         const b = d && d.battery;
         if (!b || typeof b.level !== 'number') return '<span class="battery-muted">—</span>';
@@ -1067,6 +1093,7 @@
           }
           case 'DEVICE_LIST': {
             devices = msg.devices || [];
+            wifiController.updateDevices(devices);
             const selectedBefore = selectedIds.size;
             const cur = knownIds();
             selectedIds.forEach(function (id) { if (!cur.has(id)) selectedIds.delete(id); });
@@ -1101,6 +1128,7 @@
           }
           case 'GROUP_LIST': {
             groups = msg.groups || {};
+            wifiController.updateGroups(groups);
             groupsLoaded = true;
             if (pendingSelectGroup && (pendingSelectGroup in groups)) { selectManageGroup(pendingSelectGroup); pendingSelectGroup = null; }
             else if (manageSelectedGroup && !(manageSelectedGroup in groups)) { manageSelectedGroup = null; manageMembers = new Set(); }
@@ -1157,7 +1185,6 @@
           case 'GROUP_CREATED': addLog('Group created: ' + (msg.name || '-'), 'success'); if (view === 'manage') pendingSelectGroup = msg.name; break;
           case 'GROUP_RENAMED':
             addLog('Group renamed: ' + (msg.name || '-') + ' -> ' + (msg.new_name || '-'), 'success');
-            wifiController.renameGroup(msg.name, msg.new_name);
             if (manageSelectedGroup === msg.name) pendingSelectGroup = msg.new_name;
             if (activeGroup === msg.name) activeGroup = msg.new_name;
             break;
@@ -1343,6 +1370,13 @@
           const off = offlineMembers(name);
           const on = activeGroup === name;
           const expanded = expandedGroups.has(name);
+          const overlaps = window.MdmWifiConsole.groupMembershipOverlaps(name, groups, devices);
+          const overlapNames = Array.from(new Set(overlaps.reduce(function (all, item) {
+            return all.concat(item.otherGroups);
+          }, []))).sort();
+          const overlapNote = overlaps.length
+            ? '<div class="group-overlap-note">' + overlaps.length + ' shared device(s) · also in ' + esc(overlapNames.join(', ')) + '</div>'
+            : '';
           // Collapsed rows show a one-line member preview; expanded rows show the
           // per-device status list below instead (so the preview is redundant).
           const preview = expanded ? '' : (count
@@ -1355,7 +1389,7 @@
             '<span class="group-count">' + (count === 1 ? '1 device' : count + ' devices') + '</span>' +
             '<button class="group-expand" data-act="toggleExpand" data-group="' + esc(name) + '" title="' + (expanded ? 'Collapse' : 'Show devices') + '">' + (expanded ? '▾' : '▸') + '</button>' +
             (off ? '<span class="badge-offline">' + off + ' offline</span>' : '') +
-            '</div>' + preview + '</div>' +
+            '</div>' + overlapNote + preview + '</div>' +
             '<button class="btn-edit" data-act="editGroup" data-group="' + esc(name) + '">✏ Edit</button>' +
             '</div>';
           const body = expanded ? '<div class="group-devs">' + renderGroupDevsHtml(members) + '</div>' : '';
@@ -1423,6 +1457,7 @@
 
       function deviceRowHtml(d) {
         const id = getDeviceId(d);
+        const groupMemberships = window.MdmWifiConsole.membershipGroups(id, groups, [d.serial_number]);
         const checked = selectedIds.has(id);
         const off = !isOnline(d);
         const kept = keptBySelection(d);
@@ -1453,7 +1488,8 @@
             (startup ? '<span class="badge-startup" title="' + esc(startup) + '">★</span>' : '') +
             '</div>';
         }
-        deviceCell += '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.ip || '-') + '</div>';
+        deviceCell += '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.ip || '-') +
+          (groupMemberships.length > 1 ? ' · <span class="group-overlap-warning" title="This device belongs to multiple groups">Groups: ' + esc(groupMemberships.join(', ')) + '</span>' : '') + '</div>';
 
         let status;
         if (d.status === 'registering') {
@@ -2349,6 +2385,13 @@
         const memArr = manageTab === 'wifi' ? (groups[name] || []) : Array.from(manageMembers);
         const offCount = memArr.filter(function (s) { const d = deviceById(s); return !d || !isOnline(d); }).length;
         const onCount = memArr.length - offCount;
+        const overlaps = window.MdmWifiConsole.groupMembershipOverlaps(name, groups, devices);
+        const otherGroupNames = Array.from(new Set(overlaps.reduce(function (all, item) {
+          return all.concat(item.otherGroups);
+        }, []))).sort();
+        const overlapNotice = overlaps.length
+          ? '<div class="wifi-feedback wifi-warning" role="status">' + overlaps.length + ' device(s) are also in ' + otherGroupNames.map(esc).join(', ') + '. If these groups have Wi-Fi policies, the last explicit deploy that succeeds on each device takes effect. Policies are not resent automatically.</div>'
+          : '';
         const head = renamingManageGroup
           ? '<div class="dev-edit"><input class="label-input" data-mg-rename maxlength="64" value="' + esc(renameGroupDraft) + '">' +
             '<button class="btn-mini btn-save" data-act="saveRename">Save</button>' +
@@ -2358,6 +2401,7 @@
             '<button class="btn btn-danger-outline" data-act="deleteGroup" data-group="' + esc(name) + '">Delete</button></div>';
         mgDetail.innerHTML =
           '<div class="mg-detail-head">' + head + '</div>' +
+          overlapNotice +
           '<div class="subtabs mg-tabs"><button class="subtab' + (manageTab === 'devices' ? ' active' : '') + '" data-act="manageTab" data-manage-tab="devices" aria-pressed="' + (manageTab === 'devices') + '">Devices</button>' +
           '<button class="subtab' + (manageTab === 'wifi' ? ' active' : '') + '" data-act="manageTab" data-manage-tab="wifi" aria-pressed="' + (manageTab === 'wifi') + '">Wi-Fi</button><div class="subtabs-fill"></div></div>' +
           '<div' + (manageTab === 'wifi' ? ' hidden' : '') + '><div class="mg-search"><input class="mg-search-input" data-mg-search placeholder="⌕ Search devices to add…" value="' + esc(manageSearch) + '">' +
@@ -2423,16 +2467,14 @@
         const list = filterSortDevices(manageSearch, manageSort);
         if (!list.length) return '<div class="empty small">No matching devices</div>';
         return list.map(function (d) {
-          const id = getDeviceId(d); const mem = manageMembers.has(id); const off = !isOnline(d);
-          const assignedElsewhere = window.MdmWifiConsole.membershipConflict(id, manageSelectedGroup, groups, [d.serial_number]);
-          const locked = !!assignedElsewhere && !mem;
-          return '<div class="mg-dev' + (locked ? ' wifi-member-locked' : '') + '" data-act="toggleMember" data-id="' + esc(id) + '"' +
-            (locked ? ' title="Assigned to ' + esc(assignedElsewhere) + '; remove it there before adding it here."' : '') + '>' +
-            '<div class="selbox ' + (mem ? 'on' : '') + (locked ? ' disabled' : '') + '">' + (mem ? '✓' : '') + '</div>' +
+          const id = getDeviceId(d); const mem = manageGroupHasDevice(id); const off = !isOnline(d);
+          const otherGroups = window.MdmWifiConsole.membershipGroups(id, groups, [d.serial_number]).filter(function (name) { return name !== manageSelectedGroup; });
+          return '<div class="mg-dev" data-act="toggleMember" data-id="' + esc(id) + '">' +
+            '<div class="selbox ' + (mem ? 'on' : '') + '">' + (mem ? '✓' : '') + '</div>' +
             '<div class="mg-dev-main">' +
             '<div>' + (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') + '</div>' +
             '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') +
-            (locked ? ' · Assigned to ' + esc(assignedElsewhere) : '') + '</div></div>' +
+            (otherGroups.length ? '<div class="mg-dev-overlap">Also in: ' + esc(otherGroups.join(', ')) + '</div>' : '') + '</div></div>' +
             '<div class="mg-dev-status"><span class="dot ' + (off ? 'off' : '') + '"></span>' + (off ? 'Offline' : 'Online') + '</div>' +
             '</div>';
         }).join('');
@@ -3172,13 +3214,11 @@
         }
         else if (act === 'toggleMember') {
           const id = t.dataset.id;
-          const nowMember = !manageMembers.has(id);
+          const wasMember = manageGroupHasDevice(id);
+          const nowMember = !wasMember;
           const device = deviceById(id);
-          const assignedElsewhere = window.MdmWifiConsole.membershipConflict(id, manageSelectedGroup, groups, device && [device.serial_number]);
-          if (nowMember && assignedElsewhere) {
-            addLog('Device ' + labelFor(id) + ' is already assigned to "' + assignedElsewhere + '". Remove it from that group before adding it here.', 'warn');
-            return;
-          }
+          const identities = [id, device && device.device_id, device && device.serial_number].filter(Boolean);
+          if (wasMember) identities.forEach(function (memberId) { manageMembers.delete(memberId); });
           if (nowMember) manageMembers.add(id); else manageMembers.delete(id);
           // Update only the clicked row + counts so the list keeps its scroll position.
           const box = t.querySelector('.selbox');
@@ -3186,12 +3226,7 @@
           updateMgCounts();
         }
         else if (act === 'saveMembers') {
-          const conflict = Array.from(manageMembers).map(function (id) {
-            const device = deviceById(id);
-            return { id: id, group: window.MdmWifiConsole.membershipConflict(id, manageSelectedGroup, groups, device && [device.serial_number]) };
-          }).find(function (item) { return item.group; });
-          if (conflict) addLog('Cannot save membership: ' + labelFor(conflict.id) + ' is already assigned to "' + conflict.group + '". Remove it from that group first.', 'warn');
-          else sendSetGroupMembers(manageSelectedGroup, Array.from(manageMembers));
+          sendSetGroupMembers(manageSelectedGroup, Array.from(manageMembers));
         }
         else if (act === 'cancelMembers') { manageMembers = new Set(groups[manageSelectedGroup] || []); renderManageDetail(); }
         else if (act === 'renameGroup') openRenameGroupEditor();

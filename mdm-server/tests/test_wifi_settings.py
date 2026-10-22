@@ -1,11 +1,10 @@
-"""Wi-Fi profile validation and encrypted persistence tests."""
+"""Wi-Fi profile validation and registry persistence tests."""
 
 from __future__ import annotations
 
 import json
 
 import pytest
-from cryptography.fernet import Fernet
 
 from styly_mdm.wifi_settings import (
     WiFiSettingsError,
@@ -25,16 +24,13 @@ def _networks(password: str | None = "correct-horse") -> list[dict]:
     }]
 
 
-def test_profile_state_is_encrypted_and_round_trips_without_delivery_history():
-    key = Fernet.generate_key()
-    store = WiFiSettingsStore(key)
+def test_profile_state_round_trips_without_delivery_history():
+    store = WiFiSettingsStore()
     profile = store.put_profile("Studio", validate_profile_networks(_networks()))
-    persisted = store.encrypted_state()
 
     changed = store.put_profile("Studio", validate_profile_networks(_networks(None), profile["networks"]))
     assert changed["revision"] != profile["revision"]
     assert changed["networks"][0]["password"] == "correct-horse"
-    assert b"correct-horse" not in persisted.encode("ascii")
     assert public_networks(changed["networks"]) == [{
         "ssid": "Studio Wi-Fi",
         "security": "WPA_PSK",
@@ -42,25 +38,24 @@ def test_profile_state_is_encrypted_and_round_trips_without_delivery_history():
         "hidden": False,
     }]
 
-    restored = WiFiSettingsStore(key, store.encrypted_state())
+    restored = WiFiSettingsStore(store.state)
     assert restored.profile("Studio") == changed
     assert restored.state == {"version": 1, "profiles": {"Studio": changed}}
 
 
-def test_unmanaged_profile_is_empty_and_encrypted():
-    key = Fernet.generate_key()
-    store = WiFiSettingsStore(key)
+def test_unmanaged_profile_is_empty_and_persisted():
+    store = WiFiSettingsStore()
     profile = store.put_profile("Studio", [], mode="unmanaged")
     assert profile["mode"] == "unmanaged"
     assert profile["networks"] == []
-    assert WiFiSettingsStore(key, store.encrypted_state()).profile("Studio") == profile
+    assert WiFiSettingsStore(store.state).profile("Studio") == profile
 
 
 def test_failed_registry_persistence_rolls_back_profile_state():
-    def fail(_encrypted: str) -> None:
+    def fail(_state: dict) -> None:
         raise WiFiStoreError("injected persistence failure")
 
-    store = WiFiSettingsStore(Fernet.generate_key(), persist=fail)
+    store = WiFiSettingsStore(persist=fail)
     with pytest.raises(WiFiStoreError):
         store.put_profile("Studio", validate_profile_networks(_networks()))
     assert store.profile("Studio") is None
@@ -91,7 +86,21 @@ def test_profile_validation_preserves_saved_password_and_accepts_overwrite():
 
 
 def test_unreleased_previous_wifi_storage_formats_are_rejected():
-    key = Fernet.generate_key()
-    wrong = Fernet(key).encrypt(json.dumps({"version": 2, "profiles": {}, "devices": {}}).encode()).decode()
+    wrong = {"version": 2, "profiles": {}, "devices": {}}
     with pytest.raises(WiFiStoreError, match="unsupported format"):
-        WiFiSettingsStore(key, wrong)
+        WiFiSettingsStore(wrong)
+
+
+def test_wifi_state_never_forwards_credentials_or_unvalidated_results():
+    from styly_mdm.wifi_settings import public_wifi_state
+    raw = {"managed": True, "policy_revision": "11111111-1111-4111-8111-111111111111",
+           "busy": False, "available": True, "unavailable_reason": None,
+           "password": "secret", "last_result": {
+               "operation_id": "22222222-2222-4222-8222-222222222222",
+               "revision": "11111111-1111-4111-8111-111111111111", "status": "failed",
+               "reason": "PERMISSION_DENIED", "rolled_back": False, "password": "secret"}}
+    state = public_wifi_state(raw)
+    assert "secret" not in json.dumps(state)
+    for value in ([], {}, {**raw, "busy": "yes"}, {**raw, "last_result": {"status": "success"}},
+                  {**raw, "unavailable_reason": ["secret"]}, {**raw, "policy_revision": "invalid"}):
+        assert public_wifi_state(value) is None

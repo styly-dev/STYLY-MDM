@@ -621,6 +621,147 @@ class WifiSettingsControllerTest {
         assertEquals("boot-b", empty.store.state.bootGeneration)
     }
 
+    @Test
+    fun `unchanged verified connected policy commits without mutations or disconnect`() {
+        val candidate = network("known-network")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = savedProfile(candidate)),
+            initialNetworks = listOf(candidate),
+            initialWifi = listOf(observation(10, candidate.ssid, hasIp = true)),
+        )
+        harness.apply(command(OPERATION_ID, REVISION_2, "managed", candidate))
+        assertEquals("success", harness.store.state.latestResult?.status)
+        assertEquals(REVISION_2, harness.store.state.policyRevision)
+        assertTrue(harness.adapter.applyCalls.isEmpty())
+        assertEquals(0, harness.adapter.disconnectCalls)
+        assertEquals(0, harness.adapter.captureRecoveryCalls)
+        assertTrue(harness.scheduledAlarmIds.isEmpty())
+    }
+
+    @Test
+    fun `changed password or unverified policy never uses unchanged fast path`() {
+        val candidate = network("known-network")
+        for (case in listOf("password", "autojoin", "hidden", "no-ip", "unknown-credentials")) {
+            val harness = Harness(
+                initialState = WifiLocalState(lastApplied = if (case == "unknown-credentials") null else savedProfile(candidate)),
+                initialNetworks = listOf(candidate),
+                initialWifi = listOf(observation(10, candidate.ssid, hasIp = case != "no-ip")),
+            )
+            if (case == "autojoin") harness.adapter.setAutoJoin(candidate.identity, false)
+            val target = when (case) {
+                "password" -> candidate.copy(password = "changed-secret")
+                "hidden" -> candidate.copy(hidden = !candidate.hidden)
+                else -> candidate
+            }
+            harness.adapter.afterDisconnect = { harness.connectivity.lose(10) }
+            harness.adapter.afterReconnect = { harness.connectivity.update(11, candidate.ssid, hasIp = true) }
+            harness.apply(command(OPERATION_ID, REVISION_2, "managed", target))
+            assertEquals(case, 1, harness.adapter.applyCalls.size)
+            assertEquals(case, 1, harness.adapter.disconnectCalls)
+            assertEquals(case, "success", harness.store.state.latestResult?.status)
+        }
+    }
+
+    @Test
+    fun `unmanaged abandons completed restore failure and stale rollback cannot mutate later`() {
+        val candidate = network("candidate")
+        val harness = Harness()
+        harness.adapter.restoreFailure = WifiReason.RESTORE_FAILED
+        harness.apply(command(OPERATION_ID, REVISION, "managed", candidate))
+        harness.timeout()
+        assertNotNull(harness.store.state.manualOperation)
+        harness.apply(command(OPERATION_ID_2, REVISION_2, "unmanaged"))
+        assertNull(harness.store.state.manualOperation)
+        assertFalse(harness.store.state.managedWifi)
+        val restoreCount = harness.adapter.restoreCalls.size
+        harness.watchdogs.forEach { it.task.run() }
+        harness.rollbackExecutor.runAll()
+        assertEquals(restoreCount, harness.adapter.restoreCalls.size)
+        harness.adapter.restoreFailure = null
+        harness.adapter.afterReconnect = { harness.connectivity.update(11, candidate.ssid, hasIp = true) }
+        harness.apply(command(OPERATION_ID_3, REVISION, "managed", candidate))
+        assertEquals("success", harness.store.state.latestResult?.status)
+    }
+
+    @Test
+    fun `unmanaged cannot release fence while restore owner can still mutate`() {
+        val harness = Harness()
+        harness.apply(command(OPERATION_ID, REVISION, "managed", network("candidate")))
+        harness.adapter.beforeRestore = {
+            harness.apply(command(OPERATION_ID_2, REVISION_2, "unmanaged"))
+            assertNotNull(harness.store.state.manualOperation)
+            assertTrue(harness.controller.stateSnapshot().getBoolean("busy"))
+        }
+        harness.adapter.restoreFailure = WifiReason.RESTORE_FAILED
+        harness.timeout()
+        assertNotNull(harness.store.state.manualOperation)
+        harness.apply(command(OPERATION_ID_3, REVISION_2, "unmanaged"))
+        assertNull(harness.store.state.manualOperation)
+    }
+
+    @Test
+    fun `state reports results without reconnect or secrets and removed listeners stop`() {
+        val harness = Harness()
+        val states = mutableListOf<JSONObject>()
+        val listener: () -> Unit = { states += harness.controller.stateSnapshot() }
+        harness.controller.addStateListener(listener)
+        harness.connectivity.preflightResult = WifiReason.PERMISSION_DENIED
+        harness.apply(command(OPERATION_ID, REVISION, "managed", network("private-ssid")))
+        val result = states.last().getJSONObject("last_result")
+        assertEquals("PERMISSION_DENIED", result.getString("reason"))
+        assertEquals(OPERATION_ID, result.getString("operation_id"))
+        assertFalse(states.last().getBoolean("busy"))
+        assertFalse(states.joinToString().contains("private-ssid"))
+        assertFalse(states.joinToString().contains("password"))
+        val count = states.size
+        harness.controller.removeStateListener(listener)
+        harness.apply(command(OPERATION_ID_2, REVISION_2, "unmanaged"))
+        assertEquals(count, states.size)
+        assertEquals(REVISION_2, harness.controller.stateSnapshot().getString("policy_revision"))
+    }
+
+    @Test
+    fun `busy rejection is reported while original journal remains active`() {
+        val harness = Harness()
+        harness.apply(command(OPERATION_ID, REVISION, "managed", network("candidate")))
+        harness.apply(command(OPERATION_ID_2, REVISION_2, "managed", network("next")))
+        val snapshot = harness.controller.stateSnapshot()
+        assertTrue(snapshot.getBoolean("busy"))
+        assertEquals("BUSY", snapshot.getJSONObject("last_result").getString("reason"))
+        assertEquals(OPERATION_ID, harness.store.state.manualOperation?.operationId)
+    }
+
+    @Test
+    fun `snapshots use cached readiness and refresh publishes changed permissions`() {
+        var reason: WifiReason? = WifiReason.PERMISSION_DENIED
+        var checks = 0
+        val harness = Harness(readinessCheck = { checks++; reason })
+        val baselineChecks = checks
+        repeat(5) {
+            assertFalse(harness.controller.stateSnapshot().getBoolean("available"))
+        }
+        assertEquals(baselineChecks, checks)
+        reason = null
+        harness.controller.refreshReadiness()
+        assertFalse(harness.controller.stateSnapshot().getBoolean("available"))
+        harness.operationExecutor.runAll()
+        assertTrue(harness.controller.stateSnapshot().getBoolean("available"))
+        assertEquals(baselineChecks + 1, checks)
+    }
+
+    @Test
+    fun `unreadable journal remains unknown and unmanaged cannot overwrite it`() {
+        val store = MemoryStore(WifiLocalState()).apply { failRead = true }
+        val harness = Harness(sharedStore = store)
+        assertFalse(harness.controller.startupCompletion().join())
+        harness.apply(command(OPERATION_ID, REVISION, "unmanaged"))
+        val snapshot = harness.controller.stateSnapshot()
+        assertTrue(snapshot.isNull("managed"))
+        assertEquals("STORAGE_ERROR", snapshot.getString("unavailable_reason"))
+        assertFalse(snapshot.getBoolean("available"))
+        assertTrue(store.state.processedOperationIds.isEmpty())
+    }
+
     private class Harness(
         initialState: WifiLocalState = WifiLocalState(),
         initialNetworks: List<WifiNetworkProfile> = emptyList(),
@@ -630,6 +771,7 @@ class WifiSettingsControllerTest {
         val sharedAdapter: FakeAdapter? = null,
         val sharedClock: MutableClock? = null,
         deferStartup: Boolean = false,
+        readinessCheck: () -> WifiReason? = { null },
     ) {
         val store = sharedStore ?: MemoryStore(initialState)
         val adapter = sharedAdapter ?: FakeAdapter(initialNetworks)
@@ -644,6 +786,7 @@ class WifiSettingsControllerTest {
         val controller = WifiSettingsController(
             WifiControllerDependencies(
                 store = store,
+                readinessFailure = readinessCheck,
                 adapter = adapter,
                 connectivity = connectivity,
                 nowElapsed = { clock.value },
@@ -711,7 +854,11 @@ class WifiSettingsControllerTest {
         @Volatile var state: WifiLocalState = initial
             private set
         var failWriteWhen: ((WifiLocalState) -> Boolean)? = null
-        override fun read(): WifiLocalState = state
+        var failRead = false
+        override fun read(): WifiLocalState {
+            if (failRead) throw IllegalStateException("injected read failure")
+            return state
+        }
         override fun write(state: WifiLocalState) {
             if (failWriteWhen?.invoke(state) == true) throw IllegalStateException("injected state write failure")
             this.state = state
@@ -777,6 +924,7 @@ class WifiSettingsControllerTest {
         var beforeApply: (() -> Unit)? = null
         var applyFailure: WifiReason? = null
         var restoreFailure: WifiReason? = null
+        var beforeRestore: (() -> Unit)? = null
         var afterCandidateMutationStarted: (() -> Unit)? = null
         var afterDisconnect: (() -> Unit)? = null
         var afterReconnect: (() -> Unit)? = null
@@ -864,6 +1012,7 @@ class WifiSettingsControllerTest {
             onMutationFinished: () -> Unit,
         ): WifiReason {
             restoreCalls += snapshot
+            beforeRestore?.invoke()
             restoreFailure?.let { return it }
             if (!shouldContinue()) return WifiReason.UNKNOWN
 
