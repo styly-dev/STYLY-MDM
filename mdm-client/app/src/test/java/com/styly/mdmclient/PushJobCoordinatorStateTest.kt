@@ -93,17 +93,14 @@ class PushJobCoordinatorStateTest {
     }
 
     @Test
-    fun `reset notice detail is a trimmed single line of bounded length`() {
-        val notice = PushStateResetNotice.corruptStateDiscarded(
-            IllegalArgumentException("  malformed\r\n durable\tstate " + "x".repeat(400)),
-        )
+    fun `reset notice detail is fixed and does not depend on parse error content`() {
+        val notice = PushStateResetNotice.corruptStateDiscarded()
         assertEquals(PushStateResetNotice.REASON_CORRUPT_STATE_DISCARDED, notice.reason)
-        assertTrue(notice.detail.startsWith("malformed durable state x"))
-        assertEquals(256, notice.detail.length)
+        assertEquals(
+            "Stored Push/Sync state was reset because its contents were invalid.",
+            notice.detail,
+        )
         assertFalse(notice.detail.contains('\n'))
-
-        val unnamed = PushStateResetNotice.corruptStateDiscarded(IllegalStateException())
-        assertEquals(IllegalStateException::class.java.name, unnamed.detail)
     }
 
     @Test

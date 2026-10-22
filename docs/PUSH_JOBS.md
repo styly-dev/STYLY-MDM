@@ -250,6 +250,9 @@ the terminal result when registered. The server remains authoritative for its
 canonical assignment until that exact result or later reconciliation is received.
 An expired resumed assignment can settle while still queued; it does not require
 another download dispatch to release server ownership.
+Durable-state load diagnostics never log exception text or causes, which can contain
+stored artifact URLs and lease credentials. Corrupt-state reset notices use fixed
+safe detail text for server logs and admin notifications.
 General startup/periodic removal of unreferenced files belongs to Issue #92.
 Server restart rebuilds artifact-retention references from durable job/device rows
 before cleanup, so queued, active, reconciling, and resumable assignments keep their
@@ -287,8 +290,13 @@ artifact bytes. HTTP leases follow the restart behavior described above.
   or interrupted devices paused until their own Resume or Resume all.
   A storage write failure with an exact retained partial uses the same manual
   Resume gate; the operator must free or repair device storage first.
-- **Cancel** persists an operator cancellation request for interrupted or unresolved
-  work, including offline status-confirmation waits. It revokes a still-active
+- **Cancel** finishes a never-dispatched queued target immediately on the server
+  when a running/reconciling job requires Resume, including offline targets after
+  server restart. It records `failed/cancelled` without a pending cancellation or
+  device command; no client owns that assignment. Cancelling the final unfinished
+  target terminalizes the job and allows normal artifact expiry.
+  For dispatched interrupted or unresolved work, Cancel persists an operator
+  cancellation request, including offline status-confirmation waits. It revokes a still-active
   HTTP lease and stops its stream even when the management WebSocket is offline.
   An online active worker is not directly cancellable. Pending cancellation disappears from Needs attention because no
   further operator action is needed, but remains visible in Devices. Ownership and
@@ -301,8 +309,9 @@ artifact bytes. HTTP leases follow the restart behavior described above.
   are not rolled back. Work already received and validating on an offline device
   may finish before cancellation is observed. Individual **Cancel** and **Cancel all**
   ask for confirmation; the latter shows the number of affected devices. Only
-  assignments dispatched with `push_resume_v1` can be cancelled; the snapshot
-  exposes this as `resume_supported`.
+  dispatched assignments with `push_resume_v1` can use client-confirmed cancellation;
+  the snapshot exposes this as `resume_supported`. Never-dispatched paused targets
+  can have `cancellable: true` while `resume_supported: false`.
 - Each snapshot assignment carries server-computed action flags from
   `push_jobs.assignment_actions`: `manual_wait` (a per-device wait for Resume),
   `resume_required`, `cancellable` (the same rule `CANCEL_PUSH_JOB` enforces), and
@@ -322,7 +331,10 @@ artifact bytes. HTTP leases follow the restart behavior described above.
   device fences intact. Offline targets are skipped and stay eligible for a later
   Retry; the request fails when no eligible target is online. Fenced targets wait
   for evidence that the previous worker is gone. Expired/missing artifacts require
-  a new upload. The request UUID makes replay idempotent. Shared artifact retention
+  a new upload. The request UUID makes replay idempotent: a repeated request returns
+  the existing retry job without enabling dispatch or clearing manual waits. A ready
+  retry job whose initial dispatch did not complete needs explicit dispatch/Resume.
+  Shared artifact retention
   is measured from the latest referencing terminal job, with active leases preserved.
   A target already included in a retry job is excluded from the original job's
   retry actions. An unconfirmed target with a remaining fence stays in Needs

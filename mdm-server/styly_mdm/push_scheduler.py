@@ -79,7 +79,7 @@ class PushScheduler:
         self._wake = asyncio.Event()
         self._runner: asyncio.Task[None] | None = None
         self._stopping = False
-        self._dispatch_tasks: set[asyncio.Task[None]] = set()
+        self._dispatch_tasks: dict[asyncio.Task[None], str] = {}
         self._accept_waiters: dict[
             tuple[str, str, int], asyncio.Future[tuple[str, dict[str, Any]]]
         ] = {}
@@ -164,7 +164,10 @@ class PushScheduler:
             self._wake.clear()
             while True:
                 try:
-                    assignment = await self.manager.claim_next(self.sessions().keys())
+                    # A disconnect can requeue work while its task still waits
+                    # for a slot. Keep one local task per device until it exits.
+                    eligible_devices = self.sessions().keys() - set(self._dispatch_tasks.values())
+                    assignment = await self.manager.claim_next(eligible_devices)
                     if assignment is None:
                         break
                     job_id = assignment["job"]["job_id"]
@@ -173,14 +176,14 @@ class PushScheduler:
                         self._dispatch_assignment(assignment),
                         name=f"push-{job_id}-{device_id}",
                     )
-                    self._dispatch_tasks.add(task)
+                    self._dispatch_tasks[task] = device_id
                     task.add_done_callback(self._dispatch_done)
                 except Exception:
                     log.exception("Unexpected failure in Push scheduler loop")
                     await asyncio.sleep(_RUN_RETRY_DELAY)
 
     def _dispatch_done(self, task: asyncio.Task[None]) -> None:
-        self._dispatch_tasks.discard(task)
+        self._dispatch_tasks.pop(task, None)
         if task.cancelled():
             return
         error = task.exception()

@@ -1796,23 +1796,24 @@ class PushRuntime:
                         if session.push_state_available
                         and PUSH_JOB_CAPABILITIES <= session.capabilities
                     ]
-                    _, snapshot = await self.manager.retry_failed(
+                    created, snapshot = await self.manager.retry_failed(
                         job_id, payload.get("client_request_id"),
                         artifact_root=self.artifacts.artifact_root,
                         online_devices=eligible,
                     )
                     retry_id = snapshot["job_id"]
-                    _, snapshot = await self.store.enable_dispatch(retry_id)
-                    # A target that disconnected before dispatch was enabled must not
-                    # start merely by reconnecting.
-                    for device_id in list(snapshot["devices"]):
-                        if device_id not in self.sessions:
-                            for offline_snapshot in (
-                                await self.manager.settle_offline_before_dispatch(
-                                    device_id, retry_id
-                                )
-                            ):
-                                snapshot = offline_snapshot
+                    if created:
+                        _, snapshot = await self.store.enable_dispatch(retry_id)
+                        # A target that disconnected before dispatch was enabled must not
+                        # start merely by reconnecting.
+                        for device_id in list(snapshot["devices"]):
+                            if device_id not in self.sessions:
+                                for offline_snapshot in (
+                                    await self.manager.settle_offline_before_dispatch(
+                                        device_id, retry_id
+                                    )
+                                ):
+                                    snapshot = offline_snapshot
                     await self.publish(await self.store.get_snapshot(job_id))
                     await self.publish(snapshot)
                 else:
@@ -1964,6 +1965,8 @@ class PushRuntime:
                 "Wait for the connected device to report interruption before cancelling"
             )
         snapshot = await self.manager.cancel_interrupted(job_id, device_id)
+        if snapshot["devices"][device_id]["state"] == DeviceState.FAILED.value:
+            return snapshot
         key = TransferKey("push", device_id, job_id, 1)
         token = self.leases.token(key)
         if token is not None:

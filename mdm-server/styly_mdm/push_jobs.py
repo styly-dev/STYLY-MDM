@@ -198,6 +198,7 @@ def assignment_actions(
     retried: bool,
     resume_supported: bool,
     blocking_fence: bool,
+    never_dispatched: bool = False,
     failure_code: str | None = None,
     superseded: bool = False,
     artifact_available: bool = False,
@@ -235,11 +236,21 @@ def assignment_actions(
     )
     cancellable = (
         open_for_action
-        and resume_supported
         and (
-            (state == DeviceState.QUEUED.value and queue_reason in MANUAL_WAIT_QUEUE_REASONS)
-            or state == DeviceState.RECONCILING.value
-            or (state == DeviceState.UNCONFIRMED.value and blocking_fence)
+            (
+                never_dispatched
+                and state == DeviceState.QUEUED.value
+                and job_state in {JobState.RUNNING.value, JobState.RECONCILING.value}
+                and resume_required
+            )
+            or (
+                resume_supported
+                and (
+                    (state == DeviceState.QUEUED.value and manual_wait)
+                    or state == DeviceState.RECONCILING.value
+                    or (state == DeviceState.UNCONFIRMED.value and blocking_fence)
+                )
+            )
         )
     )
     retryable = (

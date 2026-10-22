@@ -231,13 +231,11 @@ internal fun buildPushRegistrationFields(
 internal data class PushStateResetNotice(val reason: String, val detail: String) {
     companion object {
         const val REASON_CORRUPT_STATE_DISCARDED = "corrupt_state_discarded"
-        private const val MAX_DETAIL_LENGTH = 256
+        private const val CORRUPT_STATE_DETAIL =
+            "Stored Push/Sync state was reset because its contents were invalid."
 
-        fun corruptStateDiscarded(error: Throwable): PushStateResetNotice {
-            val message = error.message?.takeIf { it.isNotBlank() } ?: error.javaClass.name
-            val detail = message.replace(Regex("\\s+"), " ").trim().take(MAX_DETAIL_LENGTH)
-            return PushStateResetNotice(REASON_CORRUPT_STATE_DISCARDED, detail)
-        }
+        fun corruptStateDiscarded() =
+            PushStateResetNotice(REASON_CORRUPT_STATE_DISCARDED, CORRUPT_STATE_DETAIL)
     }
 }
 
@@ -533,28 +531,28 @@ class PushJobCoordinator internal constructor(
                 PushStateLoadResult.Missing -> dependencies.emptyState()
                 is PushStateLoadResult.Unreadable -> {
                     // The content is unknown. Never overwrite it with an empty snapshot.
-                    log(Log.ERROR, "Could not read durable Push/Sync state", result.error)
+                    log(Log.ERROR, "Could not read durable Push/Sync state", null)
                     return false
                 }
                 is PushStateLoadResult.InvalidReceipts -> {
                     // Retain all execution evidence until the snapshot can be repaired.
-                    log(Log.ERROR, "Preserving durable Push/Sync state with invalid receipts", result.error)
+                    log(Log.ERROR, "Preserving durable Push/Sync state with invalid receipts", null)
                     return false
                 }
                 is PushStateLoadResult.UnsupportedVersion -> {
-                    log(Log.ERROR, "Preserving unsupported durable Push/Sync state", result.error)
+                    log(Log.ERROR, "Preserving unsupported durable Push/Sync state", null)
                     return false
                 }
                 is PushStateLoadResult.InvalidActive -> {
                     // The active command may already have modified its destination.
                     // Preserve receipts and ownership evidence; never advertise absence.
-                    log(Log.ERROR, "Preserving durable Push/Sync state with invalid active command", result.error)
+                    log(Log.ERROR, "Preserving durable Push/Sync state with invalid active command", null)
                     return false
                 }
                 is PushStateLoadResult.Corrupt -> {
-                    log(Log.WARN, "Discarding unparseable durable Push/Sync state", result.error)
+                    log(Log.WARN, "Discarding unparseable durable Push/Sync state", null)
                     dependencies.discardState()
-                    resetNotices.record(PushStateResetNotice.corruptStateDiscarded(result.error))
+                    resetNotices.record(PushStateResetNotice.corruptStateDiscarded())
                     dependencies.emptyState()
                 }
             }
@@ -562,7 +560,7 @@ class PushJobCoordinator internal constructor(
             stateLoaded = true
             return true
         } catch (error: Throwable) {
-            log(Log.ERROR, "Could not load durable Push/Sync state", error)
+            log(Log.ERROR, "Could not load durable Push/Sync state", null)
             return false
         }
     }
