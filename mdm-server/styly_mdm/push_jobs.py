@@ -50,6 +50,8 @@ except ImportError:  # Python 3.10
 CAP_PUSH_JOB_ID_V1 = "push_job_id_v1"
 CAP_PUSH_PROGRESS_V1 = "push_progress_v1"
 CAP_PUSH_RESUME_V1 = "push_resume_v1"
+# Every Push job target must advertise both; there is no non-resumable fallback.
+PUSH_JOB_CAPABILITIES = frozenset({CAP_PUSH_JOB_ID_V1, CAP_PUSH_RESUME_V1})
 
 
 class PushMode(StrEnum):
@@ -89,6 +91,14 @@ class DeviceState(StrEnum):
     UNCONFIRMED = "unconfirmed"
 
 
+class ProgressEvent(StrEnum):
+    ACCEPTED = "accepted"
+    VALIDATION_STARTED = "validation_started"
+    TRANSFER_COMPLETE = "transfer_complete"
+    VALIDATION_COMPLETE = "validation_complete"
+    APPLYING = "applying"
+
+
 TERMINAL_JOB_STATES = frozenset(
     {
         JobState.SUCCEEDED,
@@ -115,6 +125,143 @@ ACTIVE_DEVICE_STATES = frozenset(
         DeviceState.RECONCILING,
     }
 )
+
+class DispatchPermission(StrEnum):
+    AUTOMATIC = "automatic"
+    OPERATOR_AUTHORIZED = "operator_authorized"
+    MANUAL_RESUME_REQUIRED = "manual_resume_required"
+
+
+# Decode persisted reasons into execution authority at one boundary. The stored
+# strings remain compatible with existing schema-3 databases and consoles.
+_QUEUE_PERMISSIONS = {
+    "resumable_replay": DispatchPermission.OPERATOR_AUTHORIZED,
+    **{reason: DispatchPermission.MANUAL_RESUME_REQUIRED for reason in (
+        "download_interrupted", "client_restarted", "dispatch_paused", "device_offline",
+    )},
+}
+MANUAL_WAIT_QUEUE_REASONS = frozenset(
+    reason for reason, permission in _QUEUE_PERMISSIONS.items()
+    if permission is DispatchPermission.MANUAL_RESUME_REQUIRED
+)
+# Constant SQL list literal for the reasons above (never built from input).
+MANUAL_WAIT_QUEUE_REASONS_SQL = (
+    "(" + ",".join(f"'{reason}'" for reason in sorted(MANUAL_WAIT_QUEUE_REASONS)) + ")"
+)
+
+
+def dispatch_permission(queue_reason: str | None) -> DispatchPermission:
+    return _QUEUE_PERMISSIONS.get(queue_reason, DispatchPermission.AUTOMATIC)
+
+
+def interrupted_queue_reason(
+    current: str | None, reported: str | None, transfer_interrupted: bool,
+) -> str:
+    if transfer_interrupted:
+        return "download_interrupted"
+    permission = dispatch_permission(current)
+    if permission is DispatchPermission.OPERATOR_AUTHORIZED:
+        return "resumable_replay"
+    if permission is DispatchPermission.MANUAL_RESUME_REQUIRED:
+        assert current is not None
+        return current
+    return "client_restarted" if reported == "client_restarted" else "dispatch_paused"
+
+
+def can_replay_unaccepted(
+    *, status: str, accepted_at: int | None, reconciliation_reason: str | None,
+    replay_count: int, dispatch_enabled: bool,
+) -> bool:
+    """Only a lost acceptance on an uninterrupted connection grants one replay."""
+    return (
+        status == "absent" and accepted_at is None
+        and reconciliation_reason == "command_accept_timeout"
+        and replay_count < 1 and dispatch_enabled
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AssignmentActions:
+    manual_wait: bool
+    resume_required: bool
+    cancellable: bool
+    retryable: bool
+
+
+def assignment_actions(
+    *,
+    job_state: str,
+    dispatch_enabled: bool,
+    state: str,
+    queue_reason: str | None,
+    cancel_requested: bool,
+    retried: bool,
+    resume_supported: bool,
+    blocking_fence: bool,
+    never_dispatched: bool = False,
+    failure_code: str | None = None,
+    superseded: bool = False,
+    artifact_available: bool = False,
+) -> AssignmentActions:
+    """Single source of truth for per-assignment operator actions.
+
+    Snapshots expose these flags so the console never re-derives the rules.
+    ``cancellable`` is the durable rule enforced by ``cancel_interrupted``; the
+    runtime additionally refuses to cancel a reconciling assignment while its
+    device is online, because that device can still report its outcome.
+    ``retryable`` is the rule ``retry_failed`` enforces before its online check.
+    A ``superseded`` target already has later work for the same destination, so
+    retrying it would overwrite newer content.
+    Retry also needs a published, retained artifact; its endpoint separately
+    validates the physical bytes before creating any replacement work.
+    """
+
+    manual_wait = (
+        state in {DeviceState.QUEUED.value, DeviceState.RECONCILING.value}
+        and dispatch_permission(queue_reason) is DispatchPermission.MANUAL_RESUME_REQUIRED
+    )
+    # Pending cancellation and targets moved to a retry job need no action here.
+    open_for_action = not cancel_requested and not retried
+    resume_required = (
+        open_for_action
+        and state not in TERMINAL_DEVICE_STATES
+        and (
+            manual_wait
+            or (
+                not dispatch_enabled
+                and job_state
+                in {JobState.READY.value, JobState.RUNNING.value, JobState.RECONCILING.value}
+            )
+        )
+    )
+    cancellable = (
+        open_for_action
+        and (
+            (
+                never_dispatched
+                and state == DeviceState.QUEUED.value
+                and job_state in {JobState.RUNNING.value, JobState.RECONCILING.value}
+                and resume_required
+            )
+            or (
+                resume_supported
+                and (
+                    (state == DeviceState.QUEUED.value and manual_wait)
+                    or state == DeviceState.RECONCILING.value
+                    or (state == DeviceState.UNCONFIRMED.value and blocking_fence)
+                )
+            )
+        )
+    )
+    retryable = (
+        open_for_action
+        and artifact_available
+        and not superseded
+        and state
+        in {DeviceState.FAILED.value, DeviceState.INTERRUPTED.value, DeviceState.UNCONFIRMED.value}
+        and failure_code not in {"cancelled", "artifact_missing"}
+    )
+    return AssignmentActions(manual_wait, resume_required, cancellable, retryable)
 
 
 JOB_TRANSITIONS: Mapping[JobState, frozenset[JobState]] = {

@@ -26,6 +26,11 @@ import pytest
 from aiohttp.test_utils import TestServer
 
 from styly_mdm import server
+from ws_test_helpers import (
+    device_row_matches,
+    receive_device_list as _recv_device_list,
+    receive_type as _recv_type,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -44,26 +49,11 @@ def reset_state():
     server.reset_transfer_slots()
 
 
-async def _recv_type(ws, msg_type: str, timeout: float = 2.0) -> dict | None:
-    try:
-        while True:
-            msg = await asyncio.wait_for(ws.receive(), timeout)
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                data = json.loads(msg.data)
-                if data.get("type") == msg_type:
-                    return data
-            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING,
-                              aiohttp.WSMsgType.ERROR):
-                return None
-    except asyncio.TimeoutError:
-        return None
-
-
-async def _register(session, base: str, device_id: str):
+async def _register(session, base: str, device_id: str, version_code: int = 7):
     ws = await session.ws_connect(base + "/ws/device")
     await ws.send_json({
         "type": "REGISTER", "identity_scheme": server.IDENTITY_SCHEME, "device_id": device_id, "model": "M",
-        "ip": "1.1.1.2", "version_code": 7, "version_name": "t",
+        "ip": "1.1.1.2", "version_code": version_code, "version_name": "t",
     })
     await _recv_type(ws, "REGISTERED")
     return ws
@@ -71,6 +61,90 @@ async def _register(session, base: str, device_id: str):
 
 def _row(device_list: dict, device_id: str) -> dict:
     return next(d for d in device_list["devices"] if d["device_id"] == device_id)
+
+
+def test_device_list_wait_skips_the_registering_snapshot(tmp_path):
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        ts = TestServer(server.create_app())
+        await ts.start_server()
+        base = f"http://{ts.host}:{ts.port}"
+        device_id = "64b19041-0b8c-4ef4-82fd-000000000000"
+        cancellations_started = asyncio.Event()
+        finish_cancellations = asyncio.Event()
+        registering_snapshot_seen = asyncio.Event()
+        device = None
+        admin = None
+        release_task = None
+        runtime = ts.app["push_runtime"]
+        original_pending_cancellations = runtime.manager.pending_cancellations_for_device
+
+        async def delayed_pending_cancellations(requested_device_id):
+            if requested_device_id == device_id:
+                cancellations_started.set()
+                await finish_cancellations.wait()
+            return await original_pending_cancellations(requested_device_id)
+
+        runtime.manager.pending_cancellations_for_device = delayed_pending_cancellations
+
+        class ObserveRegisteringSnapshot:
+            def __init__(self, websocket):
+                self.websocket = websocket
+
+            async def receive(self):
+                message = await self.websocket.receive()
+                if message.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(message.data)
+                    if device_row_matches(data, device_id, status="registering"):
+                        registering_snapshot_seen.set()
+                return message
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                device = await session.ws_connect(base + "/ws/device")
+                await device.send_json({
+                    "type": "REGISTER",
+                    "identity_scheme": server.IDENTITY_SCHEME,
+                    "device_id": device_id,
+                    "model": "M",
+                    "ip": "1.1.1.2",
+                    "version_code": 7,
+                    "version_name": "t",
+                    "push_state": {"status": "available"},
+                })
+                assert await _recv_type(device, "REGISTERED") is not None
+                await asyncio.wait_for(cancellations_started.wait(), timeout=2)
+                assert server.devices[device_id]["registration_ready"] is True
+                assert server.devices[device_id]["status"] == "registering"
+
+                admin = await session.ws_connect(base + "/ws/admin")
+
+                async def release_after_stale_snapshot():
+                    await asyncio.wait_for(registering_snapshot_seen.wait(), timeout=2)
+                    finish_cancellations.set()
+
+                release_task = asyncio.create_task(release_after_stale_snapshot())
+                final_list = await _recv_type(
+                    ObserveRegisteringSnapshot(admin),
+                    "DEVICE_LIST",
+                    predicate=lambda message: device_row_matches(
+                        message, device_id, status="online"
+                    ),
+                )
+                assert registering_snapshot_seen.is_set()
+                assert final_list is not None
+                assert device_row_matches(final_list, device_id, status="online")
+                await release_task
+                await device.close()
+                await admin.close()
+        finally:
+            finish_cancellations.set()
+            if release_task is not None and not release_task.done():
+                release_task.cancel()
+                await asyncio.gather(release_task, return_exceptions=True)
+            await ts.close()
+
+    asyncio.run(body())
 
 
 def test_e2e_stale_connection_teardown_keeps_the_live_device_online(tmp_path):
@@ -85,13 +159,18 @@ def test_e2e_stale_connection_teardown_keeps_the_live_device_online(tmp_path):
                 # The pre-reboot connection, still open server-side.
                 stale = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
-                dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "online"
+                device_id = "64b19041-0b8c-4ef4-82fd-000000000000"
+                dl = await _recv_device_list(admin, device_id, status="online")
+                assert dl is not None
 
                 # The rebooted client reconnects and re-registers.
-                live = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
-                dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "online"
+                live = await _register(
+                    session, base, device_id, version_code=8
+                )
+                dl = await _recv_device_list(
+                    admin, device_id, status="online", version_code=8
+                )
+                assert dl is not None
 
                 # The stale socket finally dies. The device is still connected,
                 # so it must stay online.
@@ -104,8 +183,10 @@ def test_e2e_stale_connection_teardown_keeps_the_live_device_online(tmp_path):
                 await live.send_json({
                     "type": "BATTERY_UPDATE", "level": 55, "charging": False,
                 })
-                dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "online"
+                dl = await _recv_device_list(
+                    admin, device_id, status="online", battery={"level": 55}
+                )
+                assert dl is not None
                 assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["battery"]["level"] == 55
                 assert not live.closed
 
@@ -127,9 +208,17 @@ def test_e2e_battery_update_on_a_superseded_socket_is_ignored(tmp_path):
         try:
             async with aiohttp.ClientSession() as session:
                 stale = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
-                live = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
+                live = await _register(
+                    session, base, "64b19041-0b8c-4ef4-82fd-000000000000",
+                    version_code=8,
+                )
                 admin = await session.ws_connect(base + "/ws/admin")
-                assert await _recv_type(admin, "DEVICE_LIST") is not None
+                assert await _recv_device_list(
+                    admin,
+                    "64b19041-0b8c-4ef4-82fd-000000000000",
+                    status="online",
+                    version_code=8,
+                ) is not None
 
                 # Telemetry from the socket the device has already replaced.
                 await stale.send_json({
@@ -142,7 +231,13 @@ def test_e2e_battery_update_on_a_superseded_socket_is_ignored(tmp_path):
                 await live.send_json({
                     "type": "BATTERY_UPDATE", "level": 66, "charging": True,
                 })
-                dl = await _recv_type(admin, "DEVICE_LIST")
+                dl = await _recv_device_list(
+                    admin,
+                    "64b19041-0b8c-4ef4-82fd-000000000000",
+                    status="online",
+                    battery={"level": 66},
+                )
+                assert dl is not None
                 assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["battery"]["level"] == 66
                 assert not live.closed
 
@@ -166,12 +261,13 @@ def test_e2e_single_connection_disconnect_still_goes_offline(tmp_path):
             async with aiohttp.ClientSession() as session:
                 only = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
-                dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "online"
+                device_id = "64b19041-0b8c-4ef4-82fd-000000000000"
+                dl = await _recv_device_list(admin, device_id, status="online")
+                assert dl is not None
 
                 await only.close()
-                dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "offline"
+                dl = await _recv_device_list(admin, device_id, status="offline")
+                assert dl is not None
                 assert "64b19041-0b8c-4ef4-82fd-000000000000" not in server.devices
                 assert server.device_registry["64b19041-0b8c-4ef4-82fd-000000000000"]["last_seen"] > 0
 
@@ -198,7 +294,11 @@ def test_e2e_download_complete_on_a_superseded_socket_does_not_release_the_slot(
                 stale = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 live = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
-                assert await _recv_type(admin, "DEVICE_LIST") is not None
+                assert await _recv_device_list(
+                    admin,
+                    "64b19041-0b8c-4ef4-82fd-000000000000",
+                    status="online",
+                ) is not None
                 await asyncio.sleep(0.1)
 
                 slot = asyncio.get_running_loop().create_future()
@@ -241,7 +341,9 @@ def test_e2e_terminal_result_on_a_superseded_socket_is_not_forwarded(tmp_path):
                 stale = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 live = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
-                assert await _recv_type(admin, "DEVICE_LIST") is not None
+                assert await _recv_device_list(
+                    admin, "64b19041-0b8c-4ef4-82fd-000000000000", status="online"
+                ) is not None
                 await asyncio.sleep(0.1)
 
                 await stale.send_json({

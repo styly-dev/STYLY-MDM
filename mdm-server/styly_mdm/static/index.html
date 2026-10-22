@@ -135,6 +135,24 @@
     .subtab.active { color: var(--text-primary); border-bottom-color: var(--accent); }
     .subtab.active .cnt { color: var(--text-secondary); }
     .subtabs-fill { flex: 1; border-bottom: 1px solid var(--border); align-self: stretch; }
+    .attention-tab-actions {
+      margin: 12px 20px 0; padding: 12px 14px;
+      background: #162033; border: 1px solid #25324a; border-radius: 8px;
+    }
+    .attention-tab-actions-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .attention-tab-actions-copy { min-width: 0; }
+    .attention-tab-actions-title { color: var(--text-primary); font-size: 13px; font-weight: 600; }
+    .attention-tab-actions-note { margin-top: 3px; color: var(--text-secondary); font-size: 11px; line-height: 1.4; }
+    .attention-tab-actions-buttons { display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+    .attention-tab-action[data-action="resume"] { background: var(--warning); border-color: var(--warning); color: #17130a; }
+    .attention-tab-action[data-action="resume"]:hover:not(:disabled) { background: #f5b91e; border-color: #f5b91e; color: #17130a; }
+    .attention-tab-action[data-action="cancel"] { color: var(--danger); border-color: rgba(248, 113, 113, .55); }
+    .attention-tab-action[data-action="cancel"]:hover:not(:disabled) { border-color: var(--danger); background: rgba(248, 113, 113, .08); }
+    .attention-tab-job-list { display: flex; flex-direction: column; gap: 7px; margin-top: 11px; padding-top: 10px; border-top: 1px solid var(--border-soft); }
+    .attention-tab-job { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12px; }
+    .attention-tab-job-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); }
+    .attention-tab-job-buttons { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+    .attention-tab-job-buttons .push-job-action { min-height: 26px; padding: 3px 8px; font-size: 11px; }
 
     .targets-body { padding: 0; flex: 1 1 0; min-height: 0; overflow-y: auto; }
 
@@ -186,7 +204,7 @@
     .seg-btn:hover { color: var(--text-primary); }
     .seg-btn.active { background: var(--accent); color: #fff; }
     .dev-table { width: 100%; }
-    .dev-row { display: grid; grid-template-columns: 42px minmax(0, 2fr) minmax(76px, .7fr) minmax(96px, .85fr) minmax(92px, 1fr); align-items: center; padding: 10px 0; padding-left: 18px; border-top: 1px solid var(--border-soft); font-size: 13px; }
+    .dev-row { display: grid; grid-template-columns: 42px minmax(0, 1.7fr) minmax(76px, .65fr) minmax(76px, .65fr) minmax(96px, .8fr) minmax(112px, 1.15fr); align-items: center; padding: 10px 0; padding-left: 18px; border-top: 1px solid var(--border-soft); font-size: 13px; }
     .dev-head { padding-top: 9px; padding-bottom: 9px; border-top: none; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .5px; }
     .dev-row.offline { opacity: .55; }
     .dev-row.offline:hover { opacity: .75; }
@@ -203,17 +221,22 @@
     .dev-label-row { display: flex; align-items: center; gap: 6px; }
     .dev-label { font-weight: 600; font-size: 14px; }
     .dev-label.unlabeled { color: var(--text-secondary); font-weight: 400; }
-    /* Client build, pulled out of the grey sub-line and right-aligned so laggards are
-       scannable down the list after a rollout. Muted + "unknown" for pre-version clients. */
-    .dev-version { margin-left: auto; flex: 0 0 auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-weight: 600; color: var(--text-secondary); background: var(--bg-actions); border: 1px solid var(--border-soft); border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
+    .dev-client { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 5px; padding-right: 10px; }
+    /* A dedicated column keeps client builds aligned independently of device labels
+       and of the resizable Targets pane. Muted + "unknown" for pre-version clients. */
+    .dev-version { flex: 0 0 auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-weight: 600; color: var(--text-secondary); background: var(--bg-actions); border: 1px solid var(--border-soft); border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
     .dev-version.unknown { color: var(--text-muted); font-weight: 400; }
     .dev-version.mismatch { color: var(--danger); border-color: var(--danger); font-weight: 700; }
-    .btn-update { margin-left: 6px; flex: 0 0 auto; font: 600 11px/1 inherit; color: #fff; background: var(--accent); border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; white-space: nowrap; }
+    .btn-update { flex: 0 0 auto; font: 600 11px/1 inherit; color: #fff; background: var(--accent); border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; white-space: nowrap; }
     .btn-update:hover { background: var(--accent-hover); }
     .copy-device-id { background: none; border: 0; padding: 0; color: inherit; font: inherit; cursor: pointer; }
     .copy-device-id:hover { text-decoration: underline; }
     .copy-device-id:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
     .copy-id-status:not(:empty) { margin-left: 6px; }
+    .push-state-warning { display: flex; align-items: center; flex-wrap: wrap; min-width: 0; gap: 4px 7px; color: var(--warning); line-height: 1.3; }
+    .push-state-warning-icon { flex: 0 0 auto; font-size: 11px; }
+    .push-state-warning-label { min-width: 0; overflow-wrap: anywhere; }
+    .push-state-warning-hint { color: var(--text-secondary); font-size: 11px; }
     .dev-sub { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .dev-status { font-size: 13px; }
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 6px; vertical-align: middle; }
@@ -232,6 +255,19 @@
     .battery-note { color: var(--text-muted); font-size: 11px; margin-left: 4px; }
     .battery-muted { color: var(--text-dim); }
     .dev-task { font-size: 12px; padding-right: 14px; }
+    .push-job-actions { display: inline-flex; align-items: center; gap: 6px; margin-left: 6px; vertical-align: middle; }
+    .push-job-action {
+      display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
+      min-height: 28px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px;
+      background: transparent; color: var(--text-secondary); font-family: inherit; font-size: 12px;
+      font-weight: 600; line-height: 1.2; white-space: nowrap; cursor: pointer;
+      transition: color .15s, border-color .15s, background .15s;
+    }
+    .push-job-action:hover:not(:disabled) { color: var(--text-primary); border-color: #394056; background: var(--bg-tertiary); }
+    .push-job-action[data-action="cancel"] { color: var(--danger); border-color: rgba(248, 113, 113, .55); }
+    .push-job-action[data-action="cancel"]:hover:not(:disabled) { border-color: var(--danger); background: rgba(248, 113, 113, .08); }
+    .push-job-action:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+    .push-job-action:disabled { opacity: .55; cursor: wait; }
     .ins-queued { color: var(--text-muted); }
     .ins-transferring { color: var(--info); }
     .ins-installing { color: var(--warning); }
@@ -275,12 +311,9 @@
 
     .push-attention { margin: 0 18px 12px; padding: 11px 12px; max-height: 180px; overflow-y: auto; background: #2a2415; border: 1px solid #665321; border-radius: 8px; }
     .push-attention-title { color: var(--warning); font-size: 11px; font-weight: 700; letter-spacing: .7px; text-transform: uppercase; margin-bottom: 7px; }
-    .push-attention-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-primary); }
-    .push-attention-item + .push-attention-item { margin-top: 7px; padding-top: 7px; border-top: 1px solid #55461f; }
-    .push-attention-job { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .push-resume { flex: 0 0 auto; border: none; border-radius: 5px; padding: 5px 10px; background: var(--warning); color: #17130a; font: 600 12px inherit; cursor: pointer; }
-    .push-resume:disabled { opacity: .55; cursor: wait; }
-
+    .push-attention-summary { display: flex; align-items: center; gap: 10px; }
+    .push-attention-message { min-width: 0; flex: 1 1 auto; color: var(--text-primary); font-size: 12px; line-height: 1.4; }
+    .push-attention-open { flex: 0 0 auto; }
     .commands { padding: 0 18px 18px; display: flex; flex-direction: column; gap: 14px; flex: 1 1 0; min-height: 0; overflow-y: auto; }
     .cmd-divider { height: 1px; background: var(--border); }
     .cmd-head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 8px; cursor: pointer; user-select: none; }
@@ -418,6 +451,7 @@
             <button class="subtab" id="tabAttention" data-tab="attention">Needs attention <span class="cnt" id="cntAttention">0</span></button>
             <div class="subtabs-fill"></div>
           </div>
+          <div class="attention-tab-actions" id="pushJobsTabActions" style="display:none"></div>
           <div class="dev-toolbar" id="devToolbar" style="display:none">
             <input class="dev-search-input" id="devSearch" data-dev-search maxlength="64" placeholder="⌕ Filter devices by name…">
             <div class="seg" id="devStatusFilter" role="group" aria-label="Filter by connection status">
@@ -618,7 +652,7 @@
       let userPickedTab = false;       // true once the user clicks a sub-tab (stops auto-default)
       let expandedGroups = new Set();  // group names expanded to show per-device status
       let view = 'console';            // 'console' | 'manage'
-      let deviceTaskState = {};           // id -> { task, status, filename, detail, note, verb }
+      let deviceTaskState = {};           // Latest Install/Verify or legacy Push state; job-v1 Push lives in its canonical store.
       let editingLabelId = null;
       // The rows are re-rendered from scratch on every DEVICE_LIST (a battery report from
       // any device triggers one), which destroys the open editor's <input>. Keep the typed
@@ -672,6 +706,7 @@
       const cntDevices = document.getElementById('cntDevices');
       const cntAttention = document.getElementById('cntAttention');
       const targetsBody = document.getElementById('targetsBody');
+      const pushJobsTabActions = document.getElementById('pushJobsTabActions');
       const devToolbar = document.getElementById('devToolbar');
       const devSearchInput = document.getElementById('devSearch');
       const devStatusFilter = document.getElementById('devStatusFilter');
@@ -812,7 +847,20 @@
         el.title = 'Download ' + clientApk.filename + ' to this machine for manual install';
         el.classList.add('shown');
       }
-      function deviceById(id) { return devices.find(function (d) { return getDeviceId(d) === id; }); }
+      // DEVICE_LIST replaces `devices` wholesale, so the index is rebuilt once per list.
+      let deviceIndexSource = null;
+      let deviceIndex = new Map();
+      function deviceById(id) {
+        if (deviceIndexSource !== devices) {
+          deviceIndex = new Map();
+          devices.forEach(function (d) {
+            const key = getDeviceId(d);
+            if (!deviceIndex.has(key)) deviceIndex.set(key, d);
+          });
+          deviceIndexSource = devices;
+        }
+        return deviceIndex.get(id);
+      }
       function connectionById(id) { return provisionalConnections.find(function (c) { return c.connection_id === id; }); }
       function shortConnectionId(id) { return id ? String(id).slice(0, 8) : '-'; }
       function attentionPowerSupported(entry) {
@@ -821,11 +869,16 @@
       function attentionLabelFor(id) {
         const entry = connectionById(id);
         if (!entry) return shortConnectionId(id);
-        return (entry.model || 'Unknown device') + ' (' + (entry.ip || 'unknown') + ', ' + shortConnectionId(id) + ')';
+        return (entry.model || shortConnectionId(id)) + ' (' + (entry.ip || 'unknown') + ', ' + shortConnectionId(id) + ')';
       }
       // Command targets need a live WebSocket, which "updating" (mid self-update,
       // device rebooting) does not have — only strictly-online devices qualify.
       function getOnlineIds() { return devices.filter(function (d) { return d.status === 'online'; }).map(getDeviceId).filter(Boolean); }
+      // The device retries its durable Push state by itself for about five minutes,
+      // then waits for the next app start; the operator frees storage and reboots.
+      function pushStateUnavailable(d) {
+        return !!(d && d.status === 'online' && d.push_state_status === 'unavailable');
+      }
       function knownIds() { return new Set(devices.map(getDeviceId).filter(Boolean)); }
       function labelFor(id) { if (!id) return '-'; const d = deviceById(id); return (d && d.label) ? d.label : id; }
       // Shared filter/sort for both the main Devices list and the Manage Groups picker
@@ -962,8 +1015,13 @@
             // getOnlineIds() on purpose: a device mid self-update ("updating") has no
             // live socket but its Updating… cell must survive the list refresh.
             const keepTask = new Set(devices.filter(isOnline).map(getDeviceId));
-            Object.keys(deviceTaskState).forEach(function (id) { if (!keepTask.has(id)) delete deviceTaskState[id]; });
+            Object.keys(deviceTaskState).forEach(function (id) {
+              if (!keepTask.has(id)) {
+                delete deviceTaskState[id];
+              }
+            });
             syncActiveGroupSelection();
+            if (window.__stylyPushJobsV1Actions) window.__stylyPushJobsV1Actions.refreshConnectivity();
             render();
             break;
           }
@@ -1010,7 +1068,7 @@
           case 'REBOOT_RESULT': logPowerResult('Reboot', msg); break;
           case 'POWER_OFF_RESULT': logPowerResult('Power off', msg); break;
           case 'INSTALL_SENT': addLog('Install job queued for ' + msg.target_count + ' device(s)' + (msg.max_concurrent ? ' (max ' + msg.max_concurrent + ' concurrent transfer(s))' : ''), 'info'); break;
-          case 'INSTALL_PROGRESS': showTransferProgress('install', msg); break;
+          case 'INSTALL_PROGRESS': showTransferProgress(msg); break;
           case 'INSTALL_DEVICE_STATE': {
             // Per-device companion to INSTALL_PROGRESS: the aggregate counts cannot
             // be mapped back to rows, so the server names the devices it moved.
@@ -1027,37 +1085,11 @@
             addLog('[' + (msg.status === 'success' ? 'OK' : 'FAIL') + '] install ' + (msg.apk_filename || '-') + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), st);
             break;
           }
-          case 'PUSH_FILES_SENT': addLog((msg.delete_extras ? 'Sync' : 'Push') + ' job queued for ' + msg.target_count + ' device(s) → ' + (msg.dest_path || '-') + (msg.max_concurrent ? ' (max ' + msg.max_concurrent + ' concurrent transfer(s))' : ''), 'info'); break;
-          case 'PUSH_PROGRESS': showTransferProgress('push', msg); break;
-          case 'PUSH_DEVICE_STATE': {
-            // Per-device companion to PUSH_PROGRESS, mirroring INSTALL_DEVICE_STATE.
-            const verb = msg.delete_extras ? 'Sync' : 'Push';
-            (msg.device_ids || []).forEach(function (id) {
-              deviceTaskState[id] = { task: 'push', status: msg.state, verb: verb, filename: msg.dest_path || '', note: '', detail: msg.detail || '' };
-              updateTaskCell(id);
-            });
+          case 'PUSH_FILES_SENT': addLog((msg.delete_extras ? 'Sync' : 'Push') + (msg.resume ? ' resume requested for ' : ' job queued for ') + msg.target_count + ' device(s) → ' + (msg.dest_path || '-') + (msg.max_concurrent ? ' (max ' + msg.max_concurrent + ' concurrent transfer(s))' : ''), 'info'); break;
+          case 'PUSH_STATE_RESET':
+            addLog('Push state on ' + labelFor(msg.device_id) + ' was unreadable and has been reset' +
+              (msg.detail ? ' - ' + msg.detail : '') + '; unfinished Push/Sync status on it may show as interrupted', 'warn');
             break;
-          }
-          case 'PUSH_FILES_RESULT': {
-            const st = msg.status === 'success' ? 'success' : 'fail';
-            const summary = '+' + (msg.added || 0) + ' ~' + (msg.updated || 0) + ' -' + (msg.deleted || 0);
-            const detail = msg.error || msg.message || '';
-            // PUSH_FILES_RESULT does not name the mode, so carry the verb over from the
-            // PUSH_DEVICE_STATE transitions that preceded it.
-            const prev = msg.device_id ? deviceTaskState[msg.device_id] : null;
-            const verb = (prev && prev.task === 'push' && prev.verb) || 'Push';
-            if (msg.device_id) {
-              deviceTaskState[msg.device_id] = { task: 'push', status: st, verb: verb, filename: msg.dest_path || '', note: st === 'success' ? summary : '', detail: detail };
-              updateTaskCell(msg.device_id);
-            }
-            const what = verb.toLowerCase();
-            if (st === 'success') {
-              addLog('[OK] ' + what + ' to ' + (msg.dest_path || '-') + ' on ' + labelFor(msg.device_id) + ' (' + summary + ')', 'success');
-            } else {
-              addLog('[FAIL] ' + what + ' to ' + (msg.dest_path || '-') + ' on ' + labelFor(msg.device_id) + (detail ? ' - ' + detail : ''), 'fail');
-            }
-            break;
-          }
           case 'DEVICE_LABEL_SET': addLog('Label set: ' + (msg.device_id || '-') + ' -> ' + (msg.label || '(cleared)'), 'success'); break;
           case 'DEVICE_FORGOTTEN': addLog('Device forgotten: ' + (msg.device_id || '-'), 'success'); break;
           case 'GROUP_CREATED': addLog('Group created: ' + (msg.name || '-'), 'success'); if (view === 'manage') pendingSelectGroup = msg.name; break;
@@ -1142,11 +1174,13 @@
       function renderTabs() {
         cntGroups.textContent = groupNames().length;
         cntDevices.textContent = devices.length;
-        cntAttention.textContent = provisionalConnections.length;
-        tabAttention.classList.toggle('has-items', provisionalConnections.length > 0);
+        const attentionCount = provisionalConnections.length + pushAttentionDevices().length;
+        cntAttention.textContent = attentionCount;
+        tabAttention.classList.toggle('has-items', attentionCount > 0);
         tabGroups.classList.toggle('active', targetTab === 'groups');
         tabDevices.classList.toggle('active', targetTab === 'devices');
         tabAttention.classList.toggle('active', targetTab === 'attention');
+        pushJobsTabActions.style.display = targetTab === 'attention' && pushJobsTabActions.children.length ? '' : 'none';
       }
 
       function renderTargets() {
@@ -1164,9 +1198,31 @@
         if (targetTab === 'devices') restoreLabelEditFocus(hadFocus);
       }
 
+      function pushAssignmentFor(id) {
+        const actions = window.__stylyPushJobsV1Actions;
+        return actions ? actions.assignmentFor(id) : null;
+      }
+
+      function pushAttentionDevices() {
+        return devices.filter(function (device) {
+          const assignment = pushAssignmentFor(getDeviceId(device));
+          return (assignment && assignment.needsAttention) || pushStateUnavailable(device);
+        });
+      }
+
       function renderAttentionHtml() {
-        if (!provisionalConnections.length) return '<div class="empty">No devices need attention</div>';
-        return '<div class="attention-list"><div class="attention-head">' +
+        const canonical = pushAttentionDevices();
+        if (!provisionalConnections.length && !canonical.length) return '<div class="empty">No devices need attention</div>';
+        const jobs = canonical.length ? '<div class="attention-list"><div class="zone-label">Push / Sync jobs and state</div>' +
+          canonical.map(function (device) {
+            const id = getDeviceId(device);
+            return '<div class="attention-row"><div></div><div class="attention-device">' +
+              '<div class="attention-model">' + esc(labelFor(id)) + '</div>' +
+              '<div class="attention-meta">' + esc(device.status || 'unknown') + ' · ' + esc(device.ip || '-') + '</div></div>' +
+              '<div class="dev-task" data-task-id="' + esc(id) + '">' + progressCellHtml(id) + '</div></div>';
+          }).join('') + '</div>' : '';
+        if (!provisionalConnections.length) return jobs;
+        return jobs + '<div class="attention-list"><div class="zone-label">Device identity · connection power controls</div><div class="attention-head">' +
           '<div class="selbox ' + attentionSelectAllState() + (attentionSelectableCount() ? '' : ' disabled') + '" data-act="selectAllAttention">' + attentionSelectAllGlyph() + '</div>' +
           '<div>Connection</div><div>Status</div></div>' +
           provisionalConnections.map(function (entry) {
@@ -1177,7 +1233,7 @@
           return '<div class="attention-row' + (supported ? '' : ' unsupported') + '">' +
             '<div class="selbox ' + (checked ? 'on' : '') + (supported ? '' : ' disabled') + '"' +
               (supported ? ' data-act="toggleAttention" data-id="' + esc(connectionId) + '"' : ' aria-disabled="true"') + '>' + (checked ? '✓' : '') + '</div>' +
-            '<div class="attention-device"><div class="attention-model">' + esc(entry.model || 'Unknown device') + '</div>' +
+            '<div class="attention-device"><div class="attention-model">' + esc(entry.model || shortConnectionId(connectionId)) + '</div>' +
             '<div class="attention-meta">' + esc(entry.ip || 'unknown') + ' · ' + esc(version) + '</div></div>' +
             '<div class="attention-detail">' + (supported
               ? '<div class="attention-status">' + esc(entry.identity_status || 'unknown') + '</div>'
@@ -1253,7 +1309,7 @@
             '<span class="dot ' + (updating ? 'updating' : off ? 'off' : '') + '"></span>' +
             '<span class="group-dev-name">' + esc(label) + '</span>' +
             '<span class="group-dev-status">' + status + '</span>' +
-            '<span class="group-dev-task" data-task-id="' + esc(serial) + '">' + taskCellHtml(serial) + '</span>' +
+            '<span class="group-dev-task" data-task-id="' + esc(serial) + '">' + progressCellHtml(serial) + '</span>' +
             '</div>';
         }).join('');
       }
@@ -1264,7 +1320,7 @@
         html += '<div class="dev-row dev-head">' +
           '<div class="selbox ' + selectAllState() + '" data-act="selectAll">' + selectAllGlyph() + '</div>' +
           '<div class="dev-sort-head" data-act="sortDevices" title="Sort by name">Device<span class="sort-arrow">' + sortArrowGlyph() + '</span></div>' +
-          '<div>Status</div><div>Battery</div><div>Progress</div></div>';
+          '<div>Client</div><div>Status</div><div>Battery</div><div>Progress</div></div>';
         html += '<div id="devRows">' + deviceRowsHtml() + '</div>';
         html += '</div>';
         return html;
@@ -1304,6 +1360,19 @@
         const off = !isOnline(d);
         const kept = keptBySelection(d);
         const startup = d.startup_app && d.startup_app.package_name;
+        // Client metadata has its own column so label editing, long labels, and pane
+        // resizing cannot move the version badge horizontally.
+        const verBehind = deviceVerBehind(d);
+        const verBadge = d.version_name
+          ? '<span class="dev-version' + (verBehind ? ' mismatch' : '') + '" title="' +
+              (verBehind ? 'Client v' + esc(d.version_name) + ' trails server ' + esc(serverVersion) + ' — needs updating' : 'Client build') +
+              '">v' + esc(d.version_name) + '</span>'
+          : '<span class="dev-version unknown" title="Client build unknown (device predates version reporting)">unknown</span>';
+        const canUpdate = canUpdateDevice(d);
+        const updateBtn = canUpdate
+          ? '<button class="btn-update" data-act="update" data-id="' + esc(id) + '" title="Install styly-mdm-client v' + esc(clientApk.version) + ' (the device reinstalls the MDM client and restarts)">Update</button>'
+          : '';
+        const clientCell = verBadge + updateBtn;
         let deviceCell;
         if (editingLabelId === id) {
           deviceCell = '<div class="dev-edit">' +
@@ -1311,27 +1380,10 @@
             '<button class="btn-mini btn-save" data-act="saveLabel" data-id="' + esc(id) + '">Save</button>' +
             '<button class="btn-mini btn-cancel" data-act="cancelLabel">Cancel</button></div>';
         } else {
-          // Client build, right-aligned in the label row so it reads as a column across
-          // rows; older clients that predate the version field show a muted "unknown".
-          // A stable-online client whose major.minor trails the server needs updating,
-          // so its badge is flagged red. A client *ahead* of the server is the server's
-          // problem, not the device's — that reddens the top-bar version instead.
-          const verBehind = deviceVerBehind(d);
-          const verBadge = d.version_name
-            ? '<span class="dev-version' + (verBehind ? ' mismatch' : '') + '" title="' +
-                (verBehind ? 'Client v' + esc(d.version_name) + ' trails server ' + esc(serverVersion) + ' — needs updating' : 'Client build') +
-                '">v' + esc(d.version_name) + '</span>'
-            : '<span class="dev-version unknown" title="Client build unknown (device predates version reporting)">unknown</span>';
-          const canUpdate = canUpdateDevice(d);
-          const updateBtn = canUpdate
-            ? '<button class="btn-update" data-act="update" data-id="' + esc(id) + '" title="Install styly-mdm-client v' + esc(clientApk.version) + ' (the device reinstalls the MDM client and restarts)">Update</button>'
-            : '';
           deviceCell = '<div class="dev-label-row">' +
             (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') +
             '<button class="ic-btn ' + (d.label ? '' : 'assign-btn') + '" data-act="editLabel" data-id="' + esc(id) + '" title="' + (d.label ? 'Edit label' : 'Assign label') + '">✏</button>' +
             (startup ? '<span class="badge-startup" title="' + esc(startup) + '">★</span>' : '') +
-            verBadge +
-            updateBtn +
             '</div>';
         }
         deviceCell += '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.ip || '-') + '</div>';
@@ -1360,9 +1412,10 @@
           ' data-row-id="' + esc(id) + '">' +
           '<div class="selbox ' + (checked ? 'on' : '') + '" data-act="toggleDevice" data-id="' + esc(id) + '">' + (checked ? '✓' : '') + '</div>' +
           '<div class="dev-cell">' + deviceCell + '</div>' +
+          '<div class="dev-client">' + clientCell + '</div>' +
           '<div class="dev-status">' + status + '</div>' +
           '<div class="dev-battery">' + batteryHtml(d) + '</div>' +
-          '<div class="dev-task" data-task-id="' + esc(id) + '">' + taskCellHtml(id) + '</div>' +
+          '<div class="dev-task" data-task-id="' + esc(id) + '">' + progressCellHtml(id) + '</div>' +
           '</div>';
       }
 
@@ -1407,16 +1460,8 @@
         }
       }
 
-      // The cell shows whichever job last touched the device: install, push or verify.
-      // A later job overwrites an earlier one, exactly as a second install would; the log
-      // keeps the full history either way.
-      //
-      // Install and push are both throttled against the same server-wide pool of transfer
-      // slots, so both walk the same live states, server-broadcast as the device moves: it
-      // waits for a slot (queued), pulls the file (transferring), then does its local work
-      // off the critical path — installing the APK, or unzipping and mirroring the bundle
-      // (applying) — before reporting a terminal INSTALL_RESULT / PUSH_FILES_RESULT.
-      // A verify moves no bytes, so it takes no slot and has no such phases.
+      // Install/Verify retain their latest task result. Push is rendered from the
+      // canonical job store below.
       function taskCellHtml(id) {
         const st = deviceTaskState[id];
         if (!st) return '<span class="ins-none">—</span>';
@@ -1432,16 +1477,6 @@
           if (st.status === 'error') return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ error</span>';
           return '<span class="ins-fail" title="' + esc(what + ': ' + (st.detail || 'mismatch')) + '">✗ mismatch</span>';
         }
-        if (st.task === 'push') {
-          // `verb` comes from the canonical job mode, so a synced device does not
-          // report itself as "pushed".
-          const verb = st.verb || 'Push';
-          if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
-          if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
-          if (st.status === 'applying') return '<span class="ins-installing"><span class="spinner">⟳</span> ' + esc(verb) + 'ing…</span>';
-          if (st.status === 'success') return '<span class="ins-success">✓ ' + esc(verb.toLowerCase()) + 'ed</span>' + (st.note ? ' <span class="ins-none">' + esc(st.note) + '</span>' : '');
-          return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
-        }
         if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
         if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
         if (st.status === 'installing') return '<span class="ins-installing"><span class="spinner">⟳</span> Installing…</span>';
@@ -1451,64 +1486,88 @@
         return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
       }
 
+      function pushTaskCellHtml(id, st) {
+        // `verb` comes from the canonical job mode, so a synced device does not
+        // report itself as "pushed".
+        const verb = st.verb || 'Push';
+        const device = deviceById(id);
+        if (st.status === 'cancel_pending') return '<span class="ins-queued">Cancel pending' + ((!device || device.status !== 'online') ? ' · offline' : '') + '</span>';
+        if (st.status === 'cancelled') return '<span class="ins-none">Cancelled</span>';
+        if (st.status === 'reconciling') {
+          return '<span class="ins-queued" title="Waiting for the device to report whether the job is still running or has finished.">◦ Awaiting status confirmation' + ((!device || device.status !== 'online') ? ' · offline' : '') + '</span>';
+        }
+        if (['queued', 'transferring', 'validating', 'applying'].indexOf(st.status) >= 0 &&
+            (!device || device.status !== 'online')) {
+          return '<span class="ins-queued" title="The device is disconnected. This job is unfinished; its current execution status is unknown.">◦ Job pending · offline</span>';
+        }
+        if (st.status === 'resume_required') {
+          if (!device || device.status !== 'online') {
+            return '<span class="ins-queued" title="The device is disconnected. Resume becomes available when it reconnects.">◦ Resume required · offline</span>';
+          }
+          return '<span class="ins-queued">◦ Resume required</span>';
+        }
+        if (st.status === 'unconfirmed') {
+          return '<span class="ins-queued" title="' + esc(st.detail || 'Waiting to confirm the device result') + '">◦ Status unknown</span>';
+        }
+        if (st.status === 'queued') return '<span class="ins-queued">◦ Waiting…</span>';
+        if (st.status === 'transferring') return '<span class="ins-transferring"><span class="spinner">⟳</span> Transferring…</span>';
+        if (st.status === 'validating') return '<span class="ins-installing" title="Checking artifact integrity and extracting the bundle"><span class="spinner">⟳</span> Validating…</span>';
+        if (st.status === 'applying') return '<span class="ins-installing"><span class="spinner">⟳</span> ' + esc(verb) + 'ing…</span>';
+        if (st.status === 'success') return '<span class="ins-success">✓ ' + esc(verb.toLowerCase()) + 'ed</span>' + (st.note ? ' <span class="ins-none">' + esc(st.note) + '</span>' : '');
+        return '<span class="ins-fail" title="' + esc(st.detail || '') + '">✗ failed</span>' + (st.detail ? ' <span class="ins-none">' + esc(st.detail) + '</span>' : '');
+      }
+
+      function progressCellHtml(id) {
+        const assignment = pushAssignmentFor(id);
+        let task = assignment ? pushTaskCellHtml(id, assignment) : taskCellHtml(id);
+        if (assignment) {
+          const actions = [];
+          function button(action, label, pending) {
+            const pendingLabel = action === 'resume' ? 'Resuming…' : 'Cancelling…';
+            return '<button class="push-job-action" data-act="pushDeviceAction" data-action="' + action +
+              '" data-id="' + esc(id) + '" data-job-id="' + esc(assignment.job_id) + '"' +
+              (pending ? ' disabled' : '') + '>' + (pending ? pendingLabel : label) + '</button>';
+          }
+          if (assignment.resumePending) actions.push(button('resume', 'Resume', true));
+          else if (assignment.canResume) actions.push(button('resume', 'Resume', false));
+          if (assignment.cancelPending) actions.push(button('cancel', 'Cancel', true));
+          else if (assignment.canCancel) actions.push(button('cancel', 'Cancel', false));
+          if (actions.length) task += '<span class="push-job-actions">' + actions.join('') + '</span>';
+          task = '<div><span class="ins-none">' + esc(assignment.verb) + ': </span>' + task + '</div>';
+          const other = deviceTaskState[id];
+          if (other) {
+            const label = other.task === 'verify' ? (other.kind === 'dir' ? 'Verify Dir' : 'Verify APK') : 'Install';
+            task += '<div><span class="ins-none">' + label + ': </span>' + taskCellHtml(id) + '</div>';
+          }
+        }
+        if (!pushStateUnavailable(deviceById(id))) return task;
+        return task + '<div class="push-state-warning" title="The device retries automatically for about 5 minutes. If this remains, free device storage and reboot the device.">' +
+          '<span class="push-state-warning-icon" aria-hidden="true">⚠</span>' +
+          '<span class="push-state-warning-label">Push state unavailable</span>' +
+          '<span class="push-state-warning-hint">If it persists: free storage, then Reboot</span>' +
+          '</div>';
+      }
+
       function updateTaskCell(id) {
         // Refresh every matching install cell currently rendered: the Devices-tab
         // row and/or the expanded-group per-device rows on the Groups tab.
         if (view !== 'console') return;
         const sel = '[data-task-id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]';
-        targetsBody.querySelectorAll(sel).forEach(function (cell) { cell.innerHTML = taskCellHtml(id); });
+        targetsBody.querySelectorAll(sel).forEach(function (cell) {
+          cell.innerHTML = progressCellHtml(id);
+        });
       }
 
-      // The job-v1 adapter owns only task states carrying this marker. A later
-      // install or verify result must not be replaced or cleared by an older Push
-      // snapshot that happens to arrive afterwards.
+      // The adapter invalidates cells after updating its canonical store. It never
+      // copies Push assignments into the independent Install/Verify task state.
       window.__stylyPushJobsV1Bridge = {
-        applyAssignment: function (assignment) {
-          if (!assignment || !assignment.device_id || !assignment.job_id) return false;
-          const current = deviceTaskState[assignment.device_id];
-          if (current && current.task !== 'push') return false;
-          if (current && current.owner === 'push-job-v1' &&
-              current.pending_request_id &&
-              current.pending_request_id !== assignment.client_request_id) {
-            return false;
-          }
-          deviceTaskState[assignment.device_id] = {
-            task: 'push',
-            status: assignment.status,
-            verb: assignment.verb,
-            filename: assignment.filename,
-            note: assignment.note,
-            detail: assignment.detail,
-            owner: 'push-job-v1',
-            job_id: assignment.job_id,
-            pending_request_id: null,
-            revision: assignment.revision,
-            enqueue_seq: assignment.enqueue_seq,
-          };
-          updateTaskCell(assignment.device_id);
-          return true;
+        isDeviceOnline: function (id) { const d = deviceById(id); return !!d && d.status === 'online'; },
+        refreshAttention: function () {
+          if (view !== 'console') return;
+          renderTabs();
+          if (targetTab === 'attention') renderTargets();
         },
-        clearAssignment: function (deviceId, jobId) {
-          const current = deviceTaskState[deviceId];
-          if (!current || current.owner !== 'push-job-v1' || current.job_id !== jobId) {
-            return false;
-          }
-          delete deviceTaskState[deviceId];
-          updateTaskCell(deviceId);
-          return true;
-        },
-        clearPendingRequest: function (requestId) {
-          let cleared = false;
-          Object.keys(deviceTaskState).forEach(function (deviceId) {
-            const current = deviceTaskState[deviceId];
-            if (!current || current.owner !== 'push-job-v1' ||
-                current.pending_request_id !== requestId) return;
-            delete deviceTaskState[deviceId];
-            updateTaskCell(deviceId);
-            cleared = true;
-          });
-          return cleared;
-        },
+        invalidateDevice: function (deviceId) { updateTaskCell(deviceId); },
       };
 
       function renderActions() {
@@ -1736,8 +1795,11 @@
         const destEl = document.getElementById(cfg.destId);
         const confirmEl = cfg.confirmId ? document.getElementById(cfg.confirmId) : null;
         const btn = document.getElementById(cfg.btnId);
-        let uploaded = null;
-        let uploading = false;
+        const pendingRequestIds = new Set();
+        let selectionRevision = 0;
+        let operationKey = null;
+        let operationRequestId = null;
+        let operationTargets = null;
 
         function selectionFiles() {
           if (folderInput.files.length) return Array.from(folderInput.files);
@@ -1761,87 +1823,122 @@
         function reset() {
           if (fileInput) fileInput.value = '';
           folderInput.value = '';
-          uploaded = null;
+          selectionRevision += 1;
+          resetOperationIdentity();
           if (confirmEl) confirmEl.checked = false;
           nameEl.textContent = cfg.emptyLabel;
           updateButtons();
         }
 
-        function ensureUploaded() {
-          if (uploaded) return Promise.resolve(uploaded);
+        function currentOperation() {
           const files = selectionFiles();
-          if (!files.length) return Promise.reject(new Error(cfg.emptyLabel));
-          const fd = new FormData();
-          // Send each file's relative path as its multipart filename so the server can rebuild
-          // the folder tree; webkitRelativePath is set for folder picks, empty for single files.
-          files.forEach(function (f) { fd.append('files', f, f.webkitRelativePath || f.name); });
-          uploading = true; nameEl.textContent = 'Uploading ' + files.length + ' file(s)...'; updateButtons();
-          return fetch('/api/bundles', { method: 'POST', body: fd })
-            .then(function (r) { return r.json().catch(function () { return {}; }).then(function (p) { if (!r.ok) throw new Error(p.error || r.statusText); return p; }); })
-            .then(function (p) {
-              uploaded = p;
-              nameEl.innerHTML = 'Uploaded: <strong>' + esc(p.bundle_filename) + '</strong> (' + p.entry_count + ' file(s), ' + formatBytes(p.size) + ')';
-              addLog('Uploaded bundle: ' + p.bundle_filename + ' (' + p.entry_count + ' file(s))', 'success');
-              // The picked-file count above the button counts what the OS handed the browser;
-              // the server drops its own metadata. Say so, rather than let the numbers differ.
-              if (p.skipped_count) addLog('Excluded ' + p.skipped_count + ' OS metadata file(s) (e.g. .DS_Store) from the bundle', 'info');
-              return p;
-            })
-            .finally(function () { uploading = false; updateButtons(); });
+          const deviceIds = Array.from(selectedIds);
+          const destPath = destEl.value.trim();
+          if (!files.length || !deviceIds.length || !destPath) return null;
+          const key = JSON.stringify({
+            revision: selectionRevision,
+            files: files.map(function (file) {
+              return [file.webkitRelativePath || file.name, file.size, file.lastModified];
+            }),
+            deviceIds: deviceIds.slice().sort(),
+            destPath: destPath,
+            mode: cfg.deleteExtras ? 'sync' : 'push',
+          });
+          return {
+            key: key,
+            files: files,
+            deviceIds: deviceIds,
+            destPath: destPath,
+          };
+        }
+
+        function resetOperationIdentity() {
+          if (operationRequestId) {
+            window.__stylyPushJobsV1Actions.releaseSubmission(operationRequestId);
+          }
+          operationKey = null;
+          operationRequestId = null;
+          operationTargets = null;
+        }
+
+        function syncOperationIdentity(operation) {
+          const nextKey = operation ? operation.key : null;
+          if (nextKey === operationKey) return;
+          resetOperationIdentity();
+          if (operation) {
+            operationKey = operation.key;
+            operationRequestId = window.__stylyPushJobsV1Actions.newSubmissionId();
+          }
         }
 
         function send() {
-          if (uploading) return;
-          const dest = destEl.value.trim();
-          if (!dest) { addLog('Enter a destination path to ' + cfg.verb.toLowerCase() + ' files', 'warn'); return; }
+          const operation = currentOperation();
+          syncOperationIdentity(operation);
+          if (!operation) {
+            if (!destEl.value.trim()) addLog('Enter a destination path to ' + cfg.verb.toLowerCase() + ' files', 'warn');
+            else if (!selectionFiles().length) addLog(cfg.emptyLabel, 'warn');
+            else addLog('No online devices selected to ' + cfg.verb.toLowerCase() + ' files', 'warn');
+            return Promise.resolve(false);
+          }
           if (confirmEl && !confirmEl.checked) { addLog('Confirm the delete warning before syncing', 'warn'); return; }
-          const online = onlineTargets(Array.from(selectedIds));
-          if (!online.length) { addLog('No online devices selected to ' + cfg.verb.toLowerCase() + ' files', 'warn'); return; }
-          ensureUploaded().then(function (bundle) {
-            const msg = {
-              type: 'PUSH_FILES', target_devices: online, bundle_url: bundle.bundle_url,
-              bundle_filename: bundle.bundle_filename, dest_path: dest, delete_extras: cfg.deleteExtras,
-            };
-            if (!wsSend(msg, cfg.verb.toLowerCase() + ' files')) return;
-            // Optimistic first paint only. The matching canonical job snapshot replaces
-            // it after create/upload/dispatch; unrelated older jobs cannot claim it.
-            online.forEach(function (id) {
-              const current = deviceTaskState[id];
-              if (shouldPreserveCanonicalPushAssignment(current)) {
-                return;
+          operation.requestId = operationRequestId;
+          if (pendingRequestIds.has(operation.requestId)) return Promise.resolve(false);
+          if (!operationTargets || !operationTargets.length) {
+            operationTargets = onlineTargets(operation.deviceIds);
+          }
+          if (!operationTargets.length) return Promise.resolve(false);
+          operation.targets = operationTargets.slice();
+          const startedRevision = selectionRevision;
+          pendingRequestIds.add(operation.requestId);
+          nameEl.textContent = 'Creating ' + cfg.verb + ' job…';
+          updateButtons();
+          return window.__stylyPushJobsV1Actions.submitPushJob({
+            files: operation.files,
+            targets: operation.targets,
+            destPath: operation.destPath,
+            mode: cfg.deleteExtras ? 'sync' : 'push',
+            clientRequestId: operation.requestId,
+          }).then(function (result) {
+            if (operation.key === (currentOperation() || {}).key &&
+                operation.requestId === operationRequestId && startedRevision === selectionRevision) {
+              addLog(cfg.verb + ' job ' + result.job_id.slice(0, 8) +
+                ' dispatched to ' + operation.targets.length + ' device(s)', 'success');
+              reset();
+            }
+            return result;
+          }).catch(function (error) {
+            const isCurrentOperation = operation.key === (currentOperation() || {}).key &&
+              operation.requestId === operationRequestId;
+            if (isCurrentOperation) {
+              if (error.retryWithNewRequestId) {
+                resetOperationIdentity();
               }
-              const pendingPrefix = 'push-job://pending/';
-              const pendingRequestId = String(bundle.bundle_url || '').indexOf(pendingPrefix) === 0
-                ? String(bundle.bundle_url).slice(pendingPrefix.length) : null;
-              deviceTaskState[id] = {
-                task: 'push', status: 'queued', verb: cfg.verb, filename: dest,
-                note: '', detail: '', owner: 'push-job-v1', job_id: null,
-                pending_request_id: pendingRequestId,
-              };
-              updateTaskCell(id);
-            });
-            addLog(cfg.verb + 'ing ' + bundle.bundle_filename + ' → ' + dest + ' on ' + online.length + ' device(s)', 'info');
-            // Force a fresh pick next time (LAN/non-secure context cannot detect a local change).
-            reset();
-          }).catch(function (err) { nameEl.textContent = 'Upload failed'; addLog(cfg.verb + ' files failed: ' + err.message, 'fail'); });
-        }
-
-        function shouldPreserveCanonicalPushAssignment(current) {
-          return !!(current && current.owner === 'push-job-v1' && current.job_id &&
-            ['queued', 'transferring', 'applying'].indexOf(current.status) >= 0);
+              nameEl.textContent = cfg.verb + ' failed; selection retained for retry';
+              addLog(cfg.verb + ' files failed: ' + error.message, 'fail');
+            }
+            return false;
+          }).finally(function () {
+            pendingRequestIds.delete(operation.requestId);
+            updateButtons();
+          });
         }
 
         function hasSelection() { return selectionFiles().length > 0; }
 
         function refreshButton(anySelected) {
-          btn.disabled = uploading || !hasSelection() || destEl.value.trim() === '' ||
+          const operation = currentOperation();
+          syncOperationIdentity(operation);
+          btn.disabled = !hasSelection() || destEl.value.trim() === '' ||
             (confirmEl ? !confirmEl.checked : false) || !anySelected;
+          if (operationRequestId && pendingRequestIds.has(operationRequestId)) btn.disabled = true;
         }
 
         function onPick(input, other) {
           input.addEventListener('change', function () {
             if (input.files.length && other) other.value = '';
-            uploaded = null; nameEl.textContent = describeSelection(); updateButtons();
+            selectionRevision += 1;
+            resetOperationIdentity();
+            nameEl.textContent = describeSelection(); updateButtons();
           });
         }
         if (fileInput) onPick(fileInput, folderInput);
@@ -1850,7 +1947,7 @@
         if (confirmEl) confirmEl.addEventListener('change', updateButtons);
         btn.addEventListener('click', send);
 
-        return { refreshButton: refreshButton };
+        return { refreshButton: refreshButton, send: send, reset: reset };
       }
 
       const pushPanel = createPushPanel({
@@ -2171,32 +2268,25 @@
 
       function addLog(message, type) { makeLogEntry(message, type); }
 
-      // Throttled transfer progress: the server broadcasts INSTALL_PROGRESS / PUSH_PROGRESS
-      // on every transfer-slot transition, so instead of one log line per event we keep a
-      // single entry per job and update it in place until it is done. Kept per job kind —
-      // an install and a push draw on the same server-wide slot pool and can be in flight
-      // together, so they must not overwrite each other's line.
-      const transferProgress = { install: null, push: null }; // kind -> { label, nodes }
-      function showTransferProgress(kind, msg) {
-        const label = kind === 'push'
-          ? (msg.bundle_filename || 'bundle') + ' → ' + (msg.dest_path || '-')
-          : (msg.apk_filename || 'APK');
-        const verb = kind === 'push' ? (msg.delete_extras ? 'Sync' : 'Push') : 'Install';
-        const body = verb + ' ' + label + ': ' + (msg.transferred || 0) + ' done, ' +
+      // Throttle install transfer updates to one activity entry until completion.
+      let installProgress = null;
+      function showTransferProgress(msg) {
+        const label = msg.apk_filename || 'APK';
+        const body = 'Install ' + label + ': ' + (msg.transferred || 0) + ' done, ' +
           (msg.transferring || 0) + ' transferring, ' + (msg.queued || 0) + ' queued' +
           (msg.failed ? ', ' + msg.failed + ' failed/timed out' : '') +
           ' (of ' + (msg.total || 0) + ')' + (msg.done ? ' — done' : '');
         const type = msg.done ? (msg.failed ? 'warn' : 'success') : 'info';
-        const cur = transferProgress[kind];
+        const cur = installProgress;
         if (cur && cur.label === label && cur.nodes.entry.isConnected) {
           cur.nodes.msg.textContent = body;
           cur.nodes.msg.className = 'log-msg ' + type;
           cur.nodes.time.textContent = new Date().toLocaleTimeString();
           logContainer.scrollTop = logContainer.scrollHeight;
         } else {
-          transferProgress[kind] = { label: label, nodes: makeLogEntry(body, type) };
+          installProgress = { label: label, nodes: makeLogEntry(body, type) };
         }
-        if (msg.done) transferProgress[kind] = null;
+        if (msg.done) installProgress = null;
       }
 
       // ---------------- Formatting ----------------
@@ -2759,6 +2849,10 @@
         else if (act === 'cancelLabel') closeLabelEditor();
         else if (act === 'forget') sendForget(t.dataset.id);
         else if (act === 'update') sendClientUpdate(t.dataset.id);
+        else if (act === 'pushDeviceAction') {
+          const actions = window.__stylyPushJobsV1Actions;
+          if (actions) actions.sendDeviceAction(t.dataset.id, t.dataset.jobId, t.dataset.action);
+        }
       });
       // Targets label-edit keyboard
       targetsBody.addEventListener('keydown', function (e) {

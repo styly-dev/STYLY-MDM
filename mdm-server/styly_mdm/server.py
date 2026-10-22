@@ -14,12 +14,10 @@ import re
 import shutil
 import socket
 import sys
-import tempfile
 import time
 import uuid
 import zipfile
 from pathlib import Path
-from urllib.parse import unquote
 from aiohttp import WSCloseCode, web
 
 # Bundling and integrity references must agree on what counts as content, or a reference
@@ -38,6 +36,22 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("stylymdm")
+
+
+class _RedactPushLeaseFilter(logging.Filter):
+    """Keep Push artifact lease tokens out of the HTTP access log request line."""
+
+    _LEASE = re.compile(r"(lease=)[^&\s\"]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        redacted = self._LEASE.sub(r"\1REDACTED", message)
+        if redacted != message:
+            record.msg, record.args = redacted, None
+        return True
+
+
+logging.getLogger("aiohttp.access").addFilter(_RedactPushLeaseFilter())
 
 # Writable runtime data (uploaded APKs, device registry) lives under a
 # configurable data directory rather than next to this module. When installed as
@@ -144,11 +158,10 @@ last_install_dispatch: dict[str, dict] = {}
 # replacing the file invalidates naturally.
 _apk_hash_cache: dict[tuple[str, int, int], dict] = {}
 
-# Generated file/folder bundles (for the push-files sync feature) live alongside the APKs.
-# The console uploads a file or folder; the server zips it into BUNDLE_DIR and serves it to
-# devices, which mirror it into a destination directory. Kept separate from APK_DIR so the
-# APK workflow is untouched.
+# Kept as a data-path name for installations that still have files from the retired
+# pre-job Push endpoint. Those files are left untouched and are no longer served.
 BUNDLE_DIR = DATA_DIR / "bundles"
+# The job-v1 upload endpoint still uses the original limits.
 MAX_BUNDLE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB (total uploaded bytes before zipping)
 MAX_BUNDLE_ENTRIES = 5000  # cap files per bundle to bound tree reconstruction
 
@@ -210,9 +223,9 @@ _websocket_response_factory = web.WebSocketResponse
 
 # (device_id, task) -> Future for the transfer slot a device holds during a job.
 # Resolving the future releases the slot so the next queued device is dispatched
-# (see release_transfer_slot / _run_install_job / _run_push_job). Module-global so
-# device-originated messages (DOWNLOAD_COMPLETE / INSTALL_RESULT / PUSH_FILES_RESULT /
-# disconnect) can route a release to the dispatcher coroutine waiting on it. The task
+# (see release_transfer_slot / _run_install_job). Module-global so device-originated
+# install messages and disconnect can route a release to the dispatcher coroutine waiting
+# on it. Push-v1 uses its own exact transfer registry. The task
 # is part of the key so a push's terminal message cannot free the install slot the
 # same device is holding, and vice versa.
 pending_transfers: dict[tuple[str, str], "asyncio.Future[str]"] = {}
@@ -236,6 +249,24 @@ _transfer_sem_loop: "asyncio.AbstractEventLoop | None" = None
 # ---------------------------------------------------------------------------
 # Device registry (persistent, additive — never the identity key)
 # ---------------------------------------------------------------------------
+
+def parse_push_state_status(push_state) -> str | None:
+    """Return a device's reported durable Push state status, or None if malformed."""
+    status = push_state.get("status") if isinstance(push_state, dict) else None
+    return status if status in {"available", "unavailable"} else None
+
+
+def parse_push_state_reset(push_state) -> dict | None:
+    """Return a one-shot notice that the client discarded unreadable Push state."""
+    reset = push_state.get("reset") if isinstance(push_state, dict) else None
+    if not isinstance(reset, dict) or not isinstance(reset.get("reason"), str):
+        return None
+    detail = reset.get("detail") if isinstance(reset.get("detail"), str) else ""
+    return {
+        "reason": reset["reason"][:64],
+        "detail": " ".join(detail.split())[:256],
+    }
+
 
 def _coerce_record(value) -> dict | None:
     """Normalize a registry value into a record.
@@ -426,6 +457,8 @@ def build_device_list_msg() -> str:
             "last_seen": device_registry.get(d["device_id"], {}).get("last_seen"),
             "version_code": d.get("version_code"),
             "version_name": d.get("version_name", ""),
+            # Live-only: whether the connected client can currently accept Push.
+            "push_state_status": d.get("push_state_status"),
         }
         for d in devices.values()
     ]
@@ -458,6 +491,7 @@ def build_device_list_msg() -> str:
             "version_code": rec.get("version_code"),
             "version_name": rec.get("version_name", ""),
             "identity_kind": rec.get("identity_kind", "legacy"),
+            "push_state_status": None,
         })
     device_list.sort(
         key=lambda e: (e["label"] == "", (e["label"] or e["device_id"]).lower())
@@ -1142,24 +1176,8 @@ def unique_apk_path(filename: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# File/folder bundle helpers (push-files sync)
+# Push job upload helpers
 # ---------------------------------------------------------------------------
-
-# Primary/shared external storage mount points on Android. Push-files destinations must live
-# under one of these: the PICO ToBService exposes no privileged file-copy API, so the client
-# can only reach shared storage with plain java.io.File I/O (app-scoped Android/data/<pkg>/
-# is unreadable across UIDs — the same wall the APK download documents).
-SHARED_STORAGE_PREFIXES = ("/sdcard/", "/storage/emulated/0/")
-
-# Well-known top-level directories under shared storage that full-mirror sync must never
-# target: mirroring into them would delete unrelated user/media/app data on every selected
-# device. Matched case-insensitively against the first segment below the storage root.
-PROTECTED_TOPLEVEL_DIRS = frozenset({
-    "android", "download", "downloads", "dcim", "pictures", "movies", "music",
-    "documents", "alarms", "notifications", "podcasts", "ringtones",
-})
-
-
 def sanitize_relpath(raw: str | None) -> str | None:
     """Return a safe forward-slash relative path for a bundle entry, or None if invalid.
 
@@ -1183,74 +1201,6 @@ def sanitize_relpath(raw: str | None) -> str | None:
     if not parts:
         return None
     return "/".join(parts)
-
-
-def validate_dest_path(dest: str | None) -> str | None:
-    """Return an error message if a device destination path is unsafe, else None.
-
-    A full-mirror sync deletes anything at the destination not in the bundle, so a wrong path
-    would wipe unrelated data on every selected device. Pushes are held to the same rule, so a
-    copy cannot quietly reach somewhere a sync may not. The path must be an absolute
-    shared-storage path, contain no ``..``, and be neither the storage root nor a protected
-    top-level directory. This is a first-line syntactic guard; the client re-validates
-    against the real canonical filesystem before applying.
-    """
-    if not isinstance(dest, str) or not dest.strip():
-        return "Destination path is required"
-    text = dest.strip()
-    if "\x00" in text:
-        return "Destination path contains an invalid character"
-    if not text.startswith("/"):
-        return "Destination must be an absolute path"
-    # Reject on the raw path (matching the client) so a '..' that would normalize away here
-    # can't be accepted by the server yet rejected by the client's stricter raw check.
-    if ".." in text.split("/"):
-        return "Destination path must not contain '..'"
-    with_slash = os.path.normpath(text).rstrip("/") + "/"
-    prefix = next((p for p in SHARED_STORAGE_PREFIXES if with_slash.startswith(p)), None)
-    if prefix is None:
-        return "Destination must be under shared storage (/sdcard or /storage/emulated/0)"
-    remainder = with_slash[len(prefix):].strip("/")
-    if not remainder:
-        return "Destination must be a subdirectory, not the shared-storage root"
-    first_segment = remainder.split("/")[0]
-    if first_segment.lower() in PROTECTED_TOPLEVEL_DIRS:
-        return f"Destination must not be inside the protected '{first_segment}' directory"
-    return None
-
-
-def unique_bundle_path(filename: str) -> Path:
-    """Build a unique destination path in BUNDLE_DIR for a generated bundle zip."""
-    destination = BUNDLE_DIR / filename
-    if not destination.exists():
-        return destination
-
-    stem = destination.stem
-    suffix = destination.suffix
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    candidate = BUNDLE_DIR / f"{stem}-{timestamp}{suffix}"
-    counter = 2
-    while candidate.exists():
-        candidate = BUNDLE_DIR / f"{stem}-{timestamp}-{counter}{suffix}"
-        counter += 1
-    return candidate
-
-
-def bundle_basename(relpaths: list[str]) -> str:
-    """Derive a safe base name (no extension) for the bundle zip from its entries.
-
-    A single file → its stem; a folder tree sharing one top-level directory → that directory
-    name; otherwise → ``bundle``.
-    """
-    if not relpaths:
-        return "bundle"
-    if len(relpaths) == 1 and "/" not in relpaths[0]:
-        raw = Path(relpaths[0]).stem or "bundle"
-    else:
-        first_segments = {p.split("/")[0] for p in relpaths}
-        raw = next(iter(first_segments)) if len(first_segments) == 1 else "bundle"
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw).strip("._-")
-    return safe or "bundle"
 
 
 def strip_common_root(relpaths: list[str]) -> tuple[str | None, list[str]]:
@@ -1453,7 +1403,6 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                             idempotent=True,
                         )
                         continue
-
                     if kind == "provisional":
                         now = time.time()
                         previous = provisional_connections.get(ws)
@@ -1500,6 +1449,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     provisional_connections.pop(ws, None)
                     device_id = new_device_id
                     socket_identity_kind = kind
+                    push_state_status = parse_push_state_status(data.get("push_state"))
                     devices[device_id] = {
                         "ws": ws,
                         "device_id": device_id,
@@ -1512,6 +1462,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "battery": prev.get("battery"),
                         "version_code": version_code,
                         "version_name": version_name,
+                        "push_state_status": push_state_status,
                     }
                     device_registry[device_id] = {
                         "label": prev.get("label", ""),
@@ -1823,9 +1774,9 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
         if device_id and not is_current:
             log.info("Superseded device connection closed, ignoring: %s", device_id)
         if device_id and is_current:
-            # Free every transfer slot this device was holding — it may have been in
-            # an install and a push at once — so a disconnect mid-job does not stall
-            # the queue until the timeout fires.
+            # Install keeps the legacy disconnect release. Push is deliberately
+            # retained by the runtime adapter because its Android HTTP worker outlives
+            # this WebSocket and remains bounded by exact completion or timeout.
             release_transfer_slot(device_id, "disconnect")
             # The dispatch record only bridges dispatch -> SELF_UPDATE_STARTING; by a
             # disconnect that announcement has already copied what it needed, so drop
@@ -2759,189 +2710,20 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
     )
 
 
-async def handle_push_files(admin_ws: web.WebSocketResponse, data: dict):
-    """Process a PUSH_FILES command: validate then fan out EXECUTE_PUSH_FILES to target HMDs.
+async def handle_push_files(admin_ws: web.WebSocketResponse, _data: dict):
+    """Reject the retired identity-less PUSH_FILES command.
 
-    ``delete_extras`` selects the semantics the client applies: false (the default) copies and
-    overwrites without deleting anything; true full-mirrors, pruning whatever at the destination
-    is not in the bundle. The server only passes the flag through — the delete itself lives in
-    the client — but it coerces the value here so a malformed field cannot decode to true.
-
-    The destination is validated here as a first-line guard (a mirror deletes extras, so a bad
-    path is destructive); the client re-validates against its real filesystem before applying.
-
-    Like INSTALL_APK, the fan-out is throttled against the server-wide transfer pool (a push
-    bundle can be as large as an APK), so this handler validates, acknowledges, and returns
-    while _run_push_job dispatches in the background.
+    Push/Sync now requires a durable job ID so upload, transfer, retry, and cancellation
+    share one persisted lifecycle. Push-v1 frames with a job_id are consumed by PushRuntime
+    before they reach this legacy server handler.
     """
-    target_devices: list[str] = data.get("target_devices", [])
-    bundle_url: str = data.get("bundle_url", "")
-    bundle_filename: str = data.get("bundle_filename", "")
-    dest_path: str = (data.get("dest_path") or "").strip()
-    delete_extras: bool = data.get("delete_extras") is True
-
-    if not bundle_url:
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": "bundle_url is required",
-        }))
-        return
-
-    dest_error = validate_dest_path(dest_path)
-    if dest_error is not None:
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": dest_error,
-        }))
-        return
-
-    target_ids = resolve_target_ids(target_devices)
-
-    if not target_ids:
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": "No matching online devices found",
-        }))
-        return
-
     await admin_ws.send_str(json.dumps({
-        "type": "PUSH_FILES_SENT",
-        "bundle_filename": bundle_filename,
-        "dest_path": dest_path,
-        "delete_extras": delete_extras,
-        "target_count": len(target_ids),
-        "max_concurrent": MAX_CONCURRENT_TRANSFERS,
+        "type": "ERROR",
+        "message": (
+            "Push/Sync requires a job_id. Create a job through /api/push-jobs, "
+            "upload to its upload_url, then send PUSH_FILES with that job_id."
+        ),
     }))
-
-    task = asyncio.create_task(
-        _run_push_job(bundle_url, bundle_filename, dest_path, delete_extras, target_ids)
-    )
-    _transfer_tasks.add(task)
-    task.add_done_callback(_transfer_tasks.discard)
-
-
-async def _run_push_job(
-    bundle_url: str,
-    bundle_filename: str,
-    dest_path: str,
-    delete_extras: bool,
-    target_ids: list[str],
-):
-    """Fan out EXECUTE_PUSH_FILES to target devices with bounded concurrency.
-
-    The install-job twin (_run_install_job): same slot pool, same release triggers, same
-    shape of progress. They stay two functions because everything else — the message they
-    dispatch, the counters, the states they name — is theirs alone; only the pool and
-    ``pending_transfers`` are shared, and the counters here are strictly job-local.
-
-    A device's slot is freed as soon as it reports DOWNLOAD_COMPLETE for the push
-    (primary — the unzip and mirror that follow move no bytes over the network), sends a
-    terminal PUSH_FILES_RESULT (fallback for older clients, which never signal the
-    download separately), disconnects, or hits the per-device timeout.
-    """
-    timeout = TRANSFER_TIMEOUT
-    total = len(target_ids)
-    loop = asyncio.get_running_loop()
-    sem = transfer_slots()
-    verb = "sync" if delete_extras else "push"
-
-    execute_msg = json.dumps({
-        "type": "EXECUTE_PUSH_FILES",
-        "bundle_url": bundle_url,
-        "bundle_filename": bundle_filename,
-        "dest_path": dest_path,
-        "delete_extras": delete_extras,
-    })
-
-    # Job-local progress counters. The invariant
-    #   total == queued + transferring + transferred + failed
-    # holds after every transition below (single-threaded event loop, so no lock).
-    counts = {"queued": total, "transferring": 0, "transferred": 0, "failed": 0}
-
-    async def broadcast_progress(done: bool = False):
-        await forward_to_admins({
-            "type": "PUSH_PROGRESS",
-            "bundle_filename": bundle_filename,
-            "dest_path": dest_path,
-            "delete_extras": delete_extras,
-            "total": total,
-            "queued": counts["queued"],
-            "transferring": counts["transferring"],
-            "transferred": counts["transferred"],
-            "failed": counts["failed"],
-            "done": done,
-        })
-
-    async def fail_one(device_id: str, detail: str):
-        counts["failed"] += 1
-        await broadcast_push_state([device_id], "fail", dest_path, delete_extras, detail)
-        await broadcast_progress()
-
-    async def dispatch_one(device_id: str):
-        async with sem:
-            counts["queued"] -= 1
-            entry = devices.get(device_id)
-            if not command_allowed(entry, "EXECUTE_PUSH_FILES"):
-                await fail_one(device_id, "Device is no longer eligible for Push/Sync")
-                return
-            try:
-                await entry["ws"].send_str(execute_msg)
-            except Exception as e:
-                log.warning("Failed to send EXECUTE_PUSH_FILES to %s: %s", device_id, e)
-                await fail_one(device_id, f"Failed to send the {verb} command")
-                return
-
-            counts["transferring"] += 1
-            key = (device_id, TASK_PUSH)
-            fut: "asyncio.Future[str]" = loop.create_future()
-            pending_transfers[key] = fut
-            try:
-                await broadcast_push_state(
-                    [device_id], "transferring", dest_path, delete_extras,
-                )
-                await broadcast_progress()
-                reason = await asyncio.wait_for(fut, timeout)
-                counts["transferred"] += 1
-                log.info("Transfer slot released for %s (%s)", device_id, reason)
-                # "applying" is announced by the DOWNLOAD_COMPLETE handler, and
-                # success/fail by the forwarded PUSH_FILES_RESULT, so nothing to emit
-                # here: doing so would race those messages.
-            except asyncio.TimeoutError:
-                counts["failed"] += 1
-                log.warning(
-                    "Transfer slot timeout for %s after %.0fs; releasing to keep the queue moving",
-                    device_id, timeout,
-                )
-                await broadcast_push_state(
-                    [device_id], "fail", dest_path, delete_extras, "Transfer timed out",
-                )
-            except Exception:
-                counts["failed"] += 1
-                log.exception("Unexpected error awaiting transfer completion for %s", device_id)
-                await broadcast_push_state(
-                    [device_id], "fail", dest_path, delete_extras, "Transfer failed",
-                )
-            finally:
-                if pending_transfers.get(key) is fut:
-                    del pending_transfers[key]
-                counts["transferring"] -= 1
-            await broadcast_progress()
-
-    log.info(
-        "PUSH_FILES (%s): dispatching %s -> %s to %d device(s), "
-        "max %d concurrent transfer(s) server-wide",
-        verb, bundle_filename or bundle_url, dest_path, total, MAX_CONCURRENT_TRANSFERS,
-    )
-    try:
-        await broadcast_push_state(target_ids, "queued", dest_path, delete_extras)
-        await broadcast_progress()
-        await asyncio.gather(*(dispatch_one(did) for did in target_ids), return_exceptions=True)
-    finally:
-        await broadcast_progress(done=True)
-    log.info(
-        "PUSH_FILES (%s): %s finished — %d transferred, %d failed/timed out of %d",
-        verb, bundle_filename or bundle_url, counts["transferred"], counts["failed"], total,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -3126,118 +2908,17 @@ async def upload_apk_handler(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
-# File/folder bundle upload handler
+# Retired standalone bundle upload endpoint
 # ---------------------------------------------------------------------------
 
-async def upload_bundle_handler(request: web.Request) -> web.Response:
-    """Accept a file/folder upload, zip it into a bundle, and return its download URL.
-
-    Each multipart part is one file whose *filename* carries its (possibly nested) relative
-    path, so a whole folder tree can be uploaded with its structure preserved (the console
-    sends ``file.webkitRelativePath``). Parts are reconstructed under a temp directory with
-    per-path sanitization, then zipped; the temp tree is discarded and only the zip is kept.
-    """
-    try:
-        reader = await request.multipart()
-    except Exception as e:
-        return web.json_response({"error": f"Invalid multipart request: {e}"}, status=400)
-
-    BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix="upload-", dir=BUNDLE_DIR))
-    total_size = 0
-    relpaths: list[str] = []
-    skipped: list[str] = []
-
-    try:
-        while True:
-            field = await reader.next()
-            if field is None:
-                break
-            if field.name != "files":
-                continue
-
-            # Browsers send the folder-relative path as the multipart filename; some
-            # multipart encoders percent-encode the path separators, so decode before
-            # sanitizing (sanitize_relpath still rejects any traversal after decoding).
-            raw_name = field.filename
-            relpath = sanitize_relpath(unquote(raw_name) if raw_name else None)
-            if relpath is None:
-                return web.json_response(
-                    {"error": f"Invalid file path in upload: {field.filename!r}"}, status=400)
-
-            # Drop OS metadata before it is written to staging, so it never reaches the zip
-            # and never counts against the entry limit. reader.next() drains the skipped part.
-            if is_os_metadata(relpath):
-                skipped.append(relpath)
-                continue
-
-            if len(relpaths) >= MAX_BUNDLE_ENTRIES:
-                return web.json_response(
-                    {"error": f"Bundle exceeds the {MAX_BUNDLE_ENTRIES}-file limit"}, status=413)
-
-            target = staging / relpath
-            # Defense in depth: a sanitized relpath cannot escape, but confirm the join stays
-            # under the staging root before writing.
-            if not _is_within(staging, target):
-                return web.json_response({"error": "Invalid file path in upload"}, status=400)
-
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("wb") as f:
-                while True:
-                    chunk = await field.read_chunk(size=1024 * 1024)
-                    if not chunk:
-                        break
-                    total_size += len(chunk)
-                    if total_size > MAX_BUNDLE_SIZE:
-                        return web.json_response({"error": "Bundle exceeds 2 GiB limit"}, status=413)
-                    f.write(chunk)
-            relpaths.append(relpath)
-
-        if not relpaths:
-            if skipped:
-                return web.json_response(
-                    {"error": "Upload contained only OS metadata files; nothing to send"},
-                    status=400)
-            return web.json_response({"error": "multipart field 'files' is required"}, status=400)
-
-        # A folder pick nests every file under the picked folder; mirror that folder's
-        # *contents* into the destination, so zip from the shared root (and name the
-        # bundle after it) rather than wrapping the destination in an extra directory.
-        root, _stripped = strip_common_root(relpaths)
-        content_root = staging / root if root is not None else staging
-        base = bundle_basename([root]) if root is not None else bundle_basename(relpaths)
-        bundle_path = unique_bundle_path(f"{base}.zip")
-        zip_tree(content_root, bundle_path)
-    except Exception as e:
-        log.exception("Failed to build uploaded bundle")
-        return web.json_response({"error": f"Failed to build bundle: {e}"}, status=500)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-
-    size = bundle_path.stat().st_size
-    bundle_url = f"{request.scheme}://{request.host}/bundles/{bundle_path.name}"
-    log.info("Built bundle: %s (%d entries, %d bytes zipped)",
-             bundle_path.name, len(relpaths), size)
-    if skipped:
-        log.info("Excluded %d OS metadata file(s) from %s: %s",
-                 len(skipped), bundle_path.name, ", ".join(skipped[:10]))
-
+async def upload_bundle_handler(_request: web.Request) -> web.Response:
+    """Reject the retired standalone bundle upload endpoint without reading its body."""
     return web.json_response({
-        "bundle_filename": bundle_path.name,
-        "bundle_url": bundle_url,
-        "size": size,
-        "entry_count": len(relpaths),
-        "skipped_count": len(skipped),
-    })
-
-
-def _is_within(root: Path, target: Path) -> bool:
-    """Return True if ``target`` resolves to a path inside ``root``."""
-    try:
-        target.resolve().relative_to(root.resolve())
-        return True
-    except ValueError:
-        return False
+        "error": (
+            "The standalone bundle upload endpoint is retired. Create a Push job through "
+            "/api/push-jobs and upload its files to the returned upload_url."
+        ),
+    }, status=410)
 
 
 async def handle_set_startup_app(admin_ws: web.WebSocketResponse, data: dict):
@@ -3498,9 +3179,6 @@ def create_app() -> web.Application:
     seed_bundled_client_apk()
     app.router.add_static("/apks", APK_DIR)
 
-    BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
-    app.router.add_static("/bundles", BUNDLE_DIR)
-
     return app
 
 
@@ -3565,7 +3243,6 @@ async def run_server(port: int | None = None):
     log.info("Configuration:")
     log.info("  Data directory:   %s", DATA_DIR)
     log.info("  APK directory:    %s", APK_DIR)
-    log.info("  Bundle directory: %s", BUNDLE_DIR)
     log.info("  Device registry:  %s", REGISTRY_PATH)
     log.info("  WebSocket port:   %d", port)
     log.info("  Discovery port:   %d", DISCOVERY_PORT)

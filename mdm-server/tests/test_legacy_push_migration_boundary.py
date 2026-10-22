@@ -84,7 +84,7 @@ async def test_unfinished_legacy_push_is_not_migrated_on_guid_registration(tmp_p
             "model": "M",
             "ip": "1.1.1.1",
         }
-        _, legacy_snapshot = await runtime.manager.create_job(
+        _, legacy_snapshot = await runtime.manager.store.create_job(
             _request(legacy_id),
             {legacy_id: (ProtocolMode.LEGACY, set())},
             600_000,
@@ -103,7 +103,7 @@ async def test_unfinished_legacy_push_is_not_migrated_on_guid_registration(tmp_p
                 "entry_count": 1,
             },
         )
-        await runtime.manager.enable_dispatch(legacy_job_id)
+        await runtime.manager.store.enable_dispatch(legacy_job_id)
         legacy_before = await runtime.manager.get_snapshot(legacy_job_id)
         assert legacy_before["state"] == "running"
         assert legacy_before["devices"][legacy_id]["protocol_mode"] == "legacy"
@@ -119,7 +119,7 @@ async def test_unfinished_legacy_push_is_not_migrated_on_guid_registration(tmp_p
                     "ip": "1.1.1.2",
                     "version_code": 10,
                     "version_name": "guid",
-                    "capabilities": ["push_job_id_v1"],
+                    "capabilities": ["push_job_id_v1", "push_resume_v1"],
                     "process_instance_id": str(uuid.uuid4()),
                 }
             )
