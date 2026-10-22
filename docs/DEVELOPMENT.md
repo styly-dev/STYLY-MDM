@@ -154,6 +154,15 @@ A consequence worth knowing: selecting a group stages every member, so a filter 
 afterwards cannot narrow it — the members stay on screen, marked. That is deliberate, since
 those members are exactly what an action would dispatch to.
 
+In the main Devices list, Shift-click applies the clicked checkbox's next state to the
+inclusive range from the last clicked device, leaving other selections unchanged. Each click
+sets the next anchor by device ID, retained across refreshes. Ranges follow the displayed
+filter/sort order, including selected rows kept visible. A hidden or removed anchor falls back
+to a single toggle. Select-all, clear, group selection, and tab changes reset the anchor.
+Selection updates controls and action summaries in place, removing deselected filter-kept
+rows without rebuilding the list. Ordinary clicks skip sorting; Shift-click prevents page
+text selection.
+
 ### Seeding dummy devices for UI testing
 
 `mdm-server/scripts/seed_dummy_devices.py` populates a **running** server with fake

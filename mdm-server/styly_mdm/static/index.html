@@ -612,6 +612,7 @@
       let clientApk = null;            // newest styly-mdm-client APK on the server, from CLIENT_APK_INFO ({filename,url,version} or null)
       let groups = {};                 // name -> [serials]
       let selectedIds = new Set();
+      let deviceSelectionAnchorId = null;
       let selectedConnectionIds = new Set();
       let activeGroup = null;          // group name driving the selection, or null
       let targetTab = 'groups';        // 'groups' | 'devices' | 'attention'
@@ -957,6 +958,7 @@
             const selectedBefore = selectedIds.size;
             const cur = knownIds();
             selectedIds.forEach(function (id) { if (!cur.has(id)) selectedIds.delete(id); });
+            if (deviceSelectionAnchorId && !cur.has(deviceSelectionAnchorId)) deviceSelectionAnchorId = null;
             if (selectedIds.size !== selectedBefore) powerConfirm.checked = false;
             // Purge task cells only for devices that went fully offline. Broader than
             // getOnlineIds() on purpose: a device mid self-update ("updating") has no
@@ -1603,6 +1605,7 @@
       }
       function switchTargetTab(tab) {
         if (targetTab === tab) return;
+        deviceSelectionAnchorId = null;
         const crossesAttention = targetTab === 'attention' || tab === 'attention';
         targetTab = tab;
         if (crossesAttention) {
@@ -1614,6 +1617,7 @@
         render();
       }
       function selectGroupAsTarget(name) {
+        deviceSelectionAnchorId = null;
         selectedConnectionIds.clear();
         const known = knownIds();
         selectedIds = new Set((groups[name] || []).filter(function (s) { return known.has(s); }));
@@ -1631,12 +1635,60 @@
         const known = knownIds();
         selectedIds = new Set((groups[activeGroup] || []).filter(function (s) { return known.has(s); }));
       }
-      function toggleDevice(id) {
-        if (selectedIds.has(id)) selectedIds.delete(id); else selectedIds.add(id);
+      function toggleDevice(id, shiftKey) {
+        const device = deviceById(id);
+        const query = deviceSearch.trim().toLowerCase();
+        if (!device || (!selectedIds.has(id) && !deviceMatchesFilter(device, query))) return;
+        const visible = shiftKey ? visibleDevices().map(getDeviceId) : [];
+        const clickedIndex = visible.indexOf(id);
+        const anchorIndex = deviceSelectionAnchorId ? visible.indexOf(deviceSelectionAnchorId) : -1;
+        if (shiftKey && anchorIndex >= 0) {
+          const select = !selectedIds.has(id);
+          const start = Math.min(clickedIndex, anchorIndex);
+          const end = Math.max(clickedIndex, anchorIndex);
+          for (let i = start; i <= end; i++) {
+            if (select) selectedIds.add(visible[i]);
+            else selectedIds.delete(visible[i]);
+          }
+        } else {
+          if (selectedIds.has(id)) selectedIds.delete(id); else selectedIds.add(id);
+        }
+        deviceSelectionAnchorId = id;
         activeGroup = null;
-        render();
+        refreshDeviceSelection();
+        renderActions();
+      }
+
+      // Selection cannot add hidden rows. Update existing controls in place and remove
+      // filter-kept rows when deselected, preserving row DOM, focus, and scroll position.
+      function refreshDeviceSelection() {
+        let visibleCount = 0, selectedCount = 0;
+        targetsBody.querySelectorAll('[data-act="toggleDevice"]').forEach(function (box) {
+          const checked = selectedIds.has(box.dataset.id);
+          const row = box.closest('[data-row-id]');
+          if (!checked && row.classList.contains('kept')) {
+            row.remove();
+            return;
+          }
+          visibleCount++;
+          if (checked) selectedCount++;
+          box.classList.toggle('on', checked);
+          const glyph = checked ? '✓' : '';
+          if (box.textContent !== glyph) box.textContent = glyph;
+        });
+        const header = targetsBody.querySelector('[data-act="selectAll"]');
+        if (header) {
+          const state = selectedCount === 0 ? '' : selectedCount === visibleCount ? 'on' : 'mixed';
+          header.className = 'selbox ' + state;
+          header.textContent = state === 'on' ? '✓' : state === 'mixed' ? '–' : '';
+        }
+        if (!visibleCount) {
+          const rows = targetsBody.querySelector('#devRows');
+          if (rows) rows.innerHTML = '<div class="empty small">No matching devices</div>';
+        }
       }
       function toggleSelectAll() {
+        deviceSelectionAnchorId = null;
         // Operates on the visible set: when a filter is active, select-all toggles only
         // what the user can see, not the whole hidden fleet. Deselecting reaches the entire
         // selection (so this always clears to 0) because selected ⊆ visible — see
@@ -1649,6 +1701,7 @@
         render();
       }
       function clearSelection() {
+        deviceSelectionAnchorId = null;
         selectedIds.clear();
         selectedConnectionIds.clear();
         activeGroup = null;
@@ -2751,7 +2804,7 @@
           renderTargets();
         }
         else if (act === 'editGroup') openManage(t.dataset.group);
-        else if (act === 'toggleDevice') toggleDevice(t.dataset.id);
+        else if (act === 'toggleDevice') toggleDevice(t.dataset.id, e.shiftKey);
         else if (act === 'selectAll') toggleSelectAll();
         else if (act === 'sortDevices') toggleDeviceSort();
         else if (act === 'editLabel') openLabelEditor(t.dataset.id);
@@ -2759,6 +2812,9 @@
         else if (act === 'cancelLabel') closeLabelEditor();
         else if (act === 'forget') sendForget(t.dataset.id);
         else if (act === 'update') sendClientUpdate(t.dataset.id);
+      });
+      targetsBody.addEventListener('mousedown', function (e) {
+        if (e.shiftKey && e.target.closest('[data-act="toggleDevice"]')) e.preventDefault();
       });
       // Targets label-edit keyboard
       targetsBody.addEventListener('keydown', function (e) {
