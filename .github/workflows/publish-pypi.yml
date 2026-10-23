@@ -5,8 +5,8 @@ name: Publish server to PyPI
 # created by release-version-bump.yml), so the server and APK ship from one tag.
 # workflow_dispatch runs a Test PyPI-only dry run for verification.
 #
-# Promotion is two-stage: build+test -> Test PyPI (auto) -> PyPI (gated by the
-# protected `pypi` GitHub environment, which requires manual approval). Both
+# Promotion is two-stage: build+test -> Test PyPI -> PyPI, fully automatic
+# (publishing the release is the human gate, as in STYLY-NetSync). Both
 # publish jobs use Trusted Publishing (OIDC) — no API tokens/secrets. This
 # requires a one-time Trusted Publisher setup on Test PyPI and PyPI, and the
 # `testpypi` / `pypi` environments configured in the repo settings.
@@ -122,7 +122,7 @@ jobs:
     # Only real releases go to production PyPI; workflow_dispatch stops at Test PyPI.
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
-    environment: pypi # protected: requires manual approval (the "after verification" gate)
+    environment: pypi # no protection rules; the release publish is the gate
     permissions:
       id-token: write # OIDC token for Trusted Publishing
     steps:

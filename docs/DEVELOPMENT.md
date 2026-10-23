@@ -1485,8 +1485,9 @@ draft created by `release-version-bump.yml`, which fires both builds. It builds,
 tests, then publishes in two stages using **Trusted Publishing (OIDC)** — no tokens:
 
 1. **Test PyPI** — automatic after build.
-2. **PyPI** — gated by the protected `pypi` GitHub environment (manual approval = the
-   "verify on Test PyPI first" step).
+2. **PyPI** — automatic once the Test PyPI upload succeeds. There is no approval step:
+   publishing the release is the human gate (same as STYLY-NetSync), so anyone with
+   write access can ship a release end to end.
 
 A `workflow_dispatch` run does a Test PyPI-only dry run.
 
@@ -1495,12 +1496,12 @@ A `workflow_dispatch` run does a Test PyPI-only dry run.
 - On **Test PyPI** and **PyPI**, add a Trusted Publisher for this repo: workflow
   `publish-pypi.yml`, environment `testpypi` / `pypi` respectively (use a "pending
   publisher" since the project doesn't exist yet).
-- In the repo's **Settings → Environments**, create `testpypi` (no protection) and
-  `pypi` (required reviewers → manual approval gate).
+- In the repo's **Settings → Environments**, create `testpypi` and `pypi`, both
+  without protection rules (the environments exist only to scope the Trusted Publishers).
 
-**Verifying a Test PyPI release.** After a `workflow_dispatch` dry run (or the
-automatic Test PyPI step of a real release), install the package into a throwaway
-environment and actually start it before approving the `pypi` promotion:
+**Verifying a Test PyPI build.** Since a real release goes to PyPI without pausing, do
+any install check *before* publishing the release: run the `workflow_dispatch` dry run,
+then install the package into a throwaway environment and actually start it:
 
 ```bash
 # Install from Test PyPI. Two flags matter:
@@ -1525,4 +1526,4 @@ PY
 
 A clean run — `HTTP 200`, a discovery JSON reply advertising the WS port, and a
 freshly created `/tmp/styly-data/apks/` — confirms the published artifact installs and
-runs. Only then approve the `pypi` environment to promote the release to PyPI.
+runs. Only then publish the release.
