@@ -327,13 +327,14 @@
         }
         return;
       }
-      if (job.state === 'ready' || job.dispatch_enabled === true ||
-          job.state === 'running' || job.state === 'reconciling') {
-        setSubmissionPhase(submission, 'ready');
-      }
       if (job.dispatch_enabled === true || job.state === 'running' ||
           job.state === 'reconciling') {
+        // A late canonical snapshot still proves that this request was already
+        // dispatched, even when its acknowledgement promise has ended.
+        submission.phase = 'dispatched';
         settleDispatch(submission, null);
+      } else if (job.state === 'ready') {
+        setSubmissionPhase(submission, 'ready');
       }
     });
   }
@@ -617,6 +618,11 @@
   function isDeviceOnline(deviceId) {
     const bridge = window.__stylyPushJobsV1Bridge;
     return !!(bridge && bridge.isDeviceOnline && bridge.isDeviceOnline(deviceId));
+  }
+
+  function isDevicePushStateAvailable(deviceId) {
+    const bridge = window.__stylyPushJobsV1Bridge;
+    return !!(bridge && bridge.isPushStateAvailable && bridge.isPushStateAvailable(deviceId));
   }
 
   // A job stays listed for review while any target is retryable, as offline
@@ -936,7 +942,7 @@
     const online = isDeviceOnline(deviceId);
     const resumePending = isDeviceActionPending('resume', job.job_id, deviceId);
     const cancelPending = isDeviceActionPending('cancel', job.job_id, deviceId);
-    const canResume = resumeRequired && online;
+    const canResume = resumeRequired && online && isDevicePushStateAvailable(deviceId);
     // The server refuses to cancel a reconciling assignment while its device is
     // online, because that device can still report its outcome.
     const canCancel = assignment.cancellable === true &&

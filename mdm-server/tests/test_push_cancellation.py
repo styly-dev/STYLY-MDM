@@ -5,8 +5,8 @@ import uuid
 import pytest
 
 from styly_mdm.push_job_manager import PushJobManager
-from styly_mdm.push_job_store import PushJobStore, StoreConflict
-from styly_mdm.push_jobs import DeviceState
+from styly_mdm.push_job_store import PushJobStore, StoreConflict, now_ms
+from styly_mdm.push_jobs import DeviceState, ProtocolMode, canonicalize_create_request
 from styly_mdm.push_runtime import PushRuntime
 from styly_mdm.push_scheduler import LiveSession
 from styly_mdm.transfer_registry import TransferKey, TransferRegistry
@@ -61,7 +61,7 @@ async def test_timeout_cancel_is_terminal_idempotent_and_unblocks_next_job(manag
     assert cancelled['devices']['D1']['cancel_requested']
     assert await manager.claim_next(['D1']) is None
     assert await manager.cancel_interrupted(first['job_id'], 'D1') == cancelled
-    await manager.store.enable_dispatch(first['job_id'])
+    await manager.store.enable_dispatch(first['job_id'], ['D1'])
     assert await manager.claim_next(['D1']) is None
     await manager.confirm_cancel(first['job_id'], 'D1')
     assert (await manager.claim_next(['D1']))['job']['job_id'] == second['job_id']
@@ -105,18 +105,91 @@ async def test_undispatched_snapshot_is_not_resume_supported(manager):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('phase', ['ready', 'downloading', 'resumed'])
+@pytest.mark.parametrize('phase', ['downloading', 'resumed'])
 async def test_cancel_rejects_work_not_awaiting_timeout_resume(manager, phase):
-    if phase == 'ready':
-        original = await ready_job(manager.store, manager)
-    elif phase == 'downloading':
+    if phase == 'downloading':
         original = await downloading_job(manager.store, manager)
     else:
         original = await timed_out_job(manager)
-        _, original = await manager.store.enable_dispatch(original['job_id'])
+        _, original = await manager.store.enable_dispatch(original['job_id'], ['D1'])
     with pytest.raises(StoreConflict, match='Only paused, interrupted'):
         await manager.cancel_interrupted(original['job_id'], 'D1')
     assert await manager.get_snapshot(original['job_id']) == original
+
+
+@pytest.mark.asyncio
+async def test_cancel_ready_job_targets_individually_and_terminalizes_the_last_one(manager, tmp_path):
+    request = canonicalize_create_request({
+        'client_request_id': str(uuid.uuid4()), 'target_devices': ['D1', 'D2'],
+        'mode': 'sync', 'dest_path': '/sdcard/STYLY/content',
+        'source': {'display_name': 'content', 'declared_file_count': 1,
+                   'declared_total_bytes': 4},
+    })
+    _, ready = await manager.store.create_job(request, {
+        device: (ProtocolMode.JOB_V1, CAPS) for device in ['D1', 'D2']
+    }, 60_000)
+    job_id = ready['job_id']
+    await manager.store.start_upload(job_id)
+    await manager.store.mark_packaging(job_id, 1, 4)
+    artifact_id = str(uuid.uuid4())
+    (tmp_path / (artifact_id + '.zip')).write_bytes(b'data')
+    await manager.store.publish_artifact(job_id, {
+        'artifact_id': artifact_id, 'storage_name': artifact_id + '.zip',
+        'display_filename': 'content.zip', 'byte_size': 4,
+        'sha256': 'a' * 64, 'entry_count': 1,
+    })
+
+    first = await manager.cancel_interrupted(job_id, 'D1')
+    assert first['state'] == 'ready' and first['dispatch_enabled'] is False
+    assert first['devices']['D1']['failure']['code'] == 'cancelled'
+    assert first['devices']['D2']['state'] == 'queued'
+    assert await manager.claim_next(['D1', 'D2']) is None
+    assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms() + 1) == []
+
+    final = await manager.cancel_interrupted(job_id, 'D2')
+    assert final['state'] == 'failed' and final['dispatch_enabled'] is False
+    assert final['terminal_at'] is not None
+    assert final['aggregate']['queued'] == 0
+    assert await manager.claim_next(['D1', 'D2']) is None
+    assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms() + 1) == [artifact_id]
+    assert not (tmp_path / (artifact_id + '.zip')).exists()
+
+
+@pytest.mark.asyncio
+async def test_cancel_last_never_dispatched_target_rederives_active_mixed_job(manager):
+    request = canonicalize_create_request({
+        'client_request_id': str(uuid.uuid4()), 'target_devices': ['D1', 'D2'],
+        'mode': 'sync', 'dest_path': '/sdcard/STYLY/content',
+        'source': {'display_name': 'content', 'declared_file_count': 1,
+                   'declared_total_bytes': 4},
+    })
+    _, created = await manager.store.create_job(request, {
+        device: (ProtocolMode.JOB_V1, CAPS) for device in ['D1', 'D2']
+    }, 60_000)
+    job_id = created['job_id']
+
+    def arrange_mixed_job(conn):
+        timestamp = now_ms()
+        conn.execute(
+            "UPDATE push_jobs SET state='running', dispatch_enabled=0, "
+            "dispatch_paused_reason='server_restart' WHERE job_id=?",
+            (job_id,),
+        )
+        conn.execute(
+            "UPDATE push_job_devices SET state='succeeded', dispatch_revision=1, "
+            "dispatch_capability_snapshot_json=?, accepted_at=?, terminal_at=? "
+            "WHERE job_id=? AND device_id='D1'",
+            ('["push_job_id_v1","push_resume_v1"]', timestamp, timestamp, job_id),
+        )
+
+    await manager.store._call(arrange_mixed_job)
+
+    final = await manager.cancel_interrupted(job_id, 'D2')
+
+    assert final['state'] == 'completed_with_errors'
+    assert final['devices']['D1']['state'] == 'succeeded'
+    assert final['devices']['D2']['state'] == 'failed'
+    assert final['devices']['D2']['failure']['code'] == 'cancelled'
 
 
 @pytest.mark.asyncio
@@ -177,7 +250,7 @@ async def test_client_restart_requires_explicit_resume_even_when_job_enabled(man
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=9999999999999)
     if resume_first:
-        await manager.store.enable_dispatch(active['job_id'])
+        await manager.store.enable_dispatch(active['job_id'], ['D1'])
     outcome, current = await manager.resume_interrupted(active['job_id'], 'D1', attempt=1,
         artifact_id=active['artifact']['artifact_id'], dispatch_revision=active['devices']['D1']['dispatch_revision'],
         validated_offset=1, reason='client_restarted')
@@ -185,7 +258,7 @@ async def test_client_restart_requires_explicit_resume_even_when_job_enabled(man
     assert current['devices']['D1']['queue_reason'] == ('resumable_replay' if resume_first else 'client_restarted')
     if not resume_first:
         assert await manager.claim_next(['D1']) is None
-        await manager.store.enable_dispatch(active['job_id'])
+        await manager.store.enable_dispatch(active['job_id'], ['D1'])
     assert await manager.claim_next(['D1']) is not None
 
 

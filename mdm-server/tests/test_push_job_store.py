@@ -196,6 +196,22 @@ async def test_same_device_jobs_are_ordered_by_enqueue_sequence(store, manager):
 
 
 @pytest.mark.asyncio
+async def test_initial_dispatch_replay_preserves_targeted_resume(store, tmp_path):
+    from test_push_pre_dispatch_settlement import ready
+
+    job = await ready(store, tmp_path)
+    _, targeted = await store.enable_dispatch(job["job_id"], ["D1"])
+    assert targeted["devices"]["D2"]["queue_reason"] == "dispatch_paused"
+
+    # A caller that previously observed READY must use the transaction's current
+    # state, rather than authorize every target after another admin's Resume.
+    changed, replay = await store.enable_dispatch(job["job_id"])
+    assert changed is False
+    assert replay == targeted
+    assert replay["devices"]["D2"]["resume_required"] is True
+
+
+@pytest.mark.asyncio
 async def test_terminal_result_wakes_canonical_aggregate(store, manager):
     protocols = {"D1": (ProtocolMode.JOB_V1, {"push_job_id_v1"})}
     _, job = await store.create_job(canonical(), protocols, 60_000)

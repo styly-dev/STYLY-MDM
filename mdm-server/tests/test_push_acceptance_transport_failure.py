@@ -83,7 +83,7 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
                 validated_offset=0, reason="download_interrupted",
             )
             assert outcome == "requeued"
-            await manager.store.enable_dispatch(snapshot["job_id"])
+            await manager.store.enable_dispatch(snapshot["job_id"], ["D1"])
             claimed = await manager.claim_next(["D1"])
             assert claimed is not None
             assert claimed["accepted_at"] is not None

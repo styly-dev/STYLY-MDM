@@ -226,7 +226,7 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
     assert await manager.get_snapshot(job_id) == paused
     assert runtime.scheduler.wake_count == int(reason is not None and report_path == "reconcile")
 
-    await manager.store.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id, ["D1"])
     await send_report()  # Do not re-pause after the operator authorizes Resume.
     assert (await manager.get_snapshot(job_id))["dispatch_enabled"] is True
     assert await manager.claim_next(["D1"]) is not None
@@ -474,7 +474,7 @@ async def test_retry_exhaustion_allows_another_device_waiting_for_a_slot(manager
         assert session.ws.messages[0]["type"] == "EXECUTE_PUSH_FILES"
         assert (await manager.assignment(job_id, "D2"))["state"] == "dispatching"
         assert await manager.claim_next(["D1"]) is None
-        await manager.store.enable_dispatch(job_id)
+        await manager.store.enable_dispatch(job_id, ["D1"])
         assert await manager.claim_next(["D1"]) is not None
     finally:
         task.cancel()
@@ -664,7 +664,7 @@ async def test_operator_resume_reconciles_recovered_state_before_dispatch(manage
     admin = Ws()
 
     consumed = await runtime.handle_admin_message(
-        admin, {"type": "PUSH_FILES", "job_id": job_id}
+        admin, {"type": "PUSH_FILES", "job_id": job_id, "target_devices": ["D1"]}
     )
 
     assert consumed is True
@@ -677,7 +677,7 @@ async def test_operator_resume_reconciles_recovered_state_before_dispatch(manage
     runtime.scheduler.reconcile_calls.clear()
     runtime.legacy.devices["D1"]["push_state_status"] = "unavailable"
     await runtime.handle_admin_message(
-        admin, {"type": "PUSH_FILES", "job_id": job_id}
+        admin, {"type": "PUSH_FILES", "job_id": job_id, "target_devices": ["D1"]}
     )
     assert runtime.scheduler.reconcile_calls == []
 
@@ -1828,7 +1828,7 @@ async def test_replacement_register_withdraws_pending_resume(
             validated_offset=1,
         )
         assert outcome == "requeued"
-    await manager.store.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id, ["D1"])
     assert (await manager.assignment(job_id, "D1"))["queue_reason"] == "resumable_replay"
     runtime = runtime_for(manager)
     runtime.sessions = {}
@@ -1869,7 +1869,7 @@ async def test_replacement_register_withdraws_pending_resume(
     await runtime.disconnect_device("D1", old)
     assert await manager.get_snapshot(job_id) == paused
     assert runtime.sessions["D1"].ws is new
-    await manager.store.enable_dispatch(job_id)
+    await manager.store.enable_dispatch(job_id, ["D1"])
     assert await manager.claim_next(["D1"]) is not None
 
 

@@ -51,7 +51,11 @@ new session. The transfer watchdog releases HTTP resources before handing a fail
 DB update to dispatch recovery. The scheduler keeps one dispatch task per device,
 including slot waits; disconnect and Resume cannot create a second task for that
 same device before the first exits. Deadline maintenance runs independently of artifact GC.
-Wire messages and SQLite schema 3 remain compatible; the additive device-order
+Temporarily unavailable client state pauses dispatch, including work already waiting
+for a transfer slot, without discarding retained partials. Device-handler exceptions
+run disconnect settlement; manual reconciliation send failures remain local to that
+admin operation. Registration sends `REGISTERED` before exact cleanup rejections.
+SQLite schema 3 remains unchanged; the additive device-order
 index is created for existing databases. Android writes `state_version: 2`, reads
 existing unversioned/version-1 records, and preserves unsupported versions or invalid
 active ownership as unavailable instead of discarding them. Interrupted work uses a
@@ -69,9 +73,10 @@ this repair. Retry requires a published, retained artifact that is not known to
 be missing; the Retry endpoint still checks the physical bytes before creating work.
 Replaying a Retry request UUID returns the existing job without changing its dispatch
 permission or manual waits. If creation committed before initial dispatch failed,
-the existing ready job can be explicitly dispatched without creating another Retry.
+the existing ready job can be explicitly dispatched or cancelled without creating another Retry.
 Restart-paused, never-dispatched targets can be cancelled entirely on the server,
 even offline; dispatched targets still require exact client cleanup evidence.
+Retry supersession also recognizes dispatch evidence retained from schema 1.
 
 Issue #94 adds resumable transfers, per-device Resume and Cancel controls, and
 retry of failed targets. See [Push / Sync jobs](PUSH_JOBS.md) for the recovery
@@ -86,6 +91,9 @@ metadata is released after pending work settles. Pending Resume/Cancel/Retry
 operations survive redraws and resolve from
 canonical updates, action replies, connection changes, or a bounded fallback timer.
 Untyped server errors remain visible without clearing an unrelated pending action.
+Late canonical snapshots establish completed dispatch even after an acknowledgement
+timeout. Untargeted `PUSH_FILES` retries acknowledge an already dispatched job;
+resuming its work requires explicit `target_devices`.
 
 Client WebSocket diagnostic logs record bounded message types, not message
 payloads or parser exception text, because commands contain temporary artifact
@@ -574,7 +582,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `DELETE_APP` | Uninstall an app from target devices (the console gates it behind a confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only), `package_name`. STYLY-MDM's own packages are rejected — `RETIRE_DEVICE` is the only sanctioned way to remove the client. See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_DEVICE` / `POWER_OFF_DEVICE` | Reboot or power off target devices (the console gates both behind a shared confirmation). Normal targets use `target_devices` (list of device IDs or `["*"]`; online devices only). Need attention targets use `target_connections` (a non-empty list of server-issued connection IDs) instead. The two fields cannot be combined; `target_connections` rejects empty arrays, duplicates, and wildcards, and never falls back to normal-device resolution. Only these two message types may contain `target_connections`. See [Remote Power Control](#remote-power-control). |
 | `INSTALL_APK` | Install an uploaded APK on target devices. Fields: `target_devices` (list of device IDs or `["*"]`), `apk_url`, `apk_filename` |
-| `PUSH_FILES` | Push-job flow: `job_id` and optional `target_devices` for scoped Resume; the server reads mode, destination, and immutable artifact metadata from SQLite. Every target must support `push_job_id_v1`; the legacy job fallback is disabled. Identity-less requests receive an explicit error. |
+| `PUSH_FILES` | `job_id` enables initial dispatch; an untargeted repeat only acknowledges an already dispatched job. Resume requires explicit `target_devices`. The server reads mode, destination, and immutable artifact metadata from SQLite. Targets must advertise both `push_job_id_v1` and `push_resume_v1` with available Push state. Identity-less requests receive an explicit error. |
 | `CANCEL_PUSH_JOB` | Persist cancellation for eligible interrupted or unresolved assignments. Fields: `job_id`, optional `target_devices`; missing targets means all applicable assignments. A live HTTP lease is revoked, while device ownership remains until exact cleanup or terminal evidence. |
 | `RETRY_FAILED_PUSH_JOB` | Create a new job for failed targets that are currently online, using the retained artifact. Offline targets are skipped and stay eligible for a later retry. Fields: `job_id`, idempotent `client_request_id`. |
 | `RECONCILE_PUSH_DEVICE` | Re-requests exact reconciliation for a fenced device. Field: `device_id`. It cannot force-clear state or a fence without matching client/process evidence. |

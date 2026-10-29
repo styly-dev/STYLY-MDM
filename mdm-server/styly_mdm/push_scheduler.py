@@ -50,6 +50,10 @@ class LiveSession:
     # would not be authoritative evidence, so no reconciliation is requested.
     push_state_available: bool = True
 
+    @property
+    def can_dispatch(self) -> bool:
+        return self.push_state_available and PUSH_JOB_CAPABILITIES <= self.capabilities
+
 
 class PushScheduler:
     def __init__(
@@ -166,7 +170,10 @@ class PushScheduler:
                 try:
                     # A disconnect can requeue work while its task still waits
                     # for a slot. Keep one local task per device until it exits.
-                    eligible_devices = self.sessions().keys() - set(self._dispatch_tasks.values())
+                    eligible_devices = {
+                        device_id for device_id, session in self.sessions().items()
+                        if session.can_dispatch
+                    } - set(self._dispatch_tasks.values())
                     assignment = await self.manager.claim_next(eligible_devices)
                     if assignment is None:
                         break
@@ -230,14 +237,8 @@ class PushScheduler:
                     self.wake()
                 return
 
-            if not PUSH_JOB_CAPABILITIES <= session.capabilities:
-                await self._fail_current(
-                    job_id,
-                    device_id,
-                    {DeviceState.WAITING_TRANSFER},
-                    "capability_changed_before_dispatch",
-                    "Live session no longer supports push_job_id_v1 and push_resume_v1",
-                )
+            if not session.can_dispatch:
+                await self._pause_unavailable_dispatch(job_id, device_id)
                 return
 
             # Register before the canonical waiting_transfer -> dispatching commit. A
@@ -282,6 +283,10 @@ class PushScheduler:
                         raise ConnectionOwnerChanged(
                             "device WebSocket owner changed before command send"
                         )
+                    if not session.can_dispatch:
+                        self._clear_dispatch_waiters(key, transfer_future, accept_future)
+                        await self._pause_unavailable_dispatch(job_id, device_id)
+                        return
                     assignment_now = await self.manager.assignment(job_id, device_id)
                     if assignment_now is None or assignment_now.get("cancel_requested_at") is not None:
                         self._clear_dispatch_waiters(key, transfer_future, accept_future)
@@ -760,6 +765,23 @@ class PushScheduler:
             "Device reported an active Push/Sync execution that is not canonical on this server",
         )
         return False
+
+    async def _pause_unavailable_dispatch(self, job_id: str, device_id: str) -> None:
+        try:
+            snapshot = await self.manager.transition_device(
+                job_id, device_id,
+                expected={DeviceState.WAITING_TRANSFER, DeviceState.DISPATCHING},
+                target=DeviceState.QUEUED,
+                fields={
+                    "queue_reason": "dispatch_paused",
+                    "accept_deadline": None,
+                    "failure_code": None,
+                    "failure_detail": "Device Push state is unavailable; Resume when it recovers",
+                },
+            )
+            await self.publish(snapshot)
+        except StoreConflict:
+            pass
 
     async def _requeue_after_send_race(
         self, job_id: str, device_id: str, detail: str

@@ -22,6 +22,7 @@ assert.ok(listHelpers.length > 0, 'actual device list helpers exist');
 
 function makeHarness({ order = [], selected = [], devices = null } = {}) {
   const context = vm.createContext({
+    window: {},
     devices: devices || order.map((id) => ({ device_id: id, label: id, status: 'online' })),
     deviceSearch: '',
     deviceSort: 'label-asc',

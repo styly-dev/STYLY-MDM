@@ -8,7 +8,7 @@ A browser creates a job before uploading bytes:
 
 1. `POST /api/push-jobs` allocates an opaque UUIDv4 `job_id` and atomically records the target snapshot in `DATA_DIR/push_jobs.sqlite3`.
 2. `POST /api/push-jobs/{job_id}/upload` writes into `push-work/{job_id}`, packages the upload, fsyncs it, and publishes an immutable `push-artifacts/{artifact_id}.zip`.
-3. Admin WebSocket `PUSH_FILES {job_id}` enables dispatch. Destination, mode, targets, and artifact data are read from SQLite rather than trusted from a second browser message.
+3. Admin WebSocket `PUSH_FILES {job_id}` enables initial dispatch. Repeating it after dispatch only acknowledges the existing job; Resume requires explicit `target_devices`. Destination, mode, targets, and artifact data are read from SQLite rather than trusted from a second browser message.
 
 `client_request_id` makes job creation idempotent. The server looks up an existing request **before** live-target preflight, so loss of the first response followed by a device disconnect still returns the original job. The canonical fingerprint sorts targets, normalizes the shared-storage destination, and hashes stable JSON. Reusing an ID with different canonical data returns `409 Conflict`.
 
@@ -43,8 +43,9 @@ advance; the dispatch revision remains fixed for one `(job_id, device_id,
 attempt)` and is the exact identity used when authorizing a resume. Every Push
 job target must advertise both `push_job_id_v1` and `push_resume_v1`, whatever the
 artifact size; there is no non-resumable fallback. Job creation rejects other
-targets, and dispatch rechecks the live session, failing the assignment with
-`capability_changed_before_dispatch` if it no longer qualifies. A device on an
+targets, and dispatch rechecks the live session before sending. If Push state is
+unavailable after a target is claimed, dispatch returns it to a manual wait for
+Resume after recovery; it does not fail a retained transfer or discard its partial. A device on an
 older APK must take the client self-update before it can receive Push/Sync jobs.
 The supported headset is PICO 4 Ultra Enterprise. Identity-less live Push commands
 are rejected; the obsolete `/api/bundles` upload returns HTTP 410 and `/bundles/`
@@ -277,24 +278,27 @@ artifact bytes. HTTP leases follow the restart behavior described above.
   pending cancellations are unchanged. Work the device has already accepted
   (downloading, validating, applying) is not stopped by a management WebSocket
   disconnect.
-- **Resume** is available only for online devices. **Resume all** excludes offline
-  devices, preserving their manual wait and Needs attention entry. Offline timed-out
+- **Resume** is available only for online devices with available Push state and
+  the required capabilities. **Resume all** excludes ineligible devices,
+  preserving their manual wait and Needs attention entry. Offline timed-out
   devices support **Cancel** only; reconnect alone never grants resume permission.
 - **Resume** clears current per-device retry-exhaustion waits and reopens a
   restart-paused dispatch gate. It does not rerun terminal failures, reset the first
   interruption timestamp, or authorize new interruptions reported after the action.
   Each device's Progress cell exposes its own Resume/Cancel actions, which send
-  `target_devices: [device_id]`. Omitting targets means all applicable assignments;
-  empty, malformed or foreign targets are rejected. The attention panel retains
+  `target_devices: [device_id]`. Resume requires an explicit target list;
+  an untargeted request cannot reopen a dispatched job's manual waits.
+  Empty, malformed or foreign targets are rejected. The attention panel retains
   **Resume all**. Resuming one device after a server restart keeps all other queued
   or interrupted devices paused until their own Resume or Resume all.
   A storage write failure with an exact retained partial uses the same manual
   Resume gate; the operator must free or repair device storage first.
 - **Cancel** finishes a never-dispatched queued target immediately on the server
-  when a running/reconciling job requires Resume, including offline targets after
+  when a ready/running/reconciling job requires Resume, including offline targets after
   server restart. It records `failed/cancelled` without a pending cancellation or
   device command; no client owns that assignment. Cancelling the final unfinished
-  target terminalizes the job and allows normal artifact expiry.
+  target terminalizes the job and allows normal artifact expiry. Cancelling only
+  some targets of a ready job leaves the others ready without enabling dispatch.
   For dispatched interrupted or unresolved work, Cancel persists an operator
   cancellation request, including offline status-confirmation waits. It revokes a still-active
   HTTP lease and stops its stream even when the management WebSocket is offline.
@@ -316,15 +320,17 @@ artifact bytes. HTTP leases follow the restart behavior described above.
   `push_jobs.assignment_actions`: `manual_wait` (a per-device wait for Resume),
   `resume_required`, `cancellable` (the same rule `CANCEL_PUSH_JOB` enforces), and
   `retryable` (the rule `RETRY_FAILED_PUSH_JOB` enforces before its online check).
-  The console only combines them with live connectivity: Resume needs an online
-  device, and a reconciling assignment is cancellable only while its device is
+  The console combines them with live connectivity and Push-state availability.
+  A reconciling assignment is cancellable only while its device is
   offline. Targets already moved to a retry job expose no Resume/Cancel actions;
   a remaining device fence still exposes Reconcile in the job controls.
 - **Retry failed devices** creates and dispatches a new job for online `failed`,
   `interrupted`, and `unconfirmed` targets, excluding `failure_code: cancelled`.
   A target is also excluded when a later job for the same device and destination
   was dispatched or is still pending: retrying the older artifact would overwrite
-  newer content (and, for Sync, delete it). Online means a live session that
+  newer content (and, for Sync, delete it). Existing schema-1 capability snapshots
+  and acceptance timestamps also count as dispatch evidence after migration.
+  Online means a live session that
   advertises the Push job capabilities with available Push state; a target that
   disconnects before the retry job is enabled is settled like any offline target.
   It reuses the immutable artifact without upload and leaves success records and
@@ -455,7 +461,9 @@ canonical reconciliation and fences untouched, and sends no `PUSH_RECONCILE_REQU
 until the client reports available state. A client that has not loaded its durable
 state ignores reconciliation requests instead of answering `absent`.
 Job creation for such a target fails with an explanation instead of a capability
-error.
+error. Resume also excludes unavailable targets. If state becomes unavailable while
+waiting for a transfer slot, dispatch returns to a manual wait and preserves the
+execution identity and partial bytes.
 
 The worker validates destination paths on the device as well as the server. It accepts only a shared-storage subdirectory, rejects protected top-level media/app directories, does not traverse destination symlinks, bounds ZIP entry count and expanded bytes, rejects duplicate or conflicting archive paths, and validates the exact job-v1 artifact size and SHA-256 before publishing the downloaded ZIP or touching the destination. Destination validation completes before the client reports `applying`.
 
@@ -553,6 +561,11 @@ A missing DB-referenced immutable artifact is never substituted. Startup fails t
 A client process restart retains an Issue #94 job-v1 active record as
 `interrupted` without starting work. It advertises the durable identity and
 local offset, and waits for an exact server authorization before resuming.
+Registration sends `REGISTERED` before any exact `PUSH_RESUME_REJECTED` cleanup
+instruction, so both endpoints have accepted the connection before cleanup starts.
+Device-handler failures run the same disconnect settlement as normal closure.
+Failure to send a manually requested reconciliation reports an error to the admin
+without closing the admin connection.
 Pre-Issue-94 job-v1 records without an immutable dispatch revision, and legacy
 commands, keep the earlier `client_restarted` terminal/outbox cleanup behavior
 because they cannot prove safe resume identity. Reconciliation accepts only

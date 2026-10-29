@@ -551,6 +551,8 @@ class PushJobStore:
                 "WHERE newer.device_id=older.device_id "
                 "AND newer.enqueue_seq>older.enqueue_seq AND j.dest_path=? "
                 "AND (newer.dispatch_revision IS NOT NULL "
+                "OR newer.dispatch_capability_snapshot_json IS NOT NULL "
+                "OR newer.accepted_at IS NOT NULL "
                 "OR newer.state NOT IN ('succeeded','failed','interrupted','unconfirmed'))) ",
                 (job["job_id"], job["dest_path"]),
             )
@@ -971,6 +973,12 @@ class PushJobStore:
                     if not target_devices or not set(target_devices) <= known:
                         raise StoreConflict("Resume targets must belong to this job")
                 state = JobState(row["state"])
+                if target_devices is None and state in {JobState.RUNNING, JobState.RECONCILING}:
+                    # Initial dispatch retries cannot grant a later Resume, even
+                    # when another admin changed the job after the runtime read it.
+                    snapshot = self._snapshot(conn, job_id)
+                    self._commit(conn)
+                    return False, snapshot
                 if state in {JobState.READY, JobState.RUNNING, JobState.RECONCILING}:
                     timestamp = now_ms()
                     target_clause = ""

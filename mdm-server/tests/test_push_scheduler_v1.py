@@ -62,7 +62,7 @@ def test_dispatch_requires_job_id_and_resume_capabilities(capabilities):
         scheduler = object.__new__(PushScheduler)
         scheduler.sessions = lambda: {"D1": session}
         scheduler.transfer_slots = lambda: asyncio.Semaphore(1)
-        scheduler._fail_current = AsyncMock()
+        scheduler._pause_unavailable_dispatch = AsyncMock()
         await scheduler._dispatch_assignment_inner({
             "job": {
                 "job_id": "job", "declared_total_bytes": 10,
@@ -70,8 +70,7 @@ def test_dispatch_requires_job_id_and_resume_capabilities(capabilities):
             },
             "device_id": "D1", "attempt": 1,
         })
-        scheduler._fail_current.assert_awaited_once()
-        assert scheduler._fail_current.await_args.args[3] == "capability_changed_before_dispatch"
+        scheduler._pause_unavailable_dispatch.assert_awaited_once_with("job", "D1")
         assert session.ws.messages == []
 
     asyncio.run(scenario())
@@ -186,7 +185,7 @@ async def test_resume_after_disconnect_does_not_duplicate_a_slot_waiting_task(
             validated_offset=0, reason="download_interrupted",
         )
         assert outcome == "requeued"
-        await store.enable_dispatch(job_id)
+        await store.enable_dispatch(job_id, ["D1"])
         scheduler.start()
         await asyncio.wait_for(claim_checked.wait(), 1)
         assert (await manager.assignment(job_id, "D1"))["state"] == "waiting_transfer"

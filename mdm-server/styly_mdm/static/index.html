@@ -1564,6 +1564,10 @@
       // copies Push assignments into the independent Install/Verify task state.
       window.__stylyPushJobsV1Bridge = {
         isDeviceOnline: function (id) { const d = deviceById(id); return !!d && d.status === 'online'; },
+        isPushStateAvailable: function (id) {
+          const d = deviceById(id);
+          return !!d && d.push_state_status === 'available';
+        },
         refreshAttention: function () {
           if (view !== 'console') return;
           renderTabs();

@@ -79,7 +79,7 @@ async def test_admin_queued_cancel_requests_exact_reconcile_under_owner_lock(man
     }]
     current = await manager.get_snapshot(original["job_id"])
     assert current["devices"]["D1"]["cancel_requested"]
-    await admin_action(runtime, admin, "PUSH_FILES", original["job_id"])
+    await admin_action(runtime, admin, "PUSH_FILES", original["job_id"], target_devices=list(original["devices"]))
     assert await manager.claim_next(["D1"]) is None
     assert not any(item["type"] == "EXECUTE_PUSH_FILES" for item in session.ws.messages)
 
@@ -155,7 +155,7 @@ async def test_cancel_intent_survives_exact_reconcile_send_failure(manager, tmp_
 async def test_admin_cancel_rejects_active_or_already_resumed_work(manager, tmp_path, resumed):
     original = await timed_out_job(manager) if resumed else await downloading_job(manager.store, manager)
     if resumed:
-        _, original = await manager.store.enable_dispatch(original["job_id"])
+        _, original = await manager.store.enable_dispatch(original["job_id"], ["D1"])
     runtime, session, admin = operator_runtime(manager, tmp_path)
     assert await runtime.handle_admin_message(admin, {"type": "CANCEL_PUSH_JOB", "job_id": original["job_id"]})
     assert any(message["type"] == "ERROR" for message in admin.messages)
@@ -344,7 +344,7 @@ async def test_individual_resume_from_global_pause_keeps_other_device_paused_unt
     assert await manager.claim_next(["D2"]) is None
     assert (await manager.claim_next(["D1"]))["device_id"] == "D1"
     runtime.sessions["D2"] = runtime.sessions["D1"]
-    await admin_action(runtime, admin, "PUSH_FILES", original["job_id"])
+    await admin_action(runtime, admin, "PUSH_FILES", original["job_id"], target_devices=list(original["devices"]))
     assert (await manager.claim_next(["D2"]))["device_id"] == "D2"
 
 
@@ -386,7 +386,7 @@ async def test_restart_individual_resume_does_not_authorize_other_reconnecting_w
     assert await manager.claim_next(["D2"]) is None
     assert (await manager.claim_next(["D1"]))["device_id"] == "D1"
     runtime.sessions["D2"] = runtime.sessions["D1"]
-    await admin_action(runtime, admin, "PUSH_FILES", original["job_id"])
+    await admin_action(runtime, admin, "PUSH_FILES", original["job_id"], target_devices=list(original["devices"]))
     assert (await manager.claim_next(["D2"]))["device_id"] == "D2"
 
 
@@ -409,7 +409,7 @@ async def test_offline_resume_rejected_but_cancel_allowed(manager, tmp_path):
 async def test_resume_all_keeps_offline_timeout_waiting(manager, tmp_path):
     original = await two_device_job(manager, interrupted=True)
     runtime, _, admin = operator_runtime(manager, tmp_path)
-    await admin_action(runtime, admin, "PUSH_FILES", original["job_id"])
+    await admin_action(runtime, admin, "PUSH_FILES", original["job_id"], target_devices=list(original["devices"]))
     current = await manager.get_snapshot(original["job_id"])
     assert current["devices"]["D1"]["queue_reason"] == "resumable_replay"
     assert current["devices"]["D2"]["queue_reason"] == "download_interrupted"
@@ -459,7 +459,7 @@ async def test_restart_unsent_offline_target_can_be_cancelled_without_client(
     )
     runtime, session, admin = operator_runtime(manager, tmp_path)
     if resume_online:
-        await admin_action(runtime, admin, "PUSH_FILES", job_id)
+        await admin_action(runtime, admin, "PUSH_FILES", job_id, target_devices=["D1", "D2"])
     else:
         runtime.sessions.clear()
     before = await manager.get_snapshot(job_id)
@@ -548,3 +548,21 @@ async def test_retry_request_replay_preserves_dispatch_authority(manager, tmp_pa
         await admin_action(runtime, admin, "PUSH_FILES", retry_id)
         assert (await manager.get_snapshot(retry_id))["dispatch_enabled"]
         assert (await manager.claim_next(["failed"]))["job"]["job_id"] == retry_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True])
+async def test_initial_dispatch_replay_does_not_resume_paused_targets(manager, tmp_path, restart):
+    original = await two_device_job(manager, interrupted=True)
+    if restart:
+        manager.store.recover_startup_sync(
+            accept_reconciliation_timeout_ms=1000, reconciliation_timeout_ms=1000,
+        )
+    runtime, session, admin = operator_runtime(manager, tmp_path)
+    before = await manager.get_snapshot(original["job_id"])
+    await admin_action(runtime, admin, "PUSH_FILES", original["job_id"])
+    assert await manager.get_snapshot(original["job_id"]) == before
+    assert admin.messages[-1]["type"] == "PUSH_FILES_SENT"
+    assert admin.messages[-1]["resume"] is False
+    assert session.ws.messages == []
+    assert await manager.claim_next(["D1", "D2"]) is None

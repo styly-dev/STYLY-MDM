@@ -1764,57 +1764,60 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
             elif raw_msg.type == web.WSMsgType.ERROR:
                 log.error("Device WS error: %s", ws.exception())
     finally:
-        was_provisional = provisional_connections.pop(ws, None) is not None
-        # Every teardown step below belongs to the connection that currently owns
-        # the device_id: a superseded socket must not free the live connection's
-        # transfer slots, settle its pending state, or delete its registration —
-        # that last one left a connected device stuck on "offline" until the next
-        # BATTERY_UPDATE crashed the survivor (#70). See _owns_device.
-        is_current = _owns_device(device_id, ws)
-        if device_id and not is_current:
-            log.info("Superseded device connection closed, ignoring: %s", device_id)
-        if device_id and is_current:
-            # Install keeps the legacy disconnect release. Push is deliberately
-            # retained by the runtime adapter because its Android HTTP worker outlives
-            # this WebSocket and remains bounded by exact completion or timeout.
-            release_transfer_slot(device_id, "disconnect")
-            # The dispatch record only bridges dispatch -> SELF_UPDATE_STARTING; by a
-            # disconnect that announcement has already copied what it needed, so drop
-            # it rather than let it linger until the next install overwrites it.
-            last_install_dispatch.pop(device_id, None)
-            # A disconnect during a pending retire is likewise the *expected*
-            # teardown: the entry survives (no code needed — it lives in
-            # pending_retires) and the broadcast below renders the row as
-            # "retiring" until _retire_timeout settles it.
-            # A disconnect during a pending self-update is the *expected* kill-and-
-            # power-cycle, so the entry survives and the list broadcast below renders
-            # the row as "updating". A disconnect during the post-update verification
-            # phase, however, means the answer will never arrive: close it out.
-            pend = pending_self_updates.get(device_id)
-            if pend is not None and pend.get("phase") == "verifying":
-                verify_timeout = pend.get("timeout_task")
-                if verify_timeout is not None:
-                    verify_timeout.cancel()
-                del pending_self_updates[device_id]
-                await forward_to_admins({
-                    "type": "SELF_UPDATE_VERIFIED",
-                    "device_id": device_id,
-                    "correlation_id": pend["correlation_id"],
-                    "status": "error",
-                    "detail": "device disconnected before verification completed",
-                })
-        if device_id and is_current:
-            del devices[device_id]
-            # Keep the registry entry; just stop reporting the device as online and
-            # stamp when it was last seen so it shows as offline in the list.
-            rec = device_registry.get(device_id)
-            if rec is not None:
-                rec["last_seen"] = time.time()
-                save_registry()
-            log.info("Device disconnected: %s", device_id)
-            await broadcast_device_list()
-        if was_provisional:
-            await broadcast_provisional_connection_list()
+        try:
+            was_provisional = provisional_connections.pop(ws, None) is not None
+            # Every teardown step below belongs to the connection that currently owns
+            # the device_id: a superseded socket must not free the live connection's
+            # transfer slots, settle its pending state, or delete its registration —
+            # that last one left a connected device stuck on "offline" until the next
+            # BATTERY_UPDATE crashed the survivor (#70). See _owns_device.
+            is_current = _owns_device(device_id, ws)
+            if device_id and not is_current:
+                log.info("Superseded device connection closed, ignoring: %s", device_id)
+            if device_id and is_current:
+                # Install keeps the legacy disconnect release. Push is deliberately
+                # retained by the runtime adapter because its Android HTTP worker outlives
+                # this WebSocket and remains bounded by exact completion or timeout.
+                release_transfer_slot(device_id, "disconnect")
+                # The dispatch record only bridges dispatch -> SELF_UPDATE_STARTING; by a
+                # disconnect that announcement has already copied what it needed, so drop
+                # it rather than let it linger until the next install overwrites it.
+                last_install_dispatch.pop(device_id, None)
+                # A disconnect during a pending retire is likewise the *expected*
+                # teardown: the entry survives (no code needed — it lives in
+                # pending_retires) and the broadcast below renders the row as
+                # "retiring" until _retire_timeout settles it.
+                # A disconnect during a pending self-update is the *expected* kill-and-
+                # power-cycle, so the entry survives and the list broadcast below renders
+                # the row as "updating". A disconnect during the post-update verification
+                # phase, however, means the answer will never arrive: close it out.
+                pend = pending_self_updates.get(device_id)
+                if pend is not None and pend.get("phase") == "verifying":
+                    verify_timeout = pend.get("timeout_task")
+                    if verify_timeout is not None:
+                        verify_timeout.cancel()
+                    del pending_self_updates[device_id]
+                    await forward_to_admins({
+                        "type": "SELF_UPDATE_VERIFIED",
+                        "device_id": device_id,
+                        "correlation_id": pend["correlation_id"],
+                        "status": "error",
+                        "detail": "device disconnected before verification completed",
+                    })
+            if device_id and is_current:
+                del devices[device_id]
+                # Keep the registry entry; just stop reporting the device as online and
+                # stamp when it was last seen so it shows as offline in the list.
+                rec = device_registry.get(device_id)
+                if rec is not None:
+                    rec["last_seen"] = time.time()
+                    save_registry()
+                log.info("Device disconnected: %s", device_id)
+                await broadcast_device_list()
+            if was_provisional:
+                await broadcast_provisional_connection_list()
+        finally:
+            await ws.close()
 
     return ws
 

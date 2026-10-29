@@ -240,8 +240,11 @@ def assignment_actions(
             (
                 never_dispatched
                 and state == DeviceState.QUEUED.value
-                and job_state in {JobState.RUNNING.value, JobState.RECONCILING.value}
                 and resume_required
+                and (
+                    job_state in {JobState.RUNNING.value, JobState.RECONCILING.value}
+                    or (job_state == JobState.READY.value and not dispatch_enabled)
+                )
             )
             or (
                 resume_supported

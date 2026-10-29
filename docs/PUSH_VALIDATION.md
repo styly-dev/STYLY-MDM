@@ -6,6 +6,20 @@ operating policy, and breaking changes to the old standalone API.
 
 ## Automated verification
 
+The 2026-10-29 review fixes, including the current develop integration, passed
+680 server tests on Python 3.12.13 / aiohttp 3.14.3. Console and device range
+selection checks passed 77 tests with one existing skip. Android
+`testProdDebugUnitTest assembleProdDebug` passed all 229 tests and built the APK.
+Real WebSocket regressions cover registration acknowledgement before exact resume
+rejection, disconnect settlement after handler errors, admin connection survival
+after device reconciliation send failures, and unavailable Push state before
+Resume, during slot wait, and immediately before dispatch. Additional regressions
+cover schema-1 Retry supersession, partial/final READY cancellation, late dispatch
+snapshots, and untargeted dispatch replay preserving manual waits. A controlled
+concurrent-request probe also confirmed that an old READY snapshot cannot expand
+another admin's selected Resume targets. These fixes were not tested on a physical
+headset or in Linux release CI.
+
 Earlier checks on macOS, 2026-10-21:
 
 - Python 3.11.15 / aiohttp 3.14.5: 653 server tests passed in ten consecutive runs.

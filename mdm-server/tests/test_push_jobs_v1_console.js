@@ -229,6 +229,7 @@ function loadAdapter(options = {}) {
   };
   global.__stylyPushJobsV1Bridge = {
     isDeviceOnline: options.isDeviceOnline || (() => true),
+    isPushStateAvailable: options.isPushStateAvailable || (() => true),
     refreshAttention() { global.refreshPushJobAttention(); },
     invalidateDevice(deviceId) {
       const assignment = window.__stylyPushJobsV1Actions.assignmentFor(deviceId);
@@ -302,8 +303,14 @@ function openIntegratedConsole(options = {}) {
     view: 'console', targetTab: 'devices', deviceTaskState: {},
     document: { getElementById(id) { return fields[id]; } },
     targetsBody: { querySelectorAll() { return cells; } },
-    deviceById(id) { return { device_id: id, status: options.isDeviceOnline && !options.isDeviceOnline(id) ? 'offline' : 'online' }; },
-    pushStateUnavailable() { return false; },
+    deviceById(id) {
+      return {
+        device_id: id,
+        status: options.isDeviceOnline && !options.isDeviceOnline(id) ? 'offline' : 'online',
+        push_state_status: options.pushStateStatus || 'available',
+      };
+    },
+    pushStateUnavailable() { return options.pushStateStatus === 'unavailable'; },
     renderTabs() {}, renderTargets() {}, updateButtons() {},
     selectedIds: new Set(options.selectedIds || ['D1']),
     onlineTargets(ids) {
@@ -669,6 +676,38 @@ test('a terminal snapshot settles submission successfully when dispatch was acce
     assert.deepEqual(await request, { job_id: jobId, state: 'dispatched' },
       terminal.state + ' records a successful dispatch independently of its final job result');
   }
+});
+
+test('a late dispatched snapshot prevents an ordinary Push retry from resuming the job', async () => {
+  const jobId = '88888888-8888-4888-8888-888888888888';
+  const h = openIntegratedConsole({
+    fetch: async (url) => {
+      const body = url === '/api/push-jobs'
+        ? { job_id: jobId, state: 'created', upload_url: '/upload' }
+        : { job_id: jobId, state: 'ready' };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    },
+  });
+
+  const firstAttempt = h.sendPush();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.socket.sent, [{ type: 'PUSH_FILES', job_id: jobId }]);
+  h.socket.close();
+  assert.equal(await firstAttempt, false);
+
+  const replacementSocket = new window.WebSocket('ws://localhost/ws/admin');
+  replacementSocket.snapshot(snapshot(jobId, 8, 'D1', 'queued', 1, {
+    dispatchEnabled: true,
+    jobState: 'running',
+    resumeRequired: true,
+  }));
+  assert.equal(window.__stylyPushJobsV1Actions.assignmentFor('D1').canResume, true);
+  assert.deepEqual(await h.sendPush(), { job_id: jobId, state: 'dispatched' });
+  assert.deepEqual(replacementSocket.sent, [],
+    'the snapshot settles the original request without sending an untargeted Resume');
 });
 
 test('Push panel keeps the selected files after create failure for retry', async () => {
@@ -1260,6 +1299,26 @@ test('Push state unavailable warning preserves an independent install progress',
   assert.doesNotMatch(html, /<button/);
 });
 
+test('Resume is unavailable while the device cannot use durable Push state', () => {
+  const { socket, ...h } = openIntegratedConsole({ pushStateStatus: 'unavailable' });
+  const job = snapshot('state-unavailable-resume', 1, 'D1', 'queued', 1, {
+    resumeRequired: true,
+    cancellable: true,
+  });
+  job.devices.D1.queue_reason = 'download_interrupted';
+  socket.snapshot(job);
+
+  const assignment = window.__stylyPushJobsV1Actions.assignmentFor('D1');
+  assert.equal(assignment.needsAttention, true);
+  assert.equal(assignment.canResume, false);
+  assert.equal(assignment.canCancel, true);
+  assert.equal(window.__stylyPushJobsV1Actions.sendDeviceAction('D1', job.job_id, 'resume'), false);
+  assert.equal(findElementByText(h.pushJobsTabActions, 'Resume all').disabled, true);
+  assert.match(h.html(), /Push state unavailable/);
+  assert.doesNotMatch(h.html(), /data-action="resume"/);
+  assert.match(h.html(), /data-action="cancel"/);
+});
+
 test('Needs attention includes devices with unavailable Push state once', () => {
   const devices = [
     { device_id: 'job', status: 'online' },
@@ -1346,7 +1405,7 @@ test('device list disconnect clears only generic task state', () => {
   assert.ok(match);
   const context = vm.createContext({
     msg: { devices: [{ device_id: 'D1', status: 'offline' }] },
-    devices: [], selectedIds: new Set(), powerConfirm: {},
+    devices: [], selectedIds: new Set(), deviceSelectionAnchorId: null, powerConfirm: {},
     knownIds() { return new Set(['D1']); },
     isOnline(device) { return device.status === 'online'; },
     getDeviceId(device) { return device.device_id; },

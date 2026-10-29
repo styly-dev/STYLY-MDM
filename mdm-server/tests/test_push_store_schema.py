@@ -90,6 +90,35 @@ async def test_schema_one_upgrade_writes_restorable_backup_first(tmp_path):
         ).fetchone()[0] == '3'
 
 
+@pytest.mark.asyncio
+async def test_schema_one_dispatch_history_still_supersedes_retry(tmp_path):
+    path = tmp_path / 'push_jobs.sqlite3'
+    store = PushJobStore(path)
+    manager = PushJobManager(store)
+    try:
+        old = await _ready_job(manager, tmp_path, {'D1': 'failed'})
+        await _ready_job(manager, tmp_path, {'D1': 'succeeded'})
+    finally:
+        store.close()
+
+    _downgrade_to_schema_one(path)
+
+    upgraded = PushJobStore(path)
+    upgraded_manager = PushJobManager(upgraded)
+    try:
+        old_single = await upgraded_manager.get_snapshot(old['job_id'])
+        old_list = await upgraded_manager.list_snapshots(100, 0)
+        assert old_single['devices']['D1']['retryable'] is False
+        assert next(job for job in old_list if job['job_id'] == old['job_id'])['devices']['D1']['retryable'] is False
+        with pytest.raises(StoreConflict, match='no unsuccessful'):
+            await upgraded_manager.retry_failed(
+                old['job_id'], str(uuid.uuid4()),
+                artifact_root=tmp_path, online_devices={'D1'},
+            )
+    finally:
+        upgraded.close()
+
+
 def test_new_or_current_database_writes_no_backup(tmp_path):
     path = tmp_path / 'push_jobs.sqlite3'
     PushJobStore(path).close()
@@ -244,6 +273,11 @@ def test_assignment_actions_rules():
     assert (queued.manual_wait, queued.resume_required, queued.cancellable) == (False, False, False)
     paused_job = _actions(queue_reason=None, dispatch_enabled=False)
     assert paused_job.resume_required and not paused_job.cancellable
+    ready_retry = _actions(
+        job_state='ready', dispatch_enabled=False,
+        queue_reason='awaiting_dispatch', never_dispatched=True,
+    )
+    assert ready_retry.resume_required and ready_retry.cancellable
     assert not _actions(resume_supported=False).cancellable
     assert _actions(state='reconciling', queue_reason=None).cancellable
     assert not _actions(state='unconfirmed', queue_reason=None).cancellable

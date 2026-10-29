@@ -600,6 +600,8 @@ class PushJobManager:
                     "SELECT j.dest_path, d.device_id, MAX(d.enqueue_seq) AS enqueue_seq "
                     "FROM push_job_devices d JOIN push_jobs j ON j.job_id=d.job_id "
                     "WHERE d.dispatch_revision IS NOT NULL "
+                    "OR d.dispatch_capability_snapshot_json IS NOT NULL "
+                    "OR d.accepted_at IS NOT NULL "
                     "OR d.state NOT IN ('succeeded','failed','interrupted','unconfirmed') "
                     "GROUP BY j.dest_path, d.device_id"
                 )
@@ -1159,7 +1161,21 @@ class PushJobManager:
                             "terminal_at=?, updated_at=? WHERE job_id=? AND device_id=?",
                             (timestamp, timestamp, job_id, device_id),
                         )
-                        self.store._rederive_job(conn, job_id, timestamp)
+                        if row["job_state"] == JobState.READY.value:
+                            remaining = conn.execute(
+                                "SELECT 1 FROM push_job_devices WHERE job_id=? "
+                                "AND state NOT IN ('succeeded','failed','interrupted','unconfirmed') LIMIT 1",
+                                (job_id,),
+                            ).fetchone()
+                            if remaining is None:
+                                conn.execute(
+                                    "UPDATE push_jobs SET state='failed', terminal_at=?, "
+                                    "failure_code='cancelled', failure_detail='All targets cancelled before dispatch', "
+                                    "updated_at=? WHERE job_id=?",
+                                    (timestamp, timestamp, job_id),
+                                )
+                        else:
+                            self.store._rederive_job(conn, job_id, timestamp)
                     else:
                         conn.execute(
                             "UPDATE push_job_devices SET cancel_requested_at=?, updated_at=? "
