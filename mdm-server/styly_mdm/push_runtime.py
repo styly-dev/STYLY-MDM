@@ -1,9 +1,4 @@
-"""aiohttp integration for the durable Push/Sync job model (Issue #91).
-
-The repository's established server remains the adapter for unrelated commands.
-This module confines Push/Sync interception to explicit protocol messages while
-preserving the existing routes and old-client fallback during migration.
-"""
+"""Durable Push/Sync routes and messages; server.py handles other commands."""
 
 from __future__ import annotations
 
@@ -312,9 +307,15 @@ class PushRuntime:
 
     async def on_startup(self, _app: aiohttp_web.Application) -> None:
         self.publication_stopping = False
+        loop = asyncio.get_running_loop()
+        self.store.set_retry_publication_wakeup(
+            lambda: loop.call_soon_threadsafe(self.publication_wake.set)
+        )
         self.publication_task = asyncio.create_task(
             self._publication_loop(), name="push-job-publication"
         )
+        # Recovery may have committed before the event loop notifier was attached.
+        self.publication_wake.set()
         for job_id in self.startup_cleanup:
             await asyncio.to_thread(self.artifacts.cleanup_work_best_effort, job_id)
         self.startup_cleanup.clear()
@@ -358,29 +359,35 @@ class PushRuntime:
         if self.artifact_gc_task is not None:
             self.artifact_gc_task.cancel()
         recovery_tasks = tuple(self.disconnect_recovery_tasks.values())
-        for task in recovery_tasks:
+        background_tasks = tuple(self.background_tasks)
+        for task in (*recovery_tasks, *background_tasks):
             task.cancel()
         await asyncio.gather(
             *(
                 task
-                for task in (self.created_deadline_task, self.housekeeping_task, self.artifact_gc_task, *recovery_tasks)
+                for task in (self.created_deadline_task, self.housekeeping_task, self.artifact_gc_task, *recovery_tasks, *background_tasks)
                 if task is not None
             ),
             return_exceptions=True,
         )
         if self.scheduler is not None:
             await self.scheduler.stop()
-        self.publication_stopping = True
-        self.publication_wake.set()
-        if self.publication_task is not None:
-            await asyncio.gather(self.publication_task, return_exceptions=True)
-            self.publication_task = None
-        for device_id in tuple(self.sessions):
-            self.transfers.release_all_for_device(device_id, "shutdown")
-        self.sessions.clear()
-        self.registration_candidates.clear()
-        self.store.close()
-        _RUNTIME_BY_DATA_DIR.pop(self.data_dir.resolve(), None)
+        try:
+            # Cancelling an awaiter does not stop a running DB transaction.
+            await self.store.drain()
+        finally:
+            self.store.close()
+            self.store.set_retry_publication_wakeup(None)
+            self.publication_stopping = True
+            self.publication_wake.set()
+            if self.publication_task is not None:
+                await asyncio.gather(self.publication_task, return_exceptions=True)
+                self.publication_task = None
+            for device_id in tuple(self.sessions):
+                self.transfers.release_all_for_device(device_id, "shutdown")
+            self.sessions.clear()
+            self.registration_candidates.clear()
+            _RUNTIME_BY_DATA_DIR.pop(self.data_dir.resolve(), None)
 
     async def send_initial_snapshot(self, ws: RuntimeWebSocketResponse) -> None:
         try:
@@ -862,20 +869,16 @@ class PushRuntime:
             ):
                 return
             self.sessions[device_id] = session
-            try:
-                await asyncio.wait_for(
-                    ws.send_str(
-                        json.dumps(
-                            {"type": "REGISTERED", "session_id": session.session_id},
-                            separators=(",", ":"),
-                        )
-                    ),
-                    self.send_timeout,
-                )
-            except BaseException:
-                if self.sessions.get(device_id) is session:
-                    self.sessions.pop(device_id, None)
-                raise
+            # Keep ownership until transport close settles the adopted durable state.
+            await asyncio.wait_for(
+                ws.send_str(
+                    json.dumps(
+                        {"type": "REGISTERED", "session_id": session.session_id},
+                        separators=(",", ":"),
+                    )
+                ),
+                self.send_timeout,
+            )
             if not self._legacy_owns_device(device_id, ws):
                 return
             self.legacy.devices[device_id]["registration_ready"] = True
@@ -1065,6 +1068,66 @@ class PushRuntime:
             return None
         return session
 
+    async def _reported_assignment(
+        self, session: LiveSession, device_id: str, active_report: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """Validate reported identity before either registration or recovery adopts it."""
+        job_id = active_report["job_id"]
+        assignment = await self.manager.assignment(job_id, device_id)
+        if assignment is None:
+            snapshots = await self.manager.add_opaque_fence(
+                device_id,
+                self.manager.opaque_identity_for_active(active_report),
+                ProtocolMode.JOB_V1,
+                session.process_instance_id,
+                "Device reported an active Push/Sync job unknown to this server",
+            )
+            return None, snapshots
+
+        reported_artifact = active_report.get("artifact_id")
+        if (
+            not isinstance(reported_artifact, str)
+            or reported_artifact != assignment.get("artifact_id")
+        ):
+            snapshots = await self.manager.add_opaque_fence(
+                device_id,
+                self.manager.opaque_identity_for_active(active_report),
+                ProtocolMode.JOB_V1,
+                session.process_instance_id,
+                "Reported active state conflicted with the canonical artifact",
+            )
+            current = DeviceState(assignment["state"])
+            if current not in {
+                DeviceState.SUCCEEDED,
+                DeviceState.FAILED,
+                DeviceState.INTERRUPTED,
+                DeviceState.UNCONFIRMED,
+            }:
+                try:
+                    snapshots.append(
+                        await self.manager.transition_device(
+                            job_id,
+                            device_id,
+                            expected={current},
+                            target=DeviceState.FAILED,
+                            fields={
+                                "failure_code": "artifact_identity_mismatch",
+                                "failure_detail": (
+                                    "Reported active artifact did not match the "
+                                    "canonical assignment"
+                                ),
+                                "accept_deadline": None,
+                                "reconciliation_reason": None,
+                                "reconciliation_deadline": None,
+                            },
+                        )
+                    )
+                except StoreConflict:
+                    pass
+            return None, snapshots
+
+        return assignment, []
+
     async def _registration_active_snapshots(
         self,
         device_id: str,
@@ -1091,80 +1154,13 @@ class PushRuntime:
                 "REGISTER reported malformed active Push/Sync state",
             )
 
-        assignment = await self.manager.assignment(job_id, device_id)
-        if assignment is None:
-            snapshots = await self.manager.add_opaque_fence(
-                device_id,
-                self.manager.opaque_identity_for_active(active_report),
-                ProtocolMode.JOB_V1,
-                session.process_instance_id,
-                "REGISTER reported an active Push/Sync job unknown to this server",
-            )
-            if active_report.get("status") == "interrupted":
-                await self._send_resume_rejected(
-                    session,
-                    job_id=job_id,
-                    artifact_id=active_report.get("artifact_id"),
-                    revision=active_report.get("revision"),
-                    deferred=resume_rejections,
-                )
-            return snapshots
-
-        reported_artifact = active_report.get("artifact_id")
-        if (
-            not isinstance(reported_artifact, str)
-            or reported_artifact != assignment.get("artifact_id")
-        ):
-            snapshots = await self.manager.add_opaque_fence(
-                device_id,
-                self.manager.opaque_identity_for_active(active_report),
-                ProtocolMode.JOB_V1,
-                session.process_instance_id,
-                "REGISTER active state conflicted with the canonical artifact",
-            )
-            current = DeviceState(assignment["state"])
-            if current not in {
-                DeviceState.SUCCEEDED,
-                DeviceState.FAILED,
-                DeviceState.INTERRUPTED,
-                DeviceState.UNCONFIRMED,
-            }:
-                try:
-                    snapshots.append(
-                        await self.manager.transition_device(
-                            job_id,
-                            device_id,
-                            expected={current},
-                            target=DeviceState.FAILED,
-                            fields={
-                                "failure_code": "artifact_identity_mismatch",
-                                "failure_detail": (
-                                    "REGISTER active artifact did not match the "
-                                    "canonical assignment"
-                                ),
-                                "accept_deadline": None,
-                                "reconciliation_reason": None,
-                                "reconciliation_deadline": None,
-                            },
-                        )
-                    )
-                except StoreConflict:
-                    pass
-            if active_report.get("status") == "interrupted":
-                await self._send_resume_rejected(
-                    session,
-                    job_id=job_id,
-                    artifact_id=reported_artifact,
-                    revision=active_report.get("revision"),
-                    deferred=resume_rejections,
-                )
-            return snapshots
-
         if active_report.get("status") == "interrupted":
             return await self._resume_interrupted_report(
-                session, device_id, active_report, assignment,
-                resume_rejections=resume_rejections,
+                session, device_id, active_report, resume_rejections=resume_rejections,
             )
+        assignment, snapshots = await self._reported_assignment(session, device_id, active_report)
+        if assignment is None:
+            return snapshots
         if assignment["state"] != DeviceState.RECONCILING.value:
             return []
         if phase == "downloading" and self.leases.token(
@@ -1324,15 +1320,19 @@ class PushRuntime:
             if not delivered:
                 assignment = await self.manager.assignment(job_id, device_id)
                 if assignment and assignment["state"] == DeviceState.RECONCILING.value:
+                    phase = payload.get("phase")
+                    phase = phase if isinstance(phase, str) else "downloading"
+                    if phase == "downloading" and self.leases.token(
+                        TransferKey("push", device_id, job_id, 1)
+                    ) is None:
+                        return True
                     try:
                         outcome, snapshots = await self.manager.reconcile_report(
                             job_id,
                             device_id,
                             1,
                             "active",
-                            payload.get("phase")
-                            if isinstance(payload.get("phase"), str)
-                            else "downloading",
+                            phase,
                             None,
                         )
                         if outcome == "active":
@@ -1571,7 +1571,6 @@ class PushRuntime:
         session: LiveSession,
         device_id: str,
         payload: dict[str, Any],
-        assignment: dict[str, Any],
         *,
         resume_rejections: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
@@ -1580,6 +1579,13 @@ class PushRuntime:
         artifact_id = payload.get("artifact_id")
         revision = payload.get("revision")
         offset = payload.get("validated_offset")
+        assignment, snapshots = await self._reported_assignment(session, device_id, payload)
+        if assignment is None:
+            await self._send_resume_rejected(
+                session, job_id=job_id, artifact_id=artifact_id, revision=revision,
+                deferred=resume_rejections,
+            )
+            return snapshots
         if assignment.get("cancel_requested_at") is not None:
             if artifact_id == assignment.get("artifact_id") and revision == assignment.get("dispatch_revision"):
                 await self._send_resume_rejected(session, job_id=job_id,
@@ -1589,7 +1595,7 @@ class PushRuntime:
             key = TransferKey("push", device_id, job_id, 1)
             previous_transfer = self.transfers.get(key)
             try:
-                outcome, snapshot = await self.manager.resume_interrupted(
+                outcome, snapshots = await self.manager.resume_interrupted(
                     job_id,
                     device_id,
                     attempt=1,
@@ -1602,6 +1608,7 @@ class PushRuntime:
                         offset if isinstance(offset, int) and not isinstance(offset, bool) else -1
                     ),
                     reason=payload.get("reason"),
+                    phase=payload.get("phase"),
                 )
             except (StoreConflict, StoreNotFound):
                 return []
@@ -1610,11 +1617,11 @@ class PushRuntime:
             if outcome == "requeued":
                 if previous_transfer is not None and self.transfers.get(key) is previous_transfer:
                     self.transfers.release_exact(key, "resumable_replay")
-                return [snapshot]
+                return snapshots
         await self._send_resume_rejected(
             session,
             job_id=job_id,
-            artifact_id=artifact_id if isinstance(artifact_id, str) else assignment.get("artifact_id"),
+            artifact_id=artifact_id,
             revision=revision,
             deferred=resume_rejections,
         )
@@ -1631,10 +1638,11 @@ class PushRuntime:
             or not isinstance(attempt, int)
             or isinstance(attempt, bool)
             or attempt != 1
+            or not isinstance(status, str)
             or status not in {"active", "absent", "interrupted"}
         ):
             return
-        if status in {"absent", "interrupted"}:
+        if status == "absent":
             matched, opaque_snapshots = await self.manager.clear_matching_opaque_fence(
                 device_id, job_id, 1
             )
@@ -1642,6 +1650,15 @@ class PushRuntime:
                 await self.publish(opaque_snapshot)
             if matched and self.scheduler is not None:
                 self.scheduler.wake()
+        if status == "interrupted":
+            snapshots = await self._resume_interrupted_report(
+                session, device_id, payload
+            )
+            for snapshot in snapshots:
+                await self.publish(snapshot)
+                if snapshot["dispatch_enabled"] and self.scheduler is not None:
+                    self.scheduler.wake()
+            return
         assignment = await self.manager.assignment(job_id, device_id)
         if assignment is None:
             return
@@ -1662,9 +1679,6 @@ class PushRuntime:
                     self.transfers.release_exact(TransferKey("push", device_id, job_id, 1), "cancelled")
                     if self.scheduler is not None:
                         self.scheduler.wake()
-            elif status == "interrupted" and payload.get("artifact_id") == assignment.get("artifact_id") and payload.get("revision") == assignment.get("dispatch_revision"):
-                await self._send_resume_rejected(session, job_id=job_id,
-                    artifact_id=assignment["artifact_id"], revision=assignment["dispatch_revision"])
             return
         if assignment["state"] == DeviceState.UNCONFIRMED.value and status == "absent":
             snapshots = await self.manager.clear_matching_fence(job_id, device_id, 1)
@@ -1672,15 +1686,6 @@ class PushRuntime:
                 await self.publish(snapshot)
             if snapshots and self.scheduler is not None:
                 self.scheduler.wake()
-            return
-        if status == "interrupted":
-            snapshots = await self._resume_interrupted_report(
-                session, device_id, payload, assignment
-            )
-            for snapshot in snapshots:
-                await self.publish(snapshot)
-                if snapshot["dispatch_enabled"] and self.scheduler is not None:
-                    self.scheduler.wake()
             return
         if assignment["state"] != DeviceState.RECONCILING.value:
             return
@@ -1999,18 +2004,24 @@ class PushRuntime:
             )
 
     async def publish(self, snapshot: dict[str, Any]) -> None:
-        job_id = snapshot["job_id"]
-        revision = snapshot["revision"]
-        if revision <= self.publication_revisions.get(job_id, -1):
-            return
-        self.publication_revisions[job_id] = revision
-        self.pending_publications[job_id] = snapshot
+        # No await between draining committed updates and enqueueing publication.
+        self._enqueue_publications([snapshot, *self.store.take_retry_publications()])
         self.publication_wake.set()
+
+    def _enqueue_publications(self, snapshots: list[dict[str, Any]]) -> None:
+        for current in snapshots:
+            job_id = current["job_id"]
+            revision = current["revision"]
+            if revision <= self.publication_revisions.get(job_id, -1):
+                continue
+            self.publication_revisions[job_id] = revision
+            self.pending_publications[job_id] = current
 
     async def _publication_loop(self) -> None:
         while True:
             await self.publication_wake.wait()
             self.publication_wake.clear()
+            self._enqueue_publications(self.store.take_retry_publications())
             while self.pending_publications:
                 job_id, snapshot = self.pending_publications.popitem()
                 event = {
@@ -2025,7 +2036,8 @@ class PushRuntime:
                     raise
                 except Exception:
                     log.exception("Could not publish Push job update for %s", job_id)
-            if self.publication_stopping and not self.pending_publications:
+            # A commit or shutdown may have woken us during an awaited admin send.
+            if self.publication_stopping and not self.publication_wake.is_set():
                 return
 
     def arm_created_deadline(self) -> None:

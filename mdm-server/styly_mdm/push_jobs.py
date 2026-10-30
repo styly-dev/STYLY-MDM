@@ -48,7 +48,6 @@ except ImportError:  # Python 3.10
 
 
 CAP_PUSH_JOB_ID_V1 = "push_job_id_v1"
-CAP_PUSH_PROGRESS_V1 = "push_progress_v1"
 CAP_PUSH_RESUME_V1 = "push_resume_v1"
 # Every Push job target must advertise both; there is no non-resumable fallback.
 PUSH_JOB_CAPABILITIES = frozenset({CAP_PUSH_JOB_ID_V1, CAP_PUSH_RESUME_V1})
@@ -169,12 +168,12 @@ def interrupted_queue_reason(
 
 
 def can_replay_unaccepted(
-    *, status: str, accepted_at: int | None, reconciliation_reason: str | None,
+    *, accepted_at: int | None, reconciliation_reason: str | None,
     replay_count: int, dispatch_enabled: bool,
 ) -> bool:
-    """Only a lost acceptance on an uninterrupted connection grants one replay."""
+    """Replay an absent command once, only on an uninterrupted connection."""
     return (
-        status == "absent" and accepted_at is None
+        accepted_at is None
         and reconciliation_reason == "command_accept_timeout"
         and replay_count < 1 and dispatch_enabled
     )

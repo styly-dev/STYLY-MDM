@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
+from .device_policy import CommandNotAllowedError
 from .push_job_manager import PushJobManager
 from .push_job_store import StoreConflict, now_ms
 from .push_transfer_leases import (
@@ -309,18 +310,25 @@ class PushScheduler:
                 self._clear_dispatch_waiters(key, transfer_future, accept_future)
                 await self._requeue_after_send_race(job_id, device_id, str(exc))
                 return
+            except CommandNotAllowedError as exc:
+                self.transfer_registry.release_exact(key, "command_not_allowed")
+                self._clear_dispatch_waiters(key, transfer_future, accept_future)
+                await self._settle_dispatch_failure(
+                    job_id, device_id, "command_not_allowed", str(exc), retryable=True,
+                )
+                return
             except asyncio.CancelledError:
                 self._clear_dispatch_waiters(key, transfer_future, accept_future)
                 raise
             except BaseException as exc:
                 self.transfer_registry.release_exact(key, "command_send_failed")
                 self._clear_dispatch_waiters(key, transfer_future, accept_future)
-                await self._fail_current(
+                await self._settle_dispatch_failure(
                     job_id,
                     device_id,
-                    {DeviceState.DISPATCHING},
                     "command_send_failed",
                     f"Could not send EXECUTE_PUSH_FILES: {exc}",
+                    delivery_uncertain=isinstance(exc, (ConnectionError, asyncio.TimeoutError)),
                 )
                 return
 
@@ -418,12 +426,11 @@ class PushScheduler:
                     DeviceState.APPLYING,
                     DeviceState.RECONCILING,
                 }:
-                    snapshot = await self.manager.mark_reconciling(
-                        key.job_id,
-                        key.device_id,
-                        expected={current},
-                        reason="transfer_stalled",
-                        deadline=now_ms() + int(self.reconciliation_timeout * 1000),
+                    timestamp = now_ms()
+                    snapshot = await self.manager.mark_transfer_stalled(
+                        key.job_id, key.device_id, expected={current},
+                        acceptance_deadline=timestamp + int(self.accept_reconciliation_timeout * 1000),
+                        reconciliation_deadline=timestamp + int(self.reconciliation_timeout * 1000),
                     )
                     try:
                         await self.publish(snapshot)
@@ -663,12 +670,12 @@ class PushScheduler:
         detail = payload.get("detail")
         if not isinstance(detail, str) or not detail:
             detail = reason
-        await self._fail_current(
+        await self._settle_dispatch_failure(
             job_id,
             device_id,
-            {DeviceState.DISPATCHING, DeviceState.RECONCILING},
             reason,
             detail,
+            retryable=payload.get("retryable") is True,
         )
         return False
 
@@ -766,17 +773,51 @@ class PushScheduler:
         )
         return False
 
-    async def _pause_unavailable_dispatch(self, job_id: str, device_id: str) -> None:
+    async def _settle_dispatch_failure(
+        self, job_id: str, device_id: str, code: str, detail: str, *,
+        retryable: bool = False, delivery_uncertain: bool = False,
+    ) -> None:
+        """Classify failures identically before and after the ACK waiter expires."""
+        expected = {DeviceState.DISPATCHING, DeviceState.RECONCILING}
+        if delivery_uncertain:
+            # A failed write may already have delivered the command. Revoke its
+            # lease, but retain execution ownership until the client reports it.
+            try:
+                snapshot = await self.manager.mark_reconciling(
+                    job_id, device_id, expected=expected, reason=code,
+                    deadline=now_ms() + int(self.reconciliation_timeout * 1000),
+                )
+            except StoreConflict:
+                return
+            await self.publish(snapshot)
+            session = self.sessions().get(device_id)
+            if session is not None:
+                try:
+                    await self.send_reconcile(session, snapshot, device_id)
+                except (ConnectionError, asyncio.TimeoutError):
+                    log.info("Could not reconcile failed Push send for %s/%s", job_id, device_id)
+        elif retryable:
+            # Retryability permits a manual retry, never an automatic execution.
+            await self._pause_unavailable_dispatch(job_id, device_id, detail=detail)
+        else:
+            await self._fail_current(job_id, device_id, expected, code, detail)
+
+    async def _pause_unavailable_dispatch(
+        self, job_id: str, device_id: str, *,
+        detail: str = "Device Push state is unavailable; Resume when it recovers",
+    ) -> None:
         try:
             snapshot = await self.manager.transition_device(
                 job_id, device_id,
-                expected={DeviceState.WAITING_TRANSFER, DeviceState.DISPATCHING},
+                expected={DeviceState.WAITING_TRANSFER, DeviceState.DISPATCHING, DeviceState.RECONCILING},
                 target=DeviceState.QUEUED,
                 fields={
                     "queue_reason": "dispatch_paused",
                     "accept_deadline": None,
+                    "reconciliation_reason": None,
+                    "reconciliation_deadline": None,
                     "failure_code": None,
-                    "failure_detail": "Device Push state is unavailable; Resume when it recovers",
+                    "failure_detail": detail,
                 },
             )
             await self.publish(snapshot)
@@ -959,12 +1000,12 @@ class PushScheduler:
         detail = payload.get("detail")
         if not isinstance(detail, str) or not detail:
             detail = reason
-        await self._fail_current(
+        await self._settle_dispatch_failure(
             job_id,
             device_id,
-            {DeviceState.RECONCILING},
             reason,
             detail,
+            retryable=payload.get("retryable") is True,
         )
 
     def command_response(

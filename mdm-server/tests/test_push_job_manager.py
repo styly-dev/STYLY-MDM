@@ -204,6 +204,11 @@ async def test_exact_absent_clears_fence_when_reconciliation_deadline_wins(manag
     # The runtime may have observed reconciling immediately before housekeeping
     # commits unconfirmed. The exact report must still clear the matching fence.
     await manager.mark_unconfirmed(job_id, 'D1', 'process-a', 'deadline elapsed')
+    before = await manager.get_snapshot(job_id)
+    # Interruption needs artifact/revision checks in resume_interrupted.
+    with pytest.raises(StoreConflict):
+        await manager.reconcile_report(job_id, 'D1', 1, 'interrupted', None, None)
+    assert await manager.get_snapshot(job_id) == before
     outcome, snapshots = await manager.reconcile_report(
         job_id, 'D1', 1, 'absent', None, None,
     )

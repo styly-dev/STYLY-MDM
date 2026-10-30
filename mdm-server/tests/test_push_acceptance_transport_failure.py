@@ -226,6 +226,8 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
                 assert row["reconciliation_deadline"] is None
                 return
 
+            previous_reason = row["reconciliation_reason"]
+            previous_deadline = row["reconciliation_deadline"]
             # Loss of progress must still revoke the URL and release the slot.
             leases._by_key[key].last_progress = time.monotonic() - TRANSFER_IDLE_SECONDS - 1
             await asyncio.wait_for(dispatch, 1)
@@ -235,7 +237,11 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
             assert not slots.locked()
             assert registry.get(key) is None
             row = await manager.assignment(snapshot["job_id"], "D1")
-            assert row["reconciliation_reason"] == "transfer_stalled"
+            if previous_reason in {"command_accept_timeout", "disconnect_before_accept"}:
+                assert row["reconciliation_reason"] == previous_reason
+                assert row["reconciliation_deadline"] == previous_deadline
+            else:
+                assert row["reconciliation_reason"] == "transfer_stalled"
         finally:
             dispatch.cancel()
             if stream is not None:

@@ -251,7 +251,7 @@ async def test_client_restart_requires_explicit_resume_even_when_job_enabled(man
                                    reason='device_disconnect', deadline=9999999999999)
     if resume_first:
         await manager.store.enable_dispatch(active['job_id'], ['D1'])
-    outcome, current = await manager.resume_interrupted(active['job_id'], 'D1', attempt=1,
+    outcome, (current,) = await manager.resume_interrupted(active['job_id'], 'D1', attempt=1,
         artifact_id=active['artifact']['artifact_id'], dispatch_revision=active['devices']['D1']['dispatch_revision'],
         validated_offset=1, reason='client_restarted')
     assert outcome == 'requeued'
@@ -266,7 +266,7 @@ async def test_client_restart_requires_explicit_resume_even_when_job_enabled(man
 @pytest.mark.parametrize("reason", ["storage_write_failed", "server_lease_revoked"])
 async def test_transfer_interruption_failures_wait_for_manual_resume(manager, reason):
     active = await downloading_job(manager.store, manager)
-    outcome, snapshot = await manager.resume_interrupted(
+    outcome, (snapshot,) = await manager.resume_interrupted(
         active['job_id'], 'D1', attempt=1,
         artifact_id=active['artifact']['artifact_id'],
         dispatch_revision=active['devices']['D1']['dispatch_revision'],

@@ -109,6 +109,49 @@ class PushJobManager:
             job_id, device_id, expected=expected, reason=reason, deadline=deadline,
         )
 
+    async def mark_transfer_stalled(
+        self, job_id: str, device_id: str, *, expected: set[DeviceState],
+        acceptance_deadline: int, reconciliation_deadline: int,
+    ) -> dict[str, Any]:
+        """Expire a transfer without extending an outstanding acceptance decision."""
+        def op(conn: sqlite3.Connection) -> dict[str, Any]:
+            self.store._begin(conn)
+            try:
+                row = conn.execute(
+                    "SELECT * FROM push_job_devices WHERE job_id=? AND device_id=?",
+                    (job_id, device_id),
+                ).fetchone()
+                if row is None or DeviceState(row["state"]) not in expected:
+                    raise StoreConflict("assignment changed before transfer expiry")
+                current = DeviceState(row["state"])
+                if (current is DeviceState.RECONCILING
+                        and row["reconciliation_deadline"] is not None
+                        and row["reconciliation_reason"] in {
+                            "command_accept_timeout", "disconnect_before_accept",
+                            "unexpected_dispatch_failure",
+                        }):
+                    snapshot = self.store._snapshot(conn, job_id)
+                    self.store._commit(conn)
+                    return snapshot
+                validate_device_transition(current, DeviceState.RECONCILING)
+                deadline = acceptance_deadline if current is DeviceState.DISPATCHING else reconciliation_deadline
+                timestamp = now_ms()
+                conn.execute(
+                    "UPDATE push_job_devices SET state='reconciling', "
+                    "reconciliation_reason='transfer_stalled', reconciliation_deadline=?, "
+                    "accept_deadline=NULL, updated_at=? WHERE job_id=? AND device_id=?",
+                    (deadline, timestamp, job_id, device_id),
+                )
+                self.store._increment_revision(conn, job_id, timestamp)
+                self.store._rederive_job(conn, job_id, timestamp)
+                snapshot = self.store._snapshot(conn, job_id)
+                self.store._commit(conn)
+                return snapshot
+            except BaseException:
+                self.store._rollback(conn)
+                raise
+        return await self.store._call(op)
+
     async def active_assignment_for_device(self, device_id: str) -> dict[str, Any] | None:
         return await self.store.active_assignment_for_device(device_id)
 
@@ -341,6 +384,7 @@ class PushJobManager:
                          target["protocol_mode"], target["create_capability_snapshot_json"],
                          timestamp),
                     )
+                self.store._invalidate_retry_dependents(conn, retry_id)
                 # GC reads the new job in this same serialized transaction.
                 self.store._increment_revision(conn, job_id, timestamp)
                 snapshot = self.store._snapshot(conn, retry_id)
@@ -407,6 +451,7 @@ class PushJobManager:
                             (DeviceState.FAILED.value, timestamp, timestamp,
                              row["job_id"], device_id),
                         )
+                        self.store._invalidate_retry_dependents(conn, row["job_id"])
                     else:
                         if current is not DeviceState.QUEUED:
                             validate_device_transition(current, DeviceState.QUEUED)
@@ -1013,22 +1058,25 @@ class PushJobManager:
         dispatch_revision: int | None,
         validated_offset: int,
         reason: str | None = None,
-    ) -> tuple[Literal["requeued", "retained", "rejected"], dict[str, Any]]:
+        phase: str | None = None,
+    ) -> tuple[Literal["requeued", "retained", "rejected"], list[dict[str, Any]]]:
         """Requeue an exact interrupted resumable assignment.
 
         ``dispatch_revision`` is persisted on the device row at dispatch time; it
         remains stable while the aggregate job revision advances through restart
-        reconciliation and phase updates.
+        reconciliation and phase updates. Timeout recovery additionally requires
+        saved download interruption and an unresolved exact fence; it withdraws
+        any earlier dispatch permission. Return all affected snapshots, job first.
         """
 
-        def op(conn: sqlite3.Connection) -> tuple[Literal["requeued", "retained", "rejected"], dict[str, Any]]:
+        def op(conn: sqlite3.Connection) -> tuple[Literal["requeued", "retained", "rejected"], list[dict[str, Any]]]:
             self.store._begin(conn)
             try:
                 row = conn.execute(
                     """
                     SELECT d.*, j.dispatch_enabled, j.dispatch_paused_reason,
-                           j.artifact_id AS job_artifact_id,
-                           a.byte_size
+                           j.artifact_id AS job_artifact_id, j.dest_path,
+                           a.byte_size, a.retention_state
                     FROM push_job_devices d
                     JOIN push_jobs j ON j.job_id=d.job_id
                     LEFT JOIN push_artifacts a ON a.artifact_id=j.artifact_id
@@ -1064,10 +1112,30 @@ class PushJobManager:
                     and exact_revision
                     and valid_offset
                 )
+                timed_out = (
+                    current is DeviceState.UNCONFIRMED
+                    and row["failure_code"] == "reconciliation_timeout"
+                )
+                if timed_out:
+                    # A deadline only means the outcome is unknown. Fresh durable
+                    # download interruption evidence can resolve that ambiguity,
+                    # but cannot revive cancelled, replaced, or forgotten work.
+                    fence = conn.execute(
+                        "SELECT 1 FROM push_device_fences WHERE device_id=? "
+                        "AND blocking_job_id=? AND blocking_attempt=?",
+                        (device_id, job_id, attempt),
+                    ).fetchone()
+                    resumable = resumable and (
+                        phase == "downloading"
+                        and fence is not None
+                        and row["retention_state"] == "retained"
+                        and device_id not in self.store._retry_job_ids(conn, job_id)
+                        and device_id not in self.store._superseded_devices(conn, row)
+                    )
                 if not resumable:
                     snapshot = self.store._snapshot(conn, job_id)
                     self.store._commit(conn)
-                    return "rejected", snapshot
+                    return "rejected", [snapshot]
                 # Repeated evidence while waiting for authorization must not revoke
                 # local work, reset the pause, or release a replacement transfer slot.
                 if current in {
@@ -1075,13 +1143,13 @@ class PushJobManager:
                 }:
                     snapshot = self.store._snapshot(conn, job_id)
                     self.store._commit(conn)
-                    return "retained", snapshot
-                if current is not DeviceState.RECONCILING and not (
+                    return "retained", [snapshot]
+                if not timed_out and current is not DeviceState.RECONCILING and not (
                     transfer_interrupted and current is DeviceState.DOWNLOADING
                 ):
                     snapshot = self.store._snapshot(conn, job_id)
                     self.store._commit(conn)
-                    return "rejected", snapshot
+                    return "rejected", [snapshot]
                 timestamp = now_ms()
                 if current is DeviceState.DOWNLOADING:
                     validate_device_transition(current, DeviceState.RECONCILING)
@@ -1091,13 +1159,13 @@ class PushJobManager:
                     UPDATE push_job_devices SET state=?, queue_reason=?,
                         validated_offset=?, accept_deadline=NULL,
                         reconciliation_reason=NULL, reconciliation_deadline=NULL,
-                        failure_code=NULL, failure_detail=NULL, updated_at=?
+                        failure_code=NULL, failure_detail=NULL, terminal_at=NULL, updated_at=?
                     WHERE job_id=? AND device_id=? AND state=?
                     """,
                     (
                         DeviceState.QUEUED.value,
                         interrupted_queue_reason(
-                            row["queue_reason"], reason, transfer_interrupted
+                            None if timed_out else row["queue_reason"], reason, transfer_interrupted
                         ),
                         validated_offset,
                         timestamp,
@@ -1106,11 +1174,17 @@ class PushJobManager:
                         current.value,
                     ),
                 )
-                self.store._increment_revision(conn, job_id, timestamp)
-                self.store._rederive_job(conn, job_id, timestamp)
-                snapshot = self.store._snapshot(conn, job_id)
+                affected = [job_id]
+                if timed_out:
+                    conn.execute("DELETE FROM push_device_fences WHERE device_id=?", (device_id,))
+                    affected += [other for other in self._visible_job_ids(self.store, conn, device_id)
+                                 if other != job_id]
+                for affected_job in affected:
+                    self.store._increment_revision(conn, affected_job, timestamp)
+                    self.store._rederive_job(conn, affected_job, timestamp)
+                snapshots = [self.store._snapshot(conn, other) for other in affected]
                 self.store._commit(conn)
-                return "requeued", snapshot
+                return "requeued", snapshots
             except BaseException:
                 self.store._rollback(conn)
                 raise
@@ -1176,6 +1250,7 @@ class PushJobManager:
                                 )
                         else:
                             self.store._rederive_job(conn, job_id, timestamp)
+                        self.store._invalidate_retry_dependents(conn, job_id)
                     else:
                         conn.execute(
                             "UPDATE push_job_devices SET cancel_requested_at=?, updated_at=? "
@@ -1633,7 +1708,7 @@ class PushJobManager:
     async def clear_matching_fence(
         self, job_id: str, device_id: str, attempt: int
     ) -> list[dict[str, Any]]:
-        """Clear a fence only for exact absent/interrupted evidence.
+        """Clear a fence only for exact absence evidence.
 
         The terminal assignment remains unchanged; every job whose snapshot exposes
         this device fence receives a revision in the same transaction.
@@ -1723,11 +1798,11 @@ class PushJobManager:
         job_id: str,
         device_id: str,
         attempt: int,
-        status: str,
+        status: Literal["active", "absent"],
         phase: str | None,
         detail: str | None,
     ) -> tuple[str, list[dict[str, Any]]]:
-        """Apply exact report, including the one allowed pre-accept replay."""
+        """Apply active/absent reports; interrupted work uses resume_interrupted."""
 
         if attempt != 1:
             raise StoreConflict("stale_attempt")
@@ -1746,10 +1821,7 @@ class PushJobManager:
                 if row["attempt"] != 1:
                     raise StoreConflict("stale_attempt")
                 current = DeviceState(row["state"])
-                if current is DeviceState.UNCONFIRMED and status in {
-                    "absent",
-                    "interrupted",
-                }:
+                if current is DeviceState.UNCONFIRMED and status == "absent":
                     fence = conn.execute(
                         "SELECT * FROM push_device_fences WHERE device_id=?",
                         (device_id,),
@@ -1797,9 +1869,9 @@ class PushJobManager:
                         (target.value, timestamp, timestamp, job_id, device_id),
                     )
                     outcome = "active"
-                elif status in {"absent", "interrupted"}:
+                elif status == "absent":
                     replayable = can_replay_unaccepted(
-                        status=status, accepted_at=row["accepted_at"],
+                        accepted_at=row["accepted_at"],
                         reconciliation_reason=row["reconciliation_reason"],
                         replay_count=row["accept_replay_count"],
                         dispatch_enabled=bool(row["dispatch_enabled"]),
@@ -1831,10 +1903,8 @@ class PushJobManager:
                             (
                                 DeviceState.INTERRUPTED.value,
                                 timestamp,
-                                "client_restarted"
-                                if status == "interrupted"
-                                else "client_state_absent",
-                                (detail or f"client reported {status}")[:2000],
+                                "client_state_absent",
+                                (detail or "client reported absent")[:2000],
                                 timestamp,
                                 job_id,
                                 device_id,
@@ -1955,6 +2025,7 @@ class PushJobManager:
                                 job_id,
                             ),
                         )
+                        self.store._invalidate_retry_dependents(conn, job_id)
                         self.store._increment_revision(conn, job_id, timestamp)
                         self.store._rederive_job(conn, job_id, timestamp)
                     touched.append(job_id)

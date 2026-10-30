@@ -250,7 +250,7 @@ _transfer_sem_loop: "asyncio.AbstractEventLoop | None" = None
 def parse_push_state_status(push_state) -> str | None:
     """Return a device's reported durable Push state status, or None if malformed."""
     status = push_state.get("status") if isinstance(push_state, dict) else None
-    return status if status in {"available", "unavailable"} else None
+    return status if isinstance(status, str) and status in {"available", "unavailable"} else None
 
 
 def parse_push_state_reset(push_state) -> dict | None:
@@ -1751,22 +1751,14 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
             if device_id and not is_current:
                 log.info("Superseded device connection closed, ignoring: %s", device_id)
             if device_id and is_current:
-                # Install keeps the legacy disconnect release. Push is deliberately
-                # retained by the runtime adapter because its Android HTTP worker outlives
-                # this WebSocket and remains bounded by exact completion or timeout.
+                # Release APK slots. Push HTTP survives this management connection.
                 release_transfer_slot(device_id, "disconnect")
                 # The dispatch record only bridges dispatch -> SELF_UPDATE_STARTING; by a
                 # disconnect that announcement has already copied what it needed, so drop
                 # it rather than let it linger until the next install overwrites it.
                 last_install_dispatch.pop(device_id, None)
-                # A disconnect during a pending retire is likewise the *expected*
-                # teardown: the entry survives (no code needed — it lives in
-                # pending_retires) and the broadcast below renders the row as
-                # "retiring" until _retire_timeout settles it.
-                # A disconnect during a pending self-update is the *expected* kill-and-
-                # power-cycle, so the entry survives and the list broadcast below renders
-                # the row as "updating". A disconnect during the post-update verification
-                # phase, however, means the answer will never arrive: close it out.
+                # Retire and self-update expect a disconnect; keep their pending state.
+                # Post-update verification cannot finish after disconnect, so end it.
                 pend = pending_self_updates.get(device_id)
                 if pend is not None and pend.get("phase") == "verifying":
                     verify_timeout = pend.get("timeout_task")

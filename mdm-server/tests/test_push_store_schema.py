@@ -147,7 +147,7 @@ def test_initialization_failure_rolls_back_schema_changes(tmp_path, upgrade):
         conn.set_authorizer(deny_final_index)
         with pytest.raises(sqlite3.DatabaseError, match='not authorized'):
             PushJobStore._initialize(conn)
-        conn.set_authorizer(None)
+        conn.set_authorizer(lambda *_args: sqlite3.SQLITE_OK)
 
         assert not conn.in_transaction
         assert [tuple(row) for row in conn.execute(

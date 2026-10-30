@@ -93,7 +93,7 @@ def test_stalled_transfer_stops_http_stream_before_releasing_its_slot(monkeypatc
                 "state": "downloading",
             }
 
-        async def mark_reconciling(*_args, **_kwargs):
+        async def mark_transfer_stalled(*_args, **_kwargs):
             return {"state": "reconciling"}
 
         async def publish(_snapshot):
@@ -103,9 +103,10 @@ def test_stalled_transfer_stops_http_stream_before_releasing_its_slot(monkeypatc
         scheduler.leases = leases
         scheduler.manager = SimpleNamespace(
             active_assignment_for_device=active_assignment_for_device,
-            mark_reconciling=mark_reconciling,
+            mark_transfer_stalled=mark_transfer_stalled,
         )
         scheduler.publish = publish
+        scheduler.accept_reconciliation_timeout = 10
         scheduler.reconciliation_timeout = 60
         registry = TransferRegistry(
             before_release=lambda _key: order.append(("slot_released", stream.done()))

@@ -84,10 +84,9 @@ async def test_registration_ack_precedes_exact_resume_rejection(known):
         device_id = str(uuid.uuid4())
         if known:
             job = await active_job(runtime, device_id)
-            await runtime.manager.mark_reconciling(job["job_id"], device_id,
-                expected={DeviceState.DOWNLOADING}, reason="device_disconnect", deadline=1)
-            await runtime.manager.mark_unconfirmed(job["job_id"], device_id, None,
-                "offline timeout", expected_deadline=1, observed_now=2)
+            await runtime.manager.transition_device(job["job_id"], device_id,
+                expected={DeviceState.DOWNLOADING}, target=DeviceState.FAILED,
+                fields={"failure_code": "artifact_identity_mismatch"})
             report = interrupted_report(job, device_id)
         else:
             report = {"job_id": str(uuid.uuid4()), "attempt": 1,
@@ -214,4 +213,62 @@ async def test_unavailable_push_state_preserves_interrupted_work(monkeypatch, ti
         assert current["devices"][device_id]["resume_required"]
         assert not await receive_type(device, "PUSH_RESUME_REJECTED", timeout=0.02)
         assert await runtime.manager.claim_next([device_id]) is None
+        await device.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["registration", "reconcile"])
+async def test_timeout_interruption_recovers_over_real_socket_without_auto_dispatch(route):
+    async with _server_session() as (test_server, client):
+        runtime = test_server.app["push_runtime"]
+        await runtime.scheduler.stop()
+        device_id = str(uuid.uuid4())
+        job = await active_job(runtime, device_id)
+        await runtime.manager.mark_reconciling(job["job_id"], device_id,
+            expected={DeviceState.DOWNLOADING}, reason="device_disconnect", deadline=1)
+        await runtime.manager.mark_unconfirmed(job["job_id"], device_id, None,
+            "offline timeout", expected_deadline=1, observed_now=2)
+        report = interrupted_report(job, device_id)
+        device = await client.ws_connect(test_server.make_url("/ws/device"))
+        await device.send_json(registration(device_id, str(uuid.uuid4()),
+            report if route == "registration" else {**report, "status": "active"}))
+        assert (await device.receive_json(timeout=2))["type"] == "REGISTERED"
+        if route == "reconcile":
+            await device.send_json({"type": "PUSH_RECONCILE_REPORT", **report})
+        row = await wait_for_state(runtime, job["job_id"], device_id, "queued")
+        assert row["dispatch_revision"] == report["revision"]
+        assert await runtime.manager.fenced_assignment_for_device(device_id) is None
+        assert await runtime.manager.claim_next([device_id]) is None
+        assert not await receive_type(device, "PUSH_RESUME_REJECTED", timeout=0.05)
+        assert not await receive_type(device, "EXECUTE_PUSH_FILES", timeout=0.05)
+        await device.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('phase', ['validating', 'applying'])
+async def test_initial_registration_ack_failure_settles_adopted_state(monkeypatch, phase):
+    from styly_mdm.push_runtime import RuntimeWebSocketResponse
+    async with _server_session() as (test_server, client):
+        runtime = test_server.app['push_runtime']
+        await runtime.scheduler.stop()
+        device_id = str(uuid.uuid4())
+        job = await active_job(runtime, device_id, phase)
+        await runtime.manager.mark_reconciling(job['job_id'], device_id,
+            expected={DeviceState(phase)}, reason='device_disconnect', deadline=now_ms()+60000)
+        original_send = RuntimeWebSocketResponse.send_str
+        failed = asyncio.Event()
+        async def fail_ack(ws, text, **kwargs):
+            if json.loads(text)['type'] == 'REGISTERED':
+                failed.set()
+                raise ConnectionResetError('initial registration ACK failed')
+            await original_send(ws, text, **kwargs)
+        monkeypatch.setattr(RuntimeWebSocketResponse, 'send_str', fail_ack)
+        device = await client.ws_connect(test_server.make_url('/ws/device'))
+        report = {**interrupted_report(job, device_id), 'status': 'active', 'phase': phase}
+        await device.send_json(registration(device_id, str(uuid.uuid4()), report))
+        await asyncio.wait_for(failed.wait(), 2)
+        row = await wait_for_state(runtime, job['job_id'], device_id, 'reconciling')
+        assert row['reconciliation_deadline'] is not None
+        assert device_id not in runtime.sessions
+        assert device_id not in runtime.pending_disconnects
         await device.close()

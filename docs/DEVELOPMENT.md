@@ -127,6 +127,14 @@ retries physical cleanup of tombstoned bytes after failure or restart.
 The client refreshes registration when durable state becomes unavailable and
 again after recovery, while retaining any unsaved worker outcome in memory.
 
+### Recovery transaction and publication boundaries
+
+- **Recovery decisions**: REGISTER and reconciliation use the same exact interruption identity, Cancel, and Resume checks. Retryable refusals pause for manual Resume; uncertain command delivery enters reconciliation. Watchdog expiry checks the current assignment and its acceptance deadline inside the same DB transaction.
+
+- **Committed Retry notifications**: A mutation updates dependent Retry revisions in the same transaction without extending retention timestamps. The DB worker queues committed snapshots and wakes the event-loop publisher; publication performs no DB work. Startup drains pending notices, and shutdown waits for submitted DB work before its final drain. Retained-artifact and artifact-to-job indexes bound dependency lookup over collected history.
+
+A reconciliation-timeout job can return to manual Resume only with exact saved download interruption, its matching fence, no Cancel/Retry/superseding work, and a retained artifact. Terminal artifacts still use `MDM_PUSH_ARTIFACT_RETRY_WINDOW` (default seven wall-clock days after the latest referencing terminal job); an uncancelled offline fence alone does not extend this window. Active references and pending-cancellation exceptions remain protected. GC never proves device absence or clears a fence. Client retention remains 24 powered-on hours.
+
 ## Building the MDM Client
 
 ### Build from CLI

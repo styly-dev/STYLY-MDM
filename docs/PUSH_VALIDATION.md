@@ -114,3 +114,7 @@ implementation. They were not all repeated for this follow-up.
 
 Physical power loss, multiple physical devices, and a ten-minute real transfer
 were not tested. Long-transfer timing and multi-target races use automated tests.
+
+### Recovery and Publication Boundaries
+
+Run `uv run pytest -q tests/test_push_recovery_boundaries.py tests/test_push_retry_failed.py tests/test_transfer_pool.py` for exact interruption recovery, transient/late refusals, lease-guarded late ACKs, GC-before-Resume and Resume-before-GC ordering, dependent Retry revisions, rollback, caller cancellation, and shared Install/Push transfer isolation. Publisher lifecycle tests additionally require committed notifications to arrive without an unrelated `publish()` call and require submitted DB work to drain before shutdown.

@@ -1,4 +1,7 @@
 """Retry only unsuccessful targets while preserving bytes, history, and fences."""
+import asyncio
+import sqlite3
+import threading
 import uuid
 import pytest
 from styly_mdm.push_job_manager import PushJobManager
@@ -186,3 +189,242 @@ async def test_never_dispatched_later_failure_does_not_supersede_retry(manager, 
     await manager.store._call(fail_before_dispatch)
     current = await manager.get_snapshot(original['job_id'])
     assert current['devices']['failed']['retryable'] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('ending', ['failure', 'expiry', 'cancel', 'offline', 'startup'])
+async def test_newer_work_publishes_retry_eligibility_revisions(manager, tmp_path, ending):
+    from styly_mdm.push_jobs import JobState
+    from test_push_cancellation import runtime_for
+    original = await completed(manager, tmp_path)
+    # This fixture is terminal; remove its synthetic active row before startup recovery.
+    await manager.store._call(lambda conn: conn.execute(
+        "UPDATE push_job_devices SET state='succeeded' WHERE job_id=? AND device_id='active'",
+        (original['job_id'],)))
+    original = await manager.get_snapshot(original['job_id'])
+    runtime, _ = runtime_for(manager)
+    del runtime.publish
+    await runtime.publish(original)
+    request = canonicalize_create_request({
+        'client_request_id': str(uuid.uuid4()), 'target_devices': ['failed'],
+        'mode': 'sync', 'dest_path': original['dest_path'],
+        'source': {'display_name': 'newer', 'declared_file_count': 1, 'declared_total_bytes': 4},
+    })
+    _, newer = await manager.store.create_job(
+        request, {'failed': (ProtocolMode.JOB_V1, ['push_job_id_v1', 'push_resume_v1'])},
+        0 if ending == 'expiry' else 60000)
+    await runtime.publish(newer)
+    suppressed = runtime.pending_publications[original['job_id']]
+    assert not suppressed['devices']['failed']['retryable']
+    assert suppressed['revision'] > original['revision']
+    if ending == 'expiry':
+        settled = await manager.store.expire_created(newer['job_id'])
+    elif ending == 'failure':
+        settled = await manager.store.fail_pre_dispatch(newer['job_id'], JobState.FAILED, 'upload_failed', 'failed upload')
+    else:
+        await manager.store.start_upload(newer['job_id'])
+        if ending == 'startup':
+            manager.store.recover_startup_sync(accept_reconciliation_timeout_ms=1000, reconciliation_timeout_ms=1000)
+            settled = await manager.get_snapshot(newer['job_id'])
+        else:
+            await manager.store.mark_packaging(newer['job_id'], 1, 4)
+            await manager.store.publish_artifact(newer['job_id'], {
+                'artifact_id': str(uuid.uuid4()), 'storage_name': 'newer.zip',
+                'display_filename': 'newer.zip', 'byte_size': 4, 'sha256': 'b'*64, 'entry_count': 1,
+            })
+            if ending == 'cancel':
+                settled = await manager.cancel_interrupted(newer['job_id'], 'failed')
+            else:
+                await manager.store.enable_dispatch(newer['job_id'])
+                [settled] = await manager.settle_offline_before_dispatch('failed')
+    await runtime.publish(settled)
+    restored = runtime.pending_publications[original['job_id']]
+    assert restored['devices']['failed']['retryable']
+    assert restored['revision'] > suppressed['revision']
+    # Publishing is read-only and cannot restart the retention clock.
+    assert restored['terminal_at'] == original['terminal_at']
+    assert restored['updated_at'] == original['updated_at']
+    await runtime.publish(settled)
+    assert await manager.get_snapshot(original['job_id']) == restored
+
+
+@pytest.mark.asyncio
+async def test_retry_dependency_revision_failure_rolls_back_new_job(manager, tmp_path):
+    import sqlite3
+    original = await completed(manager, tmp_path)
+    request = canonicalize_create_request({
+        'client_request_id': str(uuid.uuid4()), 'target_devices': ['failed'],
+        'mode': 'sync', 'dest_path': original['dest_path'],
+        'source': {'display_name': 'newer', 'declared_file_count': 1, 'declared_total_bytes': 4},
+    })
+    def deny_revision(action, table, column, _database, _trigger):
+        return (sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_UPDATE
+                and table == 'push_jobs' and column == 'revision' else sqlite3.SQLITE_OK)
+    await manager.store._call(lambda conn: conn.set_authorizer(deny_revision))
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            await manager.store.create_job(request, {'failed': (ProtocolMode.JOB_V1, [])}, 60000)
+    finally:
+        await manager.store._call(lambda conn: conn.set_authorizer(lambda *_args: sqlite3.SQLITE_OK))
+    assert await manager.get_snapshot(original['job_id']) == original
+    assert await manager.store._call(lambda conn: conn.execute('SELECT COUNT(*) FROM push_jobs').fetchone()[0]) == 1
+
+
+def newer_request(original, targets=None):
+    return canonicalize_create_request({
+        'client_request_id': str(uuid.uuid4()), 'target_devices': targets or ['failed'],
+        'mode': 'sync', 'dest_path': original['dest_path'],
+        'source': {'display_name': 'newer', 'declared_file_count': 1, 'declared_total_bytes': 4},
+    })
+
+
+async def create_newer(manager, original):
+    return await manager.store.create_job(
+        newer_request(original), {'failed': (ProtocolMode.JOB_V1, [])}, 60000)
+
+
+@pytest.mark.asyncio
+async def test_publish_uses_committed_retry_snapshots_without_db_access(manager, tmp_path, monkeypatch):
+    from test_push_cancellation import runtime_for
+    original = await completed(manager, tmp_path)
+    _, newer = await create_newer(manager, original)
+    expected = await manager.get_snapshot(original['job_id'])
+    runtime, _ = runtime_for(manager)
+    del runtime.publish
+
+    def reject_db_access(_op):
+        pytest.fail('publication must not submit database work')
+
+    monkeypatch.setattr(manager.store._worker, 'submit', reject_db_access)
+    await runtime.publish(newer)
+    assert runtime.pending_publications[original['job_id']] == expected
+    assert not expected['devices']['failed']['retryable']
+    # No-op publications also stay entirely in memory after the notices are drained.
+    await runtime.publish(newer)
+    await runtime.publish(original)
+    assert runtime.pending_publications[original['job_id']] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['source_snapshot', 'dependent_snapshot', 'commit'])
+async def test_retry_publications_roll_back_with_transaction(manager, tmp_path, monkeypatch, failure):
+    original = await completed(manager, tmp_path)
+    assert manager.store.take_retry_publications() == []
+    notifications = []
+    manager.store.set_retry_publication_wakeup(lambda: notifications.append(True))
+    snapshot = manager.store._snapshot
+
+    def fail_snapshot(conn, job_id):
+        if (job_id == original['job_id']) == (failure == 'dependent_snapshot'):
+            raise RuntimeError('snapshot failed after invalidation')
+        return snapshot(conn, job_id)
+
+    def deny_commit(action, operation, *_args):
+        return (sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_TRANSACTION
+                and operation == 'COMMIT' else sqlite3.SQLITE_OK)
+
+    with monkeypatch.context() as patch:
+        if failure == 'commit':
+            await manager.store._call(lambda conn: conn.set_authorizer(deny_commit))
+        else:
+            patch.setattr(manager.store, '_snapshot', fail_snapshot)
+        try:
+            with pytest.raises((RuntimeError, sqlite3.DatabaseError)):
+                await create_newer(manager, original)
+        finally:
+            await manager.store._call(lambda conn: conn.set_authorizer(lambda *_args: sqlite3.SQLITE_OK))
+    assert await manager.get_snapshot(original['job_id']) == original
+    assert manager.store.take_retry_publications() == []
+    assert notifications == []
+    # A later successful transaction must not pick up rolled-back invalidations.
+    await manager.store.create_job(
+        newer_request(original, ['other']), {'other': (ProtocolMode.JOB_V1, [])}, 60000)
+    assert manager.store.take_retry_publications() == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_mutation_keeps_committed_retry_publications(manager, tmp_path, monkeypatch):
+    from test_push_cancellation import runtime_for
+    original = await completed(manager, tmp_path)
+    started, release = threading.Event(), threading.Event()
+    commit = manager.store._commit
+
+    def blocked_commit(conn):
+        started.set()
+        assert release.wait(5)
+        commit(conn)
+
+    monkeypatch.setattr(manager.store, '_commit', blocked_commit)
+    mutation = asyncio.create_task(create_newer(manager, original))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        mutation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await mutation
+    finally:
+        release.set()
+        await asyncio.gather(mutation, return_exceptions=True)
+    expected = await manager.get_snapshot(original['job_id'])
+    runtime, _ = runtime_for(manager)
+    del runtime.publish
+    # Even an unrelated publication recovers the notice of the committed mutation.
+    await runtime.publish({'job_id': 'unrelated', 'revision': 1})
+    assert runtime.pending_publications[original['job_id']] == expected
+    assert not expected['devices']['failed']['retryable']
+
+
+@pytest.mark.asyncio
+async def test_retry_publications_coalesce_to_final_committed_revision(manager, tmp_path):
+    from styly_mdm.push_jobs import JobState
+    from test_push_cancellation import runtime_for
+    original = await completed(manager, tmp_path)
+    _, newer = await create_newer(manager, original)
+    await manager.store.fail_pre_dispatch(newer['job_id'], JobState.FAILED, 'upload_failed', 'failed upload')
+    expected = await manager.get_snapshot(original['job_id'])
+    runtime, _ = runtime_for(manager)
+    del runtime.publish
+    await runtime.publish(newer)
+    await runtime.publish(original)
+    assert runtime.pending_publications[original['job_id']] == expected
+    assert expected['devices']['failed']['retryable']
+
+
+@pytest.mark.asyncio
+async def test_retry_dependency_lookup_skips_collected_history(manager, tmp_path):
+    original = await completed(manager, tmp_path)
+    _, newer = await create_newer(manager, original)
+
+    def measure(conn, history):
+        # Reuse the real schema and old job shape; only one artifact stays retained.
+        template = dict(conn.execute('SELECT * FROM push_jobs WHERE job_id=?', (original['job_id'],)).fetchone())
+        conn.execute('BEGIN')
+        conn.execute('UPDATE push_job_devices SET enqueue_seq=? WHERE job_id=?',
+                     (1000 + history * 255 + 1, newer['job_id']))
+        for index in range(history):
+            artifact_id = f'deleted-artifact-{index}'
+            conn.execute("INSERT INTO push_artifacts (artifact_id,storage_name,display_filename,byte_size,sha256,entry_count,created_at,retention_state) VALUES (?,?,?,4,?,1,1,'deleted')",
+                         (artifact_id, artifact_id, artifact_id, 'a' * 64))
+            job = {**template, 'job_id': f'history-{index}', 'client_request_id': f'history-{index}', 'artifact_id': artifact_id}
+            conn.execute(f"INSERT INTO push_jobs ({','.join(job)}) VALUES ({','.join('?' for _ in job)})", tuple(job.values()))
+            conn.executemany("INSERT INTO push_job_devices (job_id,device_id,enqueue_seq,target_ordinal,protocol_mode,create_capability_snapshot_json,state,updated_at) VALUES (?,?,?,?,'job_v1','[]','failed',1)",
+                             [(job['job_id'], 'failed' if device == 0 else f'history-device-{device}',
+                               1000 + index * 255 + device, device) for device in range(255)])
+        conn.execute('COMMIT')
+        steps = 0
+
+        def progress():
+            nonlocal steps
+            steps += 1
+            return 0
+
+        conn.set_progress_handler(progress, 1)
+        try:
+            assert manager.store._retry_dependent_job_ids(conn, newer['job_id']) == [original['job_id']]
+        finally:
+            conn.set_progress_handler(None, 0)
+        return steps
+
+    baseline = await manager.store._call(lambda conn: measure(conn, 0))
+    with_history = await manager.store._call(lambda conn: measure(conn, 300))
+    # Bound executed SQLite instructions, not machine-dependent wall time.
+    assert with_history <= baseline * 2

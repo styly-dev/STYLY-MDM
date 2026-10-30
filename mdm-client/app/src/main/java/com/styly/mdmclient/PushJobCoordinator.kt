@@ -270,12 +270,9 @@ internal class PushStateResetNoticeTracker {
 internal enum class PushStateRecoveryAction { Reload, SaveUnsavedTerminal, ResaveCurrent }
 
 /**
- * Chooses what an automatic durable-state retry does. Before durable state was ever
- * adopted the in-memory state is not authoritative, so only a reload is safe. Afterwards
- * the file is never reloaded: a worker may own it, and a terminal outcome that could not
- * be saved must be saved as is, because recovery would turn a finished execution into a
- * resumable one. Otherwise re-saving the in-memory state (equal to the last successful
- * save) probes whether storage is writable again.
+ * Reload only before state has been adopted. Afterward, retry saving in-memory state:
+ * reloading could turn an unsaved terminal outcome into resumable work. Saving the
+ * current state also checks whether storage is writable again.
  */
 internal fun decidePushStateRecovery(
     stateLoaded: Boolean,
@@ -472,9 +469,8 @@ class PushJobCoordinator internal constructor(
     }
 
     /**
-     * Runs for every REGISTERED on [token], including the reply to a registration refresh
-     * on the same socket. Replaying the durable outbox again is safe: results are ACKed
-     * idempotently by job identity.
+     * Replays pending results and the current saved interruption after each REGISTERED,
+     * including refresh replies. The server handles duplicate reports by exact identity.
      */
     fun onRegistered(token: Any) {
         actor.execute {
@@ -483,6 +479,9 @@ class PushJobCoordinator internal constructor(
                 expireIfStale()
                 resetNotices.onRegistered(token)
                 replayPendingResults()
+                if (durabilityAvailable) {
+                    state.active?.takeIf { it.interrupted }?.let { reportInterrupted(it) }
+                }
             }
         }
     }
@@ -766,7 +765,7 @@ class PushJobCoordinator internal constructor(
             put("job_id", command.jobId)
             put("attempt", command.attempt)
             put("reason", "client_persistence_unavailable")
-            put("retryable", false)
+            put("retryable", true)
             put("detail", "Device could not save durable Push/Sync state")
         })
     }
@@ -901,18 +900,7 @@ class PushJobCoordinator internal constructor(
                     unsavedTerminal = command to execution
                     return
                 }
-                if (command.isJobV1) {
-                    val identity = PushProtocol.ReconcileIdentity(
-                        requireNotNull(command.jobId),
-                        command.attempt,
-                        command.artifactId,
-                    )
-                    send(buildActivePushReconcileReport(
-                        identity,
-                        requireNotNull(state.active),
-                        validatedOffset(command),
-                    ))
-                }
+                reportInterrupted(requireNotNull(state.active))
                 return
             }
             is PushFilesWorker.Outcome.Completed -> outcome.result
@@ -942,6 +930,16 @@ class PushJobCoordinator internal constructor(
                 log(Log.WARN, "Could not clean Push/Sync attempt directory", error)
             }
         }
+    }
+
+    private fun reportInterrupted(active: PushProtocol.Active) {
+        val command = active.command
+        if (!command.isJobV1) return
+        send(buildActivePushReconcileReport(
+            PushProtocol.ReconcileIdentity(requireNotNull(command.jobId), command.attempt, command.artifactId),
+            active,
+            validatedOffset(command),
+        ))
     }
 
     private fun setPhase(command: PushProtocol.Command, phase: String): Boolean {

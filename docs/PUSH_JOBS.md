@@ -701,3 +701,13 @@ Resume and Cancel controls.
 
 See [Push/Sync validation](PUSH_VALIDATION.md) for automated checks, hardware
 evidence, and verification limits.
+
+### Exact Timeout Recovery and Server Retention
+
+A reconciliation timeout records an unknown outcome, not evidence that the device stopped. An exact saved `downloading` interruption can restore the same assignment to queued manual Resume only while its artifact is retained and its matching fence remains. Artifact/revision mismatch, Cancel, Retry, newer work, an `applying` report, or a removed/replaced fence prevents revival. Earlier dispatch authorization is withdrawn; reconnect never starts the worker automatically. REGISTER and reconciliation share these decisions, and REGISTERED replays interrupted state that changed while registration was awaiting acknowledgement.
+
+The server keeps its existing terminal-artifact cleanup window: `MDM_PUSH_ARTIFACT_RETRY_WINDOW` (default seven wall-clock days) from the latest referencing terminal job. An uncancelled `unconfirmed` fence alone does not retain bytes indefinitely. Existing active references and pending-cancellation exceptions still protect bytes. If GC commits first, exact Resume is rejected while the fence remains; if Resume commits first, queued ownership protects the artifact. Physical unlink happens after the tombstone commit. This server window is independent of the client's powered-on retention budget.
+
+### Transactional Retry Updates
+
+Newer work for the same destination can suppress Retry on an older failed assignment; an unsent failure or cancellation can make it eligible again. These mutations update dependent job revisions in the same SQLite transaction while preserving historical `updated_at` and terminal retention timestamps. Final affected snapshots are built before COMMIT and queued only after it succeeds. The DB worker wakes the publisher independently of the request caller, including after caller cancellation. Publication drains committed snapshots without DB access, coalescing by revision. Startup drains existing notices; shutdown finishes submitted DB work before the final publication drain. Compatible indexes are created on initialization without changing table columns, schema version, or wire fields.

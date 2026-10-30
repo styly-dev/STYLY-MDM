@@ -188,6 +188,10 @@ class PushJobStore:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        # The DB worker owns staged IDs; only committed snapshots cross threads.
+        self._retry_invalidations: set[str] = set()
+        self._retry_publications: queue.SimpleQueue[list[dict[str, Any]]] = queue.SimpleQueue()
+        self._retry_publication_wakeup: Callable[[], None] | None = None
         self._worker = _DbWorker(path)
         self._call_sync(self._backup_before_upgrade)
         self._call_sync(self._initialize)
@@ -238,6 +242,10 @@ class PushJobStore:
 
     def close(self) -> None:
         self._worker.close()
+
+    async def drain(self) -> None:
+        """Wait for previously submitted mutations, including cancelled callers."""
+        await self._call(lambda _conn: None)
 
     def _call_sync(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         return self._worker.submit(fn).result()
@@ -369,6 +377,14 @@ class PushJobStore:
             CREATE INDEX IF NOT EXISTS ix_push_job_device_order
             ON push_job_devices(device_id, enqueue_seq)
             """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_push_artifacts_retained
+            ON push_artifacts(artifact_id) WHERE retention_state='retained'
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_push_jobs_artifact
+            ON push_jobs(artifact_id)
+            """,
         )
         cls._begin(conn)
         try:
@@ -398,23 +414,50 @@ class PushJobStore:
             conn.execute(
                 "INSERT OR IGNORE INTO server_metadata(key, value) VALUES ('next_enqueue_seq', '1')"
             )
-            cls._commit(conn)
+            conn.execute("COMMIT")
         except BaseException:
-            cls._rollback(conn)
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
 
     @staticmethod
     def _begin(conn: sqlite3.Connection) -> None:
         conn.execute("BEGIN IMMEDIATE")
 
-    @staticmethod
-    def _commit(conn: sqlite3.Connection) -> None:
+    def _commit(self, conn: sqlite3.Connection) -> None:
+        """Commit state before handing affected Retry snapshots to publication."""
+        related = [self._snapshot(conn, job_id) for job_id in sorted(self._retry_invalidations)]
         conn.execute("COMMIT")
+        self._retry_invalidations.clear()
+        if related:
+            self._retry_publications.put(related)
+            wakeup = self._retry_publication_wakeup
+            if wakeup is not None:
+                try:
+                    wakeup()
+                except Exception:
+                    # The transaction already committed; retain its queued snapshots.
+                    logger.exception("Could not wake Push Retry publication")
 
-    @staticmethod
-    def _rollback(conn: sqlite3.Connection) -> None:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK")
+    def set_retry_publication_wakeup(self, wakeup: Callable[[], None] | None) -> None:
+        """Attach a thread-safe notifier; detach after the DB worker has drained."""
+        self._retry_publication_wakeup = wakeup
+
+    def _rollback(self, conn: sqlite3.Connection) -> None:
+        try:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+        finally:
+            self._retry_invalidations.clear()
+
+    def take_retry_publications(self) -> list[dict[str, Any]]:
+        """Drain committed snapshots without DB access or a cancellation point."""
+        snapshots = []
+        while True:
+            try:
+                snapshots.extend(self._retry_publications.get_nowait())
+            except queue.Empty:
+                return snapshots
 
     @staticmethod
     def _next_enqueue_seq(conn: sqlite3.Connection, count: int) -> int:
@@ -434,8 +477,8 @@ class PushJobStore:
             (timestamp, job_id),
         )
 
-    @staticmethod
     def _settle_pre_dispatch_targets(
+        self,
         conn: sqlite3.Connection,
         job_id: str,
         state: JobState,
@@ -481,7 +524,7 @@ class PushJobStore:
         ).fetchone()
         if job["dispatch_started_at"] is not None or job["dispatch_enabled"] or protected:
             raise StoreConflict("job has dispatch evidence; cannot settle it as pre-dispatch")
-        return conn.execute(
+        changed = conn.execute(
             """
             UPDATE push_job_devices SET state=?, queue_reason=NULL, failure_code=?,
                 failure_detail=?, terminal_at=?, updated_at=?
@@ -489,6 +532,9 @@ class PushJobStore:
             """,
             (state.value, code, detail, terminal_at, updated_at, job_id),
         ).rowcount
+        if changed:
+            self._invalidate_retry_dependents(conn, job_id)
+        return changed
 
     @staticmethod
     def _fence_visible_job_ids(conn: sqlite3.Connection, device_id: str) -> list[str]:
@@ -557,6 +603,33 @@ class PushJobStore:
                 (job["job_id"], job["dest_path"]),
             )
         }
+
+    @staticmethod
+    def _retry_dependent_job_ids(conn: sqlite3.Connection, job_id: str) -> list[str]:
+        """Older retained failures whose Retry eligibility depends on this job."""
+        return [row["job_id"] for row in conn.execute(
+            "SELECT old_job.job_id FROM push_artifacts a "
+            "JOIN push_jobs old_job ON old_job.artifact_id=a.artifact_id "
+            "JOIN push_jobs new_job ON new_job.job_id=? "
+            "AND old_job.dest_path=new_job.dest_path "
+            "WHERE a.retention_state='retained' AND EXISTS ("
+            "SELECT 1 FROM push_job_devices older "
+            "JOIN push_job_devices newer ON newer.job_id=new_job.job_id "
+            "AND newer.device_id=older.device_id "
+            "WHERE older.job_id=old_job.job_id "
+            "AND older.enqueue_seq<newer.enqueue_seq "
+            "AND older.state IN ('failed','interrupted','unconfirmed'))", (job_id,),
+        )]
+
+    def _invalidate_retry_dependents(self, conn: sqlite3.Connection, job_id: str) -> None:
+        # Eligibility changes share the source mutation's transaction. Retention
+        # timestamps are historical and must not move with this display revision.
+        related = self._retry_dependent_job_ids(conn, job_id)
+        conn.executemany(
+            "UPDATE push_jobs SET revision=revision+1 WHERE job_id=?",
+            [(other,) for other in related],
+        )
+        self._retry_invalidations.update(related)
 
     @staticmethod
     def _resume_supported(row: Mapping[str, Any]) -> bool:
@@ -799,6 +872,7 @@ class PushJobStore:
                             timestamp,
                         ),
                     )
+                self._invalidate_retry_dependents(conn, job_id)
                 snapshot = self._snapshot(conn, job_id)
                 self._commit(conn)
                 return True, snapshot
@@ -1098,6 +1172,8 @@ class PushJobStore:
                     f"UPDATE push_job_devices SET {', '.join(assignments)} WHERE job_id=? AND device_id=?",
                     values,
                 )
+                if target in TERMINAL_DEVICE_STATES and row["dispatch_revision"] is None:
+                    self._invalidate_retry_dependents(conn, job_id)
                 self._increment_revision(conn, job_id, timestamp)
                 self._rederive_job(conn, job_id, timestamp)
                 snapshot = self._snapshot(conn, job_id)

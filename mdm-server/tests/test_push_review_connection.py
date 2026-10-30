@@ -281,7 +281,7 @@ async def test_interrupted_transfer_requires_exact_evidence_before_pausing(manag
         evidence["validated_offset"] = True
     else:
         evidence["validated_offset"] = 2
-    outcome, unchanged = await manager.resume_interrupted(
+    outcome, (unchanged,) = await manager.resume_interrupted(
         snapshot["job_id"], "D1", attempt=1,
         reason="download_interrupted", **evidence,
     )
@@ -549,7 +549,7 @@ async def test_failed_interrupted_reconciliation_returns_permanent_disposition()
             }
 
         async def resume_interrupted(self, *_args, **_kwargs):
-            return "rejected", {"job_id": "job-1"}
+            return "rejected", [{"job_id": "job-1"}]
 
     runtime = runtime_for(Manager())
     ws = Ws()
@@ -576,51 +576,20 @@ async def test_failed_interrupted_reconciliation_returns_permanent_disposition()
 
 
 @pytest.mark.asyncio
-async def test_interrupted_reconciliation_without_artifact_never_resumes():
-    artifact_id = str(uuid.uuid4())
-
-    class Manager:
-        def __init__(self):
-            self.resume_calls = 0
-
-        async def clear_matching_opaque_fence(self, *_args):
-            return False, []
-
-        async def assignment(self, *_args):
-            return {
-                "state": DeviceState.RECONCILING.value,
-                "artifact_id": artifact_id,
-                "dispatch_capability_snapshot_json": json.dumps(
-                    ["push_job_id_v1", "push_resume_v1"]
-                ),
-            }
-
-        async def resume_interrupted(self, *_args, **_kwargs):
-            self.resume_calls += 1
-            return "requeued", {"job_id": "job-1"}
-
-    runtime = runtime_for(Manager())
+async def test_interrupted_reconciliation_without_artifact_never_resumes(manager):
+    job = await downloading_job(manager.store, manager)
+    runtime = runtime_for(manager)
     ws = Ws()
     session = live_session({"push_job_id_v1", "push_resume_v1"}, ws=ws)
-
-    await runtime._handle_reconcile_report(
-        session,
-        "D1",
-        {
-            "type": "PUSH_RECONCILE_REPORT",
-            "job_id": "job-1",
-            "attempt": 1,
-            "revision": 7,
-            "validated_offset": 3,
-            "status": "interrupted",
-            "phase": "downloading",
-        },
-    )
-
-    assert runtime.manager.resume_calls == 0
-    assert ws.messages[0]["type"] == "PUSH_RESUME_REJECTED"
-    assert ws.messages[0]["artifact_id"] == artifact_id
-    assert ws.messages[0]["revision"] == 7
+    await runtime._handle_reconcile_report(session, "D1", {
+        "job_id": job["job_id"], "attempt": 1,
+        "revision": job["devices"]["D1"]["dispatch_revision"],
+        "validated_offset": 1, "status": "interrupted", "phase": "downloading",
+    })
+    assert (await manager.assignment(job["job_id"], "D1"))["state"] == "failed"
+    assert await manager.fenced_assignment_for_device("D1") is not None
+    # Do not manufacture a discard identity from the canonical assignment.
+    assert ws.messages == []
 
 
 @pytest.mark.asyncio

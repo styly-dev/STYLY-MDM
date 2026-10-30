@@ -375,7 +375,7 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
             {"artifact_id": artifact_id, "dispatch_revision": immutable_revision, "validated_offset": 11},
             {"artifact_id": artifact_id, "dispatch_revision": immutable_revision, "validated_offset": True},
         ):
-            resumed, rejected_snapshot = await manager.resume_interrupted(
+            resumed, (rejected_snapshot,) = await manager.resume_interrupted(
                 job_id,
                 "D1",
                 attempt=1,
@@ -393,7 +393,7 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
                 conn.commit(),
             )
         )
-        resumed, snapshot = await manager.resume_interrupted(
+        resumed, (snapshot,) = await manager.resume_interrupted(
             job_id,
             "D1",
             attempt=1,

@@ -684,12 +684,25 @@ class _PublicationLegacy:
             self.active -= 1
 
 
+class _PublicationStore:
+    def take_retry_publications(self):
+        return []
+
+    def set_retry_publication_wakeup(self, wakeup):
+        self.wakeup = wakeup
+
+    async def drain(self):
+        pass
+
+
 def _publication_runtime(legacy):
     runtime = object.__new__(PushRuntime)
     runtime.pending_disconnects = set()
     runtime.disconnect_recovery_tasks = {}
     runtime.artifact_gc_task = None
+    runtime.background_tasks = set()
     runtime.legacy = legacy
+    runtime.store = _PublicationStore()
     runtime.pending_publications = {}
     runtime.publication_revisions = {}
     runtime.publication_wake = asyncio.Event()
@@ -732,7 +745,7 @@ async def test_publication_worker_continues_after_exception():
 
 
 @pytest.mark.asyncio
-async def test_runtime_cleanup_drains_publication_before_store_close(tmp_path):
+async def test_runtime_cleanup_drains_final_publication_after_store_close(tmp_path):
     legacy = _PublicationLegacy()
     runtime = _publication_runtime(legacy)
     runtime.created_deadline_task = None
@@ -743,18 +756,25 @@ async def test_runtime_cleanup_drains_publication_before_store_close(tmp_path):
     runtime.transfers = TransferRegistry()
     runtime.data_dir = tmp_path
 
-    class Store:
+    class Store(_PublicationStore):
         def __init__(self):
             self.closed = False
+            self.pending = []
 
         def close(self):
-            assert legacy.events
             self.closed = True
+            self.pending.append({"job_id": "final-commit", "revision": 1})
+
+        def take_retry_publications(self):
+            snapshots, self.pending = self.pending, []
+            return snapshots
 
     runtime.store = Store()
     await runtime.publish({"job_id": "job", "revision": 1})
     await runtime.on_cleanup(None)
     assert runtime.store.closed
+    assert {event['job_id'] for event in legacy.events} == {'job', 'final-commit'}
+    assert runtime.store.wakeup is None
     assert runtime.publication_task is None
 
 

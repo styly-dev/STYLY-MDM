@@ -502,6 +502,63 @@ class PushJobCoordinatorIntegrationTest {
     }
 
     @Test
+    fun `registration synchronizes interruption on either side of acknowledgement`() {
+        for (interruptBeforeAck in listOf(true, false)) {
+            val started = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val harness = Harness().apply {
+                runExecution = { current, _ ->
+                    started.countDown()
+                    release.await()
+                    execution(current, interruptionReason = "server_lease_revoked")
+                }
+            }
+            harness.attach()
+            harness.send(command())
+            assertTrue(started.await(2, TimeUnit.SECONDS))
+            val registered = AtomicBoolean(false)
+            val delivered = CopyOnWriteArrayList<JSONObject>()
+            val token = Any()
+            harness.coordinator.attachTransport(token, { if (registered.get()) delivered.add(it) }, {})
+            assertEquals("active", harness.snapshot().getJSONObject("push_runtime").getJSONObject("active").getString("status"))
+            if (!interruptBeforeAck) {
+                registered.set(true)
+                harness.coordinator.onRegistered(token)
+                harness.snapshot()
+            }
+            release.countDown()
+            await { harness.durableState.get().active?.interrupted == true }
+            harness.snapshot()
+            if (interruptBeforeAck) {
+                assertTrue(delivered.isEmpty())
+                registered.set(true)
+                harness.coordinator.onRegistered(token)
+                harness.snapshot()
+            }
+            assertTrue(delivered.any { it.optString("status") == "interrupted" })
+            harness.coordinator.onRegistered(token)
+            harness.snapshot()
+            assertEquals(1, harness.workerRuns.get())
+            assertEquals(0, harness.cleanupCalls.get())
+        }
+    }
+
+    @Test
+    fun `registration does not report interrupted state while persistence is unavailable`() {
+        val saved = command()
+        val harness = Harness(PushProtocol.State(
+            PushProtocol.Active(saved, PushProtocol.PHASE_DOWNLOADING, interrupted = true,
+                retention = PushProtocol.Retention(PushProtocol.Retention.DURATION_MS, 1, 0L)),
+            emptyList(), emptyList(),
+        ))
+        harness.snapshot()
+        harness.clockUnavailable = true
+        harness.attach()
+        assertFalse(harness.messages.any { it.optString("type") == "PUSH_RECONCILE_REPORT" })
+        assertEquals(0, harness.cleanupCalls.get())
+    }
+
+    @Test
     fun `interrupted resume is exact and duplicate delivery starts one worker`() {
         val saved = command()
         val interrupted = PushProtocol.State(
@@ -536,8 +593,9 @@ class PushJobCoordinatorIntegrationTest {
         await { harness.messages.count { it.optString("type") == "PUSH_JOB_ACCEPTED" } >= 2 }
         assertEquals(1, harness.workerRuns.get())
 
+        val interruptionReports = harness.messages.count { it.optString("type") == "PUSH_RECONCILE_REPORT" }
         releaseWorker.countDown()
-        await { harness.messages.any { it.optString("type") == "PUSH_RECONCILE_REPORT" } }
+        await { harness.messages.count { it.optString("type") == "PUSH_RECONCILE_REPORT" } > interruptionReports }
         assertEquals(0, harness.cleanupCalls.get())
         assertTrue(harness.durableState.get().active?.interrupted == true)
         assertTrue(harness.logs.any { (message, _) ->
