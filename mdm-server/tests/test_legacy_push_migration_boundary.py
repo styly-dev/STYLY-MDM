@@ -11,6 +11,7 @@ import pytest
 from aiohttp.test_utils import TestServer
 
 from styly_mdm import server
+from styly_mdm.transfer_registry import TransferRegistry
 from styly_mdm.push_jobs import ProtocolMode, canonicalize_create_request
 
 
@@ -44,12 +45,12 @@ def _request(target: str) -> object:
 
 
 @pytest.fixture(autouse=True)
-def reset_server_state(tmp_path):
+def reset_server_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "transfer_registry", TransferRegistry())
     saved_paths = (server.DATA_DIR, server.APK_DIR, server.BUNDLE_DIR, server.REGISTRY_PATH)
     collections = (
         server.devices,
         server.admin_connections,
-        server.pending_transfers,
         server._transfer_tasks,
         server.pending_self_updates,
         server._apk_hash_cache,
@@ -84,7 +85,7 @@ async def test_unfinished_legacy_push_is_not_migrated_on_guid_registration(tmp_p
             "model": "M",
             "ip": "1.1.1.1",
         }
-        _, legacy_snapshot = await runtime.manager.create_job(
+        _, legacy_snapshot = await runtime.manager.store.create_job(
             _request(legacy_id),
             {legacy_id: (ProtocolMode.LEGACY, set())},
             600_000,
@@ -103,8 +104,8 @@ async def test_unfinished_legacy_push_is_not_migrated_on_guid_registration(tmp_p
                 "entry_count": 1,
             },
         )
-        await runtime.manager.enable_dispatch(legacy_job_id)
-        legacy_before = await runtime.manager.get_snapshot(legacy_job_id)
+        await runtime.manager.store.enable_dispatch(legacy_job_id)
+        legacy_before = await runtime.store.get_snapshot(legacy_job_id)
         assert legacy_before["state"] == "running"
         assert legacy_before["devices"][legacy_id]["protocol_mode"] == "legacy"
 
@@ -119,13 +120,13 @@ async def test_unfinished_legacy_push_is_not_migrated_on_guid_registration(tmp_p
                     "ip": "1.1.1.2",
                     "version_code": 10,
                     "version_name": "guid",
-                    "capabilities": ["push_job_id_v1"],
+                    "capabilities": ["push_job_id_v1", "push_resume_v1"],
                     "process_instance_id": str(uuid.uuid4()),
                 }
             )
             await _recv_type(device, "REGISTERED")
 
-            legacy_after_register = await runtime.manager.get_snapshot(legacy_job_id)
+            legacy_after_register = await runtime.store.get_snapshot(legacy_job_id)
             assert legacy_after_register["state"] == legacy_before["state"]
             assert legacy_after_register["devices"] == legacy_before["devices"]
             assert legacy_after_register["job_id"] == legacy_job_id
@@ -151,9 +152,9 @@ async def test_unfinished_legacy_push_is_not_migrated_on_guid_registration(tmp_p
             assert created["targets"] == [
                 {"device_id": guid_id, "protocol_mode": "job_v1"}
             ]
-            new_snapshot = await runtime.manager.get_snapshot(created["job_id"])
+            new_snapshot = await runtime.store.get_snapshot(created["job_id"])
             assert new_snapshot["devices"].keys() == {guid_id}
-            assert (await runtime.manager.get_snapshot(legacy_job_id))["state"] != "succeeded"
+            assert (await runtime.store.get_snapshot(legacy_job_id))["state"] != "succeeded"
             await device.close()
     finally:
         await test_server.close()

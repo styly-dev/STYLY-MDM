@@ -1,9 +1,4 @@
-"""aiohttp integration for the durable Push/Sync job model (Issue #91).
-
-The repository's established server remains the adapter for unrelated commands.
-This module confines Push/Sync interception to explicit protocol messages while
-preserving the existing routes and old-client fallback during migration.
-"""
+"""Durable Push/Sync routes and messages; server.py handles other commands."""
 
 from __future__ import annotations
 
@@ -13,7 +8,6 @@ import logging
 import os
 import re
 import uuid
-from collections.abc import Iterator, MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +18,7 @@ from .device_policy import (
     PROVISIONAL_POWER_COMMANDS,
     command_allowed,
 )
-from .push_artifacts import ArtifactStore
+from .push_artifacts import ArtifactStore, strong_etag
 from .push_job_manager import PushJobManager
 from .push_job_store import (
     PushJobStore,
@@ -34,16 +28,20 @@ from .push_job_store import (
     now_ms,
 )
 from .push_jobs import (
+    PUSH_JOB_CAPABILITIES,
     CAP_PUSH_JOB_ID_V1,
     DeviceState,
     JobState,
     ProtocolMode,
+    ProgressEvent,
     PushJobError,
     canonicalize_create_request,
     parse_capabilities,
 )
 from .push_scheduler import LiveSession, PushScheduler
+from .server import parse_push_state_reset, parse_push_state_status
 from .transfer_registry import TransferKey, TransferRegistry
+from .push_transfer_leases import PushTransferLeases
 
 log = logging.getLogger("stylymdm.push")
 
@@ -59,6 +57,14 @@ def _env_seconds(name: str, default: float) -> float:
     return max(0.05, value)
 
 
+def _is_file_of_size(path: Path, size: int) -> bool:
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    return path.is_file() and stat.st_size == size
+
+
 def _uuid_v4_or_none(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -67,63 +73,6 @@ def _uuid_v4_or_none(value: Any) -> str | None:
     except ValueError:
         return None
     return str(parsed) if parsed.version == 4 else None
-
-
-class _LegacyTransferAdapter(MutableMapping[tuple[str, str], asyncio.Future[str]]):
-    """Compatibility facade backed by the typed transfer registry.
-
-    Existing install and migration-only legacy Push code still uses tuple syntax.
-    The actual registry key is typed, and a legacy Push receives an opaque identity
-    that cannot collide with any canonical ``(job_id, device_id, attempt)`` waiter.
-    """
-
-    def __init__(self, registry: TransferRegistry) -> None:
-        self.registry = registry
-        self._keys: dict[tuple[str, str], TransferKey] = {}
-
-    def _key(self, key: tuple[str, str]) -> TransferKey:
-        device_id, task = key
-        if task == "install":
-            return TransferKey("install", device_id)
-        existing = self._keys.get(key)
-        if existing is not None:
-            return existing
-        return TransferKey("push", device_id, f"legacy-{uuid.uuid4()}", 1)
-
-    def __getitem__(self, key: tuple[str, str]) -> asyncio.Future[str]:
-        typed = self._keys[key]
-        future = self.registry.get(typed)
-        if future is None:
-            self._keys.pop(key, None)
-            raise KeyError(key)
-        return future
-
-    def __setitem__(self, key: tuple[str, str], value: asyncio.Future[str]) -> None:
-        previous = self._keys.get(key)
-        if previous is not None:
-            current = self.registry.get(previous)
-            if current is not None:
-                self.registry.remove_if_same(previous, current)
-        typed = self._key(key)
-        self.registry.register(typed, value)
-        self._keys[key] = typed
-
-    def __delitem__(self, key: tuple[str, str]) -> None:
-        typed = self._keys.pop(key)
-        future = self.registry.get(typed)
-        if future is not None:
-            self.registry.remove_if_same(typed, future)
-
-    def __iter__(self) -> Iterator[tuple[str, str]]:
-        for key in tuple(self._keys):
-            typed = self._keys[key]
-            if self.registry.get(typed) is None:
-                self._keys.pop(key, None)
-            else:
-                yield key
-
-    def __len__(self) -> int:
-        return sum(1 for _ in self)
 
 
 class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
@@ -214,7 +163,20 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
                 ):
                     continue
             elif self._push_path == "/ws/admin":
-                if await self._push_runtime.handle_admin_message(self, payload):
+                try:
+                    handled = await self._push_runtime.handle_admin_message(self, payload)
+                except (ConnectionError, asyncio.TimeoutError):
+                    raise
+                except Exception:
+                    # A failed operator action (for example a SQLite error) must not
+                    # close the whole admin connection.
+                    log.exception("Push admin action %s failed", payload.get("type"))
+                    await self._push_runtime.admin_send(self, {
+                        "type": "ERROR",
+                        "message": f"{payload.get('type')} failed on the server",
+                    })
+                    continue
+                if handled:
                     continue
             return message
 
@@ -229,7 +191,7 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
             await self.send_str(json.dumps({"type": "REGISTERED"}))
             return
         if idempotent:
-            await self._push_runtime.acknowledge_registration(self, device_id)
+            await self._push_runtime.refresh_registration(self, device_id, payload)
             return
         self._push_device_id = device_id
         self._push_runtime.note_registration_candidate(self, device_id)
@@ -241,14 +203,18 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
         )
 
     async def close(self, *args: Any, **kwargs: Any) -> bool:
-        if (
-            not self._push_disconnect_notified
-            and self._push_runtime is not None
-            and self._push_path == "/ws/device"
-        ):
-            self._push_disconnect_notified = True
-            await self._push_runtime.disconnect_device(self._push_device_id, self)
-        return await super().close(*args, **kwargs)
+        try:
+            if (
+                not self._push_disconnect_notified
+                and self._push_runtime is not None
+                and self._push_path == "/ws/device"
+            ):
+                self._push_disconnect_notified = True
+                await self._push_runtime.disconnect_device(self._push_device_id, self)
+        finally:
+            # Transport cleanup must not depend on durable business-state cleanup.
+            result = await super().close(*args, **kwargs)
+        return result
 
 
 class PushRuntime:
@@ -258,13 +224,16 @@ class PushRuntime:
         self.store = PushJobStore(data_dir / "push_jobs.sqlite3")
         self.manager = PushJobManager(self.store)
         self.artifacts = ArtifactStore(data_dir)
-        self.transfers = TransferRegistry()
-        self.legacy_transfers = _LegacyTransferAdapter(self.transfers)
+        self.leases = PushTransferLeases()
+        self.transfers = TransferRegistry(self.leases.revoke_now)
         self.sessions: dict[str, LiveSession] = {}
         self.device_locks: dict[str, asyncio.Lock] = {}
         self.registration_candidates: dict[str, RuntimeWebSocketResponse] = {}
+        self.pending_disconnects: set[str] = set()
+        self.disconnect_recovery_tasks: dict[str, asyncio.Task[None]] = {}
         self.scheduler: PushScheduler | None = None
         self.housekeeping_task: asyncio.Task[None] | None = None
+        self.artifact_gc_task: asyncio.Task[None] | None = None
         self.created_deadline_task: asyncio.Task[None] | None = None
         self.created_deadline_wake = asyncio.Event()
         self.publication_task: asyncio.Task[None] | None = None
@@ -272,6 +241,13 @@ class PushRuntime:
         self.pending_publications: dict[str, dict[str, Any]] = {}
         self.publication_revisions: dict[str, int] = {}
         self.publication_stopping = False
+        self.background_tasks: set[asyncio.Task[Any]] = set()
+        self.artifact_retry_window = _env_seconds(
+            "MDM_PUSH_ARTIFACT_RETRY_WINDOW", 7 * 24 * 60 * 60
+        )
+        self.artifact_gc_interval = _env_seconds(
+            "MDM_PUSH_ARTIFACT_GC_INTERVAL", 60
+        )
         self.startup_snapshots, self.startup_cleanup = self.store.recover_startup_sync(
             accept_reconciliation_timeout_ms=int(
                 _env_seconds("MDM_PUSH_ACCEPT_RECONCILIATION_TIMEOUT", 60) * 1000
@@ -299,7 +275,6 @@ class PushRuntime:
         )
         self.recent_limit = max(0, int(os.environ.get("MDM_PUSH_RECENT_JOB_LIMIT", "100")))
         self.recent_days = max(0, int(os.environ.get("MDM_PUSH_RECENT_JOB_DAYS", "30")))
-        self.allow_legacy = os.environ.get("MDM_ALLOW_LEGACY_PUSH", "1") != "0"
 
     def _device_lock(self, device_id: str) -> asyncio.Lock:
         return self.device_locks.setdefault(device_id, asyncio.Lock())
@@ -332,9 +307,15 @@ class PushRuntime:
 
     async def on_startup(self, _app: aiohttp_web.Application) -> None:
         self.publication_stopping = False
+        loop = asyncio.get_running_loop()
+        self.store.set_retry_publication_wakeup(
+            lambda: loop.call_soon_threadsafe(self.publication_wake.set)
+        )
         self.publication_task = asyncio.create_task(
             self._publication_loop(), name="push-job-publication"
         )
+        # Recovery may have committed before the event loop notifier was attached.
+        self.publication_wake.set()
         for job_id in self.startup_cleanup:
             await asyncio.to_thread(self.artifacts.cleanup_work_best_effort, job_id)
         self.startup_cleanup.clear()
@@ -344,6 +325,11 @@ class PushRuntime:
             except (OSError, ValueError):
                 log.exception("Could not remove orphan Push artifact %s", storage_name)
         self.startup_orphan_artifacts.clear()
+        await asyncio.to_thread(
+            self.store.gc_artifacts_sync,
+            self.artifacts.artifact_root,
+            retry_window_ms=int(self.artifact_retry_window * 1000),
+        )
         self.scheduler = PushScheduler(
             manager=self.manager,
             transfer_registry=self.transfers,
@@ -354,12 +340,14 @@ class PushRuntime:
             accept_timeout=self.accept_timeout,
             accept_reconciliation_timeout=self.accept_reconciliation_timeout,
             reconciliation_timeout=self.reconciliation_timeout,
-            transfer_timeout=self.legacy.TRANSFER_TIMEOUT,
-            allow_legacy=self.allow_legacy,
+            leases=self.leases,
         )
         self.scheduler.start()
         self.housekeeping_task = asyncio.create_task(
             self._reconciliation_housekeeping(), name="push-reconciliation-housekeeping"
+        )
+        self.artifact_gc_task = asyncio.create_task(
+            self._artifact_gc_loop(), name="push-artifact-gc",
         )
         self.arm_created_deadline()
 
@@ -368,43 +356,44 @@ class PushRuntime:
             self.created_deadline_task.cancel()
         if self.housekeeping_task is not None:
             self.housekeeping_task.cancel()
+        if self.artifact_gc_task is not None:
+            self.artifact_gc_task.cancel()
+        recovery_tasks = tuple(self.disconnect_recovery_tasks.values())
+        background_tasks = tuple(self.background_tasks)
+        for task in (*recovery_tasks, *background_tasks):
+            task.cancel()
         await asyncio.gather(
             *(
                 task
-                for task in (self.created_deadline_task, self.housekeeping_task)
+                for task in (self.created_deadline_task, self.housekeeping_task, self.artifact_gc_task, *recovery_tasks, *background_tasks)
                 if task is not None
             ),
             return_exceptions=True,
         )
         if self.scheduler is not None:
             await self.scheduler.stop()
-        self.publication_stopping = True
-        self.publication_wake.set()
-        if self.publication_task is not None:
-            await asyncio.gather(self.publication_task, return_exceptions=True)
-            self.publication_task = None
-        for device_id in tuple(self.sessions):
-            self.transfers.release_all_for_device(device_id, "shutdown")
-        self.sessions.clear()
-        self.registration_candidates.clear()
-        self.store.close()
-        _RUNTIME_BY_DATA_DIR.pop(self.data_dir.resolve(), None)
+        try:
+            # Cancelling an awaiter does not stop a running DB transaction.
+            await self.store.drain()
+        finally:
+            self.store.close()
+            self.store.set_retry_publication_wakeup(None)
+            self.publication_stopping = True
+            self.publication_wake.set()
+            if self.publication_task is not None:
+                await asyncio.gather(self.publication_task, return_exceptions=True)
+                self.publication_task = None
+            for device_id in tuple(self.sessions):
+                self.transfers.release_all_for_device(device_id, "shutdown")
+            self.sessions.clear()
+            self.registration_candidates.clear()
+            _RUNTIME_BY_DATA_DIR.pop(self.data_dir.resolve(), None)
 
     async def send_initial_snapshot(self, ws: RuntimeWebSocketResponse) -> None:
         try:
             cutoff = now_ms() - self.recent_days * 86_400_000
             snapshots = await self.manager.list_snapshots(self.recent_limit, cutoff)
-            await asyncio.wait_for(
-                ws.send_str(
-                    json.dumps(
-                        {"type": "PUSH_JOBS_SNAPSHOT", "jobs": snapshots},
-                        separators=(",", ":"),
-                    )
-                ),
-                self.admin_send_timeout,
-            )
-        except asyncio.CancelledError:
-            raise
+            await self.admin_send(ws, {"type": "PUSH_JOBS_SNAPSHOT", "jobs": snapshots})
         except Exception as snapshot_error:
             log.exception("Could not send initial Push job snapshot")
             try:
@@ -416,11 +405,18 @@ class PushRuntime:
                     ),
                     self.admin_send_timeout,
                 )
-            except asyncio.CancelledError:
-                raise
             except Exception:
                 log.exception("Could not close admin after initial Push snapshot failure")
                 raise snapshot_error
+
+    async def admin_send(
+        self, ws: RuntimeWebSocketResponse, payload: dict[str, Any]
+    ) -> None:
+        """Send one admin message, raising when it cannot be sent in time."""
+        await asyncio.wait_for(
+            ws.send_str(json.dumps(payload, separators=(",", ":"))),
+            self.admin_send_timeout,
+        )
 
     async def _close_failed_admin_socket(
         self, ws: RuntimeWebSocketResponse, message: bytes
@@ -440,9 +436,7 @@ class PushRuntime:
                 ),
                 self.admin_send_timeout,
             )
-        except asyncio.CancelledError:
-            raise
-        except (Exception, asyncio.TimeoutError):
+        except Exception:
             log.warning("Could not close failed admin WebSocket", exc_info=True)
 
     async def create_job_handler(self, request: aiohttp_web.Request) -> aiohttp_web.Response:
@@ -476,20 +470,23 @@ class PushRuntime:
                 session = dispatch_sessions.get(device_id)
                 if session is None:
                     raise PushJobError(f"target device is not online: {device_id}")
-                if CAP_PUSH_JOB_ID_V1 in session.capabilities:
-                    protocols[device_id] = (
-                        ProtocolMode.JOB_V1,
-                        set(session.capabilities),
-                    )
-                elif self.allow_legacy:
-                    protocols[device_id] = (
-                        ProtocolMode.LEGACY,
-                        set(session.capabilities),
-                    )
-                else:
+                # Every Push job is resumable; an older APK must self-update first.
+                missing = sorted(PUSH_JOB_CAPABILITIES - session.capabilities)
+                if missing and (entry or {}).get("push_state_status") == "unavailable":
+                    # The client withholds its Push capabilities while its durable
+                    # state cannot be read or saved; say so instead of blaming its APK.
                     raise PushJobError(
-                        f"target does not support push_job_id_v1: {device_id}"
+                        "target device cannot store Push state right now "
+                        f"(free device storage and reboot it if this persists): {device_id}"
                     )
+                if missing:
+                    raise PushJobError(
+                        f"target does not support {', '.join(missing)}: {device_id}"
+                    )
+                protocols[device_id] = (
+                    ProtocolMode.JOB_V1,
+                    set(session.capabilities),
+                )
             created, snapshot = await self.store.create_job(
                 canonical, protocols, int(self.create_timeout * 1000)
             )
@@ -669,38 +666,143 @@ class PushRuntime:
                 self.scheduler.wake()
 
     async def artifact_handler(self, request: aiohttp_web.Request) -> aiohttp_web.StreamResponse:
+        token = request.query.get("lease")
+        if request.method == "HEAD":
+            if not isinstance(token, str) or not self.leases.valid(
+                request.match_info["artifact_id"], token
+            ):
+                raise aiohttp_web.HTTPConflict(headers={
+                    "X-Push-Lease-Status": "revoked", "Cache-Control": "no-store",
+                })
+            return await self._serve_artifact(request, token)
+        task = asyncio.current_task()
+        claim = (
+            await self.leases.claim(
+                request.match_info["artifact_id"], token, task, request.transport
+            )
+            if isinstance(token, str) and task is not None
+            else "revoked"
+        )
+        if claim != "claimed":
+            raise aiohttp_web.HTTPConflict(
+                headers={
+                    "X-Push-Lease-Status": "revoked",
+                    "Cache-Control": "no-store",
+                }
+            )
+        try:
+            return await self._serve_artifact(request, token)
+        finally:
+            self.leases.unclaim(token, task)
+
+    async def _serve_artifact(
+        self, request: aiohttp_web.Request, token: str
+    ) -> aiohttp_web.StreamResponse:
         record = await self.store.artifact_record(request.match_info["artifact_id"])
-        if record is None:
+        if record is None or record.get("retention_state") == "deleted":
             raise aiohttp_web.HTTPNotFound()
         try:
             path = self.artifacts.path_for_record(record)
         except ValueError:
             raise aiohttp_web.HTTPNotFound()
-        if not path.is_file():
+        total = int(record["byte_size"])
+        # Truncated or replaced bytes would yield a body shorter than its declared
+        # Content-Length, leaving the client waiting until its idle timeout.
+        if not await asyncio.to_thread(_is_file_of_size, path, total):
+            log.error("Push artifact bytes are missing or have the wrong size: %s", path)
             raise aiohttp_web.HTTPNotFound()
-        response = aiohttp_web.StreamResponse(
-            status=200,
-            headers={
-                "ETag": f'"{record["sha256"]}"',
-                "Content-Encoding": "identity",
-                "Cache-Control": "private, immutable",
-                "Content-Type": "application/zip",
-                "Content-Length": str(record["byte_size"]),
-            },
-        )
+        etag = strong_etag(record["sha256"])
+        headers = {
+            "ETag": etag,
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+            "Content-Type": "application/zip",
+        }
+        if not self._if_match_satisfied(request.headers.get("If-Match"), etag):
+            headers["Content-Length"] = "0"
+            response = aiohttp_web.StreamResponse(status=412, headers=headers)
+            await response.prepare(request)
+            await response.write_eof()
+            return response
+
+        start, end = 0, total - 1
+        status = 200
+        range_header = request.headers.get("Range")
+        if range_header is not None:
+            try:
+                parsed = self._parse_range(range_header, total)
+            except ValueError:
+                # RFC 9110 requires invalid or unsupported Range syntax to be
+                # ignored, so serve the complete immutable representation.
+                pass
+            else:
+                if parsed is None:
+                    headers.update(
+                        {"Content-Range": f"bytes */{total}", "Content-Length": "0"}
+                    )
+                    response = aiohttp_web.StreamResponse(status=416, headers=headers)
+                    await response.prepare(request)
+                    await response.write_eof()
+                    return response
+                start, end = parsed
+                status = 206
+                headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        body_length = max(0, end - start + 1)
+        headers["Content-Length"] = str(body_length)
+        response = aiohttp_web.StreamResponse(status=status, headers=headers)
         await response.prepare(request)
         if request.method != "HEAD":
             handle = await asyncio.to_thread(path.open, "rb")
             try:
+                await asyncio.to_thread(handle.seek, start)
+                remaining = body_length
                 while True:
-                    chunk = await asyncio.to_thread(handle.read, 1024 * 1024)
+                    if remaining <= 0:
+                        break
+                    chunk = await asyncio.to_thread(
+                        handle.read, min(1024 * 1024, remaining)
+                    )
                     if not chunk:
                         break
                     await response.write(chunk)
+                    self.leases.progress(token, len(chunk))
+                    remaining -= len(chunk)
             finally:
                 await asyncio.to_thread(handle.close)
         await response.write_eof()
         return response
+
+    @staticmethod
+    def _if_match_satisfied(value: str | None, etag: str) -> bool:
+        if value is None:
+            return True
+        # This endpoint accepts one exact strong ETag, matching the job client.
+        return value.strip() == etag
+
+    @staticmethod
+    def _parse_range(value: str, total: int) -> tuple[int, int] | None:
+        if not isinstance(value, str):
+            raise ValueError("invalid Range syntax")
+        match = re.fullmatch(r"bytes=(\d+)-", value.strip())
+        if match is None:
+            raise ValueError("unsupported Range syntax")
+        start = int(match.group(1))
+        if total <= 0 or start >= total:
+            return None
+        return start, total - 1
+
+    @staticmethod
+    def _registered_capabilities(payload: dict[str, Any]) -> frozenset[str]:
+        capabilities = parse_capabilities(payload.get("capabilities"))
+        if (
+            CAP_PUSH_JOB_ID_V1 in capabilities
+            and _uuid_v4_or_none(payload.get("process_instance_id")) is None
+        ):
+            # Do not advertise safety guarantees the peer cannot fulfill.
+            capabilities = frozenset(
+                cap for cap in capabilities if cap != CAP_PUSH_JOB_ID_V1
+            )
+        return capabilities
 
     async def register_device(
         self,
@@ -712,17 +814,14 @@ class PushRuntime:
         device_id = established_device_id or payload.get("device_id")
         if not isinstance(device_id, str) or not device_id:
             return
-        capabilities = parse_capabilities(payload.get("capabilities"))
+        capabilities = self._registered_capabilities(payload)
         process_instance_id = _uuid_v4_or_none(payload.get("process_instance_id"))
-        if CAP_PUSH_JOB_ID_V1 in capabilities and process_instance_id is None:
-            # Do not advertise safety guarantees the peer cannot fulfill.
-            capabilities = frozenset(
-                cap for cap in capabilities if cap != CAP_PUSH_JOB_ID_V1
-            )
+        push_state_status = parse_push_state_status(payload.get("push_state"))
 
         lock = self._device_lock(device_id)
         snapshots: list[dict[str, Any]] = []
         needs_reconcile = False
+        resume_rejections: list[dict[str, Any]] = []
         registered = False
         session = LiveSession(
             device_id=device_id,
@@ -732,6 +831,7 @@ class PushRuntime:
             process_instance_id=process_instance_id,
             owner_lock=lock,
             http_base=http_base,
+            push_state_available=push_state_status != "unavailable",
         )
         async with lock:
             if (
@@ -743,91 +843,24 @@ class PushRuntime:
             previous = self.sessions.get(device_id)
             if previous is not None and previous.ws is not ws:
                 self.sessions.pop(device_id, None)
-                active = await self.manager.active_assignment_for_device(device_id)
-                if active is not None:
-                    job_id = active["job_id"]
-                    attempt = active["attempt"]
-                    state = DeviceState(active["state"])
-                    self.transfers.release_exact(
-                        TransferKey("push", device_id, job_id, attempt),
-                        "connection_replaced",
-                    )
-                    try:
-                        if state is DeviceState.WAITING_TRANSFER:
-                            snapshots.append(
-                                await self.manager.transition_device(
-                                    job_id,
-                                    device_id,
-                                    expected={state},
-                                    target=DeviceState.QUEUED,
-                                    fields={"queue_reason": "awaiting_dispatch"},
-                                )
-                            )
-                        elif state in {
-                            DeviceState.DISPATCHING,
-                            DeviceState.DOWNLOADING,
-                            DeviceState.VALIDATING,
-                            DeviceState.APPLYING,
-                        }:
-                            short = (
-                                state is DeviceState.DISPATCHING
-                                and active.get("accepted_at") is None
-                            )
-                            deadline = now_ms() + int(
-                                (
-                                    self.accept_reconciliation_timeout
-                                    if short
-                                    else self.reconciliation_timeout
-                                )
-                                * 1000
-                            )
-                            snapshots.append(
-                                await self.manager.mark_reconciling(
-                                    job_id,
-                                    device_id,
-                                    expected={state},
-                                    reason=(
-                                        "disconnect_before_accept"
-                                        if short
-                                        else "device_disconnect"
-                                    ),
-                                    deadline=deadline,
-                                )
-                            )
-                    except StoreConflict:
-                        pass
+                self.pending_disconnects.add(device_id)
+            # An old offline event must commit before a new session can own work.
+            # The same lock protects the background retry, so it cannot later
+            # withdraw authority granted by this new registration.
+            if device_id in self.pending_disconnects:
+                try:
+                    snapshots.extend(await self._settle_pending_disconnect(device_id))
+                except Exception:
+                    self._start_disconnect_recovery(device_id)
+                    raise
 
-            runtime = payload.get("push_runtime")
-            active_report = (
-                runtime.get("active") if isinstance(runtime, dict) else None
-            )
-            if isinstance(active_report, dict):
-                snapshots.extend(
-                    await self._registration_active_snapshots(
-                        device_id, session, active_report
-                    )
-                )
-            else:
-                # A missing process UUID on an offline-timeout fence is safe to
-                # replace only when the new job-v1 process explicitly reports no
-                # active execution. An active or malformed report must keep the
-                # fence until exact reconciliation evidence settles it.
-                if (
-                    isinstance(runtime, dict)
-                    and "active" in runtime
-                    and active_report is None
-                ):
-                    snapshots.extend(
-                        await self.manager.clear_fence_on_process_replacement(
-                            device_id,
-                            process_instance_id,
-                            CAP_PUSH_JOB_ID_V1 in capabilities,
-                        )
-                    )
-                active = await self.manager.active_assignment_for_device(device_id)
-                needs_reconcile = bool(
-                    active
-                    and active["state"] == DeviceState.RECONCILING.value
+            # An unavailable durable store cannot authoritatively report absence:
+            # the in-memory coordinator starts empty until it recovers the state on
+            # its own. Keep canonical reconciliation and fences untouched until the
+            # client registers (or refreshes) with available state.
+            if session.push_state_available:
+                needs_reconcile = await self._adopt_registration_runtime(
+                    session, payload, snapshots, resume_rejections
                 )
 
             if (
@@ -836,20 +869,16 @@ class PushRuntime:
             ):
                 return
             self.sessions[device_id] = session
-            try:
-                await asyncio.wait_for(
-                    ws.send_str(
-                        json.dumps(
-                            {"type": "REGISTERED", "session_id": session.session_id},
-                            separators=(",", ":"),
-                        )
-                    ),
-                    self.send_timeout,
-                )
-            except BaseException:
-                if self.sessions.get(device_id) is session:
-                    self.sessions.pop(device_id, None)
-                raise
+            # Keep ownership until transport close settles the adopted durable state.
+            await asyncio.wait_for(
+                ws.send_str(
+                    json.dumps(
+                        {"type": "REGISTERED", "session_id": session.session_id},
+                        separators=(",", ":"),
+                    )
+                ),
+                self.send_timeout,
+            )
             if not self._legacy_owns_device(device_id, ws):
                 return
             self.legacy.devices[device_id]["registration_ready"] = True
@@ -861,16 +890,172 @@ class PushRuntime:
             await self.publish(snapshot)
         if not registered:
             return
+        await self._after_registration(session, payload, needs_reconcile, resume_rejections)
+
+    async def _adopt_registration_runtime(
+        self,
+        session: LiveSession,
+        payload: dict[str, Any],
+        snapshots: list[dict[str, Any]],
+        resume_rejections: list[dict[str, Any]],
+    ) -> bool:
+        """Apply an available client's runtime report; return whether to reconcile.
+
+        The caller holds the device lock and has checked that durable Push state
+        is available.
+        """
+        device_id = session.device_id
+        runtime = payload.get("push_runtime")
+        active_report = runtime.get("active") if isinstance(runtime, dict) else None
+        if isinstance(active_report, dict):
+            snapshots.extend(
+                await self._registration_active_snapshots(
+                    device_id, session, active_report, resume_rejections=resume_rejections
+                )
+            )
+            return False
+        # A missing process UUID on an offline-timeout fence is safe to
+        # replace only when the new job-v1 process explicitly reports no
+        # active execution. An active or malformed report must keep the
+        # fence until exact reconciliation evidence settles it.
+        if isinstance(runtime, dict) and "active" in runtime and active_report is None:
+            snapshots.extend(
+                await self.manager.clear_fence_on_process_replacement(
+                    device_id,
+                    session.process_instance_id,
+                    CAP_PUSH_JOB_ID_V1 in session.capabilities,
+                )
+            )
+            snapshots.extend(await self.manager.reconcile_missing_runtime(
+                device_id,
+                accept_timeout_ms=int(self.accept_reconciliation_timeout * 1000),
+                reconciliation_timeout_ms=int(self.reconciliation_timeout * 1000),
+            ))
+        active = await self.store.active_assignment_for_device(device_id)
+        return bool(active and active["state"] == DeviceState.RECONCILING.value)
+
+    async def _after_registration(
+        self,
+        session: LiveSession,
+        payload: dict[str, Any],
+        needs_reconcile: bool,
+        resume_rejections: list[dict[str, Any]],
+    ) -> None:
+        device_id = session.device_id
+        # Registration must be acknowledged before the client can accept control messages.
+        for rejection in resume_rejections:
+            await self._send_resume_rejected(session, **rejection)
+        reset = parse_push_state_reset(payload.get("push_state"))
+        if reset is not None:
+            # The client deleted an unreadable state file and started empty. Its
+            # unfinished work settles through normal reconciliation as absent.
+            log.warning(
+                "Device %s reset unreadable durable Push state (%s): %s",
+                device_id, reset["reason"], reset["detail"],
+            )
+            # Admin browser backpressure must not delay device registration.
+            message = json.dumps(
+                {"type": "PUSH_STATE_RESET", "device_id": device_id, **reset},
+                separators=(",", ":"),
+            )
+            self._spawn_background(
+                self.legacy._broadcast_admin_message(message),
+                name=f"push-state-reset-{device_id}",
+            )
+        if session.push_state_available:
+            await self._send_pending_cancellations(session)
         if needs_reconcile and command_allowed(self.legacy.devices.get(device_id)):
             await self.request_reconcile(device_id)
         if self.scheduler is not None:
             self.scheduler.wake()
 
-    async def acknowledge_registration(
+    async def refresh_registration(
         self,
         ws: RuntimeWebSocketResponse,
         device_id: str,
+        payload: dict[str, Any],
     ) -> None:
+        """Refresh Push availability from a REGISTER repeated on the owning socket.
+
+        The client repeats REGISTER when its durable Push state becomes available
+        or unavailable. Closing the socket instead would settle the device's queued
+        work as offline, so the live session is updated in place and keeps its
+        session_id.
+        """
+        lock = self._device_lock(device_id)
+        snapshots: list[dict[str, Any]] = []
+        needs_reconcile = False
+        resume_rejections: list[dict[str, Any]] = []
+        async with lock:
+            session = self._registered_session(ws, device_id)
+            if session is None:
+                return
+            entry = self.legacy.devices[device_id]
+            if _uuid_v4_or_none(payload.get("process_instance_id")) != (
+                session.process_instance_id
+            ):
+                # A different process cannot share this socket; keep the session.
+                log.warning("Ignoring Push refresh with a different process: %s", device_id)
+            else:
+                push_state_status = parse_push_state_status(payload.get("push_state"))
+                became_available = (
+                    push_state_status != "unavailable" and not session.push_state_available
+                )
+                session.capabilities = self._registered_capabilities(payload)
+                session.push_state_available = push_state_status != "unavailable"
+                entry["push_state_status"] = push_state_status
+                if became_available:
+                    needs_reconcile = await self._adopt_registration_runtime(
+                        session, payload, snapshots, resume_rejections
+                    )
+            await asyncio.wait_for(
+                ws.send_str(json.dumps({
+                    "type": "REGISTERED",
+                    "session_id": session.session_id,
+                }, separators=(",", ":"))),
+                self.send_timeout,
+            )
+        for snapshot in snapshots:
+            await self.publish(snapshot)
+        self._spawn_background(
+            self.legacy.broadcast_device_list(), name=f"push-state-refresh-{device_id}"
+        )
+        await self._after_registration(session, payload, needs_reconcile, resume_rejections)
+
+    def _spawn_background(self, coro: Any, *, name: str) -> None:
+        """Run admin fan-out without holding up the device message path."""
+        task = asyncio.create_task(coro, name=name)
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+
+    async def _send_pending_cancellations(self, session: LiveSession) -> None:
+        """Ask the live owner to confirm every durable cancellation it still holds.
+
+        Callers skip this while the client's durable Push state is unavailable,
+        because its absence reports would not be authoritative.
+        """
+        if self.scheduler is None:
+            return
+        device_id = session.device_id
+        for pending in await self.manager.pending_cancellations_for_device(device_id):
+            try:
+                await self.scheduler.send_exact_reconcile(
+                    session,
+                    pending["job_id"],
+                    pending["attempt"],
+                    pending["artifact_id"],
+                )
+            except (ConnectionError, asyncio.TimeoutError):
+                log.info(
+                    "Could not send pending Push cancellation reconciliation to %s",
+                    device_id,
+                    exc_info=True,
+                )
+
+    def _registered_session(
+        self, ws: RuntimeWebSocketResponse, device_id: str
+    ) -> LiveSession | None:
+        """Return the live session only while [ws] is its ready registered owner."""
         session = self.sessions.get(device_id)
         entry = self.legacy.devices.get(device_id)
         if (
@@ -880,42 +1065,24 @@ class PushRuntime:
             or entry.get("ws") is not ws
             or entry.get("registration_ready") is not True
         ):
-            return
-        await asyncio.wait_for(
-            ws.send_str(json.dumps({
-                "type": "REGISTERED",
-                "session_id": session.session_id,
-            }, separators=(",", ":"))),
-            self.send_timeout,
-        )
+            return None
+        return session
 
-    async def _registration_active_snapshots(
-        self,
-        device_id: str,
-        session: LiveSession,
-        active_report: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        job_id = active_report.get("job_id")
-        attempt = active_report.get("attempt")
-        phase = active_report.get("phase")
-        if not isinstance(job_id, str) or attempt != 1 or not isinstance(phase, str):
-            return await self.manager.add_opaque_fence(
-                device_id,
-                self.manager.opaque_identity_for_active(active_report),
-                ProtocolMode.JOB_V1,
-                session.process_instance_id,
-                "REGISTER reported malformed active Push/Sync state",
-            )
-
+    async def _reported_assignment(
+        self, session: LiveSession, device_id: str, active_report: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """Validate reported identity before either registration or recovery adopts it."""
+        job_id = active_report["job_id"]
         assignment = await self.manager.assignment(job_id, device_id)
         if assignment is None:
-            return await self.manager.add_opaque_fence(
+            snapshots = await self.manager.add_opaque_fence(
                 device_id,
                 self.manager.opaque_identity_for_active(active_report),
                 ProtocolMode.JOB_V1,
                 session.process_instance_id,
-                "REGISTER reported an active Push/Sync job unknown to this server",
+                "Device reported an active Push/Sync job unknown to this server",
             )
+            return None, snapshots
 
         reported_artifact = active_report.get("artifact_id")
         if (
@@ -927,7 +1094,7 @@ class PushRuntime:
                 self.manager.opaque_identity_for_active(active_report),
                 ProtocolMode.JOB_V1,
                 session.process_instance_id,
-                "REGISTER active state conflicted with the canonical artifact",
+                "Reported active state conflicted with the canonical artifact",
             )
             current = DeviceState(assignment["state"])
             if current not in {
@@ -938,7 +1105,7 @@ class PushRuntime:
             }:
                 try:
                     snapshots.append(
-                        await self.manager.transition_device(
+                        await self.store.transition_device(
                             job_id,
                             device_id,
                             expected={current},
@@ -946,7 +1113,7 @@ class PushRuntime:
                             fields={
                                 "failure_code": "artifact_identity_mismatch",
                                 "failure_detail": (
-                                    "REGISTER active artifact did not match the "
+                                    "Reported active artifact did not match the "
                                     "canonical assignment"
                                 ),
                                 "accept_deadline": None,
@@ -957,9 +1124,50 @@ class PushRuntime:
                     )
                 except StoreConflict:
                     pass
-            return snapshots
+            return None, snapshots
 
+        return assignment, []
+
+    async def _registration_active_snapshots(
+        self,
+        device_id: str,
+        session: LiveSession,
+        active_report: dict[str, Any],
+        *,
+        resume_rejections: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        job_id = active_report.get("job_id")
+        attempt = active_report.get("attempt")
+        phase = active_report.get("phase")
+        if (
+            not isinstance(job_id, str)
+            or not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or attempt != 1
+            or not isinstance(phase, str)
+        ):
+            return await self.manager.add_opaque_fence(
+                device_id,
+                self.manager.opaque_identity_for_active(active_report),
+                ProtocolMode.JOB_V1,
+                session.process_instance_id,
+                "REGISTER reported malformed active Push/Sync state",
+            )
+
+        if active_report.get("status") == "interrupted":
+            return await self._resume_interrupted_report(
+                session, device_id, active_report, resume_rejections=resume_rejections,
+            )
+        assignment, snapshots = await self._reported_assignment(session, device_id, active_report)
+        if assignment is None:
+            return snapshots
         if assignment["state"] != DeviceState.RECONCILING.value:
+            return []
+        if phase == "downloading" and self.leases.token(
+            TransferKey("push", device_id, job_id, 1)
+        ) is None:
+            # A server restart revokes every in-memory HTTP lease. The old URL
+            # will be rejected; wait for interrupted evidence and manual Resume.
             return []
         try:
             outcome, snapshots = await self.manager.reconcile_report(
@@ -970,7 +1178,21 @@ class PushRuntime:
                 phase,
                 None,
             )
-            return snapshots if outcome == "active" else []
+            if outcome != "active":
+                return []
+            if phase == "downloading":
+                if self.scheduler is not None:
+                    await self.scheduler.reconcile_active_transfer(
+                        job_id, device_id, 1
+                    )
+            else:
+                # The download finished while offline, so the transfer slot and its
+                # HTTP lease are no longer needed. Holding them would let the idle
+                # watchdog move validation or apply back to reconciliation.
+                self.transfers.release_exact(
+                    TransferKey("push", device_id, job_id, 1), "transfer_complete"
+                )
+            return snapshots
         except StoreConflict:
             return []
 
@@ -980,7 +1202,7 @@ class PushRuntime:
         if not device_id:
             return
         lock = self._device_lock(device_id)
-        snapshot: dict[str, Any] | None = None
+        snapshots: list[dict[str, Any]] = []
         async with lock:
             if self.registration_candidates.get(device_id) is ws:
                 self.registration_candidates.pop(device_id, None)
@@ -990,55 +1212,54 @@ class PushRuntime:
             self.sessions.pop(device_id, None)
             if self._legacy_owns_device(device_id, ws):
                 self.legacy.devices[device_id]["registration_ready"] = False
-            active = await self.manager.active_assignment_for_device(device_id)
-            if active is None:
-                return
-            job_id = active["job_id"]
-            attempt = active["attempt"]
-            state = DeviceState(active["state"])
-            self.transfers.release_exact(
-                TransferKey("push", device_id, job_id, attempt), "device_disconnect"
-            )
+            self.pending_disconnects.add(device_id)
             try:
-                if state is DeviceState.WAITING_TRANSFER:
-                    snapshot = await self.manager.transition_device(
-                        job_id,
-                        device_id,
-                        expected={state},
-                        target=DeviceState.QUEUED,
-                        fields={"queue_reason": "awaiting_dispatch"},
-                    )
-                elif state in {
-                    DeviceState.DISPATCHING,
-                    DeviceState.DOWNLOADING,
-                    DeviceState.VALIDATING,
-                    DeviceState.APPLYING,
-                }:
-                    short = (
-                        state is DeviceState.DISPATCHING
-                        and active.get("accepted_at") is None
-                    )
-                    deadline = now_ms() + int(
-                        (
-                            self.accept_reconciliation_timeout
-                            if short
-                            else self.reconciliation_timeout
-                        )
-                        * 1000
-                    )
-                    snapshot = await self.manager.mark_reconciling(
-                        job_id,
-                        device_id,
-                        expected={state},
-                        reason=(
-                            "disconnect_before_accept" if short else "device_disconnect"
-                        ),
-                        deadline=deadline,
-                    )
-            except StoreConflict:
-                pass
-        if snapshot is not None:
+                snapshots = await self._settle_pending_disconnect(device_id)
+            except Exception:
+                log.exception("Could not persist Push disconnect for %s; retaining recovery", device_id)
+                self._start_disconnect_recovery(device_id)
+        for snapshot in snapshots:
             await self.publish(snapshot)
+
+    async def _settle_pending_disconnect(self, device_id: str) -> list[dict[str, Any]]:
+        """Called under the device lock, before any replacement session is exposed."""
+        snapshots = await self.manager.settle_disconnect(
+            device_id,
+            accept_timeout_ms=int(self.accept_reconciliation_timeout * 1000),
+            reconciliation_timeout_ms=int(self.reconciliation_timeout * 1000),
+        )
+        self.pending_disconnects.discard(device_id)
+        return snapshots
+
+    def _start_disconnect_recovery(self, device_id: str) -> None:
+        current = self.disconnect_recovery_tasks.get(device_id)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self._recover_disconnect(device_id), name=f"push-disconnect-recovery-{device_id}",
+        )
+        self.disconnect_recovery_tasks[device_id] = task
+
+    async def _recover_disconnect(self, device_id: str) -> None:
+        try:
+            while True:
+                try:
+                    async with self._device_lock(device_id):
+                        if device_id not in self.pending_disconnects:
+                            return
+                        snapshots = await self._settle_pending_disconnect(device_id)
+                    for snapshot in snapshots:
+                        await self.publish(snapshot)
+                    if self.scheduler is not None:
+                        self.scheduler.wake()
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Retrying Push disconnect settlement for %s", device_id)
+                    await asyncio.sleep(_BACKGROUND_LOOP_RETRY_DELAY)
+        finally:
+            self.disconnect_recovery_tasks.pop(device_id, None)
 
     async def handle_device_message(
         self,
@@ -1058,12 +1279,7 @@ class PushRuntime:
             "PUSH_RECONCILE_REPORT",
         } or (message_type in {"DOWNLOAD_COMPLETE", "PUSH_FILES_RESULT"} and isinstance(job_id, str))
 
-        legacy_push_message = (
-            message_type == "DOWNLOAD_COMPLETE" and payload.get("task") == "push"
-        ) or (
-            message_type == "PUSH_FILES_RESULT" and not isinstance(job_id, str)
-        )
-        if job_v1 or legacy_push_message:
+        if job_v1:
             lock = self._device_lock(device_id)
             async with lock:
                 candidate = self.registration_candidates.get(device_id)
@@ -1071,56 +1287,11 @@ class PushRuntime:
                 if (
                     candidate is not None and candidate is not ws
                 ) or session is None or session.ws is not ws:
-                    # Consume a stale job-v1 frame. For a legacy frame return False so
-                    # the established server sees it too, but its own _owns_device guard
-                    # will reject the superseded connection.
-                    return True if job_v1 else False
-                if job_v1:
-                    return await self._handle_owned_job_v1_message(
-                        session, device_id, payload
-                    )
-                return await self._handle_owned_legacy_message(
+                    # Consume stale job-v1 frames so they cannot reach legacy handlers.
+                    return True
+                return await self._handle_owned_job_v1_message(
                     session, device_id, payload
                 )
-        return False
-
-    async def _handle_owned_legacy_message(
-        self,
-        session: LiveSession,
-        device_id: str,
-        payload: dict[str, Any],
-    ) -> bool:
-        """Settle migration-only legacy Push only for the current socket owner."""
-
-        message_type = payload.get("type")
-        if message_type == "DOWNLOAD_COMPLETE" and payload.get("task") == "push":
-            active = await self.manager.active_assignment_for_device(device_id)
-            if active and active["protocol_mode"] == ProtocolMode.LEGACY.value:
-                key = TransferKey("push", device_id, active["job_id"], 1)
-                self.transfers.release_exact(key, "legacy_download_complete")
-                try:
-                    snapshot = await self.manager.transition_device(
-                        active["job_id"],
-                        device_id,
-                        expected={DeviceState.DOWNLOADING},
-                        target=DeviceState.VALIDATING,
-                        fields={"transfer_completed_at": now_ms()},
-                    )
-                    await self.publish(snapshot)
-                except StoreConflict:
-                    pass
-                return True
-            return False
-        if message_type == "PUSH_FILES_RESULT":
-            active = await self.manager.active_assignment_for_device(device_id)
-            if active and active["protocol_mode"] == ProtocolMode.LEGACY.value:
-                enriched = dict(payload)
-                enriched["job_id"] = active["job_id"]
-                enriched["attempt"] = 1
-                await self._handle_result(
-                    device_id, enriched, owned_session=session
-                )
-                return True
         return False
 
     async def _handle_owned_job_v1_message(
@@ -1149,15 +1320,19 @@ class PushRuntime:
             if not delivered:
                 assignment = await self.manager.assignment(job_id, device_id)
                 if assignment and assignment["state"] == DeviceState.RECONCILING.value:
+                    phase = payload.get("phase")
+                    phase = phase if isinstance(phase, str) else "downloading"
+                    if phase == "downloading" and self.leases.token(
+                        TransferKey("push", device_id, job_id, 1)
+                    ) is None:
+                        return True
                     try:
                         outcome, snapshots = await self.manager.reconcile_report(
                             job_id,
                             device_id,
                             1,
                             "active",
-                            payload.get("phase")
-                            if isinstance(payload.get("phase"), str)
-                            else "downloading",
+                            phase,
                             None,
                         )
                         if outcome == "active":
@@ -1207,108 +1382,42 @@ class PushRuntime:
             await self._handle_result(device_id, payload, session)
             return True
         if message_type == "PUSH_RECONCILE_REPORT" and isinstance(job_id, str):
-            await self._handle_reconcile_report(device_id, payload)
+            await self._handle_reconcile_report(session, device_id, payload)
             return True
         return False
 
-    async def _handle_transfer_complete(
-        self, device_id: str, payload: dict[str, Any]
-    ) -> None:
-        job_id = payload.get("job_id")
-        if payload.get("attempt") != 1 or not isinstance(job_id, str):
-            return
-        try:
-            snapshot = await self.store.get_snapshot(job_id)
-        except StoreNotFound:
-            return
-        device = snapshot["devices"].get(device_id)
-        artifact = snapshot.get("artifact")
-        received = payload.get("received_size")
-        if (
-            device is None
-            or artifact is None
-            or payload.get("artifact_id") != artifact["artifact_id"]
-            or isinstance(received, bool)
-            or not isinstance(received, int)
-            or received != artifact["byte_size"]
-            or device["attempt"] != 1
-        ):
-            return
-        try:
-            next_snapshot = await self.manager.transition_device(
-                job_id,
-                device_id,
-                expected={DeviceState.DOWNLOADING},
-                target=DeviceState.VALIDATING,
-                fields={
-                    "transfer_completed_at": now_ms(),
-                    "accept_deadline": None,
-                    "reconciliation_reason": None,
-                    "reconciliation_deadline": None,
-                },
-            )
-        except StoreConflict:
-            return
-        self.transfers.release_exact(
-            TransferKey("push", device_id, job_id, 1), "transfer_complete"
-        )
-        await self.publish(next_snapshot)
+    async def _handle_transfer_complete(self, device_id: str, payload: dict[str, Any]) -> None:
+        await self._record_progress_payload(device_id, payload, ProgressEvent.TRANSFER_COMPLETE)
 
-    async def _handle_validation_complete(
-        self, device_id: str, payload: dict[str, Any]
-    ) -> None:
-        job_id = payload.get("job_id")
-        if payload.get("attempt") != 1 or not isinstance(job_id, str):
-            return
-        try:
-            snapshot = await self.store.get_snapshot(job_id)
-        except StoreNotFound:
-            return
-        artifact = snapshot.get("artifact")
-        device = snapshot["devices"].get(device_id)
-        assignment = await self.manager.assignment(job_id, device_id)
-        if (
-            artifact is None
-            or device is None
-            or assignment is None
-            or payload.get("artifact_id") != artifact["artifact_id"]
-            or device["state"] != DeviceState.VALIDATING.value
-            or assignment.get("validation_completed_at") is not None
-        ):
-            return
-        try:
-            next_snapshot = await self.manager.transition_device(
-                job_id,
-                device_id,
-                expected={DeviceState.VALIDATING},
-                target=DeviceState.VALIDATING,
-                fields={"validation_completed_at": now_ms()},
-            )
-            await self.publish(next_snapshot)
-        except StoreConflict:
-            pass
+    async def _handle_validation_complete(self, device_id: str, payload: dict[str, Any]) -> None:
+        await self._record_progress_payload(device_id, payload, ProgressEvent.VALIDATION_COMPLETE)
 
     async def _handle_phase(self, device_id: str, payload: dict[str, Any]) -> None:
-        if payload.get("phase") != "applying" or payload.get("attempt") != 1:
-            return
+        event = {
+            "validating": ProgressEvent.VALIDATION_STARTED,
+            "applying": ProgressEvent.APPLYING,
+        }.get(payload.get("phase"))
+        if event is not None:
+            await self._record_progress_payload(device_id, payload, event)
+
+    async def _record_progress_payload(
+        self, device_id: str, payload: dict[str, Any], event: ProgressEvent,
+    ) -> None:
         job_id = payload.get("job_id")
-        if not isinstance(job_id, str):
+        if payload.get("attempt") != 1 or not isinstance(job_id, str):
             return
         try:
-            snapshot = await self.manager.transition_device(
-                job_id,
-                device_id,
-                expected={DeviceState.VALIDATING, DeviceState.RECONCILING},
-                target=DeviceState.APPLYING,
-                fields={
-                    "apply_started_at": now_ms(),
-                    "reconciliation_reason": None,
-                    "reconciliation_deadline": None,
-                },
+            result = await self.manager.record_progress(
+                job_id, device_id, event,
+                artifact_id=payload.get("artifact_id"), received_size=payload.get("received_size"),
             )
-            await self.publish(snapshot)
         except (StoreConflict, StoreNotFound):
-            pass
+            return
+        if result.release_transfer:
+            self.transfers.release_exact(
+                TransferKey("push", device_id, job_id, 1), event.value,
+            )
+        await self.publish(result.snapshot)
 
     async def _handle_result(
         self,
@@ -1356,81 +1465,6 @@ class PushRuntime:
                 owned_session=owned_session,
             )
             return
-        opaque_matched, opaque_snapshots = (
-            await self.manager.clear_matching_opaque_fence(
-                device_id, job_id, 1
-            )
-        )
-        if opaque_matched:
-            for snapshot in opaque_snapshots:
-                await self.publish(snapshot)
-            local = next(
-                (
-                    snapshot
-                    for snapshot in opaque_snapshots
-                    if snapshot["job_id"] == job_id
-                ),
-                None,
-            )
-            await self._send_result_ack(
-                device_id,
-                job_id,
-                True,
-                local["revision"] if local else None,
-                None,
-                owned_session=owned_session,
-            )
-            if self.scheduler is not None:
-                self.scheduler.wake()
-            return
-
-        assignment = await self.manager.assignment(job_id, device_id)
-        if assignment is None:
-            await self._send_result_ack(
-                device_id,
-                job_id,
-                False,
-                None,
-                "unknown_job",
-                owned_session=owned_session,
-            )
-            return
-        if assignment["attempt"] != 1:
-            await self._send_result_ack(
-                device_id,
-                job_id,
-                False,
-                None,
-                "stale_result",
-                owned_session=owned_session,
-            )
-            return
-        if assignment["state"] == DeviceState.UNCONFIRMED.value:
-            accepted, snapshots = await self.manager.settle_late_fenced_result(
-                job_id, device_id, 1
-            )
-            if accepted:
-                self.transfers.release_exact(
-                    TransferKey("push", device_id, job_id, 1), "terminal_result"
-                )
-            for snapshot in snapshots:
-                await self.publish(snapshot)
-            revision = next(
-                (snapshot["revision"] for snapshot in snapshots if snapshot["job_id"] == job_id),
-                None,
-            )
-            await self._send_result_ack(
-                device_id,
-                job_id,
-                accepted,
-                revision,
-                None if accepted else "stale_result",
-                owned_session=owned_session,
-            )
-            if accepted and self.scheduler is not None:
-                self.scheduler.wake()
-            return
-
         failure_code = payload.get("failure_code")
         if not isinstance(failure_code, str) or not failure_code:
             failure_code = "apply_failed" if status == "fail" else None
@@ -1438,63 +1472,27 @@ class PushRuntime:
             failure_code = failure_code[:128]
         detail = payload.get("detail")
         if not isinstance(detail, str):
-            detail = payload.get("error") if isinstance(payload.get("error"), str) else ""
+            detail = ""
         detail = detail[:2000]
-        was_terminal = assignment["state"] in {
-            DeviceState.SUCCEEDED.value,
-            DeviceState.FAILED.value,
-            DeviceState.INTERRUPTED.value,
-        }
-        accepted, reason, snapshot = await self.store.settle_result(
-            job_id,
-            device_id,
-            1,
-            status,
+        result = await self.manager.settle_result(
+            job_id, device_id, 1, status,
             added=self._nonnegative_int(payload.get("added")),
             updated=self._nonnegative_int(payload.get("updated")),
             deleted=self._nonnegative_int(payload.get("deleted")),
             failure_code=failure_code,
             failure_detail=detail,
         )
-        late_snapshots: list[dict[str, Any]] = []
-        current_after_settle = snapshot["devices"].get(device_id) if snapshot else None
-        if (
-            not accepted
-            and reason in {"unexpected_result_state", "conflicting_terminal_result"}
-            and current_after_settle is not None
-            and current_after_settle["state"] == DeviceState.UNCONFIRMED.value
-        ):
-            # Reconciliation housekeeping may commit RECONCILING -> UNCONFIRMED
-            # between the assignment read above and settle_result's transaction.
-            # Re-check the exact fence through the canonical Manager policy so a
-            # matching late result clears it instead of receiving a permanent ACK.
-            accepted, late_snapshots = await self.manager.settle_late_fenced_result(
-                job_id, device_id, 1
-            )
-            if accepted:
-                reason = None
-                snapshot = next(
-                    (item for item in late_snapshots if item["job_id"] == job_id),
-                    snapshot,
-                )
-        if accepted:
+        if result.release_transfer:
             self.transfers.release_exact(
                 TransferKey("push", device_id, job_id, 1), "terminal_result"
             )
-        if accepted and late_snapshots:
-            for late_snapshot in late_snapshots:
-                await self.publish(late_snapshot)
-        elif accepted and snapshot is not None and not was_terminal:
+        for snapshot in result.snapshots:
             await self.publish(snapshot)
         await self._send_result_ack(
-            device_id,
-            job_id,
-            accepted,
-            snapshot["revision"] if snapshot else None,
-            reason,
+            device_id, job_id, result.accepted, result.revision, result.reason,
             owned_session=owned_session,
         )
-        if accepted and self.scheduler is not None:
+        if result.accepted and self.scheduler is not None:
             self.scheduler.wake()
 
     async def _send_result_ack(
@@ -1530,33 +1528,159 @@ class PushRuntime:
         except (ConnectionError, asyncio.TimeoutError):
             pass
 
+    async def _send_resume_rejected(
+        self,
+        session: LiveSession,
+        *,
+        job_id: str,
+        artifact_id: Any,
+        revision: Any,
+        deferred: list[dict[str, Any]] | None = None,
+    ) -> None:
+        # Only an exact identity can authorize the client to discard durable work.
+        # Malformed reports remain fenced and are resolved by reconciliation timeout.
+        if (
+            not isinstance(artifact_id, str)
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+        ):
+            return
+        if deferred is not None:
+            deferred.append({"job_id": job_id, "artifact_id": artifact_id, "revision": revision})
+            return
+        payload = {
+            "type": "PUSH_RESUME_REJECTED",
+            "job_id": job_id,
+            "attempt": 1,
+            "artifact_id": artifact_id,
+            "revision": revision,
+            "reason": "resume_not_authorized",
+            "retryable": False,
+            "detail": "Server could not authorize the interrupted assignment",
+        }
+        try:
+            await asyncio.wait_for(
+                session.ws.send_str(json.dumps(payload, separators=(",", ":"))),
+                self.send_timeout,
+            )
+        except (ConnectionError, asyncio.TimeoutError):
+            pass
+
+    async def _resume_interrupted_report(
+        self,
+        session: LiveSession,
+        device_id: str,
+        payload: dict[str, Any],
+        *,
+        resume_rejections: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Resolve exact interruption evidence identically on REGISTER and reconciliation."""
+        job_id = payload["job_id"]
+        artifact_id = payload.get("artifact_id")
+        revision = payload.get("revision")
+        offset = payload.get("validated_offset")
+        assignment, snapshots = await self._reported_assignment(session, device_id, payload)
+        if assignment is None:
+            await self._send_resume_rejected(
+                session, job_id=job_id, artifact_id=artifact_id, revision=revision,
+                deferred=resume_rejections,
+            )
+            return snapshots
+        if assignment.get("cancel_requested_at") is not None:
+            if artifact_id == assignment.get("artifact_id") and revision == assignment.get("dispatch_revision"):
+                await self._send_resume_rejected(session, job_id=job_id,
+                    artifact_id=artifact_id, revision=revision, deferred=resume_rejections)
+            return []
+        if isinstance(artifact_id, str):
+            key = TransferKey("push", device_id, job_id, 1)
+            previous_transfer = self.transfers.get(key)
+            try:
+                outcome, snapshots = await self.manager.resume_interrupted(
+                    job_id,
+                    device_id,
+                    attempt=1,
+                    artifact_id=artifact_id,
+                    dispatch_revision=(
+                        revision if isinstance(revision, int) and not isinstance(revision, bool)
+                        else None
+                    ),
+                    validated_offset=(
+                        offset if isinstance(offset, int) and not isinstance(offset, bool) else -1
+                    ),
+                    reason=payload.get("reason"),
+                    phase=payload.get("phase"),
+                )
+            except (StoreConflict, StoreNotFound):
+                return []
+            if outcome == "retained":
+                return []
+            if outcome == "requeued":
+                if previous_transfer is not None and self.transfers.get(key) is previous_transfer:
+                    self.transfers.release_exact(key, "resumable_replay")
+                return snapshots
+        await self._send_resume_rejected(
+            session,
+            job_id=job_id,
+            artifact_id=artifact_id,
+            revision=revision,
+            deferred=resume_rejections,
+        )
+        return []
+
     async def _handle_reconcile_report(
-        self, device_id: str, payload: dict[str, Any]
+        self, session: LiveSession, device_id: str, payload: dict[str, Any]
     ) -> None:
         job_id = payload.get("job_id")
         attempt = payload.get("attempt")
         status = payload.get("status")
-        if not isinstance(job_id, str) or attempt != 1 or status not in {
-            "active",
-            "absent",
-            "interrupted",
-        }:
+        if (
+            not isinstance(job_id, str)
+            or not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or attempt != 1
+            or not isinstance(status, str)
+            or status not in {"active", "absent", "interrupted"}
+        ):
+            return
+        if status == "absent":
+            matched, opaque_snapshots = await self.manager.clear_matching_opaque_fence(
+                device_id, job_id, 1
+            )
+            for opaque_snapshot in opaque_snapshots:
+                await self.publish(opaque_snapshot)
+            if matched and self.scheduler is not None:
+                self.scheduler.wake()
+        if status == "interrupted":
+            snapshots = await self._resume_interrupted_report(
+                session, device_id, payload
+            )
+            for snapshot in snapshots:
+                await self.publish(snapshot)
+                if snapshot["dispatch_enabled"] and self.scheduler is not None:
+                    self.scheduler.wake()
             return
         assignment = await self.manager.assignment(job_id, device_id)
         if assignment is None:
-            if status in {"absent", "interrupted"}:
-                matched, snapshots = await self.manager.clear_matching_opaque_fence(
-                    device_id, job_id, 1
-                )
+            return
+        if assignment.get("cancel_requested_at") is not None:
+            # Only dispatched job-v1 assignments are cancellable, and those clients
+            # echo the requested artifact_id in every absent report.
+            # A missing, null, or mismatched artifact cannot clear the fence.
+            reported_artifact = payload.get("artifact_id")
+            if (
+                status == "absent"
+                and isinstance(reported_artifact, str)
+                and reported_artifact == assignment.get("artifact_id")
+            ):
+                snapshots = await self.manager.confirm_cancel(job_id, device_id)
                 for snapshot in snapshots:
                     await self.publish(snapshot)
-                if matched and self.scheduler is not None:
-                    self.scheduler.wake()
+                if snapshots:
+                    self.transfers.release_exact(TransferKey("push", device_id, job_id, 1), "cancelled")
+                    if self.scheduler is not None:
+                        self.scheduler.wake()
             return
-        if assignment["state"] == DeviceState.UNCONFIRMED.value and status in {
-            "absent",
-            "interrupted",
-        }:
+        if assignment["state"] == DeviceState.UNCONFIRMED.value and status == "absent":
             snapshots = await self.manager.clear_matching_fence(job_id, device_id, 1)
             for snapshot in snapshots:
                 await self.publish(snapshot)
@@ -1564,6 +1688,11 @@ class PushRuntime:
                 self.scheduler.wake()
             return
         if assignment["state"] != DeviceState.RECONCILING.value:
+            return
+        if status == "active" and payload.get("phase") == "downloading" and self.leases.token(
+            TransferKey("push", device_id, job_id, 1)
+        ) is None:
+            # A report cannot restore a revoked HTTP permission or its slot.
             return
         try:
             outcome, snapshots = await self.manager.reconcile_report(
@@ -1578,6 +1707,12 @@ class PushRuntime:
             return
         for snapshot in snapshots:
             await self.publish(snapshot)
+        if (
+            outcome == "active"
+            and payload.get("phase") == "downloading"
+            and self.scheduler is not None
+        ):
+            await self.scheduler.reconcile_active_transfer(job_id, device_id, 1)
         if outcome in {"requeued", "interrupted"} or (
             outcome == "active" and payload.get("phase") in {"validating", "applying"}
         ):
@@ -1587,10 +1722,22 @@ class PushRuntime:
         if self.scheduler is not None:
             self.scheduler.wake()
 
+    @staticmethod
+    def _job_action_targets(payload: dict[str, Any]) -> list[str] | None:
+        if "target_devices" not in payload:
+            return None
+        targets = payload["target_devices"]
+        if not isinstance(targets, list) or not targets or any(
+            not isinstance(value, str) or not value for value in targets
+        ):
+            raise StoreConflict("target_devices must be a nonempty list of device IDs")
+        return list(dict.fromkeys(targets))
+
     async def handle_admin_message(
         self, ws: RuntimeWebSocketResponse, payload: dict[str, Any]
     ) -> bool:
         message_type = payload.get("type")
+
         if (
             "target_connections" in payload
             and message_type not in {"REBOOT_DEVICE", "POWER_OFF_DEVICE"}
@@ -1600,19 +1747,84 @@ class PushRuntime:
                 "message": "target_connections is only supported for power control",
             }))
             return True
+        if message_type in {"CANCEL_PUSH_JOB", "RETRY_FAILED_PUSH_JOB"}:
+            job_id = payload.get("job_id")
+            try:
+                if not isinstance(job_id, str):
+                    raise StoreConflict("job_id is required")
+                if message_type == "RETRY_FAILED_PUSH_JOB":
+                    # Same live eligibility as job creation, so a target that cannot
+                    # receive Push now stays eligible for a later Retry.
+                    eligible = [
+                        device_id
+                        for device_id, session in self.sessions.items()
+                        if session.push_state_available
+                        and PUSH_JOB_CAPABILITIES <= session.capabilities
+                    ]
+                    created, snapshot = await self.manager.retry_failed(
+                        job_id, payload.get("client_request_id"),
+                        artifact_root=self.artifacts.artifact_root,
+                        online_devices=eligible,
+                    )
+                    retry_id = snapshot["job_id"]
+                    if created:
+                        _, snapshot = await self.store.enable_dispatch(retry_id)
+                        # A target that disconnected before dispatch was enabled must not
+                        # start merely by reconnecting.
+                        for device_id in list(snapshot["devices"]):
+                            if device_id not in self.sessions:
+                                for offline_snapshot in (
+                                    await self.manager.settle_offline_before_dispatch(
+                                        device_id, retry_id
+                                    )
+                                ):
+                                    snapshot = offline_snapshot
+                    await self.publish(await self.store.get_snapshot(job_id))
+                    await self.publish(snapshot)
+                else:
+                    snapshot = await self._cancel_push_job(ws, job_id, payload)
+                if self.scheduler is not None:
+                    self.scheduler.wake()
+                await self.admin_send(ws, {
+                    "type": "PUSH_JOB_ACTION_SENT", "job_id": snapshot["job_id"],
+                    "action": message_type,
+                })
+            except (StoreConflict, StoreNotFound, ValueError) as exc:
+                await self.admin_send(ws, {"type": "ERROR", "message": str(exc)})
+            return True
         if message_type == "PUSH_FILES" and isinstance(payload.get("job_id"), str):
             job_id = payload["job_id"]
             try:
-                changed, snapshot = await self.store.enable_dispatch(job_id)
+                targets = self._job_action_targets(payload)
+                current = await self.store.get_snapshot(job_id)
+                if targets is not None:
+                    if not set(targets) <= current["devices"].keys():
+                        raise StoreConflict("Resume targets must belong to this job")
+                    targets = [
+                        device_id for device_id in targets
+                        if device_id in self.sessions and self.sessions[device_id].can_dispatch
+                    ]
+                    if not targets:
+                        raise StoreConflict("Resume requires an online device with available Push state")
+                changed, snapshot = await self.store.enable_dispatch(job_id, targets)
+                initial_dispatch_replay = (
+                    targets is None and not changed
+                    and snapshot["state"] in {JobState.RUNNING.value, JobState.RECONCILING.value}
+                )
+                # Like job creation, dispatch skips offline devices: their queued
+                # work must not start later merely because they reconnect.
+                if not initial_dispatch_replay:
+                    for device_id in targets if targets is not None else list(snapshot["devices"]):
+                        if device_id in self.sessions:
+                            continue
+                        for offline_snapshot in await self.manager.settle_offline_before_dispatch(
+                            device_id, job_id
+                        ):
+                            snapshot, changed = offline_snapshot, True
             except (StoreConflict, StoreNotFound) as exc:
                 try:
-                    await asyncio.wait_for(
-                        ws.send_str(json.dumps({"type": "ERROR", "message": str(exc)})),
-                        self.admin_send_timeout,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except (Exception, asyncio.TimeoutError):
+                    await self.admin_send(ws, {"type": "ERROR", "message": str(exc)})
+                except Exception:
                     log.warning("Could not send Push dispatch error to admin", exc_info=True)
                     await self._close_failed_admin_socket(ws, b"admin send failed")
                 return True
@@ -1620,46 +1832,155 @@ class PushRuntime:
             if self.scheduler is not None:
                 self.scheduler.wake()
                 scheduler_woken = True
+            # Resume reconciles recovered assignments before returning them to
+            # the dispatch queue.
+            live_device_entries = self.legacy.devices
+            reconciling_devices = [
+                device_id
+                for device_id, device in snapshot["devices"].items()
+                if not initial_dispatch_replay
+                and device["state"] == DeviceState.RECONCILING.value
+                and (targets is None or device_id in targets)
+                and live_device_entries.get(device_id, {}).get("push_state_status")
+                != "unavailable"
+            ]
             try:
                 if changed:
                     await self.publish(snapshot)
-                await asyncio.wait_for(
-                    ws.send_str(
-                        json.dumps({
-                            "type": "PUSH_FILES_SENT",
-                            "job_id": job_id,
-                            "revision": snapshot["revision"],
-                            "state": snapshot["state"],
-                            "dispatch_enabled": snapshot["dispatch_enabled"],
-                            "target_count": snapshot["aggregate"]["total"],
-                            "max_concurrent": self.legacy.MAX_CONCURRENT_TRANSFERS,
-                            "delete_extras": snapshot["mode"] == "sync",
-                            "dest_path": snapshot["dest_path"],
-                        }, separators=(",", ":"))
+                await self.admin_send(ws, {
+                    "type": "PUSH_FILES_SENT",
+                    "job_id": job_id,
+                    "revision": snapshot["revision"],
+                    "state": snapshot["state"],
+                    "dispatch_enabled": snapshot["dispatch_enabled"],
+                    # A targeted Resume acts on the listed devices only.
+                    "target_count": (
+                        len(targets) if targets is not None
+                        else snapshot["aggregate"]["total"]
                     ),
-                    self.admin_send_timeout,
-                )
-            except asyncio.CancelledError:
-                raise
-            except (Exception, asyncio.TimeoutError):
+                    "resume": targets is not None,
+                    "max_concurrent": self.legacy.MAX_CONCURRENT_TRANSFERS,
+                    "delete_extras": snapshot["mode"] == "sync",
+                    "dest_path": snapshot["dest_path"],
+                })
+            except Exception:
                 log.warning("Could not acknowledge Push dispatch to admin", exc_info=True)
                 await self._close_failed_admin_socket(ws, b"admin send failed")
             finally:
                 if self.scheduler is not None and not scheduler_woken:
                     self.scheduler.wake()
+            # Send the canonical admin acknowledgement before bounded device I/O.
+            # A repeated Resume still retries reconciliation when enable_dispatch
+            # was already committed by an earlier interrupted admin request.
+            if reconciling_devices:
+                results = await asyncio.gather(
+                    *(self.request_reconcile(device_id) for device_id in reconciling_devices),
+                    return_exceptions=True,
+                )
+                for device_id, result in zip(reconciling_devices, results, strict=True):
+                    if isinstance(result, BaseException):
+                        log.warning(
+                            "Could not request Push reconciliation for %s after Resume",
+                            device_id,
+                            exc_info=(type(result), result, result.__traceback__),
+                        )
             return True
         if message_type == "RECONCILE_PUSH_DEVICE":
             device_id = payload.get("device_id")
             if isinstance(device_id, str):
-                await self.request_reconcile(device_id)
+                try:
+                    await self.request_reconcile(device_id)
+                except (ConnectionError, asyncio.TimeoutError):
+                    log.warning("Could not request Push reconciliation for %s", device_id, exc_info=True)
+                    await self.admin_send(ws, {
+                        "type": "ERROR", "message": "Could not contact device for Push reconciliation",
+                    })
             return True
         return False
+
+    async def _cancel_push_job(
+        self, ws: Any, job_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Cancel each requested target and return the latest job snapshot.
+
+        A per-target conflict does not stop the remaining targets; conflicts are
+        reported to the admin together after every target was processed.
+        """
+        snapshot = await self.store.get_snapshot(job_id)
+        targets = self._job_action_targets(payload)
+        if targets is None:
+            targets = list(snapshot["devices"])
+        elif not set(targets) <= snapshot["devices"].keys():
+            raise StoreConflict("Cancel targets must belong to this job")
+        errors = []
+        for device_id in targets:
+            async with self._device_lock(device_id):
+                try:
+                    snapshot = await self._cancel_push_target(job_id, device_id)
+                except StoreConflict as exc:
+                    # Nothing changed for this target, so there is nothing to publish.
+                    errors.append(str(exc))
+                    continue
+            await self.publish(snapshot)
+        if errors:
+            await self.admin_send(ws, {"type": "ERROR", "message": "; ".join(errors)})
+        return snapshot
+
+    async def _cancel_push_target(self, job_id: str, device_id: str) -> dict[str, Any]:
+        """Persist one cancellation, stop its transfer, and ask the owner to confirm.
+
+        The caller holds the device lock. Raises StoreConflict when the target is
+        not cancellable.
+        """
+        session = self.sessions.get(device_id)
+        before = await self.manager.assignment(job_id, device_id)
+        if (
+            session is not None
+            and before is not None
+            and before["state"] == DeviceState.RECONCILING.value
+            and before.get("cancel_requested_at") is None
+        ):
+            raise StoreConflict(
+                "Wait for the connected device to report interruption before cancelling"
+            )
+        snapshot = await self.manager.cancel_interrupted(job_id, device_id)
+        if snapshot["devices"][device_id]["state"] == DeviceState.FAILED.value:
+            return snapshot
+        key = TransferKey("push", device_id, job_id, 1)
+        token = self.leases.token(key)
+        if token is not None:
+            await self.leases.expire(key, token)
+        self.transfers.release_exact(key, "cancelled")
+        assignment = await self.manager.assignment(job_id, device_id)
+        if session is None or assignment is None or self.scheduler is None:
+            # Registration (or a Push-state refresh) sends pending cancellations.
+            return snapshot
+        try:
+            # Ask for exact evidence even for queued work: a client without the
+            # interrupted identity answers absent, which confirms the cancellation;
+            # one that still holds it answers interrupted and is rejected exactly.
+            await self.scheduler.send_exact_reconcile(
+                session,
+                job_id,
+                assignment["attempt"],
+                assignment["artifact_id"],
+                owner_lock_held=True,
+            )
+        except (ConnectionError, asyncio.TimeoutError):
+            # Cancellation intent is durable even if the live socket disappears
+            # while its reconciliation request is sent; registration retries it.
+            log.info(
+                "Could not send Push cancellation reconciliation to %s",
+                device_id,
+                exc_info=True,
+            )
+        return snapshot
 
     async def request_reconcile(self, device_id: str) -> None:
         session = self.sessions.get(device_id)
         if session is None or self.scheduler is None:
             return
-        active = await self.manager.active_assignment_for_device(device_id)
+        active = await self.store.active_assignment_for_device(device_id)
         if active and active["state"] == DeviceState.RECONCILING.value:
             snapshot = await self.store.get_snapshot(active["job_id"])
             await self.scheduler.send_reconcile(session, snapshot, device_id)
@@ -1683,18 +2004,24 @@ class PushRuntime:
             )
 
     async def publish(self, snapshot: dict[str, Any]) -> None:
-        job_id = snapshot["job_id"]
-        revision = snapshot["revision"]
-        if revision <= self.publication_revisions.get(job_id, -1):
-            return
-        self.publication_revisions[job_id] = revision
-        self.pending_publications[job_id] = snapshot
+        # No await between draining committed updates and enqueueing publication.
+        self._enqueue_publications([snapshot, *self.store.take_retry_publications()])
         self.publication_wake.set()
+
+    def _enqueue_publications(self, snapshots: list[dict[str, Any]]) -> None:
+        for current in snapshots:
+            job_id = current["job_id"]
+            revision = current["revision"]
+            if revision <= self.publication_revisions.get(job_id, -1):
+                continue
+            self.publication_revisions[job_id] = revision
+            self.pending_publications[job_id] = current
 
     async def _publication_loop(self) -> None:
         while True:
             await self.publication_wake.wait()
             self.publication_wake.clear()
+            self._enqueue_publications(self.store.take_retry_publications())
             while self.pending_publications:
                 job_id, snapshot = self.pending_publications.popitem()
                 event = {
@@ -1709,7 +2036,8 @@ class PushRuntime:
                     raise
                 except Exception:
                     log.exception("Could not publish Push job update for %s", job_id)
-            if self.publication_stopping and not self.pending_publications:
+            # A commit or shutdown may have woken us during an awaited admin send.
+            if self.publication_stopping and not self.publication_wake.is_set():
                 return
 
     def arm_created_deadline(self) -> None:
@@ -1759,6 +2087,23 @@ class PushRuntime:
             except Exception:
                 log.exception("Unexpected failure in Push created-deadline loop")
                 await asyncio.sleep(_BACKGROUND_LOOP_RETRY_DELAY)
+
+    async def _artifact_gc_loop(self) -> None:
+        """One GC at a time; slow filesystem cleanup cannot delay deadline work."""
+        while True:
+            await asyncio.sleep(self.artifact_gc_interval)
+            work = asyncio.create_task(asyncio.to_thread(
+                self.store.gc_artifacts_sync, self.artifacts.artifact_root,
+                retry_window_ms=int(self.artifact_retry_window * 1000),
+            ))
+            try:
+                await asyncio.shield(work)
+            except asyncio.CancelledError:
+                # The thread cannot be cancelled. Join it before closing its DB worker.
+                await work
+                raise
+            except Exception:
+                log.exception("Could not GC expired Push artifacts")
 
     async def _reconciliation_housekeeping(self) -> None:
         while True:
@@ -1810,6 +2155,14 @@ class PushRuntime:
                     job_id = row["job_id"]
                     device_id = row["device_id"]
                     attempt = row["attempt"]
+                    active_lease_progress = self.leases.last_progress(
+                        TransferKey("push", device_id, job_id, attempt)
+                    )
+                    if active_lease_progress is not None:
+                        # The transfer watchdog owns revocation and the slot
+                        # while its HTTP lease is active. It refreshes this
+                        # reconciliation deadline if the stream stalls.
+                        continue
                     deadline = row["reconciliation_deadline"]
                     session = self.sessions.get(device_id)
                     timestamp = now_ms()
@@ -1868,32 +2221,8 @@ def runtime_for_current_server() -> PushRuntime:
     if runtime is None:
         runtime = PushRuntime(server, data_dir)
         _RUNTIME_BY_DATA_DIR[data_dir] = runtime
-        server.pending_transfers = runtime.legacy_transfers
+        server.transfer_registry = runtime.transfers
     return runtime
-
-
-def _release_transfer_slot(
-    device_id: str, reason: str, task: str | None = None
-) -> bool:
-    from . import server as legacy_server
-
-    mapping = legacy_server.pending_transfers
-    if task in {"install", "push"}:
-        future = mapping.get((device_id, task))
-        if future is None or future.done():
-            return False
-        future.set_result(reason)
-        return True
-
-    released = False
-    for key in tuple(mapping):
-        if key[0] != device_id:
-            continue
-        future = mapping.get(key)
-        if future is not None and not future.done():
-            future.set_result(reason)
-            released = True
-    return released
 
 
 def install(server: Any) -> None:
@@ -1903,7 +2232,6 @@ def install(server: Any) -> None:
     _INSTALLED = True
     _ORIGINAL_CREATE_APP = server.create_app
     server._websocket_response_factory = RuntimeWebSocketResponse
-    server.release_transfer_slot = _release_transfer_slot
 
     def create_app() -> aiohttp_web.Application:
         runtime = runtime_for_current_server()

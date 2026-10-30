@@ -21,6 +21,7 @@ import pytest
 from aiohttp.test_utils import TestServer
 
 from styly_mdm import server
+from styly_mdm.transfer_registry import TransferKey, TransferRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -38,22 +39,23 @@ class FakeWS:
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(monkeypatch):
     """Isolate the module-global server state each test touches.
 
     The transfer-slot pool is dropped too: it is a semaphore sized from
     MAX_CONCURRENT_TRANSFERS and bound to the event loop that first awaited it, and
     every test here runs in a fresh loop with its own cap.
     """
+    monkeypatch.setattr(server, "transfer_registry", TransferRegistry())
     saved_n = server.MAX_CONCURRENT_TRANSFERS
     saved_t = server.TRANSFER_TIMEOUT
     for coll in (server.devices, server.admin_connections,
-                 server.pending_transfers, server._transfer_tasks):
+                 server._transfer_tasks):
         coll.clear()
     server.reset_transfer_slots()
     yield
     for coll in (server.devices, server.admin_connections,
-                 server.pending_transfers, server._transfer_tasks):
+                 server._transfer_tasks):
         coll.clear()
     server.reset_transfer_slots()
     server.MAX_CONCURRENT_TRANSFERS = saved_n
@@ -121,24 +123,24 @@ def test_never_exceeds_max_in_flight():
 
         # Only N devices dispatched; the rest are queued waiting for a slot.
         assert sum(execute_count(w) for w in wss.values()) == 2
-        assert len(server.pending_transfers) == 2
+        assert len(server.transfer_registry) == 2
 
         # Releasing one slot dispatches exactly one more (still N in flight).
-        held_device, _task = next(iter(server.pending_transfers))
+        held_device = next(d for d in targets if server.transfer_registry.get(TransferKey("install", d)))
         server.release_transfer_slot(held_device, "download_complete")
         await settle()
         assert sum(execute_count(w) for w in wss.values()) == 3
-        assert len(server.pending_transfers) == 2
+        assert len(server.transfer_registry) == 2
 
         # Drain the rest; every device is eventually dispatched exactly once.
-        while server.pending_transfers:
-            device_id, _task = next(iter(server.pending_transfers))
+        while len(server.transfer_registry):
+            device_id = next(d for d in targets if server.transfer_registry.get(TransferKey("install", d)))
             server.release_transfer_slot(device_id, "download_complete")
             await settle()
         await asyncio.wait_for(task, 1)
 
         assert all(execute_count(w) == 1 for w in wss.values())
-        assert server.pending_transfers == {}
+        assert len(server.transfer_registry) == 0
         prog = last_progress(admin)
         assert prog["done"] is True
         assert prog["transferred"] == 5 and prog["failed"] == 0
@@ -166,6 +168,38 @@ def test_release_dispatches_next_queued_device():
     asyncio.run(body())
 
 
+def test_older_install_cleanup_preserves_replacement_waiter():
+    async def body():
+        server.MAX_CONCURRENT_TRANSFERS = 2
+        add_device("a")
+        key = TransferKey("install", "a")
+        first = asyncio.create_task(server._run_install_job("http://x/first.apk", "first.apk", ["a"]))
+        second = None
+        try:
+            await settle()
+            first_waiter = server.transfer_registry.get(key)
+            assert first_waiter is not None
+            second = asyncio.create_task(server._run_install_job("http://x/second.apk", "second.apk", ["a"]))
+            await settle()
+            replacement = server.transfer_registry.get(key)
+            assert replacement is not None and replacement is not first_waiter
+
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+            assert server.transfer_registry.get(key) is replacement
+            assert not replacement.done()
+            assert server.release_transfer_slot("a", "download_complete")
+            await asyncio.wait_for(second, 1)
+            assert len(server.transfer_registry) == 0
+        finally:
+            tasks = [task for task in (first, second) if task is not None]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(body())
+
+
 def test_timeout_releases_slot_without_wall_clock():
     async def body():
         server.MAX_CONCURRENT_TRANSFERS = 1
@@ -179,7 +213,7 @@ def test_timeout_releases_slot_without_wall_clock():
         await asyncio.wait_for(task, 2)
 
         assert all(execute_count(w) == 1 for w in wss.values())
-        assert server.pending_transfers == {}
+        assert len(server.transfer_registry) == 0
         prog = last_progress(admin)
         assert prog["done"] is True
         assert prog["failed"] == 3 and prog["transferred"] == 0
@@ -201,7 +235,7 @@ def test_offline_device_does_not_hold_a_slot():
         # The offline target is skipped (no slot held), so the online device is
         # dispatched even though it is behind "ghost" in the queue with N == 1.
         assert execute_count(online) == 1
-        assert ("ghost", server.TASK_INSTALL) not in server.pending_transfers
+        assert server.transfer_registry.get(TransferKey("install", "ghost")) is None
 
         server.release_transfer_slot("online", "download_complete")
         await asyncio.wait_for(task, 1)
@@ -282,7 +316,7 @@ def test_release_transfer_slot_reports_whether_it_freed_a_slot():
         assert server.release_transfer_slot("nobody", "download_complete") is False
 
         fut = asyncio.get_running_loop().create_future()
-        server.pending_transfers[("a", server.TASK_INSTALL)] = fut
+        server.transfer_registry.register(TransferKey("install", "a"), fut)
         assert server.release_transfer_slot("a", "download_complete") is True
         # The second call is the guard that stops a DOWNLOAD_COMPLETE arriving after
         # a timeout from resurrecting an "installing" cell for a written-off device.
@@ -291,49 +325,13 @@ def test_release_transfer_slot_reports_whether_it_freed_a_slot():
     asyncio.run(body())
 
 
-def test_release_transfer_slot_frees_only_the_named_task():
-    """A device can hold an install slot and a push slot at once.
-
-    Each job's terminal message must free its own slot and leave the other alone,
-    or an INSTALL_RESULT would let an unrelated push's queue run ahead of its
-    transfer — the whole point of keying pending_transfers by task.
-    """
+@pytest.mark.parametrize("task", ["push", "unknown"])
+def test_unidentified_non_install_completion_does_not_release_install(task):
     async def body():
-        loop = asyncio.get_running_loop()
-        install_fut = loop.create_future()
-        push_fut = loop.create_future()
-        server.pending_transfers[("a", server.TASK_INSTALL)] = install_fut
-        server.pending_transfers[("a", server.TASK_PUSH)] = push_fut
-
-        assert server.release_transfer_slot("a", "install_result", task=server.TASK_INSTALL) is True
-        assert install_fut.done() and not push_fut.done()
-
-        # No install slot left to free, and the push slot must survive the attempt.
-        assert server.release_transfer_slot("a", "install_result", task=server.TASK_INSTALL) is False
-        assert not push_fut.done()
-
-        assert server.release_transfer_slot("a", "push_files_result", task=server.TASK_PUSH) is True
-        assert push_fut.done()
-
-    asyncio.run(body())
-
-
-def test_disconnect_frees_every_slot_the_device_holds():
-    """A disconnect is task-agnostic: nothing the device was transferring survives it."""
-    async def body():
-        loop = asyncio.get_running_loop()
-        futs = {
-            task: loop.create_future() for task in (server.TASK_INSTALL, server.TASK_PUSH)
-        }
-        for task, fut in futs.items():
-            server.pending_transfers[("a", task)] = fut
-        # A second device must not be touched by "a" disconnecting.
-        other = loop.create_future()
-        server.pending_transfers[("b", server.TASK_INSTALL)] = other
-
-        assert server.release_transfer_slot("a", "disconnect") is True
-        assert all(f.done() and f.result() == "disconnect" for f in futs.values())
-        assert not other.done()
+        future = asyncio.get_running_loop().create_future()
+        server.transfer_registry.register(TransferKey("install", "a"), future)
+        assert server.release_transfer_slot("a", "download_complete", task=task) is False
+        assert not future.done()
 
     asyncio.run(body())
 

@@ -17,8 +17,8 @@ STYLY-MDM currently supports PICO devices (PICO OS with Business Mode). Support 
 - **Boot persistence** — the MDM client starts automatically on HMD boot via `BOOT_COMPLETED` and PICO auto-boot intents
 - **Activity log** — every launch command and result is shown in the web console with timestamps
 - **APK deployment** — upload an APK from the web console and install it silently on selected online devices
-- **File/folder push** — upload a file or an entire folder and copy it into a directory on selected devices; existing files of the same name are overwritten, nothing else at the destination is touched
-- **Folder sync** — mirror a folder into a directory on selected devices, so the destination matches it exactly (new files added, changed files overwritten, **extras removed**). Requires an explicit confirmation, since it deletes. Both actions are limited to shared storage (`/sdcard`)
+- **File/folder push** — upload a file or an entire folder and copy it into a directory on selected devices; existing files of the same name are overwritten, nothing else at the destination is touched. Transfers are resumable across interruptions with per-device **Resume**, **Cancel**, and **Retry failed devices** controls
+- **Folder sync** — mirror a folder into a directory on selected devices, so the destination matches it exactly (new files added, changed files overwritten, **extras removed**). Uses the same durable resumable job pipeline and requires an explicit confirmation, since it deletes. Both actions are limited to shared storage (`/sdcard`)
 - **Integrity verification** — on demand, check that an installed APK (or a shared-storage directory) on selected devices matches a local reference; the reference is hashed in your browser (or via the `styly-mdm hash` CLI) with no upload and no HTTPS requirement, and each device shows a ✓/✗ match
 - **Client self-update** — push a new MDM client build over MDM itself: the download is verified against server-computed hashes before installing, the device power-cycles itself to recover from the install killing the client, the console shows `updating` (not `offline`) across the restart, and the result — including a post-update integrity check — is reported per device
 - **Version visibility & one-click update** — the console shows the running server's STYLY-MDM version in the top bar and each connected device's client build in its row. Compatibility is keyed on `major.minor` — the third ("build") digit is reserved for compatible, independent updates, so a `v0.2.1` server and a `v0.2.0` client count as in sync. A connected client on an older `major.minor` than the server is flagged in **red** as out of sync; when the server holds a newer client APK, an **Update** button on that row reinstalls the client in place (through the self-update flow above). If instead the server trails a connected client, the server version in the top bar turns red. See the [Developer Guide](docs/DEVELOPMENT.md) for the exact compatibility policy
@@ -66,7 +66,6 @@ current working directory — see the configuration table below):
 2026-02-24 [INFO] Configuration:
 2026-02-24 [INFO]   Data directory:   /srv/styly-mdm
 2026-02-24 [INFO]   APK directory:    /srv/styly-mdm/apks
-2026-02-24 [INFO]   Bundle directory: /srv/styly-mdm/bundles
 2026-02-24 [INFO]   Device registry:  /srv/styly-mdm/device_registry.json
 2026-02-24 [INFO]   WebSocket port:   7070
 2026-02-24 [INFO]   Discovery port:   7071
@@ -81,14 +80,14 @@ Open `http://<server-ip>:7070` in a browser to access the web console.
 |---------|---------|------|---------|
 | HTTP/WebSocket port | `MDM_WS_PORT` | `--port` | `7070` |
 | UDP discovery port | `MDM_DISCOVERY_PORT` | — | `7071` |
-| Data directory (uploaded APKs, pushed bundles, device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
+| Data directory (APKs, Push jobs/artifacts, device registry) | `MDM_DATA_DIR` | `--data-dir` | current directory |
 | Simultaneous device downloads, server-wide | `MDM_MAX_CONCURRENT_TRANSFERS` | `--max-concurrent-transfers` | `5` |
-| Seconds a device may hold a transfer slot | `MDM_TRANSFER_TIMEOUT` | — | `600` |
+| APK transfer timeout in seconds | `MDM_TRANSFER_TIMEOUT` | — | `600` |
 | Seconds a retiring device must stay silent before the retire counts as done | `MDM_RETIRE_TIMEOUT` | — | `120` |
 
-The **data directory** holds everything the server persists: uploaded APKs (`apks/`), pushed file bundles (`bundles/`), and the device registry (`device_registry.json`). It defaults to the directory the server is started from, so `uvx styly-mdm` in a fresh directory comes up with no devices or groups. Pass `--data-dir` to pin it somewhere stable.
+The **data directory** holds everything the server persists: uploaded APKs (`apks/`), Push metadata (`push_jobs.sqlite3`), artifact bytes (`push-artifacts/`), upload work (`push-work/`), and the device registry (`device_registry.json`). It defaults to the directory the server is started from, so `uvx styly-mdm` in a fresh directory comes up with no devices or groups. Pass `--data-dir` to pin it somewhere stable.
 
-**Transfer throttling** keeps a large fan-out — an APK install, a file push, or a folder sync — from making every device download at the same instant (an APK or a pushed bundle can be up to 2 GiB). All jobs share one server-wide pool: at most `--max-concurrent-transfers` devices download at once; the rest queue, and a slot frees as soon as its device reports the download finished. `MDM_TRANSFER_TIMEOUT` caps how long one device may hold a slot, so a stuck device cannot block the queue. The [Developer Guide](docs/DEVELOPMENT.md) documents the full slot-release rules.
+**Transfer throttling** keeps a large fan-out — an APK install, a file push, or a folder sync — from making every device download at the same instant (an APK or a pushed bundle can be up to 2 GiB). All jobs share one server-wide pool: at most `--max-concurrent-transfers` devices download at once; the rest queue, and a slot frees as soon as its device reports the download finished. `MDM_TRANSFER_TIMEOUT` caps APK download slots. Push slots instead use a lease that expires after 60 seconds without successful HTTP writes; validation and application do not occupy a download slot. The [Developer Guide](docs/DEVELOPMENT.md) documents the full slot-release rules.
 
 > **Only one server per discovery port.** Devices connect to whichever server answers discovery first, so two servers sharing a discovery port would split them nondeterministically. To prevent that, the server broadcasts a probe on startup and exits if another STYLY-MDM server answers:
 >
@@ -231,7 +230,7 @@ same ID keep their groups even if they are offline during the server move. This
 does not migrate groups from a legacy serial ID to a new Provider GUID when the
 client is upgraded.
 
-Uploaded APKs (`<data-dir>/apks/`) and pushed file bundles (`<data-dir>/bundles/`) are not part of the registry. Copy those directories separately with `rsync` or `scp` if the new server needs them — a single APK can be up to 2 GiB, so they are not worth moving through a browser.
+Uploaded APKs (`<data-dir>/apks/`) and Push metadata/artifacts (`push_jobs.sqlite3`, `push-artifacts/`, and `push-work/` below the data directory) are not part of the registry export. Stop the server before copying its full data directory if the new server must retain job ownership and artifacts; copy job metadata and artifact bytes together. Historical `<data-dir>/bundles/` files are no longer served.
 
 ## Documentation
 

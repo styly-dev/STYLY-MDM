@@ -106,7 +106,7 @@ async def test_opaque_job_v1_fence_has_exact_reconcile_and_clear(tmp_path):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
-        _, visible = await manager.create_job(request(), protocols(), 60_000)
+        _, visible = await manager.store.create_job(request(), protocols(), 60_000)
         foreign_job = str(uuid.uuid4())
         foreign_artifact = str(uuid.uuid4())
         opaque = manager.opaque_identity_for_active({
@@ -138,7 +138,7 @@ async def test_mismatched_opaque_evidence_does_not_clear_fence(tmp_path):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
-        await manager.create_job(request(), protocols(), 60_000)
+        await manager.store.create_job(request(), protocols(), 60_000)
         foreign_job = str(uuid.uuid4())
         await manager.add_opaque_fence(
             "D1",
@@ -182,7 +182,7 @@ async def test_runtime_acks_unknown_exact_result_and_clears_opaque_fence(tmp_pat
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
-        await manager.create_job(request(), protocols(), 60_000)
+        await manager.store.create_job(request(), protocols(), 60_000)
         foreign_job = str(uuid.uuid4())
         await manager.add_opaque_fence(
             "D1",
@@ -236,7 +236,7 @@ async def test_runtime_reconcile_action_targets_canonical_opaque_identity(tmp_pa
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
-        await manager.create_job(request(), protocols(), 60_000)
+        await manager.store.create_job(request(), protocols(), 60_000)
         foreign_job = str(uuid.uuid4())
         artifact_id = str(uuid.uuid4())
         await manager.add_opaque_fence(
@@ -252,6 +252,7 @@ async def test_runtime_reconcile_action_targets_canonical_opaque_identity(tmp_pa
         )
         runtime = object.__new__(PushRuntime)
         runtime.manager = manager
+        runtime.store = manager.store
         runtime.scheduler = _Scheduler()
         session = LiveSession(
             device_id="D1",
@@ -372,8 +373,8 @@ async def test_process_replacement_revises_terminal_opaque_fence_display(tmp_pat
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
-        _, created = await manager.create_job(request(), protocols(), 60_000)
-        await manager.fail_pre_dispatch(
+        _, created = await manager.store.create_job(request(), protocols(), 60_000)
+        await manager.store.fail_pre_dispatch(
             created["job_id"],
             __import__("styly_mdm.push_jobs", fromlist=["JobState"]).JobState.INTERRUPTED,
             "test_terminal",
@@ -409,7 +410,7 @@ async def test_malformed_foreign_success_does_not_clear_opaque_fence(tmp_path):
     store = PushJobStore(tmp_path / "push_jobs.sqlite3")
     manager = PushJobManager(store)
     try:
-        await manager.create_job(request(), protocols(), 60_000)
+        await manager.store.create_job(request(), protocols(), 60_000)
         foreign_job = str(uuid.uuid4())
         await manager.add_opaque_fence(
             "D1",
