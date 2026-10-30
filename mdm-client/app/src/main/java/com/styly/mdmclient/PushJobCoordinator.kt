@@ -887,7 +887,7 @@ class PushJobCoordinator internal constructor(
         val result = when (val outcome = execution.outcome) {
             is PushFilesWorker.Outcome.Interrupted -> {
                 val active = state.active ?: return
-                log(Log.WARN, "Interrupted Push/Sync ${command.identity}: ${outcome.reason}; ${outcome.detail.orEmpty()}")
+                log(Log.WARN, "Interrupted Push/Sync ${command.identity}: ${outcome.reason}; ${outcome.detail}")
                 val nextState = state.copy(
                     active = active.copy(
                         interrupted = true,

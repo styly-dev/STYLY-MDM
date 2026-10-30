@@ -226,7 +226,7 @@ class PushFilesWorker internal constructor(
         /** The exact job remains active and its validated partial data is retained. */
         data class Interrupted(
             val reason: String,
-            val detail: String?,
+            val detail: String,
         ) : Outcome()
     }
 

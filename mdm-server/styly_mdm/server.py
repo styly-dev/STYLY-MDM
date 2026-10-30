@@ -96,11 +96,8 @@ TRANSFER_TIMEOUT = float(os.environ.get("MDM_TRANSFER_TIMEOUT", "600"))
 # WebSocket. Each admin send is bounded independently in _broadcast_admin_message.
 ADMIN_SEND_TIMEOUT = max(0.1, float(os.environ.get("MDM_ADMIN_SEND_TIMEOUT", "5")))
 
-# The two kinds of byte-moving job. A device can be in one of each at the same time
-# (an admin can push files to a group already installing an APK), so both the slot
-# registry and the release path are keyed by task, never by device alone.
+# Task identifier for Install download completion messages.
 TASK_INSTALL = "install"
-TASK_PUSH = "push"
 
 # Seconds a self-updating client may stay away before the update is declared lost.
 # The client schedules a device power cycle (shutdown at +2 min, startup at +3 min)
@@ -730,35 +727,6 @@ async def broadcast_install_state(
         "device_ids": device_ids,
         "state": state,
         "apk_filename": apk_filename,
-        "detail": detail,
-    })
-
-
-async def broadcast_push_state(
-    device_ids: list[str],
-    state: str,
-    dest_path: str = "",
-    delete_extras: bool = False,
-    detail: str = "",
-) -> None:
-    """The push/sync counterpart of broadcast_install_state.
-
-    States: queued -> transferring -> applying -> (PUSH_FILES_RESULT: success/fail),
-    where applying covers the client's local unzip and mirror — the phase that runs
-    after the slot is freed. As with install, fail is also emitted here for devices
-    that never reach a client (offline before their turn, failed dispatch, timeout).
-
-    ``delete_extras`` rides along so the console can name the action (Push vs Sync)
-    without having to remember what it dispatched.
-    """
-    if not device_ids:
-        return
-    await forward_to_admins({
-        "type": "PUSH_DEVICE_STATE",
-        "device_ids": device_ids,
-        "state": state,
-        "dest_path": dest_path,
-        "delete_extras": delete_extras,
         "detail": detail,
     })
 
@@ -1502,11 +1470,9 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     await broadcast_device_list()
 
                 elif msg_type == "DOWNLOAD_COMPLETE":
-                    # Primary transfer-slot release: the network-heavy download has
-                    # finished, so free this device's slot right away and let the
-                    # local install (or unzip/mirror) proceed without holding up the
-                    # queue. `task` names which job finished downloading; clients that
-                    # predate push throttling only ever send it for an install.
+                    # Release the Install slot once downloading finishes so local
+                    # installation does not hold up the transfer queue. A missing
+                    # task means Install; Push-v1 completion is handled by PushRuntime.
                     if device_id:
                         task = data.get("task") or TASK_INSTALL
                         released = release_transfer_slot(
@@ -1517,7 +1483,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                             task, device_id,
                             data.get("apk_filename") or data.get("dest_path", ""),
                         )
-                        # Announce the transferring -> installing/applying transition
+                        # Announce the transferring -> installing transition
                         # here, in the receive loop, so it is ordered before the
                         # terminal result that follows on this same connection.
                         # Emitting it from the dispatcher instead would race that
@@ -1525,12 +1491,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         # Skipped when the slot was already gone (timed out), so a
                         # late message cannot resurrect a device the job has written
                         # off as failed.
-                        if released and task == TASK_PUSH:
-                            await broadcast_push_state(
-                                [device_id], "applying", data.get("dest_path", ""),
-                                bool(data.get("delete_extras")),
-                            )
-                        elif released:
+                        if released:
                             await broadcast_install_state(
                                 [device_id], "installing", data.get("apk_filename", ""),
                             )
@@ -1694,16 +1655,13 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                             continue
                         data.pop("connection_id", None)
                         data["device_id"] = device_id
-                    # Fallback transfer-slot release: an older client that never
+                    # Fallback Install slot release: an older client that never
                     # emits DOWNLOAD_COMPLETE, or a client whose download failed and
                     # jumped straight to a terminal result, frees its slot here. A
-                    # no-op if DOWNLOAD_COMPLETE already released it. Each result only
-                    # ever frees its own job's slot.
+                    # no-op if DOWNLOAD_COMPLETE already released it.
                     if device_id and msg_type == "INSTALL_RESULT":
                         release_transfer_slot(device_id, "install_result", task=TASK_INSTALL)
                         _clear_pending_self_update_on_install_result(device_id)
-                    elif device_id and msg_type == "PUSH_FILES_RESULT":
-                        release_transfer_slot(device_id, "push_files_result", task=TASK_PUSH)
                     elif device_id and msg_type == "VERIFY_APK_RESULT":
                         if await _consume_self_update_verify(device_id, data):
                             continue
