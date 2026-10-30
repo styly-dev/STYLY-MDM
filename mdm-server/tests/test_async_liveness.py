@@ -1,6 +1,7 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
@@ -127,6 +128,9 @@ async def test_dispatch_exception_moves_uncertain_send_to_reconciliation(monkeyp
     published = []
 
     class Manager:
+        def __init__(self):
+            self.store = SimpleNamespace(mark_reconciling=self._mark_reconciling)
+
         async def assignment(self, _job_id, _device_id):
             return {
                 "state": "dispatching",
@@ -135,7 +139,7 @@ async def test_dispatch_exception_moves_uncertain_send_to_reconciliation(monkeyp
                 "protocol_mode": "job_v1",
             }
 
-        async def mark_reconciling(self, _job_id, _device_id, **kwargs):
+        async def _mark_reconciling(self, _job_id, _device_id, **kwargs):
             assert kwargs["expected"] == {push_scheduler.DeviceState.DISPATCHING}
             assert kwargs["reason"] == "unexpected_dispatch_failure"
             return {
@@ -340,6 +344,7 @@ async def _transfer_slot():
 
 class _DispatchManager:
     def __init__(self):
+        self.store = SimpleNamespace(transition_device=self._transition_device)
         self.claimed = False
         self.transitions = []
         self.transitioned = asyncio.Event()
@@ -375,7 +380,7 @@ class _DispatchManager:
     async def prepare_dispatch(self, *_args, **_kwargs):
         return self.snapshot
 
-    async def transition_device(self, *_args, **kwargs):
+    async def _transition_device(self, *_args, **kwargs):
         self.transitions.append(kwargs["target"])
         self.transitioned.set()
         return self.snapshot

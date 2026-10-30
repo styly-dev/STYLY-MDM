@@ -105,7 +105,7 @@ async def test_unfinished_legacy_push_is_not_migrated_on_guid_registration(tmp_p
             },
         )
         await runtime.manager.store.enable_dispatch(legacy_job_id)
-        legacy_before = await runtime.manager.get_snapshot(legacy_job_id)
+        legacy_before = await runtime.store.get_snapshot(legacy_job_id)
         assert legacy_before["state"] == "running"
         assert legacy_before["devices"][legacy_id]["protocol_mode"] == "legacy"
 
@@ -126,7 +126,7 @@ async def test_unfinished_legacy_push_is_not_migrated_on_guid_registration(tmp_p
             )
             await _recv_type(device, "REGISTERED")
 
-            legacy_after_register = await runtime.manager.get_snapshot(legacy_job_id)
+            legacy_after_register = await runtime.store.get_snapshot(legacy_job_id)
             assert legacy_after_register["state"] == legacy_before["state"]
             assert legacy_after_register["devices"] == legacy_before["devices"]
             assert legacy_after_register["job_id"] == legacy_job_id
@@ -152,9 +152,9 @@ async def test_unfinished_legacy_push_is_not_migrated_on_guid_registration(tmp_p
             assert created["targets"] == [
                 {"device_id": guid_id, "protocol_mode": "job_v1"}
             ]
-            new_snapshot = await runtime.manager.get_snapshot(created["job_id"])
+            new_snapshot = await runtime.store.get_snapshot(created["job_id"])
             assert new_snapshot["devices"].keys() == {guid_id}
-            assert (await runtime.manager.get_snapshot(legacy_job_id))["state"] != "succeeded"
+            assert (await runtime.store.get_snapshot(legacy_job_id))["state"] != "succeeded"
             await device.close()
     finally:
         await test_server.close()

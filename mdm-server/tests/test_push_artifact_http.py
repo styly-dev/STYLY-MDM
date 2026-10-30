@@ -248,7 +248,7 @@ async def test_offline_cancel_revokes_http_lease_before_next_request(tmp_path):
         )
         await old_writer.drain()
         await asyncio.wait_for(started.wait(), timeout=1)
-        await manager.mark_reconciling(active["job_id"], "D1", expected={DeviceState.DOWNLOADING},
+        await manager.store.mark_reconciling(active["job_id"], "D1", expected={DeviceState.DOWNLOADING},
                                        reason="device_disconnect", deadline=now_ms() + 60_000)
         runtime.sessions.clear()
         await admin_action(runtime, admin, "CANCEL_PUSH_JOB", active["job_id"], target_devices=["D1"])
@@ -363,7 +363,7 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
         first = await manager.assignment(job_id, "D1")
         assert first is not None
         immutable_revision = first["dispatch_revision"]
-        await manager.transition_device(
+        await manager.store.transition_device(
             job_id,
             "D1",
             expected={DeviceState.DISPATCHING},
@@ -412,7 +412,7 @@ async def test_resumable_replay_keeps_immutable_assignment_revision(tmp_path):
             "D1",
             accept_deadline=now_ms() + 1000,
         )
-        replayed = await manager.get_snapshot(job_id)
+        replayed = await manager.store.get_snapshot(job_id)
         command = PushScheduler._command(
             replayed, "D1", "http://server", lease_token="test-lease"
         )

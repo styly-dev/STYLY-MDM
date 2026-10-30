@@ -50,7 +50,7 @@ async def settled_snapshot(manager, result, job_id):
     snapshot = next(
         (item for item in result.snapshots if item["job_id"] == job_id), None
     )
-    return snapshot if snapshot is not None else await manager.get_snapshot(job_id)
+    return snapshot if snapshot is not None else await manager.store.get_snapshot(job_id)
 
 
 @pytest.fixture
@@ -518,7 +518,7 @@ async def cancelled_unconfirmed_job(store, manager):
     await store.enable_dispatch(job_id)
     await manager.claim_next(["D1"])
     await prepare_job_v1_dispatch(manager, job_id)
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id, "D1", expected={DeviceState.DISPATCHING},
         reason="test", deadline=now_ms(),
     )

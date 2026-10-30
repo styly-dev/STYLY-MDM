@@ -47,7 +47,7 @@ async def timed_out_job(manager):
         active['job_id'], 'D1', attempt=1, reason='download_interrupted',
         artifact_id=active['artifact']['artifact_id'],
         dispatch_revision=active['devices']['D1']['dispatch_revision'], validated_offset=1)
-    return await manager.get_snapshot(active['job_id'])
+    return await manager.store.get_snapshot(active['job_id'])
 
 
 @pytest.mark.asyncio
@@ -77,8 +77,8 @@ async def test_snapshot_resume_supported_uses_job_v1_revision(manager, dispatch_
         (dispatch_snapshot, active['job_id'], 'D1'),
     ))
     assert active['devices']['D1']['dispatch_revision'] is not None
-    assert (await manager.get_snapshot(active['job_id']))['devices']['D1']['resume_supported'] is True
-    await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
+    assert (await manager.store.get_snapshot(active['job_id']))['devices']['D1']['resume_supported'] is True
+    await manager.store.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=1)
     await manager.cancel_interrupted(active['job_id'], 'D1')
 
@@ -90,10 +90,10 @@ async def test_legacy_assignment_revision_does_not_enable_resume_or_cancel(manag
         "UPDATE push_job_devices SET protocol_mode='legacy' WHERE job_id=? AND device_id=?",
         (active['job_id'], 'D1'),
     ))
-    legacy = await manager.get_snapshot(active['job_id'])
+    legacy = await manager.store.get_snapshot(active['job_id'])
     assert legacy['devices']['D1']['dispatch_revision'] is not None
     assert legacy['devices']['D1']['resume_supported'] is False
-    await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
+    await manager.store.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=1)
     with pytest.raises(StoreConflict, match='Only paused, interrupted'):
         await manager.cancel_interrupted(active['job_id'], 'D1')
@@ -114,7 +114,7 @@ async def test_cancel_rejects_work_not_awaiting_timeout_resume(manager, phase):
         _, original = await manager.store.enable_dispatch(original['job_id'], ['D1'])
     with pytest.raises(StoreConflict, match='Only paused, interrupted'):
         await manager.cancel_interrupted(original['job_id'], 'D1')
-    assert await manager.get_snapshot(original['job_id']) == original
+    assert await manager.store.get_snapshot(original['job_id']) == original
 
 
 @pytest.mark.asyncio
@@ -144,14 +144,14 @@ async def test_cancel_ready_job_targets_individually_and_terminalizes_the_last_o
     assert first['devices']['D1']['failure']['code'] == 'cancelled'
     assert first['devices']['D2']['state'] == 'queued'
     assert await manager.claim_next(['D1', 'D2']) is None
-    assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms() + 1) == []
+    assert manager.store.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms() + 1) == []
 
     final = await manager.cancel_interrupted(job_id, 'D2')
     assert final['state'] == 'failed' and final['dispatch_enabled'] is False
     assert final['terminal_at'] is not None
     assert final['aggregate']['queued'] == 0
     assert await manager.claim_next(['D1', 'D2']) is None
-    assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms() + 1) == [artifact_id]
+    assert manager.store.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms() + 1) == [artifact_id]
     assert not (tmp_path / (artifact_id + '.zip')).exists()
 
 
@@ -207,7 +207,7 @@ async def test_offline_cancel_rejects_recovered_partial_on_reconnect(manager):
     assert session.ws.messages[0]['type'] == 'PUSH_RESUME_REJECTED'
     for field in ['job_id', 'attempt', 'artifact_id', 'revision']:
         assert session.ws.messages[0][field] == active_report[field]
-    assert await manager.get_snapshot(original['job_id']) == cancelled
+    assert await manager.store.get_snapshot(original['job_id']) == cancelled
     assert await manager.claim_next(['D1']) is None
 
 
@@ -215,12 +215,12 @@ async def test_offline_cancel_rejects_recovered_partial_on_reconnect(manager):
 async def test_offline_cancel_preserves_fence_and_artifact_until_exact_cleanup(manager, tmp_path):
     from styly_mdm.push_job_store import now_ms
     active = await downloading_job(manager.store, manager)
-    await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
+    await manager.store.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=1)
     await manager.cancel_interrupted(active['job_id'], 'D1')
     await manager.mark_unconfirmed(active['job_id'], 'D1', None, 'timeout', observed_now=2)
     assert (await manager.store.artifact_record(active['artifact']['artifact_id']))['retention_state'] == 'retained'
-    assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms()+1000) == []
+    assert manager.store.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms()+1000) == []
     next_job = await ready_job(manager.store, manager)
     await manager.store.enable_dispatch(next_job['job_id'])
     assert await manager.claim_next(['D1']) is None
@@ -239,7 +239,7 @@ async def test_offline_cancel_preserves_fence_and_artifact_until_exact_cleanup(m
         await runtime._handle_reconcile_report(session, 'D1', {**mismatch, 'status': 'absent'})
         assert await manager.claim_next(['D1']) is None
     await runtime._handle_reconcile_report(session, 'D1', {**identity, 'status': 'absent'})
-    assert (await manager.get_snapshot(active['job_id']))['devices']['D1']['failure']['code'] == 'cancelled'
+    assert (await manager.store.get_snapshot(active['job_id']))['devices']['D1']['failure']['code'] == 'cancelled'
     assert (await manager.claim_next(['D1']))['job']['job_id'] == next_job['job_id']
 
 
@@ -247,7 +247,7 @@ async def test_offline_cancel_preserves_fence_and_artifact_until_exact_cleanup(m
 @pytest.mark.parametrize('resume_first', [False, True])
 async def test_client_restart_requires_explicit_resume_even_when_job_enabled(manager, resume_first):
     active = await downloading_job(manager.store, manager)
-    await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
+    await manager.store.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=9999999999999)
     if resume_first:
         await manager.store.enable_dispatch(active['job_id'], ['D1'])
@@ -286,15 +286,15 @@ async def test_late_absent_cannot_rewrite_completed_terminal_result(manager):
         original['job_id'], 'D1', 1, 'fail', failure_code='resume_expired'
     )
     assert result.accepted
-    terminal = await manager.get_snapshot(original['job_id'])
+    terminal = await manager.store.get_snapshot(original['job_id'])
     assert await manager.confirm_cancel(original['job_id'], 'D1') == []
-    assert await manager.get_snapshot(original['job_id']) == terminal
+    assert await manager.store.get_snapshot(original['job_id']) == terminal
 
 
 @pytest.mark.asyncio
 async def test_cancelled_reconciling_assignment_ignores_late_phase_and_completion(manager):
     active = await downloading_job(manager.store, manager)
-    await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
+    await manager.store.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=9999999999999)
     await manager.cancel_interrupted(active['job_id'], 'D1')
     runtime, _session = runtime_for(manager)
@@ -303,7 +303,7 @@ async def test_cancelled_reconciling_assignment_ignores_late_phase_and_completio
     await runtime._handle_phase('D1', {**identity, 'phase': 'validating'})
     await runtime._handle_transfer_complete('D1', {**identity, 'received_size': 1})
     await runtime._handle_phase('D1', {**identity, 'phase': 'applying'})
-    current = await manager.get_snapshot(active['job_id'])
+    current = await manager.store.get_snapshot(active['job_id'])
     assert current['devices']['D1']['state'] == 'reconciling'
     assert current['devices']['D1']['cancel_requested']
 
@@ -321,7 +321,7 @@ async def test_cancelled_late_result_racing_timeout_is_settled_with_exact_fence(
 ):
     active = await downloading_job(manager.store, manager)
     job_id = active['job_id']
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id, 'D1', expected={DeviceState.DOWNLOADING},
         reason='device_disconnect', deadline=1,
     )
@@ -352,7 +352,7 @@ async def test_cancelled_late_result_racing_timeout_is_settled_with_exact_fence(
 
     await runtime._handle_result('D1', payload, owned_session=session)
 
-    after = await manager.get_snapshot(job_id)
+    after = await manager.store.get_snapshot(job_id)
     device = after['devices']['D1']
     assert device['state'] == expected_state
     assert device['device_fence'] is None
@@ -386,28 +386,28 @@ async def test_validation_phase_releases_slot_before_verified_completion(manager
     await runtime._handle_phase('D1', {**identity, 'phase': 'validating'})
     assert future.result() == 'validation_started'
     assert runtime.leases.token(key) is None
-    assert (await manager.get_snapshot(active['job_id']))['devices']['D1']['state'] == 'validating'
+    assert (await manager.store.get_snapshot(active['job_id']))['devices']['D1']['state'] == 'validating'
     await runtime._handle_transfer_complete('D1', {**identity, 'received_size': 1})
-    assert (await manager.get_snapshot(active['job_id']))['devices']['D1']['state'] == 'validating'
+    assert (await manager.store.get_snapshot(active['job_id']))['devices']['D1']['state'] == 'validating'
 
 
 @pytest.mark.asyncio
 async def test_exact_verified_completion_recovers_reconciling_state(manager):
     active = await downloading_job(manager.store, manager)
-    await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
+    await manager.store.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='transfer_stalled', deadline=9999999999999)
     runtime, _session = runtime_for(manager)
     await runtime._handle_transfer_complete('D1', {
         'job_id': active['job_id'], 'attempt': 1,
         'artifact_id': active['artifact']['artifact_id'], 'received_size': 1,
     })
-    assert (await manager.get_snapshot(active['job_id']))['devices']['D1']['state'] == 'validating'
+    assert (await manager.store.get_snapshot(active['job_id']))['devices']['D1']['state'] == 'validating'
 
 
 @pytest.mark.asyncio
 async def test_success_after_cancelled_absence_was_missed_settles_exact_result(manager):
     active = await downloading_job(manager.store, manager)
-    await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
+    await manager.store.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=1)
     await manager.cancel_interrupted(active['job_id'], 'D1')
     await manager.mark_unconfirmed(active['job_id'], 'D1', None, 'timeout', observed_now=2)
@@ -416,7 +416,7 @@ async def test_success_after_cancelled_absence_was_missed_settles_exact_result(m
         'job_id': active['job_id'], 'attempt': 1, 'status': 'success',
         'added': 1, 'updated': 0, 'deleted': 0,
     }, session)
-    settled = await manager.get_snapshot(active['job_id'])
+    settled = await manager.store.get_snapshot(active['job_id'])
     assert settled['devices']['D1']['state'] == 'succeeded'
     assert settled['devices']['D1']['result']['added'] == 1
     assert session.ws.messages[-1]['accepted'] is True

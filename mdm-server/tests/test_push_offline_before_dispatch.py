@@ -61,7 +61,7 @@ async def test_never_dispatched_work_fails_and_pending_resume_waits(manager):
     for device in ('NEW', 'SLOT', 'RESUME', 'WAIT'):
         await manager.settle_offline_before_dispatch(device)
 
-    devices = (await manager.get_snapshot(job_id))['devices']
+    devices = (await manager.store.get_snapshot(job_id))['devices']
     for device in ('NEW', 'SLOT'):
         assert devices[device]['state'] == 'failed'
         assert devices[device]['failure']['code'] == 'device_offline_before_dispatch'
@@ -80,7 +80,7 @@ async def test_never_dispatched_work_fails_and_pending_resume_waits(manager):
 async def test_undispatched_job_is_left_for_its_dispatch_check(manager):
     job_id = await _ready_job(manager, ['D1'], dispatch=False)
     assert await manager.settle_offline_before_dispatch('D1') == []
-    assert (await manager.get_snapshot(job_id))['devices']['D1']['state'] == 'queued'
+    assert (await manager.store.get_snapshot(job_id))['devices']['D1']['state'] == 'queued'
 
 
 @pytest.mark.asyncio
@@ -107,7 +107,7 @@ async def test_repeated_prepare_dispatch_still_rejects_already_dispatching(manag
     with pytest.raises(StoreConflict):
         await manager.prepare_dispatch(job_id, 'D1', accept_deadline=456)
 
-    current = await manager.get_snapshot(job_id)
+    current = await manager.store.get_snapshot(job_id)
     assert current == first
 
 
@@ -137,7 +137,7 @@ async def test_dispatch_skips_devices_that_are_offline(manager):
     runtime.publish = publish
     assert await runtime.handle_admin_message(Ws(), {'type': 'PUSH_FILES', 'job_id': job_id})
 
-    devices = (await manager.get_snapshot(job_id))['devices']
+    devices = (await manager.store.get_snapshot(job_id))['devices']
     assert devices['ON']['state'] == 'queued'
     assert devices['OFF']['state'] == 'failed'
     assert devices['OFF']['failure']['code'] == 'device_offline_before_dispatch'
@@ -147,7 +147,7 @@ async def test_dispatch_skips_devices_that_are_offline(manager):
 @pytest.mark.asyncio
 async def test_retry_failed_targets_only_online_devices(manager, tmp_path):
     job_id = await _ready_job(manager, ['ON', 'OFF'])
-    artifact = (await manager.get_snapshot(job_id))['artifact']
+    artifact = (await manager.store.get_snapshot(job_id))['artifact']
     (tmp_path / (artifact['artifact_id'] + '.zip')).write_bytes(b'a')
     await manager.store._call(lambda conn: conn.execute(
         "UPDATE push_artifacts SET storage_name=? WHERE artifact_id=?",
@@ -164,7 +164,7 @@ async def test_retry_failed_targets_only_online_devices(manager, tmp_path):
         job_id, str(uuid.uuid4()), artifact_root=tmp_path, online_devices={'ON'},
     )
     assert set(retry['devices']) == {'ON'}
-    original = (await manager.get_snapshot(job_id))['devices']
+    original = (await manager.store.get_snapshot(job_id))['devices']
     assert original['OFF']['retry_job_id'] is None
     _, later = await manager.retry_failed(
         job_id, str(uuid.uuid4()), artifact_root=tmp_path, online_devices={'OFF'},
@@ -183,7 +183,7 @@ async def test_lost_acceptance_replays_only_while_the_device_stays_connected(man
     assert (await manager.reconcile_report(job_id, 'STAYED', 1, 'absent', None, None))[0] == 'requeued'
     outcome, _ = await manager.reconcile_report(job_id, 'LEFT', 1, 'absent', None, None)
     assert outcome == 'interrupted'
-    devices = (await manager.get_snapshot(job_id))['devices']
+    devices = (await manager.store.get_snapshot(job_id))['devices']
     assert devices['STAYED']['state'] == 'queued'
     assert devices['LEFT']['state'] == 'interrupted'
 
@@ -195,16 +195,16 @@ async def test_disconnect_withdraws_a_pending_operator_resume(manager):
                queue_reason='resumable_replay', reconciliation_reason='device_disconnect',
                dispatch_capability_snapshot_json='["push_job_id_v1","push_resume_v1"]')
     await manager.settle_offline_before_dispatch('D1')
-    device = (await manager.get_snapshot(job_id))['devices']['D1']
+    device = (await manager.store.get_snapshot(job_id))['devices']['D1']
     assert (device['state'], device['queue_reason']) == ('reconciling', 'device_offline')
     assert device['manual_wait'] and device['resume_required']
 
-    artifact_id = (await manager.get_snapshot(job_id))['artifact']['artifact_id']
+    artifact_id = (await manager.store.get_snapshot(job_id))['artifact']['artifact_id']
     outcome, _ = await manager.resume_interrupted(
         job_id, 'D1', attempt=1, artifact_id=artifact_id, dispatch_revision=1,
         validated_offset=0, reason='client_restarted',
     )
     assert outcome == 'requeued'
-    device = (await manager.get_snapshot(job_id))['devices']['D1']
+    device = (await manager.store.get_snapshot(job_id))['devices']['D1']
     assert (device['state'], device['queue_reason']) == ('queued', 'device_offline')
     assert await manager.claim_next(['D1']) is None

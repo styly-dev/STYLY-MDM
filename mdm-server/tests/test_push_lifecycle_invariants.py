@@ -33,6 +33,7 @@ def _registration_runtime(manager, ws):
     runtime.pending_disconnects = set()
     runtime.disconnect_recovery_tasks = {}
     runtime.manager = manager
+    runtime.store = manager.store
     runtime.sessions = {}
     runtime.device_locks = {}
     runtime.registration_candidates = {"D1": ws}
@@ -309,7 +310,7 @@ async def test_stalled_transfer_db_failure_releases_http_slot_then_outer_recover
     scheduler._dispatch_waiters = {}
     scheduler._stopping = False
     scheduler._wake = asyncio.Event()
-    original_mark = manager.mark_reconciling
+    original_mark = manager.store.mark_reconciling
     calls = 0
 
     async def fail_persistence_once(*args, **kwargs):
@@ -319,7 +320,7 @@ async def test_stalled_transfer_db_failure_releases_http_slot_then_outer_recover
             raise sqlite3.OperationalError("injected transient write failure")
         return await original_mark(*args, **kwargs)
 
-    manager.mark_reconciling = fail_persistence_once
+    manager.store.mark_reconciling = fail_persistence_once
     assignment = {"job": {"job_id": job_id}, "device_id": "D1", "attempt": 1}
 
     async def expire_from_slot(_assignment):
@@ -362,7 +363,7 @@ async def test_newer_success_supersedes_retry_even_with_equal_creation_time(
     await manager.store.enable_dispatch(older["job_id"])
     assert (await manager.claim_next(["D1"]))["job"]["job_id"] == older["job_id"]
     await manager.prepare_dispatch(older["job_id"], "D1", accept_deadline=now_ms() + 60_000)
-    await manager.transition_device(
+    await manager.store.transition_device(
         older["job_id"], "D1", expected={DeviceState.DISPATCHING},
         target=DeviceState.DOWNLOADING,
     )
@@ -373,7 +374,7 @@ async def test_newer_success_supersedes_retry_even_with_equal_creation_time(
     await manager.store.enable_dispatch(newer["job_id"])
     assert (await manager.claim_next(["D1"]))["job"]["job_id"] == newer["job_id"]
     await manager.prepare_dispatch(newer["job_id"], "D1", accept_deadline=now_ms() + 60_000)
-    await manager.transition_device(
+    await manager.store.transition_device(
         newer["job_id"], "D1", expected={DeviceState.DISPATCHING},
         target=DeviceState.DOWNLOADING,
     )
@@ -382,7 +383,7 @@ async def test_newer_success_supersedes_retry_even_with_equal_creation_time(
     artifact = await manager.store.artifact_record(older["artifact"]["artifact_id"])
     older_path = tmp_path / artifact["storage_name"]
     older_path.write_bytes(b"x")
-    original = await manager.get_snapshot(older["job_id"])
+    original = await manager.store.get_snapshot(older["job_id"])
     assert original["devices"]["D1"]["retryable"] is False
 
     with pytest.raises(StoreConflict, match="no unsuccessful targets to retry"):
@@ -405,12 +406,13 @@ async def test_slow_artifact_gc_does_not_delay_reconciliation_deadline(
     manager, tmp_path, monkeypatch
 ):
     active = await downloading_job(manager.store, manager)
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         active["job_id"], "D1", expected={DeviceState.DOWNLOADING},
         reason="device_disconnect", deadline=now_ms() - 1,
     )
     runtime = object.__new__(PushRuntime)
     runtime.manager = manager
+    runtime.store = manager.store
     runtime.leases = PushTransferLeases()
     runtime.transfers = TransferRegistry()
     runtime.sessions = {}
@@ -428,7 +430,7 @@ async def test_slow_artifact_gc_does_not_delay_reconciliation_deadline(
         assert release_gc.wait(timeout=2)
         return []
 
-    manager.gc_artifacts_sync = block_gc
+    manager.store.gc_artifacts_sync = block_gc
     expired = asyncio.Event()
     original_unconfirmed = manager.mark_unconfirmed
 
@@ -472,7 +474,7 @@ async def test_shutdown_waits_for_artifact_gc_thread_before_closing_store(
         finally:
             gc_finished.set()
 
-    runtime.manager.gc_artifacts_sync = block_gc
+    runtime.store.gc_artifacts_sync = block_gc
     store_closed_after_gc = []
     original_close = runtime.store.close
     original_shield = asyncio.shield

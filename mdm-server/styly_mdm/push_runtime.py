@@ -326,7 +326,7 @@ class PushRuntime:
                 log.exception("Could not remove orphan Push artifact %s", storage_name)
         self.startup_orphan_artifacts.clear()
         await asyncio.to_thread(
-            self.manager.gc_artifacts_sync,
+            self.store.gc_artifacts_sync,
             self.artifacts.artifact_root,
             retry_window_ms=int(self.artifact_retry_window * 1000),
         )
@@ -931,7 +931,7 @@ class PushRuntime:
                 accept_timeout_ms=int(self.accept_reconciliation_timeout * 1000),
                 reconciliation_timeout_ms=int(self.reconciliation_timeout * 1000),
             ))
-        active = await self.manager.active_assignment_for_device(device_id)
+        active = await self.store.active_assignment_for_device(device_id)
         return bool(active and active["state"] == DeviceState.RECONCILING.value)
 
     async def _after_registration(
@@ -1105,7 +1105,7 @@ class PushRuntime:
             }:
                 try:
                     snapshots.append(
-                        await self.manager.transition_device(
+                        await self.store.transition_device(
                             job_id,
                             device_id,
                             expected={current},
@@ -1980,7 +1980,7 @@ class PushRuntime:
         session = self.sessions.get(device_id)
         if session is None or self.scheduler is None:
             return
-        active = await self.manager.active_assignment_for_device(device_id)
+        active = await self.store.active_assignment_for_device(device_id)
         if active and active["state"] == DeviceState.RECONCILING.value:
             snapshot = await self.store.get_snapshot(active["job_id"])
             await self.scheduler.send_reconcile(session, snapshot, device_id)
@@ -2093,7 +2093,7 @@ class PushRuntime:
         while True:
             await asyncio.sleep(self.artifact_gc_interval)
             work = asyncio.create_task(asyncio.to_thread(
-                self.manager.gc_artifacts_sync, self.artifacts.artifact_root,
+                self.store.gc_artifacts_sync, self.artifacts.artifact_root,
                 retry_window_ms=int(self.artifact_retry_window * 1000),
             ))
             try:

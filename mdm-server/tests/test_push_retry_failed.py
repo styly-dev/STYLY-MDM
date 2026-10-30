@@ -45,7 +45,7 @@ async def completed(manager, root):
             conn.execute('UPDATE push_job_devices SET state=?, failure_code=? WHERE job_id=? AND device_id=?', (state, code, job_id, device))
         conn.execute("INSERT INTO push_device_fences(device_id,blocking_job_id,blocking_attempt,protocol_mode,reason,created_at,updated_at) VALUES ('unknown',?,1,'job_v1','timeout',1,1)", (job_id,))
     await manager.store._call(settle)
-    return await manager.get_snapshot(job_id)
+    return await manager.store.get_snapshot(job_id)
 
 
 @pytest.mark.asyncio
@@ -60,7 +60,7 @@ async def test_retry_selects_unsuccessful_targets_preserving_history_and_fence(m
     for device in retry['devices'].values():
         assert device['state'] == 'queued' and device['attempt'] == 1
         assert device['failure'] is None
-    previous = await manager.get_snapshot(original['job_id'])
+    previous = await manager.store.get_snapshot(original['job_id'])
     for device in original['devices']:
         assert previous['devices'][device]['state'] == original['devices'][device]['state']
         assert previous['devices'][device]['retry_job_id'] == (retry['job_id'] if device in retry['devices'] else None)
@@ -101,7 +101,7 @@ async def test_retry_ready_job_prevents_gc_past_original_deadline(manager, tmp_p
     original = await completed(manager, tmp_path)
     await manager.store._call(lambda conn: conn.execute("UPDATE push_job_devices SET state='failed' WHERE device_id='active'"))
     _, retry = await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
-    assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms() + 1) == []
+    assert manager.store.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms() + 1) == []
     assert (tmp_path / (retry['artifact']['artifact_id'] + '.zip')).is_file()
 
 
@@ -127,9 +127,9 @@ async def test_shared_artifact_gc_uses_latest_reference_end(manager, tmp_path, t
                      (terminal_at, retry['job_id']))
     await manager.store._call(finish)
     assert (await manager.store.artifact_record(artifact_id))['retention_state'] == 'retained'
-    assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=100, timestamp=299) == []
+    assert manager.store.gc_artifacts_sync(tmp_path, retry_window_ms=100, timestamp=299) == []
     assert (tmp_path / (artifact_id + '.zip')).is_file()
-    assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=100, timestamp=300) == [artifact_id]
+    assert manager.store.gc_artifacts_sync(tmp_path, retry_window_ms=100, timestamp=300) == [artifact_id]
     assert not (tmp_path / (artifact_id + '.zip')).exists()
 
 
@@ -142,7 +142,7 @@ async def test_old_failure_cannot_be_retried_twice_but_new_failure_can(manager, 
     await manager.store._call(lambda conn: conn.execute("UPDATE push_job_devices SET state='failed' WHERE job_id=?", (retry['job_id'],)))
     _, again = await manager.retry_failed(retry['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
     assert set(again['devices']) == set(retry['devices'])
-    assert (await manager.get_snapshot(retry['job_id']))['devices']['failed']['retry_job_id'] == again['job_id']
+    assert (await manager.store.get_snapshot(retry['job_id']))['devices']['failed']['retry_job_id'] == again['job_id']
 
 
 @pytest.mark.asyncio
@@ -162,7 +162,7 @@ async def test_retry_skips_targets_superseded_by_later_work_for_same_destination
         'UPDATE push_jobs SET created_at=? WHERE job_id=?',
         (original['created_at'] + 1000, newer['job_id'])))
     # Pending newer work supersedes the old targets: retrying them would overwrite it.
-    current = await manager.get_snapshot(original['job_id'])
+    current = await manager.store.get_snapshot(original['job_id'])
     assert {d for d, a in current['devices'].items() if a['retryable']} == {'unknown'}
     _, retry = await manager.retry_failed(
         original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
@@ -187,7 +187,7 @@ async def test_never_dispatched_later_failure_does_not_supersede_retry(manager, 
                      "WHERE job_id=?", (newer['job_id'],))
 
     await manager.store._call(fail_before_dispatch)
-    current = await manager.get_snapshot(original['job_id'])
+    current = await manager.store.get_snapshot(original['job_id'])
     assert current['devices']['failed']['retryable'] is True
 
 
@@ -201,7 +201,7 @@ async def test_newer_work_publishes_retry_eligibility_revisions(manager, tmp_pat
     await manager.store._call(lambda conn: conn.execute(
         "UPDATE push_job_devices SET state='succeeded' WHERE job_id=? AND device_id='active'",
         (original['job_id'],)))
-    original = await manager.get_snapshot(original['job_id'])
+    original = await manager.store.get_snapshot(original['job_id'])
     runtime, _ = runtime_for(manager)
     del runtime.publish
     await runtime.publish(original)
@@ -225,7 +225,7 @@ async def test_newer_work_publishes_retry_eligibility_revisions(manager, tmp_pat
         await manager.store.start_upload(newer['job_id'])
         if ending == 'startup':
             manager.store.recover_startup_sync(accept_reconciliation_timeout_ms=1000, reconciliation_timeout_ms=1000)
-            settled = await manager.get_snapshot(newer['job_id'])
+            settled = await manager.store.get_snapshot(newer['job_id'])
         else:
             await manager.store.mark_packaging(newer['job_id'], 1, 4)
             await manager.store.publish_artifact(newer['job_id'], {
@@ -245,7 +245,7 @@ async def test_newer_work_publishes_retry_eligibility_revisions(manager, tmp_pat
     assert restored['terminal_at'] == original['terminal_at']
     assert restored['updated_at'] == original['updated_at']
     await runtime.publish(settled)
-    assert await manager.get_snapshot(original['job_id']) == restored
+    assert await manager.store.get_snapshot(original['job_id']) == restored
 
 
 @pytest.mark.asyncio
@@ -266,7 +266,7 @@ async def test_retry_dependency_revision_failure_rolls_back_new_job(manager, tmp
             await manager.store.create_job(request, {'failed': (ProtocolMode.JOB_V1, [])}, 60000)
     finally:
         await manager.store._call(lambda conn: conn.set_authorizer(lambda *_args: sqlite3.SQLITE_OK))
-    assert await manager.get_snapshot(original['job_id']) == original
+    assert await manager.store.get_snapshot(original['job_id']) == original
     assert await manager.store._call(lambda conn: conn.execute('SELECT COUNT(*) FROM push_jobs').fetchone()[0]) == 1
 
 
@@ -288,7 +288,7 @@ async def test_publish_uses_committed_retry_snapshots_without_db_access(manager,
     from test_push_cancellation import runtime_for
     original = await completed(manager, tmp_path)
     _, newer = await create_newer(manager, original)
-    expected = await manager.get_snapshot(original['job_id'])
+    expected = await manager.store.get_snapshot(original['job_id'])
     runtime, _ = runtime_for(manager)
     del runtime.publish
 
@@ -333,7 +333,7 @@ async def test_retry_publications_roll_back_with_transaction(manager, tmp_path, 
                 await create_newer(manager, original)
         finally:
             await manager.store._call(lambda conn: conn.set_authorizer(lambda *_args: sqlite3.SQLITE_OK))
-    assert await manager.get_snapshot(original['job_id']) == original
+    assert await manager.store.get_snapshot(original['job_id']) == original
     assert manager.store.take_retry_publications() == []
     assert notifications == []
     # A later successful transaction must not pick up rolled-back invalidations.
@@ -364,7 +364,7 @@ async def test_cancelled_mutation_keeps_committed_retry_publications(manager, tm
     finally:
         release.set()
         await asyncio.gather(mutation, return_exceptions=True)
-    expected = await manager.get_snapshot(original['job_id'])
+    expected = await manager.store.get_snapshot(original['job_id'])
     runtime, _ = runtime_for(manager)
     del runtime.publish
     # Even an unrelated publication recovers the notice of the committed mutation.
@@ -380,7 +380,7 @@ async def test_retry_publications_coalesce_to_final_committed_revision(manager, 
     original = await completed(manager, tmp_path)
     _, newer = await create_newer(manager, original)
     await manager.store.fail_pre_dispatch(newer['job_id'], JobState.FAILED, 'upload_failed', 'failed upload')
-    expected = await manager.get_snapshot(original['job_id'])
+    expected = await manager.store.get_snapshot(original['job_id'])
     runtime, _ = runtime_for(manager)
     del runtime.publish
     await runtime.publish(newer)

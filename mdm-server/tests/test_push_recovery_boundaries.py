@@ -17,7 +17,7 @@ from test_push_review_connection import downloading_job, ready_job, Ws
 
 async def expired_assignment(manager):
     job = await downloading_job(manager.store, manager)
-    await manager.mark_reconciling(job['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
+    await manager.store.mark_reconciling(job['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=1)
     # An older Resume authorization must not survive the unknown-outcome deadline.
     await manager.store.enable_dispatch(job['job_id'], ['D1'])
@@ -46,24 +46,24 @@ async def test_timeout_retains_bytes_and_recovers_only_after_exact_interruption(
     if restart:
         manager.store.recover_startup_sync(accept_reconciliation_timeout_ms=1000,
                                           reconciliation_timeout_ms=1000)
-    terminal_at = (await manager.get_snapshot(job['job_id']))['terminal_at']
-    assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=7*86_400_000, timestamp=terminal_at+7*86_400_000-1) == []
+    terminal_at = (await manager.store.get_snapshot(job['job_id']))['terminal_at']
+    assert manager.store.gc_artifacts_sync(tmp_path, retry_window_ms=7*86_400_000, timestamp=terminal_at+7*86_400_000-1) == []
     assert path.exists()
     assert await manager.claim_next(['D1']) is None
-    before = await manager.get_snapshot(other['job_id'])
+    before = await manager.store.get_snapshot(other['job_id'])
     outcome, snapshots = await manager.resume_interrupted(job_id, 'D1', **evidence(job))
     assert outcome == 'requeued'
     assert {snapshot['job_id'] for snapshot in snapshots} == {job_id, other['job_id']}
-    current = await manager.get_snapshot(job_id)
+    current = await manager.store.get_snapshot(job_id)
     row = current['devices']['D1']
     assert row['state'] == 'queued' and row['resume_required']
     assert row['dispatch_revision'] == evidence(job)['dispatch_revision']
     assert row['validated_offset'] == 1
     assert current['terminal_at'] is None
     assert await manager.fenced_assignment_for_device('D1') is None
-    assert (await manager.get_snapshot(other['job_id']))['revision'] > before['revision']
+    assert (await manager.store.get_snapshot(other['job_id']))['revision'] > before['revision']
     # Recovered queued ownership protects the bytes even after the terminal window.
-    assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms()+1) == []
+    assert manager.store.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms()+1) == []
     assert path.exists()
     assert await manager.claim_next(['D1']) is None
     await manager.store.enable_dispatch(job_id, ['D1'])
@@ -98,10 +98,10 @@ async def test_timeout_does_not_resurrect_invalid_or_superseded_work(manager, tm
         fields['dispatch_revision'] += 1
     else:
         fields['phase'] = 'applying' if invalid == 'applying' else None
-    before = await manager.get_snapshot(job_id)
+    before = await manager.store.get_snapshot(job_id)
     outcome, _ = await manager.resume_interrupted(job_id, 'D1', **fields)
     assert outcome == 'rejected'
-    assert await manager.get_snapshot(job_id) == before
+    assert await manager.store.get_snapshot(job_id) == before
 
 
 @pytest.mark.asyncio
@@ -109,16 +109,16 @@ async def test_timeout_artifact_expiry_rejects_resume_without_clearing_fence(man
     job = await expired_assignment(manager)
     path = tmp_path / (await manager.store.artifact_record(job['artifact']['artifact_id']))['storage_name']
     path.write_bytes(b'x')
-    terminal_at = (await manager.get_snapshot(job['job_id']))['terminal_at']
-    assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=7*86_400_000, timestamp=terminal_at+7*86_400_000-1) == []
-    before = await manager.get_snapshot(job['job_id'])
+    terminal_at = (await manager.store.get_snapshot(job['job_id']))['terminal_at']
+    assert manager.store.gc_artifacts_sync(tmp_path, retry_window_ms=7*86_400_000, timestamp=terminal_at+7*86_400_000-1) == []
+    before = await manager.store.get_snapshot(job['job_id'])
     fence = await manager.fenced_assignment_for_device('D1')
     assert fence is not None
-    assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=7*86_400_000, timestamp=terminal_at+7*86_400_000) == [job['artifact']['artifact_id']]
+    assert manager.store.gc_artifacts_sync(tmp_path, retry_window_ms=7*86_400_000, timestamp=terminal_at+7*86_400_000) == [job['artifact']['artifact_id']]
     assert not path.exists()
     outcome, _ = await manager.resume_interrupted(job['job_id'], 'D1', **evidence(job))
     assert outcome == 'rejected'
-    current = await manager.get_snapshot(job['job_id'])
+    current = await manager.store.get_snapshot(job['job_id'])
     assert current['devices']['D1']['state'] == before['devices']['D1']['state'] == 'unconfirmed'
     assert current['devices']['D1']['dispatch_revision'] == before['devices']['D1']['dispatch_revision']
     assert await manager.fenced_assignment_for_device('D1') == fence
@@ -131,7 +131,7 @@ async def test_transient_dispatch_failures_preserve_resume_and_release_resources
     async with _ready(tmp_path) as (manager, caps, job, _claimed):
         job_id = job['job_id']
         prior = await manager.prepare_dispatch(job_id, 'D1', accept_deadline=now_ms()+1000)
-        await manager.transition_device(job_id, 'D1', expected={DeviceState.DISPATCHING},
+        await manager.store.transition_device(job_id, 'D1', expected={DeviceState.DISPATCHING},
                                        target=DeviceState.DOWNLOADING, fields={'accepted_at': now_ms()})
         fields = evidence(prior)
         fields['reason'] = 'download_interrupted'
@@ -188,7 +188,7 @@ async def test_transient_dispatch_failures_preserve_resume_and_release_resources
                       'status': 'interrupted', 'phase': 'downloading', 'reason': 'server_lease_revoked'}
             await runtime._handle_reconcile_report(live, 'D1', report)
             assert not any(m['type'] == 'PUSH_RESUME_REJECTED' for m in ws.messages)
-            current = await manager.get_snapshot(job_id)
+            current = await manager.store.get_snapshot(job_id)
             assert current['devices']['D1']['resume_required']
             assert current['devices']['D1']['validated_offset'] == 1
             assert await manager.claim_next(['D1']) is None
@@ -215,7 +215,7 @@ async def test_permanent_identity_rejection_still_fails(manager, late):
     await manager.claim_next(['D1'])
     await manager.prepare_dispatch(job['job_id'], 'D1', accept_deadline=now_ms()+1000)
     if late:
-        await manager.mark_reconciling(job['job_id'], 'D1', expected={DeviceState.DISPATCHING},
+        await manager.store.mark_reconciling(job['job_id'], 'D1', expected={DeviceState.DISPATCHING},
                                        reason='accept_timeout', deadline=now_ms()+1000)
     runtime, session = runtime_for(manager)
     scheduler = _scheduler(manager, runtime.transfers, runtime.leases, runtime.sessions, asyncio.Semaphore(1))
@@ -266,7 +266,7 @@ async def test_interrupted_decision_is_shared(manager, route, case):
         assert not replies
         row = await manager.assignment(job['job_id'], 'D1')
         assert row['state'] == 'queued'
-        assert (await manager.get_snapshot(job['job_id']))['devices']['D1']['resume_required']
+        assert (await manager.store.get_snapshot(job['job_id']))['devices']['D1']['resume_required']
     if case in {'unknown', 'artifact'}:
         assert await manager.fenced_assignment_for_device('D1') is not None
 
@@ -303,7 +303,7 @@ async def test_failed_unknown_rejection_replays_without_releasing_fence(manager)
 @pytest.mark.parametrize('phase', [None, 'downloading', 'validating'])
 async def test_late_ack_requires_download_lease(manager, lease_present, phase):
     job = await downloading_job(manager.store, manager)
-    await manager.mark_reconciling(job['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
+    await manager.store.mark_reconciling(job['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='command_send_failed', deadline=now_ms()+10000)
     runtime, session = runtime_for(manager)
     runtime.scheduler = None
@@ -352,7 +352,7 @@ def test_malformed_push_state_status_is_not_hashable_input(status):
 @pytest.mark.parametrize('reason', ['command_accept_timeout', 'disconnect_before_accept'])
 async def test_stall_preserves_current_db_deadline_and_expires_on_time(manager, reason):
     job = await downloading_job(manager.store, manager)
-    await manager.mark_reconciling(job['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
+    await manager.store.mark_reconciling(job['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason=reason, deadline=10)
     # The watchdog must read the authoritative deadline inside its transaction,
     # even when the dispatch task has older timeout information.

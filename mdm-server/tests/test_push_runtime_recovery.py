@@ -44,13 +44,13 @@ async def active_job(runtime, device_id, phase="downloading"):
     await store.enable_dispatch(job_id)
     assert await manager.claim_next([device_id]) is not None
     await manager.prepare_dispatch(job_id, device_id, accept_deadline=now_ms() + 60_000)
-    await manager.transition_device(job_id, device_id, expected={DeviceState.DISPATCHING},
+    await manager.store.transition_device(job_id, device_id, expected={DeviceState.DISPATCHING},
         target=DeviceState.DOWNLOADING, fields={"accepted_at": now_ms(), "accept_deadline": None})
     if phase in {"validating", "applying"}:
-        await manager.transition_device(job_id, device_id, expected={DeviceState.DOWNLOADING},
+        await manager.store.transition_device(job_id, device_id, expected={DeviceState.DOWNLOADING},
             target=DeviceState.VALIDATING)
     if phase == "applying":
-        await manager.transition_device(job_id, device_id, expected={DeviceState.VALIDATING},
+        await manager.store.transition_device(job_id, device_id, expected={DeviceState.VALIDATING},
             target=DeviceState.APPLYING)
     return await store.get_snapshot(job_id)
 
@@ -84,7 +84,7 @@ async def test_registration_ack_precedes_exact_resume_rejection(known):
         device_id = str(uuid.uuid4())
         if known:
             job = await active_job(runtime, device_id)
-            await runtime.manager.transition_device(job["job_id"], device_id,
+            await runtime.store.transition_device(job["job_id"], device_id,
                 expected={DeviceState.DOWNLOADING}, target=DeviceState.FAILED,
                 fields={"failure_code": "artifact_identity_mismatch"})
             report = interrupted_report(job, device_id)
@@ -137,7 +137,7 @@ async def test_device_reconcile_send_failure_keeps_admin_socket_open(monkeypatch
         device_id, device = await _registered(client, str(test_server.make_url("")), CAPS)
         await runtime.scheduler.stop()
         job = await active_job(runtime, device_id)
-        await runtime.manager.mark_reconciling(job["job_id"], device_id,
+        await runtime.store.mark_reconciling(job["job_id"], device_id,
             expected={DeviceState.DOWNLOADING}, reason="device_disconnect", deadline=now_ms() + 60_000)
         live = runtime.sessions[device_id]
         original_send = live.ws.send_str
@@ -224,7 +224,7 @@ async def test_timeout_interruption_recovers_over_real_socket_without_auto_dispa
         await runtime.scheduler.stop()
         device_id = str(uuid.uuid4())
         job = await active_job(runtime, device_id)
-        await runtime.manager.mark_reconciling(job["job_id"], device_id,
+        await runtime.store.mark_reconciling(job["job_id"], device_id,
             expected={DeviceState.DOWNLOADING}, reason="device_disconnect", deadline=1)
         await runtime.manager.mark_unconfirmed(job["job_id"], device_id, None,
             "offline timeout", expected_deadline=1, observed_now=2)
@@ -253,7 +253,7 @@ async def test_initial_registration_ack_failure_settles_adopted_state(monkeypatc
         await runtime.scheduler.stop()
         device_id = str(uuid.uuid4())
         job = await active_job(runtime, device_id, phase)
-        await runtime.manager.mark_reconciling(job['job_id'], device_id,
+        await runtime.store.mark_reconciling(job['job_id'], device_id,
             expected={DeviceState(phase)}, reason='device_disconnect', deadline=now_ms()+60000)
         original_send = RuntimeWebSocketResponse.send_str
         failed = asyncio.Event()

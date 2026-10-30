@@ -64,7 +64,7 @@ async def downloading_job(store, manager):
         "D1",
         accept_deadline=now_ms() + 60_000,
     )
-    return await manager.transition_device(
+    return await manager.store.transition_device(
         job_id,
         "D1",
         expected={DeviceState.DISPATCHING},
@@ -113,12 +113,13 @@ class RegistrationManager:
 
     def __init__(self):
         self.clear_calls = 0
+        self.store = types.SimpleNamespace(active_assignment_for_device=self._active_assignment_for_device)
 
     async def clear_fence_on_process_replacement(self, *_args):
         self.clear_calls += 1
         return []
 
-    async def active_assignment_for_device(self, _device_id):
+    async def _active_assignment_for_device(self, _device_id):
         return None
 
     async def reconcile_missing_runtime(self, *_args, **_kwargs):
@@ -131,6 +132,7 @@ def runtime_for(manager):
     runtime.disconnect_recovery_tasks = {}
     runtime.artifact_gc_task = None
     runtime.manager = manager
+    runtime.store = manager.store
     runtime.transfers = TransferRegistry()
     runtime.scheduler = None
     runtime.send_timeout = 1
@@ -205,7 +207,7 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
     runtime.transfers.register(key, old_transfer)
     await send_report()
     assert old_transfer.result() == "resumable_replay"
-    paused = await manager.get_snapshot(job_id)
+    paused = await manager.store.get_snapshot(job_id)
     assert paused["devices"]["D1"]["state"] == "queued"
     assert paused["devices"]["D1"]["validated_offset"] == 1
     assert paused["dispatch_enabled"] is (reason is not None)
@@ -220,15 +222,15 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
     assert await manager.claim_next(["D1"]) is None
     # Disconnect does not rewrite queued state: repeated REGISTER/reconcile
     # must retain it without a rejection or a revision change.
-    assert await manager.active_assignment_for_device("D1") is None
+    assert await manager.store.active_assignment_for_device("D1") is None
     await send_report()
     await send_report()
-    assert await manager.get_snapshot(job_id) == paused
+    assert await manager.store.get_snapshot(job_id) == paused
     assert runtime.scheduler.wake_count == int(reason is not None and report_path == "reconcile")
 
     await manager.store.enable_dispatch(job_id, ["D1"])
     await send_report()  # Do not re-pause after the operator authorizes Resume.
-    assert (await manager.get_snapshot(job_id))["dispatch_enabled"] is True
+    assert (await manager.store.get_snapshot(job_id))["dispatch_enabled"] is True
     assert await manager.claim_next(["D1"]) is not None
     replacement = asyncio.get_running_loop().create_future()
     runtime.transfers.register(key, replacement)
@@ -238,9 +240,9 @@ async def test_interrupted_reports_preserve_paused_work_and_replacement_slot(
                 job_id, "D1",
                 accept_deadline=now_ms() + 60_000,
             )
-        before = await manager.get_snapshot(job_id)
+        before = await manager.store.get_snapshot(job_id)
         await send_report()
-        assert await manager.get_snapshot(job_id) == before
+        assert await manager.store.get_snapshot(job_id) == before
         assert not replacement.done()
         assert runtime.transfers.get(key) is replacement
     command = PushScheduler._command(
@@ -309,7 +311,7 @@ async def test_paused_resume_can_expire_without_another_dispatch(manager):
     expired = await store.get_snapshot(job_id)
     assert expired["devices"]["D1"]["state"] == "failed"
     assert (await manager.assignment(job_id, "D1"))["failure_code"] == "resume_expired"
-    assert await manager.active_assignment_for_device("D1") is None
+    assert await manager.store.active_assignment_for_device("D1") is None
 
 
 @pytest.mark.asyncio
@@ -322,7 +324,7 @@ async def test_unversioned_interrupted_report_waits_for_absent_reconciliation(ma
         "WHERE job_id=? AND device_id='D1'",
         (job_id,),
     ))
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id, "D1", expected={DeviceState.DOWNLOADING},
         reason="device_disconnect", deadline=now_ms() + 60_000,
     )
@@ -361,7 +363,7 @@ async def test_interrupted_report_requires_integer_identity_fields(manager, fiel
         "WHERE job_id=? AND device_id='D1'",
         (job_id,),
     ))
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id, "D1", expected={DeviceState.DOWNLOADING},
         reason="device_disconnect", deadline=now_ms() + 60_000,
     )
@@ -403,7 +405,7 @@ async def test_interrupted_reconcile_uses_job_v1_revision_not_capability_snapsho
         "WHERE job_id=? AND device_id='D1'",
         (dispatch_capabilities_json, job_id),
     ))
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id,
         "D1",
         expected={DeviceState.DOWNLOADING},
@@ -536,6 +538,8 @@ async def test_failed_interrupted_reconciliation_returns_permanent_disposition()
     artifact_id = str(uuid.uuid4())
 
     class Manager:
+        store = types.SimpleNamespace()
+
         async def clear_matching_opaque_fence(self, *_args):
             return False, []
 
@@ -597,7 +601,7 @@ async def test_operator_resume_reconciles_recovered_state_before_dispatch(manage
     store = manager.store
     active = await downloading_job(store, manager)
     job_id = active["job_id"]
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id,
         "D1",
         expected={DeviceState.DOWNLOADING},
@@ -902,6 +906,7 @@ async def test_current_register_is_bound_to_legacy_owner():
     runtime.artifact_gc_task = None
     runtime.legacy = types.SimpleNamespace(devices={"D1": {"ws": ws}})
     runtime.manager = manager
+    runtime.store = manager.store
     runtime.sessions = {}
     runtime.device_locks = {}
     runtime.registration_candidates = {"D1": ws}
@@ -1026,7 +1031,7 @@ async def test_registration_active_report_preserves_offline_timeout_fence(tmp_pa
         active = await downloading_job(store, manager)
         job_id = active["job_id"]
         artifact_id = active["artifact"]["artifact_id"]
-        await manager.mark_reconciling(
+        await manager.store.mark_reconciling(
             job_id,
             "D1",
             expected={DeviceState.DOWNLOADING},
@@ -1074,7 +1079,7 @@ async def test_registration_active_report_preserves_offline_timeout_fence(tmp_pa
             "http://server",
         )
 
-        fenced = await manager.get_snapshot(job_id)
+        fenced = await manager.store.get_snapshot(job_id)
         assert fenced["devices"]["D1"]["device_fence"] is not None
         assert await manager.claim_next(["D1"]) is None
     finally:
@@ -1216,6 +1221,7 @@ async def test_registration_active_artifact_conflict_fails_and_fences(tmp_path):
         runtime.disconnect_recovery_tasks = {}
         runtime.artifact_gc_task = None
         runtime.manager = manager
+        runtime.store = manager.store
         session = LiveSession(
             device_id="D1",
             session_id="session",
@@ -1235,7 +1241,7 @@ async def test_registration_active_artifact_conflict_fails_and_fences(tmp_path):
                 "phase": "downloading",
             },
         )
-        current = await manager.get_snapshot(job_id)
+        current = await manager.store.get_snapshot(job_id)
         assert current["devices"]["D1"]["state"] == DeviceState.FAILED.value
         assert current["devices"]["D1"]["device_fence"] is not None
         assert snapshots[-1]["revision"] == current["revision"]
@@ -1252,7 +1258,7 @@ async def test_server_restart_active_registration_does_not_reuse_revoked_http_le
         active = await downloading_job(store, manager)
         job_id = active["job_id"]
         artifact_id = active["artifact"]["artifact_id"]
-        await manager.mark_reconciling(
+        await manager.store.mark_reconciling(
             job_id,
             "D1",
             expected={DeviceState.DOWNLOADING},
@@ -1322,7 +1328,7 @@ async def test_active_registration_after_offline_download_releases_transfer_slot
     active = await downloading_job(store, manager)
     job_id = active["job_id"]
     artifact_id = active["artifact"]["artifact_id"]
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id,
         "D1",
         expected={DeviceState.DOWNLOADING},
@@ -1373,7 +1379,7 @@ async def test_interrupted_registration_uses_revision_without_session_resume_cap
     active = await downloading_job(store, manager)
     job_id = active["job_id"]
     artifact_id = active["artifact"]["artifact_id"]
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id,
         "D1",
         expected={DeviceState.DOWNLOADING},
@@ -1478,14 +1484,14 @@ async def test_first_terminal_result_queues_one_canonical_update_and_duplicate_i
     try:
         active = await downloading_job(store, manager)
         job_id = active["job_id"]
-        await manager.transition_device(
+        await manager.store.transition_device(
             job_id,
             "D1",
             expected={DeviceState.DOWNLOADING},
             target=DeviceState.VALIDATING,
             fields={"transfer_completed_at": now_ms()},
         )
-        await manager.transition_device(
+        await manager.store.transition_device(
             job_id,
             "D1",
             expected={DeviceState.VALIDATING},
@@ -1785,7 +1791,7 @@ async def test_replacement_register_withdraws_pending_resume(
     capabilities = frozenset({"push_job_id_v1", "push_resume_v1"})
     active = await downloading_job(store, manager)
     job_id = active["job_id"]
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id, "D1", expected={DeviceState.DOWNLOADING},
         reason="device_disconnect", deadline=now_ms() + 60_000,
     )
@@ -1829,14 +1835,14 @@ async def test_replacement_register_withdraws_pending_resume(
             "validated_offset": 1,
         }},
     }, "http://server")
-    paused = await manager.get_snapshot(job_id)
+    paused = await manager.store.get_snapshot(job_id)
     assert paused["devices"]["D1"]["state"] == "queued"
     assert paused["devices"]["D1"]["queue_reason"] == "device_offline"
     assert paused["devices"]["D1"]["resume_required"] is True
     assert await manager.claim_next(["D1"]) is None
     # A late close from the superseded socket cannot change the new owner.
     await runtime.disconnect_device("D1", old)
-    assert await manager.get_snapshot(job_id) == paused
+    assert await manager.store.get_snapshot(job_id) == paused
     assert runtime.sessions["D1"].ws is new
     await manager.store.enable_dispatch(job_id, ["D1"])
     assert await manager.claim_next(["D1"]) is not None
@@ -1852,7 +1858,7 @@ async def test_result_racing_unconfirmed_is_settled_atomically_and_acked(
     try:
         active = await downloading_job(store, manager)
         job_id = active["job_id"]
-        await manager.mark_reconciling(
+        await manager.store.mark_reconciling(
             job_id,
             "D1",
             expected={DeviceState.DOWNLOADING},
@@ -2028,20 +2034,20 @@ async def test_legacy_result_does_not_settle_preserved_assignment(tmp_path):
                 conn.commit(),
             )
         )
-        await manager.transition_device(
+        await manager.store.transition_device(
             job_id,
             "D1",
             expected={DeviceState.DISPATCHING},
             target=DeviceState.DOWNLOADING,
             fields={"accepted_at": now_ms()},
         )
-        await manager.transition_device(
+        await manager.store.transition_device(
             job_id,
             "D1",
             expected={DeviceState.DOWNLOADING},
             target=DeviceState.VALIDATING,
         )
-        await manager.transition_device(
+        await manager.store.transition_device(
             job_id,
             "D1",
             expected={DeviceState.VALIDATING},

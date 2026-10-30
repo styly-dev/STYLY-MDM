@@ -102,7 +102,7 @@ def test_stalled_transfer_stops_http_stream_before_releasing_its_slot(monkeypatc
         scheduler = object.__new__(PushScheduler)
         scheduler.leases = leases
         scheduler.manager = SimpleNamespace(
-            active_assignment_for_device=active_assignment_for_device,
+            store=SimpleNamespace(active_assignment_for_device=active_assignment_for_device),
             mark_transfer_stalled=mark_transfer_stalled,
         )
         scheduler.publish = publish

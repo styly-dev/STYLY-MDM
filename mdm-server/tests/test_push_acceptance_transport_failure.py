@@ -71,7 +71,7 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
                 snapshot["job_id"], "D1",
                 accept_deadline=now_ms() + 1_000,
             )
-            await manager.transition_device(
+            await manager.store.transition_device(
                 snapshot["job_id"], "D1", expected={DeviceState.DISPATCHING},
                 target=DeviceState.DOWNLOADING,
                 fields={"accepted_at": now_ms(), "accept_deadline": None},
@@ -262,7 +262,7 @@ async def test_disconnect_timeout_cannot_keep_obsolete_transfer(tmp_path, change
             job_id, "D1",
             accept_deadline=deadline,
         )
-        await manager.mark_reconciling(
+        await manager.store.mark_reconciling(
             job_id, "D1", expected={DeviceState.DISPATCHING},
             reason="disconnect_before_accept", deadline=5678,
         )
@@ -298,7 +298,7 @@ async def test_disconnect_timeout_cannot_keep_obsolete_transfer(tmp_path, change
                         "UPDATE push_job_devices SET cancel_requested_at=1 "
                         "WHERE job_id=? AND device_id='D1'", (job_id,),
                     ))
-                await manager.transition_device(
+                await manager.store.transition_device(
                     job_id, "D1", expected={DeviceState.RECONCILING},
                     target=target, fields=fields,
                 )

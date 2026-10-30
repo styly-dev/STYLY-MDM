@@ -252,6 +252,7 @@ async def test_runtime_reconcile_action_targets_canonical_opaque_identity(tmp_pa
         )
         runtime = object.__new__(PushRuntime)
         runtime.manager = manager
+        runtime.store = manager.store
         runtime.scheduler = _Scheduler()
         session = LiveSession(
             device_id="D1",

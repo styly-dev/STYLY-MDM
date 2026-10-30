@@ -110,11 +110,11 @@ async def test_fence_mutation_revisions_every_visible_job(manager):
         first['job_id'], 'D1',
         accept_deadline=now_ms() + 1_000,
     )
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         first['job_id'], 'D1', expected={DeviceState.DISPATCHING},
         reason='test', deadline=now_ms(),
     )
-    before_second = await manager.get_snapshot(second['job_id'])
+    before_second = await manager.store.get_snapshot(second['job_id'])
     snapshots = await manager.mark_unconfirmed(
         first['job_id'], 'D1', 'process-a', 'test timeout',
     )
@@ -158,7 +158,7 @@ async def test_preaccept_absent_requeues_same_attempt_only_once(manager):
         job_id, 'D1',
         accept_deadline=now_ms() + 1_000,
     )
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id, 'D1', expected={DeviceState.DISPATCHING},
         reason='command_accept_timeout', deadline=now_ms() + 60_000,
     )
@@ -174,7 +174,7 @@ async def test_preaccept_absent_requeues_same_attempt_only_once(manager):
         job_id, 'D1',
         accept_deadline=now_ms() + 1_000,
     )
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id, 'D1', expected={DeviceState.DISPATCHING},
         reason='command_accept_timeout', deadline=now_ms() + 60_000,
     )
@@ -196,7 +196,7 @@ async def test_exact_absent_clears_fence_when_reconciliation_deadline_wins(manag
         job_id, 'D1',
         accept_deadline=now_ms() + 1_000,
     )
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id, 'D1', expected={DeviceState.DISPATCHING},
         reason='command_accept_timeout', deadline=now_ms(),
     )
@@ -204,11 +204,11 @@ async def test_exact_absent_clears_fence_when_reconciliation_deadline_wins(manag
     # The runtime may have observed reconciling immediately before housekeeping
     # commits unconfirmed. The exact report must still clear the matching fence.
     await manager.mark_unconfirmed(job_id, 'D1', 'process-a', 'deadline elapsed')
-    before = await manager.get_snapshot(job_id)
+    before = await manager.store.get_snapshot(job_id)
     # Interruption needs artifact/revision checks in resume_interrupted.
     with pytest.raises(StoreConflict):
         await manager.reconcile_report(job_id, 'D1', 1, 'interrupted', None, None)
-    assert await manager.get_snapshot(job_id) == before
+    assert await manager.store.get_snapshot(job_id) == before
     outcome, snapshots = await manager.reconcile_report(
         job_id, 'D1', 1, 'absent', None, None,
     )
@@ -241,7 +241,7 @@ async def test_expired_acceptance_query_tracks_only_unaccepted_dispatches(manage
         'accept_deadline': deadline,
     }]
 
-    await manager.transition_device(
+    await manager.store.transition_device(
         job_id,
         'D1',
         expected={DeviceState.DISPATCHING},
@@ -299,7 +299,7 @@ async def test_stale_expired_acceptance_cannot_reconcile_replayed_dispatch(manag
             expected_accept_deadline=first_deadline,
             reconciliation_deadline=now_ms() + 60_000,
         )
-    current = await manager.get_snapshot(job_id)
+    current = await manager.store.get_snapshot(job_id)
     assert current['devices']['D1']['state'] == DeviceState.DISPATCHING.value
     current_row = await manager.assignment(job_id, 'D1')
     assert current_row['accept_deadline'] == second_deadline
@@ -319,7 +319,7 @@ async def test_new_job_v1_process_safely_clears_legacy_fence(manager):
         'D1', str(uuid.uuid4()), True,
     )
     assert cleared
-    current = await manager.get_snapshot(queued['job_id'])
+    current = await manager.store.get_snapshot(queued['job_id'])
     assert current['devices']['D1']['device_fence'] is None
 
 
@@ -334,7 +334,7 @@ async def test_new_job_v1_process_clears_offline_job_v1_fence(manager):
         first['job_id'], 'D1',
         accept_deadline=now_ms() + 1_000,
     )
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         first['job_id'], 'D1', expected={DeviceState.DISPATCHING},
         reason='device_disconnect', deadline=now_ms(),
     )
@@ -361,7 +361,7 @@ async def test_stale_reconciliation_deadline_cannot_mark_recovered_assignment(ma
         accept_deadline=now_ms() + 1_000,
     )
     first_deadline = now_ms() + 10
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id, 'D1', expected={DeviceState.DISPATCHING},
         reason='command_accept_timeout', deadline=first_deadline,
     )
@@ -369,7 +369,7 @@ async def test_stale_reconciliation_deadline_cannot_mark_recovered_assignment(ma
     # installs a different deadline. The old timeout callback must be a no-op.
     await manager.reconcile_report(job_id, 'D1', 1, 'active', 'downloading', None)
     second_deadline = first_deadline + 60_000
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id, 'D1', expected={DeviceState.DOWNLOADING},
         reason='device_disconnect', deadline=second_deadline,
     )
@@ -382,7 +382,7 @@ async def test_stale_reconciliation_deadline_cannot_mark_recovered_assignment(ma
             expected_deadline=first_deadline,
             observed_now=first_deadline + 1,
         )
-    current = await manager.get_snapshot(job_id)
+    current = await manager.store.get_snapshot(job_id)
     assert current['devices']['D1']['state'] == DeviceState.RECONCILING.value
     assert current['devices']['D1']['reconciliation_deadline'] == second_deadline
 
@@ -398,7 +398,7 @@ async def test_active_assignment_blocks_a_second_claim(manager):
     # The second row remains queued; unique-index contention is a normal no-op, not
     # an exception that terminates the scheduler loop.
     assert await manager.claim_next(['D1']) is None
-    current = await manager.get_snapshot(second['job_id'])
+    current = await manager.store.get_snapshot(second['job_id'])
     assert current['devices']['D1']['state'] == DeviceState.QUEUED.value
 
 
@@ -414,7 +414,7 @@ async def test_exact_late_result_is_acked_after_process_replacement_cleared_fenc
         'D1',
         accept_deadline=now_ms() + 1_000,
     )
-    await manager.mark_reconciling(
+    await manager.store.mark_reconciling(
         job_id,
         'D1',
         expected={DeviceState.DISPATCHING},
@@ -427,13 +427,13 @@ async def test_exact_late_result_is_acked_after_process_replacement_cleared_fenc
     await manager.clear_fence_on_process_replacement(
         'D1', 'process-b', True
     )
-    before = await manager.get_snapshot(job_id)
+    before = await manager.store.get_snapshot(job_id)
     result = await manager.settle_result(job_id, 'D1', 1, 'success')
     assert result.accepted
     assert result.release_transfer
     assert result.revision == before['revision']
     assert result.snapshots == []
-    current = await manager.get_snapshot(job_id)
+    current = await manager.store.get_snapshot(job_id)
     assert current['state'] == JobState.COMPLETED_WITH_ERRORS.value
     assert current['devices']['D1']['state'] == DeviceState.UNCONFIRMED.value
     assert current['devices']['D1']['device_fence'] is None

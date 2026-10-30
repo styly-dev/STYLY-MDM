@@ -408,7 +408,7 @@ class PushScheduler:
             return False
         persistence_error: Exception | None = None
         try:
-            active = await self.manager.active_assignment_for_device(key.device_id)
+            active = await self.manager.store.active_assignment_for_device(key.device_id)
             if (
                 self.leases.is_current(lease)
                 and self.transfer_registry.get(key) is future
@@ -514,7 +514,7 @@ class PushScheduler:
                     return
                 current = DeviceState(current_row["state"])
                 if current is DeviceState.WAITING_TRANSFER:
-                    snapshot = await self.manager.transition_device(
+                    snapshot = await self.manager.store.transition_device(
                         job_id,
                         device_id,
                         expected={DeviceState.WAITING_TRANSFER},
@@ -541,7 +541,7 @@ class PushScheduler:
                         if pre_accept
                         else self.reconciliation_timeout
                     )
-                    snapshot = await self.manager.mark_reconciling(
+                    snapshot = await self.manager.store.mark_reconciling(
                         job_id,
                         device_id,
                         expected={current},
@@ -549,7 +549,7 @@ class PushScheduler:
                         deadline=now_ms() + int(timeout * 1000),
                     )
                 elif current is DeviceState.RECONCILING:
-                    snapshot = await self.manager.get_snapshot(job_id)
+                    snapshot = await self.manager.store.get_snapshot(job_id)
                 else:
                     return
 
@@ -721,7 +721,7 @@ class PushScheduler:
                 known_state is DeviceState.UNCONFIRMED and matches_fence
             ):
                 try:
-                    queued = await self.manager.transition_device(
+                    queued = await self.manager.store.transition_device(
                         job_id,
                         device_id,
                         expected={DeviceState.DISPATCHING, DeviceState.RECONCILING},
@@ -783,7 +783,7 @@ class PushScheduler:
             # A failed write may already have delivered the command. Revoke its
             # lease, but retain execution ownership until the client reports it.
             try:
-                snapshot = await self.manager.mark_reconciling(
+                snapshot = await self.manager.store.mark_reconciling(
                     job_id, device_id, expected=expected, reason=code,
                     deadline=now_ms() + int(self.reconciliation_timeout * 1000),
                 )
@@ -807,7 +807,7 @@ class PushScheduler:
         detail: str = "Device Push state is unavailable; Resume when it recovers",
     ) -> None:
         try:
-            snapshot = await self.manager.transition_device(
+            snapshot = await self.manager.store.transition_device(
                 job_id, device_id,
                 expected={DeviceState.WAITING_TRANSFER, DeviceState.DISPATCHING, DeviceState.RECONCILING},
                 target=DeviceState.QUEUED,
@@ -828,7 +828,7 @@ class PushScheduler:
         self, job_id: str, device_id: str, detail: str
     ) -> None:
         try:
-            snapshot = await self.manager.transition_device(
+            snapshot = await self.manager.store.transition_device(
                 job_id,
                 device_id,
                 expected={DeviceState.DISPATCHING},
@@ -854,7 +854,7 @@ class PushScheduler:
         detail: str,
     ) -> None:
         try:
-            snapshot = await self.manager.transition_device(
+            snapshot = await self.manager.store.transition_device(
                 job_id,
                 device_id,
                 expected=expected,
@@ -982,7 +982,7 @@ class PushScheduler:
             return
         key = TransferKey("push", device_id, job_id, 1)
         if outcome == "busy":
-            snapshot = await self.manager.get_snapshot(job_id)
+            snapshot = await self.manager.store.get_snapshot(job_id)
             keep_transfer = await self._handle_busy(
                 snapshot,
                 device_id,

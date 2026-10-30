@@ -45,7 +45,7 @@ async def _ready_job(manager: PushJobManager, root: Path, states: dict[str, str]
                  '["push_job_id_v1","push_resume_v1"]', job_id, device),
             )
     await manager.store._call(settle)
-    return await manager.get_snapshot(job_id)
+    return await manager.store.get_snapshot(job_id)
 
 
 def _downgrade_to_schema_one(path: Path) -> None:
@@ -106,7 +106,7 @@ async def test_schema_one_dispatch_history_still_supersedes_retry(tmp_path):
     upgraded = PushJobStore(path)
     upgraded_manager = PushJobManager(upgraded)
     try:
-        old_single = await upgraded_manager.get_snapshot(old['job_id'])
+        old_single = await upgraded_manager.store.get_snapshot(old['job_id'])
         old_list = await upgraded_manager.list_snapshots(100, 0)
         assert old_single['devices']['D1']['retryable'] is False
         assert next(job for job in old_list if job['job_id'] == old['job_id'])['devices']['D1']['retryable'] is False
@@ -173,7 +173,7 @@ async def test_retry_job_is_linked_by_indexed_column(tmp_path):
             'SELECT retry_of_job_id FROM push_jobs WHERE job_id=?', (retry['job_id'],),
         ).fetchone()[0])
         assert linked == original['job_id']
-        snapshot = await manager.get_snapshot(original['job_id'])
+        snapshot = await manager.store.get_snapshot(original['job_id'])
         assert snapshot['devices']['D1']['retry_job_id'] == retry['job_id']
         assert snapshot['devices']['D2']['retry_job_id'] is None
         plan = await store._call(lambda conn: ' '.join(
@@ -242,12 +242,12 @@ async def test_gc_retries_tombstoned_file_after_reopen_and_reports_removal_once(
         reopened = PushJobStore(tmp_path / 'jobs.sqlite3')
         reopened_manager = PushJobManager(reopened)
         assert (await reopened.artifact_record(artifact_id))['retention_state'] == 'deleted'
-        assert reopened_manager.gc_artifacts_sync(
+        assert reopened_manager.store.gc_artifacts_sync(
             tmp_path, retry_window_ms=0, timestamp=11
         ) == [artifact_id]
         assert not artifact_path.exists()
         assert (await reopened.artifact_record(artifact_id))['retention_state'] == 'deleted'
-        assert reopened_manager.gc_artifacts_sync(
+        assert reopened_manager.store.gc_artifacts_sync(
             tmp_path, retry_window_ms=0, timestamp=12
         ) == []
     finally:
@@ -299,11 +299,11 @@ async def test_retried_target_is_not_cancellable_in_snapshot_or_store(tmp_path):
             "protocol_mode,reason,created_at,updated_at) VALUES ('D1',?,1,'job_v1','timeout',1,1)",
             (job_id,),
         ))
-        assert (await manager.get_snapshot(job_id))['devices']['D1']['cancellable'] is True
+        assert (await manager.store.get_snapshot(job_id))['devices']['D1']['cancellable'] is True
         await manager.retry_failed(
             job_id, str(uuid.uuid4()), artifact_root=tmp_path, online_devices={'D1'},
         )
-        assert (await manager.get_snapshot(job_id))['devices']['D1']['cancellable'] is False
+        assert (await manager.store.get_snapshot(job_id))['devices']['D1']['cancellable'] is False
         with pytest.raises(StoreConflict):
             await manager.cancel_interrupted(job_id, 'D1')
     finally:

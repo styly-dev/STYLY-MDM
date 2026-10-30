@@ -38,7 +38,7 @@ async def test_startup_drains_retry_updates_committed_before_wake_attachment(tmp
     try:
         original = await completed(runtime.manager, runtime.artifacts.artifact_root)
         await create_newer(runtime.manager, original)
-        expected = await runtime.manager.get_snapshot(original['job_id'])
+        expected = await runtime.store.get_snapshot(original['job_id'])
         await runtime.on_startup(None)
         assert await update_for(legacy, original['job_id'], expected['revision']) == expected
     finally:
@@ -127,7 +127,7 @@ async def test_shutdown_drains_commit_queued_during_admin_send(tmp_path, monkeyp
         await runtime.publish({'job_id': 'earlier', 'revision': 1})
         await asyncio.wait_for(sending.wait(), 2)
         await create_newer(runtime.manager, original)
-        expected = await runtime.manager.get_snapshot(original['job_id'])
+        expected = await runtime.store.get_snapshot(original['job_id'])
         close = runtime.store.close
 
         def observe_close():
@@ -162,7 +162,7 @@ async def test_notification_failure_keeps_commit_successful_and_snapshot_queued(
     manager.store.set_retry_publication_wakeup(failed_notification)
     created, _ = await create_newer(manager, original)
     assert created
-    expected = await manager.get_snapshot(original['job_id'])
+    expected = await manager.store.get_snapshot(original['job_id'])
     assert not expected['devices']['failed']['retryable']
     assert manager.store.take_retry_publications() == [expected]
     assert 'Could not wake Push Retry publication' in caplog.text

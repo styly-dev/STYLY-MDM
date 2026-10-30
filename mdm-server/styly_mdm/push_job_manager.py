@@ -76,39 +76,6 @@ class PushJobManager:
         self.store = store
         self.verify_schema_sync()
 
-    # Primitive operations exposed by the manager's public API. Store lifecycle
-    # and private worker access remain on the explicitly owned store.
-    async def get_snapshot(self, job_id: str) -> dict[str, Any]:
-        return await self.store.get_snapshot(job_id)
-
-    async def transition_device(
-        self,
-        job_id: str,
-        device_id: str,
-        *,
-        expected: set[DeviceState] | None,
-        target: DeviceState,
-        fields: Mapping[str, Any] | None = None,
-        allow_terminal_idempotent: bool = False,
-    ) -> dict[str, Any]:
-        return await self.store.transition_device(
-            job_id, device_id, expected=expected, target=target, fields=fields,
-            allow_terminal_idempotent=allow_terminal_idempotent,
-        )
-
-    async def mark_reconciling(
-        self,
-        job_id: str,
-        device_id: str,
-        *,
-        expected: set[DeviceState],
-        reason: str,
-        deadline: int,
-    ) -> dict[str, Any]:
-        return await self.store.mark_reconciling(
-            job_id, device_id, expected=expected, reason=reason, deadline=deadline,
-        )
-
     async def mark_transfer_stalled(
         self, job_id: str, device_id: str, *, expected: set[DeviceState],
         acceptance_deadline: int, reconciliation_deadline: int,
@@ -145,16 +112,6 @@ class PushJobManager:
                 snapshot = self.store._snapshot(conn, job_id)
                 return snapshot
         return await self.store._call(op)
-
-    async def active_assignment_for_device(self, device_id: str) -> dict[str, Any] | None:
-        return await self.store.active_assignment_for_device(device_id)
-
-    def gc_artifacts_sync(
-        self, artifact_root: Path, *, retry_window_ms: int, timestamp: int | None = None,
-    ) -> list[str]:
-        return self.store.gc_artifacts_sync(
-            artifact_root, retry_window_ms=retry_window_ms, timestamp=timestamp,
-        )
 
     def _reconcile_active_assignment(
         self,
