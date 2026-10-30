@@ -749,6 +749,11 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > it never releases a Push-v1 waiter or revokes its live HTTP lease. Server shutdown
 > releases all remaining registry waiters, including Install.
 >
+> Android interruption diagnostics are written locally by `PushJobCoordinator` at
+> warning level with the job/attempt identity, interruption reason, and error detail
+> (for example an HTTP status or connection failure). The detail is not added to the
+> durable state or wire protocol.
+>
 > Admins see install aggregate progress via `INSTALL_PROGRESS`. The Push console
 > uses full `PUSH_JOB_UPDATED` snapshots.
 

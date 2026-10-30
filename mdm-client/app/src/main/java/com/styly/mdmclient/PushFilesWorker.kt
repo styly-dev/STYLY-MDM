@@ -226,7 +226,6 @@ class PushFilesWorker internal constructor(
         /** The exact job remains active and its validated partial data is retained. */
         data class Interrupted(
             val reason: String,
-            val failureCode: String?,
             val detail: String?,
         ) : Outcome()
     }
@@ -258,8 +257,7 @@ class PushFilesWorker internal constructor(
             )
         }
         val work = attemptDirectoryProvider(command)
-        var interruptionReason: String? = null
-        val result = try {
+        val outcome = try {
             prepareResumableDirectory(command, work)
             val bundle = download(command, work, callbacks.onValidationStart)
             callbacks.onTransferComplete(bundle.length())
@@ -275,7 +273,7 @@ class PushFilesWorker internal constructor(
                 )
             }
             val applied = BundleSync.apply(staging, destination, command.deleteExtras)
-            PushProtocol.Result(
+            Outcome.Completed(PushProtocol.Result(
                 jobId = command.jobId,
                 attempt = command.attempt,
                 status = "success",
@@ -285,28 +283,26 @@ class PushFilesWorker internal constructor(
                 deleted = applied.deleted,
                 failureCode = null,
                 detail = null,
-            )
+            ))
         } catch (error: Throwable) {
             val failure = error as? PushWorkerException
-            val policy = failurePolicy(command, failure)
-            interruptionReason = policy.interruptionReason
-            PushProtocol.Result(
-                jobId = command.jobId,
-                attempt = command.attempt,
-                status = "fail",
-                destPath = command.destPath,
-                added = 0,
-                updated = 0,
-                deleted = 0,
-                failureCode = failure?.code ?: classifyFailure(error),
-                detail = error.message ?: error.javaClass.simpleName,
-            )
+            val interruptionReason = failurePolicy(command, failure).interruptionReason
+            val detail = error.message ?: error.javaClass.simpleName
+            if (interruptionReason != null) {
+                Outcome.Interrupted(interruptionReason, detail)
+            } else {
+                Outcome.Completed(PushProtocol.Result(
+                    jobId = command.jobId,
+                    attempt = command.attempt,
+                    status = "fail",
+                    destPath = command.destPath,
+                    failureCode = failure?.code ?: classifyFailure(error),
+                    detail = detail,
+                ))
+            }
         }
         // The coordinator persists this execution outcome before terminal cleanup;
         // interrupted downloads instead retain their durable ownership and bytes.
-        val outcome = interruptionReason?.let {
-            Outcome.Interrupted(it, result.failureCode, result.detail)
-        } ?: Outcome.Completed(result)
         return Execution(outcome, work)
     }
 

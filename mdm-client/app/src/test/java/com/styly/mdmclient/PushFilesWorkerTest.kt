@@ -40,7 +40,6 @@ class PushFilesWorkerTest {
         ).execute(job, PushFilesWorker.Callbacks({}, {}, beforeApply = { true }))
 
         assertEquals("download_interrupted", execution.interruptedOutcome().reason)
-        assertEquals("download_failed", execution.interruptedOutcome().failureCode)
     }
 
     @Test
@@ -164,7 +163,6 @@ class PushFilesWorkerTest {
 
             val outcome = execution.interruptedOutcome()
             assertEquals("server_lease_revoked", outcome.reason)
-            assertEquals("push_lease_revoked", outcome.failureCode)
             assertEquals(0, retryCount)
             assertTrue(server.request.contains("Range: bytes=$split-"))
             assertArrayEquals(partial, File(work, "artifact.part").readBytes())
@@ -195,8 +193,8 @@ class PushFilesWorkerTest {
             )
 
             val outcome = execution.interruptedOutcome()
-            assertEquals("download_failed", outcome.failureCode)
             assertEquals("download_interrupted", outcome.reason)
+            assertEquals("artifact download returned unexpected HTTP 403", outcome.detail)
             assertEquals(0, retryCount)
             assertTrue(server.request.contains("Range: bytes=$split-"))
             assertArrayEquals(partial, File(work, "artifact.part").readBytes())
@@ -883,7 +881,6 @@ class PushFilesWorkerTest {
             ).execute(command, workerCallbacks())
 
             val interrupted = execution.interruptedOutcome()
-            assertEquals("download_failed", interrupted.failureCode)
             assertEquals("download_interrupted", interrupted.reason)
             assertEquals(split.toLong(), File(work, "artifact.part").length())
             assertEquals(listOf(1_000L, 2_000L, 4_000L, 8_000L, 8_000L, 8_000L, 8_000L, 8_000L, 8_000L, 5_000L), delays)
@@ -1211,7 +1208,6 @@ class PushFilesWorkerTest {
                 if (status == 409) {
                     val interrupted = execution.interruptedOutcome()
                     assertEquals("server_lease_revoked", interrupted.reason)
-                    assertEquals("push_lease_revoked", interrupted.failureCode)
                 } else {
                     assertEquals("fail", execution.completedResult().status)
                     assertEquals("artifact_unavailable", execution.completedResult().failureCode)
@@ -1280,7 +1276,6 @@ class PushFilesWorkerTest {
 
                 val interrupted = execution.interruptedOutcome()
                 assertEquals(case.name, "download_interrupted", interrupted.reason)
-                assertEquals(case.name, "download_failed", interrupted.failureCode)
                 assertArrayEquals(case.name, prefix, File(work, "artifact.part").readBytes())
                 assertTrue(case.name, File(work, "metadata.json").isFile)
                 assertTrue(case.name, retryDelays.isEmpty())

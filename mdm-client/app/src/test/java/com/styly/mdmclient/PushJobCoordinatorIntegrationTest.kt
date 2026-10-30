@@ -540,6 +540,10 @@ class PushJobCoordinatorIntegrationTest {
         await { harness.messages.any { it.optString("type") == "PUSH_RECONCILE_REPORT" } }
         assertEquals(0, harness.cleanupCalls.get())
         assertTrue(harness.durableState.get().active?.interrupted == true)
+        assertTrue(harness.logs.any { (message, _) ->
+            message.contains(saved.identity) && message.contains("download_interrupted") &&
+                message.contains("test interruption")
+        })
     }
 
     @Test
@@ -955,7 +959,6 @@ class PushJobCoordinatorIntegrationTest {
         } else {
             PushFilesWorker.Outcome.Interrupted(
                 reason = interruptionReason,
-                failureCode = failureCode ?: "download_failed",
                 detail = "test interruption",
             )
         }
