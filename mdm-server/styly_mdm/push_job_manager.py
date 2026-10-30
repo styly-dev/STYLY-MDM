@@ -115,8 +115,7 @@ class PushJobManager:
     ) -> dict[str, Any]:
         """Expire a transfer without extending an outstanding acceptance decision."""
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 row = conn.execute(
                     "SELECT * FROM push_job_devices WHERE job_id=? AND device_id=?",
                     (job_id, device_id),
@@ -131,7 +130,6 @@ class PushJobManager:
                             "unexpected_dispatch_failure",
                         }):
                     snapshot = self.store._snapshot(conn, job_id)
-                    self.store._commit(conn)
                     return snapshot
                 validate_device_transition(current, DeviceState.RECONCILING)
                 deadline = acceptance_deadline if current is DeviceState.DISPATCHING else reconciliation_deadline
@@ -145,11 +143,7 @@ class PushJobManager:
                 self.store._increment_revision(conn, job_id, timestamp)
                 self.store._rederive_job(conn, job_id, timestamp)
                 snapshot = self.store._snapshot(conn, job_id)
-                self.store._commit(conn)
                 return snapshot
-            except BaseException:
-                self.store._rollback(conn)
-                raise
         return await self.store._call(op)
 
     async def active_assignment_for_device(self, device_id: str) -> dict[str, Any] | None:
@@ -303,8 +297,7 @@ class PushJobManager:
         root = artifact_root.resolve()
 
         def op(conn: sqlite3.Connection) -> tuple[bool, dict[str, Any]]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 existing = conn.execute(
                     "SELECT job_id, request_fingerprint FROM push_jobs WHERE client_request_id=?",
                     (client_request_id,),
@@ -313,7 +306,6 @@ class PushJobManager:
                     if existing["request_fingerprint"] != fingerprint:
                         raise StoreConflict("client_request_id was already used for a different request")
                     snapshot = self.store._snapshot(conn, existing["job_id"])
-                    self.store._commit(conn)
                     return False, snapshot
                 original = conn.execute(
                     "SELECT * FROM push_jobs WHERE job_id=?", (job_id,)
@@ -388,11 +380,7 @@ class PushJobManager:
                 # GC reads the new job in this same serialized transaction.
                 self.store._increment_revision(conn, job_id, timestamp)
                 snapshot = self.store._snapshot(conn, retry_id)
-                self.store._commit(conn)
                 return True, snapshot
-            except BaseException:
-                self.store._rollback(conn)
-                raise
 
         return await self.store._call(op)
 
@@ -417,8 +405,7 @@ class PushJobManager:
             raise ValueError("Disconnect timeouts must be provided together")
 
         def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 job_clause = " AND d.job_id=?" if job_id is not None else ""
                 rows = conn.execute(
                     "SELECT d.job_id, d.state, d.queue_reason, d.dispatch_revision "
@@ -507,11 +494,7 @@ class PushJobManager:
                     if active_job_id is not None and active_job_id not in changed:
                         changed.append(active_job_id)
                 snapshots = [self.store._snapshot(conn, changed_job) for changed_job in changed]
-                self.store._commit(conn)
                 return snapshots
-            except BaseException:
-                self.store._rollback(conn)
-                raise
 
         return await self.store._call(op)
 
@@ -530,8 +513,7 @@ class PushJobManager:
     ) -> list[dict[str, Any]]:
         """Recover an authoritative empty registration against orphaned execution."""
         def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 timestamp = now_ms()
                 job_id = self._reconcile_active_assignment(
                     conn,
@@ -542,14 +524,9 @@ class PushJobManager:
                     reason="client_runtime_absent",
                 )
                 if job_id is None:
-                    self.store._commit(conn)
                     return []
                 snapshot = self.store._snapshot(conn, job_id)
-                self.store._commit(conn)
                 return [snapshot]
-            except BaseException:
-                self.store._rollback(conn)
-                raise
         return await self.store._call(op)
 
     async def find_idempotent_job(
@@ -715,8 +692,7 @@ class PushJobManager:
         """
 
         def op(conn: sqlite3.Connection) -> tuple[bool, dict[str, Any]]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 row = conn.execute(
                     "SELECT state, accept_deadline, reconciliation_reason "
                     "FROM push_job_devices WHERE job_id=? AND device_id=?",
@@ -732,7 +708,6 @@ class PushJobManager:
                     and row["reconciliation_reason"] == "command_accept_timeout"
                 ):
                     snapshot = self.store._snapshot(conn, job_id)
-                    self.store._commit(conn)
                     return False, snapshot
                 if (
                     current is not DeviceState.DISPATCHING
@@ -757,11 +732,7 @@ class PushJobManager:
                 self.store._increment_revision(conn, job_id, timestamp)
                 self.store._rederive_job(conn, job_id, timestamp)
                 snapshot = self.store._snapshot(conn, job_id)
-                self.store._commit(conn)
                 return True, snapshot
-            except BaseException:
-                self.store._rollback(conn)
-                raise
 
         return await self.store._call(op)
 
@@ -886,8 +857,7 @@ class PushJobManager:
         """Commit waiter-ready dispatch metadata after the exact waiter exists."""
 
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 row = conn.execute(
                     "SELECT d.state, d.attempt, d.dispatch_revision, d.queue_reason, d.cancel_requested_at, j.dispatch_enabled "
                     "FROM push_job_devices d JOIN push_jobs j ON j.job_id=d.job_id "
@@ -905,7 +875,6 @@ class PushJobManager:
                     raise StoreConflict("assignment is already dispatching")
                 if current is not DeviceState.WAITING_TRANSFER:
                     snapshot = self.store._snapshot(conn, job_id)
-                    self.store._commit(conn)
                     return snapshot
                 validate_device_transition(current, DeviceState.DISPATCHING)
                 timestamp = now_ms()
@@ -924,7 +893,6 @@ class PushJobManager:
                     self.store._increment_revision(conn, job_id, timestamp)
                     self.store._rederive_job(conn, job_id, timestamp)
                     snapshot = self.store._snapshot(conn, job_id)
-                    self.store._commit(conn)
                     return snapshot
                 result = conn.execute(
                     "UPDATE push_job_devices SET state=?, protocol_mode=?, queue_reason=NULL, "
@@ -953,11 +921,7 @@ class PushJobManager:
                 )
                 self.store._rederive_job(conn, job_id, timestamp)
                 snapshot = self.store._snapshot(conn, job_id)
-                self.store._commit(conn)
                 return snapshot
-            except BaseException:
-                self.store._rollback(conn)
-                raise
 
         return await self.store._call(op)
 
@@ -996,8 +960,7 @@ class PushJobManager:
         }
 
         def op(conn: sqlite3.Connection) -> ProgressSettlement:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 row = conn.execute(
                     "SELECT d.*, j.artifact_id, a.byte_size FROM push_job_devices d "
                     "JOIN push_jobs j ON j.job_id=d.job_id "
@@ -1039,13 +1002,9 @@ class PushJobManager:
                 self.store._increment_revision(conn, job_id, timestamp)
                 self.store._rederive_job(conn, job_id, timestamp)
                 snapshot = self.store._snapshot(conn, job_id)
-                self.store._commit(conn)
-                return ProgressSettlement(snapshot, event in {
-                    ProgressEvent.VALIDATION_STARTED, ProgressEvent.TRANSFER_COMPLETE,
-                })
-            except BaseException:
-                self.store._rollback(conn)
-                raise
+            return ProgressSettlement(snapshot, event in {
+                ProgressEvent.VALIDATION_STARTED, ProgressEvent.TRANSFER_COMPLETE,
+            })
         return await self.store._call(op)
 
     async def resume_interrupted(
@@ -1070,8 +1029,7 @@ class PushJobManager:
         """
 
         def op(conn: sqlite3.Connection) -> tuple[Literal["requeued", "retained", "rejected"], list[dict[str, Any]]]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 row = conn.execute(
                     """
                     SELECT d.*, j.dispatch_enabled, j.dispatch_paused_reason,
@@ -1134,7 +1092,6 @@ class PushJobManager:
                     )
                 if not resumable:
                     snapshot = self.store._snapshot(conn, job_id)
-                    self.store._commit(conn)
                     return "rejected", [snapshot]
                 # Repeated evidence while waiting for authorization must not revoke
                 # local work, reset the pause, or release a replacement transfer slot.
@@ -1142,13 +1099,11 @@ class PushJobManager:
                     DeviceState.QUEUED, DeviceState.WAITING_TRANSFER, DeviceState.DISPATCHING
                 }:
                     snapshot = self.store._snapshot(conn, job_id)
-                    self.store._commit(conn)
                     return "retained", [snapshot]
                 if not timed_out and current is not DeviceState.RECONCILING and not (
                     transfer_interrupted and current is DeviceState.DOWNLOADING
                 ):
                     snapshot = self.store._snapshot(conn, job_id)
-                    self.store._commit(conn)
                     return "rejected", [snapshot]
                 timestamp = now_ms()
                 if current is DeviceState.DOWNLOADING:
@@ -1183,19 +1138,14 @@ class PushJobManager:
                     self.store._increment_revision(conn, affected_job, timestamp)
                     self.store._rederive_job(conn, affected_job, timestamp)
                 snapshots = [self.store._snapshot(conn, other) for other in affected]
-                self.store._commit(conn)
                 return "requeued", snapshots
-            except BaseException:
-                self.store._rollback(conn)
-                raise
 
         return await self.store._call(op)
 
     async def cancel_interrupted(self, job_id: str, device_id: str) -> dict[str, Any]:
         """Cancel unsent work, or retain dispatched ownership until cleanup evidence."""
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 row = conn.execute(
                     "SELECT d.*, j.state AS job_state, j.dispatch_enabled "
                     "FROM push_job_devices d JOIN push_jobs j ON j.job_id=d.job_id "
@@ -1259,11 +1209,7 @@ class PushJobManager:
                         )
                     self.store._increment_revision(conn, job_id, timestamp)
                 snapshot = self.store._snapshot(conn, job_id)
-                self.store._commit(conn)
                 return snapshot
-            except BaseException:
-                self.store._rollback(conn)
-                raise
         return await self.store._call(op)
 
     async def pending_cancellations_for_device(self, device_id: str) -> list[dict[str, Any]]:
@@ -1275,12 +1221,10 @@ class PushJobManager:
     async def confirm_cancel(self, job_id: str, device_id: str) -> list[dict[str, Any]]:
         """Caller must verify exact absent or terminal evidence from the live owner."""
         def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 row = conn.execute("SELECT * FROM push_job_devices WHERE job_id=? AND device_id=?",
                                    (job_id, device_id)).fetchone()
                 if row is None or row["cancel_requested_at"] is None or row["state"] in {"failed", "succeeded", "interrupted"}:
-                    self.store._commit(conn)
                     return []
                 timestamp = now_ms()
                 conn.execute("UPDATE push_job_devices SET state='failed', queue_reason=NULL, terminal_at=?, updated_at=?, "
@@ -1294,11 +1238,7 @@ class PushJobManager:
                     self.store._increment_revision(conn, affected, timestamp)
                 self.store._rederive_job(conn, job_id, timestamp)
                 snapshots = [self.store._snapshot(conn, affected) for affected in ids]
-                self.store._commit(conn)
                 return snapshots
-            except BaseException:
-                self.store._rollback(conn)
-                raise
         return await self.store._call(op)
 
     async def settle_result(
@@ -1424,14 +1364,9 @@ class PushJobManager:
             return ResultSettlement(True, None, revision, snapshots, release_transfer=True)
 
         def op(conn: sqlite3.Connection) -> ResultSettlement:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 result = settle(conn)
-                self.store._commit(conn)
                 return result
-            except BaseException:
-                self.store._rollback(conn)
-                raise
 
         return await self.store._call(op)
 
@@ -1509,8 +1444,7 @@ class PushJobManager:
         observed_now: int | None = None,
     ) -> list[dict[str, Any]]:
         def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 row = conn.execute(
                     "SELECT state, attempt, protocol_mode, reconciliation_deadline "
                     "FROM push_job_devices WHERE job_id=? AND device_id=?",
@@ -1574,11 +1508,7 @@ class PushJobManager:
                     self.store._increment_revision(conn, affected, timestamp)
                     self.store._rederive_job(conn, affected, timestamp)
                 snapshots = [self.store._snapshot(conn, affected) for affected in ids]
-                self.store._commit(conn)
                 return snapshots
-            except BaseException:
-                self.store._rollback(conn)
-                raise
 
         return await self.store._call(op)
 
@@ -1594,8 +1524,7 @@ class PushJobManager:
             raise StoreConflict("opaque fence identity is invalid")
 
         def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 existing = conn.execute(
                     "SELECT * FROM push_device_fences WHERE device_id=?", (device_id,)
                 ).fetchone()
@@ -1617,7 +1546,6 @@ class PushJobManager:
                         existing["reason"],
                     )
                     if current == canonical:
-                        self.store._commit(conn)
                         return []
                 timestamp = now_ms()
                 conn.execute(
@@ -1650,11 +1578,7 @@ class PushJobManager:
                 for affected in ids:
                     self.store._increment_revision(conn, affected, timestamp)
                 snapshots = [self.store._snapshot(conn, affected) for affected in ids]
-                self.store._commit(conn)
                 return snapshots
-            except BaseException:
-                self.store._rollback(conn)
-                raise
 
         return await self.store._call(op)
 
@@ -1665,13 +1589,11 @@ class PushJobManager:
         has_job_v1: bool,
     ) -> list[dict[str, Any]]:
         def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 fence = conn.execute(
                     "SELECT * FROM push_device_fences WHERE device_id=?", (device_id,)
                 ).fetchone()
                 if fence is None or not has_job_v1 or not process_instance_id:
-                    self.store._commit(conn)
                     return []
                 old_process = fence["blocking_process_instance_id"]
                 # A different recorded process proves replacement.  For a legacy fence
@@ -1681,12 +1603,10 @@ class PushJobManager:
                     old_process is not None and old_process != process_instance_id
                 ) or old_process is None
                 if not replaced:
-                    self.store._commit(conn)
                     return []
                 blocking_job_id = fence["blocking_job_id"]
                 if conn.execute("SELECT 1 FROM push_job_devices WHERE job_id=? AND device_id=? AND cancel_requested_at IS NOT NULL",
                                 (blocking_job_id, device_id)).fetchone():
-                    self.store._commit(conn)
                     return []
                 ids = self._visible_job_ids(
                     self.store, conn, device_id, blocking_job_id
@@ -1696,11 +1616,7 @@ class PushJobManager:
                 for affected in ids:
                     self.store._increment_revision(conn, affected, timestamp)
                 snapshots = [self.store._snapshot(conn, affected) for affected in ids]
-                self.store._commit(conn)
                 return snapshots
-            except BaseException:
-                self.store._rollback(conn)
-                raise
 
         return await self.store._call(op)
 
@@ -1718,8 +1634,7 @@ class PushJobManager:
             return []
 
         def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 fence = conn.execute(
                     "SELECT * FROM push_device_fences WHERE device_id=?",
                     (device_id,),
@@ -1729,7 +1644,6 @@ class PushJobManager:
                     or fence["blocking_job_id"] != job_id
                     or fence["blocking_attempt"] != attempt
                 ):
-                    self.store._commit(conn)
                     return []
                 conn.execute("DELETE FROM push_device_fences WHERE device_id=?", (device_id,))
                 timestamp = now_ms()
@@ -1737,11 +1651,7 @@ class PushJobManager:
                 for affected in ids:
                     self.store._increment_revision(conn, affected, timestamp)
                 snapshots = [self.store._snapshot(conn, affected) for affected in ids]
-                self.store._commit(conn)
                 return snapshots
-            except BaseException:
-                self.store._rollback(conn)
-                raise
 
         return await self.store._call(op)
 
@@ -1783,14 +1693,9 @@ class PushJobManager:
     ) -> tuple[bool, list[dict[str, Any]]]:
         """Clear only a canonical opaque job-v1 fence matching exact evidence."""
         def op(conn: sqlite3.Connection) -> tuple[bool, list[dict[str, Any]]]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 result = self._clear_matching_opaque_fence(conn, device_id, job_id, attempt)
-                self.store._commit(conn)
                 return result
-            except BaseException:
-                self.store._rollback(conn)
-                raise
         return await self.store._call(op)
 
     async def reconcile_report(
@@ -1808,8 +1713,7 @@ class PushJobManager:
             raise StoreConflict("stale_attempt")
 
         def op(conn: sqlite3.Connection) -> tuple[str, list[dict[str, Any]]]:
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 row = conn.execute(
                     "SELECT d.*, j.dispatch_enabled FROM push_job_devices d "
                     "JOIN push_jobs j ON j.job_id=d.job_id "
@@ -1843,7 +1747,6 @@ class PushJobManager:
                     snapshots = [
                         self.store._snapshot(conn, affected) for affected in ids
                     ]
-                    self.store._commit(conn)
                     return "fence_cleared", snapshots
                 if current is not DeviceState.RECONCILING:
                     raise StoreConflict("assignment is not reconciling")
@@ -1916,11 +1819,7 @@ class PushJobManager:
                 self.store._increment_revision(conn, job_id, timestamp)
                 self.store._rederive_job(conn, job_id, timestamp)
                 snapshot = self.store._snapshot(conn, job_id)
-                self.store._commit(conn)
                 return outcome, [snapshot]
-            except BaseException:
-                self.store._rollback(conn)
-                raise
 
         return await self.store._call(op)
 
@@ -1974,8 +1873,7 @@ class PushJobManager:
             ]
             if not missing:
                 return []
-            self.store._begin(conn)
-            try:
+            with self.store._transaction(conn):
                 timestamp = now_ms()
                 touched: list[str] = []
                 for row in missing:
@@ -2030,10 +1928,6 @@ class PushJobManager:
                         self.store._rederive_job(conn, job_id, timestamp)
                     touched.append(job_id)
                 snapshots = [self.store._snapshot(conn, job_id) for job_id in touched]
-                self.store._commit(conn)
                 return snapshots
-            except BaseException:
-                self.store._rollback(conn)
-                raise
 
         return self.store._call_sync(op)

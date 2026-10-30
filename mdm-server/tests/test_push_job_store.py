@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import threading
 import time
 import uuid
@@ -62,6 +63,30 @@ def store(tmp_path):
 @pytest.fixture
 def manager(store):
     return PushJobManager(store)
+
+
+@pytest.mark.asyncio
+async def test_idempotent_create_commits_before_returning_existing_job(store):
+    request = canonical()
+    targets = {"D1": (ProtocolMode.JOB_V1, ["push_job_id_v1"])}
+    _, original = await store.create_job(request, targets, 60_000)
+
+    def deny_commit(action, operation, *_args):
+        if action == sqlite3.SQLITE_TRANSACTION and operation == "COMMIT":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    await store._call(lambda conn: conn.set_authorizer(deny_commit))
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            await store.create_job(request, targets, 60_000)
+    finally:
+        await store._call(lambda conn: conn.set_authorizer(lambda *_args: sqlite3.SQLITE_OK))
+
+    assert not await store._call(lambda conn: conn.in_transaction)
+    assert store.take_retry_publications() == []
+    created, replay = await store.create_job(request, targets, 60_000)
+    assert not created and replay == original
 
 
 @pytest.mark.asyncio
