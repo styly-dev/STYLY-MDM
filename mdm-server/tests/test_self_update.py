@@ -30,6 +30,7 @@ import pytest
 from aiohttp.test_utils import TestServer
 
 from styly_mdm import integrity, server
+from styly_mdm.transfer_registry import TransferRegistry
 from ws_test_helpers import (
     device_row_matches,
     receive_device_list as _recv_device_list,
@@ -56,18 +57,19 @@ class FakeWS:
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(monkeypatch):
+    monkeypatch.setattr(server, "transfer_registry", TransferRegistry())
     saved_n = server.MAX_CONCURRENT_TRANSFERS
     saved_t = server.TRANSFER_TIMEOUT
     saved_u = server.SELF_UPDATE_TIMEOUT
     saved_v = server.SELF_UPDATE_VERIFY_TIMEOUT
-    for coll in (server.devices, server.admin_connections, server.pending_transfers,
+    for coll in (server.devices, server.admin_connections,
                  server._transfer_tasks, server.pending_self_updates,
                  server._apk_hash_cache, server.device_registry):
         coll.clear()
     server.reset_transfer_slots()
     yield
-    for coll in (server.devices, server.admin_connections, server.pending_transfers,
+    for coll in (server.devices, server.admin_connections,
                  server._transfer_tasks, server.pending_self_updates,
                  server._apk_hash_cache, server.device_registry):
         coll.clear()

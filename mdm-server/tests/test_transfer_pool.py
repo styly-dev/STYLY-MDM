@@ -8,6 +8,7 @@ import json
 import pytest
 
 from styly_mdm import server
+from styly_mdm.transfer_registry import TransferKey, TransferRegistry
 
 
 class FakeWS:
@@ -48,18 +49,16 @@ async def settle(turns: int = 40) -> None:
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(monkeypatch):
+    monkeypatch.setattr(server, "transfer_registry", TransferRegistry())
     saved_limit = server.MAX_CONCURRENT_TRANSFERS
     saved_timeout = server.TRANSFER_TIMEOUT
-    saved_pending_transfers = server.pending_transfers
     for collection in (
         server.devices,
         server.admin_connections,
         server._transfer_tasks,
     ):
         collection.clear()
-    saved_pending_transfers.clear()
-    server.pending_transfers = {}
     server.reset_transfer_slots()
     yield
     for collection in (
@@ -68,9 +67,6 @@ def reset_state():
         server._transfer_tasks,
     ):
         collection.clear()
-    server.pending_transfers.clear()
-    saved_pending_transfers.clear()
-    server.pending_transfers = saved_pending_transfers
     server.reset_transfer_slots()
     server.MAX_CONCURRENT_TRANSFERS = saved_limit
     server.TRANSFER_TIMEOUT = saved_timeout
@@ -78,16 +74,12 @@ def reset_state():
 
 def prepare_job_v1_dispatch(manager, capabilities, snapshot, assignment, slots):
     from test_push_acceptance_transport_failure import _scheduler
-    from styly_mdm.push_runtime import _LegacyTransferAdapter
     from styly_mdm.push_scheduler import LiveSession
     from styly_mdm.push_transfer_leases import PushTransferLeases
-    from styly_mdm.transfer_registry import TransferKey, TransferRegistry
 
     leases = PushTransferLeases()
     registry = TransferRegistry(leases.revoke_now)
-    # The install path still uses the tuple-key facade. Back it with the same typed
-    # registry as Push-v1 so the tests exercise the production shared-release boundary.
-    server.pending_transfers = _LegacyTransferAdapter(registry)
+    server.transfer_registry = registry
     sessions = {}
     scheduler = _scheduler(manager, registry, leases, sessions, slots)
     sent = asyncio.Event()
@@ -145,7 +137,7 @@ async def test_job_v1_push_waits_for_install_to_release_shared_budget(tmp_path):
         install_task = run_install(["installer"])
         await settle()
         assert count_of(install_ws, "EXECUTE_INSTALL") == 1
-        assert ("installer", server.TASK_INSTALL) in server.pending_transfers
+        assert registry.get(TransferKey("install", "installer")) is not None
 
         push_task = start_dispatch()
         try:
@@ -172,37 +164,87 @@ async def test_job_v1_push_waits_for_install_to_release_shared_budget(tmp_path):
             await asyncio.gather(install_task, push_task, return_exceptions=True)
 
 
+@pytest.mark.parametrize("reason, task", [("install_result", "install"), ("disconnect", None)])
 @pytest.mark.asyncio
-async def test_install_completion_does_not_release_job_v1_push_transfer(tmp_path):
+async def test_install_release_preserves_job_v1_push_transfer_and_http_lease(tmp_path, reason, task):
     from test_push_acceptance_transport_failure import _ready
 
     async with _ready(tmp_path) as (manager, capabilities, snapshot, assignment):
         server.MAX_CONCURRENT_TRANSFERS = 2
         slots = server.transfer_slots()
-        start_dispatch, push_sent, waiting, registry, _leases, key = (
+        start_dispatch, push_sent, waiting, registry, leases, key = (
             prepare_job_v1_dispatch(manager, capabilities, snapshot, assignment, slots)
         )
         install_ws = add_install_device("D1")
         install_task = run_install(["D1"])
         push_task = start_dispatch()
+        stream = None
         try:
             await asyncio.wait_for(waiting.wait(), 1)
             assert push_sent.is_set()
             assert count_of(install_ws, "EXECUTE_INSTALL") == 1
             push_transfer = registry.get(key)
             assert push_transfer is not None and not push_transfer.done()
-            assert ("D1", server.TASK_INSTALL) in server.pending_transfers
+            assert registry.get(TransferKey("install", "D1")) is not None
 
-            assert server.release_transfer_slot("D1", "install_result", task=server.TASK_INSTALL)
+            token = leases.token(key)
+            assert token is not None
+
+            class Transport:
+                aborted = False
+
+                def abort(self):
+                    self.aborted = True
+
+            transport = Transport()
+            stream = asyncio.create_task(asyncio.Event().wait())
+            assert await leases.claim(snapshot["artifact"]["artifact_id"], token, stream, transport) == "claimed"
+            other_install = asyncio.get_running_loop().create_future()
+            other_key = TransferKey("install", "other-device")
+            registry.register(other_key, other_install)
+
+            assert server.release_transfer_slot("D1", reason, task=task)
             await asyncio.wait_for(install_task, 1)
             assert not push_transfer.done()
             assert not push_task.done()
+            assert not other_install.done()
+            assert leases.valid(snapshot["artifact"]["artifact_id"], token)
+            assert not stream.done()
+            assert not transport.aborted
+            registry.remove_if_same(other_key, other_install)
 
             registry.release_exact(key, "download_complete")
+            await asyncio.gather(stream, return_exceptions=True)
             await asyncio.wait_for(push_task, 1)
-            assert server.pending_transfers == {}
+            assert len(registry) == 0
         finally:
+            if stream is not None:
+                stream.cancel()
+                await asyncio.gather(stream, return_exceptions=True)
             for task in (install_task, push_task):
                 if not task.done():
                     task.cancel()
             await asyncio.gather(install_task, push_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_releases_shared_install_waiter(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+    app = server.create_app()
+    runtime = app["push_runtime"]
+    add_install_device("D1")
+    runtime.sessions["D1"] = object()
+    install_task = run_install(["D1"])
+    try:
+        await settle()
+        waiter = runtime.transfers.get(TransferKey("install", "D1"))
+        assert waiter is not None and not waiter.done()
+        await runtime.on_cleanup(app)
+        assert waiter.result() == "shutdown"
+        await asyncio.wait_for(install_task, 1)
+        assert len(runtime.transfers) == 0
+    finally:
+        if not install_task.done():
+            install_task.cancel()
+        await asyncio.gather(install_task, return_exceptions=True)
+        runtime.store.close()

@@ -30,6 +30,7 @@ from .device_policy import (
 )
 from .integrity import apk_cd_digest, file_sha256, is_os_metadata
 from .push_jobs import parse_capabilities
+from .transfer_registry import TransferKey, TransferRegistry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -221,14 +222,10 @@ _admin_send_locks: dict[web.WebSocketResponse, asyncio.Lock] = {}
 # makes import order observable.
 _websocket_response_factory = web.WebSocketResponse
 
-# (device_id, task) -> Future for the transfer slot a device holds during a job.
-# Resolving the future releases the slot so the next queued device is dispatched
-# (see release_transfer_slot / _run_install_job). Module-global so device-originated
-# install messages and disconnect can route a release to the dispatcher coroutine waiting
-# on it. Push-v1 uses its own exact transfer registry. The task
-# is part of the key so a push's terminal message cannot free the install slot the
-# same device is holding, and vice versa.
-pending_transfers: dict[tuple[str, str], "asyncio.Future[str]"] = {}
+# Install and Push share one typed registry, bound to PushRuntime at app creation.
+# Device-originated install messages release only the exact install key; Push
+# waiters require their own job identity and can outlive a WebSocket disconnect.
+transfer_registry = TransferRegistry()
 
 # Strong references to in-flight transfer-job tasks. asyncio only keeps weak
 # references to tasks, so without this a backgrounded job could be garbage
@@ -696,36 +693,15 @@ def reset_transfer_slots() -> None:
 
 
 def release_transfer_slot(device_id: str, reason: str, task: str | None = None) -> bool:
-    """Free the transfer slot(s) a device holds, if any.
+    """Release only this device's install waiter, including on disconnect.
 
-    Resolving the pending future wakes the dispatcher coroutine parked on it so the
-    next queued device is dispatched. Safe to call for a device that holds no slot
-    (an older client's INSTALL_RESULT, an idle device disconnecting) and safe to call
-    more than once for the same device and task (e.g. DOWNLOAD_COMPLETE followed by
-    INSTALL_RESULT) — the second call is a no-op.
-
-    ``task`` names which job to release: a device may be transferring for an install
-    and a push at the same time, and each job's terminal message must free only its
-    own slot. Pass None to free every slot the device holds, which is what a
-    disconnect means.
-
-    Returns True only when this call actually released a live slot, so callers can
-    tell a real transfer→apply transition from a late message for a device whose
-    transfer already timed out or finished.
+    Push-v1 completion is routed with its exact job identity in PushRuntime.
+    A legacy Push message must never release either an install or Push-v1 waiter.
+    False means a late or duplicate message did not release a live install slot.
     """
-    if task is not None:
-        fut = pending_transfers.get((device_id, task))
-        if fut is not None and not fut.done():
-            fut.set_result(reason)
-            return True
+    if task not in {None, TASK_INSTALL}:
         return False
-
-    released = False
-    for (did, _task), fut in list(pending_transfers.items()):
-        if did == device_id and not fut.done():
-            fut.set_result(reason)
-            released = True
-    return released
+    return transfer_registry.release_exact(TransferKey("install", device_id), reason)
 
 
 async def broadcast_install_state(
@@ -2656,9 +2632,12 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
             }
 
             counts["transferring"] += 1
-            key = (device_id, TASK_INSTALL)
+            key = TransferKey("install", device_id)
             fut: "asyncio.Future[str]" = loop.create_future()
-            pending_transfers[key] = fut
+            previous = transfer_registry.get(key)
+            if previous is not None:
+                transfer_registry.remove_if_same(key, previous)
+            transfer_registry.register(key, fut)
             try:
                 await broadcast_install_state([device_id], "transferring", apk_filename)
                 await broadcast_progress()
@@ -2688,8 +2667,7 @@ async def _run_install_job(apk_url: str, apk_filename: str, target_ids: list[str
             finally:
                 # Remove only our own future — a later job targeting the same
                 # device may already have replaced the entry.
-                if pending_transfers.get(key) is fut:
-                    del pending_transfers[key]
+                transfer_registry.remove_if_same(key, fut)
                 counts["transferring"] -= 1
             await broadcast_progress()
 

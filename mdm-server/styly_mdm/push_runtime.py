@@ -13,7 +13,6 @@ import logging
 import os
 import re
 import uuid
-from collections.abc import Iterator, MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -79,63 +78,6 @@ def _uuid_v4_or_none(value: Any) -> str | None:
     except ValueError:
         return None
     return str(parsed) if parsed.version == 4 else None
-
-
-class _LegacyTransferAdapter(MutableMapping[tuple[str, str], asyncio.Future[str]]):
-    """Compatibility facade backed by the typed transfer registry.
-
-    Existing install and migration-only legacy Push code still uses tuple syntax.
-    The actual registry key is typed, and a legacy Push receives an opaque identity
-    that cannot collide with any canonical ``(job_id, device_id, attempt)`` waiter.
-    """
-
-    def __init__(self, registry: TransferRegistry) -> None:
-        self.registry = registry
-        self._keys: dict[tuple[str, str], TransferKey] = {}
-
-    def _key(self, key: tuple[str, str]) -> TransferKey:
-        device_id, task = key
-        if task == "install":
-            return TransferKey("install", device_id)
-        existing = self._keys.get(key)
-        if existing is not None:
-            return existing
-        return TransferKey("push", device_id, f"legacy-{uuid.uuid4()}", 1)
-
-    def __getitem__(self, key: tuple[str, str]) -> asyncio.Future[str]:
-        typed = self._keys[key]
-        future = self.registry.get(typed)
-        if future is None:
-            self._keys.pop(key, None)
-            raise KeyError(key)
-        return future
-
-    def __setitem__(self, key: tuple[str, str], value: asyncio.Future[str]) -> None:
-        previous = self._keys.get(key)
-        if previous is not None:
-            current = self.registry.get(previous)
-            if current is not None:
-                self.registry.remove_if_same(previous, current)
-        typed = self._key(key)
-        self.registry.register(typed, value)
-        self._keys[key] = typed
-
-    def __delitem__(self, key: tuple[str, str]) -> None:
-        typed = self._keys.pop(key)
-        future = self.registry.get(typed)
-        if future is not None:
-            self.registry.remove_if_same(typed, future)
-
-    def __iter__(self) -> Iterator[tuple[str, str]]:
-        for key in tuple(self._keys):
-            typed = self._keys[key]
-            if self.registry.get(typed) is None:
-                self._keys.pop(key, None)
-            else:
-                yield key
-
-    def __len__(self) -> int:
-        return sum(1 for _ in self)
 
 
 class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
@@ -289,7 +231,6 @@ class PushRuntime:
         self.artifacts = ArtifactStore(data_dir)
         self.leases = PushTransferLeases()
         self.transfers = TransferRegistry(self.leases.revoke_now)
-        self.legacy_transfers = _LegacyTransferAdapter(self.transfers)
         self.sessions: dict[str, LiveSession] = {}
         self.device_locks: dict[str, asyncio.Lock] = {}
         self.registration_candidates: dict[str, RuntimeWebSocketResponse] = {}
@@ -2268,37 +2209,8 @@ def runtime_for_current_server() -> PushRuntime:
     if runtime is None:
         runtime = PushRuntime(server, data_dir)
         _RUNTIME_BY_DATA_DIR[data_dir] = runtime
-        server.pending_transfers = runtime.legacy_transfers
+        server.transfer_registry = runtime.transfers
     return runtime
-
-
-def _release_transfer_slot(
-    device_id: str, reason: str, task: str | None = None
-) -> bool:
-    from . import server as legacy_server
-
-    mapping = legacy_server.pending_transfers
-    if task in {"install", "push"}:
-        future = mapping.get((device_id, task))
-        if future is None or future.done():
-            return False
-        future.set_result(reason)
-        return True
-
-    released = False
-    for key in tuple(mapping):
-        if key[0] != device_id:
-            continue
-        if reason == "disconnect" and key[1] == "push":
-            # The Android Push worker and its HTTP transfer outlive the WebSocket.
-            # Keep the exact lease until transfer completion, terminal evidence, or
-            # the bounded transfer timeout releases it.
-            continue
-        future = mapping.get(key)
-        if future is not None and not future.done():
-            future.set_result(reason)
-            released = True
-    return released
 
 
 def install(server: Any) -> None:
@@ -2308,7 +2220,6 @@ def install(server: Any) -> None:
     _INSTALLED = True
     _ORIGINAL_CREATE_APP = server.create_app
     server._websocket_response_factory = RuntimeWebSocketResponse
-    server.release_transfer_slot = _release_transfer_slot
 
     def create_app() -> aiohttp_web.Application:
         runtime = runtime_for_current_server()

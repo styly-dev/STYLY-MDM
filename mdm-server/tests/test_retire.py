@@ -28,6 +28,7 @@ import pytest
 from aiohttp.test_utils import TestServer
 
 from styly_mdm import server
+from styly_mdm.transfer_registry import TransferRegistry
 from ws_test_helpers import receive_device_list as _recv_device_list, receive_type as _recv_type
 
 
@@ -49,11 +50,12 @@ class FakeWS:
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(monkeypatch):
+    monkeypatch.setattr(server, "transfer_registry", TransferRegistry())
     saved_r = server.RETIRE_TIMEOUT
     saved_u = server.SELF_UPDATE_TIMEOUT
     collections = (
-        server.devices, server.admin_connections, server.pending_transfers,
+        server.devices, server.admin_connections,
         server._transfer_tasks, server.pending_self_updates, server.pending_retires,
         server._apk_hash_cache, server.device_registry, server.device_groups,
     )

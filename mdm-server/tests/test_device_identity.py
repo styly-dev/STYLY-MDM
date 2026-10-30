@@ -9,6 +9,7 @@ import pytest
 from aiohttp.test_utils import TestServer
 
 from styly_mdm import push_runtime, server
+from styly_mdm.transfer_registry import TransferRegistry
 from styly_mdm.device_policy import CommandNotAllowedError
 
 
@@ -17,6 +18,7 @@ GUID = "64b19041-0b8c-4ef4-82fd-000000000000"
 
 @pytest.fixture(autouse=True)
 def reset_state(monkeypatch):
+    monkeypatch.setattr(server, "transfer_registry", TransferRegistry())
     for collection in (
         server.devices,
         server.device_registry,
@@ -24,7 +26,6 @@ def reset_state(monkeypatch):
         server.provisional_connections,
         server.admin_connections,
         server.pending_self_updates,
-        server.pending_transfers,
         server.last_install_dispatch,
         server.pending_retires,
     ):

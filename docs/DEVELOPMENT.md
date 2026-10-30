@@ -740,10 +740,14 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > [resumable artifact transfer](PUSH_JOBS.md#resumable-artifact-transfer) for the
 > release conditions, idle deadline, and coordinated rollout requirements.
 >
-> `pending_transfers` is keyed by **`(device_id, task)`**, not by device: an admin can
+> Install and Push use `TransferRegistry` directly with typed keys
+> (`TransferKey("install", device_id)` and
+> `TransferKey("push", device_id, job_id, attempt=1)`): an admin can
 > push files to a group that is already installing an APK, so one device may hold an
-> install slot and a push slot at once. Each terminal message frees only its own task's
-> slot. A disconnect still releases Install ownership.
+> install slot and a push slot at once. Each terminal or phase message frees only its
+> own exact waiter. A WebSocket disconnect releases only the exact Install key;
+> it never releases a Push-v1 waiter or revokes its live HTTP lease. Server shutdown
+> releases all remaining registry waiters, including Install.
 >
 > Admins see install aggregate progress via `INSTALL_PROGRESS`. The Push console
 > uses full `PUSH_JOB_UPDATED` snapshots.

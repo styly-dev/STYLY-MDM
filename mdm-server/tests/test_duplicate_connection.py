@@ -26,6 +26,7 @@ import pytest
 from aiohttp.test_utils import TestServer
 
 from styly_mdm import server
+from styly_mdm.transfer_registry import TransferKey, TransferRegistry
 from ws_test_helpers import (
     device_row_matches,
     receive_device_list as _recv_device_list,
@@ -34,9 +35,10 @@ from ws_test_helpers import (
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(monkeypatch):
+    monkeypatch.setattr(server, "transfer_registry", TransferRegistry())
     collections = (
-        server.devices, server.admin_connections, server.pending_transfers,
+        server.devices, server.admin_connections,
         server._transfer_tasks, server.pending_self_updates, server.pending_retires,
         server._apk_hash_cache, server.device_registry, server.device_groups,
     )
@@ -302,7 +304,7 @@ def test_e2e_download_complete_on_a_superseded_socket_does_not_release_the_slot(
                 await asyncio.sleep(0.1)
 
                 slot = asyncio.get_running_loop().create_future()
-                server.pending_transfers[("64b19041-0b8c-4ef4-82fd-000000000000", server.TASK_INSTALL)] = slot
+                server.transfer_registry.register(TransferKey("install", "64b19041-0b8c-4ef4-82fd-000000000000"), slot)
 
                 await stale.send_json({
                     "type": "DOWNLOAD_COMPLETE", "task": server.TASK_INSTALL,
@@ -383,7 +385,7 @@ def test_e2e_stale_teardown_does_not_free_the_live_transfer_slot(tmp_path):
                 await asyncio.sleep(0.1)
 
                 slot = asyncio.get_running_loop().create_future()
-                server.pending_transfers[("64b19041-0b8c-4ef4-82fd-000000000000", server.TASK_INSTALL)] = slot
+                server.transfer_registry.register(TransferKey("install", "64b19041-0b8c-4ef4-82fd-000000000000"), slot)
 
                 await stale.close()
                 await asyncio.sleep(0.1)
