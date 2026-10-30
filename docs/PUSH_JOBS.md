@@ -1,706 +1,226 @@
-# Push / Sync jobs
+# Durable Push / Sync Jobs
 
-Issue #91 introduces a server-owned job model for **Push Files** and **Sync Folder**. APK install remains on the existing path.
+**Push Files** and **Sync Folder** run as server-owned, SQLite-backed jobs with immutable artifacts, resumable HTTP Range transfers, per-device execution ownership, and explicit operator recovery controls. APK installation remains on its separate install pipeline.
 
-## Identity and persistence
+---
 
-A browser creates a job before uploading bytes:
+## Scope and Deployment Requirements
 
-1. `POST /api/push-jobs` allocates an opaque UUIDv4 `job_id` and atomically records the target snapshot in `DATA_DIR/push_jobs.sqlite3`.
-2. `POST /api/push-jobs/{job_id}/upload` writes into `push-work/{job_id}`, packages the upload, fsyncs it, and publishes an immutable `push-artifacts/{artifact_id}.zip`.
-3. Admin WebSocket `PUSH_FILES {job_id}` enables initial dispatch. Repeating it after dispatch only acknowledges the existing job; Resume requires explicit `target_devices`. Destination, mode, targets, and artifact data are read from SQLite rather than trusted from a second browser message.
+- **Supported target**: PICO 4 Ultra Enterprise registered with a canonical lowercase `styly_device_id_v1` GUID (`8-4-4-4-12` hex), advertising `capabilities: ["push_job_id_v1", "push_resume_v1"]` and `push_state.status == "available"`.
+- **Same-version requirement**: Push/Sync runs only between matching server and client versions, regardless of artifact size. There is no non-resumable or identity-less Push fallback. Devices on older APKs or legacy serial IDs can only receive APK installation and client self-update commands.
+- **Coordinated cutover**: Deploy the server and matching client APK together when no Push/Sync transfer is in flight. Unscoped artifact URLs from older builds are rejected. Finish pending serial-ID Push/Sync jobs before upgrading; old serial-keyed rows remain as historical records and are not migrated to GUIDs (create a new job for the registered GUID if delivery is still needed).
+- **Removed legacy endpoints**: `POST /api/bundles` returns `410 Gone` and `/bundles/` is unmounted. External scripts must use `POST /api/push-jobs` → `POST /api/push-jobs/{job_id}/upload` → Admin WebSocket `PUSH_FILES {job_id}`. Historical files under `DATA_DIR/bundles/` are untouched and can be backed up and removed manually once no longer needed.
 
-`client_request_id` makes job creation idempotent. The server looks up an existing request **before** live-target preflight, so loss of the first response followed by a device disconnect still returns the original job. The canonical fingerprint sorts targets, normalizes the shared-storage destination, and hashes stable JSON. Reusing an ID with different canonical data returns `409 Conflict`.
+---
 
-Issue #94 upgrades the released Issue #91 `push_jobs.sqlite3` schema directly
-from version 1 to version 3. It adds an immutable per-device dispatch revision,
-nullable `cancel_requested_at`, and an indexed `retry_of_job_id` link from a
-Retry failed devices job to its original job, without discarding existing jobs.
-The upgrade runs in one transaction. Before it starts, the server writes a
-consistent copy of the old database to `push_jobs.sqlite3.v1.bak` in the same
-data directory (SQLite backup API, written to a temporary file and then renamed).
-The Issue #91 server rejects any schema version other than 1 at startup, so
-rollback means stopping the server and replacing `push_jobs.sqlite3` with that
-backup (and removing any `-wal`/`-shm` files). Jobs created after the upgrade are
-not in the backup. Schema 2 was never released.
+## Ownership Model and Safety Invariants
 
-## Resumable artifact transfer
+### Three Independent Ownership Mechanisms
 
-Published bytes are immutable for the lifetime of an opaque `artifact_id`. The
-SQLite artifact row stores the unique storage name, exact byte size, SHA-256,
-creation time, and retention state. The SHA-256 is also exposed as a quoted
-strong ETag. Garbage collection leaves a tombstone row, so neither an artifact
-ID nor its `/artifacts/{artifact_id}` URL can be reused after its bytes expire.
-It commits the tombstone first and removes the file afterwards, outside the
-single database worker, so deleting a multi-gigabyte artifact never blocks other
-Push state transitions. A failed removal is logged; later GC runs, including
-after server restart, retry removal of remaining tombstoned files. Their bytes
-remain unavailable for download or job Retry throughout cleanup.
+Push/Sync separates device execution, network concurrency, and post-timeout safety into three distinct mechanisms:
 
-Job-v1 commands carry an immutable per-device `revision`, `artifact_id`, absolute
-URL, exact size, SHA-256, and ETag. The aggregate job revision may continue to
-advance; the dispatch revision remains fixed for one `(job_id, device_id,
-attempt)` and is the exact identity used when authorizing a resume. Every Push
-job target must advertise both `push_job_id_v1` and `push_resume_v1`, whatever the
-artifact size; there is no non-resumable fallback. Job creation rejects other
-targets, and dispatch rechecks the live session before sending. If Push state is
-unavailable after a target is claimed, dispatch returns it to a manual wait for
-Resume after recovery; it does not fail a retained transfer or discard its partial. A device on an
-older APK must take the client self-update before it can receive Push/Sync jobs.
-The supported headset is PICO 4 Ultra Enterprise. Identity-less live Push commands
-are rejected; the obsolete `/api/bundles` upload returns HTTP 410 and `/bundles/`
-is no longer served. Use the job creation/upload/dispatch API.
-This is a breaking API change for external scripts: create a job through
-`POST /api/push-jobs`, upload to its returned `upload_url`, then dispatch
-`PUSH_FILES` with the resulting `job_id`.
+| Mechanism | Owner & Storage | Scope / Key | Acquired When | Released When |
+|---|---|---|---|---|
+| **1. Client Execution Ownership** | Android `PushJobCoordinator` (`files/push-jobs/state.json` → `state.active`) | 1 active or interrupted job per device | Persisted before `PUSH_JOB_ACCEPTED` | Atomically moved to `pendingResults` on terminal completion, cleared by exact `PUSH_RESUME_REJECTED`, or expired via `resume_expired` |
+| **2. Global Transfer Slot & HTTP Lease** | Server `TransferRegistry` + `PushTransferLeases` (in-memory) | `TransferKey("push", device_id, job_id, attempt=1)` bounded by `MDM_MAX_CONCURRENT_TRANSFERS` | Scheduler claims `waiting_transfer -> dispatching` and mints random `?lease=<token>` | `PUSH_PHASE validating`, settled terminal result, exact `validating`/`applying` registration after offline download completion, 60s HTTP no-write watchdog, or pending `CANCEL_PUSH_JOB` |
+| **3. Persistent Device Fence** | Server SQLite (`push_device_fences` table) | `device_id` → exact `{job_id, attempt, artifact_id}` or `unknown-active-job` | Reconciliation deadline expires (`reconciling -> unconfirmed`) | Matching late `PUSH_FILES_RESULT`, matching `PUSH_RECONCILE_REPORT` (`status: "absent"`), eligible `downloading` interruption revival (`unconfirmed -> queued`), or proven client process replacement when no cancellation is pending (`process_instance_id` change, or a new job-v1 process reporting `active: null` against a legacy/no-PID fence) |
 
-Each job-v1 artifact URL includes a random, in-memory `lease` token scoped to its
-exact assignment. The server accepts the URL only while that assignment owns a
-transfer slot. A missing, stale, or revoked token returns `409` with
-`X-Push-Lease-Status: revoked`; the client keeps its validated partial and reports
-interrupted work for manual Resume. Resume issues a new URL and token. The token is
-not restored after a server restart, so the old URL is rejected and a partial
-download must be manually resumed after the device reports the revoked lease.
-If a device reconnects with the same live token while its earlier HTTP handler
-is still open, the newer request aborts and replaces that handler. It can then
-continue with a Range request under the same assignment and transfer slot.
+### Transactional and Concurrency Invariants
 
-The client keeps job-owned state below
-`Downloads/styly-mdm/.push-tmp/jobs/{job_id}/{attempt}/`:
+1. **Persist before side effects (Client)**: `PushJobCoordinator` is owned by `MdmClientApplication` and serializes all operations on a single actor. It never sends `PUSH_JOB_ACCEPTED` before saving `state.active`, never mutates destination files before awaiting the durable `beforeApply` (`applying`) checkpoint, and never sends `PUSH_FILES_RESULT` before atomically clearing `state.active` and writing the terminal outbox entry. If durable state cannot be loaded or saved, the MDM client stays alive, advertises `push_state.status = "unavailable"` with empty Push capabilities, and rejects new work with `client_persistence_unavailable`.
+2. **Single-worker transactions before network I/O (Server)**: `PushJobStore` owns the single serialized SQLite worker; `PushJobManager` executes compound policies (queue claims, disconnect settlement, `settle_result`, fence updates) in one transaction and builds exact-revision snapshots *before* commit. Transfer release, admin snapshot publication, and `PUSH_RESULT_ACK` happen only *after* commit. If a transaction fails, no side effect is emitted and the client retains its outbox entry for replay.
+3. **Per-device session serialization**: Device `REGISTER` replacement, disconnect settlement, incoming job-v1 device frames, and final `EXECUTE_PUSH_FILES` session checks + bounded `send_str` serialize under `_device_lock(device_id)`. One scheduler dispatch task runs per device (including slot waits); superseded sockets cannot settle phases, ACKs, or results. If a disconnect DB commit fails, a per-device recovery task is flushed under the same lock before any replacement `REGISTER` exposes a new session.
+4. **Decoupled admin backpressure**: Committed snapshots are coalesced per `job_id` and sent by an independent background publisher where each admin WebSocket send is bounded by `MDM_ADMIN_SEND_TIMEOUT` (5s). Stalled admin sockets are closed (and auto-recover via a fresh `PUSH_JOBS_SNAPSHOT` on reconnect) without ever holding a device lock. Fence creation or clearance revises every affected non-terminal job snapshot plus the terminal blocking job.
 
-- `artifact.part` is the only authoritative byte offset;
-- atomically replaced `metadata.json` binds that file to the job, attempt,
-  dispatch revision, artifact ID, size, SHA-256, and strong ETag from the
-  command. It does not store the URL: that is a replaceable locator taken from
-  each exact server authorization, so a server authority change does not
-  invalidate the artifact;
-- `artifact.zip` appears only after exact-size and SHA-256 verification.
+---
 
-Unknown, malformed, or mismatched metadata is never appended to. Expired
-interrupted ownership is rejected by the coordinator before starting a worker. A
-validated partial of `0 < N < artifact_size` bytes is requested with `Range: bytes=N-`,
-`If-Match: <strong-etag>`, and `Accept-Encoding: identity`.
-If a metadata-bound partial already has the exact artifact size, the worker enters
-validation and verifies its SHA-256 locally without an HTTP request or download
-deadline. A matching file is atomically renamed and reused; a hash mismatch removes
-the partial and its metadata before extraction or destination apply. If an HTTP I/O
-failure or idle expiry occurs after all bytes were durably written, the same local
-validation can finish without another request or a new operator Resume. Incomplete interrupted
-ownership still requires an exact operator-authorized Resume, and dispatch still
-acquires a transfer slot and issues a lease. The validating phase releases that slot
-before the whole-file hash begins, just as it does after an HTTP download.
+## Canonical Lifecycle and State Machines
 
-The job-v1 artifact endpoint supports only open-ended `Range: bytes=N-` requests
-and an exact ETag in `If-Match`. A missing `If-Match` still permits a full request;
-wildcard, weak, and multiple validators fail with `412`. Unsupported Range syntax,
-including suffix and bounded ranges, is ignored and returns the whole artifact with
-`200`; an unsatisfiable open-ended range returns `416`. This is a dedicated endpoint
-for the matching client version, not a general-purpose range service.
-
-Registration and reconciliation report a nonzero `validated_offset` only when
-the same worker metadata checks accept the partial identity and its length is
-within the expected artifact size. This is a resume
-offset, not a completed SHA-256 verification. The server sends unencoded bytes
-without a `Content-Encoding` header; an explicit `Content-Encoding: identity`
-is also accepted as an unencoded response.
-
-All live Push downloads require exact size, SHA-256, and strong ETag metadata.
-Partial-file deletion is decided in the worker, before terminal state persistence:
-retryable failures, unavailable artifacts, revoked leases, and storage failures
-with a validated prefix retain their bytes. A definitive response identity failure discards
-the partial; a final SHA mismatch also invalidates job metadata.
-The coordinator keeps interrupted ownership and its bytes for manual Resume.
-`artifact_unavailable` is instead a terminal failure: its bytes survive only until
-the terminal result is saved, then the coordinator deletes the attempt directory.
-If saving the result fails, cleanup waits for durable recovery.
-
-`validated_offset` is reconciliation state, not live console byte progress.
-Live byte reporting and monotonic displayed progress across an ignored-Range full
-restart remain part of Issue #85; the worker currently exposes no progress callback.
-
-Response handling is fail-closed:
-
-- `206` is appended only when ETag, `Content-Range`, total size, and
-  `Content-Length` describe a range starting at the requested offset, with its
-  inclusive end strictly below the total size. A shorter valid range may be
-  continued; a non-identity content encoding is rejected before writing;
-- `200` is never appended; with the same validator it replaces the partial from
-  byte zero;
-- `412` is an artifact-identity failure;
-- `416` is always rejected because HTTP requests start from an incomplete local
-  artifact; the validated partial is retained for manual Resume. Complete partials
-  take the local validation path above;
-- `404` and `410` are explicit artifact-unavailable failures;
-- `409` with `X-Push-Lease-Status: revoked` ends this attempt as interrupted,
-  preserving the validated partial for manual Resume;
-- any other status fails a fresh download with `download_failed`; on a resume it
-  says nothing about the stored bytes, so the attempt ends as interrupted
-  (`download_interrupted`) and keeps the validated partial for manual Resume;
-- transient I/O, `408`, `429`, and 5xx failures keep validated partial bytes and
-  retry with bounded 1/2/4/8-second backoff while the 60-second no-progress
-  window remains open. A retry that received artifact bytes starts the backoff over.
-  Only received artifact bytes reset this monotonic deadline;
-  connection establishment and response headers do not. Blocked HTTP operations
-  are cancelled when the window expires. Management WebSocket loss alone does not
-  stop a download that is still making progress. Local file write or sync failures
-  never retry the network request: with a validated partial they end the attempt as
-  interrupted for manual Resume; without one they fail with `storage_write_failed`.
-
-The client deadline measures bytes received and saved on the device; the server
-measures bytes successfully written to the HTTP response. These clocks can differ
-because of buffering. The server renews the job-v1 lease only after successful HTTP
-writes. After 60 seconds without such progress, it revokes the URL, aborts and awaits
-the matching HTTP handler, then releases that assignment's slot. A healthy transfer
-can continue beyond the previous 600-second timeout. Once revoked, the old URL cannot
-reconnect without a new operator-authorized Resume, so it cannot restart outside the
-slot limit. The accepted-work reconciliation deadline defers while this exact
-HTTP lease is live; the watchdog owns stalled-stream recovery. APK installation
-retains its existing timeout behavior.
-
-If no artifact bytes arrive for 60 seconds, a resumable client persists interrupted
-ownership with `reason: download_interrupted` instead of creating a terminal
-receipt or deleting the partial. It includes that reason in reconciliation and
-registration reports. The server validates the exact assignment, atomically
-requeues it with per-device `queue_reason: download_interrupted`. This generic reason
-also covers a resumed response rejected before writing, without implying that
-network retries occurred. When the client reports `server_lease_revoked` or
-`storage_write_failed`, the server maps it to the same
-per-device manual Resume gate.
-The console exposes **Resume** while the job's dispatch gate remains enabled.
-Only that assignment waits for authorization; other queued and running devices continue.
-Reconnect and duplicate reports cannot clear this manual requirement.
-Resume authorizes a fresh 60-second no-progress window with the same identity and offset.
-Download completion ends this timer; validation and destination apply may continue
-without the management connection. Application restart requires manual Resume
-(`client_restarted`) instead of granting a fresh automatic recovery window.
-Repeated reports while queued, waiting for a slot, or dispatching are no-ops:
-they neither re-pause the job nor release the replacement transfer slot.
-
-Deploy the server and matching client update together. This rollout assumes there is
-no active Push/Sync transfer on the old APK; old unscoped job-v1 artifact URLs are
-intentionally invalid after cutover. No compatibility machinery is kept for an
-in-flight old job-v1 download. APK installation is unchanged. Cancellation intent requires schema 3 as described below; no new device
-WebSocket message type is required.
-
-Malformed response headers rejected before writing do not invalidate an existing
-partial: the client retains it and waits for manual Resume. A changed strong ETag
-or failed artifact integrity check still rejects the artifact.
-
-Extraction and destination apply start only after size and SHA-256 verification
-and an atomic local rename. A hash mismatch removes the untrusted partial. The
-client hashes bytes as they are written, so an uninterrupted download is not read
-again for verification. A resume in a new execution never rereads its kept prefix
-before or during the HTTP transfer, because the server's 60-second lease idle timer
-is already running; it hashes the whole file once after `PUSH_PHASE validating`.
-
-On process or device restart, the client retains a valid interrupted Issue #94 job-v1
-record and reports its exact artifact, dispatch revision, attempt, and local
-offset during registration/reconciliation. The server requeues it only when that
-evidence matches a job-v1 assignment with an immutable dispatch revision, an
-authorized dispatch gate, and no pending cancellation. Dispatch admission requires
-both `push_job_id_v1` and `push_resume_v1`; resume does not parse historical
-capability snapshots or repeat the session capability check. New dispatches no
-longer write capability snapshots; the nullable database column and historical
-values remain for schema compatibility. Restarted work also
-waits for manual Resume before the server sends
-a fresh `EXECUTE_PUSH_FILES` authorization. The client
-never resumes, extracts, or applies stale partial work merely because it exists.
-If an interrupted report supplies a cleanup identity but cannot be authorized, the server sends
-`PUSH_RESUME_REJECTED`; the client durably releases only that exact interrupted
-identity, removes its owned work, and confirms `absent`. A verified
-`artifact.zip` surviving a restart is hash-checked and reused without network
-transfer.
-
-Push runs only between a server and client of the same version; a newer server
-only updates an older client's APK. The client therefore rejects a live job-v1
-command without `artifact_url`, a positive `revision`, and a strong `artifact_etag`
-as malformed, and compares replays by exact execution fields. Job-v1 commands no
-longer duplicate `artifact_url` as `bundle_url`. Live identity-less commands are
-rejected. Saved job-v1 commands also require
-`artifact_url`, which the released Issue #91 client (v0.6.0) already persisted.
-Durable state written by that client still loads: its active work, which has no revision, closes as
-`client_restarted` instead of resuming, and its receipts still answer result
-acknowledgements and reconciliation. Historical standalone receipts remain
-readable and replayable; they do not enable new standalone execution.
-
-Interrupted client ownership expires after 24 hours of cumulative device powered-on
-time from the first interruption, including deep sleep. The coordinator stores a
-remaining budget, `Settings.Global.BOOT_COUNT`, and an `elapsedRealtime()` anchor
-in its atomic state file. Within the same boot, elapsed time includes client process
-downtime. A new boot resumes the last saved budget at client startup; power-off time
-and uncheckpointed time from the previous boot are not counted. Device wall-clock
-changes do not affect this budget. Resume consumes the existing budget without
-resetting it; an executing worker is allowed to finish and is not aborted by expiry.
-
-One replaceable actor timer checkpoints a retained budget every five minutes and
-checks interrupted expiry sooner when due. Durable state changes also checkpoint
-the budget. A context-registered `ACTION_SHUTDOWN` receiver makes a bounded final
-save attempt through the same actor before a normal shutdown completes. If the
-client is stopped, the CPU is asleep, storage fails, or power is lost, the last
-checkpoint remains authoritative and retention can extend beyond 24 hours of
-actual powered-on time. Five minutes is the normal checkpoint interval, not a
-hard maximum extension. No wakeup alarm or wake lock is used for retention.
-
-Command acceptance, registration, and reconciliation recheck interrupted expiry
-in case the timer was delayed during sleep. Failed expiry persistence retains
-ownership and is retried after 60 seconds; successful persistence precedes release
-and cleanup. Completed-receipt age and display timestamps still use wall-clock time.
-At expiry the client durably records `resume_expired`,
-releases its local execution gate, removes the exact job-owned work, and replays
-the terminal result when registered. The server remains authoritative for its
-canonical assignment until that exact result or later reconciliation is received.
-An expired resumed assignment can settle while still queued; it does not require
-another download dispatch to release server ownership.
-Durable-state load diagnostics never log exception text or causes, which can contain
-stored artifact URLs and lease credentials. Corrupt-state reset notices use fixed
-safe detail text for server logs and admin notifications.
-General startup/periodic removal of unreferenced files belongs to Issue #92.
-Server restart rebuilds artifact-retention references from durable job/device rows
-before cleanup, so queued, active, reconciling, and resumable assignments keep their
-artifact bytes. HTTP leases follow the restart behavior described above.
-
-## Operator controls
-
-- **Offline devices never start queued work by reconnecting.** Job creation and
-  Retry failed devices accept only online targets, and the initial dispatch of a
-  job skips any target that went offline while the job was uploading. When a
-  device disconnects, or is offline when its queue turn arrives, its queued or
-  slot-waiting work in a dispatch-enabled job is settled at once
-  (`settle_offline_before_dispatch`): never-dispatched work fails with
-  `device_offline_before_dispatch` (the operator can Retry it), while an assignment
-  that was already dispatched and waits to resume returns to a manual
-  `device_offline` wait (**Resume required**), keeping its identity and the device's
-  validated partial. The same disconnect also withdraws authority that applied
-  only while the device stayed connected: a pending Resume on a reconciling
-  assignment returns to the `device_offline` wait, and a lost acceptance is no
-  longer replayable. Interrupted evidence reported later never authorizes dispatch
-  by itself; only a Resume that is still pending does. Existing manual waits and
-  pending cancellations are unchanged. Work the device has already accepted
-  (downloading, validating, applying) is not stopped by a management WebSocket
-  disconnect.
-- **Resume** is available only for online devices with available Push state and
-  the required capabilities. **Resume all** excludes ineligible devices,
-  preserving their manual wait and Needs attention entry. Offline timed-out
-  devices support **Cancel** only; reconnect alone never grants resume permission.
-- **Resume** clears current per-device retry-exhaustion waits and reopens a
-  restart-paused dispatch gate. It does not rerun terminal failures, reset the first
-  interruption timestamp, or authorize new interruptions reported after the action.
-  Each device's Progress cell exposes its own Resume/Cancel actions, which send
-  `target_devices: [device_id]`. Resume requires an explicit target list;
-  an untargeted request cannot reopen a dispatched job's manual waits.
-  Empty, malformed or foreign targets are rejected. The attention panel retains
-  **Resume all**. Resuming one device after a server restart keeps all other queued
-  or interrupted devices paused until their own Resume or Resume all.
-  A storage write failure with an exact retained partial uses the same manual
-  Resume gate; the operator must free or repair device storage first.
-- **Cancel** finishes a never-dispatched queued target immediately on the server
-  when a ready/running/reconciling job requires Resume, including offline targets after
-  server restart. It records `failed/cancelled` without a pending cancellation or
-  device command; no client owns that assignment. Cancelling the final unfinished
-  target terminalizes the job and allows normal artifact expiry. Cancelling only
-  some targets of a ready job leaves the others ready without enabling dispatch.
-  For dispatched interrupted or unresolved work, Cancel persists an operator
-  cancellation request, including offline status-confirmation waits. It revokes a still-active
-  HTTP lease and stops its stream even when the management WebSocket is offline.
-  An online active worker is not directly cancellable. Pending cancellation disappears from Needs attention because no
-  further operator action is needed, but remains visible in Devices. Ownership and
-  fences remain until exact absence or a terminal result confirms release; the next
-  job for that device cannot start earlier. For an online device, Cancel sends an
-  exact `PUSH_RECONCILE_REQUEST` whatever the assignment state: a client that no
-  longer holds the identity answers `absent`, which confirms the cancellation at
-  once. When the client reports interrupted work, the server sends the existing
-  `PUSH_RESUME_REJECTED` with exact identity to discard it. Reconnection never authorizes a cancelled assignment. Already-applied files
-  are not rolled back. Work already received and validating on an offline device
-  may finish before cancellation is observed. Individual **Cancel** and **Cancel all**
-  ask for confirmation; the latter shows the number of affected devices. Only
-  dispatched assignments with `push_resume_v1` can use client-confirmed cancellation;
-  the snapshot exposes this as `resume_supported`. Never-dispatched paused targets
-  can have `cancellable: true` while `resume_supported: false`.
-- Each snapshot assignment carries server-computed action flags from
-  `push_jobs.assignment_actions`: `manual_wait` (a per-device wait for Resume),
-  `resume_required`, `cancellable` (the same rule `CANCEL_PUSH_JOB` enforces), and
-  `retryable` (the rule `RETRY_FAILED_PUSH_JOB` enforces before its online check).
-  The console combines them with live connectivity and Push-state availability.
-  A reconciling assignment is cancellable only while its device is
-  offline. Targets already moved to a retry job expose no Resume/Cancel actions;
-  a remaining device fence still exposes Reconcile in the job controls.
-- **Retry failed devices** creates and dispatches a new job for online `failed`,
-  `interrupted`, and `unconfirmed` targets, excluding `failure_code: cancelled`.
-  A target is also excluded when a later job for the same device and destination
-  was dispatched or is still pending: retrying the older artifact would overwrite
-  newer content (and, for Sync, delete it). Existing schema-1 capability snapshots
-  and acceptance timestamps also count as dispatch evidence after migration.
-  Online means a live session that
-  advertises the Push job capabilities with available Push state; a target that
-  disconnects before the retry job is enabled is settled like any offline target.
-  It reuses the immutable artifact without upload and leaves success records and
-  device fences intact. Offline targets are skipped and stay eligible for a later
-  Retry; the request fails when no eligible target is online. Fenced targets wait
-  for evidence that the previous worker is gone. Expired/missing artifacts require
-  a new upload. The request UUID makes replay idempotent: a repeated request returns
-  the existing retry job without enabling dispatch or clearing manual waits. A ready
-  retry job whose initial dispatch did not complete needs explicit dispatch/Resume.
-  Shared artifact retention
-  is measured from the latest referencing terminal job, with active leases preserved.
-  A target already included in a retry job is excluded from the original job's
-  retry actions. An unconfirmed target with a remaining fence stays in Needs
-  attention with Reconcile until canonical evidence clears that fence. The device
-  then shows its queued retry job. History remains; any new failure belongs to the retry job.
-- Offline task cells show **Job pending · offline** or **Resume required**,
-  rather than claiming active pushing. Reconciliation
-  shows **Awaiting status confirmation**, with **offline** appended when disconnected;
-  unconfirmed outcomes show **Status unknown**. This is distinct from job history.
-  Canonical devices needing operator attention also appear in **Needs attention**
-  while remaining in **Devices**. This list is derived from current job state and
-  disappears as action requirements clear; confirmed cancellation and success do
-  not leave stale entries. These registered devices are separate from provisional
-  connection rows and never become provisional power-control targets.
-
-`CANCEL_PUSH_JOB` remains an admin action; clients receive the existing exact-identity
-`PUSH_RESUME_REJECTED` only after they report interrupted work. Only an `absent`
-reconciliation report from the current device owner that carries the exact job,
-attempt, and artifact ID confirms cancellation; a missing or mismatched artifact
-ID never does.
-
-APK installation is a separate client worker and can overlap Push/Sync when a shared
-network slot is available. Reboot does not wait for a transfer slot but requires a
-live eligible connection. Neither operation requires this Cancel action.
-
-## Ownership model
-
-Push/Sync uses three independent ownership mechanisms:
-
-- **Device execution ownership** is the coordinator's durable `state.active`, held through validation and apply until the terminal result is persisted. Interrupted ownership also reserves the device until exact Resume authorization or durable settlement; no separate in-memory gate tracks ownership.
-- **Global transfer slot** is independent of the device WebSocket. It is released on `PUSH_PHASE validating` before SHA-256, a matching terminal result, or an exact `validating`/`applying` registration after offline download completion. `PUSH_TRANSFER_COMPLETE` remains the post-SHA-256 checkpoint. The [HTTP lease watchdog](#resumable-artifact-transfer) bounds stalled transfers.
-- **Persistent device fence** blocks later jobs after an `unconfirmed` outcome until exact evidence proves the old worker is gone.
-
-The transfer registry uses typed keys. A job-v1 slot is addressed by `(job_id, device_id, attempt=1)`; a stale result cannot release a different job's slot. Job-v1 uses the existing server-wide transfer semaphore. APK installation keeps its existing slot handling.
-
-The device queue is ordered by the server-wide monotonic `enqueue_seq`. A later enabled job cannot jump over an older non-terminal queued assignment merely because the older job is still uploading or has its dispatch gate paused. The console therefore keeps every dispatchable `ready`, `running`, or `reconciling` job with a closed gate in a stable attention panel; an uploaded `ready` job can be dispatched with its existing `job_id` even if the original browser send was lost.
-
-## Client capability and durability
-
-New clients register:
-
-```json
-{
-  "capabilities": ["push_job_id_v1", "push_resume_v1"],
-  "process_instance_id": "<process UUIDv4>",
-  "push_state": {"status": "available"},
-  "push_runtime": {"active": null}
-}
-```
-
-`PushJobCoordinator` is owned by `MdmClientApplication`, not by a Service instance. It serializes commands on one actor, permits one active Push/Sync worker, persists active state before `PUSH_JOB_ACCEPTED`, and stores terminal results in an outbox until a matching `PUSH_RESULT_ACK` either accepts the result or marks its rejection as permanent with `retryable: false`. An older server that omits `retryable` is treated as retryable. Completed receipts retain the original command metadata for at most 256 entries and seven days. A missing state file is initialized as an empty state. If durable state cannot be loaded or saved, the coordinator keeps the rest of the MDM client alive but rejects new work with `client_persistence_unavailable`; it never starts a worker, publishes a phase, releases an execution lease, or sends a terminal result whose required state was not persisted.
-
-The worker's phase callbacks report observations. Before destination mutation,
-The required `beforeApply` callback is an explicit checkpoint: the worker waits for the actor to save
-`applying`, and a rejected or failed checkpoint returns
-`client_persistence_unavailable` without applying files. Worker outcomes distinguish
-terminal results from interrupted ownership; an interruption is never sent as a
-terminal result. Execution fingerprints list their fields explicitly; changing the
-artifact URL alone still permits exact Resume.
-An `applying` record permits destination mutation; it does not prove that mutation
-has already occurred. A worker interrupted during the checkpoint cannot apply, and
-its terminal failure is serialized after any already-running phase save.
-
-### Durable state recovery
-
-State JSON now carries `state_version: 2`. Existing unversioned and version-1
-Issue #91/94 records remain readable. Their wall-clock interruption timestamp cannot
-recover a reliable monotonic budget, so resumable active work receives one fresh
-24-hour budget during recovery, saved in version 2 before it is exposed. Malformed
-version-2 retention data preserves ownership as unavailable. Version-1 readers that
-honor the version field preserve version-2 state as unavailable on downgrade; restore
-a matching client instead of deleting the state. Historical readers that predate
-version validation are not supported for rollback with retained work.
-Wire-command validation and stored-command decoding share value invariants while
-retaining separate required-field contracts. Only the stored reader accepts
-historical commands without current execution identity.
-Unsupported future versions are retained as unavailable, never reset.
-
-The client recovers its durable Push state (`files/push-jobs/state.json`) by itself;
-there is no operator retry command.
-
-- **Malformed active commands, receipt records, or collections**: the client preserves the entire state
-  file and stays unavailable, rather than losing valid active work or deduplication
-  evidence. It does not report absence or start another worker. The bounded load
-  retries below can recover if the file is repaired or restored; reboot alone does
-  not repair malformed records. After retries are exhausted, repair or restore the
-  state file and restart the client.
-- **Other unparseable state** (malformed JSON): retrying cannot help, so the client
-  deletes the file, starts from an empty state, and continues normally. Its next
-  REGISTER carries a one-shot notice,
-  `push_state: {status: "available", reset: {reason: "corrupt_state_discarded", detail}}`
-  (single-line detail, at most 256 characters), cleared once acknowledged. The server
-  logs it and broadcasts `PUSH_STATE_RESET` to admin consoles. Only bookkeeping is lost:
-  no worker runs before the state is loaded, and job work directories (including
-  validated partials and their metadata) are untouched. Work the server still tracks
-  settles through normal reconciliation: an assignment awaiting status confirmation
-  becomes `interrupted` (`client_state_absent`) and can be retried; a fence is cleared
-  by the new process; a manual Resume wait stays and, when resumed, reuses the
-  retained partial. A result that was never delivered is reported the same way.
-- **Read I/O error at load, or save failure while running** (for example, full
-  storage): the client stays unavailable, advertises no Push capabilities, and rejects
-  new work with `client_persistence_unavailable`. A runtime transition from available
-  to unavailable refreshes registration once so the server and console see the
-  failure. A refresh is a REGISTER repeated on the same socket: the server updates
-  the live session's capabilities and Push state in place and answers `REGISTERED`
-  with the same `session_id`. Closing the socket instead would settle the device's
-  queued work as offline. Repeated failures while unavailable do not trigger reconnect loops.
-  It retries every 60 seconds, at most
-  five times per incident. A retry after a save failure re-saves the in-memory state,
-  including a finished worker outcome that could not be saved, and never reloads disk.
-  On success the client refreshes its registration on the same socket, so the
-  server sees the recovered state, pending cancellations, and runtime report. After five failures it stops until the next app start, which loads again and
-  gets five new attempts. The console shows **Push state unavailable** with the remedy:
-  free device storage, then use **Reboot**.
-
-An unavailable registration is never authoritative absence evidence: the server keeps
-canonical reconciliation and fences untouched, and sends no `PUSH_RECONCILE_REQUEST`,
-until the client reports available state. A client that has not loaded its durable
-state ignores reconciliation requests instead of answering `absent`.
-Job creation for such a target fails with an explanation instead of a capability
-error. Resume also excludes unavailable targets. If state becomes unavailable while
-waiting for a transfer slot, dispatch returns to a manual wait and preserves the
-execution identity and partial bytes.
-
-The worker validates destination paths on the device as well as the server. It accepts only a shared-storage subdirectory, rejects protected top-level media/app directories, does not traverse destination symlinks, bounds ZIP entry count and expanded bytes, rejects duplicate or conflicting archive paths, and validates the exact job-v1 artifact size and SHA-256 before publishing the downloaded ZIP or touching the destination. Destination validation completes before the client reports `applying`.
-
-Push jobs require a registered GUID client advertising `push_job_id_v1` and
-`push_resume_v1` on PICO 4 Ultra Enterprise. There is one live job-based Push
-execution path. Identity-less requests receive an explicit error; the old upload
-endpoint returns HTTP 410. Historical durable execution records and receipts are
-retained to prevent duplicate execution. Legacy serial-ID clients remain eligible
-only for APK installation/update. The 2 GiB content limit applies to uploaded
-source bytes and extracted content; ZIP overhead may make the artifact larger.
-
-Historical `DATA_DIR/bundles/` files are left untouched and are not referenced by
-the job artifact store. After stopping the old server and checking that no old
-client still needs a standalone download, back up this directory and remove it
-manually if its contents are no longer needed. Do not apply this cleanup to
-`push-artifacts/`, `push-work/`, or `push_jobs.sqlite3`.
-
-Finish pending serial-ID Push/Sync jobs with the previous server before upgrading
-to GUID identity. Old assignments are not migrated or resumed on serial clients;
-queued assignments may remain pending. Retain those records and create a new job
-for the registered GUID if delivery is still needed. A database reset is not
-required, and an old pending record is not evidence of successful delivery.
-Identity-less standalone Push messages do not settle old database-backed legacy
-assignments. Startup adds no legacy-specific terminal cleanup. A retained assignment or
-fence for the same device key can continue to block later work until the existing
-reconciliation policy resolves it; records under a different serial key do not
-block the registered GUID. Schema upgrades and their backups remain supported.
-
-## State and revision
-
-Each job has a monotonic 64-bit `revision`. Canonical mutations are committed and snapshotted in the same serialized SQLite operation. The current console receives:
-
-- `PUSH_JOBS_SNAPSHOT` after connection,
-- `PUSH_JOB_UPDATED` with a full job snapshot.
-
-`PushJobManager.settle_result` reads the current assignment and fence, decides
-normal/cancelled/late/opaque-fenced results, and commits outcome changes and
-affected revisions in one transaction. A late result without cancellation clears
-its exact fence while preserving the `unconfirmed` history; after cancellation,
-the actual terminal success/failure is retained. Identical terminal replays do
-not create revisions or publications. The returned `ResultSettlement` authorizes
-transfer release, snapshot publication and ACK only after commit. A failed
-transaction produces none of these effects; the client retains its result for
-replay. No protocol or persisted-format migration is required for this refactor.
-
-The server coalesces pending publication by `job_id` and sends only the newest queued revision from a single best-effort publication worker. Admin WebSocket sends are concurrent across connections and individually bounded by `MDM_ADMIN_SEND_TIMEOUT`, so a stalled browser cannot hold a device owner lock or delay another browser. A failed or timed-out admin socket, including one whose initial canonical snapshot cannot be sent, is closed; the current console's existing reconnect loop opens a new socket after three seconds and restores state from a fresh full snapshot. The console treats `PUSH_JOBS_SNAPSHOT` as a full replacement, buffers updates that arrive before that initial snapshot, and ignores revisions that are not newer. Fence create/clear, including an opaque fence, revises every non-terminal job whose snapshot displays that device fence plus the terminal blocking job.
-
-## Scheduling and connection ownership
-
-The exact transfer waiter is registered before `waiting_transfer -> dispatching` commits and before the command is sent. Waiter cleanup is identity-checked, so a superseded dispatch task cannot cancel a replacement task's waiter. The durable `accept_deadline` is swept into short reconciliation only when no live dispatch task still owns the exact in-memory acceptance waiter. The local waiter owns the normal timeout; the durable sweep recovers process/background-task loss. Its transition compares the exact stored deadline in the same transaction, so a stale sweep cannot capture a later replay of the same attempt. After slot acquisition, the scheduler rechecks the live connection and capability. It then holds the same per-device owner lock used by REGISTER replacement and disconnect while performing the final session check and bounded `send_str`.
-
-Job-v1 messages from a device are also checked and settled under that owner lock. Disconnect removes the old owner and commits its queue authority withdrawal and active reconciliation in one transaction before a replacement REGISTER may acquire ownership. A failed commit retains a per-device recovery task; registration flushes that pending event under the same owner lock before exposing the new session. Authoritative empty registration also repairs orphaned dispatched phases. It does not release an active Push transfer slot because the Android HTTP worker outlives the WebSocket. An exact active `downloading` report preserves ownership of an in-process live HTTP lease and also satisfies a still-live acceptance waiter. After a server restart, no HTTP token or active stream is recovered; the old URL is rejected and the client must report interrupted work before manual Resume can issue a fresh token and slot. The server maps `server_lease_revoked` to the existing per-device `download_interrupted` Resume gate. Once a replacement REGISTER owns the device, the superseded socket cannot settle an ACK, phase, transfer completion, result, or reconciliation report. Committed admin snapshots are queued for publication and sent after this correctness path returns; browser backpressure is not part of device ownership.
-
-The timeout watchdog must retain a recovery owner if its DB update fails: it first
-stops the HTTP handler and releases the exact transfer, then delegates the durable
-transition to dispatch recovery. Artifact GC has its own single background loop;
-a slow physical removal never holds up acceptance/reconciliation deadline processing.
-Retry supersession compares the existing per-device `enqueue_seq`, including when
-job timestamps are equal or the clock moves backward. Initial snapshots batch that
-lookup instead of repeating a cross-job query for every visible job, and retrieve
-each job's fences in one query instead of one query per device.
-
-
-A failed acceptance probe on the management WebSocket does not stop independent
-HTTP progress. If disconnect or an exact late active report wins the acceptance
-timeout race, the scheduler preserves only the same live transfer waiter and lease
-in a compatible reconciliation/downloading state. Its HTTP no-progress watchdog
-still bounds the transfer; cancellation, terminal states, manual waits, and
-replacement ownership cannot inherit that continuation.
-For resumed commands, the earlier `accepted_at` remains historical evidence;
-the current dispatch state and exact `accept_deadline` govern the new acceptance wait.
-
-If a replacement REGISTER arrives before the old socket's disconnect callback,
-it applies the same offline queue settlement under the device owner lock before
-adopting the new report. Pending Resume authorization is withdrawn in either
-order, while an accepted worker's healthy HTTP transfer retains its lease.
-
-Artifact URLs in device commands are absolute HTTP(S) URLs derived from the accepted device connection's server authority and include a per-assignment `lease` query token. The canonical snapshot retains the relative `/artifacts/{artifact_id}` route for console/API use; it is not a downloadable job-v1 URL without an active lease. The server redacts the `lease` value from the HTTP access log, and it serves an artifact only when the stored file still has its recorded byte size (otherwise `404`).
-
-## Restart and reconciliation
-
-On server restart:
-
-- `uploading` and `packaging` become `interrupted` and their owned work trees are cleaned;
-- expired `created` jobs become `interrupted`;
-- `waiting_transfer` returns to `queued`;
-- dispatched phases become `reconciling`;
-- active download URLs are not recovered after process restart; the old URL is rejected and the device must report `server_lease_revoked` before manual Resume can issue a new lease. The server maps this reason to the existing `download_interrupted` gate;
-- dispatch is paused and no command is automatically resent;
-- the operator re-enables an existing job through **Resume** or **Resume all** in Needs attention, which sends `PUSH_FILES` for the selected target devices; this also covers an uploaded `ready` job whose original dispatch send was lost;
-- scheduler wake-up immediately follows the durable re-enable and does not wait for its direct admin acknowledgement.
-
-A missing DB-referenced immutable artifact is never substituted. Startup fails the work that still needs that artifact. Canonical UUID-named artifact files with no owning DB row are treated as publication-crash orphans and removed; unknown files are left for the general stale-file policy.
-
-A client process restart retains an Issue #94 job-v1 active record as
-`interrupted` without starting work. It advertises the durable identity and
-local offset, and waits for an exact server authorization before resuming.
-Registration sends `REGISTERED` before any exact `PUSH_RESUME_REJECTED` cleanup
-instruction, so both endpoints have accepted the connection before cleanup starts.
-Device-handler failures run the same disconnect settlement as normal closure.
-Failure to send a manually requested reconciliation reports an error to the admin
-without closing the admin connection.
-Pre-Issue-94 job-v1 records without an immutable dispatch revision, and legacy
-commands, keep the earlier `client_restarted` terminal/outbox cleanup behavior
-because they cannot prove safe resume identity. Reconciliation accepts only
-exact identity evidence:
-
-- a matching active report restores the reported phase;
-- an explicit pre-accept `absent` report requeues the same attempt at most once, and
-  only while the device stayed connected after the command; after a disconnect it
-  becomes `interrupted` instead of starting on reconnect;
-- restart-origin `absent` becomes `interrupted` and is never automatically requeued;
-- an elapsed accept deadline enters the short exact reconciliation probe even if its in-memory waiter was lost;
-- an elapsed reconciliation deadline becomes `unconfirmed` only if the callback's stored deadline still matches and no live HTTP lease exists. A live lease defers reconciliation expiry; its watchdog owns the 60-second no-write timeout and refreshes the reconciliation deadline before revoking the lease;
-- a matching late result or exact `absent|interrupted` clears the fence without rewriting the old terminal job, except that an exact result for an assignment with pending cancellation records its actual success or failure (an explicit cancellation receipt records `cancelled`);
-- a different recorded job-v1 process UUID proves process replacement; a new job-v1 process that explicitly reports no active execution also safely replaces a legacy or offline-timeout fence that had no process UUID.
-
-An exact terminal result from the current owner settles any dispatched active phase even if an intermediate phase frame was lost during WebSocket replacement. Reconciliation can replay a matching completed receipt after its original result was already ACKed, allowing a server that missed that ACK boundary to converge without rerunning the worker.
-
-## Configuration
-
-| Environment variable | Default | Meaning |
-|---|---:|---|
-| `MDM_PUSH_CREATE_TIMEOUT` | `600` | Seconds allowed before upload starts |
-| `MDM_PUSH_COMMAND_SEND_TIMEOUT` | `5` | Bounded WebSocket send time |
-| `MDM_PUSH_COMMAND_ACCEPT_TIMEOUT` | `15` | Wait for accept/reject before probing |
-| `MDM_PUSH_ACCEPT_RECONCILIATION_TIMEOUT` | `60` | Pre-accept reconciliation window |
-| `MDM_PUSH_RECONCILIATION_TIMEOUT` | `1800` | Accepted-work reconciliation window when no live HTTP transfer lease is active |
-| `MDM_PUSH_ARTIFACT_RETRY_WINDOW` | `604800` | Seconds terminal artifact bytes remain available for recoverable retry |
-| `MDM_PUSH_ARTIFACT_GC_INTERVAL` | `60` | Seconds between lease-aware artifact GC scans |
-| `MDM_PUSH_RECENT_JOB_LIMIT` | `100` | Recent terminal snapshots returned |
-| `MDM_PUSH_RECENT_JOB_DAYS` | `30` | Recent terminal metadata window |
-| `MDM_ADMIN_SEND_TIMEOUT` | `5` | Per-browser WebSocket send timeout in seconds |
-
-`MDM_MAX_CONCURRENT_TRANSFERS` controls the shared network resource. `MDM_TRANSFER_TIMEOUT` (default 600 seconds) remains the timeout for APK installation. Job-v1 Push instead releases a stalled slot only after 60 seconds without successful HTTP response writes, after revoking the URL and stopping the exact handler; successful writes keep healthy transfers alive beyond 600 seconds.
-
-## Deliberate file-layout differences from the proposal
-
-The protocol and behavior follow the Issue #91 design. Three implementation-layout choices differ intentionally:
-
-1. `PushJobManager` is in `push_job_manager.py` rather than `push_jobs.py`. `push_jobs.py` stays a dependency-free domain module used by `push_job_store.py`; importing the SQLite store back into it would create a circular dependency. The manager remains the sole policy layer above the serialized store.
-2. `push_runtime.py` is the HTTP/WebSocket compatibility adapter rather than placing all Issue #91 routing into the already-large `server.py`. It installs explicit routes and consumes only job-v1 messages while leaving unrelated and old-client commands on the established server path.
-3. The console bridge is `static/push-jobs-v1.js`. The file panels call its explicit submission API, while rendering and operator actions use canonical full snapshots. The existing picker, target selection, and unrelated operation controls remain in `index.html`.
-
-On POSIX, both the published file and artifact directory rename are fsynced. Python has no portable directory-fsync handle on Windows, so Windows fsyncs the file and uses atomic `os.replace` but skips only the directory-handle fsync. This platform limitation is explicit rather than allowing artifact publication to fail on every Windows server.
-
-## Message flow
+### Job State Machine
 
 ```mermaid
-sequenceDiagram
-    participant B as Browser
-    participant S as Server
-    participant DB as SQLite
-    participant D as Device
-
-    B->>S: POST /api/push-jobs
-    S->>DB: create job + assignments
-    S-->>B: job_id, upload_url
-    B->>S: POST /api/push-jobs/{job_id}/upload
-    S->>DB: uploading -> packaging -> ready
-    B->>S: WS PUSH_FILES {job_id}
-    S->>DB: dispatch_enabled=1
-    S->>DB: queued -> waiting_transfer
-    S->>S: acquire shared transfer slot; register exact waiter
-    S->>DB: waiting_transfer -> dispatching
-    S->>D: EXECUTE_PUSH_FILES(job_id, attempt, artifact_url + lease token)
-    D->>D: persist active command
-    D-->>S: PUSH_JOB_ACCEPTED
-    S->>DB: downloading
-    alt Metadata-bound partial already has the complete size
-        D->>D: reuse local partial; skip HTTP
-        Note over S,D: Exact Resume authorization and dispatch slot still required
-    else Network transfer required
-        D->>S: HTTP Range + If-Match + identity encoding + lease token
-        opt No successful HTTP writes for 60 seconds
-            S->>S: revoke token; abort and await exact handler; release exact slot
-            D->>S: retry old URL + revoked token
-            S-->>D: HTTP 409 X-Push-Lease-Status: revoked
-            Note over S,D: Keep partial; manual Resume issues a new URL and lease
-        end
-        opt Server restarts while the device keeps downloading
-            S->>S: discard in-memory lease; do not reissue the old URL
-            D->>S: retry old URL + revoked token
-            S-->>D: HTTP 409 X-Push-Lease-Status: revoked
-            D-->>S: PUSH_RECONCILE_REPORT interrupted + server_lease_revoked + offset
-            S->>DB: map to existing per-device manual Resume gate
-            Note over S,D: Retain partial; Resume creates a new lease and reserves a slot
-        end
-        opt No artifact bytes received for 60 seconds
-            D->>D: persist interruption reason; retain partial and original expiry
-            D-->>S: PUSH_RECONCILE_REPORT interrupted + exact identity + offset
-            S->>DB: requeue only this device with manual Resume required
-            S-->>B: snapshot: download_interrupted
-            Note over S,D: Repeated waiting reports retain work and replacement slots
-            Note over S,D: Other devices continue; reconnect alone cannot resume this one
-            B->>S: Resume interrupted devices in existing job
-            S->>D: EXECUTE_PUSH_FILES with same assignment revision
-            D->>S: HTTP Range + If-Match + identity encoding
-        end
-    end
-    D-->>S: PUSH_PHASE validating (complete bytes available, before SHA-256)
-    S->>DB: validating; release exact transfer slot
-    D->>D: verify exact size and SHA-256
-    D-->>S: PUSH_TRANSFER_COMPLETE
-    D-->>S: DOWNLOAD_COMPLETE
-    D-->>S: PUSH_PHASE applying
-    S->>DB: applying
-    D->>D: atomically clear state.active and persist terminal outbox
-    D-->>S: PUSH_FILES_RESULT
-    S->>DB: one transaction: current assignment/fence + result + affected revisions
-    DB-->>S: committed ResultSettlement
-    S->>S: release authorized transfer; publish changed snapshots
-    S-->>D: PUSH_RESULT_ACK accepted or permanent/retryable rejection
-    D->>D: remove accepted/permanently rejected result; retain retryable result
-    opt Operator cancels interrupted or unresolved offline work
-        B->>S: CANCEL_PUSH_JOB(job_id, target_devices)
-        S->>DB: persist cancel request; retain ownership until confirmed
-        S->>D: PUSH_RESUME_REJECTED(exact identity), on reconnect if offline
-        D->>D: clear interrupted ownership; retain receipt; queue partial cleanup
-        D-->>S: PUSH_RECONCILE_REPORT(absent)
-        S->>DB: settle cancelled; allow next job
-    end
-    opt Operator retries failed targets
-        B->>S: RETRY_FAILED_PUSH_JOB(job_id, request UUID)
-        S->>DB: new job + unsuccessful online targets + shared artifact lease
-        Note over S,D: Successful/cancelled/offline targets excluded; fences remain
-    end
+stateDiagram-v2
+    [*] --> created: POST /api/push-jobs
+    created --> uploading: POST .../upload starts
+    created --> interrupted: Create timeout / server restart
+    uploading --> packaging: Multipart stream complete
+    uploading --> failed: Validation / size / empty-bundle error
+    uploading --> interrupted: Server restart
+    packaging --> ready: fsync + atomic artifact publish
+    packaging --> failed: Packaging / I/O error
+    packaging --> interrupted: Server restart
+    ready --> running: Device leaves queued
+    ready --> reconciling: Device enters reconciling
+    ready --> failed: All targets cancelled/failed before running
+    running --> reconciling: Any target enters reconciling
+    reconciling --> running: Reconciling targets resume/settle while others run
+    running --> succeeded: All targets succeeded
+    running --> completed_with_errors: >=1 succeeded and >=1 failed/interrupted/unconfirmed
+    running --> interrupted: 0 succeeded and >=1 interrupted
+    running --> failed: All targets failed/unconfirmed (0 succeeded, 0 interrupted)
+    reconciling --> succeeded: All targets succeeded
+    reconciling --> completed_with_errors: >=1 succeeded and >=1 non-succeeded
+    reconciling --> interrupted: 0 succeeded and >=1 interrupted
+    reconciling --> failed: All targets failed/unconfirmed
 ```
 
-Activity log is read-only history. Needs attention contains Resume all, Cancel
-all, Retry failed devices, and Reconcile; eligible device rows have individual
-Resume and Cancel controls.
+- Every canonical mutation increments the job's monotonic 64-bit `revision`.
+- Upload/packaging failures or `created` expiry settle both the job and any never-dispatched `queued` device rows in a single transaction.
 
-## Validation
+### Device Assignment State Machine
 
-See [Push/Sync validation](PUSH_VALIDATION.md) for automated checks, hardware
-evidence, and verification limits.
+Assignments use fixed `attempt = 1` per `(job_id, device_id)`; operator **Retry failed devices** creates a new job linked via `retry_of_job_id`.
+
+| State | Terminal? | Meaning | Allowed Next States |
+|---|:---:|---|---|
+| `queued` | No | Waiting for queue turn, job gate, or per-device manual `Resume` | `waiting_transfer`, `failed`, `interrupted` |
+| `waiting_transfer` | No | Claimed by scheduler; waiting for a global transfer slot | `queued`, `dispatching`, `failed`, `interrupted` |
+| `dispatching` | No | Slot + HTTP lease acquired; `EXECUTE_PUSH_FILES` sent; awaiting `PUSH_JOB_ACCEPTED` | `queued`, `downloading`, `validating`, `applying`, `reconciling`, `succeeded`, `failed`, `interrupted` |
+| `downloading` | No | Accepted by client; HTTP Range transfer or local partial check in progress | `queued`, `validating`, `applying`, `reconciling`, `succeeded`, `failed`, `interrupted` |
+| `validating` | No | Complete bytes on device; transfer slot released; SHA-256 + ZIP extraction running | `applying`, `reconciling`, `succeeded`, `failed`, `interrupted` |
+| `applying` | No | Durable `beforeApply` checkpoint saved; mutating destination directory | `reconciling`, `succeeded`, `failed`, `interrupted` |
+| `reconciling` | No | Management WebSocket lost or accept timeout elapsed; awaiting exact device evidence | `queued`, `downloading`, `validating`, `applying`, `succeeded`, `failed`, `interrupted`, `unconfirmed` |
+| `succeeded` | **Yes** | Destination updated and `PUSH_FILES_RESULT(success)` committed | — |
+| `failed` | **Yes** | Definitive failure or confirmed `cancelled` (`failure_code` recorded) | — |
+| `interrupted` | **Yes** | Unrecovered pre-accept or state-loss interruption (settled; eligible for `Retry failed devices`, not `Cancel`) | — |
+| `unconfirmed` | **Yes**\* | Reconciliation deadline expired without proof; installs a `push_device_fences` row | `queued`, `succeeded`, `failed`\* |
+
+\* *`unconfirmed` is a terminal state (`TERMINAL_DEVICE_STATES`), with two fence-guarded exceptions in `PushJobManager`: ① an exact saved `downloading` interruption report revives the row to `queued` (manual wait) and clears the fence when the artifact is still `retained`, no Cancel/Retry/superseding work exists, and the matching fence holds; ② when `cancel_requested_at` is set, exact `absent` / `resume_not_authorized` evidence settles `failed` (`failure_code: "cancelled"`) and clears the fence, or an offline worker that finished before seeing cancel settles its actual `succeeded` / `failed` outcome. Without pending cancellation, a late result or `absent` report clears only the fence while preserving `unconfirmed` history.*
+
+### Queue Ordering and Dispatch Permission
+
+Device queues are strictly ordered by server-wide monotonic `enqueue_seq`: a newer enabled job never overtakes an older non-terminal assignment on the same device, even while the older job is still uploading or paused.
+
+Whether `PushScheduler` may claim a `queued` row is governed by `dispatch_permission(queue_reason)` combined with the job-level gate `job.dispatch_enabled`:
+
+| `DispatchPermission` | `queue_reason` Condition | Scheduler Behavior |
+|---|---|---|
+| `automatic` | `None` or an internal scheduler wait (`"awaiting_dispatch"`, `"same_device_job"`, `"dispatch_recovery"`) | Dispatched automatically while `job.dispatch_enabled == true` (held by the job gate while `job.dispatch_enabled == false`) |
+| `operator_authorized` | `queue_reason == "resumable_replay"` (set by targeted `PUSH_FILES {job_id, target_devices}`) | Dispatched once even if `job.dispatch_enabled == false`; degrades to `"device_offline"` (`manual_resume_required`) if the device disconnects before acceptance |
+| `manual_resume_required` | `queue_reason` in `{"download_interrupted", "client_restarted", "dispatch_paused", "device_offline"}` | Paused for this device until explicit targeted **Resume**; other eligible devices in the same job continue normally |
+
+- `"dispatch_paused"` is persisted when server startup pauses active/waiting rows, when targeted **Resume** on a `ready` job pauses non-selected sibling targets, or when a target's Push state turns `unavailable` during slot wait / dispatch (`_pause_unavailable_dispatch`).
+- Client interruption reasons `server_lease_revoked` and `storage_write_failed` map to server `queue_reason = "download_interrupted"`.
+- Repeated interrupted reports while already `queued`, `waiting_transfer`, or `dispatching` are idempotent no-ops (they do not re-pause `"resumable_replay"` or drop a replacement slot). If a target's Push state becomes `unavailable` while waiting for a transfer slot or dispatching, the scheduler returns it to `queued` with `queue_reason = "dispatch_paused"` without failing or discarding retained partial bytes.
+- Each dispatched assignment records an immutable per-device dispatch `revision` on first claim. Even as the aggregate job `revision` advances, `(job_id, attempt, artifact_id, dispatch_revision)` remains fixed across Resume authorizations for that assignment.
+
+---
+
+## Resumable Artifact Transfer
+
+### Job Creation, Upload, and Initial Dispatch
+
+1. **Create (`POST /api/push-jobs`)**:
+   - Looks up `client_request_id` **before** live-target preflight so retrying a lost response after a target disconnects still returns the original job (`409 Conflict` if the canonical SHA-256 fingerprint over sorted targets, normalized `dest_path`, and `mode` differs).
+   - Rejects targets that are offline, legacy/provisional, missing `push_job_id_v1` + `push_resume_v1`, or reporting `push_state.status != "available"`.
+2. **Upload and Publish (`POST /api/push-jobs/{job_id}/upload`)**:
+   - Streams multipart files into `DATA_DIR/push-work/{job_id}/`, stripping OS metadata segments case-insensitively (`.DS_Store`, `._*`, `Thumbs.db`, `desktop.ini`, `__MACOSX`, `.Spotlight-V100`, `$RECYCLE.BIN`, `.Trash-*`) and returning `skipped_count` (rejecting with `400` if 100% of uploaded entries were metadata).
+   - Enforces the 2 GiB content limit on uploaded source bytes and extracted content (ZIP container overhead may make the archive slightly larger).
+   - Packages the archive, `fsync`s the file (plus parent directory on POSIX; Windows uses file `fsync` + atomic `os.replace`), records exact byte size, SHA-256, and strong ETag `"<sha256>"` in SQLite `push_artifacts`, publishes `DATA_DIR/push-artifacts/{artifact_id}.zip`, and transitions the job to `ready`.
+3. **Dispatch (`PUSH_FILES {job_id}`)**:
+   - An untargeted `PUSH_FILES {job_id}` sets `dispatch_enabled = 1` on a `ready` job; repeating an untargeted `PUSH_FILES` on an already-dispatched job only acknowledges it without reopening manual waits.
+   - Destination, `delete_extras` (`false` for Push Files, `true` for Sync Folder), target list, and artifact metadata are read exclusively from SQLite.
+
+### Scoped Lease URL and HTTP Range Contract
+
+When dispatching `(job_id, device_id, attempt=1)`, the server builds an absolute URL from the accepted WebSocket authority:
+`http(s)://<server-host>:<port>/artifacts/{artifact_id}?lease=<random-token>` (the `lease` query value is redacted from HTTP access logs; canonical admin snapshots expose only `/artifacts/{artifact_id}`, which is not downloadable without an active lease). The server serves an artifact only while the physical file still matches its recorded byte size (`404` otherwise).
+
+- **Client request headers**:
+  - Fresh download (`offset == 0`): `GET` with `Accept-Encoding: identity`.
+  - Resumed download (`0 < offset < artifact_size`): `GET` with `Range: bytes=<offset>-`, `If-Match: "<sha256>"`, and `Accept-Encoding: identity`.
+- **Same-lease connection replacement**: If a client reconnects using the same live lease token while its earlier HTTP handler is still open, the server aborts and replaces that handler so the Range transfer continues under the same assignment and transfer slot.
+- **Server and Client HTTP Disposition Matrix**:
+
+| HTTP Response / Local Event | Server Condition | Client Action | Validated Partial (`artifact.part`) | Worker Outcome |
+|---|---|---|---|---|
+| `200 OK` | Full request, or unsupported bounded/suffix `Range` syntax ignored | Verify identity encoding + matching strong ETag; overwrite from byte `0` | Replaced from byte `0` | Continue download |
+| `206 Partial Content` | Valid open-ended `Range: bytes=N-` with matching `If-Match` | Verify ETag, identity encoding, `Content-Length`, and `Content-Range: bytes N-M/T` (`M < T`); append at `N` | Appended | Continue download |
+| `409 Conflict` + `X-Push-Lease-Status: revoked` | Missing, stale, server-restarted, watchdog-expired, or cancelled lease token | Do not retry HTTP; stop attempt | **Retained** | `Interrupted("server_lease_revoked")` → manual **Resume** |
+| `404 Not Found` / `410 Gone` | Tombstoned/missing artifact or physical file size mismatch | Stop immediately | Retained by worker, then **deleted** once terminal failure is saved | `Completed(fail, "artifact_unavailable")` |
+| `412 Precondition Failed` (or changed ETag / non-identity encoding) | Wildcard, weak, multiple, or mismatched `If-Match` validator | Reject untrusted artifact identity | **Deleted** | `Completed(fail, "artifact_identity_mismatch" / "download_failed")` |
+| `416 Range Not Satisfiable` | `N >= artifact_size` (`Content-Range: bytes */T`) | Always rejected (complete partials skip HTTP locally) | **Retained** | `Interrupted("download_interrupted")` → manual **Resume** |
+| `408` / `429` / `5xx` / truncated body / transient network `IOException` | Transient server or transport error | Retry with `1s, 2s, 4s, 8s` backoff while 60s byte-progress window remains (backoff resets once payload bytes arrive). On 60s window expiry: stop | **Retained** (if `> 0` bytes; `validated_offset = 0` if none yet) | `Interrupted("download_interrupted")` → manual **Resume** (even at `0` bytes) |
+| Other unexpected `4xx` / invalid ETag or non-identity `Content-Encoding` before write | Unexpected HTTP status or invalid response headers | Stop immediately without network retry | **Retained** on resume (`offset > 0`); none at `offset == 0` | Fresh (`offset == 0`): `Completed(fail, "download_failed")` (unexpected HTTP status) or `Completed(fail, "artifact_identity_mismatch")` (missing/weak ETag or non-identity encoding)<br>Resume (`offset > 0`): `Interrupted("download_interrupted")` → manual **Resume** |
+| Local disk write / `fsync` error | Device storage full or I/O error during download | Never retry network | **Retained** if prior validated bytes exist | With partial: `Interrupted("storage_write_failed")`<br>At `0` bytes: `Completed(fail, "storage_write_failed")` |
+
+*(Note: `validated_offset` reported in registration/reconciliation is resume bookkeeping, not live console byte progress.)*
+
+### Dual 60-Second Progress Timers
+
+- **Client byte-receipt timer (60s monotonic)**: Resets *only* when artifact payload bytes are written locally (TCP connect and HTTP headers do not reset it). Cancels blocked OkHttp calls when expired. Management WebSocket disconnects do *not* stop a progressing HTTP download.
+- **Server HTTP write-progress lease (60s)**: Renews *only* on successful HTTP response body writes (`MDM_TRANSFER_TIMEOUT=600s` applies only to APK installation; healthy Push transfers may run beyond 600s). While live, this lease defers `reconciling` deadline expiry and survives an acceptance-probe race if the device already began downloading. After 60s without writes, the watchdog revokes the token, aborts and awaits the exact HTTP handler, releases the transfer slot, and delegates the durable transition to dispatch recovery.
+
+### Validation, Hashing, and Destination Apply
+
+1. **Zero-HTTP local fast path**: If `metadata.json` matches the command and either `artifact.zip` or `artifact.part` already equals `artifact_size` (for example, all bytes reached disk just before a socket drop), the worker skips HTTP and enters validation directly. (An interrupted assignment still requires operator **Resume** authorization and acquires/releases a dispatch slot cleanly.)
+2. **Slot release and SHA-256 (`validating`)**: Once all bytes are on disk, the worker queues `PUSH_PHASE validating` on the coordinator actor (immediately releasing the server's transfer slot and stopping the HTTP watchdog) while computing SHA-256 on the worker thread:
+   - *Uninterrupted single-pass download*: incremental SHA-256 computed over buffers as written (no disk re-read).
+   - *Resumed execution*: kept prefix bytes are **never** re-read during HTTP transfer (avoiding a 60s server lease stall); the complete file is hashed once during `validating`.
+   - On match, `artifact.part` is atomically renamed to `artifact.zip` and `PUSH_TRANSFER_COMPLETE` is emitted. On mismatch, both `artifact.part` and `metadata.json` are deleted (`sha256_mismatch`).
+3. **Extraction and `DOWNLOAD_COMPLETE`**: `PushFilesWorker` bounds ZIP entry count and expanded bytes, rejects path traversal, symlinks, and conflicting entries, extracts into `staging/`, and emits `DOWNLOAD_COMPLETE` (`task: "push"`, `job_id`, `attempt`, `artifact_id`, `dest_path`, `delete_extras`).
+4. **Destination check and `beforeApply` (`applying`)**: Validates canonical shared-storage destination (must be a subdirectory under `/storage/emulated/0`, never root or protected top-level directories `Android`, `Download`/`Downloads`, `DCIM`, `Pictures`, `Movies`, `Music`, `Documents`, `Alarms`, `Notifications`, `Podcasts`, `Ringtones`, and never traversing destination symlinks). Awaits durable `applying` persistence (`beforeApply`) and emits `PUSH_PHASE applying`. (`applying` permits destination mutation; a worker interrupted before or during `beforeApply` never modifies destination files.)
+5. **Apply and Settlement**: `BundleSync.apply` copies/overwrites files (and deletes extras + empty directories when `delete_extras == true`). Coordinator atomically clears `state.active`, records `pendingResults` + `completedReceipts` (capped at 256 entries / 7 days), deletes the `.push-tmp` attempt directory, and sends `PUSH_FILES_RESULT` until `PUSH_RESULT_ACK` accepts it or rejects it with `retryable: false` (an omitted `retryable` field is treated as retryable).
+
+---
+
+## Operator Controls and Console Mapping
+
+### Offline and Reconnect Policy
+
+**Offline devices never start queued work automatically by reconnecting.**
+
+| Assignment State When Device Disconnects (or Turn Arrives Offline) | Server Settlement (`settle_offline_before_dispatch` / Disconnect) | Recovery Path |
+|---|---|---|
+| `queued` / `waiting_transfer` (never dispatched, `dispatch_enabled=1`) | Settled immediately to `failed` (`failure_code: "device_offline_before_dispatch"`) | **Retry failed devices** once back online |
+| `queued` / `waiting_transfer` (previously dispatched) or `reconciling` with pending Resume | Returned to `queued` with `queue_reason: "device_offline"` (`manual_wait: true`) | Operator **Resume** (retains partial bytes) or **Cancel** |
+| `dispatching` (unaccepted: `accepted_at IS NULL`) | Enters short `reconciling` (`MDM_PUSH_ACCEPT_RECONCILIATION_TIMEOUT = 60s`); disconnect withdraws automatic replay | Becomes `interrupted` if `absent` → **Retry failed devices** |
+| `downloading` / `validating` / `applying` (accepted worker) | Enters `reconciling` (`MDM_PUSH_RECONCILIATION_TIMEOUT = 1800s`, deferred while HTTP lease writes progress); worker continues on device | Converges automatically on reconnect / `PUSH_FILES_RESULT`, or operator **Cancel** while offline |
+
+*(Note: If a replacement `REGISTER` arrives before the old socket's disconnect callback, the server runs the same offline settlement under `_device_lock(device_id)` before adopting the new session.)*
+
+### Operator Action Eligibility Matrix
+
+Snapshot assignments include server-computed flags from `push_jobs.assignment_actions` (`manual_wait`, `resume_required`, `cancellable`, `retryable`), which the console combines with live connectivity and `push_state_status`:
+
+| Action & Admin WS Message | Server Flag / Target Filter | Live Device Requirement | Exact Behavior |
+|---|---|---|---|
+| **Initial Dispatch**<br>`PUSH_FILES {job_id}` | Job is `ready` with `dispatch_enabled == false` (no `target_devices`) | Online targets execute; targets that went offline during upload fail with `device_offline_before_dispatch` | Opens `dispatch_enabled = 1` and wakes scheduler immediately. Repeating without `target_devices` after dispatch is a safe ACK no-op. |
+| **Resume / Resume all**<br>`PUSH_FILES {job_id, target_devices}` | `resume_required == true` (job gate closed **or** row in `manual_wait`), no pending cancel, not superseded by Retry | **Must be online** with `push_state_status == "available"` and `push_job_id_v1` + `push_resume_v1` (**Resume all** skips ineligible rows) | Requires explicit non-empty `target_devices`. Authorizes only listed targets (other paused rows stay paused). Keeps original dispatch `revision` and 24h retention clock; mints a fresh HTTP lease token on dispatch. |
+| **Cancel / Cancel all**<br>`CANCEL_PUSH_JOB {job_id, target_devices?}` | `cancellable == true`:<br>① Never-dispatched paused `queued` job-v1 row (`dispatch_revision IS NULL`, `resume_required == true`), **or**<br>② Dispatched job-v1 row (`dispatch_revision IS NOT NULL`, `resume_supported == true`) in `queued` with `manual_wait` (including after a client `interrupted` report), **offline** `reconciling`, or fenced `unconfirmed` (`blocking_fence == true`). *(Server terminal `interrupted` and online `reconciling`/active workers are not cancellable.)* | Online **or** offline (refused for `reconciling` while online so the device can report its outcome; gated behind confirmation UI) | **Case ① (never dispatched)**: Immediately settles on server as `failed` (`cancelled`) with no client message; terminalizes job if final target; leaves remaining `ready` targets paused.<br>**Case ② (dispatched)**: Persists `cancel_requested_at`, revokes any live HTTP lease, probes online device via `PUSH_RECONCILE_REQUEST`, and sends `PUSH_RESUME_REJECTED` when client `interrupted` state is reported. Settles `failed` (`cancelled`) upon exact `PUSH_RECONCILE_REPORT(status: "absent")` or synthetic `PUSH_FILES_RESULT(fail, "resume_not_authorized")` (or records actual `succeeded`/`failed` if an offline worker finished before seeing cancel), clearing any matching fence. Already-applied files are not rolled back; ownership/fences remain until confirmed. |
+| **Retry failed devices**<br>`RETRY_FAILED_PUSH_JOB {job_id, client_request_id}` | `retryable == true`: `failed` (excluding `cancelled` and `artifact_missing`), `interrupted`, or `unconfirmed`; artifact still `retention_state == "retained"` on disk; not superseded by a newer dispatched/pending job for `(device_id, dest_path)` by `enqueue_seq` (including schema-1 dispatch evidence) | **Must be online** with `push_state_status == "available"` and Push capabilities (offline targets are skipped and stay retryable; fails if 0 eligible online targets) | Creates and dispatches a new job (`retry_of_job_id`) reusing the immutable `artifact_id` without re-upload. Preserves original success records and fences (`unconfirmed` devices wait for fence clearance before the retry job dispatches). Idempotent on `client_request_id` (replay returns existing retry job without changing dispatch/manual-wait state). |
+| **Reconcile**<br>`RECONCILE_PUSH_DEVICE {device_id}` | Device has a row in `push_device_fences` (remains available even after Retry supersedes the old assignment) | Online with `push_state_status == "available"` | Sends `PUSH_RECONCILE_REQUEST` for the fenced identity. Never force-clears a fence without client/process evidence; send failures report an admin error without closing the admin socket. |
+
+*(APK installation runs on a separate client worker and can overlap Push/Sync when a transfer slot is free; Reboot bypasses transfer slots.)*
+
+### Web Console Rendering
+
+- **`Devices` PROGRESS cell**: Renders directly from canonical `PUSH_JOBS_SNAPSHOT` / `PUSH_JOB_UPDATED` assignments via `pushTaskCellHtml()` without writing Push state into `deviceTaskState`:
+  - Non-terminal: `Waiting…`, `Job pending · offline`, `Resume required` (with row **Resume** / **Cancel** buttons), `Transferring…`, `Validating…`, `Pushing…` / `Syncing…`, `Awaiting status confirmation` (`· offline` when disconnected), `Cancelling…`.
+  - Terminal: `✓ pushed` / `✓ synced (+added ~updated -deleted)`, `✗ cancelled`, `✗ failed`, `Status unknown` (`unconfirmed`).
+  - Latest APK Install / Integrity Verify status renders on a separate labeled second line alongside Push.
+- **`Needs attention` tab**: Dynamically lists canonical Push items needing operator action (**Resume all**, **Cancel all**, **Retry failed devices**, **Reconcile**, or **Reboot** remediation for `Push state unavailable`), separate from provisional unresolved-identity connections. Pending cancellations disappear from `Needs attention` immediately while remaining visible in `Devices`.
+- **`Activity log`**: Read-only historical job view.
+
+---
+
+## Restart, Retention, and Durable State Recovery
+
+### Server Startup and Reconciliation
+
+On server startup, before accepting traffic:
+
+1. `uploading`, `packaging`, and expired `created` jobs transition to `interrupted`, settling never-dispatched `queued` targets and cleaning `push-work/`.
+2. `waiting_transfer` returns to `queued`; `dispatching`, `downloading`, `validating`, and `applying` enter `reconciling` (for resumed dispatches, the current dispatch state and `accept_deadline` govern acceptance timeouts while preserving historical `accepted_at`).
+3. `dispatch_enabled` is paused (`0`) on surviving jobs so no command auto-sends before operator **Resume** / **Resume all** (which also dispatches an uploaded `ready` job whose initial browser `PUSH_FILES` frame was lost).
+4. All in-memory HTTP lease tokens are discarded. Any device still downloading hits `409` (`X-Push-Lease-Status: revoked`), keeps its partial, and reports `server_lease_revoked` (mapped to `download_interrupted`) for manual **Resume**.
+5. Artifact retention references are rebuilt from durable rows (measured from the latest referencing terminal job while preserving active references). Missing DB-referenced artifacts fail dependent work (never substituted); unreferenced canonical UUID `.zip` files in `push-artifacts/` are deleted as publication-crash orphans. Periodic artifact GC (`MDM_PUSH_ARTIFACT_GC_INTERVAL`) commits a `retention_state = "deleted"` tombstone on `push_artifacts` *before* unlinking the file outside the DB worker so multi-gigabyte unlinks never block state transitions or deadline sweeps, retrying any failed unlink on subsequent scans.
+
+During reconciliation (`REGISTER` or `PUSH_RECONCILE_REQUEST`):
+- Matching `active` report restores `downloading`, `validating`, or `applying` (and satisfies a live accept waiter). Downloading evidence, including a late ACK, cannot restore an expired HTTP lease. The watchdog preserves an existing pre-accept reconciliation deadline rather than extending it to the execution timeout.
+- Explicit pre-accept `absent` while continuously connected requeues the same attempt at most once; disconnect-origin or restart-origin `absent` becomes `interrupted`.
+- Terminal results from the current socket owner settle any dispatched active phase even if intermediate phase frames were lost; completed jobs in `pendingResults` or `completedReceipts` answer `PUSH_RECONCILE_REQUEST` by replaying `PUSH_FILES_RESULT`.
+- Late results without pending cancellation clear matching fences while preserving `unconfirmed` history; with pending cancellation, actual `succeeded`/`failed` (or `cancelled` from `resume_not_authorized`) is recorded.
 
 ### Exact Timeout Recovery and Server Retention
 
@@ -711,3 +231,149 @@ The server keeps its existing terminal-artifact cleanup window: `MDM_PUSH_ARTIFA
 ### Transactional Retry Updates
 
 Newer work for the same destination can suppress Retry on an older failed assignment; an unsent failure or cancellation can make it eligible again. These mutations update dependent job revisions in the same SQLite transaction while preserving historical `updated_at` and terminal retention timestamps. Final affected snapshots are built before COMMIT and queued only after it succeeds. The DB worker wakes the publisher independently of the request caller, including after caller cancellation. Publication drains committed snapshots without DB access, coalescing by revision. Startup drains existing notices; shutdown finishes submitted DB work before the final publication drain. Compatible indexes are created on initialization without changing table columns, schema version, or wire fields.
+
+### Client Restart and 24-Hour Powered-On Retention
+
+- **Process or device restart**: A valid active job-v1 record carrying a dispatch `revision` transitions to `interrupted` (`reason: "client_restarted"`) without starting a worker, reporting its exact identity and `validated_offset` on `REGISTER` (the server always sends `REGISTERED` before any `PUSH_RESUME_REJECTED` cleanup instruction). Historical records lacking an immutable dispatch `revision` close terminally as `client_restarted` while retaining receipts for replay/deduplication.
+- **24-hour cumulative powered-on budget (`state_version: 2`)**:
+  - Measured from first interruption across process downtime and deep sleep within a boot using `remaining_budget_ms`, `Settings.Global.BOOT_COUNT`, and `SystemClock.elapsedRealtime()`. Immune to wall-clock adjustments; power-off time is excluded.
+  - Checkpointed atomically every **5 minutes** on one replaceable actor timer, on every durable state save, and best-effort via a context-registered `ACTION_SHUTDOWN` receiver (uncheckpointed time before sudden power loss, deep sleep, or storage error can extend retention beyond 24h; no wake locks or wakeup alarms are used).
+  - Operator **Resume** consumes the remaining budget without resetting it; an actively running worker is allowed to finish and is not aborted by expiry.
+  - Rechecked on command acceptance, `REGISTER`, and reconciliation; at expiry, the client persists `resume_expired` (retrying after 60s if disk save fails), releases `state.active`, deletes the `.push-tmp` attempt directory, and replays `PUSH_FILES_RESULT(fail, "resume_expired")`. Expired queued assignments settle on the server without needing another dispatch.
+
+### Durable State Recovery
+
+`PushJobCoordinator` recovers `files/push-jobs/state.json` autonomously without an operator reset command. Wire-command parsing requires full current job-v1 fields (`artifact_url`, positive `revision`, strong `artifact_etag`), whereas stored-state decoding preserves historical records for safe cleanup and deduplication. Durable-state decode diagnostics and reset notices use fixed safe text rather than raw stored payloads or exception causes. Worker interruption diagnostics separately record the job/attempt identity, reason, and error detail locally in `PushJobCoordinator`; no new durable or wire field is added.
+
+| Condition | Client Behavior | `.push-tmp` Partials | Server / Console Visibility |
+|---|---|---|---|
+| **Missing file** | Initialize empty `state_version: 2` (`available`) | Untouched | Normal registration (`push_state.status: "available"`) |
+| **Unversioned / `state_version: 1`** | Migrate in place to `state_version: 2`; active resumable work gets one fresh 24h budget (v0.6.0 active work without `revision` closes as `client_restarted`) | Preserved for resumable work | Normal registration |
+| **Corrupt JSON (`Corrupt`)** | Unparseable JSON syntax or non-object root: delete `state.json`, start empty, send one-shot `push_state.reset: {reason: "corrupt_state_discarded", detail}` (<=256 chars) until `REGISTERED` ACK | **Preserved** (manual Resume still reuses metadata-matched partials) | Server logs warning + broadcasts `PUSH_STATE_RESET`; `reconciling` jobs settle as `interrupted` (`client_state_absent`), fences clear via new `process_instance_id` |
+| **Malformed `active` (`InvalidActive`), malformed receipts (`InvalidReceipts`), or unsupported `state_version` (`UnsupportedVersion`)** | **Preserve `state.json` untouched**; stay `unavailable` (never deletes uncertain active ownership, `pending_results` / `completed_receipts` deduplication evidence, or unrecognized version formats) | Untouched | `push_state.status: "unavailable"`, `capabilities: []`; retries load every 60s × 5 attempts; repair/restore file or matching APK and restart |
+| **Disk read `IOException` or runtime save failure (e.g., `ENOSPC`)** | Stay/become `unavailable`; keep unsaved worker outcome in memory; refresh `REGISTER` **in place on the same WebSocket** (preserving `session_id` so queued work is not settled offline). Retry every 60s × 5 attempts (re-saving in-memory state after save failure, never reloading disk); refresh `REGISTER` in place on recovery | Untouched | Rejects new commands with `client_persistence_unavailable`; server withholds `PUSH_RECONCILE_REQUEST` and preserves fences until `available` returns. Console shows **Push state unavailable** (remedy: free storage, then **Reboot**) |
+
+---
+
+## Storage Layout, Schema Upgrade, and Configuration
+
+### Server Storage and SQLite Schema v3
+
+```text
+DATA_DIR/
+├── push_jobs.sqlite3         # Canonical jobs, assignments, artifacts, fences, request IDs (schema v3)
+├── push_jobs.sqlite3.v1.bak  # Automatic pre-upgrade backup when migrating from schema v1
+├── push-artifacts/
+│   └── {artifact_id}.zip     # Immutable published bundles (tombstoned in DB before GC unlink)
+└── push-work/
+    └── {job_id}/             # Ephemeral upload/packaging staging (cleaned on publish/restart)
+```
+
+- **Schema v1 → v3 upgrade**: Runs automatically in one transaction on startup after atomically copying the v1 database to `push_jobs.sqlite3.v1.bak` via the SQLite backup API (schema 2 was never released). Adds immutable per-device dispatch `revision`, nullable `cancel_requested_at`, indexed `retry_of_job_id`, and device-order indexes without discarding existing jobs. To roll back to a schema-1 server, stop the server, replace `push_jobs.sqlite3` with `push_jobs.sqlite3.v1.bak`, and remove any `-wal` / `-shm` files (jobs created after upgrade are not in the backup).
+
+### Android Client Storage
+
+```text
+<App internal dir>/files/push-jobs/
+└── state.json                # Atomic durable state v2: active/interrupted owner, pendingResults, completedReceipts
+
+/storage/emulated/0/Download/styly-mdm/.push-tmp/jobs/{job_id}/{attempt}/
+├── metadata.json             # Binds job_id, attempt, revision, artifact_id, size, sha256, strong ETag (no URL)
+├── artifact.part             # In-progress resumable payload
+├── artifact.zip              # Verified complete archive (atomic rename after SHA-256 check)
+└── staging/                  # Validated ZIP extraction tree prior to destination apply
+```
+
+- `metadata.json` intentionally omits `artifact_url` so changing server host/port or minting a new lease token never invalidates retained partial bytes.
+- `validatedResumeOffset` returns `0` unless `metadata.json` matches the exact command identity; when matched, it returns `artifact_size` if a complete `artifact.zip` exists, otherwise `artifact.part.length()` (when `<= artifact_size`).
+
+### Server Environment Variables
+
+| Environment Variable | Default | Unit | Description |
+|---|---:|---|---|
+| `MDM_MAX_CONCURRENT_TRANSFERS` | `5` | slots | Shared semaphore across APK installs and active Push downloads |
+| `MDM_PUSH_CREATE_TIMEOUT` | `600` | sec | Max time a `created` job waits before upload starts |
+| `MDM_PUSH_COMMAND_SEND_TIMEOUT` | `5` | sec | Bounded WebSocket `send_str` timeout for `EXECUTE_PUSH_FILES` |
+| `MDM_PUSH_COMMAND_ACCEPT_TIMEOUT` | `15` | sec | Wait for `PUSH_JOB_ACCEPTED` / `PUSH_JOB_REJECTED` before probing |
+| `MDM_PUSH_ACCEPT_RECONCILIATION_TIMEOUT` | `60` | sec | Pre-accept reconciliation window |
+| `MDM_PUSH_RECONCILIATION_TIMEOUT` | `1800` | sec | Accepted-work reconciliation window when no live HTTP lease is writing |
+| `MDM_PUSH_ARTIFACT_RETRY_WINDOW` | `604800` | sec | Retention window (7 days) after latest referencing terminal job for Retry |
+| `MDM_PUSH_ARTIFACT_GC_INTERVAL` | `60` | sec | Interval between lease-aware artifact GC and tombstone cleanup scans |
+| `MDM_PUSH_RECENT_JOB_LIMIT` | `100` | jobs | Max recent terminal jobs included in `PUSH_JOBS_SNAPSHOT` |
+| `MDM_PUSH_RECENT_JOB_DAYS` | `30` | days | Max age of terminal jobs included in `PUSH_JOBS_SNAPSHOT` |
+| `MDM_ADMIN_SEND_TIMEOUT` | `5` | sec | Per-admin-WebSocket send timeout before closing a stalled console socket |
+
+*(Note: `MDM_TRANSFER_TIMEOUT` [default `600`s] governs APK installations only; Push/Sync transfers use the 60-second HTTP write-progress lease.)*
+
+---
+
+## Sequence Diagrams
+
+### Normal Execution and Slot Release
+
+```mermaid
+sequenceDiagram
+    participant B as Admin Console
+    participant S as Server + SQLite
+    participant D as Android Client
+
+    B->>S: POST /api/push-jobs (client_request_id)
+    S-->>B: 201 {job_id, upload_url}
+    B->>S: POST /api/push-jobs/{job_id}/upload
+    S->>S: uploading -> packaging -> fsync artifact -> ready
+    B->>S: WS PUSH_FILES {job_id}
+    S->>S: dispatch_enabled=1; claim slot + mint lease token; waiting_transfer -> dispatching
+    S->>D: EXECUTE_PUSH_FILES (job_id, attempt=1, revision, artifact_url?lease=...)
+    D->>D: Persist state.active (downloading)
+    D-->>S: PUSH_JOB_ACCEPTED
+    D->>S: GET /artifacts/{id}?lease=... (Accept-Encoding: identity)
+    S-->>D: 200 OK (stream bytes; renew 60s lease on each write)
+    D-->>S: PUSH_PHASE validating (queued as soon as bytes finish)
+    S->>S: Transition to validating; release transfer slot & lease immediately
+    D->>D: Verify exact size + SHA-256; rename artifact.part -> artifact.zip
+    D-->>S: PUSH_TRANSFER_COMPLETE (received_size)
+    D->>D: Validate & extract ZIP to staging/
+    D-->>S: DOWNLOAD_COMPLETE (task="push")
+    D->>D: Validate shared-storage dest; persist beforeApply (applying)
+    D-->>S: PUSH_PHASE applying
+    D->>D: BundleSync.apply; atomically move state.active -> pendingResults
+    D-->>S: PUSH_FILES_RESULT (status="success", added/updated/deleted)
+    S->>S: Single-tx settle_result; enqueue PUSH_JOB_UPDATED
+    S-->>D: PUSH_RESULT_ACK (accepted=true, revision)
+    D->>D: Clear pendingResults; retain completedReceipts
+```
+
+### Interruption, Manual Resume, Cancel, and Retry
+
+```mermaid
+sequenceDiagram
+    participant B as Admin Console
+    participant S as Server + SQLite
+    participant D as Android Client
+
+    Note over S,D: 60s without bytes, revoked lease (409), or client restart
+    D->>D: Retain artifact.part + metadata.json + 24h powered-on budget; persist interrupted
+    D-->>S: PUSH_RECONCILE_REPORT (status="interrupted", phase="downloading", revision, validated_offset)
+    S->>S: Requeue device with manual_wait (queue_reason="download_interrupted" / "client_restarted")
+    S-->>B: PUSH_JOB_UPDATED (Device row: "Resume required")
+
+    alt Operator clicks Resume
+        B->>S: WS PUSH_FILES {job_id, target_devices: [device_id]}
+        S->>S: Set queue_reason="resumable_replay"; acquire transfer slot; mint fresh lease token
+        S->>D: EXECUTE_PUSH_FILES (same revision, new artifact_url?lease=...)
+        D->>S: GET /artifacts/{id}?lease=... (Range: bytes=N-, If-Match: "<etag>")
+        S-->>D: 206 Partial Content
+    else Operator clicks Cancel
+        B->>S: WS CANCEL_PUSH_JOB {job_id, target_devices: [device_id]}
+        S->>S: Set cancel_requested_at; revoke live lease; probe if online
+        S->>D: PUSH_RESUME_REJECTED (job_id, attempt=1, artifact_id, revision)
+        D->>D: Clear state.active; save synthetic receipt; delete .push-tmp attempt dir
+        D-->>S: PUSH_RECONCILE_REPORT (status="absent")
+        S->>S: Settle failed (failure_code="cancelled"); unblock next queued job
+    end
+
+    opt Operator clicks Retry failed devices
+        B->>S: WS RETRY_FAILED_PUSH_JOB {job_id, client_request_id}
+        S->>S: Create + dispatch new job (retry_of_job_id) for online failed/interrupted/unconfirmed targets reusing artifact_id
+    end
+```

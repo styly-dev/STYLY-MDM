@@ -20,120 +20,15 @@ For end-user setup and usage, see the [README](../README.md).
 
 ### Durable Push / Sync jobs
 
-Issue #91 gives **Push Files** and **Sync Folder** a server-owned UUID job identity,
-SQLite-backed lifecycle, immutable artifact identity, per-device queue, exact transfer
-ownership, restart reconciliation, and an Application-scoped single-active client
-worker. Exact-token durable accept deadlines recover lost in-memory waiters without
-competing with a live local waiter or capturing a later replay, and the console exposes
-undispatched `ready` jobs plus restart-paused jobs without allocating a replacement job.
-APK Install intentionally remains on its existing path.
+**Push Files** and **Sync Folder** use SQLite-backed jobs, immutable ZIP artifacts, resumable HTTP transfers, and per-device execution ownership. APK installation keeps its own pipeline and shares the server's transfer pool.
 
-The authoritative implementation and protocol guide is
-[`PUSH_JOBS.md`](PUSH_JOBS.md). Its sequence diagram covers create-before-upload,
-dispatch, command acceptance, transfer completion, validation/apply, terminal result,
-ACK, restart recovery, and persistent device-fence reconciliation.
+Key architectural boundaries:
 
-`PushJobManager` declares its public operations explicitly; store methods are not
-automatically exposed through it. Upload preparation, startup recovery, and artifact
-metadata access use the store directly in both runtime code and test fixtures.
-SQLite initialization executes an ordered list
-of DDL statements within the same transaction as column and metadata upgrades.
+- **Server layering**: `PushJobStore` owns the serialized SQLite worker; `PushJobManager` executes compound queue, fence, disconnect, and result-settlement transactions. `PushScheduler` and `PushTransferLeases` own dispatch and HTTP transfer lifetimes. `PushRuntime` installs HTTP/WebSocket handlers and publishes committed snapshots independently of device operations.
+- **Client durability**: The Application-scoped `PushJobCoordinator` persists execution ownership before acceptance, applying state before destination changes, and results before sending. Interrupted work retains partial bytes and requires explicit operator **Resume**.
+- **Console rendering**: `static/push-jobs-v1.js` renders Push progress and per-device **Resume** / **Cancel** controls directly from canonical job snapshots alongside a separate labeled line for latest APK Install / Verify results.
 
-Terminal results are decided by `PushJobManager.settle_result` in one SQLite
-transaction, including assignment/fence checks, outcome updates and revisions.
-The runtime then releases the authorized transfer, publishes changed snapshots
-and sends the ACK. On Android, the coordinator's durable `state.active` is the
-sole execution owner; the actor checks incoming commands directly against that state.
-Lifecycle events (disconnect, acceptance, and transfer/apply progress) validate
-and commit their related fields in Manager operations. A failed disconnect retains
-a retry owner; replacement registration commits that event before exposing its
-new session. The transfer watchdog releases HTTP resources before handing a failed
-DB update to dispatch recovery. The scheduler keeps one dispatch task per device,
-including slot waits; disconnect and Resume cannot create a second task for that
-same device before the first exits. Deadline maintenance runs independently of artifact GC.
-Temporarily unavailable client state pauses dispatch, including work already waiting
-for a transfer slot, without discarding retained partials. Device-handler exceptions
-run disconnect settlement; manual reconciliation send failures remain local to that
-admin operation. Registration sends `REGISTERED` before exact cleanup rejections.
-SQLite schema 3 remains unchanged; the additive device-order
-index is created for existing databases. Android writes `state_version: 2`, reads
-existing unversioned/version-1 records, and preserves unsupported versions or invalid
-active ownership as unavailable instead of discarding them. Interrupted work uses a
-24-hour cumulative powered-on budget with five-minute atomic checkpoints and a best-effort
-normal-shutdown save. Device clock changes do not affect this budget; power-off and
-uncheckpointed time may extend retention. Legacy active work receives one fresh budget
-on migration; version-1 readers preserve version-2 state as unavailable on downgrade.
-The worker waits for a durable `applying` checkpoint before changing destination files.
-
-Before dispatch, upload/preparation failure or expiry settles the job and its
-never-dispatched queued targets in one transaction. Startup recovery also repairs
-older failed/interrupted jobs whose targets were left queued, preserving their
-original terminal history. Dispatch evidence and exact fences exclude a job from
-this repair. Retry requires a published, retained artifact that is not known to
-be missing; the Retry endpoint still checks the physical bytes before creating work.
-Replaying a Retry request UUID returns the existing job without changing its dispatch
-permission or manual waits. If creation committed before initial dispatch failed,
-the existing ready job can be explicitly dispatched or cancelled without creating another Retry.
-Restart-paused, never-dispatched targets can be cancelled entirely on the server,
-even offline; dispatched targets still require exact client cleanup evidence.
-Retry supersession also recognizes dispatch evidence retained from schema 1.
-
-Issue #94 adds resumable transfers, per-device Resume and Cancel controls, and
-retry of failed targets. See [Push / Sync jobs](PUSH_JOBS.md) for the recovery
-rules, protocol, operator controls, and schema-3 deployment requirements.
-
-The file panel calls an explicit asynchronous Push submission API. It retains its
-selection on failure and resets only the submitted selection after successful upload
-and dispatch. A submission captures its targets on the first send and keeps the
-same request ID through connectivity changes and retries. Explicit selection,
-destination, or mode changes create a new intent. Completed or abandoned submission
-metadata is released after pending work settles. Pending Resume/Cancel/Retry
-operations survive redraws and resolve from
-canonical updates, action replies, connection changes, or a bounded fallback timer.
-Untyped server errors remain visible without clearing an unrelated pending action.
-Late canonical snapshots establish completed dispatch even after an acknowledgement
-timeout. Untargeted `PUSH_FILES` retries acknowledge an already dispatched job;
-resuming its work requires explicit `target_devices`.
-
-Client WebSocket diagnostic logs record bounded message types, not message
-payloads or parser exception text, because commands contain temporary artifact
-lease credentials. Durable Push-state load failures also use fixed diagnostic messages
-without exception text or causes; corrupt-state reset notices sent to the server and
-admin use fixed detail text. Registration acknowledgements and admin device-list updates
-are separate events; integration tests wait for the expected snapshot contents
-with one bounded deadline. See [Push/Sync validation](PUSH_VALIDATION.md).
-
-The console renders Push progress and Resume/Cancel controls directly from the
-same selected canonical assignment. The adapter invalidates device cells when
-snapshots or connectivity change; it does not copy Push into the generic task
-state or paint optimistic Push assignments. The latest Install/Verify result
-appears on a separate labeled line alongside Push. Install/Verify still share
-their existing latest-result state and have no per-operation response ordering.
-
-Push runs only between a server and client of the same version; see
-[Push / Sync jobs](PUSH_JOBS.md) for partial-file retention and interrupted
-ownership expiry. PICO 4 Ultra Enterprise is the supported headset; live Push
-requires job identity and resumable artifact metadata. Historical durable records
-and receipts remain readable to prevent duplicate execution. The guide also covers
-local validation of complete partials,
-the dedicated HTTP request format, and interruption reasons.
-
-Management connection loss leaves healthy HTTP transfers under their existing
-watchdog. Replacement registration withdraws unstarted Resume authorization,
-and a retained fence keeps Reconcile visible even after Retry. Retry supersession
-uses per-device enqueue order rather than wall-clock timestamps. Initial snapshots
-batch this eligibility lookup and each job's fence rows. Artifact GC
-retries physical cleanup of tombstoned bytes after failure or restart.
-The client refreshes registration when durable state becomes unavailable and
-again after recovery, while retaining any unsaved worker outcome in memory.
-
-### Recovery transaction and publication boundaries
-
-- **Recovery decisions**: REGISTER and reconciliation use the same exact interruption identity, Cancel, and Resume checks. Retryable refusals pause for manual Resume; uncertain command delivery enters reconciliation. Watchdog expiry checks the current assignment and its acceptance deadline inside the same DB transaction.
-
-- **Committed Retry notifications**: A mutation updates dependent Retry revisions in the same transaction without extending retention timestamps. The DB worker queues committed snapshots and wakes the event-loop publisher; publication performs no DB work. Startup drains pending notices, and shutdown waits for submitted DB work before its final drain. Retained-artifact and artifact-to-job indexes bound dependency lookup over collected history.
-
-A reconciliation-timeout job can return to manual Resume only with exact saved download interruption, its matching fence, no Cancel/Retry/superseding work, and a retained artifact. Terminal artifacts still use `MDM_PUSH_ARTIFACT_RETRY_WINDOW` (default seven wall-clock days after the latest referencing terminal job); an uncancelled offline fence alone does not extend this window. Active references and pending-cancellation exceptions remain protected. GC never proves device absence or clears a fence. Client retention remains 24 powered-on hours.
+See [`PUSH_JOBS.md`](PUSH_JOBS.md) for deployment requirements, state machines, the transfer protocol, operator controls, retention, and schema migration.
 
 ## Building the MDM Client
 
@@ -176,6 +71,18 @@ adb install mdm-client/app/build/outputs/apk/prod/debug/app-prod-debug.apk
 ```
 
 > **Dev Container:** A ready-to-use build environment is provided via [Dev Containers](https://containers.dev/). Open this repository in VS Code with the Dev Containers extension (or GitHub Codespaces) and all prerequisites (JDK 17, Android SDK 33, build-tools, Gradle) are set up automatically — no local installation needed.
+
+## Tests
+
+Install server test dependencies with `uv sync --extra dev` in `mdm-server`, then run:
+
+| Suite | Working directory | Command |
+|---|---|---|
+| Server | `mdm-server` | `uv run pytest -q` |
+| Console and device selection | `mdm-server` | `node --test tests/test_push_jobs_v1_console.js tests/test_device_range_selection.js` |
+| Android unit tests and APK build | `mdm-client` | `./gradlew :app:testProdDebugUnitTest :app:assembleProdDebug` |
+
+The server suite includes real loopback HTTP/WebSocket tests. Android commands use the JDK and SDK setup described in [Building the MDM Client](#building-the-mdm-client).
 
 ## Running a Dev Environment Alongside Production
 
@@ -327,6 +234,9 @@ MDM_DISCOVERY_PORT=7099 PYTHONPATH=. python -m styly_mdm \
 
 ```
 STYLY-MDM/
+├── docs/
+│   ├── DEVELOPMENT.md       # System architecture & developer guide
+│   └── PUSH_JOBS.md         # Durable Push/Sync job specification
 ├── mdm-server/
 │   ├── pyproject.toml       # Packaging metadata (published to PyPI as styly-mdm)
 │   ├── run.sh               # Dev/prod launcher (python -m styly_mdm)
@@ -336,31 +246,34 @@ STYLY-MDM/
 │   │   ├── __init__.py      # Exports create_app / main
 │   │   ├── __main__.py      # `python -m styly_mdm` entrypoint
 │   │   ├── server.py        # Established HTTP/WebSocket handlers + CLI
+│   │   ├── device_policy.py # Canonical GUID vs legacy serial command eligibility
 │   │   ├── push_jobs.py     # Push/Sync domain state, identity, transitions
-│   │   ├── push_job_store.py    # Dedicated SQLite worker + canonical snapshots
-│   │   ├── push_job_manager.py  # Transactional queue/fence/reconciliation policy
-│   │   ├── push_scheduler.py    # Per-device queue + exact transfer ownership
-│   │   ├── push_artifacts.py    # Job-owned work and immutable publication
-│   │   ├── push_runtime.py      # Issue #91 HTTP/WebSocket compatibility adapter
-│   │   ├── transfer_registry.py # Typed Install/Push transfer waiters
+│   │   ├── push_job_store.py       # Dedicated SQLite worker + canonical snapshots
+│   │   ├── push_job_manager.py     # Transactional queue/fence/reconciliation policy
+│   │   ├── push_scheduler.py       # Per-device queue + exact transfer ownership
+│   │   ├── push_transfer_leases.py # Per-assignment HTTP lease tokens + 60s write watchdog
+│   │   ├── push_artifacts.py       # Job-owned work and immutable publication
+│   │   ├── push_runtime.py         # HTTP/WebSocket runtime for durable Push/Sync jobs
+│   │   ├── transfer_registry.py    # Typed Install/Push transfer waiters
 │   │   ├── integrity.py     # APK CD-digest + directory tree-hash (integrity reference)
 │   │   └── static/
 │   │       ├── index.html          # Web management console
 │   │       └── push-jobs-v1.js     # Revisioned Push/Sync job console adapter
 │   └── tests/
-│       └── test_app.py      # Smoke tests
+│       └── test_app.py      # Smoke tests (+ Push, identity, install, retire suites)
 └── mdm-client/
     ├── app/src/main/
     │   ├── AndroidManifest.xml
     │   └── java/com/styly/mdmclient/
     │       ├── MdmClientApplication.kt   # Application entry point
     │       ├── MdmClientService.kt       # Foreground service; executes launch commands
+    │       ├── DeviceIdentityResolver.kt # Application-scoped async GUID lookup + permission recovery
+    │       ├── ConnectionRegistration.kt # Socket-bound provisional/canonical registration state
     │       ├── WebSocketManager.kt       # WebSocket transport + capability registration
     │       ├── PushProtocol.kt           # Strict job-v1 wire protocol and durable codec
     │       ├── PushJobCoordinator.kt     # Application-scoped actor + single active worker
     │       ├── PushJobStore.kt           # Atomic active/outbox/receipt persistence
-    │       ├── PushFilesWorker.kt        # Download, ZIP validation, extraction, apply
-    │       ├── PushExecutionGate.kt      # Duplicate/busy execution ownership
+    │       ├── PushFilesWorker.kt        # Resumable download, ZIP validation, extraction, apply
     │       ├── ConnectionScheduler.kt    # Connection-window state machine (host-JVM tested)
     │       ├── ConnectionAttemptPolicy.kt # Per-window manual/auto target policy (host-JVM tested)
     │       ├── ClientConfig.kt           # Window/retry tunables + config-file overrides (host-JVM tested)
@@ -546,17 +459,17 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 
 | Message type | Description |
 |---|---|
-| `REGISTER` | Sent on connect and again on the same socket when a provisional identity becomes Ready, or when a registered job-v1 client's durable Push state becomes available or unavailable (the server refreshes Push state in place and keeps the `session_id`). New clients set `identity_scheme: "styly_device_id_v1"`; `device_id` is the lowercase Provider GUID when ready, or `null` with `identity: {state: "provisional", status, diagnostic, mint_attempted}` otherwise. A client that supports Need attention power control also sends `capabilities: ["provisional_power_control_v1"]` on the provisional registration. `status` is `resolving`, `access_denied`, `io_error`, or `unsupported_api`; `diagnostic` is a single-line string bounded to 256 characters, and `mint_attempted` is a boolean indicating whether the provider attempted to create an ID (`false` while resolving). Scheme-less legacy clients send their serial as `device_id`. Canonical job-v1 registrations also send `process_instance_id` (UUIDv4), `capabilities: ["push_job_id_v1", "push_resume_v1"]` when durable Push state is available, `push_state.status` (`available` or `unavailable`), and `push_runtime.active` (exact active/interrupted identity, dispatch revision, phase, and validated offset or `null`). A missing durable file initializes empty; malformed receipt records preserve the file and report `unavailable` until repaired or restored; other unparseable state is deleted and reported once as `push_state.reset` (`reason`, single-line `detail`); read or save failures report `unavailable` while the client retries by itself (see [Push / Sync jobs](PUSH_JOBS.md#durable-state-recovery)). `unavailable` is never authoritative absence. Capability parsing is all-or-nothing: lists exceeding 32 entries or containing an invalid entry produce no capabilities. Capabilities are never inferred from a version number. |
+| `REGISTER` | Sent on connect and again on the same socket when a provisional identity becomes Ready, or when a registered job-v1 client's durable Push state becomes available or unavailable (the server refreshes Push state in place and keeps the `session_id`). New clients set `identity_scheme: "styly_device_id_v1"`; `device_id` is the lowercase Provider GUID when ready, or `null` with `identity: {state: "provisional", status, diagnostic, mint_attempted}` otherwise. A client that supports Need attention power control also sends `capabilities: ["provisional_power_control_v1"]` on the provisional registration. `status` is `resolving`, `access_denied`, `io_error`, or `unsupported_api`; `diagnostic` is a single-line string bounded to 256 characters, and `mint_attempted` is a boolean indicating whether the provider attempted to create an ID (`false` while resolving). Scheme-less legacy clients send their serial as `device_id`. Canonical job-v1 registrations also send `process_instance_id` (UUIDv4), `capabilities: ["push_job_id_v1", "push_resume_v1"]` when durable Push state is available, `push_state.status` (`available` or `unavailable`), and `push_runtime.active` (exact active/interrupted identity, dispatch revision, phase, and validated offset or `null`). A missing `files/push-jobs/state.json` initializes empty; malformed `active` or receipt entries (`pending_results` / `completed_receipts`) and unsupported `state_version` values preserve `state.json` untouched and report `unavailable`; corrupt JSON syntax is discarded once with `push_state.reset` (`reason: "corrupt_state_discarded"`, single-line `detail`); read or save `IOException`s report `unavailable` while the client retries in place (see [Push / Sync jobs](PUSH_JOBS.md#durable-state-recovery)). `unavailable` is never authoritative absence. Capability parsing is all-or-nothing: lists exceeding 32 entries or containing an invalid entry produce no capabilities. Capabilities are never inferred from a version number. |
 | `BATTERY_UPDATE` | New clients send battery telemetry after canonical `REGISTERED`. Fields: `level` (integer 0-100), `charging` (boolean), `timestamp` (epoch seconds). The server attributes the message to the current socket owner; new clients do not send `device_id`. |
 | `LAUNCH_RESULT` | Result of an app launch. Fields: `status` (`success`/`fail`), `package_name`, `error` (optional) |
 | `DELETE_APP_RESULT` | Result of a remote app uninstall — exactly one per `EXECUTE_UNINSTALL`. The client survives it, so this always arrives (unlike `SELF_UNINSTALL_RESULT`). Fields: `status` (`success`/`fail`), `package_name`, `error` (optional), `result_code` (optional), `startup_app_cleared` (optional; reports what the device did — the server decides from its own record, see below). See [Remote App Uninstall](#remote-app-uninstall). |
 | `REBOOT_RESULT` / `POWER_OFF_RESULT` | Acknowledgement of a power command. `status` is `accepted` (the client received it and flushed this before invoking the SDK — a successful reboot/shutdown tears down the socket first, so no `success` is ever sent) or `fail` (the SDK rejected the call, so the device stayed up to report it). Fields: `status`, `error` (optional), and `connection_id` for a provisional socket. Provisional results never carry `device_id`; the server forwards them only while that exact connection remains live. See [Remote Power Control](#remote-power-control). |
 | `INSTALL_RESULT` | Result of an APK install. Fields: `status` (`success`/`fail`), `apk_filename`, `result_code` (optional), `error` (optional) |
-| `DOWNLOAD_COMPLETE` | Install/legacy: the existing post-download signal. Job-v1 Push: an exact `job_id`, `attempt`, and `artifact_id` checkpoint emitted only after exact-size/basic ZIP/path validation; it **does not** release the network slot. |
+| `DOWNLOAD_COMPLETE` | APK install: releases the install transfer slot and advances device state to `installing`. Job-v1 Push: emitted after SHA-256 verification and ZIP extraction into `staging/` (before destination validation) with `task: "push"`, `job_id`, `attempt`, `artifact_id`, `dest_path`, `delete_extras`; **does not** release the Push transfer slot (already released at `PUSH_PHASE validating`). |
 | `PUSH_JOB_ACCEPTED` / `PUSH_JOB_REJECTED` | Exact command acceptance after the client durably persists active state, or a duplicate-safe rejection (`device_busy`, `client_persistence_unavailable`, malformed identity, destination/artifact conflict). A persistence rejection keeps the MDM process alive but starts no worker. Fields include `job_id`, fixed `attempt=1`, and current phase/reason. |
 | `PUSH_TRANSFER_COMPLETE` | Job-v1 post-SHA-256 checkpoint. Fields: `job_id`, `attempt`, `artifact_id`, cumulative exact `received_size` including a validated resume prefix. It follows `PUSH_PHASE validating` and accepts an exact reconciling assignment if that phase was lost. |
-| `PUSH_PHASE` | Job-v1 phase transition. `phase=validating` carries `artifact_id` and is sent after all bytes arrive but before SHA-256; it releases the HTTP slot and stops the 60-second write watchdog. `phase=applying` follows artifact and destination validation. Both carry `job_id` and `attempt`. |
-| `PUSH_RECONCILE_REPORT` | Exact `active`, `absent`, or `interrupted` answer to a server reconciliation request. A resumable interrupted report proves `artifact_id`, immutable dispatch `revision`, and local `validated_offset`; missing or mismatched identity is never requeued. `server_lease_revoked` maps to the per-device `download_interrupted` Resume gate. `absent` is sent only in response to that request. |
+| `PUSH_PHASE` | Job-v1 phase transition (`job_id`, `attempt`). `phase=validating` (with `artifact_id`) is queued as soon as all artifact bytes are on disk, releasing the server's HTTP transfer slot and 60-second write watchdog while SHA-256 runs. `phase=applying` is emitted after destination validation and durable `beforeApply` persistence. |
+| `PUSH_RECONCILE_REPORT` | Exact status report (`job_id`, `attempt=1`, optional `artifact_id`, `status`: `"active"`, `"interrupted"`, or `"absent"`). Sent in response to `PUSH_RECONCILE_REQUEST`, unsolicited with `status="interrupted"` when a resumable worker stops (`reason`: `download_interrupted`, `server_lease_revoked`, or `storage_write_failed`), or with `status="absent"` after `PUSH_RESUME_REJECTED` cleanup. (Settled jobs in `pendingResults` or `completedReceipts` answer `PUSH_RECONCILE_REQUEST` by replaying `PUSH_FILES_RESULT` instead.) An `"active"` or `"interrupted"` report includes `phase`, immutable dispatch `revision`, and local `validated_offset`; see [`PUSH_JOBS.md`](PUSH_JOBS.md#restart-retention-and-durable-state-recovery). |
 | `PUSH_FILES_RESULT` | Durable terminal result. Job-v1 fields: `job_id`, fixed `attempt=1`, `status`, `dest_path`, success counts or `failure_code` + `detail`. The client retains it until a matching accepted or permanent-rejection ACK and can replay the bounded completed receipt during exact reconciliation. |
 | `VERIFY_APK_RESULT` | Result of an APK integrity check. Fields: `package_name`, `found` (boolean), `size`, `cd_sha256`, `full_sha256`, `version_code`, `version_name`, `signer_sha256`, `error` (optional). Absent hash/version fields when `found` is false. |
 | `VERIFY_DIR_RESULT` | Result of a directory integrity check. Fields: `path`, `found` (boolean), `tree_hash`, `file_count`, `total_size`, `manifest` (optional array of `{relative_path, size, sha256}`, omitted above a cap), `error` (optional) |
@@ -742,9 +655,10 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 >
 > APK installation retains its existing completion and `MDM_TRANSFER_TIMEOUT`
 > (default **600 seconds**) handling. Every job-v1 Push
-> download requires an assignment-scoped HTTP lease. Its transfer slot ends before
-> validation or when the HTTP watchdog stops a stalled transfer; WebSocket loss
-> alone does not release it. See [Push ownership](PUSH_JOBS.md#ownership-model) and
+> download requires an assignment-scoped HTTP lease. Its transfer slot ends as soon
+> as `PUSH_PHASE validating` arrives or when the HTTP watchdog stops a stalled transfer;
+> WebSocket loss alone does not release it. See
+> [Push ownership](PUSH_JOBS.md#ownership-model-and-safety-invariants) and
 > [resumable artifact transfer](PUSH_JOBS.md#resumable-artifact-transfer) for the
 > release conditions, idle deadline, and coordinated rollout requirements.
 >
@@ -767,8 +681,8 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 
 > **Per-device transfer state.** `INSTALL_PROGRESS` carries only aggregate counts, so
 > install also broadcasts `INSTALL_DEVICE_STATE`. Job-v1 derives the
-> same `Waiting…` → `Transferring…` → `Pushing…` / `Syncing…` → terminal display from
-> canonical assignment states in each full job snapshot.
+> `Waiting…` → `Transferring…` → `Validating…` → `Pushing…` / `Syncing…` → terminal
+> display from canonical assignment states in each full job snapshot.
 >
 > For APK installation, state publication is ordered as follows:
 >
@@ -847,14 +761,15 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > Download SHA-256 normally covers received buffers after successful writes, rather
 > than rereading stored bytes. A Resume in a new execution rehashes the complete
 > downloaded file during validation; hashing state is not persisted across executions.
-> The current console derives these
-> states and the Push/Sync verb from each canonical `PUSH_JOBS_SNAPSHOT` /
-> `PUSH_JOB_UPDATED` assignment. The initial snapshot is a full replacement, so a
-> reconnect also removes jobs outside the server's retention window instead of leaving
-> stale rows. The column still holds one state per device: a later install or verify
-> replaces the Push/Sync cell, and older job snapshots cannot reclaim that non-push
-> state. The bridge stores its owned state in `deviceTaskState[id]` and `taskCellHtml()`
-> repaints it after `DEVICE_LIST` renders; the log keeps the retained canonical jobs.
+> The console derives Push/Sync cell labels and per-device **Resume** / **Cancel**
+> buttons directly from canonical `PUSH_JOBS_SNAPSHOT` / `PUSH_JOB_UPDATED`
+> assignments via `pushTaskCellHtml()`, without writing Push state into
+> `deviceTaskState[id]`. The initial snapshot is a full replacement, so a
+> reconnect also drops jobs outside the server's retention window instead of leaving
+> stale rows. When a device also has an APK install or integrity verification entry
+> in `deviceTaskState[id]`, the cell renders Push/Sync on the primary line and the
+> latest Install/Verify status on a separate labeled line underneath so neither
+> operation overwrites the other.
 
 ## Integrity Verification
 
@@ -1602,16 +1517,21 @@ A `workflow_dispatch` run does a Test PyPI-only dry run.
 
 **Verifying a Test PyPI build.** Since a real release goes to PyPI without pausing, do
 any install check *before* publishing the release: run the `workflow_dispatch` dry run,
-then install the package into a throwaway environment and actually start it:
+read the exact built version (e.g. `0.7.1.dev12` on an untagged commit) from the
+`Build sdist and wheel` step log or `dist` workflow artifact, and install that exact
+wheel from Test PyPI into a throwaway environment:
 
 ```bash
-# Install from Test PyPI. Two flags matter:
-#   --extra-index-url : runtime deps (aiohttp, ...) live on real PyPI, not Test PyPI,
-#                       so --index-url alone fails to resolve them.
-#   --pre             : Test PyPI only ever has dev builds (e.g. 0.2.1.devN).
+# Test PyPI contains both workflow_dispatch .devN dry-run wheels and tagged release
+# wheels (publish-testpypi runs before publish-pypi on every release). Pin the exact
+# version built by your workflow_dispatch run and install styly-mdm with --no-deps
+# (without --extra-index-url) after installing runtime deps from PyPI so pip cannot
+# resolve a different version or pull styly-mdm from production PyPI.
+VERSION=0.7.1.dev12   # replace with the exact version from "Build sdist and wheel"
 python -m venv /tmp/styly-test && source /tmp/styly-test/bin/activate
-pip install --index-url https://test.pypi.org/simple/ \
-            --extra-index-url https://pypi.org/simple/ --pre styly-mdm
+pip install 'aiohttp>=3.9,<4'
+pip install --index-url https://test.pypi.org/simple/ --no-deps "styly-mdm==${VERSION}"
+python -c "import importlib.metadata as m; assert m.version('styly-mdm') == '${VERSION}', m.version('styly-mdm')"
 
 # Start it on non-default ports with a throwaway data dir (so it never clashes with a
 # real 7070/7071 server), then smoke-test HTTP and UDP discovery:
@@ -1625,10 +1545,8 @@ print('discovery:', s.recvfrom(1024)[0].decode())   # -> {"service": "stylymdm",
 PY
 ```
 
-A clean run — `HTTP 200`, a discovery JSON reply advertising the WS port, and a
-freshly created `/tmp/styly-data/apks/` — confirms the published artifact installs and
-runs. Only then publish the release.
-
-Activity log is read-only history. Resume all, Cancel all, Retry failed devices,
-and Reconcile are shown in the Needs attention tab. Eligible devices also expose
-their own Resume and Cancel controls; there is no separate Dispatch button.
+A clean run — matching `importlib.metadata.version('styly-mdm')`, `HTTP 200`, a
+discovery JSON reply advertising the WS port, and a freshly created
+`/tmp/styly-data/apks/` directory (`workflow_dispatch` dry runs skip bundling the
+signed client APK, so `apks/` starts empty until a tagged `release` build) — confirms
+the Test PyPI artifact installs and runs. Only then publish the release.
