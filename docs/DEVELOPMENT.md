@@ -73,6 +73,21 @@ the existing ready job can be explicitly dispatched without creating another Ret
 Restart-paused, never-dispatched targets can be cancelled entirely on the server,
 even offline; dispatched targets still require exact client cleanup evidence.
 
+Retry eligibility depends on later jobs for the same device and destination.
+Creation and settlement of never-dispatched work revise affected older unsuccessful
+jobs in the same SQLite transaction. Artifact expiry also revises its referencing
+jobs. Committed dependency snapshots are coalesced by the database worker and
+drained by the existing admin publication loop, including startup and shutdown;
+their delivery does not depend on the initiating request remaining alive. Database
+rollback discards the pending notifications. This uses the existing schema and
+`PUSH_JOB_UPDATED` protocol without a migration.
+
+Interrupted-work cleanup messages are sent only after `REGISTERED` and canonical
+registration readiness. An unknown interrupted job stays fenced while the server
+requests exact cleanup; a repeated Reconcile report retries that instruction.
+Only an absence report matching the retained ownership evidence releases the fence,
+so a new Push cannot overtake the client's durable cleanup.
+
 Issue #94 adds resumable transfers, per-device Resume and Cancel controls, and
 retry of failed targets. See [Push / Sync jobs](PUSH_JOBS.md) for the recovery
 rules, protocol, operator controls, and schema-3 deployment requirements.

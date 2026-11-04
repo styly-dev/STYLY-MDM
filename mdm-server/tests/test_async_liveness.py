@@ -685,7 +685,12 @@ class _PublicationLegacy:
 
 
 def _publication_runtime(legacy):
+    class Store:
+        async def drain_retry_publications(self):
+            return []
+
     runtime = object.__new__(PushRuntime)
+    runtime.store = Store()
     runtime.pending_disconnects = set()
     runtime.disconnect_recovery_tasks = {}
     runtime.artifact_gc_task = None
@@ -746,6 +751,10 @@ async def test_runtime_cleanup_drains_publication_before_store_close(tmp_path):
     class Store:
         def __init__(self):
             self.closed = False
+
+        async def drain_retry_publications(self):
+            assert not self.closed
+            return []
 
         def close(self):
             assert legacy.events

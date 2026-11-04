@@ -371,9 +371,13 @@ class PushRuntime:
 
     async def on_startup(self, _app: aiohttp_web.Application) -> None:
         self.publication_stopping = False
+        loop = asyncio.get_running_loop()
+        self.store.retry_publication_notify = lambda: loop.call_soon_threadsafe(self.publication_wake.set)
         self.publication_task = asyncio.create_task(
             self._publication_loop(), name="push-job-publication"
         )
+        # Recovery may already have committed dependent Retry revisions.
+        self.publication_wake.set()
         for job_id in self.startup_cleanup:
             await asyncio.to_thread(self.artifacts.cleanup_work_best_effort, job_id)
         self.startup_cleanup.clear()
@@ -429,11 +433,14 @@ class PushRuntime:
         )
         if self.scheduler is not None:
             await self.scheduler.stop()
+        # The publication loop drains the DB worker before it stops, including
+        # commits whose original request was cancelled after submission.
         self.publication_stopping = True
         self.publication_wake.set()
         if self.publication_task is not None:
             await asyncio.gather(self.publication_task, return_exceptions=True)
             self.publication_task = None
+        self.store.retry_publication_notify = None
         for device_id in tuple(self.sessions):
             self.transfers.release_all_for_device(device_id, "shutdown")
         self.sessions.clear()
@@ -872,6 +879,7 @@ class PushRuntime:
 
         lock = self._device_lock(device_id)
         snapshots: list[dict[str, Any]] = []
+        deferred_rejections: list[dict[str, Any]] = []
         needs_reconcile = False
         registered = False
         session = LiveSession(
@@ -911,7 +919,7 @@ class PushRuntime:
             # client registers (or refreshes) with available state.
             if session.push_state_available:
                 needs_reconcile = await self._adopt_registration_runtime(
-                    session, payload, snapshots
+                    session, payload, snapshots, deferred_rejections
                 )
 
             if (
@@ -945,13 +953,16 @@ class PushRuntime:
             await self.publish(snapshot)
         if not registered:
             return
-        await self._after_registration(session, payload, needs_reconcile)
+        await self._after_registration(
+            session, payload, needs_reconcile, deferred_rejections
+        )
 
     async def _adopt_registration_runtime(
         self,
         session: LiveSession,
         payload: dict[str, Any],
         snapshots: list[dict[str, Any]],
+        deferred_rejections: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Apply an available client's runtime report; return whether to reconcile.
 
@@ -964,7 +975,7 @@ class PushRuntime:
         if isinstance(active_report, dict):
             snapshots.extend(
                 await self._registration_active_snapshots(
-                    device_id, session, active_report
+                    device_id, session, active_report, deferred_rejections
                 )
             )
             return False
@@ -993,6 +1004,7 @@ class PushRuntime:
         session: LiveSession,
         payload: dict[str, Any],
         needs_reconcile: bool,
+        deferred_rejections: list[dict[str, Any]] | None = None,
     ) -> None:
         device_id = session.device_id
         reset = parse_push_state_reset(payload.get("push_state"))
@@ -1013,6 +1025,9 @@ class PushRuntime:
                 name=f"push-state-reset-{device_id}",
             )
         if session.push_state_available:
+            await self._flush_deferred_resume_rejections(
+                session, deferred_rejections or []
+            )
             await self._send_pending_cancellations(session)
         if needs_reconcile and command_allowed(self.legacy.devices.get(device_id)):
             await self.request_reconcile(device_id)
@@ -1034,6 +1049,7 @@ class PushRuntime:
         """
         lock = self._device_lock(device_id)
         snapshots: list[dict[str, Any]] = []
+        deferred_rejections: list[dict[str, Any]] = []
         needs_reconcile = False
         async with lock:
             session = self._registered_session(ws, device_id)
@@ -1055,7 +1071,7 @@ class PushRuntime:
                 entry["push_state_status"] = push_state_status
                 if became_available:
                     needs_reconcile = await self._adopt_registration_runtime(
-                        session, payload, snapshots
+                        session, payload, snapshots, deferred_rejections
                     )
             await asyncio.wait_for(
                 ws.send_str(json.dumps({
@@ -1069,7 +1085,9 @@ class PushRuntime:
         self._spawn_background(
             self.legacy.broadcast_device_list(), name=f"push-state-refresh-{device_id}"
         )
-        await self._after_registration(session, payload, needs_reconcile)
+        await self._after_registration(
+            session, payload, needs_reconcile, deferred_rejections
+        )
 
     def _spawn_background(self, coro: Any, *, name: str) -> None:
         """Run admin fan-out without holding up the device message path."""
@@ -1122,6 +1140,7 @@ class PushRuntime:
         device_id: str,
         session: LiveSession,
         active_report: dict[str, Any],
+        deferred_rejections: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         job_id = active_report.get("job_id")
         attempt = active_report.get("attempt")
@@ -1156,6 +1175,7 @@ class PushRuntime:
                     job_id=job_id,
                     artifact_id=active_report.get("artifact_id"),
                     revision=active_report.get("revision"),
+                    deferred_rejections=deferred_rejections,
                 )
             return snapshots
 
@@ -1205,12 +1225,14 @@ class PushRuntime:
                     job_id=job_id,
                     artifact_id=reported_artifact,
                     revision=active_report.get("revision"),
+                    deferred_rejections=deferred_rejections,
                 )
             return snapshots
 
         if active_report.get("status") == "interrupted":
             return await self._resume_interrupted_report(
-                session, device_id, active_report, assignment
+                session, device_id, active_report, assignment,
+                deferred_rejections=deferred_rejections,
             )
         if assignment["state"] != DeviceState.RECONCILING.value:
             return []
@@ -1582,6 +1604,7 @@ class PushRuntime:
         job_id: str,
         artifact_id: Any,
         revision: Any,
+        deferred_rejections: list[dict[str, Any]] | None = None,
     ) -> None:
         # Only an exact identity can authorize the client to discard durable work.
         # Malformed reports remain fenced and are resolved by reconciliation timeout.
@@ -1601,6 +1624,9 @@ class PushRuntime:
             "retryable": False,
             "detail": "Server could not authorize the interrupted assignment",
         }
+        if deferred_rejections is not None:
+            deferred_rejections.append(payload)
+            return
         try:
             await asyncio.wait_for(
                 session.ws.send_str(json.dumps(payload, separators=(",", ":"))),
@@ -1609,12 +1635,34 @@ class PushRuntime:
         except (ConnectionError, asyncio.TimeoutError):
             pass
 
+    async def _flush_deferred_resume_rejections(
+        self, session: LiveSession, rejections: list[dict[str, Any]]
+    ) -> None:
+        """Send registration-time rejections only after this socket is ready."""
+        for rejection in rejections:
+            entry = self.legacy.devices.get(session.device_id)
+            if (
+                self.sessions.get(session.device_id) is not session
+                or entry is None
+                or entry.get("ws") is not session.ws
+                or not command_allowed(entry)
+            ):
+                return
+            await self._send_resume_rejected(
+                session,
+                job_id=rejection["job_id"],
+                artifact_id=rejection["artifact_id"],
+                revision=rejection["revision"],
+            )
+
     async def _resume_interrupted_report(
         self,
         session: LiveSession,
         device_id: str,
         payload: dict[str, Any],
         assignment: dict[str, Any],
+        *,
+        deferred_rejections: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Resolve exact interruption evidence identically on REGISTER and reconciliation."""
         job_id = payload["job_id"]
@@ -1624,7 +1672,8 @@ class PushRuntime:
         if assignment.get("cancel_requested_at") is not None:
             if artifact_id == assignment.get("artifact_id") and revision == assignment.get("dispatch_revision"):
                 await self._send_resume_rejected(session, job_id=job_id,
-                    artifact_id=artifact_id, revision=revision)
+                    artifact_id=artifact_id, revision=revision,
+                    deferred_rejections=deferred_rejections)
             return []
         if isinstance(artifact_id, str):
             key = TransferKey("push", device_id, job_id, 1)
@@ -1657,6 +1706,7 @@ class PushRuntime:
             job_id=job_id,
             artifact_id=artifact_id if isinstance(artifact_id, str) else assignment.get("artifact_id"),
             revision=revision,
+            deferred_rejections=deferred_rejections,
         )
         return []
 
@@ -1674,9 +1724,17 @@ class PushRuntime:
             or status not in {"active", "absent", "interrupted"}
         ):
             return
-        if status in {"absent", "interrupted"}:
+        if status == "absent":
             matched, opaque_snapshots = await self.manager.clear_matching_opaque_fence(
-                device_id, job_id, 1
+                device_id,
+                job_id,
+                1,
+                artifact_id=(
+                    payload.get("artifact_id")
+                    if isinstance(payload.get("artifact_id"), str)
+                    else None
+                ),
+                require_artifact_match=True,
             )
             for opaque_snapshot in opaque_snapshots:
                 await self.publish(opaque_snapshot)
@@ -1684,6 +1742,15 @@ class PushRuntime:
                 self.scheduler.wake()
         assignment = await self.manager.assignment(job_id, device_id)
         if assignment is None:
+            if status == "interrupted":
+                # Interrupted evidence proves the old bytes still exist. Keep the
+                # opaque fence until the client confirms rejection as absent.
+                await self._send_resume_rejected(
+                    session,
+                    job_id=job_id,
+                    artifact_id=payload.get("artifact_id"),
+                    revision=payload.get("revision"),
+                )
             return
         if assignment.get("cancel_requested_at") is not None:
             # Only dispatched job-v1 assignments are cancellable, and those clients
@@ -2037,6 +2104,8 @@ class PushRuntime:
         while True:
             await self.publication_wake.wait()
             self.publication_wake.clear()
+            for snapshot in await self.store.drain_retry_publications():
+                await self.publish(snapshot)
             while self.pending_publications:
                 job_id, snapshot = self.pending_publications.popitem()
                 event = {

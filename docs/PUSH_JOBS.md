@@ -210,6 +210,12 @@ identity, removes its owned work, and confirms `absent`. A verified
 `artifact.zip` surviving a restart is hash-checked and reused without network
 transfer.
 
+Registration-time cleanup instructions follow `REGISTERED` and canonical socket
+readiness. Unknown interrupted work remains fenced until a matching `absent`
+report confirms cleanup, including the artifact ID when recorded in the fence.
+Manual Reconcile of still-interrupted work retries the rejection; interruption
+alone does not authorize the server to release that ownership.
+
 Push runs only between a server and client of the same version; a newer server
 only updates an older client's APK. The client therefore rejects a live job-v1
 command without `artifact_url`, a positive `revision`, and a strong `artifact_etag`
@@ -490,6 +496,12 @@ Each job has a monotonic 64-bit `revision`. Canonical mutations are committed an
 
 - `PUSH_JOBS_SNAPSHOT` after connection,
 - `PUSH_JOB_UPDATED` with a full job snapshot.
+
+Creating later work or settling it before dispatch can change an older job's
+Retry eligibility for the same device and destination. Those dependent revisions
+commit with the source transition and enter the publication queue even if the
+initiating request is cancelled. Artifact expiry likewise publishes changed Retry
+controls. Unaffected historical jobs keep their revision and timestamp.
 
 `PushJobManager.settle_result` reads the current assignment and fence, decides
 normal/cancelled/late/opaque-fenced results, and commits outcome changes and

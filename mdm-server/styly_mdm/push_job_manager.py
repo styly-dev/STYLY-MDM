@@ -342,7 +342,7 @@ class PushJobManager:
                          timestamp),
                     )
                 # GC reads the new job in this same serialized transaction.
-                self.store._increment_revision(conn, job_id, timestamp)
+                self.store._invalidate_retry_dependents(conn, retry_id, timestamp)
                 snapshot = self.store._snapshot(conn, retry_id)
                 self.store._commit(conn)
                 return True, snapshot
@@ -407,6 +407,7 @@ class PushJobManager:
                             (DeviceState.FAILED.value, timestamp, timestamp,
                              row["job_id"], device_id),
                         )
+                        self.store._invalidate_retry_dependents(conn, row["job_id"], timestamp)
                     else:
                         if current is not DeviceState.QUEUED:
                             validate_device_transition(current, DeviceState.QUEUED)
@@ -1159,6 +1160,7 @@ class PushJobManager:
                             "terminal_at=?, updated_at=? WHERE job_id=? AND device_id=?",
                             (timestamp, timestamp, job_id, device_id),
                         )
+                        self.store._invalidate_retry_dependents(conn, job_id, timestamp)
                         self.store._rederive_job(conn, job_id, timestamp)
                     else:
                         conn.execute(
@@ -1656,6 +1658,7 @@ class PushJobManager:
 
     def _clear_matching_opaque_fence(
         self, conn: sqlite3.Connection, device_id: str, job_id: str, attempt: int,
+        *, artifact_id: str | None = None, require_artifact_match: bool = False,
     ) -> tuple[bool, list[dict[str, Any]]]:
         """Clear exact opaque evidence inside the caller's transaction."""
         expected = self.canonical_opaque_job_identity(
@@ -1677,6 +1680,11 @@ class PushJobManager:
             stored is None
             or stored["job_id"] != expected_identity["job_id"]
             or stored["attempt"] != expected_identity["attempt"]
+            or (
+                require_artifact_match
+                and stored.get("artifact_id") is not None
+                and artifact_id != stored["artifact_id"]
+            )
         ):
             return False, []
         # Capture the terminal display row before removing its opaque fence.
@@ -1689,12 +1697,17 @@ class PushJobManager:
 
     async def clear_matching_opaque_fence(
         self, device_id: str, job_id: str, attempt: int,
+        *, artifact_id: str | None = None, require_artifact_match: bool = False,
     ) -> tuple[bool, list[dict[str, Any]]]:
         """Clear only a canonical opaque job-v1 fence matching exact evidence."""
         def op(conn: sqlite3.Connection) -> tuple[bool, list[dict[str, Any]]]:
             self.store._begin(conn)
             try:
-                result = self._clear_matching_opaque_fence(conn, device_id, job_id, attempt)
+                result = self._clear_matching_opaque_fence(
+                    conn, device_id, job_id, attempt,
+                    artifact_id=artifact_id,
+                    require_artifact_match=require_artifact_match,
+                )
                 self.store._commit(conn)
                 return result
             except BaseException:
@@ -1941,6 +1954,7 @@ class PushJobManager:
                         )
                         self.store._increment_revision(conn, job_id, timestamp)
                         self.store._rederive_job(conn, job_id, timestamp)
+                        self.store._invalidate_retry_dependents(conn, job_id, timestamp)
                     touched.append(job_id)
                 snapshots = [self.store._snapshot(conn, job_id) for job_id in touched]
                 self.store._commit(conn)
