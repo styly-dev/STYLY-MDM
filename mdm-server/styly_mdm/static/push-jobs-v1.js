@@ -411,6 +411,7 @@
       jobId: jobId,
       targets: Array.from(targets || []),
       clientRequestId: clientRequestId || null,
+      requestId: ['resume', 'cancel'].indexOf(action) >= 0 ? uuid() : null,
       socket: currentAdminSocket,
       timer: null,
     };
@@ -419,7 +420,17 @@
     pendingActions.set(key, pending);
     refreshPendingActionDevices(pending.targets);
     if (shouldRender !== false) renderPausedJobs();
-    return true;
+    return pending;
+  }
+
+  function settleTargetedAction(socket, action, message) {
+    const messageAction = action === 'resume' ? 'PUSH_FILES' : 'CANCEL_PUSH_JOB';
+    if (message.action !== undefined && message.action !== messageAction) return;
+    pendingActions.forEach(function (pending, key) {
+      if (pending.action !== action || pending.jobId !== message.job_id || pending.socket !== socket) return;
+      // An old response for the same targets must not settle a newer request.
+      if (message.request_id === pending.requestId) settlePendingAction(key);
+    });
   }
 
   function settleActionsFromJob(job) {
@@ -660,13 +671,16 @@
     try {
       groups.forEach(function (group) {
         const key = actionKey(action, group.job.job_id, group.targetDevices);
-        if (!trackAction(action, group.job.job_id, group.targetDevices, null, false)) return;
+        const pending = trackAction(action, group.job.job_id, group.targetDevices, null, false);
+        if (!pending) return;
         try {
-          nativeSend.call(currentAdminSocket, JSON.stringify({
+          const payload = {
             type: messageType,
             job_id: group.job.job_id,
             target_devices: group.targetDevices,
-          }));
+          };
+          if (pending.requestId) payload.request_id = pending.requestId;
+          nativeSend.call(currentAdminSocket, JSON.stringify(payload));
         } catch (error) {
           settlePendingAction(key);
           throw error;
@@ -991,13 +1005,16 @@
       if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return false;
       if (action === 'cancel' && typeof window.confirm === 'function' &&
           !window.confirm('Cancel Push / Sync for ' + deviceId + '?')) return false;
-      if (!trackAction(action, jobId, [deviceId], null, false)) return false;
+      const pending = trackAction(action, jobId, [deviceId], null, false);
+      if (!pending) return false;
       try {
-        nativeSend.call(currentAdminSocket, JSON.stringify({
+        const payload = {
           type: action === 'resume' ? 'PUSH_FILES' : 'CANCEL_PUSH_JOB',
           job_id: jobId,
           target_devices: [deviceId],
-        }));
+        };
+        if (pending.requestId) payload.request_id = pending.requestId;
+        nativeSend.call(currentAdminSocket, JSON.stringify(payload));
         renderPausedJobs();
         return true;
       } catch (error) {
@@ -1053,12 +1070,17 @@
       if (socket !== currentAdminSocket) return;
       const shortId = String(message.job_id || '').slice(0, 8);
       if (message.action === 'CANCEL_PUSH_JOB') {
-        const cancels = Array.from(pendingActions.values()).filter(function (pending) {
-          return pending.action === 'cancel' && pending.jobId === message.job_id;
+        settleTargetedAction(socket, 'cancel', message);
+        const accepted = message.accepted_devices || [];
+        const rejected = Object.entries(message.rejected_devices || {}).map(function (entry) {
+          return entry[0] + ' (' + entry[1] + ')';
         });
-        if (cancels.length === 1) settlePendingAction(cancels[0].key);
-        appendLog('Cancel recorded for job #' + shortId +
-          '; affected devices settle once they confirm the work is absent', 'info');
+        if (accepted.length) {
+          appendLog((rejected.length ? 'Cancel partially recorded' : 'Cancel recorded') +
+            ' for job #' + shortId + ': ' + accepted.join(', ') +
+            (rejected.length ? '; rejected: ' + rejected.join('; ') : '') +
+            '; outstanding device cleanup still needs confirmation', rejected.length ? 'warn' : 'info');
+        }
       } else if (message.action === 'RETRY_FAILED_PUSH_JOB') {
         const retries = Array.from(pendingActions.values()).filter(function (pending) {
           return pending.action === 'retry';
@@ -1067,21 +1089,28 @@
         appendLog('Created retry job #' + shortId + ' for unsuccessful devices', 'info');
       }
     } else if (message.type === 'PUSH_FILES_SENT' && message.job_id) {
-      if (socket !== currentAdminSocket) return;
+      if (socket !== currentAdminSocket) {
+        event.stopImmediatePropagation();
+        return;
+      }
       const submission = pendingDispatches.get(message.job_id);
       if (submission) settleDispatch(submission, null);
       if (message.resume === true) {
-        const resumes = Array.from(pendingActions.values()).filter(function (pending) {
-          return pending.action === 'resume' && pending.jobId === message.job_id &&
-            pending.targets.length === message.target_count;
-        });
-        if (resumes.length === 1) settlePendingAction(resumes[0].key);
+        settleTargetedAction(socket, 'resume', message);
       }
     } else if (message.type === 'ERROR') {
+      const action = message.action === 'CANCEL_PUSH_JOB' ? 'cancel' :
+        message.action === 'PUSH_FILES' && (message.request_id !== undefined ||
+          Array.isArray(message.target_devices)) ? 'resume' : null;
+      if (action) event.stopImmediatePropagation();
       if (socket !== currentAdminSocket) return;
-      // ERROR currently contains only a message, so it cannot safely settle a
-      // specific action. The legacy log handler shows the error; canonical or
-      // typed acknowledgements and the timeout settle pending state.
+      if (action) {
+        settleTargetedAction(socket, action, message);
+        appendLog((action === 'cancel' ? 'Cancel' : 'Resume') + ' failed for job #' + String(message.job_id || '').slice(0, 8) +
+          ': ' + message.message, 'fail');
+      }
+      // Other uncorrelated errors remain with the legacy log handler and cannot
+      // safely settle a specific action.
     }
   }
 

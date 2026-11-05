@@ -50,7 +50,10 @@ internal class PushDownloadDeadline(
         if (expired || elapsed >= timeoutMs) {
             expired = true
             call?.cancel()
-            throw PushWorkerException("download_failed", "No download data received for ${timeoutMs}ms", retryable = true)
+            throw PushWorkerException(
+                "download_failed", "No download data received for ${timeoutMs}ms",
+                recovery = PushFailureRecovery.RetryWithinDeadline,
+            )
         }
         return timeoutMs - elapsed
     }
@@ -239,7 +242,7 @@ class PushFilesWorker internal constructor(
     private data class FailurePolicy(
         val interruptionReason: String? = null,
         val retainPartial: Boolean = false,
-        val retryInWorker: Boolean = false,
+        val recovery: PushFailureRecovery = PushFailureRecovery.TerminalFailure,
     )
 
     fun execute(command: PushProtocol.Command, callbacks: Callbacks): Execution {
@@ -555,16 +558,20 @@ class PushFilesWorker internal constructor(
                         receivedSinceRetry = true
                     }
                     if (partial.length() == expectedSize) break
-                    throw PushWorkerException("download_failed", "artifact response ended before declared size", retryable = true)
-                } catch (stop: PushTransferInterrupted) {
-                    throw stop.failure
-                } catch (error: PushWorkerException) {
+                    throw PushWorkerException(
+                        "download_failed", "artifact response ended before declared size",
+                        recovery = PushFailureRecovery.RetryWithinDeadline,
+                    )
+                } catch (error: Exception) {
                     val policy = failurePolicy(command, error)
-                    discardPartialOnFailure(command, partial, error, policy = policy)
-                    if (!policy.retryInWorker) throw error
-                } catch (error: IOException) {
-                    // Keep the exact partial and retry only within the remaining idle window.
-                    if (!failurePolicy(command, error).retryInWorker) throw error
+                    if (error is PushWorkerException) {
+                        discardPartialOnFailure(command, partial, error, policy = policy)
+                    }
+                    when (policy.recovery) {
+                        PushFailureRecovery.RetryWithinDeadline -> Unit
+                        PushFailureRecovery.AwaitOperatorResume,
+                        PushFailureRecovery.TerminalFailure -> throw error
+                    }
                 }
                 if (partial.isFile && partial.length() == expectedSize) {
                     break
@@ -591,34 +598,36 @@ class PushFilesWorker internal constructor(
         if (error == null) return FailurePolicy()
         val failure = error as? PushWorkerException ?: return FailurePolicy(
             retainPartial = error is IOException,
-            retryInWorker = error is IOException,
+            recovery = if (error is IOException) PushFailureRecovery.RetryWithinDeadline
+                else PushFailureRecovery.TerminalFailure,
         )
-        val retainPartial = failure.code == "artifact_unavailable"
         return when (failure.code) {
-            "download_failed" -> if (failure.retryable) {
-                FailurePolicy(
+            "download_failed" -> when (failure.recovery) {
+                PushFailureRecovery.RetryWithinDeadline,
+                PushFailureRecovery.AwaitOperatorResume -> FailurePolicy(
                     interruptionReason = "download_interrupted",
                     retainPartial = true,
-                    retryInWorker = true,
+                    recovery = failure.recovery,
                 )
-            } else {
-                FailurePolicy(retainPartial = retainPartial)
+                PushFailureRecovery.TerminalFailure -> FailurePolicy()
             }
             PUSH_LEASE_REVOKED -> FailurePolicy(
                 interruptionReason = "server_lease_revoked",
                 retainPartial = true,
+                recovery = PushFailureRecovery.AwaitOperatorResume,
             )
             "storage_write_failed" -> if (validatedResumeOffset(command) > 0L) {
                 FailurePolicy(
                     interruptionReason = "storage_write_failed",
                     retainPartial = true,
+                    recovery = PushFailureRecovery.AwaitOperatorResume,
                 )
             } else {
                 FailurePolicy()
             }
             else -> FailurePolicy(
-                retainPartial = retainPartial,
-                retryInWorker = failure.retryable,
+                retainPartial = failure.code == "artifact_unavailable",
+                recovery = failure.recovery,
             )
         }
     }
@@ -702,7 +711,10 @@ class PushFilesWorker internal constructor(
             }
         }
         if (expectedLength != null && received != expectedLength) {
-            throw PushWorkerException("download_failed", "HTTP body ended before its declared range", retryable = true)
+            throw PushWorkerException(
+                "download_failed", "HTTP body ended before its declared range",
+                recovery = PushFailureRecovery.RetryWithinDeadline,
+            )
         }
     }
 
@@ -735,7 +747,10 @@ class PushFilesWorker internal constructor(
                 throw PushWorkerException("artifact_unavailable", "artifact is unavailable (HTTP $status)")
             }
             if (status == 408 || status == 429 || status >= 500) {
-                throw PushWorkerException("download_failed", "artifact download returned HTTP $status", retryable = true)
+                throw PushWorkerException(
+                    "download_failed", "artifact download returned HTTP $status",
+                    recovery = PushFailureRecovery.RetryWithinDeadline,
+                )
             }
             val handledStatuses = if (offset == 0L) {
                 setOf(HttpURLConnection.HTTP_OK)
@@ -747,12 +762,18 @@ class PushFilesWorker internal constructor(
                 if (offset == 0L) throw PushWorkerException("download_failed", failure)
                 // The status says nothing about the stored bytes: keep the validated
                 // partial and end this attempt as interrupted for manual Resume.
-                throw PushTransferInterrupted(PushWorkerException("download_failed", failure, retryable = true))
+                throw PushWorkerException(
+                    "download_failed", failure,
+                    recovery = PushFailureRecovery.AwaitOperatorResume,
+                )
             }
             fun rejectInvalidResponse(detail: String): Nothing {
                 // Reject this response before writing, without discarding an authorized prefix.
                 if (offset > 0L) {
-                    throw PushTransferInterrupted(PushWorkerException("download_failed", detail, retryable = true))
+                    throw PushWorkerException(
+                        "download_failed", detail,
+                        recovery = PushFailureRecovery.AwaitOperatorResume,
+                    )
                 }
                 throw PushWorkerException("artifact_identity_mismatch", detail)
             }
@@ -794,12 +815,12 @@ class PushFilesWorker internal constructor(
                 HttpURLConnection.HTTP_PARTIAL -> {
                     val range = parseContentRange(connection.header("Content-Range"))
                         ?: rejectInvalidResponse("missing or malformed Content-Range")
-                    if (range.first != offset || range.third != expectedSize ||
-                        range.second < range.first || range.second >= range.third
+                    if (range.start != offset || range.totalLength != expectedSize ||
+                        range.endInclusive < range.start || range.endInclusive >= range.totalLength
                     ) {
                         rejectInvalidResponse("Content-Range does not match the requested offset or expected size")
                     }
-                    val rangeLength = range.second - range.first + 1L
+                    val rangeLength = range.endInclusive - range.start + 1L
                     if ((connection.body?.contentLength() ?: -1L) != rangeLength) {
                         rejectInvalidResponse("Content-Length does not match Content-Range")
                     }
@@ -817,7 +838,7 @@ class PushFilesWorker internal constructor(
         }
     }
 
-    private data class ContentRange(val first: Long, val second: Long, val third: Long)
+    private data class ContentRange(val start: Long, val endInclusive: Long, val totalLength: Long)
 
     private fun parseContentRange(value: String?): ContentRange? {
         val match = Regex("^bytes ([0-9]+)-([0-9]+)/([0-9]+)$").matchEntire(value ?: "") ?: return null
@@ -999,15 +1020,17 @@ class PushFilesWorker internal constructor(
     }
 }
 
-/**
- * Ends the job-v1 transfer loop without another retry. The wrapped retryable
- * `download_failed` [failure] becomes an interrupted attempt that keeps the partial.
- */
-private class PushTransferInterrupted(val failure: PushWorkerException) : Exception(failure.message, failure)
+/** Download recovery is independent of the failure code and partial-file cleanup. */
+enum class PushFailureRecovery {
+    RetryWithinDeadline,
+    AwaitOperatorResume,
+    TerminalFailure,
+}
 
 class PushWorkerException(
     val code: String,
     message: String,
     cause: Throwable? = null,
-    val retryable: Boolean = false,
+    val recovery: PushFailureRecovery = PushFailureRecovery.TerminalFailure,
 ) : Exception(message, cause)
+

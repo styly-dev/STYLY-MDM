@@ -6,79 +6,18 @@ import uuid
 import pytest
 
 from styly_mdm import push_runtime
+from styly_mdm.push_artifacts import ArtifactStore
 from styly_mdm.push_job_manager import PushJobManager
 from styly_mdm.push_job_store import PushJobStore, StoreConflict, now_ms
 from styly_mdm.push_jobs import (
     DeviceState,
     ProtocolMode,
-    canonicalize_create_request,
 )
 from styly_mdm.push_runtime import PushRuntime
 from styly_mdm.push_scheduler import LiveSession, PushScheduler
 from styly_mdm.push_transfer_leases import PushTransferLeases
 from styly_mdm.transfer_registry import TransferKey, TransferRegistry
-
-
-def request():
-    return canonicalize_create_request({
-        "client_request_id": str(uuid.uuid4()),
-        "target_devices": ["D1"],
-        "mode": "push",
-        "dest_path": "/sdcard/STYLY/content",
-        "source": {
-            "display_name": "content",
-            "declared_file_count": 1,
-            "declared_total_bytes": 1,
-        },
-    })
-
-
-def protocols():
-    return {"D1": (ProtocolMode.JOB_V1, {"push_job_id_v1"})}
-
-
-async def ready_job(store, manager):
-    _, created = await manager.store.create_job(request(), protocols(), 60_000)
-    job_id = created["job_id"]
-    await store.start_upload(job_id)
-    await store.mark_packaging(job_id, 1, 1)
-    ready = await store.publish_artifact(job_id, {
-        "artifact_id": str(uuid.uuid4()),
-        "storage_name": str(uuid.uuid4()) + ".zip",
-        "display_filename": "content.zip",
-        "byte_size": 1,
-        "sha256": "a" * 64,
-        "entry_count": 1,
-    })
-    return ready
-
-
-async def downloading_job(store, manager):
-    ready = await ready_job(store, manager)
-    job_id = ready["job_id"]
-    await manager.store.enable_dispatch(job_id)
-    claimed = await manager.claim_next(["D1"])
-    assert claimed is not None
-    await manager.prepare_dispatch(
-        job_id,
-        "D1",
-        accept_deadline=now_ms() + 60_000,
-    )
-    return await manager.transition_device(
-        job_id,
-        "D1",
-        expected={DeviceState.DISPATCHING},
-        target=DeviceState.DOWNLOADING,
-        fields={"accepted_at": now_ms(), "accept_deadline": None},
-    )
-
-
-class Ws:
-    def __init__(self):
-        self.messages = []
-
-    async def send_str(self, value):
-        self.messages.append(json.loads(value))
+from push_test_helpers import LegacyEvents, Scheduler, Ws, downloading_job, manager, ready_job, request
 
 
 class SnapshotWs(Ws):
@@ -89,22 +28,6 @@ class SnapshotWs(Ws):
     async def close(self, **kwargs):
         self.close_calls.append(kwargs)
         return True
-
-
-class Scheduler:
-    def __init__(self):
-        self.wake_count = 0
-        self.reconcile_calls = []
-        self.active_transfer_slots = []
-
-    def wake(self):
-        self.wake_count += 1
-
-    async def send_reconcile(self, session, snapshot, device_id):
-        self.reconcile_calls.append((session, snapshot, device_id))
-
-    async def reconcile_active_transfer(self, job_id, device_id, attempt):
-        self.active_transfer_slots.append((job_id, device_id, attempt))
 
 
 class RegistrationManager:
@@ -131,6 +54,10 @@ def runtime_for(manager):
     runtime.disconnect_recovery_tasks = {}
     runtime.artifact_gc_task = None
     runtime.manager = manager
+    runtime.artifacts = (
+        ArtifactStore(manager.store.path.parent)
+        if hasattr(manager, "store") else types.SimpleNamespace(artifact_root=None)
+    )
     runtime.transfers = TransferRegistry()
     runtime.scheduler = None
     runtime.send_timeout = 1
@@ -143,15 +70,6 @@ def live_session(capabilities, *, ws=None, device_id="D1", session_id="session")
         device_id, session_id, ws if ws is not None else Ws(),
         frozenset(capabilities), str(uuid.uuid4()), asyncio.Lock(), "http://server",
     )
-
-
-@pytest.fixture
-def manager(tmp_path):
-    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
-    try:
-        yield PushJobManager(store)
-    finally:
-        store.close()
 
 
 @pytest.mark.asyncio
@@ -281,7 +199,7 @@ async def test_interrupted_transfer_requires_exact_evidence_before_pausing(manag
         evidence["validated_offset"] = True
     else:
         evidence["validated_offset"] = 2
-    outcome, unchanged = await manager.resume_interrupted(
+    outcome, [unchanged] = await manager.resume_interrupted(
         snapshot["job_id"], "D1", attempt=1,
         reason="download_interrupted", **evidence,
     )
@@ -549,7 +467,7 @@ async def test_failed_interrupted_reconciliation_returns_permanent_disposition()
             }
 
         async def resume_interrupted(self, *_args, **_kwargs):
-            return "rejected", {"job_id": "job-1"}
+            return "rejected", [{"job_id": "job-1"}]
 
     runtime = runtime_for(Manager())
     ws = Ws()
@@ -597,7 +515,7 @@ async def test_interrupted_reconciliation_without_artifact_never_resumes():
 
         async def resume_interrupted(self, *_args, **_kwargs):
             self.resume_calls += 1
-            return "requeued", {"job_id": "job-1"}
+            return "requeued", [{"job_id": "job-1"}]
 
     runtime = runtime_for(Manager())
     ws = Ws()
@@ -1418,6 +1336,7 @@ async def test_interrupted_registration_uses_revision_without_session_resume_cap
     runtime.disconnect_recovery_tasks = {}
     runtime.artifact_gc_task = None
     runtime.manager = manager
+    runtime.artifacts = ArtifactStore(store.path.parent)
     runtime.transfers = TransferRegistry()
     runtime.send_timeout = 1
     session = LiveSession(
@@ -1450,15 +1369,6 @@ async def test_interrupted_registration_uses_revision_without_session_resume_cap
     assert current["state"] == DeviceState.QUEUED.value
     assert current["validated_offset"] == 0
     assert ws.messages == []
-
-
-class LegacyEvents:
-    def __init__(self):
-        self.events = []
-        self.devices = {}
-
-    async def forward_to_admins(self, event):
-        self.events.append(event)
 
 
 @pytest.mark.asyncio

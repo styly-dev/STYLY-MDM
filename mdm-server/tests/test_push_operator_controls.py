@@ -1,59 +1,14 @@
 """Exercise operator commands across runtime, durable state, and owner locks."""
 import asyncio
 import uuid
-from types import SimpleNamespace
 
 import pytest
 
-from styly_mdm.push_job_manager import PushJobManager
-from styly_mdm.push_job_store import PushJobStore, now_ms
+from styly_mdm.push_job_store import now_ms
 from styly_mdm.push_jobs import DeviceState, ProtocolMode, canonicalize_create_request
-from styly_mdm.push_scheduler import PushScheduler
-from test_push_cancellation import CAPS, runtime_for, timed_out_job
-from test_push_retry_failed import completed
-from test_push_review_connection import Ws, downloading_job
-
-
-@pytest.fixture
-def manager(tmp_path):
-    store = PushJobStore(tmp_path / "operator.sqlite3")
-    yield PushJobManager(store)
-    store.close()
-
-
-class OperatorScheduler:
-    """Keep scheduling deterministic while exercising the real reconcile lock path."""
-
-    send_exact_reconcile = PushScheduler.send_exact_reconcile
-
-    def __init__(self, runtime):
-        self.runtime = runtime
-        self.send_timeout = 0.5
-        self.wake_count = 0
-
-    def sessions(self):
-        return self.runtime.sessions
-
-    def wake(self):
-        self.wake_count += 1
-
-
-def operator_runtime(manager, artifact_root):
-    runtime, session = runtime_for(manager)
-    runtime.device_locks = {"D1": session.owner_lock}
-    runtime.admin_send_timeout = 0.5
-    runtime.artifacts = SimpleNamespace(artifact_root=artifact_root)
-    runtime.legacy.MAX_CONCURRENT_TRANSFERS = 5
-    runtime.legacy.devices = {}
-    runtime.scheduler = OperatorScheduler(runtime)
-    return runtime, session, Ws()
-
-
-async def admin_action(runtime, admin, message_type, job_id, **fields):
-    assert await asyncio.wait_for(runtime.handle_admin_message(admin, {
-        "type": message_type, "job_id": job_id, **fields,
-    }), timeout=2)
-    assert not [message for message in admin.messages if message["type"] == "ERROR"]
+from push_test_helpers import (
+    CAPS, admin_action, completed, downloading_job, manager, operator_runtime, timed_out_job,
+)
 
 
 @pytest.mark.asyncio
@@ -177,7 +132,10 @@ async def test_admin_cancel_rejects_active_or_already_resumed_work(manager, tmp_
         _, original = await manager.store.enable_dispatch(original["job_id"])
     runtime, session, admin = operator_runtime(manager, tmp_path)
     assert await runtime.handle_admin_message(admin, {"type": "CANCEL_PUSH_JOB", "job_id": original["job_id"]})
-    assert any(message["type"] == "ERROR" for message in admin.messages)
+    assert [message["type"] for message in admin.messages] == ["ERROR"]
+    assert admin.messages[0]["status"] == "rejected"
+    assert admin.messages[0]["accepted_devices"] == []
+    assert set(admin.messages[0]["rejected_devices"]) == {"D1"}
     assert await manager.get_snapshot(original["job_id"]) == original
     assert session.ws.messages == []
 
@@ -495,7 +453,12 @@ async def test_restart_unsent_offline_target_can_be_cancelled_without_client(
     assert (await manager.assignment(job_id, "D2"))["terminal_at"] is not None
     assert await manager.assignment(job_id, "D1") == other_before
     assert session.ws.messages == []
+    response = admin.messages[-1]
+    assert response["status"] == "accepted"
+    assert response["accepted_devices"] == ["D2"]
+    assert response["rejected_devices"] == {}
     await admin_action(runtime, admin, "CANCEL_PUSH_JOB", job_id, target_devices=["D2"])
+    assert admin.messages[-1] == response
     assert await manager.get_snapshot(job_id) == cancelled
     assert await manager.claim_next(["D2"]) is None
 
@@ -567,3 +530,194 @@ async def test_retry_request_replay_preserves_dispatch_authority(manager, tmp_pa
         await admin_action(runtime, admin, "PUSH_FILES", retry_id)
         assert (await manager.get_snapshot(retry_id))["dispatch_enabled"]
         assert (await manager.claim_next(["failed"]))["job"]["job_id"] == retry_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rejected_targets", [[], ["D1"], ["D1", "D2"]])
+async def test_cancel_returns_one_correlated_outcome_for_every_target(
+    manager, tmp_path, rejected_targets
+):
+    original = await two_device_job(manager, interrupted=True)
+    job_id = original["job_id"]
+    if rejected_targets:
+        await manager.store.enable_dispatch(job_id, rejected_targets)
+    runtime, _session, admin = operator_runtime(manager, tmp_path)
+    requested = ["D2", "D1"]
+    accepted = [device_id for device_id in requested if device_id not in rejected_targets]
+    before_rejected = {
+        device_id: await manager.assignment(job_id, device_id)
+        for device_id in rejected_targets
+    }
+    await runtime.handle_admin_message(admin, {
+        "type": "CANCEL_PUSH_JOB", "job_id": job_id,
+        "target_devices": requested + ["D2"], "request_id": "cancel-request",
+    })
+
+    assert len(admin.messages) == 1
+    response = admin.messages[0]
+    assert response["type"] == ("PUSH_JOB_ACTION_SENT" if accepted else "ERROR")
+    assert response["status"] == (
+        "partial" if accepted and rejected_targets else "accepted" if accepted else "rejected"
+    )
+    assert response["action"] == "CANCEL_PUSH_JOB"
+    assert response["job_id"] == job_id
+    assert response["request_id"] == "cancel-request"
+    assert response["target_devices"] == requested
+    assert response["accepted_devices"] == accepted
+    assert set(response["rejected_devices"]) == set(rejected_targets)
+    assert all("Only paused, interrupted" in reason for reason in response["rejected_devices"].values())
+    assert runtime.scheduler.wake_count == bool(accepted)
+    for device_id in rejected_targets:
+        assert await manager.assignment(job_id, device_id) == before_rejected[device_id]
+    snapshot = await manager.get_snapshot(job_id)
+    assert all(snapshot["devices"][device_id]["cancel_requested"] for device_id in accepted)
+
+    # Repeating an already recorded request has the same accurate outcome and
+    # cannot convert rejected targets into accepted ones or mutate durable state.
+    admin.messages.clear()
+    await runtime.handle_admin_message(admin, {
+        "type": "CANCEL_PUSH_JOB", "job_id": job_id,
+        "target_devices": requested, "request_id": "cancel-request",
+    })
+    assert admin.messages == [response]
+    assert await manager.get_snapshot(job_id) == snapshot
+
+
+@pytest.mark.asyncio
+async def test_cancel_acknowledgement_failure_preserves_intent_and_can_be_retried(manager, tmp_path):
+    original = await timed_out_job(manager)
+    runtime, _session, admin = operator_runtime(manager, tmp_path)
+    attempted = []
+    closed = []
+
+    async def fail_send(_ws, response):
+        attempted.append(response)
+        raise ConnectionError("admin disconnected")
+
+    async def close_failed(ws, _reason):
+        closed.append(ws)
+
+    real_send = runtime.admin_send
+    runtime.admin_send = fail_send
+    runtime._close_failed_admin_socket = close_failed
+    request = {
+        "type": "CANCEL_PUSH_JOB", "job_id": original["job_id"],
+        "target_devices": ["D1"], "request_id": "lost-ack",
+    }
+    assert await runtime.handle_admin_message(admin, request)
+    current = await manager.get_snapshot(original["job_id"])
+    assert current["devices"]["D1"]["cancel_requested"]
+    assert attempted[0]["status"] == "accepted"
+    assert attempted[0]["accepted_devices"] == ["D1"]
+    assert closed == [admin]
+
+    runtime.admin_send = real_send
+    assert await runtime.handle_admin_message(admin, {**request, "request_id": "retry-ack"})
+    assert admin.messages == [{**attempted[0], "request_id": "retry-ack"}]
+    assert await manager.get_snapshot(original["job_id"]) == current
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["CANCEL_PUSH_JOB", "PUSH_FILES"])
+@pytest.mark.parametrize("targets", [[], ["unknown"], ["D1", "unknown"]])
+async def test_invalid_operator_action_returns_correlated_error(manager, tmp_path, action, targets):
+    original = await two_device_job(manager, interrupted=True)
+    runtime, _session, admin = operator_runtime(manager, tmp_path)
+    assert await runtime.handle_admin_message(admin, {
+        "type": action, "job_id": original["job_id"], "target_devices": targets,
+        "request_id": "invalid-action",
+    })
+    assert len(admin.messages) == 1
+    response = admin.messages[0]
+    assert response["type"] == "ERROR"
+    assert response["action"] == action
+    assert response["job_id"] == original["job_id"]
+    assert response["request_id"] == "invalid-action"
+    assert response["target_devices"] == targets
+    assert await manager.get_snapshot(original["job_id"]) == original
+
+
+@pytest.mark.asyncio
+async def test_resume_acknowledgement_echoes_requested_targets_before_online_filter(manager, tmp_path):
+    original = await two_device_job(manager, interrupted=True)
+    runtime, _session, admin = operator_runtime(manager, tmp_path)
+    await admin_action(runtime, admin, "PUSH_FILES", original["job_id"],
+                       target_devices=["D2", "D1", "D2"], request_id="resume-request")
+    response = admin.messages[0]
+    assert response["type"] == "PUSH_FILES_SENT"
+    assert response["action"] == "PUSH_FILES"
+    assert response["request_id"] == "resume-request"
+    assert response["target_devices"] == ["D2", "D1"]
+    assert response["target_count"] == 1
+    current = await manager.get_snapshot(original["job_id"])
+    assert current["devices"]["D1"]["queue_reason"] == "resumable_replay"
+    assert current["devices"]["D2"]["queue_reason"] == "download_interrupted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["CANCEL_PUSH_JOB", "PUSH_FILES"])
+@pytest.mark.parametrize("committed", [False, True])
+async def test_socket_wrapper_correlates_unexpected_failure_without_claiming_outcome(
+    manager, tmp_path, monkeypatch, action, committed,
+):
+    import json
+    import sqlite3
+
+    from aiohttp import WSMessage, WSMsgType, web
+    from styly_mdm.push_runtime import RuntimeWebSocketResponse
+
+    original = await two_device_job(manager, interrupted=True)
+    runtime, session, _admin = operator_runtime(manager, tmp_path)
+    runtime.sessions["D2"] = session
+    request = {
+        "type": action, "job_id": original["job_id"], "request_id": "failed-operation",
+        "target_devices": ["D1", "D2"],
+    }
+    owner = manager if action == "CANCEL_PUSH_JOB" else manager.store
+    method = "cancel_interrupted" if action == "CANCEL_PUSH_JOB" else "enable_dispatch"
+    original_method = getattr(owner, method)
+
+    async def fail_operation(*args, **kwargs):
+        if committed:
+            await original_method(*args, **kwargs)
+        raise sqlite3.OperationalError("injected database failure")
+
+    monkeypatch.setattr(owner, method, fail_operation)
+    marker = WSMessage(WSMsgType.BINARY, b"next frame", "")
+    incoming = iter([WSMessage(WSMsgType.TEXT, json.dumps(request), ""), marker])
+
+    async def next_frame(_socket):
+        return next(incoming)
+
+    monkeypatch.setattr(web.WebSocketResponse, "__anext__", next_frame)
+    socket = RuntimeWebSocketResponse()
+    socket._push_runtime = runtime
+    socket._push_path = "/ws/admin"
+    socket._push_admin_snapshot_sent = True
+    responses = []
+
+    async def record_response(recipient, response):
+        assert recipient is socket
+        responses.append(response)
+
+    runtime.admin_send = record_response
+    # The wrapper consumes the failed command and continues reading the connection.
+    assert await socket.__anext__() is marker
+    assert len(responses) == 1
+    response = responses[0]
+    assert response["type"] == "ERROR"
+    for field in ("job_id", "request_id", "target_devices"):
+        assert response[field] == request[field]
+    assert response["action"] == action
+    assert "could not be confirmed" in response["message"]
+    assert "changes may already be recorded" in response["message"]
+    assert not {"status", "accepted_devices", "rejected_devices"} & response.keys()
+    current = await manager.get_snapshot(original["job_id"])
+    if not committed:
+        assert current == original
+    elif action == "CANCEL_PUSH_JOB":
+        # The first target committed, then the handler failed before reaching D2.
+        assert current["devices"]["D1"]["cancel_requested"]
+        assert not current["devices"]["D2"]["cancel_requested"]
+    else:
+        assert all(device["queue_reason"] == "resumable_replay" for device in current["devices"].values())

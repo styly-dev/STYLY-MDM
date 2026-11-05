@@ -8,7 +8,7 @@ from aiohttp.test_utils import TestServer
 
 from styly_mdm import server
 from server_test_helpers import reset_server_state
-from test_push_registration_cleanup import push_request
+from push_test_helpers import push_request
 from ws_test_helpers import receive_type
 
 

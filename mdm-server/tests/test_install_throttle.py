@@ -318,23 +318,19 @@ def test_release_transfer_slot_frees_only_the_named_task():
     asyncio.run(body())
 
 
-def test_disconnect_keeps_push_slot_but_releases_install_slot():
-    """A Push HTTP worker survives WebSocket loss; install keeps legacy behavior."""
+def test_disconnect_releases_only_the_devices_install_slot():
+    """Job-v1 Push ownership is separate from the established install mapping."""
     async def body():
         loop = asyncio.get_running_loop()
-        futs = {
-            task: loop.create_future() for task in (server.TASK_INSTALL, server.TASK_PUSH)
-        }
-        for task, fut in futs.items():
-            server.pending_transfers[("a", task)] = fut
+        install = loop.create_future()
+        server.pending_transfers[("a", server.TASK_INSTALL)] = install
         # A second device must not be touched by "a" disconnecting.
         other = loop.create_future()
         server.pending_transfers[("b", server.TASK_INSTALL)] = other
 
         assert server.release_transfer_slot("a", "disconnect") is True
-        assert futs[server.TASK_INSTALL].done()
-        assert futs[server.TASK_INSTALL].result() == "disconnect"
-        assert not futs[server.TASK_PUSH].done()
+        assert install.done()
+        assert install.result() == "disconnect"
         assert not other.done()
 
     asyncio.run(body())

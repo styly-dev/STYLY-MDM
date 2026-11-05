@@ -9,23 +9,13 @@ import uuid
 import pytest
 
 from styly_mdm import push_runtime, push_scheduler
-from styly_mdm.push_job_manager import PushJobManager
 from styly_mdm.push_job_store import PushJobStore, StoreConflict, now_ms
 from styly_mdm.push_jobs import DeviceState
 from styly_mdm.push_runtime import PushRuntime
 from styly_mdm.push_scheduler import LiveSession, PushScheduler
 from styly_mdm.push_transfer_leases import PushTransferLeases, TRANSFER_IDLE_SECONDS
 from styly_mdm.transfer_registry import TransferKey, TransferRegistry
-from test_push_review_connection import Ws, downloading_job, ready_job
-
-
-@pytest.fixture
-def manager(tmp_path):
-    store = PushJobStore(tmp_path / "push_jobs.sqlite3")
-    try:
-        yield PushJobManager(store)
-    finally:
-        store.close()
+from push_test_helpers import Ws, downloading_job, manager, ready_job
 
 
 def _registration_runtime(manager, ws):

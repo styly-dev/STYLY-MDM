@@ -10,6 +10,7 @@ import pytest
 from aiohttp.test_utils import TestServer
 
 from server_test_helpers import reset_server_state
+from push_test_helpers import push_request
 from styly_mdm import server
 from ws_test_helpers import receive_type
 
@@ -18,20 +19,6 @@ async def recv_type(ws, expected: str, timeout: float = 2.0) -> dict:
     payload = await receive_type(ws, expected, timeout=timeout)
     assert payload is not None, f"timed out waiting for {expected}"
     return payload
-
-
-def push_request(device_id: str) -> dict:
-    return {
-        "client_request_id": str(uuid.uuid4()),
-        "target_devices": [device_id],
-        "mode": "push",
-        "dest_path": "/sdcard/STYLY/recovery",
-        "source": {
-            "display_name": "recovery-test",
-            "declared_file_count": 1,
-            "declared_total_bytes": 7,
-        },
-    }
 
 
 @pytest.mark.asyncio

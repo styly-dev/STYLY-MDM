@@ -977,6 +977,10 @@ async def test_reconciliation_housekeeping_isolates_query_and_row_errors(monkeyp
     class Transfers:
         def __init__(self):
             self.released = []
+            self.waiter = object()
+
+        def get(self, key):
+            return self.waiter
 
         def release_exact(self, key, reason):
             self.released.append((key.job_id, reason))

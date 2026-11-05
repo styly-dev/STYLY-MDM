@@ -11,12 +11,12 @@ from styly_mdm.transfer_registry import TransferKey, TransferRegistry
 
 @pytest.mark.asyncio
 async def test_transfer_with_progress_is_not_capped_at_ten_minutes(tmp_path, monkeypatch):
-    from test_push_acceptance_transport_failure import _ready, _scheduler
+    from push_test_helpers import claimed_job_context, dispatch_scheduler
     from styly_mdm import push_transfer_leases
     from styly_mdm.push_scheduler import LiveSession
     import json
 
-    async with _ready(tmp_path) as (manager, capabilities, snapshot, claimed):
+    async with claimed_job_context(tmp_path) as (manager, capabilities, snapshot, claimed):
         loop = asyncio.get_running_loop()
         started_at = loop.time()
         clock = SimpleNamespace(now=started_at)
@@ -28,7 +28,7 @@ async def test_transfer_with_progress_is_not_capped_at_ten_minutes(tmp_path, mon
         leases = PushTransferLeases()
         registry = TransferRegistry(leases.revoke_now)
         sessions = {}
-        scheduler = _scheduler(manager, registry, leases, sessions, asyncio.Semaphore(1))
+        scheduler = dispatch_scheduler(manager, registry, leases, sessions, asyncio.Semaphore(1))
         waiting = asyncio.Event()
         original_wait = scheduler._wait_for_transfer_or_stall
 

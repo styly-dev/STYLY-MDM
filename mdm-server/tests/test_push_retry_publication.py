@@ -9,7 +9,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from server_test_helpers import reset_server_state
 from styly_mdm import server
 from styly_mdm.push_jobs import DeviceState, JobState, ProtocolMode, canonicalize_create_request
-from test_push_retry_failed import completed, manager
+from push_test_helpers import completed, manager
 from ws_test_helpers import receive_type
 
 

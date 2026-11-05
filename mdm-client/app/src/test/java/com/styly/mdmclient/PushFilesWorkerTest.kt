@@ -230,6 +230,52 @@ class PushFilesWorkerTest {
     }
 
     @Test
+    fun `invalid resumed response stops automatic recovery after a transient retry`() {
+        val archive = zip("content.txt" to "manual-after-retry").readBytes()
+        val split = archive.size / 2
+        val prefix = archive.copyOfRange(0, split)
+        val remaining = archive.copyOfRange(split, archive.size)
+        val rangeHeaders = "Content-Range: bytes $split-${archive.lastIndex}/${archive.size}\r\n" +
+            "Content-Length: ${remaining.size}"
+        val work = File(tmp.root, "manual-after-retry-work")
+        val delays = mutableListOf<Long>()
+        val callbacks = mutableListOf<String>()
+        var now = 0L
+
+        TestHttpServer(
+            listOf(
+                response("HTTP/1.1 503 Retry\r\nContent-Length: 0"),
+                // A malformed resumed response must not consume the valid response after it.
+                response("HTTP/1.1 206 Partial Content\r\n$rangeHeaders", remaining),
+                response("HTTP/1.1 206 Partial Content\r\nETag: \"v1\"\r\n$rangeHeaders", remaining),
+            ),
+        ).use { server ->
+            val command = command(
+                artifactUrl = server.url,
+                artifactSize = archive.size.toLong(),
+                artifactSha256 = sha256(archive),
+            )
+            seedResume(work, command, prefix)
+            val worker = worker(
+                work,
+                retryDelay = { delays += it; now += it },
+                monotonicMillis = { now },
+            )
+            val execution = worker.execute(command, workerCallbacks(callbacks))
+
+            assertEquals("download_interrupted", execution.interruptedOutcome().reason)
+            assertEquals("download_failed", execution.interruptedOutcome().failureCode)
+            assertEquals("response did not provide a strong ETag", execution.interruptedOutcome().detail)
+            assertEquals(listOf(1_000L), delays)
+            assertEquals(2, server.requests.size)
+            assertTrue(server.requests.all { it.contains("Range: bytes=$split-") })
+            assertArrayEquals(prefix, File(work, "artifact.part").readBytes())
+            assertEquals(split.toLong(), worker.validatedResumeOffset(command))
+            assertTrue(callbacks.isEmpty())
+        }
+    }
+
+    @Test
     fun `retry backoff starts over after a retry received artifact bytes`() {
         val archive = zip("content.txt" to "backoff-reset").readBytes()
         val split = archive.size / 2

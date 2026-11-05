@@ -1,48 +1,12 @@
 """Retry only unsuccessful targets while preserving bytes, history, and fences."""
 import uuid
 import pytest
-from styly_mdm.push_job_manager import PushJobManager
-from styly_mdm.push_job_store import PushJobStore, StoreConflict, now_ms
+from styly_mdm.push_job_store import StoreConflict, now_ms
 from styly_mdm.push_jobs import ProtocolMode, canonicalize_create_request
+from push_test_helpers import completed, manager
 
 # Retry targets only online devices; these unit tests treat every target as online.
 ONLINE = {'success', 'failed', 'interrupted', 'unknown', 'cancelled', 'active'}
-
-
-@pytest.fixture
-def manager(tmp_path):
-    store = PushJobStore(tmp_path / 'jobs.sqlite3')
-    yield PushJobManager(store)
-    store.close()
-
-
-async def completed(manager, root):
-    states = {'success': ('succeeded', None), 'failed': ('failed', 'download_failed'),
-              'interrupted': ('interrupted', 'restart'), 'unknown': ('unconfirmed', 'timeout'),
-              'cancelled': ('failed', 'cancelled'), 'active': ('downloading', None)}
-    request = canonicalize_create_request({
-        'client_request_id': str(uuid.uuid4()), 'target_devices': list(states),
-        'mode': 'sync', 'dest_path': '/sdcard/STYLY/content',
-        'source': {'display_name': 'content', 'declared_file_count': 1, 'declared_total_bytes': 4},
-    })
-    _, job = await manager.store.create_job(request, {
-        device: (ProtocolMode.JOB_V1, ['push_job_id_v1']) for device in states}, 600_000)
-    job_id = job['job_id']
-    await manager.store.start_upload(job_id)
-    await manager.store.mark_packaging(job_id, 1, 4)
-    artifact_id = str(uuid.uuid4())
-    (root / (artifact_id + '.zip')).write_bytes(b'data')
-    await manager.store.publish_artifact(job_id, {
-        'artifact_id': artifact_id, 'storage_name': artifact_id + '.zip',
-        'display_filename': 'content.zip', 'byte_size': 4, 'sha256': 'a' * 64, 'entry_count': 1,
-    })
-    def settle(conn):
-        conn.execute("UPDATE push_jobs SET state='completed_with_errors', terminal_at=1 WHERE job_id=?", (job_id,))
-        for device, (state, code) in states.items():
-            conn.execute('UPDATE push_job_devices SET state=?, failure_code=? WHERE job_id=? AND device_id=?', (state, code, job_id, device))
-        conn.execute("INSERT INTO push_device_fences(device_id,blocking_job_id,blocking_attempt,protocol_mode,reason,created_at,updated_at) VALUES ('unknown',?,1,'job_v1','timeout',1,1)", (job_id,))
-    await manager.store._call(settle)
-    return await manager.get_snapshot(job_id)
 
 
 @pytest.mark.asyncio

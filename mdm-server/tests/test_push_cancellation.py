@@ -4,50 +4,11 @@ import uuid
 
 import pytest
 
-from styly_mdm.push_job_manager import PushJobManager
 from styly_mdm.push_job_store import PushJobStore, StoreConflict
 from styly_mdm.push_jobs import DeviceState
-from styly_mdm.push_runtime import PushRuntime
-from styly_mdm.push_scheduler import LiveSession
 from styly_mdm.transfer_registry import TransferKey, TransferRegistry
 from styly_mdm.push_transfer_leases import PushTransferLeases
-from test_push_review_connection import ready_job, downloading_job, Ws, Scheduler, LegacyEvents
-
-CAPS = frozenset({'push_job_id_v1', 'push_resume_v1'})
-
-
-@pytest.fixture
-def manager(tmp_path):
-    store = PushJobStore(tmp_path / 'push_jobs.sqlite3')
-    yield PushJobManager(store)
-    store.close()
-
-
-def runtime_for(manager):
-    runtime = object.__new__(PushRuntime)
-    runtime.store = manager.store
-    runtime.manager = manager
-    runtime.scheduler = Scheduler()
-    runtime.leases = PushTransferLeases()
-    runtime.transfers = TransferRegistry(runtime.leases.revoke_now)
-    runtime.send_timeout = 1
-    runtime.legacy = LegacyEvents()
-    runtime.pending_publications = {}
-    runtime.publication_revisions = {}
-    runtime.publication_wake = asyncio.Event()
-    runtime.publish = lambda snapshot: asyncio.sleep(0)
-    session = LiveSession('D1', 'session', Ws(), CAPS, str(uuid.uuid4()), asyncio.Lock(), 'http://server')
-    runtime.sessions = {'D1': session}
-    return runtime, session
-
-
-async def timed_out_job(manager):
-    active = await downloading_job(manager.store, manager)
-    await manager.resume_interrupted(
-        active['job_id'], 'D1', attempt=1, reason='download_interrupted',
-        artifact_id=active['artifact']['artifact_id'],
-        dispatch_revision=active['devices']['D1']['dispatch_revision'], validated_offset=1)
-    return await manager.get_snapshot(active['job_id'])
+from push_test_helpers import downloading_job, manager, ready_job, session_runtime_for, timed_out_job
 
 
 @pytest.mark.asyncio
@@ -123,7 +84,7 @@ async def test_cancel_rejects_work_not_awaiting_timeout_resume(manager, phase):
 async def test_offline_cancel_rejects_recovered_partial_on_reconnect(manager):
     original = await timed_out_job(manager)
     cancelled = await manager.cancel_interrupted(original['job_id'], 'D1')
-    runtime, session = runtime_for(manager)
+    runtime, session = session_runtime_for(manager)
     active_report = {
         'job_id': original['job_id'], 'attempt': 1, 'status': 'interrupted',
         'phase': 'downloading', 'reason': 'download_interrupted',
@@ -151,7 +112,7 @@ async def test_offline_cancel_preserves_fence_and_artifact_until_exact_cleanup(m
     next_job = await ready_job(manager.store, manager)
     await manager.store.enable_dispatch(next_job['job_id'])
     assert await manager.claim_next(['D1']) is None
-    runtime, session = runtime_for(manager)
+    runtime, session = session_runtime_for(manager)
     identity = {'job_id': active['job_id'], 'attempt': 1, 'artifact_id': active['artifact']['artifact_id'],
                 'revision': active['devices']['D1']['dispatch_revision']}
     await runtime._handle_reconcile_report(session, 'D1', {**identity, 'status': 'active', 'phase': 'downloading'})
@@ -178,7 +139,7 @@ async def test_client_restart_requires_explicit_resume_even_when_job_enabled(man
                                    reason='device_disconnect', deadline=9999999999999)
     if resume_first:
         await manager.store.enable_dispatch(active['job_id'])
-    outcome, current = await manager.resume_interrupted(active['job_id'], 'D1', attempt=1,
+    outcome, [current] = await manager.resume_interrupted(active['job_id'], 'D1', attempt=1,
         artifact_id=active['artifact']['artifact_id'], dispatch_revision=active['devices']['D1']['dispatch_revision'],
         validated_offset=1, reason='client_restarted')
     assert outcome == 'requeued'
@@ -193,7 +154,7 @@ async def test_client_restart_requires_explicit_resume_even_when_job_enabled(man
 @pytest.mark.parametrize("reason", ["storage_write_failed", "server_lease_revoked"])
 async def test_transfer_interruption_failures_wait_for_manual_resume(manager, reason):
     active = await downloading_job(manager.store, manager)
-    outcome, snapshot = await manager.resume_interrupted(
+    outcome, [snapshot] = await manager.resume_interrupted(
         active['job_id'], 'D1', attempt=1,
         artifact_id=active['artifact']['artifact_id'],
         dispatch_revision=active['devices']['D1']['dispatch_revision'],
@@ -224,7 +185,7 @@ async def test_cancelled_reconciling_assignment_ignores_late_phase_and_completio
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='device_disconnect', deadline=9999999999999)
     await manager.cancel_interrupted(active['job_id'], 'D1')
-    runtime, _session = runtime_for(manager)
+    runtime, _session = session_runtime_for(manager)
     identity = {'job_id': active['job_id'], 'attempt': 1,
                 'artifact_id': active['artifact']['artifact_id']}
     await runtime._handle_phase('D1', {**identity, 'phase': 'validating'})
@@ -255,7 +216,7 @@ async def test_cancelled_late_result_racing_timeout_is_settled_with_exact_fence(
     await manager.cancel_interrupted(job_id, 'D1')
     await manager.mark_unconfirmed(job_id, 'D1', 'process-a', 'timeout', observed_now=2)
 
-    runtime, session = runtime_for(manager)
+    runtime, session = session_runtime_for(manager)
     published = []
     original_publish = runtime.publish
 
@@ -301,7 +262,7 @@ async def test_cancelled_late_result_racing_timeout_is_settled_with_exact_fence(
 @pytest.mark.asyncio
 async def test_validation_phase_releases_slot_before_verified_completion(manager):
     active = await downloading_job(manager.store, manager)
-    runtime, _session = runtime_for(manager)
+    runtime, _session = session_runtime_for(manager)
     runtime.leases = PushTransferLeases()
     runtime.transfers = TransferRegistry(runtime.leases.revoke_now)
     key = TransferKey('push', 'D1', active['job_id'], 1)
@@ -323,7 +284,7 @@ async def test_exact_verified_completion_recovers_reconciling_state(manager):
     active = await downloading_job(manager.store, manager)
     await manager.mark_reconciling(active['job_id'], 'D1', expected={DeviceState.DOWNLOADING},
                                    reason='transfer_stalled', deadline=9999999999999)
-    runtime, _session = runtime_for(manager)
+    runtime, _session = session_runtime_for(manager)
     await runtime._handle_transfer_complete('D1', {
         'job_id': active['job_id'], 'attempt': 1,
         'artifact_id': active['artifact']['artifact_id'], 'received_size': 1,
@@ -338,7 +299,7 @@ async def test_success_after_cancelled_absence_was_missed_settles_exact_result(m
                                    reason='device_disconnect', deadline=1)
     await manager.cancel_interrupted(active['job_id'], 'D1')
     await manager.mark_unconfirmed(active['job_id'], 'D1', None, 'timeout', observed_now=2)
-    runtime, session = runtime_for(manager)
+    runtime, session = session_runtime_for(manager)
     await runtime._handle_result('D1', {
         'job_id': active['job_id'], 'attempt': 1, 'status': 'success',
         'added': 1, 'updated': 0, 'deleted': 0,

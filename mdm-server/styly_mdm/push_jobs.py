@@ -157,11 +157,11 @@ def dispatch_permission(queue_reason: str | None) -> DispatchPermission:
 def interrupted_queue_reason(
     current: str | None, reported: str | None, transfer_interrupted: bool,
 ) -> str:
-    if transfer_interrupted:
-        return "download_interrupted"
     permission = dispatch_permission(current)
     if permission is DispatchPermission.OPERATOR_AUTHORIZED:
         return "resumable_replay"
+    if transfer_interrupted:
+        return "download_interrupted"
     if permission is DispatchPermission.MANUAL_RESUME_REQUIRED:
         assert current is not None
         return current

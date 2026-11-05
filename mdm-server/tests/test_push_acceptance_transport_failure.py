@@ -1,63 +1,19 @@
 import asyncio
 import json
 import time
-import uuid
-from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
 
-from styly_mdm.push_job_manager import PushJobManager
-from styly_mdm.push_job_store import PushJobStore, now_ms
-from styly_mdm.push_jobs import DeviceState, ProgressEvent, ProtocolMode, canonicalize_create_request
+from styly_mdm.push_job_store import now_ms
+from styly_mdm.push_jobs import DeviceState, ProgressEvent
 from styly_mdm.push_runtime import PushRuntime
-from styly_mdm.push_scheduler import LiveSession, PushScheduler
+from styly_mdm.push_scheduler import LiveSession
 from styly_mdm.push_transfer_leases import PushTransferLeases, TRANSFER_IDLE_SECONDS
 from styly_mdm.transfer_registry import TransferKey, TransferRegistry
-from test_push_cancellation import runtime_for
-from test_push_review_connection import ready_job
-
-
-async def _publish(_snapshot):
-    pass
-
-
-@asynccontextmanager
-async def _ready(tmp_path):
-    store = PushJobStore(tmp_path / "jobs.sqlite3")
-    manager = PushJobManager(store)
-    capabilities = frozenset({"push_job_id_v1", "push_resume_v1"})
-    try:
-        _, job = await manager.store.create_job(canonicalize_create_request({
-            "client_request_id": str(uuid.uuid4()),
-            "target_devices": ["D1"], "mode": "push",
-            "dest_path": "/sdcard/STYLY/content",
-            "source": {"display_name": "content", "declared_file_count": 1,
-                       "declared_total_bytes": 1},
-        }), {"D1": (ProtocolMode.JOB_V1, capabilities)}, 60_000)
-        job_id = job["job_id"]
-        await store.start_upload(job_id)
-        await store.mark_packaging(job_id, 1, 1)
-        snapshot = await store.publish_artifact(job_id, {
-            "artifact_id": str(uuid.uuid4()), "storage_name": "content.zip",
-            "display_filename": "content.zip", "byte_size": 1,
-            "sha256": "a" * 64, "entry_count": 1,
-        })
-        await manager.store.enable_dispatch(job_id)
-        claimed = await manager.claim_next(["D1"])
-        assert claimed is not None
-        yield manager, capabilities, snapshot, claimed
-    finally:
-        store.close()
-
-
-def _scheduler(manager, registry, leases, sessions, slots):
-    return PushScheduler(
-        manager=manager, transfer_registry=registry, leases=leases,
-        transfer_slots=lambda: slots, sessions=lambda: sessions, publish=_publish,
-        send_timeout=1, accept_timeout=0.1, accept_reconciliation_timeout=60,
-        reconciliation_timeout=60,
-    )
+from push_test_helpers import (
+    claimed_job_context, dispatch_scheduler, ignore_publication, ready_job, session_runtime_for,
+)
 
 
 @pytest.mark.asyncio
@@ -67,7 +23,7 @@ def _scheduler(manager, registry, leases, sessions, slots):
 async def test_persistence_rejection_preserves_manual_wait_through_recovery(
     tmp_path, late, resumed, finish,
 ):
-    async with _ready(tmp_path) as (manager, _caps, snapshot, _claimed):
+    async with claimed_job_context(tmp_path) as (manager, _caps, snapshot, _claimed):
         job_id = snapshot["job_id"]
         dispatched = await manager.prepare_dispatch(job_id, "D1", accept_deadline=100)
         revision = dispatched["devices"]["D1"]["dispatch_revision"]
@@ -88,8 +44,8 @@ async def test_persistence_rejection_preserves_manual_wait_through_recovery(
             assert await manager.claim_next(["D1"]) is not None
             dispatched = await manager.prepare_dispatch(job_id, "D1", accept_deadline=100)
         before = await manager.assignment(job_id, "D1")
-        runtime, session = runtime_for(manager)
-        scheduler = _scheduler(manager, runtime.transfers, runtime.leases,
+        runtime, session = session_runtime_for(manager)
+        scheduler = dispatch_scheduler(manager, runtime.transfers, runtime.leases,
                                runtime.sessions, asyncio.Semaphore(1))
         scheduler.wake = lambda: None
         key = TransferKey("push", "D1", job_id, 1)
@@ -149,10 +105,10 @@ async def test_persistence_rejection_preserves_manual_wait_through_recovery(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["before_send", "normal", "late"])
 async def test_rejection_commit_failure_retries_the_same_decision(tmp_path, monkeypatch, stage):
-    async with _ready(tmp_path) as (manager, _caps, snapshot, claimed):
+    async with claimed_job_context(tmp_path) as (manager, _caps, snapshot, claimed):
         job_id = snapshot["job_id"]
-        runtime, session = runtime_for(manager)
-        scheduler = _scheduler(manager, runtime.transfers, runtime.leases,
+        runtime, session = session_runtime_for(manager)
+        scheduler = dispatch_scheduler(manager, runtime.transfers, runtime.leases,
                                runtime.sessions, asyncio.Semaphore(1))
         scheduler.wake = lambda: None
         runtime.scheduler = scheduler
@@ -209,9 +165,9 @@ async def test_rejection_commit_failure_retries_the_same_decision(tmp_path, monk
 
 @pytest.mark.asyncio
 async def test_rejection_storage_retry_can_be_cancelled(tmp_path, monkeypatch):
-    async with _ready(tmp_path) as (manager, _caps, snapshot, claimed):
-        runtime, session = runtime_for(manager)
-        scheduler = _scheduler(manager, runtime.transfers, runtime.leases,
+    async with claimed_job_context(tmp_path) as (manager, _caps, snapshot, claimed):
+        runtime, session = session_runtime_for(manager)
+        scheduler = dispatch_scheduler(manager, runtime.transfers, runtime.leases,
                                runtime.sessions, asyncio.Semaphore(1))
         scheduler.wake = lambda: None
         original_commit = manager.store._commit
@@ -244,9 +200,9 @@ async def test_rejection_storage_retry_can_be_cancelled(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["waiting_slot", "before_send"])
 async def test_dispatch_becoming_unavailable_returns_to_manual_wait(tmp_path, stage):
-    async with _ready(tmp_path) as (manager, _caps, snapshot, claimed):
-        runtime, session = runtime_for(manager)
-        scheduler = _scheduler(manager, runtime.transfers, runtime.leases,
+    async with claimed_job_context(tmp_path) as (manager, _caps, snapshot, claimed):
+        runtime, session = session_runtime_for(manager)
+        scheduler = dispatch_scheduler(manager, runtime.transfers, runtime.leases,
                                runtime.sessions, asyncio.Semaphore(1))
         scheduler.wake = lambda: None
         async def publish(_snapshot):
@@ -267,11 +223,11 @@ async def test_dispatch_becoming_unavailable_returns_to_manual_wait(tmp_path, st
 @pytest.mark.asyncio
 @pytest.mark.parametrize("late", [False, True])
 async def test_permanent_rejection_remains_terminal(tmp_path, late):
-    async with _ready(tmp_path) as (manager, _caps, snapshot, _claimed):
+    async with claimed_job_context(tmp_path) as (manager, _caps, snapshot, _claimed):
         job_id = snapshot["job_id"]
         dispatched = await manager.prepare_dispatch(job_id, "D1", accept_deadline=100)
-        runtime, session = runtime_for(manager)
-        scheduler = _scheduler(manager, runtime.transfers, runtime.leases,
+        runtime, session = session_runtime_for(manager)
+        scheduler = dispatch_scheduler(manager, runtime.transfers, runtime.leases,
                                runtime.sessions, asyncio.Semaphore(1))
         scheduler.wake = lambda: None
         payload = {"reason": "artifact_identity_mismatch", "detail": "Conflicting artifact"}
@@ -304,7 +260,7 @@ async def test_permanent_rejection_remains_terminal(tmp_path, late):
 async def test_lost_acceptance_preserves_http_until_progress_stalls(
     tmp_path, monkeypatch, disconnect_first, resumed, finish
 ):
-    async with _ready(tmp_path) as (manager, capabilities, snapshot, claimed):
+    async with claimed_job_context(tmp_path) as (manager, capabilities, snapshot, claimed):
         if resumed:
             prior = await manager.prepare_dispatch(
                 snapshot["job_id"], "D1",
@@ -346,7 +302,7 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
         leases = PushTransferLeases()
         registry = TransferRegistry(leases.revoke_now)
         slots = asyncio.Semaphore(1)
-        scheduler = _scheduler(manager, registry, leases, sessions, slots)
+        scheduler = dispatch_scheduler(manager, registry, leases, sessions, slots)
         wait_for_transfer = scheduler._wait_for_transfer_or_stall
 
         async def watched_wait(lease, future):
@@ -387,7 +343,7 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
                 runtime.legacy = SimpleNamespace(devices={"D1": {"ws": ws}})
                 runtime.accept_reconciliation_timeout = 60
                 runtime.reconciliation_timeout = 60
-                runtime.publish = _publish
+                runtime.publish = ignore_publication
                 await runtime.disconnect_device("D1", ws)
                 if disconnect_first == "late_active_report":
                     original_mark = manager.mark_acceptance_reconciling
@@ -447,7 +403,7 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
                 runtime.manager = manager
                 runtime.store = manager.store
                 runtime.transfers = registry
-                runtime.publish = _publish
+                runtime.publish = ignore_publication
                 payload = {
                     "job_id": snapshot["job_id"], "attempt": 1,
                     "artifact_id": artifact_id, "phase": "validating",
@@ -488,7 +444,7 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
     "validating", "applying",
 ])
 async def test_disconnect_timeout_cannot_keep_obsolete_transfer(tmp_path, changed):
-    async with _ready(tmp_path) as (manager, capabilities, snapshot, _claimed):
+    async with claimed_job_context(tmp_path) as (manager, capabilities, snapshot, _claimed):
         job_id = snapshot["job_id"]
         deadline = 1234
         snapshot = await manager.prepare_dispatch(
@@ -505,7 +461,7 @@ async def test_disconnect_timeout_cannot_keep_obsolete_transfer(tmp_path, change
         transfer = asyncio.get_running_loop().create_future()
         registry.register(key, transfer)
         lease = leases.issue(key, snapshot["artifact"]["artifact_id"])
-        scheduler = _scheduler(manager, registry, leases, {}, asyncio.Semaphore(1))
+        scheduler = dispatch_scheduler(manager, registry, leases, {}, asyncio.Semaphore(1))
         original_mark = manager.mark_acceptance_reconciling
 
         async def change_then_mark(*args, **kwargs):

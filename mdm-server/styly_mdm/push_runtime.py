@@ -2,7 +2,7 @@
 
 The repository's established server remains the adapter for unrelated commands.
 This module confines Push/Sync interception to explicit protocol messages while
-preserving the existing routes and old-client fallback during migration.
+leaving unrelated device commands on the established server path.
 """
 
 from __future__ import annotations
@@ -81,12 +81,24 @@ def _uuid_v4_or_none(value: Any) -> str | None:
     return str(parsed) if parsed.version == 4 else None
 
 
+def _operator_action_context(payload: dict[str, Any]) -> dict[str, Any]:
+    """Correlate both expected and unexpected Resume/Cancel responses."""
+    message_type = payload.get("type")
+    if message_type not in ("CANCEL_PUSH_JOB", "PUSH_FILES"):
+        return {}
+    context = {"action": message_type, "job_id": payload.get("job_id")}
+    if isinstance(payload.get("request_id"), str):
+        context["request_id"] = payload["request_id"]
+    if "target_devices" in payload:
+        context["target_devices"] = payload["target_devices"]
+    return context
+
+
 class _LegacyTransferAdapter(MutableMapping[tuple[str, str], asyncio.Future[str]]):
     """Compatibility facade backed by the typed transfer registry.
 
-    Existing install and migration-only legacy Push code still uses tuple syntax.
-    The actual registry key is typed, and a legacy Push receives an opaque identity
-    that cannot collide with any canonical ``(job_id, device_id, attempt)`` waiter.
+    The established install path uses tuple syntax. Job-v1 Push accesses the typed
+    registry directly, so its waiter ownership is independent of this facade.
     """
 
     def __init__(self, registry: TransferRegistry) -> None:
@@ -234,9 +246,15 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
                     # A failed operator action (for example a SQLite error) must not
                     # close the whole admin connection.
                     log.exception("Push admin action %s failed", payload.get("type"))
+                    context = _operator_action_context(payload)
                     await self._push_runtime.admin_send(self, {
                         "type": "ERROR",
-                        "message": f"{payload.get('type')} failed on the server",
+                        "message": (
+                            f"{payload.get('type')} could not be confirmed; changes may "
+                            "already be recorded. Refresh job state before retrying."
+                            if context else f"{payload.get('type')} failed on the server"
+                        ),
+                        **context,
                     })
                     continue
                 if handled:
@@ -1683,7 +1701,7 @@ class PushRuntime:
             key = TransferKey("push", device_id, job_id, 1)
             previous_transfer = self.transfers.get(key)
             try:
-                outcome, snapshot = await self.manager.resume_interrupted(
+                outcome, snapshots = await self.manager.resume_interrupted(
                     job_id,
                     device_id,
                     attempt=1,
@@ -1696,6 +1714,7 @@ class PushRuntime:
                         offset if isinstance(offset, int) and not isinstance(offset, bool) else -1
                     ),
                     reason=payload.get("reason"),
+                    artifact_root=self.artifacts.artifact_root,
                 )
             except (StoreConflict, StoreNotFound):
                 return []
@@ -1704,7 +1723,7 @@ class PushRuntime:
             if outcome == "requeued":
                 if previous_transfer is not None and self.transfers.get(key) is previous_transfer:
                     self.transfers.release_exact(key, "resumable_replay")
-                return [snapshot]
+                return snapshots
         await self._send_resume_rejected(
             session,
             job_id=job_id,
@@ -1843,6 +1862,7 @@ class PushRuntime:
         self, ws: RuntimeWebSocketResponse, payload: dict[str, Any]
     ) -> bool:
         message_type = payload.get("type")
+        action_context = _operator_action_context(payload)
 
         if (
             "target_connections" in payload
@@ -1851,6 +1871,7 @@ class PushRuntime:
             await ws.send_str(json.dumps({
                 "type": "ERROR",
                 "message": "target_connections is only supported for power control",
+                **action_context,
             }))
             return True
         if message_type in {"CANCEL_PUSH_JOB", "RETRY_FAILED_PUSH_JOB"}:
@@ -1888,7 +1909,30 @@ class PushRuntime:
                     await self.publish(await self.store.get_snapshot(job_id))
                     await self.publish(snapshot)
                 else:
-                    snapshot = await self._cancel_push_job(ws, job_id, payload)
+                    result = await self._cancel_push_job(job_id, payload)
+                    accepted = result["accepted_devices"]
+                    rejected = result["rejected_devices"]
+                    response = {
+                        "type": "PUSH_JOB_ACTION_SENT" if accepted else "ERROR",
+                        **action_context,
+                        "status": (
+                            "partial" if accepted and rejected else
+                            "accepted" if accepted else "rejected"
+                        ),
+                        **result,
+                    }
+                    if not accepted:
+                        response["message"] = "Cancel rejected: " + "; ".join(
+                            f"{device_id}: {reason}" for device_id, reason in rejected.items()
+                        )
+                    if accepted and self.scheduler is not None:
+                        self.scheduler.wake()
+                    try:
+                        await self.admin_send(ws, response)
+                    except Exception:
+                        log.warning("Could not acknowledge Push cancellation to admin", exc_info=True)
+                        await self._close_failed_admin_socket(ws, b"admin send failed")
+                    return True
                 if self.scheduler is not None:
                     self.scheduler.wake()
                 await self.admin_send(ws, {
@@ -1896,15 +1940,18 @@ class PushRuntime:
                     "action": message_type,
                 })
             except (StoreConflict, StoreNotFound, ValueError) as exc:
-                await self.admin_send(ws, {"type": "ERROR", "message": str(exc)})
+                error = {"type": "ERROR", "message": str(exc), **action_context}
+                if message_type == "CANCEL_PUSH_JOB":
+                    error["status"] = "rejected"
+                await self.admin_send(ws, error)
             return True
         if message_type == "PUSH_FILES" and isinstance(payload.get("job_id"), str):
             job_id = payload["job_id"]
             try:
                 targets = self._job_action_targets(payload)
                 current = await self.store.get_snapshot(job_id)
+                requested = targets if targets is not None else list(current["devices"])
                 if current["state"] in {JobState.RUNNING.value, JobState.RECONCILING.value}:
-                    requested = targets if targets is not None else list(current["devices"])
                     if not set(requested) <= current["devices"].keys():
                         raise StoreConflict("Resume targets must belong to this job")
                     targets = [
@@ -1926,7 +1973,9 @@ class PushRuntime:
                         snapshot, changed = offline_snapshot, True
             except (StoreConflict, StoreNotFound) as exc:
                 try:
-                    await self.admin_send(ws, {"type": "ERROR", "message": str(exc)})
+                    await self.admin_send(ws, {
+                        "type": "ERROR", "message": str(exc), **action_context,
+                    })
                 except Exception:
                     log.warning("Could not send Push dispatch error to admin", exc_info=True)
                     await self._close_failed_admin_socket(ws, b"admin send failed")
@@ -1951,7 +2000,8 @@ class PushRuntime:
                     await self.publish(snapshot)
                 await self.admin_send(ws, {
                     "type": "PUSH_FILES_SENT",
-                    "job_id": job_id,
+                    **action_context,
+                    "target_devices": requested,
                     "revision": snapshot["revision"],
                     "state": snapshot["state"],
                     "dispatch_enabled": snapshot["dispatch_enabled"],
@@ -1995,12 +2045,12 @@ class PushRuntime:
         return False
 
     async def _cancel_push_job(
-        self, ws: Any, job_id: str, payload: dict[str, Any]
+        self, job_id: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
-        """Cancel each requested target and return the latest job snapshot.
+        """Return the accepted targets and per-target cancellation rejections.
 
         A per-target conflict does not stop the remaining targets; conflicts are
-        reported to the admin together after every target was processed.
+        returned with the accepted targets for a single correlated acknowledgement.
         """
         snapshot = await self.store.get_snapshot(job_id)
         targets = self._job_action_targets(payload)
@@ -2008,19 +2058,23 @@ class PushRuntime:
             targets = list(snapshot["devices"])
         elif not set(targets) <= snapshot["devices"].keys():
             raise StoreConflict("Cancel targets must belong to this job")
-        errors = []
+        accepted = []
+        rejected = {}
         for device_id in targets:
             async with self._device_lock(device_id):
                 try:
                     snapshot = await self._cancel_push_target(job_id, device_id)
                 except StoreConflict as exc:
                     # Nothing changed for this target, so there is nothing to publish.
-                    errors.append(str(exc))
+                    rejected[device_id] = str(exc)
                     continue
+            accepted.append(device_id)
             await self.publish(snapshot)
-        if errors:
-            await self.admin_send(ws, {"type": "ERROR", "message": "; ".join(errors)})
-        return snapshot
+        return {
+            "target_devices": targets,
+            "accepted_devices": accepted,
+            "rejected_devices": rejected,
+        }
 
     async def _cancel_push_target(self, job_id: str, device_id: str) -> dict[str, Any]:
         """Persist one cancellation, stop its transfer, and ask the owner to confirm.
@@ -2246,9 +2300,9 @@ class PushRuntime:
                     job_id = row["job_id"]
                     device_id = row["device_id"]
                     attempt = row["attempt"]
-                    active_lease_progress = self.leases.last_progress(
-                        TransferKey("push", device_id, job_id, attempt)
-                    )
+                    key = TransferKey("push", device_id, job_id, attempt)
+                    previous_transfer = self.transfers.get(key)
+                    active_lease_progress = self.leases.last_progress(key)
                     if active_lease_progress is not None:
                         # The transfer watchdog owns revocation and the slot
                         # while its HTTP lease is active. It refreshes this
@@ -2277,10 +2331,8 @@ class PushRuntime:
                     continue
                 try:
                     try:
-                        self.transfers.release_exact(
-                            TransferKey("push", device_id, job_id, attempt),
-                            "reconciliation_timeout",
-                        )
+                        if previous_transfer is not None and self.transfers.get(key) is previous_transfer:
+                            self.transfers.release_exact(key, "reconciliation_timeout")
                         for snapshot in snapshots:
                             await self.publish(snapshot)
                     finally:
@@ -2332,11 +2384,6 @@ def _release_transfer_slot(
     released = False
     for key in tuple(mapping):
         if key[0] != device_id:
-            continue
-        if reason == "disconnect" and key[1] == "push":
-            # The Android Push worker and its HTTP transfer outlive the WebSocket.
-            # Keep the exact lease until transfer completion, terminal evidence, or
-            # the bounded transfer timeout releases it.
             continue
         future = mapping.get(key)
         if future is not None and not future.done():

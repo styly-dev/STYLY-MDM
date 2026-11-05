@@ -11,7 +11,7 @@ from styly_mdm.push_jobs import ProtocolMode
 from styly_mdm.push_scheduler import LiveSession, PushScheduler
 from styly_mdm.push_transfer_leases import PushTransferLeases
 from styly_mdm.transfer_registry import TransferKey, TransferRegistry
-from test_push_review_connection import downloading_job
+from push_test_helpers import downloading_job
 
 
 def test_job_v1_command_uses_absolute_artifact_url():

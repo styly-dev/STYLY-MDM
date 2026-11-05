@@ -77,7 +77,7 @@ def reset_state():
 
 
 def prepare_job_v1_dispatch(manager, capabilities, snapshot, assignment, slots):
-    from test_push_acceptance_transport_failure import _scheduler
+    from push_test_helpers import dispatch_scheduler
     from styly_mdm.push_runtime import _LegacyTransferAdapter
     from styly_mdm.push_scheduler import LiveSession
     from styly_mdm.push_transfer_leases import PushTransferLeases
@@ -89,7 +89,7 @@ def prepare_job_v1_dispatch(manager, capabilities, snapshot, assignment, slots):
     # registry as Push-v1 so the tests exercise the production shared-release boundary.
     server.pending_transfers = _LegacyTransferAdapter(registry)
     sessions = {}
-    scheduler = _scheduler(manager, registry, leases, sessions, slots)
+    scheduler = dispatch_scheduler(manager, registry, leases, sessions, slots)
     sent = asyncio.Event()
     waiting_for_transfer = asyncio.Event()
 
@@ -133,9 +133,9 @@ def prepare_job_v1_dispatch(manager, capabilities, snapshot, assignment, slots):
 
 @pytest.mark.asyncio
 async def test_job_v1_push_waits_for_install_to_release_shared_budget(tmp_path):
-    from test_push_acceptance_transport_failure import _ready
+    from push_test_helpers import claimed_job_context
 
-    async with _ready(tmp_path) as (manager, capabilities, snapshot, assignment):
+    async with claimed_job_context(tmp_path) as (manager, capabilities, snapshot, assignment):
         server.MAX_CONCURRENT_TRANSFERS = 1
         slots = server.transfer_slots()
         start_dispatch, push_sent, waiting, registry, _leases, key = (
@@ -174,9 +174,9 @@ async def test_job_v1_push_waits_for_install_to_release_shared_budget(tmp_path):
 
 @pytest.mark.asyncio
 async def test_install_completion_does_not_release_job_v1_push_transfer(tmp_path):
-    from test_push_acceptance_transport_failure import _ready
+    from push_test_helpers import claimed_job_context
 
-    async with _ready(tmp_path) as (manager, capabilities, snapshot, assignment):
+    async with claimed_job_context(tmp_path) as (manager, capabilities, snapshot, assignment):
         server.MAX_CONCURRENT_TRANSFERS = 2
         slots = server.transfer_slots()
         start_dispatch, push_sent, waiting, registry, _leases, key = (

@@ -173,6 +173,26 @@ function snapshot(jobId, revision, deviceId, state, enqueueSeq, options = {}) {
   };
 }
 
+function operatorRequestFields(request) {
+  const { request_id, ...fields } = request;
+  assert.match(request_id, /^[0-9a-f-]{36}$/, 'every targeted action has a request ID');
+  return fields;
+}
+
+function operatorAck(request, fields = {}) {
+  return {
+    ...request,
+    action: request.type,
+    ...(request.type === 'CANCEL_PUSH_JOB' ? {
+      type: 'PUSH_JOB_ACTION_SENT', status: 'accepted',
+      accepted_devices: request.target_devices, rejected_devices: {},
+    } : {
+      type: 'PUSH_FILES_SENT', resume: true, target_count: request.target_devices.length,
+    }),
+    ...fields,
+  };
+}
+
 function loadAdapter(options = {}) {
   const logContainer = new FakeElement('div');
   const logEmpty = new FakeElement('div');
@@ -954,7 +974,7 @@ test('inline action pending state survives a canonical cell redraw and clears on
   assert.match(h.html(), /disabled>Resuming…<\/button>/,
     'a later canonical redraw keeps the action pending');
 
-  h.socket.emit({ type: 'PUSH_FILES_SENT', job_id: job.job_id, resume: true, target_count: 1 });
+  h.socket.emit(operatorAck(h.socket.sent.at(-1)));
   assert.match(h.html(), /data-action="resume"/);
   assert.doesNotMatch(h.html(), /Resuming…/);
 });
@@ -974,7 +994,7 @@ test('a replaced socket closing settles only actions sent on that socket', () =>
   assert.ok(findElementByText(h.pushJobsTabActions, 'Resume all'));
   assert.ok(findElementByText(h.pushJobsTabActions, 'Cancelling…'),
     'the new socket action stays pending after the old socket closes');
-  assert.deepEqual(replacementSocket.sent, [{
+  assert.deepEqual(replacementSocket.sent.map(operatorRequestFields), [{
     type: 'CANCEL_PUSH_JOB', job_id: job.job_id, target_devices: ['D1'],
   }]);
 });
@@ -1142,7 +1162,7 @@ test('restart-paused jobs expose the existing operator resume command', () => {
   assert.ok(resume);
   resume.click();
 
-  assert.deepEqual(socket.sent, [{ type: 'PUSH_FILES', job_id: 'paused-job', target_devices: ['D1'] }]);
+  assert.deepEqual(socket.sent.map(operatorRequestFields), [{ type: 'PUSH_FILES', job_id: 'paused-job', target_devices: ['D1'] }]);
   assert.equal(resume.isConnected, false);
   const pendingResume = findElementByText(harness.pushJobsTabActions, 'Resuming…');
   assert.ok(pendingResume);
@@ -1200,7 +1220,7 @@ test('dispatch attention includes durable ready jobs without a pause reason', ()
   const resume = findElementByText(harness.pushJobsTabActions, 'Resume all');
   assert.ok(resume);
   resume.click();
-  assert.deepEqual(socket.sent, [{ type: 'PUSH_FILES', job_id: 'ready-job', target_devices: ['D1'] }]);
+  assert.deepEqual(socket.sent.map(operatorRequestFields), [{ type: 'PUSH_FILES', job_id: 'ready-job', target_devices: ['D1'] }]);
   assert.equal(resume.isConnected, false);
   assert.ok(findElementByText(harness.pushJobsTabActions, 'Resuming…'));
 });
@@ -1406,7 +1426,7 @@ test('per-device Resume remains available while other devices may dispatch', () 
   assert.equal(h.bridgeState.get('D1').status, 'resume_required');
   assert.equal(h.pushJobsAttention.style.display, '');
   findElementByText(h.pushJobsTabActions, 'Resume all').click();
-  assert.deepEqual(socket.sent, [{ type: 'PUSH_FILES', job_id: 'partial-job', target_devices: ['D1'] }]);
+  assert.deepEqual(socket.sent.map(operatorRequestFields), [{ type: 'PUSH_FILES', job_id: 'partial-job', target_devices: ['D1'] }]);
 });
 
 test('job controls keep actions out of logs and remove Retry after cancellation', () => {
@@ -1476,22 +1496,22 @@ test('inline actions send only the selected device while Resume all targets elig
   socket.snapshot(job);
   const api = window.__stylyPushJobsV1Actions;
   assert.equal(api.sendDeviceAction('D1', job.job_id, 'resume'), true);
-  assert.deepEqual(socket.sent.at(-1), {
+  assert.deepEqual(operatorRequestFields(socket.sent.at(-1)), {
     type: 'PUSH_FILES', job_id: job.job_id, target_devices: ['D1'],
   });
-  socket.emit({ type: 'PUSH_FILES_SENT', job_id: job.job_id, resume: true, target_count: 1 });
+  socket.emit(operatorAck(socket.sent.at(-1)));
   assert.equal(api.sendDeviceAction('D2', job.job_id, 'cancel'), true);
-  assert.deepEqual(socket.sent.at(-1), {
+  assert.deepEqual(operatorRequestFields(socket.sent.at(-1)), {
     type: 'CANCEL_PUSH_JOB', job_id: job.job_id, target_devices: ['D2'],
   });
-  socket.emit({ type: 'PUSH_JOB_ACTION_SENT', job_id: job.job_id, action: 'CANCEL_PUSH_JOB' });
+  socket.emit(operatorAck(socket.sent.at(-1)));
   assert.equal(api.sendDeviceAction('D2', 'stale-job', 'cancel'), false);
   const all = findElementByText(harness.pushJobsTabActions, 'Resume all');
   assert.equal(all.textContent, 'Resume all');
   all.click();
-  assert.deepEqual(socket.sent.at(-1), { type: 'PUSH_FILES', job_id: job.job_id, target_devices: ['D1', 'D2'] });
+  assert.deepEqual(operatorRequestFields(socket.sent.at(-1)), { type: 'PUSH_FILES', job_id: job.job_id, target_devices: ['D1', 'D2'] });
   findElementByText(harness.pushJobsTabActions, 'Cancel all').click();
-  assert.deepEqual(socket.sent.at(-1), {
+  assert.deepEqual(operatorRequestFields(socket.sent.at(-1)), {
     type: 'CANCEL_PUSH_JOB', job_id: job.job_id, target_devices: ['D1', 'D2'],
   });
 });
@@ -1516,12 +1536,12 @@ test('never-dispatched paused device follows server Cancel permission without re
   assert.equal(api.assignmentFor('D1').canResume, false);
   assert.equal(api.assignmentFor('D1').canCancel, true);
   assert.equal(api.sendDeviceAction('D1', job.job_id, 'cancel'), true);
-  assert.deepEqual(socket.sent.at(-1), {
+  assert.deepEqual(operatorRequestFields(socket.sent.at(-1)), {
     type: 'CANCEL_PUSH_JOB', job_id: job.job_id, target_devices: ['D1'],
   });
-  socket.emit({ type: 'PUSH_JOB_ACTION_SENT', job_id: job.job_id, action: 'CANCEL_PUSH_JOB' });
+  socket.emit(operatorAck(socket.sent.at(-1)));
   findElementByText(h.pushJobsTabActions, 'Cancel all').click();
-  assert.deepEqual(socket.sent.at(-1), {
+  assert.deepEqual(operatorRequestFields(socket.sent.at(-1)), {
     type: 'CANCEL_PUSH_JOB', job_id: job.job_id, target_devices: ['D1'],
   });
 });
@@ -1731,7 +1751,7 @@ test('offline timeout keeps attention and Cancel but excludes Resume and refresh
   assert.equal(api.sendDeviceAction('D1', job.job_id, 'resume'), false);
   findElementByText(h.pushJobsTabActions, 'Resume all').click();
   assert.deepEqual(socket.sent.at(-1).target_devices, ['D2']);
-  socket.emit({ type: 'PUSH_FILES_SENT', job_id: job.job_id, resume: true, target_count: 1 });
+  socket.emit(operatorAck(socket.sent.at(-1)));
   online.clear();
   api.refreshConnectivity();
   assert.equal(findElementByText(h.pushJobsTabActions, 'Resume all').disabled, true);
@@ -1893,7 +1913,7 @@ test('attention selection limits Resume to selected eligible devices across jobs
   h.selectAttention('D1', 'D3');
   assert.equal(findElementByText(h.pushJobsTabActions, 'Resume all'), undefined);
   findElementByText(h.pushJobsTabActions, 'Resume selection').click();
-  assert.deepEqual(h.socket.sent, [
+  assert.deepEqual(h.socket.sent.map(operatorRequestFields), [
     { type: 'PUSH_FILES', job_id: first.job_id, target_devices: ['D1'] },
     { type: 'PUSH_FILES', job_id: second.job_id, target_devices: ['D3'] },
   ]);
@@ -1919,7 +1939,7 @@ test('offline selection disables Resume but Cancel confirms and targets only the
   assert.match(prompts[0], /1 selected eligible device\(s\) across 1 job\(s\)/);
   approved = true;
   cancel.click();
-  assert.deepEqual(h.socket.sent, [{ type: 'CANCEL_PUSH_JOB', job_id: job.job_id, target_devices: ['D2'] }]);
+  assert.deepEqual(h.socket.sent.map(operatorRequestFields), [{ type: 'CANCEL_PUSH_JOB', job_id: job.job_id, target_devices: ['D2'] }]);
 });
 
 test('ineligible selection never falls back to all, including after replacement snapshots', () => {
@@ -1947,7 +1967,7 @@ test('a resumed selection stays scoped when its row leaves attention and another
   h.socket.snapshot(job);
   h.selectAttention('D1');
   findElementByText(h.pushJobsTabActions, 'Resume selection').click();
-  h.socket.emit({ type: 'PUSH_FILES_SENT', job_id: job.job_id, resume: true, target_count: 1 });
+  h.socket.emit(operatorAck(h.socket.sent.at(-1)));
   h.socket.update({ ...job, revision: 2, devices: {
     ...job.devices, D1: { ...job.devices.D1, state: 'downloading', resume_required: false },
   } });
@@ -2184,6 +2204,7 @@ test('job action acknowledgements become readable log lines', () => {
     type: 'PUSH_JOB_ACTION_SENT',
     job_id: 'aaaaaaaa-1111-4111-8111-111111111111',
     action: 'CANCEL_PUSH_JOB',
+    status: 'accepted', accepted_devices: ['D1'], rejected_devices: {},
   });
   const retry = socket.emit({
     type: 'PUSH_JOB_ACTION_SENT',
@@ -2197,4 +2218,146 @@ test('job action acknowledgements become readable log lines', () => {
   const lines = harness.logContainer.children.map((entry) => entry.children[1].textContent);
   assert.match(lines[0], /^Cancel recorded for job #aaaaaaaa/);
   assert.equal(lines[1], 'Created retry job #bbbbbbbb for unsuccessful devices');
+});
+
+for (const action of ['resume', 'cancel']) {
+  test(action + ' never guesses a pending request from a same-job acknowledgement or count', () => {
+    const { socket } = openConsole();
+    const job = snapshot('unscoped-action', 1, 'D1', 'queued', 1, {
+      resumeRequired: true, cancellable: true,
+    });
+    socket.snapshot(job);
+    const api = window.__stylyPushJobsV1Actions;
+    assert.equal(api.sendDeviceAction('D1', job.job_id, action), true);
+    const response = operatorAck(socket.sent[0]);
+    delete response.request_id;
+    delete response.target_devices;
+    socket.emit(response);
+    assert.equal(api.actionPending(action, job.job_id, 'D1'), true);
+  });
+
+  test(action + ' correlates simultaneous same-job actions only by request ID', () => {
+    const { socket } = openConsole();
+    const job = snapshot('concurrent-actions', 1, 'D1', 'queued', 1, {
+      resumeRequired: true, cancellable: true,
+    });
+    job.devices.D2 = { ...job.devices.D1, enqueue_seq: 2 };
+    socket.snapshot(job);
+    const api = window.__stylyPushJobsV1Actions;
+    for (const device of ['D1', 'D2']) {
+      assert.equal(api.sendDeviceAction(device, job.job_id, action), true);
+    }
+    const [first, second] = socket.sent;
+    assert.notEqual(first.request_id, second.request_id);
+    socket.emit(operatorAck(first));
+    assert.equal(api.actionPending(action, job.job_id, 'D1'), false);
+    assert.equal(api.actionPending(action, job.job_id, 'D2'), true);
+
+    // Even an exact target set cannot identify which request produced a reply.
+    const noId = operatorAck(second);
+    delete noId.request_id;
+    socket.emit(noId);
+    socket.emit({ ...noId, type: 'ERROR', message: 'Uncorrelated failure' });
+    assert.equal(api.actionPending(action, job.job_id, 'D2'), true);
+    socket.emit(operatorAck(second));
+    assert.equal(api.actionPending(action, job.job_id, 'D2'), false);
+  });
+
+  test(action + ' ignores delayed old responses after a new request for the same target', () => {
+    const { socket } = openConsole();
+    const job = snapshot('repeated-action', 1, 'D1', 'queued', 1, {
+      resumeRequired: true, cancellable: true,
+    });
+    socket.snapshot(job);
+    const api = window.__stylyPushJobsV1Actions;
+    assert.equal(api.sendDeviceAction('D1', job.job_id, action), true);
+    const first = socket.sent[0];
+    const failure = {
+      ...operatorAck(first), type: 'ERROR', status: 'rejected',
+      accepted_devices: [], rejected_devices: { D1: 'State changed' }, message: 'State changed',
+    };
+    socket.emit(failure);
+    assert.equal(api.actionPending(action, job.job_id, 'D1'), false);
+    assert.equal(api.sendDeviceAction('D1', job.job_id, action), true);
+    const second = socket.sent[1];
+    assert.notEqual(first.request_id, second.request_id);
+
+    socket.emit(operatorAck(first));
+    socket.emit(failure);
+    socket.emit({ ...operatorAck(second), job_id: 'different-job' });
+    socket.emit({ ...operatorAck(second), action: 'different-action' });
+    socket.emit({ ...failure, request_id: second.request_id,
+      action: action === 'cancel' ? 'PUSH_FILES' : 'CANCEL_PUSH_JOB' });
+    assert.equal(api.actionPending(action, job.job_id, 'D1'), true);
+    socket.emit({ ...failure, request_id: second.request_id });
+    assert.equal(api.actionPending(action, job.job_id, 'D1'), false);
+  });
+
+  test(action + ' ignores acknowledgements and errors from a replaced socket', () => {
+    const { socket: oldSocket, ...h } = openConsole();
+    const job = snapshot('stale-socket-action', 1, 'D1', 'queued', 1, {
+      resumeRequired: true, cancellable: true,
+    });
+    oldSocket.snapshot(job);
+    const api = window.__stylyPushJobsV1Actions;
+    assert.equal(api.sendDeviceAction('D1', job.job_id, action), true);
+    const oldRequest = oldSocket.sent[0];
+    oldSocket.close();
+    const current = new window.WebSocket('ws://localhost/ws/admin');
+    current.snapshot(job);
+    assert.equal(api.sendDeviceAction('D1', job.job_id, action), true);
+    const request = current.sent[0];
+    const logCount = h.logContainer.children.length;
+    const oldAck = oldSocket.emit(operatorAck(request));
+    const oldError = oldSocket.emit({ ...operatorAck(request), type: 'ERROR', message: 'Old socket' });
+    assert.equal(oldAck.stopped, true);
+    assert.equal(oldError.stopped, true);
+    assert.equal(h.logContainer.children.length, logCount);
+    assert.equal(api.actionPending(action, job.job_id, 'D1'), true);
+    current.emit(operatorAck(oldRequest));
+    assert.equal(api.actionPending(action, job.job_id, 'D1'), true);
+    current.emit(operatorAck(request));
+    assert.equal(api.actionPending(action, job.job_id, 'D1'), false);
+  });
+}
+
+test('partial Cancel clears its complete requested scope and names accepted and rejected targets once', () => {
+  const { socket, ...h } = openConsole();
+  const job = snapshot('partial-cancel', 1, 'D1', 'queued', 1, {
+    resumeRequired: true, cancellable: true,
+  });
+  job.devices.D2 = { ...job.devices.D1, enqueue_seq: 2 };
+  socket.snapshot(job);
+  findElementByText(h.pushJobsTabActions, 'Cancel all').click();
+  const api = window.__stylyPushJobsV1Actions;
+  const response = socket.emit(operatorAck(socket.sent[0], {
+    status: 'partial', accepted_devices: ['D1'], rejected_devices: { D2: 'Already resumed' },
+  }));
+  assert.equal(response.stopped, true, 'the legacy handler must not log a second acknowledgement');
+  assert.equal(api.actionPending('cancel', job.job_id, 'D1'), false);
+  assert.equal(api.actionPending('cancel', job.job_id, 'D2'), false);
+  const lines = h.logContainer.children.map(entry => entry.children[1].textContent);
+  assert.equal(lines.filter(line => line.startsWith('Cancel partially recorded')).length, 1);
+  assert.ok(lines.some(line => /Cancel partially recorded.*D1.*rejected: D2 \(Already resumed\)/.test(line)));
+  assert.equal(lines.some(line => line.startsWith('Cancel recorded')), false);
+});
+
+test('all-rejected Cancel clears only its request and never logs cancellation recorded', () => {
+  const { socket, ...h } = openConsole();
+  const job = snapshot('rejected-cancel', 1, 'D1', 'queued', 1, { cancellable: true });
+  job.devices.D2 = { ...job.devices.D1, enqueue_seq: 2 };
+  socket.snapshot(job);
+  const api = window.__stylyPushJobsV1Actions;
+  assert.equal(api.sendDeviceAction('D1', job.job_id, 'cancel'), true);
+  assert.equal(api.sendDeviceAction('D2', job.job_id, 'cancel'), true);
+  const response = socket.emit(operatorAck(socket.sent[0], {
+    type: 'ERROR', status: 'rejected', accepted_devices: [],
+    rejected_devices: { D1: 'Already resumed' }, message: 'Cancel rejected: D1: Already resumed',
+  }));
+  assert.equal(response.stopped, true);
+  assert.equal(api.actionPending('cancel', job.job_id, 'D1'), false);
+  assert.equal(api.actionPending('cancel', job.job_id, 'D2'), true);
+  const lines = h.logContainer.children.map(entry => entry.children[1].textContent);
+  assert.ok(lines.some(line => /Cancel failed.*D1: Already resumed/.test(line)));
+  assert.equal(lines.some(line => /Cancel (?:partially )?recorded/.test(line)), false);
 });

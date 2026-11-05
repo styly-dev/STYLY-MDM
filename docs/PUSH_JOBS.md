@@ -117,6 +117,11 @@ If saving the result fails, cleanup waits for durable recovery.
 Live byte reporting and monotonic displayed progress across an ignored-Range full
 restart remain part of Issue #85; the worker currently exposes no progress callback.
 
+The worker's `FailurePolicy` uses an explicit recovery choice:
+`RetryWithinDeadline`, `AwaitOperatorResume`, or `TerminalFailure`. Every download
+exception uses that policy; exception wrapping does not bypass the retry decision.
+Partial retention and the reported interruption reason are separate policy fields.
+
 Response handling is fail-closed:
 
 - `206` is appended only when ETag, `Content-Range`, total size, and
@@ -164,7 +169,10 @@ requeues it with per-device `queue_reason: download_interrupted`. This generic r
 also covers a resumed response rejected before writing, without implying that
 network retries occurred. When the client reports `server_lease_revoked` or
 `storage_write_failed`, the server maps it to the same
-per-device manual Resume gate.
+per-device manual Resume gate. A delayed report preserves a still-unconsumed
+operator Resume grant, including these transfer-interruption reasons. Dispatch
+claim, accepted progress, or active reconciliation consumes the grant; disconnect
+withdraws it. A later interruption requires another Resume.
 The console exposes **Resume** while the job's dispatch gate remains enabled.
 Only that assignment waits for authorization; other queued and running devices continue.
 Reconnect and duplicate reports cannot clear this manual requirement.
@@ -329,6 +337,21 @@ artifact bytes. HTTP leases follow the restart behavior described above.
   dispatched assignments with `push_resume_v1` can use client-confirmed cancellation;
   the snapshot exposes this as `resume_supported`. Never-dispatched paused targets
   can have `cancellable: true` while `resume_supported: false`.
+- Resume and Cancel requests carry an opaque `request_id`; acknowledgements and
+  operation errors echo it with `job_id`, `action`, and `target_devices`.
+  `target_devices` in the response identifies the requested set, even when Resume
+  excludes targets that became offline. Request IDs correlate responses, not
+  durable idempotency keys. Cancel returns `accepted_devices` and
+  `rejected_devices` (device ID to rejection reason). All accepted targets produce
+  `PUSH_JOB_ACTION_SENT` with `status: accepted`; mixed results use `status: partial`.
+  All rejected targets produce one correlated `ERROR` with `status: rejected` and
+  no success acknowledgement. Acceptance records intent, not client cleanup
+  completion. Lost acknowledgement delivery never rolls back that intent.
+  Unexpected server errors also echo correlation fields, but omit outcome status
+  and device outcomes because changes may already have committed. They ask the
+  operator to refresh job state before retrying. The console matches request ID,
+  job, action, and socket; target sets, counts, or a single pending action are not
+  sufficient evidence. The server still accepts requests from scripts without IDs.
 - Each snapshot assignment carries server-computed action flags from
   `push_jobs.assignment_actions`: `manual_wait` (a per-device wait for Resume),
   `resume_required`, `cancellable` (the same rule `CANCEL_PUSH_JOB` enforces), and
@@ -538,7 +561,9 @@ the actual terminal success/failure is retained. Identical terminal replays do
 not create revisions or publications. The returned `ResultSettlement` authorizes
 transfer release, snapshot publication and ACK only after commit. A failed
 transaction produces none of these effects; the client retains its result for
-replay. No protocol or persisted-format migration is required for this refactor.
+replay. Exact timeout recovery in `resume_interrupted` likewise returns every
+snapshot affected by clearing its fence in the same transaction. No persisted-format
+migration is required for these settlement changes.
 
 The server coalesces pending publication by `job_id` and sends only the newest queued revision from a single best-effort publication worker. Admin WebSocket sends are concurrent across connections and individually bounded by `MDM_ADMIN_SEND_TIMEOUT`, so a stalled browser cannot hold a device owner lock or delay another browser. A failed or timed-out admin socket, including one whose initial canonical snapshot cannot be sent, is closed; the current console's existing reconnect loop opens a new socket after three seconds and restores state from a fresh full snapshot. The console treats `PUSH_JOBS_SNAPSHOT` as a full replacement, buffers updates that arrive before that initial snapshot, and ignores revisions that are not newer. Fence create/clear, including an opaque fence, revises every non-terminal job whose snapshot displays that device fence plus the terminal blocking job.
 
@@ -604,8 +629,34 @@ exact identity evidence:
 - restart-origin `absent` becomes `interrupted` and is never automatically requeued;
 - an elapsed accept deadline enters the short exact reconciliation probe even if its in-memory waiter was lost;
 - an elapsed reconciliation deadline becomes `unconfirmed` only if the callback's stored deadline still matches and no live HTTP lease exists. A live lease defers reconciliation expiry; its watchdog owns the 60-second no-write timeout and refreshes the reconciliation deadline before revoking the lease;
-- a matching late result or exact `absent|interrupted` clears the fence without rewriting the old terminal job, except that an exact result for an assignment with pending cancellation records its actual success or failure (an explicit cancellation receipt records `cancelled`);
+- a matching late result or exact `absent` clears its fence without rewriting the
+  old terminal job, except that an exact result for an assignment with pending
+  cancellation records its actual success or failure (an explicit cancellation
+  receipt records `cancelled`);
+- exact late interrupted evidence can recover the timeout-only case below; other
+  rejected interrupted ownership is kept fenced until the client confirms cleanup;
 - a different recorded job-v1 process UUID proves process replacement; a new job-v1 process that explicitly reports no active execution also safely replaces a legacy or offline-timeout fence that had no process UUID.
+
+A late `interrupted` report, from REGISTER or `PUSH_RECONCILE_REPORT`, may reopen
+only a device marked `unconfirmed` by `reconciliation_timeout` while its job is
+`running`, `reconciling`, or `completed_with_errors`. It must match the exact
+job/device, integer attempt 1, artifact, immutable integer dispatch revision, and
+integer offset within the artifact size (booleans are not integers here). The
+exact job-v1 fence must still belong to this assignment, with no other active
+owner, pending cancellation, Retry for this device, or later pending/dispatched
+work for the same device and destination. The artifact must be retained and its
+canonical physical file must have the recorded size; a GC tombstone rejects
+recovery even when unlink has not finished.
+
+All checks and changes share one serialized transaction. Recovery keeps the job,
+attempt, enqueue order, artifact, and dispatch revision, records the validated
+offset, clears timeout/terminal metadata and the exact fence, and rederives the
+aggregate. Every fence-visible affected job receives a new revision. The target
+returns to a manual Resume wait, even if an old grant was stored. Duplicate reports
+make no change, stale deadline callbacks cannot terminalize it again, and cleanup
+only releases the previously captured transfer waiter, never a replacement for
+the same attempt. Restart preserves the manual wait. Client interruption expiry
+and server artifact retention still bound recovery; it is not indefinite.
 
 An exact terminal result from the current owner settles any dispatched active phase even if an intermediate phase frame was lost during WebSocket replacement. Reconciliation can replay a matching completed receipt after its original result was already ACKed, allowing a server that missed that ACK boundary to converge without rerunning the worker.
 
@@ -685,7 +736,12 @@ sequenceDiagram
             S-->>B: snapshot: download_interrupted
             Note over S,D: Repeated waiting reports retain work and replacement slots
             Note over S,D: Other devices continue; reconnect alone cannot resume this one
-            B->>S: Resume interrupted devices in existing job
+            opt Reconciliation deadline already expired
+                S->>DB: verify timeout, exact fence, retained bytes, no supersession
+                S->>DB: reopen manual wait + clear exact fence + revise affected jobs
+            end
+            B->>S: PUSH_FILES(job_id, target_devices, request_id)
+            S-->>B: PUSH_FILES_SENT(request_id, requested targets)
             S->>D: EXECUTE_PUSH_FILES with same assignment revision
             D->>S: HTTP Range + If-Match + identity encoding
         end
@@ -705,8 +761,9 @@ sequenceDiagram
     S-->>D: PUSH_RESULT_ACK accepted or permanent/retryable rejection
     D->>D: remove accepted/permanently rejected result; retain retryable result
     opt Operator cancels interrupted or unresolved offline work
-        B->>S: CANCEL_PUSH_JOB(job_id, target_devices)
-        S->>DB: persist cancel request; retain ownership until confirmed
+        B->>S: CANCEL_PUSH_JOB(job_id, target_devices, request_id)
+        S->>DB: persist eligible cancel requests; retain ownership until confirmed
+        S-->>B: correlated accepted/partial result, or ERROR if all rejected
         S->>D: PUSH_RESUME_REJECTED(exact identity), on reconnect if offline
         D->>D: clear interrupted ownership; retain receipt; queue partial cleanup
         D-->>S: PUSH_RECONCILE_REPORT(absent)
