@@ -18,9 +18,11 @@ import tempfile
 import time
 import uuid
 import zipfile
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import unquote
 from aiohttp import WSCloseCode, web
+from yarl import URL
 
 # Bundling and integrity references must agree on what counts as content, or a reference
 # built from a folder could never match the device that folder was pushed to.
@@ -3111,7 +3113,19 @@ async def upload_apk_handler(request: web.Request) -> web.Response:
         destination.unlink(missing_ok=True)
         return web.json_response({"error": "Uploaded APK is empty"}, status=400)
 
-    apk_url = f"{request.scheme}://{request.host}/apks/{destination.name}"
+    download_url = URL.build(
+        scheme=request.scheme, authority=request.host, path=f"/apks/{destination.name}")
+    try:
+        loopback = ip_address(download_url.host).is_loopback
+    except ValueError:
+        loopback = download_url.host in {"localhost", "localhost."}
+    if loopback:
+        # Headsets cannot reach the server through their own loopback address.
+        # Hostname resolution can block; keep it off the WebSocket event loop.
+        addresses = await asyncio.to_thread(get_local_ip_addresses)
+        if len(addresses) == 1:
+            download_url = download_url.with_host(addresses[0])
+    apk_url = str(download_url)
     log.info("Uploaded APK: %s (%d bytes)", destination.name, size)
 
     # A freshly uploaded client APK may be the newest one — refresh the console's
@@ -3507,8 +3521,8 @@ def create_app() -> web.Application:
 def get_local_ip_addresses() -> list[str]:
     """Return this machine's usable non-loopback IPv4 addresses.
 
-    Feeds the startup banner and the discovery responder's fallback. Link-local
-    (169.254.0.0/16) addresses are dropped: they are self-assigned to interfaces
+    Feeds the startup banner, discovery fallback, and loopback APK upload URLs.
+    Link-local (169.254.0.0/16) addresses are dropped: they are self-assigned to interfaces
     that failed DHCP — an unplugged Ethernet port or a Thunderbolt bridge — so they
     are never reachable from a device on the real LAN. Advertising one to a client
     is strictly worse than advertising nothing.
