@@ -34,6 +34,7 @@ function makeHarness({ order = [], selected = [], devices = null } = {}) {
     targetTab: 'devices',
     powerConfirm: { checked: true },
     deviceTaskState: {},
+    window: {},
     render() {},
     refreshDeviceSelection() {},
     renderActions() {},

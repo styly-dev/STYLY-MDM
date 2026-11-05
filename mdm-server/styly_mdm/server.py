@@ -758,35 +758,6 @@ async def broadcast_install_state(
     })
 
 
-async def broadcast_push_state(
-    device_ids: list[str],
-    state: str,
-    dest_path: str = "",
-    delete_extras: bool = False,
-    detail: str = "",
-) -> None:
-    """The push/sync counterpart of broadcast_install_state.
-
-    States: queued -> transferring -> applying -> (PUSH_FILES_RESULT: success/fail),
-    where applying covers the client's local unzip and mirror — the phase that runs
-    after the slot is freed. As with install, fail is also emitted here for devices
-    that never reach a client (offline before their turn, failed dispatch, timeout).
-
-    ``delete_extras`` rides along so the console can name the action (Push vs Sync)
-    without having to remember what it dispatched.
-    """
-    if not device_ids:
-        return
-    await forward_to_admins({
-        "type": "PUSH_DEVICE_STATE",
-        "device_ids": device_ids,
-        "state": state,
-        "dest_path": dest_path,
-        "delete_extras": delete_extras,
-        "detail": detail,
-    })
-
-
 async def _self_update_timeout(device_id: str, correlation_id: str) -> None:
     """Give up on a self-update whose device never re-registered.
 
@@ -1528,9 +1499,8 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                 elif msg_type == "DOWNLOAD_COMPLETE":
                     # Primary transfer-slot release: the network-heavy download has
                     # finished, so free this device's slot right away and let the
-                    # local install (or unzip/mirror) proceed without holding up the
-                    # queue. `task` names which job finished downloading; clients that
-                    # predate push throttling only ever send it for an install.
+                    # local install proceed without holding up the queue.
+                    # PushRuntime consumes job-v1 Push completion messages first.
                     if device_id:
                         task = data.get("task") or TASK_INSTALL
                         released = release_transfer_slot(
@@ -1541,7 +1511,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                             task, device_id,
                             data.get("apk_filename") or data.get("dest_path", ""),
                         )
-                        # Announce the transferring -> installing/applying transition
+                        # Announce the transferring -> installing transition
                         # here, in the receive loop, so it is ordered before the
                         # terminal result that follows on this same connection.
                         # Emitting it from the dispatcher instead would race that
@@ -1549,12 +1519,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         # Skipped when the slot was already gone (timed out), so a
                         # late message cannot resurrect a device the job has written
                         # off as failed.
-                        if released and task == TASK_PUSH:
-                            await broadcast_push_state(
-                                [device_id], "applying", data.get("dest_path", ""),
-                                bool(data.get("delete_extras")),
-                            )
-                        elif released:
+                        if released and task == TASK_INSTALL:
                             await broadcast_install_state(
                                 [device_id], "installing", data.get("apk_filename", ""),
                             )
@@ -1726,8 +1691,6 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     if device_id and msg_type == "INSTALL_RESULT":
                         release_transfer_slot(device_id, "install_result", task=TASK_INSTALL)
                         _clear_pending_self_update_on_install_result(device_id)
-                    elif device_id and msg_type == "PUSH_FILES_RESULT":
-                        release_transfer_slot(device_id, "push_files_result", task=TASK_PUSH)
                     elif device_id and msg_type == "VERIFY_APK_RESULT":
                         if await _consume_self_update_verify(device_id, data):
                             continue

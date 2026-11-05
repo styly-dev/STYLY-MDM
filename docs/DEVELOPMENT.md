@@ -20,119 +20,31 @@ For end-user setup and usage, see the [README](../README.md).
 
 ### Durable Push / Sync jobs
 
-Issue #91 gives **Push Files** and **Sync Folder** a server-owned UUID job identity,
-SQLite-backed lifecycle, immutable artifact identity, per-device queue, exact transfer
-ownership, restart reconciliation, and an Application-scoped single-active client
-worker. Exact-token durable accept deadlines recover lost in-memory waiters without
-competing with a live local waiter or capturing a later replay, and the console exposes
-undispatched `ready` jobs plus restart-paused jobs without allocating a replacement job.
-APK Install intentionally remains on its existing path.
+**Push Files** and **Sync Folder** use server-owned UUID jobs, a SQLite-backed
+lifecycle, immutable artifacts, and an Application-scoped client coordinator.
+APK installation keeps its existing command path and shares the server-wide
+download budget with Push/Sync.
 
-The authoritative implementation and protocol guide is
-[`PUSH_JOBS.md`](PUSH_JOBS.md). Its sequence diagram covers create-before-upload,
-dispatch, command acceptance, transfer completion, validation/apply, terminal result,
-ACK, restart recovery, and persistent device-fence reconciliation.
+`PushJobStore` serializes SQLite access; `PushJobManager` owns lifecycle decisions
+and commits related state, fences, and revisions together. `push_runtime.py`
+adapts HTTP/WebSocket messages and queues committed snapshots for admin publication.
+`PushScheduler` owns dispatch tasks and exact transfer waiters. Artifact GC runs
+separately from deadline maintenance.
 
-`PushJobManager` declares its public operations explicitly; store methods are not
-automatically exposed through it. Upload preparation, startup recovery, and artifact
-metadata access use the store directly in both runtime code and test fixtures.
-SQLite initialization executes an ordered list
-of DDL statements within the same transaction as column and metadata upgrades.
+On Android, `PushJobCoordinator` serializes events through its actor and uses
+durable `state.active` as the execution owner. `PushFilesWorker` downloads and
+validates the artifact, then waits for a durable applying checkpoint before
+changing destination files.
 
-Terminal results are decided by `PushJobManager.settle_result` in one SQLite
-transaction, including assignment/fence checks, outcome updates and revisions.
-The runtime then releases the authorized transfer, publishes changed snapshots
-and sends the ACK. On Android, the coordinator's durable `state.active` is the
-sole execution owner; the actor checks incoming commands directly against that state.
-Lifecycle events (disconnect, acceptance, and transfer/apply progress) validate
-and commit their related fields in Manager operations. A failed disconnect retains
-a retry owner; replacement registration commits that event before exposing its
-new session. The transfer watchdog releases HTTP resources before handing a failed
-DB update to dispatch recovery. The scheduler keeps one dispatch task per device,
-including slot waits; disconnect and Resume cannot create a second task for that
-same device before the first exits. Deadline maintenance runs independently of artifact GC.
-Wire messages and SQLite schema 3 remain compatible; the additive device-order
-index is created for existing databases. Android writes `state_version: 2`, reads
-existing unversioned/version-1 records, and preserves unsupported versions or invalid
-active ownership as unavailable instead of discarding them. Interrupted work uses a
-24-hour cumulative powered-on budget with five-minute atomic checkpoints and a best-effort
-normal-shutdown save. Device clock changes do not affect this budget; power-off and
-uncheckpointed time may extend retention. Legacy active work receives one fresh budget
-on migration; version-1 readers preserve version-2 state as unavailable on downgrade.
-The worker waits for a durable `applying` checkpoint before changing destination files.
+The console's `push-jobs-v1.js` keeps revisioned canonical snapshots and exposes an
+asynchronous submission API to the existing file panels. Submission request IDs
+survive retries; pending operator actions survive redraws. Push state is rendered
+separately from the latest Install/Verify result. Diagnostic logs omit command
+payloads and parser exception details that could contain artifact lease tokens.
 
-Before dispatch, upload/preparation failure or expiry settles the job and its
-never-dispatched queued targets in one transaction. Startup recovery also repairs
-older failed/interrupted jobs whose targets were left queued, preserving their
-original terminal history. Dispatch evidence and exact fences exclude a job from
-this repair. Retry requires a published, retained artifact that is not known to
-be missing; the Retry endpoint still checks the physical bytes before creating work.
-Replaying a Retry request UUID returns the existing job without changing its dispatch
-permission or manual waits. If creation committed before initial dispatch failed,
-the existing ready job can be explicitly dispatched without creating another Retry.
-Restart-paused, never-dispatched targets can be cancelled entirely on the server,
-even offline; dispatched targets still require exact client cleanup evidence.
-
-Retry eligibility depends on later jobs for the same device and destination.
-Creation and settlement of never-dispatched work revise affected older unsuccessful
-jobs in the same SQLite transaction. Artifact expiry also revises its referencing
-jobs. Committed dependency snapshots are coalesced by the database worker and
-drained by the existing admin publication loop, including startup and shutdown;
-their delivery does not depend on the initiating request remaining alive. Database
-rollback discards the pending notifications. This uses the existing schema and
-`PUSH_JOB_UPDATED` protocol without a migration.
-
-Interrupted-work cleanup messages are sent only after `REGISTERED` and canonical
-registration readiness. An unknown interrupted job stays fenced while the server
-requests exact cleanup; a repeated Reconcile report retries that instruction.
-Only an absence report matching the retained ownership evidence releases the fence,
-so a new Push cannot overtake the client's durable cleanup.
-
-Issue #94 adds resumable transfers, per-device Resume and Cancel controls, and
-retry of failed targets. See [Push / Sync jobs](PUSH_JOBS.md) for the recovery
-rules, protocol, operator controls, and schema-3 deployment requirements.
-
-The file panel calls an explicit asynchronous Push submission API. It retains its
-selection on failure and resets only the submitted selection after successful upload
-and dispatch. A submission captures its targets on the first send and keeps the
-same request ID through connectivity changes and retries. Explicit selection,
-destination, or mode changes create a new intent. Completed or abandoned submission
-metadata is released after pending work settles. Pending Resume/Cancel/Retry
-operations survive redraws and resolve from
-canonical updates, action replies, connection changes, or a bounded fallback timer.
-Untyped server errors remain visible without clearing an unrelated pending action.
-
-Client WebSocket diagnostic logs record bounded message types, not message
-payloads or parser exception text, because commands contain temporary artifact
-lease credentials. Durable Push-state load failures also use fixed diagnostic messages
-without exception text or causes; corrupt-state reset notices sent to the server and
-admin use fixed detail text. Registration acknowledgements and admin device-list updates
-are separate events; integration tests wait for the expected snapshot contents
-with one bounded deadline.
-
-The console renders Push progress and Resume/Cancel controls directly from the
-same selected canonical assignment. The adapter invalidates device cells when
-snapshots or connectivity change; it does not copy Push into the generic task
-state or paint optimistic Push assignments. The latest Install/Verify result
-appears on a separate labeled line alongside Push. Install/Verify still share
-their existing latest-result state and have no per-operation response ordering.
-
-Push runs only between a server and client of the same version; see
-[Push / Sync jobs](PUSH_JOBS.md) for partial-file retention and interrupted
-ownership expiry. PICO 4 Ultra Enterprise is the supported headset; live Push
-requires job identity and resumable artifact metadata. Historical durable records
-and receipts remain readable to prevent duplicate execution. The guide also covers
-local validation of complete partials,
-the dedicated HTTP request format, and interruption reasons.
-
-Management connection loss leaves healthy HTTP transfers under their existing
-watchdog. Replacement registration withdraws unstarted Resume authorization,
-and a retained fence keeps Reconcile visible even after Retry. Retry supersession
-uses per-device enqueue order rather than wall-clock timestamps. Initial snapshots
-batch this eligibility lookup and each job's fence rows. Artifact GC
-retries physical cleanup of tombstoned bytes after failure or restart.
-The client refreshes registration when durable state becomes unavailable and
-again after recovery, while retaining any unsaved worker outcome in memory.
+[`PUSH_JOBS.md`](PUSH_JOBS.md) is the canonical specification for protocol fields,
+state transitions, Resume/Cancel/Retry eligibility, retention, recovery, deployment
+compatibility, and message sequences.
 
 ## Building the MDM Client
 
@@ -1631,7 +1543,3 @@ PY
 A clean run — `HTTP 200`, a discovery JSON reply advertising the WS port, and a
 freshly created `/tmp/styly-data/apks/` — confirms the published artifact installs and
 runs. Only then publish the release.
-
-Activity log is read-only history. Resume all, Cancel all, Retry failed devices,
-and Reconcile are shown in the Needs attention tab. Eligible devices also expose
-their own Resume and Cancel controls; there is no separate Dispatch button.

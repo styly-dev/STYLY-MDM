@@ -1347,6 +1347,7 @@ test('device list disconnect clears only generic task state', () => {
   const context = vm.createContext({
     msg: { devices: [{ device_id: 'D1', status: 'offline' }] },
     devices: [], selectedIds: new Set(), powerConfirm: {},
+    deviceSelectionAnchorId: null,
     knownIds() { return new Set(['D1']); },
     isOnline(device) { return device.status === 'online'; },
     getDeviceId(device) { return device.device_id; },
