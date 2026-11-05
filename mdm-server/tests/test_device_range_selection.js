@@ -4,7 +4,7 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 
-const source = fs.readFileSync(path.join(__dirname, '..', 'styly_mdm', 'static', 'index.html'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, '..', 'styly_mdm', 'static', 'index.html'), 'utf8').replace(/\r\n/g, '\n');
 
 function functionSource(name) {
   const start = source.indexOf('function ' + name + '(');
@@ -28,7 +28,10 @@ function makeHarness({ order = [], selected = [], devices = null } = {}) {
     deviceStatusFilter: 'any',
     selectedIds: new Set(selected),
     selectedConnectionIds: new Set(['connection-1']),
+    selectedPushAttentionIds: new Set(),
     deviceSelectionAnchorId: null,
+    pushAttentionSelectionAnchorId: null,
+    connectionSelectionAnchorId: null,
     activeGroup: null,
     groups: {},
     targetTab: 'devices',
@@ -46,6 +49,7 @@ function makeHarness({ order = [], selected = [], devices = null } = {}) {
   context.deviceById = (id) => context.devices.find((d) => d.device_id === id);
   context.knownIds = () => new Set(context.devices.map((d) => d.device_id));
   vm.runInContext(listHelpers, context);
+  vm.runInContext(functionSource('toggleRangeSelection'), context);
   for (const name of ['toggleDevice', 'toggleSelectAll', 'clearSelection', 'selectGroupAsTarget',
     'syncActiveGroupSelection', 'switchTargetTab']) {
     vm.runInContext(functionSource(name), context);
@@ -61,6 +65,8 @@ test('forward and reverse ranges include both endpoints and preserve outside sel
   forward.toggleDevice('d', true);
   assert.deepEqual(selected(forward), ['b', 'c', 'd', 'e']);
   assert.equal(forward.deviceSelectionAnchorId, 'd');
+  assert.deepEqual([...forward.selectedPushAttentionIds], [], 'device ranges do not alter Push selection');
+  assert.deepEqual([...forward.selectedConnectionIds], ['connection-1'], 'device ranges do not alter power selection');
 
   const reverse = makeHarness({ order: ['a', 'b', 'c', 'd', 'e'], selected: ['a'] });
   reverse.toggleDevice('d', false);
@@ -126,6 +132,7 @@ test('DEVICE_LIST refresh keeps an existing anchor ID and prunes one whose devic
   context.deviceSelectionAnchorId = 'b';
   context.devices = [{ device_id: 'a', label: 'A', status: 'online' }, { device_id: 'b', label: 'B', status: 'online' }];
   context.render = () => {};
+  context.window = {};
   vm.runInContext('function applyDeviceList(msg) {' + body + '\n}', context);
   context.applyDeviceList({ devices: [
     { device_id: 'b', label: 'B renamed', status: 'online' },
@@ -139,23 +146,35 @@ test('DEVICE_LIST refresh keeps an existing anchor ID and prunes one whose devic
 test('select-all, clear, group selection/sync, and tab transitions reset the anchor', () => {
   const context = makeHarness({ order: ['a', 'b'] });
   context.deviceSelectionAnchorId = 'a';
+  context.pushAttentionSelectionAnchorId = 'push-a';
+  context.connectionSelectionAnchorId = 'connection-a';
   context.toggleSelectAll();
   assert.equal(context.deviceSelectionAnchorId, null);
+  assert.equal(context.pushAttentionSelectionAnchorId, 'push-a', 'device select-all keeps the other selection anchors scoped');
+  assert.equal(context.connectionSelectionAnchorId, 'connection-a');
   assert.deepEqual(selected(context), ['a', 'b']);
   context.deviceSelectionAnchorId = 'b';
   context.toggleSelectAll();
   assert.deepEqual(selected(context), []);
 
   context.deviceSelectionAnchorId = 'a';
+  context.pushAttentionSelectionAnchorId = 'push-a';
+  context.connectionSelectionAnchorId = 'connection-a';
   context.clearSelection();
   assert.equal(context.deviceSelectionAnchorId, null);
+  assert.equal(context.pushAttentionSelectionAnchorId, null);
+  assert.equal(context.connectionSelectionAnchorId, null);
   assert.equal(context.powerConfirm.checked, false);
 
   context.devices = [{ device_id: 'a' }, { device_id: 'b' }];
   context.groups = { 'Room A': ['a', 'b', 'missing'] };
   context.deviceSelectionAnchorId = 'b';
+  context.pushAttentionSelectionAnchorId = 'push-a';
+  context.connectionSelectionAnchorId = 'connection-a';
   context.selectGroupAsTarget('Room A');
   assert.equal(context.deviceSelectionAnchorId, null);
+  assert.equal(context.pushAttentionSelectionAnchorId, null);
+  assert.equal(context.connectionSelectionAnchorId, null);
   assert.deepEqual(selected(context), ['a', 'b']);
   context.groups['Room A'] = ['b'];
   context.syncActiveGroupSelection();
@@ -163,21 +182,30 @@ test('select-all, clear, group selection/sync, and tab transitions reset the anc
   assert.deepEqual(selected(context), ['b']);
 
   context.deviceSelectionAnchorId = 'b';
+  context.pushAttentionSelectionAnchorId = 'push-a';
+  context.connectionSelectionAnchorId = 'connection-a';
   context.switchTargetTab('groups');
   assert.equal(context.deviceSelectionAnchorId, null);
+  assert.equal(context.pushAttentionSelectionAnchorId, null);
+  assert.equal(context.connectionSelectionAnchorId, null);
   context.deviceSelectionAnchorId = 'a';
+  context.pushAttentionSelectionAnchorId = 'push-a';
+  context.connectionSelectionAnchorId = 'connection-a';
   context.switchTargetTab('attention');
   assert.equal(context.deviceSelectionAnchorId, null);
+  assert.equal(context.pushAttentionSelectionAnchorId, null);
+  assert.equal(context.connectionSelectionAnchorId, null);
   assert.deepEqual(selected(context), []);
 });
 
-test('actual delegated handlers toggle once and prevent selection only for Shift device checkboxes', () => {
+test('actual delegated handlers pass Shift once and prevent text selection for range checkboxes', () => {
   const handlers = new Map();
-  let toggleCount = 0;
-  let lastShift = null;
+  const calls = [];
   const context = vm.createContext({
     targetsBody: { addEventListener(type, listener) { handlers.set(type, listener); } },
-    toggleDevice(id, shift) { toggleCount += 1; lastShift = shift; },
+    toggleDevice(id, shift) { calls.push(['device', id, shift]); },
+    togglePushAttention(id, shift) { calls.push(['push', id, shift]); },
+    toggleAttention(id, shift) { calls.push(['power', id, shift]); },
     renderTargets() {},
     expandedGroups: new Set(),
     render() {},
@@ -190,7 +218,10 @@ test('actual delegated handlers toggle once and prevent selection only for Shift
     let prevented = 0;
     const target = { dataset: { act, id: 'device-a' } };
     return {
-      target: { closest(selector) { return selector === '[data-act]' || selector === '[data-act="toggleDevice"]' && act === 'toggleDevice' ? target : null; } },
+      target: { closest(selector) {
+        if (selector === '[data-act]') return target;
+        return selector.split(',').some((part) => part.trim() === '[data-act="' + act + '"]') ? target : null;
+      } },
       shiftKey,
       preventDefault() { prevented += 1; },
       stopPropagation() {},
@@ -199,19 +230,29 @@ test('actual delegated handlers toggle once and prevent selection only for Shift
   }
   const clickEvent = event('toggleDevice', true);
   handlers.get('click')(clickEvent);
-  assert.equal(toggleCount, 1);
-  assert.equal(lastShift, true);
+  assert.deepEqual(calls, [['device', 'device-a', true]]);
   assert.equal(clickEvent.prevented, 0);
 
   const shiftBox = event('toggleDevice', true);
   handlers.get('mousedown')(shiftBox);
   assert.equal(shiftBox.prevented, 1);
+  for (const act of ['selectPushAttention', 'toggleAttention']) {
+    const box = event(act, true);
+    handlers.get('mousedown')(box);
+    assert.equal(box.prevented, 1, act);
+  }
   const plainBox = event('toggleDevice', false);
   handlers.get('mousedown')(plainBox);
   assert.equal(plainBox.prevented, 0);
   const shiftLabel = event('editLabel', true);
   handlers.get('mousedown')(shiftLabel);
   assert.equal(shiftLabel.prevented, 0);
+
+  for (const [act, expected] of [['selectPushAttention', 'push'], ['toggleAttention', 'power']]) {
+    handlers.get('click')(event(act, true));
+    assert.deepEqual(calls.at(-1), [expected, 'device-a', true]);
+  }
+  assert.equal(calls.length, 3, 'one delegated click calls one selection handler');
 });
 
 test('ordinary selection at 300 devices does not sort or rebuild the list and refreshes actions', () => {

@@ -167,14 +167,15 @@ A consequence worth knowing: selecting a group stages every member, so a filter 
 afterwards cannot narrow it — the members stay on screen, marked. That is deliberate, since
 those members are exactly what an action would dispatch to.
 
-In the main Devices list, Shift-click applies the clicked checkbox's next state to the
-inclusive range from the last clicked device, leaving other selections unchanged. Each click
-sets the next anchor by device ID, retained across refreshes. Ranges follow the displayed
-filter/sort order, including selected rows kept visible. A hidden or removed anchor falls back
-to a single toggle. Select-all, clear, group selection, and tab changes reset the anchor.
-Selection updates controls and action summaries in place, removing deselected filter-kept
-rows without rebuilding the list. Ordinary clicks skip sorting; Shift-click prevents page
-text selection.
+Shift-click range selection is shared by the main Devices list, Push/Sync devices in Needs
+attention, and provisional connection checkboxes; each keeps its own selection and anchor.
+It applies the clicked checkbox's next state to the inclusive range in the current displayed
+order. If the anchor is no longer displayed, the click toggles only that row and makes it the
+new anchor. Clearing or crossing the relevant tab boundary resets that panel's selection and
+anchor; select-all resets its anchor as well, and choosing a group resets the Devices anchor.
+On Devices, ranges include selected rows kept visible by filters, and selection updates
+controls in place without rebuilding the list. Ordinary clicks skip sorting; Shift-click
+prevents page text selection. See [Push / Sync jobs](PUSH_JOBS.md) for the bulk action scope.
 
 ### Seeding dummy devices for UI testing
 

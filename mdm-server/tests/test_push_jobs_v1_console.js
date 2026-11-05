@@ -192,6 +192,7 @@ function loadAdapter(options = {}) {
   global.view = 'console';
   global.devices = [];
   global.provisionalConnections = [];
+  global.selectedPushAttentionIds = new Set();
   global.targetTab = 'attention';
   global.groupNames = () => [];
   global.pushAttentionDevices = () => [];
@@ -234,6 +235,7 @@ function loadAdapter(options = {}) {
   global.__stylyPushJobsV1Bridge = {
     addLog: logging.addLog,
     isDeviceOnline: options.isDeviceOnline || (() => true),
+    selectedAttentionDeviceIds() { return Array.from(global.selectedPushAttentionIds); },
     refreshAttention() { global.refreshPushJobAttention(); },
     invalidateDevice(deviceId) {
       const assignment = window.__stylyPushJobsV1Actions.assignmentFor(deviceId);
@@ -254,6 +256,10 @@ function loadAdapter(options = {}) {
   vm.runInThisContext(fs.readFileSync(adapterPath, 'utf8'), { filename: adapterPath });
   return {
     logContainer, pushJobsAttention, pushJobsTabActions, tabAttention, bridgeState, applied, cleared,
+    selectAttention(...ids) {
+      global.selectedPushAttentionIds = new Set(ids);
+      window.__stylyPushJobsV1Actions.refreshAttentionActions();
+    },
     setTargetTab(tab) { global.targetTab = tab; global.renderTabs(); },
   };
 }
@@ -278,7 +284,7 @@ function openConsole(options = {}) {
 function loadConsoleFunction(name, globals) {
   const source = indexSource.match(new RegExp('function ' + name + '\\([^)]*\\) \\{[\\s\\S]*?\\n      \\}'));
   assert.ok(source, 'the console exposes ' + name);
-  const context = vm.createContext({ deviceTaskState: {}, ...globals });
+  const context = vm.createContext({ deviceTaskState: {}, selectedPushAttentionIds: new Set(), ...globals });
   if (name === 'taskCellHtml') {
     vm.runInContext(consoleFunctionSource('pushTaskCellHtml'), context);
   }
@@ -311,6 +317,7 @@ function openIntegratedConsole(options = {}) {
     pushStateUnavailable() { return false; },
     renderTabs() {}, renderTargets() {}, updateButtons() {},
     selectedIds: new Set(options.selectedIds || ['D1']),
+    selectedPushAttentionIds: new Set(),
     onlineTargets(ids) {
       return options.onlineTargets ? options.onlineTargets(ids) : ids;
     },
@@ -1295,6 +1302,7 @@ test('target tabs preserve normal selection and clear it across Need attention',
       targetTab: from,
       selectedIds: new Set(['device-1', 'device-2']),
       selectedConnectionIds: new Set(['connection-1']),
+      selectedPushAttentionIds: new Set(['push-device-1']),
       activeGroup: 'Room A',
       powerConfirm: { checked: true },
       render() {},
@@ -1305,6 +1313,7 @@ test('target tabs preserve normal selection and clear it across Need attention',
     assert.equal(context.targetTab, to, label);
     assert.deepEqual([...context.selectedIds], cleared ? [] : ['device-1', 'device-2'], label);
     assert.deepEqual([...context.selectedConnectionIds], cleared ? [] : ['connection-1'], label);
+    assert.deepEqual([...context.selectedPushAttentionIds], cleared ? [] : ['push-device-1'], label);
     assert.equal(context.activeGroup, cleared ? null : 'Room A', label);
     assert.equal(context.powerConfirm.checked, !cleared, label);
   }
@@ -1689,6 +1698,7 @@ test('attention reuses canonical label resolution and provisional IDs only when 
     deviceById(id) { return devices.find(d => d.device_id === id); },
     pushAttentionDevices() { return devices; }, getDeviceId(d) { return d.device_id; },
     provisionalConnections: [{ connection_id: 'unresolved-connection', model: '' }],
+    selectedPushAttentionIds: new Set(),
     selectedConnectionIds: new Set(), attentionSelectAllState() { return ''; },
     attentionSelectableCount() { return 0; }, attentionSelectAllGlyph() { return ''; },
     attentionPowerSupported() { return false; }, shortConnectionId(id) { return id.slice(0, 8); },
@@ -1870,6 +1880,266 @@ test('Cancel all confirmation states devices and jobs', () => {
   findElementByText(h.pushJobsTabActions, 'Cancel all').click();
   assert.equal(prompt, 'Cancel Push / Sync for 3 device(s) across 2 job(s)?');
   assert.equal(socket.sent.length, 0);
+});
+
+test('attention selection limits Resume to selected eligible devices across jobs', () => {
+  const h = openConsole();
+  const first = snapshot('selected-first', 1, 'D1', 'queued', 1, { resumeRequired: true });
+  first.devices.D2 = { ...first.devices.D1, enqueue_seq: 2 };
+  const second = snapshot('selected-second', 1, 'D3', 'queued', 3, { resumeRequired: true });
+  const excluded = snapshot('unselected-job', 1, 'D4', 'queued', 4, { resumeRequired: true });
+  h.socket.snapshot(first, second, excluded);
+  assert.ok(findElementByText(h.pushJobsTabActions, 'Resume all'));
+  h.selectAttention('D1', 'D3');
+  assert.equal(findElementByText(h.pushJobsTabActions, 'Resume all'), undefined);
+  findElementByText(h.pushJobsTabActions, 'Resume selection').click();
+  assert.deepEqual(h.socket.sent, [
+    { type: 'PUSH_FILES', job_id: first.job_id, target_devices: ['D1'] },
+    { type: 'PUSH_FILES', job_id: second.job_id, target_devices: ['D3'] },
+  ]);
+  assert.equal(findElementByText(h.pushJobsTabActions, 'Resuming…').disabled, true);
+});
+
+test('offline selection disables Resume but Cancel confirms and targets only the selection', () => {
+  const prompts = [];
+  let approved = false;
+  const h = openConsole({
+    isDeviceOnline: id => id !== 'D2',
+    confirm: message => { prompts.push(message); return approved; },
+  });
+  const job = snapshot('selected-cancel', 1, 'D1', 'queued', 1, { resumeRequired: true, cancellable: true });
+  job.devices.D2 = { ...job.devices.D1, enqueue_seq: 2 };
+  h.socket.snapshot(job);
+  h.selectAttention('D2');
+  assert.equal(findElementByText(h.pushJobsTabActions, 'Resume selection').disabled, true);
+  const cancel = findElementByText(h.pushJobsTabActions, 'Cancel selection');
+  assert.equal(cancel.disabled, false);
+  cancel.click();
+  assert.equal(h.socket.sent.length, 0, 'declining confirmation sends nothing');
+  assert.match(prompts[0], /1 selected eligible device\(s\) across 1 job\(s\)/);
+  approved = true;
+  cancel.click();
+  assert.deepEqual(h.socket.sent, [{ type: 'CANCEL_PUSH_JOB', job_id: job.job_id, target_devices: ['D2'] }]);
+});
+
+test('ineligible selection never falls back to all, including after replacement snapshots', () => {
+  const h = openConsole();
+  const job = snapshot('still-paused', 1, 'D1', 'queued', 1, { resumeRequired: true, cancellable: true });
+  h.socket.snapshot(job);
+  h.selectAttention('unavailable-device');
+  for (const label of ['Resume selection', 'Cancel selection']) {
+    assert.equal(findElementByText(h.pushJobsTabActions, label).disabled, true);
+    findElementByText(h.pushJobsTabActions, label).click();
+  }
+  h.socket.snapshot({ ...job, revision: 2 });
+  assert.equal(findElementByText(h.pushJobsTabActions, 'Resume selection').disabled, true);
+  assert.equal(findElementByText(h.pushJobsTabActions, 'Resume all'), undefined);
+  assert.equal(h.socket.sent.length, 0);
+  h.selectAttention();
+  findElementByText(h.pushJobsTabActions, 'Resume all').click();
+  assert.deepEqual(h.socket.sent.at(-1).target_devices, ['D1']);
+});
+
+test('a resumed selection stays scoped when its row leaves attention and another device remains', () => {
+  const h = openConsole();
+  const job = snapshot('live-selection', 1, 'D1', 'queued', 1, { resumeRequired: true });
+  job.devices.D2 = { ...job.devices.D1, enqueue_seq: 2 };
+  h.socket.snapshot(job);
+  h.selectAttention('D1');
+  findElementByText(h.pushJobsTabActions, 'Resume selection').click();
+  h.socket.emit({ type: 'PUSH_FILES_SENT', job_id: job.job_id, resume: true, target_count: 1 });
+  h.socket.update({ ...job, revision: 2, devices: {
+    ...job.devices, D1: { ...job.devices.D1, state: 'downloading', resume_required: false },
+  } });
+  assert.equal(window.__stylyPushJobsV1Actions.assignmentFor('D1').needsAttention, false);
+  const resume = findElementByText(h.pushJobsTabActions, 'Resume selection');
+  assert.equal(resume.disabled, true);
+  resume.click();
+  assert.equal(h.socket.sent.length, 1, 'the unselected paused device must not resume');
+  h.selectAttention();
+  findElementByText(h.pushJobsTabActions, 'Resume all').click();
+  assert.deepEqual(h.socket.sent.at(-1).target_devices, ['D2']);
+});
+
+test('attention selection does not change job-scoped Retry', () => {
+  const h = openConsole();
+  const job = snapshot('retry-scope', 1, 'D1', 'failed', 1, { retryable: true });
+  job.devices.D2 = { ...job.devices.D1, enqueue_seq: 2 };
+  h.socket.snapshot(job);
+  h.selectAttention('D1');
+  findElementByText(h.pushJobsTabActions, 'Retry failed devices').click();
+  assert.equal(h.socket.sent.at(-1).type, 'RETRY_FAILED_PUSH_JOB');
+  assert.equal(h.socket.sent.at(-1).job_id, job.job_id);
+  assert.equal(Object.hasOwn(h.socket.sent.at(-1), 'target_devices'), false);
+});
+
+test('Push attention checkboxes support partial/select-all state without selecting power controls', () => {
+  const rows = ['D1', 'D2'].map(id => ({ dataset: { id }, checked: false }));
+  const header = {};
+  const listed = rows.map(row => ({ device_id: row.dataset.id }));
+  const selected = new Set();
+  const power = new Set(['connection-1']);
+  let refreshes = 0;
+  const context = vm.createContext({
+    selectedPushAttentionIds: selected, selectedConnectionIds: power,
+    selectedIds: new Set(['normal-device']), activeGroup: null, deviceSelectionAnchorId: null,
+    pushAttentionSelectionAnchorId: null, connectionSelectionAnchorId: null,
+    powerConfirm: { checked: true },
+    pushAttentionDevices() { return listed; }, getDeviceId(device) { return device.device_id; },
+    targetsBody: { querySelectorAll() { return rows; }, querySelector() { return header; } },
+    renderActions() { refreshes++; }, render() {},
+  });
+  for (const name of ['toggleRangeSelection', 'syncPushAttentionCheckboxes', 'togglePushAttention', 'selectAllPushAttention', 'clearSelection']) {
+    vm.runInContext(consoleFunctionSource(name), context);
+  }
+  context.togglePushAttention('D1', false);
+  assert.equal(rows[0].checked, true);
+  assert.equal(header.indeterminate, true);
+  assert.equal(header.checked, false);
+  assert.deepEqual([...power], ['connection-1']);
+  context.selectAllPushAttention(true);
+  assert.deepEqual([...selected], ['D1', 'D2']);
+  assert.equal(header.checked, true);
+  assert.equal(header.indeterminate, false);
+  context.selectAllPushAttention(false);
+  assert.equal(selected.size, 0);
+  assert.deepEqual([...power], ['connection-1']);
+  context.togglePushAttention('unknown', true);
+  assert.equal(selected.size, 0);
+  context.togglePushAttention('D1', false);
+  listed.shift();
+  context.syncPushAttentionCheckboxes();
+  assert.equal(selected.has('D1'), true, 'live updates cannot silently broaden scope to all');
+  assert.equal(context.pushAttentionSelectionAnchorId, null, 'removed rows clear only the range anchor');
+  context.clearSelection();
+  assert.equal(selected.size, 0);
+  assert.equal(power.size, 0);
+  assert.equal(context.powerConfirm.checked, false);
+  assert.equal(refreshes, 4);
+});
+
+test('Push attention Shift selection uses current visible order and keeps selection scopes independent', () => {
+  const rows = ['D1', 'D2', 'D3', 'D4'].map(id => ({ dataset: { id }, checked: false }));
+  const header = {};
+  let listed = rows.map(row => ({ device_id: row.dataset.id }));
+  const selectedPush = new Set();
+  const selectedDevices = new Set(['device-selection']);
+  const selectedPower = new Set(['connection-selection']);
+  const context = vm.createContext({
+    selectedPushAttentionIds: selectedPush,
+    selectedIds: selectedDevices,
+    selectedConnectionIds: selectedPower,
+    deviceSelectionAnchorId: 'device-anchor', connectionSelectionAnchorId: 'power-anchor',
+    pushAttentionSelectionAnchorId: null,
+    pushAttentionDevices() { return listed; }, getDeviceId(device) { return device.device_id; },
+    targetsBody: { querySelectorAll() { return rows; }, querySelector() { return header; } },
+    renderActions() {}, render() {},
+  });
+  for (const name of ['toggleRangeSelection', 'syncPushAttentionCheckboxes', 'togglePushAttention', 'selectAllPushAttention']) {
+    vm.runInContext(consoleFunctionSource(name), context);
+  }
+
+  context.togglePushAttention('D2', false);
+  context.togglePushAttention('D4', true);
+  assert.deepEqual([...selectedPush].sort(), ['D2', 'D3', 'D4']);
+  context.togglePushAttention('D3', true); // The clicked item was selected, so clear D3..D4.
+  assert.deepEqual([...selectedPush].sort(), ['D2']);
+  context.togglePushAttention('D1', true); // The new anchor is D3; D2 remains selected outside the range.
+  assert.deepEqual([...selectedPush].sort(), ['D1', 'D2', 'D3']);
+  assert.equal(context.pushAttentionSelectionAnchorId, 'D1');
+
+  // A current display reorder, rather than insertion order, defines the next range.
+  selectedPush.clear();
+  context.pushAttentionSelectionAnchorId = null;
+  listed = ['D4', 'D3', 'D2', 'D1'].map(device_id => ({ device_id }));
+  context.togglePushAttention('D2', false);
+  context.togglePushAttention('D4', true);
+  assert.deepEqual([...selectedPush].sort(), ['D2', 'D3', 'D4']);
+  assert.equal(selectedPush.has('D1'), false);
+
+  // A missing anchor falls back to one item, and a vanished live row clears the anchor
+  // while preserving selected IDs so a refresh cannot broaden the action scope.
+  listed = listed.filter(device => device.device_id !== 'D2');
+  context.syncPushAttentionCheckboxes();
+  assert.equal(context.pushAttentionSelectionAnchorId, 'D4');
+  listed = listed.filter(device => device.device_id !== 'D4');
+  context.syncPushAttentionCheckboxes();
+  assert.equal(context.pushAttentionSelectionAnchorId, null);
+  const before = [...selectedPush].sort();
+  context.togglePushAttention('D1', true);
+  assert.deepEqual([...selectedPush].sort(), [...before, 'D1'].sort());
+
+  context.selectAllPushAttention(true);
+  assert.equal(context.pushAttentionSelectionAnchorId, null);
+  assert.deepEqual([...selectedDevices], ['device-selection']);
+  assert.deepEqual([...selectedPower], ['connection-selection']);
+});
+
+test('provisional power Shift ranges skip unsupported rows and reset stale anchors', () => {
+  const entries = [
+    { connection_id: 'C1', power_control_supported: true },
+    { connection_id: 'unsupported', power_control_supported: false },
+    { connection_id: 'C2', power_control_supported: true },
+    { connection_id: 'C3', power_control_supported: true },
+  ];
+  const selectedConnections = new Set();
+  const selectedPush = new Set(['push-device']);
+  const selectedDevices = new Set(['normal-device']);
+  const context = vm.createContext({
+    provisionalConnections: entries,
+    selectedConnectionIds: selectedConnections,
+    selectedPushAttentionIds: selectedPush,
+    selectedIds: selectedDevices,
+    connectionSelectionAnchorId: null,
+    connectionById(id) { return entries.find(entry => entry.connection_id === id); },
+    attentionPowerSupported(entry) { return !!entry && entry.power_control_supported === true; },
+    render() {},
+  });
+  for (const name of ['toggleRangeSelection', 'attentionSelectableEntries', 'toggleAttention',
+    'toggleSelectAllAttention', 'pruneAttentionSelection']) {
+    vm.runInContext(consoleFunctionSource(name), context);
+  }
+
+  context.toggleAttention('C1', false);
+  context.toggleAttention('C3', true);
+  assert.deepEqual([...selectedConnections].sort(), ['C1', 'C2', 'C3']);
+  assert.equal(selectedConnections.has('unsupported'), false);
+  context.toggleAttention('C2', true); // The anchor advanced to C3; clear C2..C3.
+  assert.deepEqual([...selectedConnections].sort(), ['C1']);
+  assert.equal(context.connectionSelectionAnchorId, 'C2');
+  context.toggleAttention('unsupported', true);
+  assert.deepEqual([...selectedConnections].sort(), ['C1']);
+
+  // Unsupported rows do not participate in range positions. Shift from C3 back to C1
+  // selects exactly the three power-capable entries in their displayed order.
+  context.toggleAttention('C1', false);
+  context.toggleAttention('C3', false);
+  context.toggleAttention('C1', true);
+  assert.deepEqual([...selectedConnections].sort(), ['C1', 'C2', 'C3']);
+  assert.deepEqual([...selectedPush], ['push-device']);
+  assert.deepEqual([...selectedDevices], ['normal-device']);
+
+  context.toggleAttention('C3', false);
+  assert.equal(context.connectionSelectionAnchorId, 'C3');
+  context.toggleAttention('C3', false);
+  assert.equal(selectedConnections.has('C3'), true);
+  entries.splice(entries.findIndex(entry => entry.connection_id === 'C3'), 1);
+  assert.equal(context.pruneAttentionSelection(), true);
+  assert.equal(context.connectionSelectionAnchorId, null, 'removed anchor is cleared without clearing still-supported selections');
+  assert.deepEqual([...selectedConnections].sort(), ['C1', 'C2']);
+
+  context.toggleSelectAllAttention();
+  assert.deepEqual([...selectedConnections], []);
+  assert.equal(context.connectionSelectionAnchorId, null);
+});
+
+test('Push checkbox selection is delegated through one native click handler', () => {
+  const eventBlock = indexSource.match(/targetsBody\.addEventListener\('click', function \(e\) \{[\s\S]*?\n      \}\);/);
+  assert.ok(eventBlock, 'selection event delegation is wired on click');
+  assert.match(eventBlock[0], /selectPushAttention'\) togglePushAttention\(t\.dataset\.id, e\.shiftKey\)/);
+  assert.match(eventBlock[0], /toggleAttention\(t\.dataset\.id, e\.shiftKey\)/);
+  assert.doesNotMatch(indexSource, /targetsBody\.addEventListener\('change'/,
+    'selection checkboxes do not have a second change handler that would toggle twice');
 });
 
 test('client restart requires operator Resume and allows Cancel', () => {

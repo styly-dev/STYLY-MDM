@@ -115,6 +115,7 @@
     .attention-diagnostic { margin-top: 3px; color: var(--text-secondary); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; word-break: break-word; }
     .attention-row.unsupported { opacity: .62; }
     .attention-row.unsupported .selbox { cursor: not-allowed; }
+    .push-attention-checkbox { width: 16px; height: 16px; margin: 0; color-scheme: dark; accent-color: var(--accent); cursor: pointer; }
     .actions > .zone-label, .sel-card, .push-attention { flex: 0 0 auto; }
 
     /* Drag handles */
@@ -648,6 +649,10 @@
       let selectedIds = new Set();
       let deviceSelectionAnchorId = null;
       let selectedConnectionIds = new Set();
+      let connectionSelectionAnchorId = null;
+      // Keep scope through live updates; only an explicit clear/tab change returns to all.
+      const selectedPushAttentionIds = new Set();
+      let pushAttentionSelectionAnchorId = null;
       let activeGroup = null;          // group name driving the selection, or null
       let targetTab = 'groups';        // 'groups' | 'devices' | 'attention'
       let userPickedTab = false;       // true once the user clicks a sub-tab (stops auto-default)
@@ -1198,6 +1203,7 @@
           ? renderGroupsHtml()
           : (targetTab === 'devices' ? renderDevicesHtml() : renderAttentionHtml());
         if (targetTab === 'devices') restoreLabelEditFocus(hadFocus);
+        if (targetTab === 'attention') syncPushAttentionCheckboxes();
       }
 
       function pushAssignmentFor(id) {
@@ -1216,9 +1222,12 @@
         const canonical = pushAttentionDevices();
         if (!provisionalConnections.length && !canonical.length) return '<div class="empty">No devices need attention</div>';
         const jobs = canonical.length ? '<div class="attention-list"><div class="zone-label">Push / Sync jobs and state</div>' +
+          '<div class="attention-head"><input type="checkbox" class="push-attention-checkbox" data-act="selectAllPushAttention" aria-label="Select all listed Push / Sync devices">' +
+          '<div>Device</div><div>Push / Sync status</div></div>' +
           canonical.map(function (device) {
             const id = getDeviceId(device);
-            return '<div class="attention-row"><div></div><div class="attention-device">' +
+            return '<div class="attention-row"><input type="checkbox" class="push-attention-checkbox" data-act="selectPushAttention" data-id="' + esc(id) + '"' +
+              (selectedPushAttentionIds.has(id) ? ' checked' : '') + ' aria-label="Select ' + esc(labelFor(id)) + ' for Push / Sync actions"><div class="attention-device">' +
               '<div class="attention-model">' + esc(labelFor(id)) + '</div>' +
               '<div class="attention-meta">' + esc(device.status || 'unknown') + ' · ' + esc(device.ip || '-') + '</div></div>' +
               '<div class="dev-task" data-task-id="' + esc(id) + '">' + progressCellHtml(id) + '</div></div>';
@@ -1565,6 +1574,7 @@
       window.__stylyPushJobsV1Bridge = {
         addLog: addLog,
         isDeviceOnline: function (id) { const d = deviceById(id); return !!d && d.status === 'online'; },
+        selectedAttentionDeviceIds: function () { return Array.from(selectedPushAttentionIds); },
         refreshAttention: function () {
           if (view !== 'console') return;
           renderTabs();
@@ -1574,14 +1584,17 @@
       };
 
       function renderActions() {
+        const pushActions = window.__stylyPushJobsV1Actions;
+        if (pushActions) pushActions.refreshAttentionActions();
         const attentionMode = targetTab === 'attention';
         const online = new Set(getOnlineIds());
         let on = 0, off = 0;
         selectedIds.forEach(function (id) { if (online.has(id)) on++; else off++; });
-        const n = attentionMode ? selectedConnectionIds.size : selectedIds.size;
+        const n = attentionMode ? selectedConnectionIds.size + selectedPushAttentionIds.size : selectedIds.size;
         let ctx;
         if (n === 0) ctx = 'Select devices or a group to act on';
-        else if (attentionMode) ctx = n + ' Need attention connection(s) selected · power control only';
+        else if (attentionMode) ctx = (selectedPushAttentionIds.size ? selectedPushAttentionIds.size + ' Push / Sync device(s) selected · Resume/Cancel above · ' : '') +
+          selectedConnectionIds.size + ' connection(s) selected for power control';
         else if (activeGroup) ctx = 'via group "' + esc(activeGroup) + '" · ' + on + ' online' + (off ? ' · ' + off + ' offline skipped' : '');
         else ctx = on + ' online' + (off ? ' · ' + off + ' offline skipped' : '') + ' · add or remove individually';
         if (!attentionMode && Array.from(selectedIds).some(function (id) { return (deviceById(id) || {}).identity_kind === 'legacy'; })) ctx += ' · Legacy devices: APK installation/update only';
@@ -1624,8 +1637,57 @@
       }
 
       // ---------------- Selection actions ----------------
+      function toggleRangeSelection(selection, visibleIds, anchorId, id, shiftKey) {
+        const clickedIndex = shiftKey ? visibleIds.indexOf(id) : -1;
+        if (shiftKey && clickedIndex < 0) return anchorId;
+        const anchorIndex = shiftKey && anchorId ? visibleIds.indexOf(anchorId) : -1;
+        const range = anchorIndex >= 0
+          ? visibleIds.slice(Math.min(clickedIndex, anchorIndex), Math.max(clickedIndex, anchorIndex) + 1)
+          : [id];
+        const select = !selection.has(id);
+        range.forEach(function (targetId) {
+          if (select) selection.add(targetId);
+          else selection.delete(targetId);
+        });
+        return id;
+      }
+
+      function syncPushAttentionCheckboxes() {
+        const listed = pushAttentionDevices().map(getDeviceId);
+        if (pushAttentionSelectionAnchorId && listed.indexOf(pushAttentionSelectionAnchorId) < 0) pushAttentionSelectionAnchorId = null;
+        const checkedCount = listed.filter(function (id) { return selectedPushAttentionIds.has(id); }).length;
+        targetsBody.querySelectorAll('[data-act="selectPushAttention"]').forEach(function (box) {
+          box.checked = selectedPushAttentionIds.has(box.dataset.id);
+        });
+        const header = targetsBody.querySelector('[data-act="selectAllPushAttention"]');
+        if (header) {
+          header.checked = listed.length > 0 && checkedCount === listed.length;
+          header.indeterminate = checkedCount > 0 && checkedCount < listed.length;
+        }
+      }
+
+      function togglePushAttention(id, shiftKey) {
+        const listed = pushAttentionDevices().map(getDeviceId);
+        if (listed.indexOf(id) < 0) return;
+        pushAttentionSelectionAnchorId = toggleRangeSelection(selectedPushAttentionIds, listed, pushAttentionSelectionAnchorId, id, shiftKey);
+        syncPushAttentionCheckboxes();
+        renderActions();
+      }
+
+      function selectAllPushAttention(checked) {
+        pushAttentionSelectionAnchorId = null;
+        pushAttentionDevices().forEach(function (device) {
+          const id = getDeviceId(device);
+          if (checked) selectedPushAttentionIds.add(id);
+          else selectedPushAttentionIds.delete(id);
+        });
+        syncPushAttentionCheckboxes();
+        renderActions();
+      }
+
       function pruneAttentionSelection() {
         let changed = false;
+        if (connectionSelectionAnchorId && !attentionPowerSupported(connectionById(connectionSelectionAnchorId))) connectionSelectionAnchorId = null;
         selectedConnectionIds.forEach(function (id) {
           if (!attentionPowerSupported(connectionById(id))) {
             selectedConnectionIds.delete(id);
@@ -1647,14 +1709,15 @@
         const state = attentionSelectAllState();
         return state === 'on' ? '✓' : state === 'mixed' ? '–' : '';
       }
-      function toggleAttention(id) {
+      function toggleAttention(id, shiftKey) {
         const entry = connectionById(id);
         if (!attentionPowerSupported(entry)) return;
-        if (selectedConnectionIds.has(id)) selectedConnectionIds.delete(id);
-        else selectedConnectionIds.add(id);
+        const listed = attentionSelectableEntries().map(function (connection) { return connection.connection_id; });
+        connectionSelectionAnchorId = toggleRangeSelection(selectedConnectionIds, listed, connectionSelectionAnchorId, id, shiftKey);
         render();
       }
       function toggleSelectAllAttention() {
+        connectionSelectionAnchorId = null;
         const selectable = attentionSelectableEntries();
         const all = selectable.length > 0 && selectable.every(function (entry) {
           return selectedConnectionIds.has(entry.connection_id);
@@ -1666,11 +1729,14 @@
       function switchTargetTab(tab) {
         if (targetTab === tab) return;
         deviceSelectionAnchorId = null;
+        pushAttentionSelectionAnchorId = null;
+        connectionSelectionAnchorId = null;
         const crossesAttention = targetTab === 'attention' || tab === 'attention';
         targetTab = tab;
         if (crossesAttention) {
           selectedIds.clear();
           selectedConnectionIds.clear();
+          selectedPushAttentionIds.clear();
           activeGroup = null;
           powerConfirm.checked = false;
         }
@@ -1678,6 +1744,8 @@
       }
       function selectGroupAsTarget(name) {
         deviceSelectionAnchorId = null;
+        pushAttentionSelectionAnchorId = null;
+        connectionSelectionAnchorId = null;
         selectedConnectionIds.clear();
         const known = knownIds();
         selectedIds = new Set((groups[name] || []).filter(function (s) { return known.has(s); }));
@@ -1700,20 +1768,7 @@
         const query = deviceSearch.trim().toLowerCase();
         if (!device || (!selectedIds.has(id) && !deviceMatchesFilter(device, query))) return;
         const visible = shiftKey ? visibleDevices().map(getDeviceId) : [];
-        const clickedIndex = visible.indexOf(id);
-        const anchorIndex = deviceSelectionAnchorId ? visible.indexOf(deviceSelectionAnchorId) : -1;
-        if (shiftKey && anchorIndex >= 0) {
-          const select = !selectedIds.has(id);
-          const start = Math.min(clickedIndex, anchorIndex);
-          const end = Math.max(clickedIndex, anchorIndex);
-          for (let i = start; i <= end; i++) {
-            if (select) selectedIds.add(visible[i]);
-            else selectedIds.delete(visible[i]);
-          }
-        } else {
-          if (selectedIds.has(id)) selectedIds.delete(id); else selectedIds.add(id);
-        }
-        deviceSelectionAnchorId = id;
+        deviceSelectionAnchorId = toggleRangeSelection(selectedIds, visible, deviceSelectionAnchorId, id, shiftKey);
         activeGroup = null;
         refreshDeviceSelection();
         renderActions();
@@ -1762,8 +1817,11 @@
       }
       function clearSelection() {
         deviceSelectionAnchorId = null;
+        pushAttentionSelectionAnchorId = null;
+        connectionSelectionAnchorId = null;
         selectedIds.clear();
         selectedConnectionIds.clear();
+        selectedPushAttentionIds.clear();
         activeGroup = null;
         powerConfirm.checked = false;
         render();
@@ -2886,7 +2944,9 @@
         if (!t) return;
         const act = t.dataset.act;
         if (act === 'copyDeviceId') { e.stopPropagation(); copyDeviceId(t); }
-        else if (act === 'toggleAttention') toggleAttention(t.dataset.id);
+        else if (act === 'toggleAttention') toggleAttention(t.dataset.id, e.shiftKey);
+        else if (act === 'selectPushAttention') togglePushAttention(t.dataset.id, e.shiftKey);
+        else if (act === 'selectAllPushAttention') selectAllPushAttention(t.checked);
         else if (act === 'selectAllAttention') toggleSelectAllAttention();
         else if (act === 'selectGroup') selectGroupAsTarget(t.dataset.group);
         else if (act === 'toggleExpand') {
@@ -2909,7 +2969,7 @@
         }
       });
       targetsBody.addEventListener('mousedown', function (e) {
-        if (e.shiftKey && e.target.closest('[data-act="toggleDevice"]')) e.preventDefault();
+        if (e.shiftKey && e.target.closest('[data-act="toggleDevice"], [data-act="selectPushAttention"], [data-act="toggleAttention"]')) e.preventDefault();
       });
       // Targets label-edit keyboard
       targetsBody.addEventListener('keydown', function (e) {

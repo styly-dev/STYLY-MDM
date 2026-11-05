@@ -291,8 +291,19 @@ artifact bytes. HTTP leases follow the restart behavior described above.
   interruption timestamp, or authorize new interruptions reported after the action.
   Each device's Progress cell exposes its own Resume/Cancel actions, which send
   `target_devices: [device_id]`. Omitting targets means all applicable assignments;
-  empty, malformed or foreign targets are rejected. The attention panel retains
-  **Resume all**. Resuming one device after a server restart keeps all other queued
+  empty, malformed or foreign targets are rejected. With no checked Push/Sync
+  devices, the attention panel offers **Resume all** and **Cancel all**. Checking
+  any device switches them to **Resume selection** and **Cancel selection**, which
+  include only eligible selected devices; no eligible selection disables the action
+  rather than targeting all. Selection persists through live updates until it is
+  explicitly cleared or the operator leaves Needs attention. Shift-click applies the
+  clicked checkbox's next state to the inclusive range in the displayed order, matching
+  Devices and provisional connection checkboxes; each panel keeps its own selection and
+  anchor. If the anchor is no longer displayed, the click toggles only that row and makes
+  it the new anchor. Clearing or leaving Needs attention resets its selection and anchor.
+  Provisional connection checkboxes are separate and do not scope these actions.
+  **Retry failed devices**
+  and **Reconcile** remain job-scoped. Resuming one device after a server restart keeps all other queued
   or interrupted devices paused until their own Resume or Resume all.
   A storage write failure with an exact retained partial uses the same manual
   Resume gate; the operator must free or repair device storage first.

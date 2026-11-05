@@ -630,11 +630,19 @@
   }
 
   function bulkActionGroups(action) {
+    const selected = new Set(attentionSelection());
     return Array.from(pushJobs.values()).map(function (job) {
-      return { job: job, targetDevices: actionTargetsForJob(job, action) };
+      return { job: job, targetDevices: actionTargetsForJob(job, action).filter(function (id) {
+        return !selected.size || selected.has(id);
+      }) };
     }).filter(function (group) {
       return group.targetDevices.length > 0;
     });
+  }
+
+  function attentionSelection() {
+    const bridge = window.__stylyPushJobsV1Bridge;
+    return bridge && bridge.selectedAttentionDeviceIds ? bridge.selectedAttentionDeviceIds() : [];
   }
 
   function sendBulkAction(action) {
@@ -642,11 +650,11 @@
     const groups = bulkActionGroups(action);
     if (!groups.length || !currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return false;
     const messageType = action === 'resume' ? 'PUSH_FILES' : 'CANCEL_PUSH_JOB';
-    const label = action === 'resume' ? 'Resume all' : 'Cancel all';
+    const label = (action === 'resume' ? 'Resume' : 'Cancel') + (attentionSelection().length ? ' selection' : ' all');
     const targetCount = groups.reduce(function (count, group) {
       return count + group.targetDevices.length;
     }, 0);
-    const scope = targetCount + ' device(s) across ' + groups.length + ' job(s)';
+    const scope = targetCount + (attentionSelection().length ? ' selected eligible' : '') + ' device(s) across ' + groups.length + ' job(s)';
     if (action === 'cancel' && typeof window.confirm === 'function' &&
         !window.confirm('Cancel Push / Sync for ' + scope + '?')) return false;
     try {
@@ -718,7 +726,10 @@
     title.textContent = 'Push / Sync actions';
     const note = document.createElement('div');
     note.className = 'attention-tab-actions-note';
-    note.textContent = 'Apply an action to every eligible device across all Push / Sync jobs.';
+    const selectedCount = attentionSelection().length;
+    note.textContent = selectedCount
+      ? selectedCount + ' device(s) selected. Resume and Cancel apply only to eligible selected devices.'
+      : 'Resume and Cancel apply to every eligible device across all Push / Sync jobs.';
     copy.appendChild(title);
     copy.appendChild(note);
     const buttons = document.createElement('div');
@@ -739,8 +750,9 @@
       return button;
     }
 
-    buttons.appendChild(bulkButton('resume', 'Resume all', 'Resuming…', resumeTargets));
-    buttons.appendChild(bulkButton('cancel', 'Cancel all', 'Cancelling…', cancelTargets));
+    const suffix = selectedCount ? ' selection' : ' all';
+    buttons.appendChild(bulkButton('resume', 'Resume' + suffix, 'Resuming…', resumeTargets));
+    buttons.appendChild(bulkButton('cancel', 'Cancel' + suffix, 'Cancelling…', cancelTargets));
     head.appendChild(copy);
     head.appendChild(buttons);
     container.appendChild(head);
@@ -754,6 +766,10 @@
     if (!actionJobs.length) return;
     const jobList = document.createElement('div');
     jobList.className = 'attention-tab-job-list';
+    const jobScope = document.createElement('div');
+    jobScope.className = 'attention-tab-actions-note';
+    jobScope.textContent = 'Retry and Reconcile below apply to each job, independently of the checkbox selection.';
+    jobList.appendChild(jobScope);
     actionJobs.forEach(function (job) {
       const row = document.createElement('div');
       row.className = 'attention-tab-job';
@@ -958,6 +974,7 @@
     newSubmissionId: uuid,
     releaseSubmission: releaseSubmission,
     actionPending: isDeviceActionPending,
+    refreshAttentionActions: renderPausedJobs,
     refreshConnectivity: function () { renderPausedJobs(); syncDeviceAssignments(); },
     assignmentFor: function (deviceId) {
       const selected = selectedAssignmentFor(deviceId);
