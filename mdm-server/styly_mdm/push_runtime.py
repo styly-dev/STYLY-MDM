@@ -265,15 +265,19 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
             established_device_id=device_id,
         )
 
+    async def notify_canonical_disconnect(self) -> None:
+        """Settle ownership even when peer EOF bypasses WebSocket close()."""
+        if (
+            not self._push_disconnect_notified
+            and self._push_runtime is not None
+            and self._push_path == "/ws/device"
+        ):
+            self._push_disconnect_notified = True
+            await self._push_runtime.disconnect_device(self._push_device_id, self)
+
     async def close(self, *args: Any, **kwargs: Any) -> bool:
         try:
-            if (
-                not self._push_disconnect_notified
-                and self._push_runtime is not None
-                and self._push_path == "/ws/device"
-            ):
-                self._push_disconnect_notified = True
-                await self._push_runtime.disconnect_device(self._push_device_id, self)
+            await self.notify_canonical_disconnect()
         finally:
             # Transport cleanup must not depend on durable business-state cleanup.
             result = await super().close(*args, **kwargs)

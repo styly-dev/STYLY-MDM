@@ -1727,6 +1727,14 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
             elif raw_msg.type == web.WSMsgType.ERROR:
                 log.error("Device WS error: %s", ws.exception())
     finally:
+        # Abrupt TCP loss can end iteration without calling WebSocket.close().
+        # Notify the Push adapter while this socket's registration is still present.
+        notify_disconnect = getattr(ws, "notify_canonical_disconnect", None)
+        if notify_disconnect is not None:
+            try:
+                await notify_disconnect()
+            except Exception:
+                log.exception("Could not settle Push WebSocket disconnect")
         was_provisional = provisional_connections.pop(ws, None) is not None
         # Every teardown step below belongs to the connection that currently owns
         # the device_id: a superseded socket must not free the live connection's
