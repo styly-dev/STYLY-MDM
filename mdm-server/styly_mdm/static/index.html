@@ -1233,7 +1233,7 @@
               '<div class="dev-task" data-task-id="' + esc(id) + '">' + progressCellHtml(id) + '</div></div>';
           }).join('') + '</div>' : '';
         if (!provisionalConnections.length) return jobs;
-        return jobs + '<div class="attention-list"><div class="zone-label">Device identity · connection power controls</div><div class="attention-head">' +
+        return jobs + '<div class="attention-list"><div class="attention-head">' +
           '<div class="selbox ' + attentionSelectAllState() + (attentionSelectableCount() ? '' : ' disabled') + '" data-act="selectAllAttention">' + attentionSelectAllGlyph() + '</div>' +
           '<div>Connection</div><div>Status</div></div>' +
           provisionalConnections.map(function (entry) {
