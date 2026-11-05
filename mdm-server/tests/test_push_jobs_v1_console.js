@@ -227,7 +227,12 @@ function loadAdapter(options = {}) {
     createElement(tagName) { return new FakeElement(tagName); },
     createTextNode(text) { return { textContent: text, isConnected: true }; },
   };
+  const logging = vm.createContext({ document: global.document, logContainer, logEmpty });
+  for (const name of ['makeLogEntry', 'addLog']) {
+    vm.runInContext(consoleFunctionSource(name), logging);
+  }
   global.__stylyPushJobsV1Bridge = {
+    addLog: logging.addLog,
     isDeviceOnline: options.isDeviceOnline || (() => true),
     refreshAttention() { global.refreshPushJobAttention(); },
     invalidateDevice(deviceId) {

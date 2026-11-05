@@ -45,20 +45,7 @@ object PushProtocol {
         val identity: String get() = if (jobId != null) "$jobId:$attempt" else "legacy"
 
         /** Exact execution fingerprint, excluding the replaceable artifact URL. */
-        fun sameExecution(other: Command): Boolean = executionFingerprint() == other.executionFingerprint()
-
-        private fun executionFingerprint() = ExecutionFingerprint(
-            jobId = jobId,
-            attempt = attempt,
-            artifactId = artifactId,
-            artifactSize = artifactSize,
-            artifactSha256 = artifactSha256,
-            bundleFilename = bundleFilename,
-            destPath = destPath,
-            deleteExtras = deleteExtras,
-            revision = revision,
-            artifactEtag = artifactEtag,
-        )
+        fun sameExecution(other: Command): Boolean = copy(artifactUrl = other.artifactUrl) == other
 
         fun toJson(): JSONObject = JSONObject().apply {
             if (jobId != null) put("job_id", jobId)
@@ -74,20 +61,6 @@ object PushProtocol {
             put("delete_extras", deleteExtras)
         }
     }
-
-    /** Fields that authorize one execution; artifactUrl is only a replaceable locator. */
-    private data class ExecutionFingerprint(
-        val jobId: String?,
-        val attempt: Int,
-        val artifactId: String?,
-        val artifactSize: Long?,
-        val artifactSha256: String?,
-        val bundleFilename: String,
-        val destPath: String,
-        val deleteExtras: Boolean,
-        val revision: Long,
-        val artifactEtag: String?,
-    )
 
     /** A saved budget of powered-on time, including deep sleep, after the first interruption. */
     data class Retention(

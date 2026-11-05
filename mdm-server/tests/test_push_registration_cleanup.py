@@ -9,31 +9,9 @@ import aiohttp
 import pytest
 from aiohttp.test_utils import TestServer
 
+from server_test_helpers import reset_server_state
 from styly_mdm import server
 from ws_test_helpers import receive_type
-
-
-@pytest.fixture(autouse=True)
-def reset_server_state(tmp_path):
-    saved_paths = (server.DATA_DIR, server.APK_DIR, server.BUNDLE_DIR, server.REGISTRY_PATH)
-    collections = (
-        server.devices,
-        server.admin_connections,
-        server.pending_transfers,
-        server._transfer_tasks,
-        server.pending_self_updates,
-        server._apk_hash_cache,
-        server.device_registry,
-    )
-    for collection in collections:
-        collection.clear()
-    server.reset_transfer_slots()
-    server._apply_data_dir(str(tmp_path))
-    yield
-    for collection in collections:
-        collection.clear()
-    server.reset_transfer_slots()
-    server.DATA_DIR, server.APK_DIR, server.BUNDLE_DIR, server.REGISTRY_PATH = saved_paths
 
 
 async def recv_type(ws, expected: str, timeout: float = 2.0) -> dict:

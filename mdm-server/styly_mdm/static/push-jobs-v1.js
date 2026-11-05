@@ -71,22 +71,7 @@
   }
 
   function appendLog(text, level) {
-    const container = document.getElementById('logContainer');
-    const empty = document.getElementById('logEmpty');
-    if (!container) return;
-    if (empty) empty.style.display = 'none';
-    const entry = document.createElement('div');
-    entry.className = 'log-entry push-job-v1-entry';
-    const time = document.createElement('span');
-    time.className = 'log-time';
-    time.textContent = new Date().toLocaleTimeString();
-    const message = document.createElement('span');
-    message.className = 'log-msg ' + (level || 'info');
-    message.textContent = text;
-    entry.appendChild(time);
-    entry.appendChild(message);
-    container.appendChild(entry);
-    container.scrollTop = container.scrollHeight;
+    window.__stylyPushJobsV1Bridge.addLog(text, level);
   }
 
   function checkedJson(response) {
@@ -694,7 +679,7 @@
     const key = job.job_id + ':' + job.revision;
     if (!retryRequestIds.has(key)) retryRequestIds.set(key, uuid());
     const clientRequestId = retryRequestIds.get(key);
-    if (!trackAction('retry', job.job_id, actionTargetsForJob(job, 'retry'), clientRequestId)) return false;
+    if (!trackAction('retry', job.job_id, [], clientRequestId)) return false;
     const payload = {
       type: 'RETRY_FAILED_PUSH_JOB',
       job_id: job.job_id,
@@ -703,7 +688,7 @@
     try {
       nativeSend.call(currentAdminSocket, JSON.stringify(payload));
     } catch (error) {
-      settlePendingAction(actionKey('retry', job.job_id, actionTargetsForJob(job, 'retry')));
+      settlePendingAction(actionKey('retry', job.job_id, []));
       appendLog('Could not retry failed devices: ' + error.message, 'fail');
       return false;
     }

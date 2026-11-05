@@ -1563,6 +1563,7 @@
       // The adapter invalidates cells after updating its canonical store. It never
       // copies Push assignments into the independent Install/Verify task state.
       window.__stylyPushJobsV1Bridge = {
+        addLog: addLog,
         isDeviceOnline: function (id) { const d = deviceById(id); return !!d && d.status === 'online'; },
         refreshAttention: function () {
           if (view !== 'console') return;
