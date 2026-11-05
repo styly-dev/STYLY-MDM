@@ -695,8 +695,3 @@ sequenceDiagram
 Activity log is read-only history. Needs attention contains Resume all, Cancel
 all, Retry failed devices, and Reconcile; eligible device rows have individual
 Resume and Cancel controls.
-
-## Validation
-
-See [Push/Sync validation](PUSH_VALIDATION.md) for automated checks, hardware
-evidence, and verification limits.

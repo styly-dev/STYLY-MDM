@@ -108,7 +108,7 @@ lease credentials. Durable Push-state load failures also use fixed diagnostic me
 without exception text or causes; corrupt-state reset notices sent to the server and
 admin use fixed detail text. Registration acknowledgements and admin device-list updates
 are separate events; integration tests wait for the expected snapshot contents
-with one bounded deadline. See [Push/Sync validation](PUSH_VALIDATION.md).
+with one bounded deadline.
 
 The console renders Push progress and Resume/Cancel controls directly from the
 same selected canonical assignment. The adapter invalidates device cells when
@@ -1545,6 +1545,19 @@ cd mdm-server
 uv sync --extra dev     # editable install + pytest (plain `uv sync` drops the dev extra)
 uv run pytest           # smoke tests
 uv build                # sdist + wheel into dist/
+```
+
+For registration-sensitive and console checks, run from `mdm-server`:
+
+```bash
+uv run pytest -q tests/test_self_update.py tests/test_retire.py tests/test_duplicate_connection.py
+node --test tests/test_push_jobs_v1_console.js
+```
+
+For Android unit tests and a development APK build, run from `mdm-client`:
+
+```bash
+./gradlew testProdDebugUnitTest assembleProdDebug
 ```
 
 **Versioning.** The package version is derived from the `vX.Y.Z` git tag via
