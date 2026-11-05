@@ -57,6 +57,25 @@ async def admin_action(runtime, admin, message_type, job_id, **fields):
 
 
 @pytest.mark.asyncio
+async def test_resume_during_persistence_failure_keeps_manual_wait(manager, tmp_path):
+    original = await timed_out_job(manager)
+    runtime, session, admin = operator_runtime(manager, tmp_path)
+    session.push_state_available = False
+    session.capabilities = frozenset()
+    await runtime.handle_admin_message(admin, {
+        "type": "PUSH_FILES", "job_id": original["job_id"], "target_devices": ["D1"],
+    })
+    assert admin.messages[-1]["type"] == "ERROR"
+    assert "available Push state" in admin.messages[-1]["message"]
+    assert await manager.get_snapshot(original["job_id"]) == original
+    session.push_state_available = True
+    session.capabilities = CAPS
+    admin.messages.clear()
+    await admin_action(runtime, admin, "PUSH_FILES", original["job_id"], target_devices=["D1"])
+    assert (await manager.claim_next(["D1"]))["job"]["job_id"] == original["job_id"]
+
+
+@pytest.mark.asyncio
 async def test_admin_queued_cancel_requests_exact_reconcile_under_owner_lock(manager, tmp_path):
     original = await timed_out_job(manager)
     runtime, session, admin = operator_runtime(manager, tmp_path)

@@ -9,6 +9,7 @@ import org.junit.Test
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -41,10 +42,13 @@ class PushJobCoordinatorIntegrationTest {
         val messages = CopyOnWriteArrayList<JSONObject>()
         val events = CopyOnWriteArrayList<String>()
         val logs = CopyOnWriteArrayList<Pair<String, Throwable?>>()
+        @Volatile var lastRegistration: JSONObject? = null
         val cleanedDirectories = CopyOnWriteArrayList<File>()
         val workerRuns = AtomicInteger()
         val cleanupCalls = AtomicInteger()
         val discardCalls = AtomicInteger()
+        private val connectionRegistration = ConnectionRegistration<Any>()
+        @Volatile private var currentTransport: Any? = null
         private val actor = object : ScheduledThreadPoolExecutor(1, { runnable ->
             Thread(runnable, "push-coordinator-test-actor").apply { isDaemon = true }
         }) {
@@ -81,6 +85,7 @@ class PushJobCoordinatorIntegrationTest {
                     durableState.set(next)
                     events.add(when {
                         next.active?.phase == PushProtocol.PHASE_APPLYING -> "save:phase:applying"
+                        next.active?.interrupted == true -> "save:interrupted"
                         next.active != null -> "save:active"
                         next.completedReceipts.isNotEmpty() -> "save:result"
                         else -> "save:empty"
@@ -125,17 +130,56 @@ class PushJobCoordinatorIntegrationTest {
             assertTrue(workerExecutor.awaitTermination(2, TimeUnit.SECONDS))
         }
 
-        fun attach() {
+        fun attach(): Any {
+            val token = openTransport()
+            register(token)
+            acknowledge(token)
+            return token
+        }
+
+        fun reconnectBeforeAcknowledgement(): Pair<Any, JSONObject> {
+            val token = openTransport()
+            return token to register(token)
+        }
+
+        private fun openTransport(): Any {
             val token = Any()
+            currentTransport = token
+            connectionRegistration.open(token)
             coordinator.attachTransport(
                 token,
                 { message ->
-                    messages.add(message)
-                    events.add("send:${message.optString("type")}")
+                    if (connectionRegistration.isCanonicalAcknowledged(token)) {
+                        messages.add(message)
+                        events.add("send:${message.optString("type")}")
+                    } else {
+                        events.add("drop:${message.optString("type")}")
+                    }
                 },
                 {},
             )
+            return token
+        }
+
+        private fun register(token: Any): JSONObject {
+            val register = snapshot()
+            lastRegistration = register
+            connectionRegistration.markSent(token)
+            return register
+        }
+
+        fun acknowledge(token: Any) {
+            assertTrue(connectionRegistration.acknowledge(token))
             coordinator.onRegistered(token)
+            snapshot()
+        }
+
+        fun disconnect(token: Any) {
+            if (currentTransport === token) {
+                currentTransport = null
+                connectionRegistration.clear()
+            }
+            coordinator.detachTransport(token)
             snapshot()
         }
 
@@ -262,7 +306,7 @@ class PushJobCoordinatorIntegrationTest {
             val harness = Harness(loadStateOverride = { loadResult })
             harness.attach()
 
-            val pushState = harness.snapshot().getJSONObject("push_state")
+            val pushState = requireNotNull(harness.lastRegistration).getJSONObject("push_state")
 
             assertEquals(label, shouldDiscard, harness.discardCalls.get() == 1)
             assertTrue(label, harness.logs.isNotEmpty())
@@ -537,9 +581,137 @@ class PushJobCoordinatorIntegrationTest {
         assertEquals(1, harness.workerRuns.get())
 
         releaseWorker.countDown()
-        await { harness.messages.any { it.optString("type") == "PUSH_RECONCILE_REPORT" } }
+        await { harness.durableState.get().active?.interrupted == true }
+        harness.snapshot()
         assertEquals(0, harness.cleanupCalls.get())
+        assertEquals(
+            2,
+            harness.messages.count { it.optString("type") == "PUSH_RECONCILE_REPORT" },
+        )
+    }
+
+    @Test
+    fun `interruption during reconnect registration is replayed after acknowledgement`() {
+        val current = command()
+        val started = CountDownLatch(1)
+        val releaseWorker = CountDownLatch(1)
+        val harness = Harness().apply {
+            runExecution = { command, _ ->
+                started.countDown()
+                releaseWorker.await()
+                execution(command, interruptionReason = "download_interrupted")
+            }
+        }
+        val oldTransport = harness.attach()
+        harness.send(current)
+        assertTrue("worker did not start", started.await(2, TimeUnit.SECONDS))
+        harness.disconnect(oldTransport)
+
+        val (newTransport, register) = harness.reconnectBeforeAcknowledgement()
+        val registeredActive = register.getJSONObject("push_runtime").getJSONObject("active")
+        assertEquals("active", registeredActive.getString("status"))
+        assertEquals(current.jobId, registeredActive.getString("job_id"))
+
+        releaseWorker.countDown()
+        await {
+            harness.durableState.get().active?.interrupted == true &&
+                harness.events.contains("save:interrupted")
+        }
+        assertTrue(harness.messages.none { it.optString("type") == "PUSH_RECONCILE_REPORT" })
+
+        harness.acknowledge(newTransport)
+        val reports = { harness.messages.filter { it.optString("type") == "PUSH_RECONCILE_REPORT" } }
+        assertEquals(1, reports().size)
+        val report = reports().single()
+        assertEquals(current.jobId, report.getString("job_id"))
+        assertEquals(current.attempt, report.getInt("attempt"))
+        assertEquals(current.artifactId, report.getString("artifact_id"))
+        assertEquals("interrupted", report.getString("status"))
+        assertEquals("download_interrupted", report.getString("reason"))
+
+        harness.coordinator.onRegistered(oldTransport)
+        harness.snapshot()
+        assertEquals(1, reports().size)
+        harness.coordinator.onRegistered(newTransport)
+        harness.snapshot()
+        assertEquals(2, reports().size)
+        assertEquals(1, harness.workerRuns.get())
+    }
+
+    @Test
+    fun `interrupted state recovery reports only after its durable save succeeds`() {
+        val saveInterruptedState = AtomicBoolean(false)
+        val started = CountDownLatch(1)
+        val releaseWorker = CountDownLatch(1)
+        val harness = Harness(manualRecovery = true).apply {
+            shouldFailSave = { next ->
+                next.active?.interrupted == true && !saveInterruptedState.get()
+            }
+            runExecution = { command, _ ->
+                started.countDown()
+                releaseWorker.await()
+                execution(command, interruptionReason = "download_interrupted")
+            }
+        }
+        harness.attach()
+        harness.send(command())
+        assertTrue("worker did not start", started.await(2, TimeUnit.SECONDS))
+
+        releaseWorker.countDown()
+        await { harness.events.contains("save:failed") }
+        assertFalse(harness.durableState.get().active?.interrupted == true)
+        assertTrue(harness.messages.none { it.optString("type") == "PUSH_RECONCILE_REPORT" })
+
+        saveInterruptedState.set(true)
+        harness.runRecovery()
+        await { harness.messages.any { it.optString("type") == "PUSH_RECONCILE_REPORT" } }
         assertTrue(harness.durableState.get().active?.interrupted == true)
+        assertEquals(1, harness.messages.count { it.optString("type") == "PUSH_RECONCILE_REPORT" })
+        assertTrue(
+            harness.events.indexOf("save:interrupted") <
+                harness.events.indexOf("send:PUSH_RECONCILE_REPORT"),
+        )
+    }
+
+    @Test
+    fun `active duplicate and busy responses survive temporary persistence unavailability`() {
+        val started = CountDownLatch(1)
+        val releaseWorker = CountDownLatch(1)
+        val harness = Harness().apply {
+            shouldFailSave = { it.active?.phase == PushProtocol.PHASE_VALIDATING }
+            runExecution = { command, callbacks ->
+                started.countDown()
+                callbacks.onValidationStart()
+                releaseWorker.await()
+                execution(command)
+            }
+        }
+        harness.attach()
+        val active = command()
+        harness.send(active)
+        assertTrue("worker did not start", started.await(2, TimeUnit.SECONDS))
+        await { harness.events.contains("save:failed") }
+        assertEquals("unavailable", harness.snapshot().getJSONObject("push_state").getString("status"))
+
+        harness.send(active)
+        harness.send(active.copy(jobId = UUID.randomUUID().toString()))
+        await { harness.messages.count { it.optString("type") == "PUSH_JOB_ACCEPTED" } >= 2 }
+        await {
+            harness.messages.any {
+                it.optString("type") == "PUSH_JOB_REJECTED" &&
+                    it.optString("reason") == "device_busy"
+            }
+        }
+        assertFalse(
+            harness.messages.any {
+                it.optString("type") == "PUSH_JOB_REJECTED" &&
+                    it.optString("reason") == "client_persistence_unavailable"
+            },
+        )
+        assertEquals(1, harness.workerRuns.get())
+
+        releaseWorker.countDown()
+        await { harness.durableState.get().active == null }
     }
 
     @Test

@@ -931,6 +931,30 @@ class PushJobManager:
 
         return await self.store._call(op)
 
+    async def settle_command_rejection(
+        self, job_id: str, device_id: str, reason: str, detail: str,
+        *, expected: set[DeviceState],
+    ) -> dict[str, Any]:
+        """Settle a rejection without discarding temporarily unavailable work.
+
+        The Store checks the current state and commits the decision atomically.
+        A manual queued wait preserves execution identity, cancellation intent,
+        and FIFO exclusion while requiring fresh operator authorization.
+        """
+        unavailable = reason == "client_persistence_unavailable"
+        return await self.store.transition_device(
+            job_id, device_id, expected=expected,
+            target=DeviceState.QUEUED if unavailable else DeviceState.FAILED,
+            fields={
+                "queue_reason": "dispatch_paused" if unavailable else None,
+                "failure_code": None if unavailable else reason,
+                "failure_detail": None if unavailable else detail[:2000],
+                "accept_deadline": None,
+                "reconciliation_reason": None,
+                "reconciliation_deadline": None,
+            },
+        )
+
     async def record_progress(
         self, job_id: str, device_id: str, event: ProgressEvent, *,
         artifact_id: Any = None, received_size: Any = None,

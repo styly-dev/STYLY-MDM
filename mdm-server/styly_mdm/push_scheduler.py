@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from .push_job_manager import PushJobManager
-from .push_job_store import StoreConflict, now_ms
+from .push_job_store import StoreConflict, StoreNotFound, now_ms
 from .push_transfer_leases import (
     PushTransferLease,
     PushTransferLeases,
@@ -230,6 +231,13 @@ class PushScheduler:
                     self.wake()
                 return
 
+            if not session.push_state_available:
+                await self._settle_rejection(
+                    job_id, device_id,
+                    {DeviceState.WAITING_TRANSFER},
+                    {"reason": "client_persistence_unavailable"},
+                )
+                return
             if not PUSH_JOB_CAPABILITIES <= session.capabilities:
                 await self._fail_current(
                     job_id,
@@ -284,6 +292,13 @@ class PushScheduler:
                         )
                     assignment_now = await self.manager.assignment(job_id, device_id)
                     if assignment_now is None or assignment_now.get("cancel_requested_at") is not None:
+                        self._clear_dispatch_waiters(key, transfer_future, accept_future)
+                        return
+                    if not session.push_state_available:
+                        await self._settle_rejection(
+                            job_id, device_id, {DeviceState.DISPATCHING},
+                            {"reason": "client_persistence_unavailable"},
+                        )
                         self._clear_dispatch_waiters(key, transfer_future, accept_future)
                         return
                     artifact = snapshot["artifact"]
@@ -651,21 +666,42 @@ class PushScheduler:
             self.transfer_registry.release_exact(key, "device_busy")
             return False
 
-        self.transfer_registry.release_exact(key, "command_rejected")
+        await self._settle_rejection(
+            job_id, device_id,
+            {DeviceState.DISPATCHING, DeviceState.RECONCILING}, payload,
+        )
+        return False
+
+    async def _settle_rejection(
+        self, job_id: str, device_id: str, expected: set[DeviceState],
+        payload: dict[str, Any],
+    ) -> None:
+        """Normal, late, and pre-send rejections share one committed decision."""
         reason = payload.get("reason")
         if not isinstance(reason, str) or not reason:
             reason = "command_rejected"
         detail = payload.get("detail")
         if not isinstance(detail, str) or not detail:
             detail = reason
-        await self._fail_current(
-            job_id,
-            device_id,
-            {DeviceState.DISPATCHING, DeviceState.RECONCILING},
-            reason,
-            detail,
+        while True:
+            try:
+                snapshot = await self.manager.settle_command_rejection(
+                    job_id, device_id, reason, detail, expected=expected,
+                )
+                break
+            except (StoreConflict, StoreNotFound):
+                return
+            except (OSError, sqlite3.OperationalError):
+                # Retain this decision; generic dispatch recovery would replace
+                # the manual wait with a finite reconciliation deadline.
+                log.exception("Retrying Push rejection settlement for %s/%s", job_id, device_id)
+                await asyncio.sleep(_RUN_RETRY_DELAY)
+        # Release only after the durable decision commits.
+        self.transfer_registry.release_exact(
+            TransferKey("push", device_id, job_id, 1), "command_rejected",
         )
-        return False
+        await self.publish(snapshot)
+        self.wake()
 
     async def _handle_busy(
         self,
@@ -930,19 +966,8 @@ class PushScheduler:
                 self.transfer_registry.release_exact(key, "late_device_busy")
             return
 
-        self.transfer_registry.release_exact(key, "late_command_rejected")
-        reason = payload.get("reason")
-        if not isinstance(reason, str) or not reason:
-            reason = "command_rejected"
-        detail = payload.get("detail")
-        if not isinstance(detail, str) or not detail:
-            detail = reason
-        await self._fail_current(
-            job_id,
-            device_id,
-            {DeviceState.RECONCILING},
-            reason,
-            detail,
+        await self._settle_rejection(
+            job_id, device_id, {DeviceState.RECONCILING}, payload,
         )
 
     def command_response(

@@ -404,6 +404,11 @@ New clients register:
 
 `PushJobCoordinator` is owned by `MdmClientApplication`, not by a Service instance. It serializes commands on one actor, permits one active Push/Sync worker, persists active state before `PUSH_JOB_ACCEPTED`, and stores terminal results in an outbox until a matching `PUSH_RESULT_ACK` either accepts the result or marks its rejection as permanent with `retryable: false`. An older server that omits `retryable` is treated as retryable. Completed receipts retain the original command metadata for at most 256 entries and seven days. A missing state file is initialized as an empty state. If durable state cannot be loaded or saved, the coordinator keeps the rest of the MDM client alive but rejects new work with `client_persistence_unavailable`; it never starts a worker, publishes a phase, releases an execution lease, or sends a terminal result whose required state was not persisted.
 
+Registration completion, saved interruptions, and storage recovery use the same replay
+path, reading the current durable interrupted ownership and pending results.
+An interruption after the REGISTER snapshot but before REGISTERED is therefore
+reported once the connection is acknowledged; stale JSON is not queued for replay.
+
 The worker's phase callbacks report observations. Before destination mutation,
 The required `beforeApply` callback is an explicit checkpoint: the worker waits for the actor to save
 `applying`, and a rejected or failed checkpoint returns
@@ -473,6 +478,17 @@ until the client reports available state. A client that has not loaded its durab
 state ignores reconciliation requests instead of answering `absent`.
 Job creation for such a target fails with an explanation instead of a capability
 error.
+
+A `client_persistence_unavailable` command rejection, including a late response,
+returns the assignment to the existing `queued` / `dispatch_paused` manual wait.
+The dispatch identity, partial offset, and cancellation intent are preserved;
+the exact HTTP lease and transfer slot are released only after that state commits.
+This wait has no reconciliation deadline and survives server restart. It blocks
+later jobs for the device through the existing queue order. Resume requires
+available Push state, and dispatch rechecks availability after slot acquisition
+and under the connection-owner lock before sending. Storage recovery alone does
+not authorize another download. Pending cancellation still requires exact cleanup
+confirmation. Permanent command rejections remain terminal failures.
 
 The worker validates destination paths on the device as well as the server. It accepts only a shared-storage subdirectory, rejects protected top-level media/app directories, does not traverse destination symlinks, bounds ZIP entry count and expanded bytes, rejects duplicate or conflicting archive paths, and validates the exact job-v1 artifact size and SHA-256 before publishing the downloaded ZIP or touching the destination. Destination validation completes before the client reports `applying`.
 

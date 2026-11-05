@@ -1907,9 +1907,13 @@ class PushRuntime:
                     requested = targets if targets is not None else list(current["devices"])
                     if not set(requested) <= current["devices"].keys():
                         raise StoreConflict("Resume targets must belong to this job")
-                    targets = [device_id for device_id in requested if device_id in self.sessions]
+                    targets = [
+                        device_id for device_id in requested
+                        if device_id in self.sessions
+                        and self.sessions[device_id].push_state_available
+                    ]
                     if not targets:
-                        raise StoreConflict("Resume requires an online device")
+                        raise StoreConflict("Resume requires an online device with available Push state")
                 changed, snapshot = await self.store.enable_dispatch(job_id, targets)
                 # Like job creation, dispatch skips offline devices: their queued
                 # work must not start later merely because they reconnect.

@@ -482,7 +482,7 @@ class PushJobCoordinator internal constructor(
                 transportRegistered = true
                 expireIfStale()
                 resetNotices.onRegistered(token)
-                replayPendingResults()
+                replayDurableState()
             }
         }
     }
@@ -594,6 +594,7 @@ class PushJobCoordinator internal constructor(
         if (recovered) {
             recoveryBudget.onRecovered()
             setDurabilityAvailable(true)
+            if (state.active?.interrupted == true) replayDurableState()
             log(Log.INFO, "Durable Push/Sync state recovered", null)
         } else if (recoveryBudget.onAttemptFailed()) {
             scheduleRecoveryAttempt()
@@ -667,14 +668,12 @@ class PushJobCoordinator internal constructor(
             return
         }
 
-        if (!durabilityAvailable) {
-            rejectPersistenceUnavailable(command)
-            return
-        }
-
         val current = state.active?.command
         when {
-            current == null -> accept(command)
+            current == null -> {
+                if (!durabilityAvailable) rejectPersistenceUnavailable(command)
+                else accept(command)
+            }
             !sameIdentity(current, command) -> rejectBusy(command, current)
             current.sameExecution(command) -> handleDuplicate(command)
             else -> rejectConflict(command, "same identity carried different artifact, destination, or mode")
@@ -900,18 +899,7 @@ class PushJobCoordinator internal constructor(
                     unsavedTerminal = command to execution
                     return
                 }
-                if (command.isJobV1) {
-                    val identity = PushProtocol.ReconcileIdentity(
-                        requireNotNull(command.jobId),
-                        command.attempt,
-                        command.artifactId,
-                    )
-                    send(buildActivePushReconcileReport(
-                        identity,
-                        requireNotNull(state.active),
-                        validatedOffset(command),
-                    ))
-                }
+                replayDurableState()
                 return
             }
             is PushFilesWorker.Outcome.Completed -> outcome.result
@@ -973,8 +961,20 @@ class PushJobCoordinator internal constructor(
         persist(next)
     }
 
-    private fun replayPendingResults() {
+    /** Re-presents current durable state after registration, interruption, or storage recovery. */
+    private fun replayDurableState() {
+        if (!transportRegistered) return
         state.pendingResults.forEach { send(it.result.toJson()) }
+        val active = state.active?.takeIf {
+            stateLoaded && durabilityAvailable && it.interrupted && it.command.isJobV1
+        } ?: return
+        val command = active.command
+        val identity = PushProtocol.ReconcileIdentity(
+            requireNotNull(command.jobId),
+            command.attempt,
+            command.artifactId,
+        )
+        send(buildActivePushReconcileReport(identity, active, validatedOffset(command)))
     }
 
     private fun handleReconcileRequest(payload: JSONObject) {

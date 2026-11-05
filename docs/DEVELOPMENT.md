@@ -29,12 +29,15 @@ download budget with Push/Sync.
 and commits related state, fences, and revisions together. `push_runtime.py`
 adapts HTTP/WebSocket messages and queues committed snapshots for admin publication.
 `PushScheduler` owns dispatch tasks and exact transfer waiters. Artifact GC runs
-separately from deadline maintenance.
+separately from deadline maintenance. Normal and late command rejections share
+the Manager's settlement rule: temporary state-storage failure preserves the
+assignment in an existing manual Resume wait; transfer release follows commit.
 
 On Android, `PushJobCoordinator` serializes events through its actor and uses
 durable `state.active` as the execution owner. `PushFilesWorker` downloads and
 validates the artifact, then waits for a durable applying checkpoint before
-changing destination files.
+changing destination files. Registration, saved interruptions, and storage recovery
+share one replay path for current interrupted ownership and pending results.
 
 The console's `push-jobs-v1.js` keeps revisioned canonical snapshots and exposes an
 asynchronous submission API to the existing file panels. Submission request IDs
@@ -484,7 +487,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `EXECUTE_UNINSTALL` | Silently uninstall an app (`pbsControlAPPManger` / `PACKAGE_SILENCE_UNINSTALL`). Fields: `package_name`. The client refuses its own and the guard's package, and clears the startup app first when the target is it. See [Remote App Uninstall](#remote-app-uninstall). |
 | `EXECUTE_REBOOT` / `EXECUTE_POWER_OFF` | Reboot or power off the device immediately via the PICO advanced device-control API (`pbsControlSetDeviceAction`). Canonical targets receive no fields; provisional targets receive their exact `connection_id` and only a capability-gated client may accept the command. See [Remote Power Control](#remote-power-control). |
 | `EXECUTE_INSTALL` | Download and install an APK. Fields: `apk_url`, `apk_filename`, plus `full_sha256` + `cd_sha256` (reference hashes of the file being dispatched; present only when the APK is a local upload in `apks/`). The client verifies the download against `full_sha256` before installing; a **self**-update is refused outright when the hashes are absent. |
-| `REGISTERED` | Server acknowledgement after ownership/capability processing. Field: `session_id`. The client then enables command handling, starts battery telemetry, and replays its durable pending terminal outbox. |
+| `REGISTERED` | Server acknowledgement after ownership/capability processing. Field: `session_id`. The client then enables command handling, starts battery telemetry, and replays its current durable interruption and pending terminal outbox. |
 | `REGISTERED_PROVISIONAL` | Acknowledges a provisional registration or status update. Fields: server-issued `connection_id`. After this ACK, a client with `provisional_power_control_v1` may accept only `EXECUTE_REBOOT` and `EXECUTE_POWER_OFF` carrying the same ID; battery telemetry, Push, and all other commands remain disabled until canonical registration completes. |
 | `EXECUTE_PUSH_FILES` | Push-job fields: `job_id`, fixed `attempt=1`, immutable per-device dispatch `revision`, immutable `artifact_id`, absolute `artifact_url` with an in-memory assignment `lease` token, exact size/SHA-256/strong-ETag metadata, destination, and server-derived `delete_extras`. Every job target must advertise `push_job_id_v1` and `push_resume_v1`, regardless of artifact size. A resumed command keeps the original dispatch revision and gets a new lease token. Commands without job-v1 identity are not admitted as job targets. Identity-less live Push commands are rejected. Safety-critical fields that are present require their exact JSON types. |
 | `PUSH_RESULT_ACK` | Terminal-result disposition. Fields: exact identity, `accepted`, committed `revision` when a local canonical job exists, and on rejection `reason` plus `retryable`. The client retains retryable results; accepted or permanently rejected results leave the pending outbox while remaining in bounded dedupe receipts. |

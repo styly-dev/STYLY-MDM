@@ -9,11 +9,13 @@ import pytest
 
 from styly_mdm.push_job_manager import PushJobManager
 from styly_mdm.push_job_store import PushJobStore, now_ms
-from styly_mdm.push_jobs import DeviceState, ProtocolMode, canonicalize_create_request
+from styly_mdm.push_jobs import DeviceState, ProgressEvent, ProtocolMode, canonicalize_create_request
 from styly_mdm.push_runtime import PushRuntime
 from styly_mdm.push_scheduler import LiveSession, PushScheduler
 from styly_mdm.push_transfer_leases import PushTransferLeases, TRANSFER_IDLE_SECONDS
 from styly_mdm.transfer_registry import TransferKey, TransferRegistry
+from test_push_cancellation import runtime_for
+from test_push_review_connection import ready_job
 
 
 async def _publish(_snapshot):
@@ -56,6 +58,243 @@ def _scheduler(manager, registry, leases, sessions, slots):
         send_timeout=1, accept_timeout=0.1, accept_reconciliation_timeout=60,
         reconciliation_timeout=60,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late", [False, True])
+@pytest.mark.parametrize("resumed", [False, True])
+@pytest.mark.parametrize("finish", ["resume", "cancel"])
+async def test_persistence_rejection_preserves_manual_wait_through_recovery(
+    tmp_path, late, resumed, finish,
+):
+    async with _ready(tmp_path) as (manager, _caps, snapshot, _claimed):
+        job_id = snapshot["job_id"]
+        dispatched = await manager.prepare_dispatch(job_id, "D1", accept_deadline=100)
+        revision = dispatched["devices"]["D1"]["dispatch_revision"]
+        report = {
+            "job_id": job_id, "attempt": 1, "status": "interrupted",
+            "phase": "downloading", "reason": "download_interrupted",
+            "artifact_id": snapshot["artifact"]["artifact_id"],
+            "revision": revision, "validated_offset": 1,
+        }
+        if resumed:
+            await manager.record_progress(job_id, "D1", ProgressEvent.ACCEPTED)
+            await manager.resume_interrupted(
+                job_id, "D1", attempt=1, artifact_id=report["artifact_id"],
+                dispatch_revision=revision, validated_offset=1,
+                reason="download_interrupted",
+            )
+            await manager.store.enable_dispatch(job_id)
+            assert await manager.claim_next(["D1"]) is not None
+            dispatched = await manager.prepare_dispatch(job_id, "D1", accept_deadline=100)
+        before = await manager.assignment(job_id, "D1")
+        runtime, session = runtime_for(manager)
+        scheduler = _scheduler(manager, runtime.transfers, runtime.leases,
+                               runtime.sessions, asyncio.Semaphore(1))
+        scheduler.wake = lambda: None
+        key = TransferKey("push", "D1", job_id, 1)
+        runtime.transfers.register(key, asyncio.get_running_loop().create_future())
+        runtime.leases.issue(key, report["artifact_id"])
+        rejection = {"reason": "client_persistence_unavailable"}
+        if late:
+            await manager.mark_reconciling(
+                job_id, "D1", expected={DeviceState.DISPATCHING},
+                reason="command_accept_timeout", deadline=1,
+            )
+            await scheduler.handle_late_command_response(
+                job_id=job_id, device_id="D1", outcome="rejected", payload=rejection,
+            )
+        else:
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(("rejected", rejection))
+            assert not await scheduler._await_acceptance(
+                session, dispatched, "D1", future, key, 100,
+            )
+        paused = await manager.assignment(job_id, "D1")
+        assert paused["state"] == "queued"
+        assert paused["queue_reason"] == "dispatch_paused"
+        for field in ("dispatch_revision", "accepted_at", "validated_offset"):
+            assert paused[field] == before[field]
+        assert runtime.transfers.get(key).done()
+        assert runtime.leases.token(key) is None
+        assert await manager.expired_reconciliations(now_ms() + 86_400_000) == []
+        await runtime._resume_interrupted_report(session, "D1", report, paused)
+        assert session.ws.messages == [], "valid retained work must not be rejected"
+        later = await ready_job(manager.store, manager)
+        await manager.store.enable_dispatch(later["job_id"])
+        assert await manager.claim_next(["D1"]) is None
+        manager.store.recover_startup_sync(
+            accept_reconciliation_timeout_ms=1000, reconciliation_timeout_ms=1000,
+        )
+        assert (await manager.assignment(job_id, "D1"))["queue_reason"] == "dispatch_paused"
+        assert await manager.expired_reconciliations(now_ms() + 86_400_000) == []
+        if finish == "cancel":
+            await manager.cancel_interrupted(job_id, "D1")
+            await runtime._handle_reconcile_report(session, "D1", report)
+            assert session.ws.messages[-1]["type"] == "PUSH_RESUME_REJECTED"
+            await runtime._handle_reconcile_report(session, "D1", {
+                "job_id": job_id, "attempt": 1, "artifact_id": report["artifact_id"],
+                "status": "absent",
+            })
+            assert (await manager.assignment(job_id, "D1"))["failure_code"] == "cancelled"
+            await manager.store.enable_dispatch(later["job_id"])
+            assert (await manager.claim_next(["D1"]))["job"]["job_id"] == later["job_id"]
+        else:
+            await manager.store.enable_dispatch(job_id)
+            assert (await manager.claim_next(["D1"]))["job"]["job_id"] == job_id
+            resumed_snapshot = await manager.prepare_dispatch(job_id, "D1", accept_deadline=200)
+            assert resumed_snapshot["devices"]["D1"]["dispatch_revision"] == revision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["before_send", "normal", "late"])
+async def test_rejection_commit_failure_retries_the_same_decision(tmp_path, monkeypatch, stage):
+    async with _ready(tmp_path) as (manager, _caps, snapshot, claimed):
+        job_id = snapshot["job_id"]
+        runtime, session = runtime_for(manager)
+        scheduler = _scheduler(manager, runtime.transfers, runtime.leases,
+                               runtime.sessions, asyncio.Semaphore(1))
+        scheduler.wake = lambda: None
+        runtime.scheduler = scheduler
+        key = TransferKey("push", "D1", job_id, 1)
+        attempts = []
+        original_commit = manager.store._commit
+        def fail_first_pause(conn):
+            row = conn.execute("SELECT state FROM push_job_devices WHERE job_id=?", (job_id,)).fetchone()
+            if row["state"] == "queued":
+                # No lease/slot may be released before either commit attempt.
+                assert not runtime.transfers.get(key).done()
+                assert runtime.leases.token(key) is not None or stage == "before_send"
+                attempts.append(row["state"])
+                if len(attempts) == 1:
+                    raise OSError("injected commit failure")
+            original_commit(conn)
+        async def publish(_snapshot):
+            if stage == "before_send":
+                session.push_state_available = False
+        async def send_command(text):
+            session.ws.messages.append(json.loads(text))
+            session.push_state_available = False
+            scheduler.command_response(
+                job_id=job_id, device_id="D1", attempt=1, outcome="rejected",
+                payload={"reason": "client_persistence_unavailable"},
+            )
+        scheduler.publish = publish
+        session.ws.send_str = send_command
+        monkeypatch.setattr("styly_mdm.push_scheduler._RUN_RETRY_DELAY", 0)
+        monkeypatch.setattr(manager.store, "_commit", fail_first_pause)
+        if stage == "late":
+            await manager.prepare_dispatch(job_id, "D1", accept_deadline=100)
+            await manager.mark_reconciling(job_id, "D1", expected={DeviceState.DISPATCHING},
+                                          reason="command_accept_timeout", deadline=1)
+            runtime.transfers.register(key, asyncio.get_running_loop().create_future())
+            runtime.leases.issue(key, snapshot["artifact"]["artifact_id"])
+            async with session.owner_lock:
+                await runtime._handle_owned_job_v1_message(session, "D1", {
+                    "type": "PUSH_JOB_REJECTED", "job_id": job_id, "attempt": 1,
+                    "reason": "client_persistence_unavailable",
+                })
+            assert runtime.transfers.get(key).done()
+            runtime.transfers.remove_if_same(key, runtime.transfers.get(key))
+        else:
+            await scheduler._dispatch_assignment(claimed)
+        paused = (await manager.get_snapshot(job_id))["devices"]["D1"]
+        assert attempts == ["queued", "queued"]
+        assert paused["state"] == "queued" and paused["manual_wait"]
+        assert paused["failure"] is None
+        assert runtime.transfers.get(key) is None
+        assert runtime.leases.token(key) is None
+        assert len(session.ws.messages) == (1 if stage == "normal" else 0)
+
+
+@pytest.mark.asyncio
+async def test_rejection_storage_retry_can_be_cancelled(tmp_path, monkeypatch):
+    async with _ready(tmp_path) as (manager, _caps, snapshot, claimed):
+        runtime, session = runtime_for(manager)
+        scheduler = _scheduler(manager, runtime.transfers, runtime.leases,
+                               runtime.sessions, asyncio.Semaphore(1))
+        scheduler.wake = lambda: None
+        original_commit = manager.store._commit
+        failed = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        def fail_pause(conn):
+            row = conn.execute("SELECT state FROM push_job_devices WHERE job_id=?",
+                               (snapshot["job_id"],)).fetchone()
+            if row["state"] == "queued":
+                loop.call_soon_threadsafe(failed.set)
+                raise OSError("storage remains unavailable")
+            original_commit(conn)
+        async def publish(_snapshot):
+            session.push_state_available = False
+        scheduler.publish = publish
+        monkeypatch.setattr(manager.store, "_commit", fail_pause)
+        task = asyncio.create_task(scheduler._dispatch_assignment_inner(claimed))
+        try:
+            await asyncio.wait_for(failed.wait(), 1)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert not session.owner_lock.locked()
+        assert len(runtime.transfers) == 0
+        assert runtime.leases.token(TransferKey("push", "D1", snapshot["job_id"], 1)) is None
+        assert (await manager.assignment(snapshot["job_id"], "D1"))["state"] == "dispatching"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["waiting_slot", "before_send"])
+async def test_dispatch_becoming_unavailable_returns_to_manual_wait(tmp_path, stage):
+    async with _ready(tmp_path) as (manager, _caps, snapshot, claimed):
+        runtime, session = runtime_for(manager)
+        scheduler = _scheduler(manager, runtime.transfers, runtime.leases,
+                               runtime.sessions, asyncio.Semaphore(1))
+        scheduler.wake = lambda: None
+        async def publish(_snapshot):
+            session.push_state_available = False
+            session.capabilities = frozenset()
+        if stage == "waiting_slot":
+            session.push_state_available = False
+            session.capabilities = frozenset()
+        else:
+            scheduler.publish = publish
+        await scheduler._dispatch_assignment_inner(claimed)
+        paused = (await manager.get_snapshot(snapshot["job_id"]))["devices"]["D1"]
+        assert paused["state"] == "queued" and paused["manual_wait"]
+        assert session.ws.messages == []
+        assert await manager.claim_next(["D1"]) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late", [False, True])
+async def test_permanent_rejection_remains_terminal(tmp_path, late):
+    async with _ready(tmp_path) as (manager, _caps, snapshot, _claimed):
+        job_id = snapshot["job_id"]
+        dispatched = await manager.prepare_dispatch(job_id, "D1", accept_deadline=100)
+        runtime, session = runtime_for(manager)
+        scheduler = _scheduler(manager, runtime.transfers, runtime.leases,
+                               runtime.sessions, asyncio.Semaphore(1))
+        scheduler.wake = lambda: None
+        payload = {"reason": "artifact_identity_mismatch", "detail": "Conflicting artifact"}
+        if late:
+            await manager.mark_reconciling(job_id, "D1", expected={DeviceState.DISPATCHING},
+                                          reason="command_accept_timeout", deadline=1)
+            await scheduler.handle_late_command_response(
+                job_id=job_id, device_id="D1", outcome="rejected", payload=payload,
+            )
+        else:
+            response = asyncio.get_running_loop().create_future()
+            response.set_result(("rejected", payload))
+            await scheduler._await_acceptance(
+                session, dispatched, "D1", response, TransferKey("push", "D1", job_id, 1), 100,
+            )
+        failed = await manager.assignment(job_id, "D1")
+        assert failed["state"] == "failed"
+        assert failed["failure_code"] == "artifact_identity_mismatch"
+        await scheduler.handle_late_command_response(
+            job_id=job_id, device_id="D1", outcome="rejected",
+            payload={"reason": "client_persistence_unavailable"},
+        )
+        assert await manager.assignment(job_id, "D1") == failed
 
 
 @pytest.mark.asyncio
