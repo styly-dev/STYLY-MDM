@@ -28,10 +28,15 @@ async def newer_job(store, original, *, destination=None, request_id=None):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ending", ["upload_failure", "expiry", "restart", "cancel", "offline", "transition"])
-async def test_retry_dependency_revised_and_published_when_newer_work_ends(manager, tmp_path, ending):
+@pytest.mark.parametrize("destination", [
+    "/sdcard/STYLY/content", "/sdcard/STYLY/content/eventA", "/sdcard/STYLY",
+])
+async def test_retry_dependency_revised_and_published_when_newer_work_ends(
+    manager, tmp_path, ending, destination,
+):
     store = manager.store
     original = await completed(manager, tmp_path)
-    _, newer = await newer_job(store, original)
+    _, newer = await newer_job(store, original, destination=destination)
     changed, = await store.drain_retry_publications()
     assert changed["job_id"] == original["job_id"]
     assert changed["revision"] > original["revision"]
@@ -74,10 +79,11 @@ async def test_retry_dependency_revised_and_published_when_newer_work_ends(manag
 
 
 @pytest.mark.asyncio
-async def test_other_destination_and_idempotent_creation_do_not_revise_dependencies(manager, tmp_path):
+@pytest.mark.parametrize("destination", ["/sdcard/STYLY/other", "/sdcard/STYLY/content2"])
+async def test_other_destination_and_idempotent_creation_do_not_revise_dependencies(manager, tmp_path, destination):
     store = manager.store
     original = await completed(manager, tmp_path)
-    await newer_job(store, original, destination="/sdcard/STYLY/other")
+    await newer_job(store, original, destination=destination)
     assert await store.drain_retry_publications() == []
     assert (await store.get_snapshot(original["job_id"]))["revision"] == original["revision"]
     request_id = str(uuid.uuid4())
@@ -121,9 +127,9 @@ async def test_unchanged_old_history_is_not_revised_or_republished(manager, tmp_
 async def test_only_last_pending_superseder_restores_old_retry(manager, tmp_path):
     store = manager.store
     original = await completed(manager, tmp_path)
-    _, first = await newer_job(store, original)
+    _, first = await newer_job(store, original, destination="/sdcard/STYLY/content/eventA")
     paused, = await store.drain_retry_publications()
-    _, second = await newer_job(store, original)
+    _, second = await newer_job(store, original, destination="/sdcard/STYLY/content/eventB")
     assert await store.drain_retry_publications() == []
     await store.fail_pre_dispatch(first["job_id"], JobState.FAILED, "upload_failed", "Upload failed")
     assert await store.drain_retry_publications() == []

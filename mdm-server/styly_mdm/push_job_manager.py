@@ -610,16 +610,15 @@ class PushJobManager:
             )
             # Resolve supersession once for the whole list instead of repeating a
             # cross-job search for every job. Enqueue order is independent of clocks.
-            latest_work = {
-                (row["dest_path"], row["device_id"]): row["enqueue_seq"]
-                for row in conn.execute(
-                    "SELECT j.dest_path, d.device_id, MAX(d.enqueue_seq) AS enqueue_seq "
-                    "FROM push_job_devices d JOIN push_jobs j ON j.job_id=d.job_id "
-                    "WHERE d.dispatch_revision IS NOT NULL "
-                    "OR d.state NOT IN ('succeeded','failed','interrupted','unconfirmed') "
-                    "GROUP BY j.dest_path, d.device_id"
-                )
-            }
+            latest_work: dict[str, dict[str, int]] = {}
+            for row in conn.execute(
+                "SELECT j.dest_path, d.device_id, MAX(d.enqueue_seq) AS enqueue_seq "
+                "FROM push_job_devices d JOIN push_jobs j ON j.job_id=d.job_id "
+                "WHERE d.dispatch_revision IS NOT NULL "
+                "OR d.state NOT IN ('succeeded','failed','interrupted','unconfirmed') "
+                "GROUP BY j.dest_path, d.device_id"
+            ):
+                latest_work.setdefault(row["device_id"], {})[row["dest_path"]] = row["enqueue_seq"]
             snapshots = [
                 self.store._snapshot(conn, job_id, latest_work=latest_work)
                 for job_id in ids

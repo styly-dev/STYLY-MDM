@@ -362,9 +362,11 @@ artifact bytes. HTTP leases follow the restart behavior described above.
   a remaining device fence still exposes Reconcile in the job controls.
 - **Retry failed devices** creates and dispatches a new job for online `failed`,
   `interrupted`, and `unconfirmed` targets, excluding `failure_code: cancelled`.
-  A target is also excluded when a later job for the same device and destination
-  was dispatched or is still pending: retrying the older artifact would overwrite
-  newer content (and, for Sync, delete it). Online means a live session that
+  A target is also excluded when a later job for the same device was dispatched
+  or is still pending at the same destination, an ancestor, or a descendant:
+  retrying the older artifact would overwrite newer content (and, for Sync,
+  delete it). Comparisons use canonical paths and directory boundaries, so
+  `/content` and `/content2` remain independent. Online means a live session that
   advertises the Push job capabilities with available Push state; a target that
   disconnects before the retry job is enabled is settled like any offline target.
   It reuses the immutable artifact without upload and leaves success records and
@@ -644,7 +646,8 @@ job/device, integer attempt 1, artifact, immutable integer dispatch revision, an
 integer offset within the artifact size (booleans are not integers here). The
 exact job-v1 fence must still belong to this assignment, with no other active
 owner, pending cancellation, Retry for this device, or later pending/dispatched
-work for the same device and destination. The artifact must be retained and its
+work for the same device at an overlapping destination (equal, ancestor, or
+descendant). The artifact must be retained and its
 canonical physical file must have the recorded size; a GC tombstone rejects
 recovery even when unlink has not finished.
 

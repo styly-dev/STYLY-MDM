@@ -425,6 +425,11 @@ def canonical_destination(value: Any) -> str:
     return "/sdcard/" + remainder
 
 
+def destinations_overlap(left: str, right: str) -> bool:
+    """Compare canonical destinations at directory boundaries."""
+    return left == right or left.startswith(right + "/") or right.startswith(left + "/")
+
+
 def canonicalize_create_request(data: Mapping[str, Any]) -> CanonicalCreateRequest:
     client_request_id = require_uuid(data.get("client_request_id"), "client_request_id")
 

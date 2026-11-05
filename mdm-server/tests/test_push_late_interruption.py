@@ -230,7 +230,7 @@ async def test_late_recovery_requires_retained_canonical_complete_bytes(manager,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("condition", ["cancel", "retry", "new_pending", "new_dispatched", "other_owner", "failed", "interrupted", "succeeded", "other_failure"])
+@pytest.mark.parametrize("condition", ["cancel", "retry", "new_pending", "new_child", "new_parent", "new_dispatched", "other_owner", "failed", "interrupted", "succeeded", "other_failure"])
 async def test_late_recovery_cannot_overrule_a_later_decision(manager, tmp_path, condition):
     job, report = await interrupted(manager, tmp_path)
     job_id = job["job_id"]
@@ -238,9 +238,13 @@ async def test_late_recovery_cannot_overrule_a_later_decision(manager, tmp_path,
         await manager.cancel_interrupted(job_id, "D1")
     elif condition == "retry":
         await manager.retry_failed(job_id, str(uuid.uuid4()), artifact_root=tmp_path, online_devices=["D1"])
-    elif condition in {"new_pending", "new_dispatched", "other_owner"}:
-        later = await ready(manager, tmp_path, destination="/sdcard/STYLY/other" if condition == "other_owner" else job["dest_path"])
-        if condition != "new_pending":
+    elif condition in {"new_pending", "new_child", "new_parent", "new_dispatched", "other_owner"}:
+        destination = {
+            "new_child": job["dest_path"] + "/eventA",
+            "new_parent": "/sdcard/STYLY", "other_owner": "/sdcard/STYLY/other",
+        }.get(condition, job["dest_path"])
+        later = await ready(manager, tmp_path, destination=destination)
+        if condition in {"new_dispatched", "other_owner"}:
             await manager.store._call(lambda conn: conn.execute(
                 "UPDATE push_job_devices SET state=?, dispatch_revision=1 WHERE job_id=?",
                 ("downloading" if condition == "other_owner" else "succeeded", later["job_id"]),

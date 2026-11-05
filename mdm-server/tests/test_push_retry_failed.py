@@ -107,13 +107,24 @@ async def test_old_failure_cannot_be_retried_twice_but_new_failure_can(manager, 
 
 
 @pytest.mark.asyncio
-async def test_retry_skips_targets_superseded_by_later_work_for_same_destination(manager, tmp_path):
+@pytest.mark.parametrize('destination, supersedes', [
+    ('/sdcard/STYLY/content', True),
+    ('/sdcard/STYLY/content/eventA', True),
+    ('/sdcard/STYLY', True),
+    ('/storage/emulated/0/STYLY/content/eventA/', True),
+    ('/sdcard/STYLY/content2', False),
+    ('/sdcard/STYLY/other', False),
+])
+@pytest.mark.parametrize('newer_completed', [False, True])
+async def test_retry_skips_targets_superseded_by_later_overlapping_work(
+    manager, tmp_path, destination, supersedes, newer_completed,
+):
     original = await completed(manager, tmp_path)
     assert {d for d, a in original['devices'].items() if a['retryable']} == {
         'failed', 'interrupted', 'unknown'}
     request = canonicalize_create_request({
         'client_request_id': str(uuid.uuid4()), 'target_devices': ['failed', 'interrupted'],
-        'mode': 'sync', 'dest_path': original['dest_path'],
+        'mode': 'sync', 'dest_path': destination,
         'source': {'display_name': 'newer', 'declared_file_count': 1, 'declared_total_bytes': 4},
     })
     _, newer = await manager.store.create_job(request, {
@@ -122,12 +133,29 @@ async def test_retry_skips_targets_superseded_by_later_work_for_same_destination
     await manager.store._call(lambda conn: conn.execute(
         'UPDATE push_jobs SET created_at=? WHERE job_id=?',
         (original['created_at'] + 1000, newer['job_id'])))
-    # Pending newer work supersedes the old targets: retrying them would overwrite it.
+    if newer_completed:
+        job_id = newer['job_id']
+        await manager.store.start_upload(job_id)
+        await manager.store.mark_packaging(job_id, 1, 4)
+        await manager.store.publish_artifact(job_id, {
+            'artifact_id': str(uuid.uuid4()), 'storage_name': 'newer.zip',
+            'display_filename': 'newer.zip', 'byte_size': 4,
+            'sha256': 'b' * 64, 'entry_count': 1,
+        })
+        await manager.store.enable_dispatch(job_id)
+        for device_id in ('failed', 'interrupted'):
+            assert (await manager.claim_next([device_id]))['job']['job_id'] == job_id
+            await manager.prepare_dispatch(job_id, device_id, accept_deadline=now_ms() + 60_000)
+            assert (await manager.settle_result(job_id, device_id, 1, 'success')).accepted
+    # Retry must not overwrite newer content, including child or parent destinations.
     current = await manager.get_snapshot(original['job_id'])
-    assert {d for d, a in current['devices'].items() if a['retryable']} == {'unknown'}
+    expected = {'unknown'} if supersedes else {'failed', 'interrupted', 'unknown'}
+    assert {d for d, a in current['devices'].items() if a['retryable']} == expected
+    listed = {job['job_id']: job for job in await manager.list_snapshots(100, 0)}
+    assert listed[original['job_id']] == current
     _, retry = await manager.retry_failed(
         original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
-    assert set(retry['devices']) == {'unknown'}
+    assert set(retry['devices']) == expected
 
 
 @pytest.mark.asyncio

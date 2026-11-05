@@ -31,6 +31,7 @@ from .push_jobs import (
     aggregate_device_states,
     assignment_actions,
     derive_dispatched_job_state,
+    destinations_overlap,
     is_terminal_job_state,
     validate_device_transition,
     validate_job_transition,
@@ -85,6 +86,7 @@ class _DbWorker:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(self._path, isolation_level=None, timeout=5.0)
             conn.row_factory = sqlite3.Row
+            conn.create_function("destinations_overlap", 2, destinations_overlap, deterministic=True)
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = FULL")
             conn.execute("PRAGMA foreign_keys = ON")
@@ -456,7 +458,7 @@ class PushJobStore:
                 AND older.enqueue_seq<newer.enqueue_seq
             JOIN push_jobs previous ON previous.job_id=older.job_id
             JOIN push_artifacts artifact ON artifact.artifact_id=previous.artifact_id
-            WHERE newer.job_id=? AND previous.dest_path=source.dest_path
+            WHERE newer.job_id=? AND destinations_overlap(previous.dest_path, source.dest_path)
                 AND newer.dispatch_revision IS NULL
                 AND artifact.retention_state='retained'
                 AND COALESCE(previous.failure_code, '') <> 'artifact_missing'
@@ -473,7 +475,8 @@ class PushJobStore:
                     SELECT 1 FROM push_job_devices other
                     JOIN push_jobs other_job ON other_job.job_id=other.job_id
                     WHERE other.device_id=older.device_id AND other.enqueue_seq>older.enqueue_seq
-                        AND other_job.dest_path=previous.dest_path AND other.job_id<>source.job_id
+                        AND destinations_overlap(other_job.dest_path, previous.dest_path)
+                        AND other.job_id<>source.job_id
                         AND (other.dispatch_revision IS NOT NULL
                             OR other.state NOT IN ('succeeded','failed','interrupted','unconfirmed'))
                 )
@@ -612,7 +615,7 @@ class PushJobStore:
 
     @staticmethod
     def _superseded_devices(conn: sqlite3.Connection, job: Mapping[str, Any]) -> set[str]:
-        """Targets of ``job`` with later dispatched or pending work for its destination."""
+        """Targets with later dispatched or pending work in an overlapping destination."""
 
         return {
             row["device_id"]
@@ -622,7 +625,7 @@ class PushJobStore:
                 "SELECT 1 FROM push_job_devices newer "
                 "JOIN push_jobs j ON j.job_id=newer.job_id "
                 "WHERE newer.device_id=older.device_id "
-                "AND newer.enqueue_seq>older.enqueue_seq AND j.dest_path=? "
+                "AND newer.enqueue_seq>older.enqueue_seq AND destinations_overlap(j.dest_path, ?) "
                 "AND (newer.dispatch_revision IS NOT NULL "
                 "OR newer.state NOT IN ('succeeded','failed','interrupted','unconfirmed'))) ",
                 (job["job_id"], job["dest_path"]),
@@ -641,7 +644,7 @@ class PushJobStore:
     @staticmethod
     def _snapshot(
         conn: sqlite3.Connection, job_id: str, *,
-        latest_work: Mapping[tuple[str, str], int] | None = None,
+        latest_work: Mapping[str, Mapping[str, int]] | None = None,
     ) -> dict[str, Any]:
         job = conn.execute(
             """
@@ -667,8 +670,10 @@ class PushJobStore:
             PushJobStore._superseded_devices(conn, job)
             if latest_work is None else {
                 row["device_id"] for row in device_rows
-                if latest_work.get((job["dest_path"], row["device_id"]), 0)
-                > row["enqueue_seq"]
+                if any(
+                    sequence > row["enqueue_seq"] and destinations_overlap(job["dest_path"], destination)
+                    for destination, sequence in latest_work.get(row["device_id"], {}).items()
+                )
             }
         )
         fences = {

@@ -36,6 +36,8 @@ Exact late interruption can reopen only a still-fenced reconciliation timeout,
 with retained physical artifact bytes and no cancellation, Retry, newer work, or
 other owner. Recovery and every fence-visible revision commit together and require
 a fresh Resume. Both interruption and timeout cleanup preserve replacement waiters.
+Retry and late recovery protect newer work at equal, parent, and child destinations;
+SQL decisions and batched snapshots share the canonical directory-overlap predicate.
 
 On Android, `PushJobCoordinator` serializes events through its actor and uses
 durable `state.active` as the execution owner. `PushFilesWorker` downloads and
