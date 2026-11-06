@@ -450,9 +450,6 @@
         return !!assignment && (assignment.cancel_requested === true ||
           ['succeeded', 'failed', 'interrupted'].indexOf(assignment.state) >= 0);
       })) settlePendingAction(key);
-      else if (pending.action === 'reconcile' && assignments.every(function (assignment) {
-        return !!assignment && !assignment.device_fence;
-      })) settlePendingAction(key);
     });
   }
 
@@ -771,18 +768,13 @@
     head.appendChild(buttons);
     container.appendChild(head);
 
-    const actionJobs = paused.filter(function (job) {
-      return hasRetryableAssignments(job) || Object.keys(job.devices || {}).some(function (deviceId) {
-        const assignment = job.devices[deviceId];
-        return needsFenceReconciliation(assignment);
-      });
-    });
+    const actionJobs = paused.filter(hasRetryableAssignments);
     if (!actionJobs.length) return;
     const jobList = document.createElement('div');
     jobList.className = 'attention-tab-job-list';
     const jobScope = document.createElement('div');
     jobScope.className = 'attention-tab-actions-note';
-    jobScope.textContent = 'Retry and Reconcile below apply to each job, independently of the checkbox selection.';
+    jobScope.textContent = 'Retry below applies to each job, independently of the checkbox selection.';
     jobList.appendChild(jobScope);
     actionJobs.forEach(function (job) {
       const row = document.createElement('div');
@@ -809,42 +801,6 @@
           sendRetryJobAction(job, retry);
         });
         rowButtons.appendChild(retry);
-      }
-      const fenced = Object.keys(job.devices || {}).filter(function (deviceId) {
-        const assignment = job.devices[deviceId];
-        return needsFenceReconciliation(assignment);
-      });
-      if (fenced.length) {
-        const reconcile = document.createElement('button');
-        reconcile.type = 'button';
-        reconcile.className = 'push-job-action';
-        reconcile.textContent = 'Reconcile';
-        if (isActionPending('reconcile', job.job_id)) {
-          reconcile.disabled = true;
-          reconcile.textContent = 'Reconciling…';
-        }
-        reconcile.addEventListener('click', function () {
-          if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return;
-          try {
-            fenced.forEach(function (deviceId) {
-              const key = actionKey('reconcile', job.job_id, [deviceId]);
-              if (!trackAction('reconcile', job.job_id, [deviceId], null, false)) return;
-              try {
-                nativeSend.call(currentAdminSocket, JSON.stringify({
-                  type: 'RECONCILE_PUSH_DEVICE',
-                  device_id: deviceId,
-                }));
-              } catch (error) {
-                settlePendingAction(key);
-                throw error;
-              }
-            });
-            renderPausedJobs();
-          } catch (error) {
-            appendLog('Could not reconcile: ' + error.message, 'fail');
-          }
-        });
-        rowButtons.appendChild(reconcile);
       }
       row.appendChild(label);
       row.appendChild(rowButtons);

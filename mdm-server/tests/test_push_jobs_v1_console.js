@@ -1763,13 +1763,13 @@ test('offline timeout keeps attention and Cancel but excludes Resume and refresh
 });
 
 
-test('Reconcile stays in job controls and never appears inside Activity log', () => {
+test('fenced jobs remain visible without a Reconcile control', () => {
   const { socket, ...h } = openConsole();
   const job = snapshot('fenced-job', 2, 'D1', 'unconfirmed', 1);
   job.devices.D1.device_fence = { reason: 'result_unconfirmed' };
   socket.snapshot(job);
-  findElementByText(h.pushJobsTabActions, 'Reconcile').click();
-  assert.deepEqual(socket.sent, [{ type: 'RECONCILE_PUSH_DEVICE', device_id: 'D1' }]);
+  assert.equal(findElementByText(h.pushJobsTabActions, 'Reconcile'), undefined);
+  assert.deepEqual(socket.sent, []);
   for (const entry of h.logContainer.children) {
     assert.equal(entry.children[1].children.some(e => e.tagName === 'button'), false);
   }
@@ -1808,7 +1808,7 @@ test('retried targets leave old attention and retry controls while a new failure
   assert.equal(h.pushJobsAttention.children.length, 2, 'only new failed job needs attention');
 });
 
-test('Retry preserves Reconcile and device attention until the old fence is cleared', () => {
+test('Retry preserves device attention until the old fence is cleared', () => {
   const { socket, ...h } = openConsole();
   const old = snapshot('fenced-original', 1, 'D1', 'unconfirmed', 1);
   old.devices.D1.retry_job_id = 'fenced-retry';
@@ -1829,8 +1829,8 @@ test('Retry preserves Reconcile and device attention until the old fence is clea
   assert.equal(h.pushJobsAttention.style.display, '');
   assert.equal(h.pushJobsTabActions.style.display, '');
   assert.equal(findElementByText(h.pushJobsTabActions, 'Retry failed devices'), undefined);
-  findElementByText(h.pushJobsTabActions, 'Reconcile').click();
-  assert.deepEqual(socket.sent, [{ type: 'RECONCILE_PUSH_DEVICE', device_id: 'D1' }]);
+  assert.equal(findElementByText(h.pushJobsTabActions, 'Reconcile'), undefined);
+  assert.deepEqual(socket.sent, []);
 
   socket.emit({ type: 'PUSH_JOB_UPDATED', job: {
     ...old, revision: 2, devices: { D1: { ...old.devices.D1, device_fence: null } },

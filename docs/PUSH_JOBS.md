@@ -221,7 +221,7 @@ transfer.
 Registration-time cleanup instructions follow `REGISTERED` and canonical socket
 readiness. Unknown interrupted work remains fenced until a matching `absent`
 report confirms cleanup, including the artifact ID when recorded in the fence.
-Manual Reconcile of still-interrupted work retries the rejection; interruption
+A `RECONCILE_PUSH_DEVICE` request for still-interrupted work retries the rejection; interruption
 alone does not authorize the server to release that ownership.
 
 Push runs only between a server and client of the same version; a newer server
@@ -310,8 +310,7 @@ artifact bytes. HTTP leases follow the restart behavior described above.
   anchor. If the anchor is no longer displayed, the click toggles only that row and makes
   it the new anchor. Clearing or leaving Needs attention resets its selection and anchor.
   Provisional connection checkboxes are separate and do not scope these actions.
-  **Retry failed devices**
-  and **Reconcile** remain job-scoped. Resuming one device after a server restart keeps all other queued
+  **Retry failed devices** remains job-scoped. Resuming one device after a server restart keeps all other queued
   or interrupted devices paused until their own Resume or Resume all.
   A storage write failure with an exact retained partial uses the same manual
   Resume gate; the operator must free or repair device storage first.
@@ -359,7 +358,7 @@ artifact bytes. HTTP leases follow the restart behavior described above.
   The console only combines them with live connectivity: Resume needs an online
   device, and a reconciling assignment is cancellable only while its device is
   offline. Targets already moved to a retry job expose no Resume/Cancel actions;
-  a remaining device fence still exposes Reconcile in the job controls.
+  a remaining device fence still keeps the device in Needs attention.
 - **Retry failed devices** creates and dispatches a new job for online `failed`,
   `interrupted`, and `unconfirmed` targets, excluding `failure_code: cancelled`.
   A target is also excluded when a later job for the same device was dispatched
@@ -380,7 +379,7 @@ artifact bytes. HTTP leases follow the restart behavior described above.
   is measured from the latest referencing terminal job, with active leases preserved.
   A target already included in a retry job is excluded from the original job's
   retry actions. An unconfirmed target with a remaining fence stays in Needs
-  attention with Reconcile until canonical evidence clears that fence. The device
+  attention until canonical evidence clears that fence. The device
   then shows its queued retry job. History remains; any new failure belongs to the retry job.
 - Offline task cells show **Job pending · offline** or **Resume required**,
   rather than claiming active pushing. Reconciliation
@@ -780,5 +779,5 @@ sequenceDiagram
 ```
 
 Activity log is read-only history. Needs attention contains Resume all, Cancel
-all, Retry failed devices, and Reconcile; eligible device rows have individual
+all and Retry failed devices; eligible device rows have individual
 Resume and Cancel controls.
