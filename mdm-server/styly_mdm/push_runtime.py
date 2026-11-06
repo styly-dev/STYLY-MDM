@@ -325,6 +325,7 @@ class PushRuntime:
         self.publication_task: asyncio.Task[None] | None = None
         self.publication_wake = asyncio.Event()
         self.pending_publications: dict[str, dict[str, Any]] = {}
+        self.pending_reconciliation_state: dict[str, Any] | None = None
         self.publication_revisions: dict[str, int] = {}
         self.publication_stopping = False
         self.background_tasks: set[asyncio.Task[Any]] = set()
@@ -425,6 +426,7 @@ class PushRuntime:
             accept_reconciliation_timeout=self.accept_reconciliation_timeout,
             reconciliation_timeout=self.reconciliation_timeout,
             leases=self.leases,
+            reconciliation_changed=self._reconciliation_changed,
         )
         self.scheduler.start()
         self.housekeeping_task = asyncio.create_task(
@@ -474,7 +476,10 @@ class PushRuntime:
         try:
             cutoff = now_ms() - self.recent_days * 86_400_000
             snapshots = await self.manager.list_snapshots(self.recent_limit, cutoff)
-            await self.admin_send(ws, {"type": "PUSH_JOBS_SNAPSHOT", "jobs": snapshots})
+            await self.admin_send(ws, {
+                "type": "PUSH_JOBS_SNAPSHOT", "jobs": snapshots,
+                "reconciliation": self.scheduler.reconciliation_snapshot() if self.scheduler else None,
+            })
         except Exception as snapshot_error:
             log.exception("Could not send initial Push job snapshot")
             try:
@@ -902,7 +907,6 @@ class PushRuntime:
         lock = self._device_lock(device_id)
         snapshots: list[dict[str, Any]] = []
         deferred_rejections: list[dict[str, Any]] = []
-        needs_reconcile = False
         registered = False
         session = LiveSession(
             device_id=device_id,
@@ -924,6 +928,8 @@ class PushRuntime:
             previous = self.sessions.get(device_id)
             if previous is not None and previous.ws is not ws:
                 self.sessions.pop(device_id, None)
+                if self.scheduler is not None:
+                    self.scheduler.forget_reconciliation(device_id)
                 self.pending_disconnects.add(device_id)
             # An old offline event must commit before a new session can own work.
             # The same lock protects the background retry, so it cannot later
@@ -940,7 +946,7 @@ class PushRuntime:
             # its own. Keep canonical reconciliation and fences untouched until the
             # client registers (or refreshes) with available state.
             if session.push_state_available:
-                needs_reconcile = await self._adopt_registration_runtime(
+                await self._adopt_registration_runtime(
                     session, payload, snapshots, deferred_rejections
                 )
 
@@ -976,7 +982,7 @@ class PushRuntime:
         if not registered:
             return
         await self._after_registration(
-            session, payload, needs_reconcile, deferred_rejections
+            session, payload, deferred_rejections
         )
 
     async def _adopt_registration_runtime(
@@ -985,8 +991,8 @@ class PushRuntime:
         payload: dict[str, Any],
         snapshots: list[dict[str, Any]],
         deferred_rejections: list[dict[str, Any]] | None = None,
-    ) -> bool:
-        """Apply an available client's runtime report; return whether to reconcile.
+    ) -> None:
+        """Apply an available client's runtime report before requesting reconciliation.
 
         The caller holds the device lock and has checked that durable Push state
         is available.
@@ -1000,7 +1006,7 @@ class PushRuntime:
                     device_id, session, active_report, deferred_rejections
                 )
             )
-            return False
+            return
         # A missing process UUID on an offline-timeout fence is safe to
         # replace only when the new job-v1 process explicitly reports no
         # active execution. An active or malformed report must keep the
@@ -1018,14 +1024,11 @@ class PushRuntime:
                 accept_timeout_ms=int(self.accept_reconciliation_timeout * 1000),
                 reconciliation_timeout_ms=int(self.reconciliation_timeout * 1000),
             ))
-        active = await self.manager.active_assignment_for_device(device_id)
-        return bool(active and active["state"] == DeviceState.RECONCILING.value)
 
     async def _after_registration(
         self,
         session: LiveSession,
         payload: dict[str, Any],
-        needs_reconcile: bool,
         deferred_rejections: list[dict[str, Any]] | None = None,
     ) -> None:
         device_id = session.device_id
@@ -1051,7 +1054,10 @@ class PushRuntime:
                 session, deferred_rejections or []
             )
             await self._send_pending_cancellations(session)
-        if needs_reconcile and command_allowed(self.legacy.devices.get(device_id)):
+        if self.scheduler is not None:
+            async with self._device_lock(device_id):
+                await self.scheduler.refresh_reconciliation(session)
+        if session.push_state_available and command_allowed(self.legacy.devices.get(device_id)):
             await self.request_reconcile(device_id)
         if self.scheduler is not None:
             self.scheduler.wake()
@@ -1072,7 +1078,6 @@ class PushRuntime:
         lock = self._device_lock(device_id)
         snapshots: list[dict[str, Any]] = []
         deferred_rejections: list[dict[str, Any]] = []
-        needs_reconcile = False
         async with lock:
             session = self._registered_session(ws, device_id)
             if session is None:
@@ -1092,7 +1097,7 @@ class PushRuntime:
                 session.push_state_available = push_state_status != "unavailable"
                 entry["push_state_status"] = push_state_status
                 if became_available:
-                    needs_reconcile = await self._adopt_registration_runtime(
+                    await self._adopt_registration_runtime(
                         session, payload, snapshots, deferred_rejections
                     )
             await asyncio.wait_for(
@@ -1108,7 +1113,7 @@ class PushRuntime:
             self.legacy.broadcast_device_list(), name=f"push-state-refresh-{device_id}"
         )
         await self._after_registration(
-            session, payload, needs_reconcile, deferred_rejections
+            session, payload, deferred_rejections
         )
 
     def _spawn_background(self, coro: Any, *, name: str) -> None:
@@ -1305,6 +1310,8 @@ class PushRuntime:
             if session is None or session.ws is not ws:
                 return
             self.sessions.pop(device_id, None)
+            if self.scheduler is not None:
+                self.scheduler.forget_reconciliation(device_id)
             if self._legacy_owns_device(device_id, ws):
                 self.legacy.devices[device_id]["registration_ready"] = False
             self.pending_disconnects.add(device_id)
@@ -1384,9 +1391,10 @@ class PushRuntime:
                 ) or session is None or session.ws is not ws:
                     # Consume stale job-v1 frames so they cannot reach legacy handlers.
                     return True
-                return await self._handle_owned_job_v1_message(
-                    session, device_id, payload
-                )
+                handled = await self._handle_owned_job_v1_message(session, device_id, payload)
+                if self.scheduler is not None:
+                    await self.scheduler.refresh_reconciliation(session)
+                return handled
         return False
 
     async def _handle_owned_job_v1_message(
@@ -2040,6 +2048,8 @@ class PushRuntime:
         if message_type == "RECONCILE_PUSH_DEVICE":
             device_id = payload.get("device_id")
             if isinstance(device_id, str):
+                if self.scheduler is not None:
+                    self.scheduler.forget_reconciliation(device_id)
                 await self.request_reconcile(device_id)
             return True
         return False
@@ -2130,28 +2140,19 @@ class PushRuntime:
         session = self.sessions.get(device_id)
         if session is None or self.scheduler is None:
             return
-        active = await self.manager.active_assignment_for_device(device_id)
-        if active and active["state"] == DeviceState.RECONCILING.value:
-            snapshot = await self.store.get_snapshot(active["job_id"])
-            await self.scheduler.send_reconcile(session, snapshot, device_id)
-            return
-        fence = await self.manager.fenced_assignment_for_device(device_id)
-        if fence and fence.get("blocking_job_id") and fence.get("blocking_attempt") == 1:
+        target = await self.manager.reconciliation_target_for_device(device_id)
+        if target is not None:
             await self.scheduler.send_exact_reconcile(
-                session,
-                fence["blocking_job_id"],
-                1,
-                fence.get("artifact_id"),
+                session, target["job_id"], target["attempt"], target.get("artifact_id"),
             )
+
+    def _reconciliation_changed(self) -> None:
+        if self.scheduler is None:
             return
-        opaque = await self.manager.opaque_reconcile_target(device_id)
-        if opaque is not None:
-            await self.scheduler.send_exact_reconcile(
-                session,
-                opaque["job_id"],
-                opaque["attempt"],
-                opaque.get("artifact_id"),
-            )
+        self.pending_reconciliation_state = {
+            "type": "PUSH_RECONCILIATION_STATE", **self.scheduler.reconciliation_snapshot()
+        }
+        self.publication_wake.set()
 
     async def publish(self, snapshot: dict[str, Any]) -> None:
         job_id = snapshot["job_id"]
@@ -2182,7 +2183,16 @@ class PushRuntime:
                     raise
                 except Exception:
                     log.exception("Could not publish Push job update for %s", job_id)
-            if self.publication_stopping and not self.pending_publications:
+            if self.pending_reconciliation_state is not None:
+                event = self.pending_reconciliation_state
+                self.pending_reconciliation_state = None
+                try:
+                    await self.legacy.forward_to_admins(event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Could not publish Push reconciliation state")
+            if self.publication_stopping and not self.pending_publications and self.pending_reconciliation_state is None:
                 return
 
     def arm_created_deadline(self) -> None:

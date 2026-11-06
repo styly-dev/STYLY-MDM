@@ -1504,6 +1504,17 @@
         const device = deviceById(id);
         if (st.status === 'cancel_pending') return '<span class="ins-queued">Cancel pending' + ((!device || device.status !== 'online') ? ' · offline' : '') + '</span>';
         if (st.status === 'cancelled') return '<span class="ins-none">Cancelled</span>';
+        if (st.requiresReconciliation || st.reconciliationStatus || st.status === 'reconciling' || st.status === 'unconfirmed') {
+          if (!device || device.status !== 'online') {
+            return '<span class="ins-queued">◦ Waiting for device to reconnect</span>';
+          }
+          if (st.reconciliationStatus === 'checking') {
+            return '<span class="ins-queued">◦ Checking device status…</span>';
+          }
+          if (st.reconciliationStatus === 'unavailable') {
+            return '<span class="ins-queued" title="Automatic status checks received no conclusive evidence. Check the device connection. Existing work remains blocked until its state is confirmed.">◦ Unable to confirm device status</span>';
+          }
+        }
         if (st.status === 'reconciling') {
           return '<span class="ins-queued" title="Waiting for the device to report whether the job is still running or has finished.">◦ Awaiting status confirmation' + ((!device || device.status !== 'online') ? ' · offline' : '') + '</span>';
         }

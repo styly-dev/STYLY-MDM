@@ -221,7 +221,7 @@ transfer.
 Registration-time cleanup instructions follow `REGISTERED` and canonical socket
 readiness. Unknown interrupted work remains fenced until a matching `absent`
 report confirms cleanup, including the artifact ID when recorded in the fence.
-A `RECONCILE_PUSH_DEVICE` request for still-interrupted work retries the rejection; interruption
+Automatic reconciliation of still-interrupted work retries the rejection; interruption
 alone does not authorize the server to release that ownership.
 
 Push runs only between a server and client of the same version; a newer server
@@ -273,6 +273,28 @@ before cleanup, so queued, active, reconciling, and resumable assignments keep t
 artifact bytes. HTTP leases follow the restart behavior described above.
 
 ## Operator controls
+
+Reconciliation is automatic. Each connected execution is checked immediately, then
+retried after 1, 2, 4, and 8 seconds while canonical state still requires evidence.
+After an additional 8-second response window, checking stops and the console shows
+**Unable to confirm device status**. It sends no further periodic probes for that
+connection/execution. A disconnect or unavailable durable Push state stops the
+cycle; reconnect or restored state allows a fresh cycle. Offline rows show
+**Waiting for device to reconnect**. Exact terminal/absence evidence can resolve a
+wait even after the probe budget is exhausted. An interrupted cleanup response
+keeps the cycle alive until exact absence confirms release. This includes
+dispatched work cancelled while queued for manual Resume. A stalled transfer
+starts checking after its HTTP lease and waiter are released. Offline rows with
+an unresolved fence continue to show reconnect wait after the live probe ends.
+
+The probe budget does not change durable acceptance/reconciliation deadlines,
+lease ownership, fences, cancellation, or manual Resume gates. No unanswered check
+is evidence that a worker stopped. The transient admin-only
+`PUSH_RECONCILIATION_STATE` and initial `PUSH_JOBS_SNAPSHOT.reconciliation` carry
+independently revisioned full probe snapshots (`revision`, `devices` with
+`device_id`, `job_id`, `attempt`, `artifact_id`, `status: checking|unavailable`).
+These optional fields require no client APK or database migration; older consoles
+ignore them. There is no Reconcile button in the console.
 
 - **Offline devices never start queued work by reconnecting.** Job creation and
   Retry failed devices accept only online targets, and the initial dispatch of a
@@ -770,6 +792,15 @@ sequenceDiagram
         D->>D: clear interrupted ownership; retain receipt; queue partial cleanup
         D-->>S: PUSH_RECONCILE_REPORT(absent)
         S->>DB: settle cancelled; allow next job
+    end
+    opt Device execution needs reconciliation
+        S->>D: PUSH_RECONCILE_REQUEST(exact identity)
+        loop Unresolved after 1, 2, 4, 8 seconds
+            S->>D: PUSH_RECONCILE_REQUEST(exact identity, same connection)
+        end
+        Note over S,D: Stop on resolution/disconnect; final response window is 8 seconds
+        S-->>B: PUSH_RECONCILIATION_STATE(checking or unavailable)
+        Note over S,DB: Probe exhaustion never clears fences or grants Resume
     end
     opt Operator retries failed targets
         B->>S: RETRY_FAILED_PUSH_JOB(job_id, request UUID)

@@ -16,6 +16,7 @@ from styly_mdm.push_scheduler import PushScheduler
 from styly_mdm.push_runtime import PushRuntime
 from styly_mdm.push_transfer_leases import PushTransferLeases
 from styly_mdm.transfer_registry import TransferKey
+from push_test_helpers import operator_runtime
 
 
 @asynccontextmanager
@@ -207,9 +208,9 @@ async def test_artifact_http_range_reconnect_replaces_busy_lease(artifact_runtim
 
 
 @pytest.mark.asyncio
-async def test_offline_cancel_revokes_http_lease_before_next_request(tmp_path):
+async def test_offline_cancel_revokes_http_lease_before_next_request(operator_runtime, tmp_path):
     from styly_mdm.transfer_registry import TransferRegistry
-    from push_test_helpers import admin_action, downloading_job, operator_runtime
+    from push_test_helpers import admin_action, downloading_job
 
     store = PushJobStore(tmp_path / "cancel.sqlite3")
     manager = PushJobManager(store)

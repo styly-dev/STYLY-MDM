@@ -12,7 +12,7 @@ from push_test_helpers import (
 
 
 @pytest.mark.asyncio
-async def test_resume_during_persistence_failure_keeps_manual_wait(manager, tmp_path):
+async def test_resume_during_persistence_failure_keeps_manual_wait(operator_runtime, manager, tmp_path):
     original = await timed_out_job(manager)
     runtime, session, admin = operator_runtime(manager, tmp_path)
     session.push_state_available = False
@@ -31,7 +31,7 @@ async def test_resume_during_persistence_failure_keeps_manual_wait(manager, tmp_
 
 
 @pytest.mark.asyncio
-async def test_admin_queued_cancel_requests_exact_reconcile_under_owner_lock(manager, tmp_path):
+async def test_admin_queued_cancel_requests_exact_reconcile_under_owner_lock(operator_runtime, manager, tmp_path):
     original = await timed_out_job(manager)
     runtime, session, admin = operator_runtime(manager, tmp_path)
     original_send = session.ws.send_str
@@ -60,7 +60,7 @@ async def test_admin_queued_cancel_requests_exact_reconcile_under_owner_lock(man
 
 @pytest.mark.asyncio
 async def test_queued_cancel_is_confirmed_by_absent_from_client_without_interrupted_work(
-    manager, tmp_path
+    operator_runtime, manager, tmp_path
 ):
     """A client that no longer holds the interrupted identity (for example after a
     state reset) answers absent; the cancellation must settle while it stays online."""
@@ -80,7 +80,7 @@ async def test_queued_cancel_is_confirmed_by_absent_from_client_without_interrup
 
 
 @pytest.mark.asyncio
-async def test_queued_cancel_rejects_interrupted_work_still_held_by_client(manager, tmp_path):
+async def test_queued_cancel_rejects_interrupted_work_still_held_by_client(operator_runtime, manager, tmp_path):
     original = await timed_out_job(manager)
     runtime, session, admin = operator_runtime(manager, tmp_path)
     await admin_action(runtime, admin, "CANCEL_PUSH_JOB", original["job_id"])
@@ -97,7 +97,7 @@ async def test_queued_cancel_rejects_interrupted_work_still_held_by_client(manag
 
 
 @pytest.mark.asyncio
-async def test_admin_offline_timeout_cancel_finishes_without_device_command(manager, tmp_path):
+async def test_admin_offline_timeout_cancel_finishes_without_device_command(operator_runtime, manager, tmp_path):
     original = await timed_out_job(manager)
     runtime, session, admin = operator_runtime(manager, tmp_path)
     runtime.sessions.clear()
@@ -108,7 +108,7 @@ async def test_admin_offline_timeout_cancel_finishes_without_device_command(mana
 
 
 @pytest.mark.asyncio
-async def test_cancel_intent_survives_exact_reconcile_send_failure(manager, tmp_path):
+async def test_cancel_intent_survives_exact_reconcile_send_failure(operator_runtime, manager, tmp_path):
     active = await downloading_job(manager.store, manager)
     await manager.mark_reconciling(active["job_id"], "D1", expected={DeviceState.DOWNLOADING},
                                    reason="device_disconnect", deadline=1)
@@ -126,7 +126,7 @@ async def test_cancel_intent_survives_exact_reconcile_send_failure(manager, tmp_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resumed", [False, True])
-async def test_admin_cancel_rejects_active_or_already_resumed_work(manager, tmp_path, resumed):
+async def test_admin_cancel_rejects_active_or_already_resumed_work(operator_runtime, manager, tmp_path, resumed):
     original = await timed_out_job(manager) if resumed else await downloading_job(manager.store, manager)
     if resumed:
         _, original = await manager.store.enable_dispatch(original["job_id"])
@@ -141,7 +141,7 @@ async def test_admin_cancel_rejects_active_or_already_resumed_work(manager, tmp_
 
 
 @pytest.mark.asyncio
-async def test_admin_retry_creates_enabled_job_reusing_artifact_and_failed_targets(manager, tmp_path):
+async def test_admin_retry_creates_enabled_job_reusing_artifact_and_failed_targets(operator_runtime, manager, tmp_path):
     original = await completed(manager, tmp_path)
     runtime, session, admin = operator_runtime(manager, tmp_path)
     runtime.sessions = {device: session for device in ("failed", "interrupted", "unknown")}
@@ -200,7 +200,7 @@ async def two_device_job(manager, *, interrupted=False, downloading=False):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["PUSH_FILES", "CANCEL_PUSH_JOB"])
-async def test_individual_action_leaves_other_interrupted_device_untouched(manager, tmp_path, action):
+async def test_individual_action_leaves_other_interrupted_device_untouched(operator_runtime, manager, tmp_path, action):
     original = await two_device_job(manager, interrupted=True)
     other_before = await manager.assignment(original["job_id"], "D2")
     runtime, _, admin = operator_runtime(manager, tmp_path)
@@ -310,7 +310,7 @@ async def test_targeted_resume_timestamps_non_target_that_it_pauses(manager):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("restart", [False, True])
-async def test_individual_resume_from_global_pause_keeps_other_device_paused_until_resume_all(manager, tmp_path, restart):
+async def test_individual_resume_from_global_pause_keeps_other_device_paused_until_resume_all(operator_runtime, manager, tmp_path, restart):
     original = await two_device_job(manager)
     if restart:
         await manager.store.enable_dispatch(original["job_id"])
@@ -328,7 +328,7 @@ async def test_individual_resume_from_global_pause_keeps_other_device_paused_unt
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["PUSH_FILES", "CANCEL_PUSH_JOB"])
 @pytest.mark.parametrize("targets", [[], ["unknown"], ["D1", "unknown"], "D1", [1], None])
-async def test_invalid_explicit_targets_never_expand_to_all_devices(manager, tmp_path, action, targets):
+async def test_invalid_explicit_targets_never_expand_to_all_devices(operator_runtime, manager, tmp_path, action, targets):
     original = await two_device_job(manager, interrupted=True)
     runtime, session, admin = operator_runtime(manager, tmp_path)
     assert await asyncio.wait_for(runtime.handle_admin_message(admin, {
@@ -341,7 +341,7 @@ async def test_invalid_explicit_targets_never_expand_to_all_devices(manager, tmp
 
 
 @pytest.mark.asyncio
-async def test_restart_individual_resume_does_not_authorize_other_reconnecting_worker(manager, tmp_path):
+async def test_restart_individual_resume_does_not_authorize_other_reconnecting_worker(operator_runtime, manager, tmp_path):
     original = await two_device_job(manager, downloading=True)
     manager.store.recover_startup_sync(accept_reconciliation_timeout_ms=1000,
                                  reconciliation_timeout_ms=1000)
@@ -368,7 +368,7 @@ async def test_restart_individual_resume_does_not_authorize_other_reconnecting_w
 
 
 @pytest.mark.asyncio
-async def test_offline_resume_rejected_but_cancel_allowed(manager, tmp_path):
+async def test_offline_resume_rejected_but_cancel_allowed(operator_runtime, manager, tmp_path):
     original = await timed_out_job(manager)
     runtime, _, admin = operator_runtime(manager, tmp_path)
     runtime.sessions.clear()
@@ -383,7 +383,7 @@ async def test_offline_resume_rejected_but_cancel_allowed(manager, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_resume_all_keeps_offline_timeout_waiting(manager, tmp_path):
+async def test_resume_all_keeps_offline_timeout_waiting(operator_runtime, manager, tmp_path):
     original = await two_device_job(manager, interrupted=True)
     runtime, _, admin = operator_runtime(manager, tmp_path)
     await admin_action(runtime, admin, "PUSH_FILES", original["job_id"])
@@ -410,7 +410,7 @@ async def test_active_report_consumes_pending_resume_authorization(manager):
 
 
 @pytest.mark.asyncio
-async def test_reconcile_is_deferred_while_push_state_is_unavailable(manager, tmp_path):
+async def test_reconcile_is_deferred_while_push_state_is_unavailable(operator_runtime, manager, tmp_path):
     original = await timed_out_job(manager)
     runtime, session, admin = operator_runtime(manager, tmp_path)
     session.push_state_available = False
@@ -424,7 +424,7 @@ async def test_reconcile_is_deferred_while_push_state_is_unavailable(manager, tm
 @pytest.mark.parametrize("claimed", [False, True])
 @pytest.mark.parametrize("resume_online", [False, True])
 async def test_restart_unsent_offline_target_can_be_cancelled_without_client(
-    manager, tmp_path, claimed, resume_online,
+    operator_runtime, manager, tmp_path, claimed, resume_online,
 ):
     original = await two_device_job(manager)
     job_id = original["job_id"]
@@ -464,7 +464,7 @@ async def test_restart_unsent_offline_target_can_be_cancelled_without_client(
 
 
 @pytest.mark.asyncio
-async def test_cancel_all_unsent_restart_targets_finishes_job_and_releases_artifact(manager, tmp_path):
+async def test_cancel_all_unsent_restart_targets_finishes_job_and_releases_artifact(operator_runtime, manager, tmp_path):
     original = await two_device_job(manager)
     job_id = original["job_id"]
     await manager.store.enable_dispatch(job_id)
@@ -488,7 +488,7 @@ async def test_cancel_all_unsent_restart_targets_finishes_job_and_releases_artif
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("paused", ["restart", "interrupted", "ready"])
-async def test_retry_request_replay_preserves_dispatch_authority(manager, tmp_path, paused):
+async def test_retry_request_replay_preserves_dispatch_authority(operator_runtime, manager, tmp_path, paused):
     original = await completed(manager, tmp_path)
     runtime, session, admin = operator_runtime(manager, tmp_path)
     runtime.sessions = {device: session for device in ("failed", "interrupted", "unknown")}
@@ -535,7 +535,7 @@ async def test_retry_request_replay_preserves_dispatch_authority(manager, tmp_pa
 @pytest.mark.asyncio
 @pytest.mark.parametrize("rejected_targets", [[], ["D1"], ["D1", "D2"]])
 async def test_cancel_returns_one_correlated_outcome_for_every_target(
-    manager, tmp_path, rejected_targets
+    operator_runtime, manager, tmp_path, rejected_targets
 ):
     original = await two_device_job(manager, interrupted=True)
     job_id = original["job_id"]
@@ -584,7 +584,7 @@ async def test_cancel_returns_one_correlated_outcome_for_every_target(
 
 
 @pytest.mark.asyncio
-async def test_cancel_acknowledgement_failure_preserves_intent_and_can_be_retried(manager, tmp_path):
+async def test_cancel_acknowledgement_failure_preserves_intent_and_can_be_retried(operator_runtime, manager, tmp_path):
     original = await timed_out_job(manager)
     runtime, _session, admin = operator_runtime(manager, tmp_path)
     attempted = []
@@ -620,7 +620,7 @@ async def test_cancel_acknowledgement_failure_preserves_intent_and_can_be_retrie
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["CANCEL_PUSH_JOB", "PUSH_FILES"])
 @pytest.mark.parametrize("targets", [[], ["unknown"], ["D1", "unknown"]])
-async def test_invalid_operator_action_returns_correlated_error(manager, tmp_path, action, targets):
+async def test_invalid_operator_action_returns_correlated_error(operator_runtime, manager, tmp_path, action, targets):
     original = await two_device_job(manager, interrupted=True)
     runtime, _session, admin = operator_runtime(manager, tmp_path)
     assert await runtime.handle_admin_message(admin, {
@@ -638,7 +638,7 @@ async def test_invalid_operator_action_returns_correlated_error(manager, tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_resume_acknowledgement_echoes_requested_targets_before_online_filter(manager, tmp_path):
+async def test_resume_acknowledgement_echoes_requested_targets_before_online_filter(operator_runtime, manager, tmp_path):
     original = await two_device_job(manager, interrupted=True)
     runtime, _session, admin = operator_runtime(manager, tmp_path)
     await admin_action(runtime, admin, "PUSH_FILES", original["job_id"],
@@ -658,7 +658,7 @@ async def test_resume_acknowledgement_echoes_requested_targets_before_online_fil
 @pytest.mark.parametrize("action", ["CANCEL_PUSH_JOB", "PUSH_FILES"])
 @pytest.mark.parametrize("committed", [False, True])
 async def test_socket_wrapper_correlates_unexpected_failure_without_claiming_outcome(
-    manager, tmp_path, monkeypatch, action, committed,
+    operator_runtime, manager, tmp_path, monkeypatch, action, committed,
 ):
     import json
     import sqlite3

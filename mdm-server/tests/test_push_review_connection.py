@@ -31,6 +31,9 @@ class SnapshotWs(Ws):
 
 
 class RegistrationManager:
+    async def reconciliation_target_for_device(self, device_id):
+        return None
+
     async def pending_cancellations_for_device(self, device_id):
         return []
 
@@ -588,9 +591,11 @@ async def test_operator_resume_reconciles_recovered_state_before_dispatch(manage
     assert consumed is True
     assert runtime.scheduler.wake_count == 1
     assert len(runtime.scheduler.reconcile_calls) == 1
-    _, snapshot, device_id = runtime.scheduler.reconcile_calls[0]
-    assert device_id == "D1"
-    assert snapshot["devices"]["D1"]["state"] == DeviceState.RECONCILING.value
+    session, reconciled_job, attempt, artifact_id = runtime.scheduler.reconcile_calls[0]
+    assert session is runtime.sessions["D1"]
+    assert (reconciled_job, attempt, artifact_id) == (
+        job_id, 1, (await manager.assignment(job_id, "D1"))["artifact_id"],
+    )
 
     runtime.scheduler.reconcile_calls.clear()
     runtime.legacy.devices["D1"]["push_state_status"] = "unavailable"

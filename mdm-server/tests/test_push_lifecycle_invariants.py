@@ -34,6 +34,8 @@ def _registration_runtime(manager, ws):
     runtime.leases = PushTransferLeases()
     runtime.scheduler = types.SimpleNamespace(
         wake=lambda: None,
+        forget_reconciliation=lambda _device_id: None,
+        refresh_reconciliation=lambda _session: asyncio.sleep(0),
         reconcile_active_transfer=lambda *_args: asyncio.sleep(0),
     )
     runtime.publish = lambda _snapshot: asyncio.sleep(0)
@@ -105,7 +107,7 @@ async def test_disconnect_database_failure_is_retried_without_reconnect(
     runtime.legacy = types.SimpleNamespace(devices={"D1": {"ws": ws}})
     runtime.accept_reconciliation_timeout = 1
     runtime.reconciliation_timeout = 60
-    runtime.scheduler = types.SimpleNamespace(wake=lambda: None)
+    runtime.scheduler = types.SimpleNamespace(wake=lambda: None, forget_reconciliation=lambda _id: None)
     runtime.publish = lambda _snapshot: asyncio.sleep(0)
     monkeypatch.setattr(push_runtime, "_BACKGROUND_LOOP_RETRY_DELAY", 0.01)
 

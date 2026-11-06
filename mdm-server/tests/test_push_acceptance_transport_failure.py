@@ -337,6 +337,7 @@ async def test_lost_acceptance_preserves_http_until_progress_stalls(
                 runtime.disconnect_recovery_tasks = {}
                 runtime.artifact_gc_task = None
                 runtime.manager = manager
+                runtime.scheduler = scheduler
                 runtime.sessions = sessions
                 runtime.device_locks = {"D1": sessions["D1"].owner_lock}
                 runtime.registration_candidates = {}

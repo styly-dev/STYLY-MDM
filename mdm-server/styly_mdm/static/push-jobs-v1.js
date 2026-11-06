@@ -21,6 +21,22 @@
   const pendingActionTimeoutMs = 15000;
   let currentAdminSocket = null;
   let awaitingInitialSnapshot = false;
+  let reconciliationRevision = -1;
+  let reconciliations = new Map();
+
+  function applyReconciliationState(state) {
+    if (!state || !Number.isInteger(state.revision) || state.revision <= reconciliationRevision) return;
+    reconciliationRevision = state.revision;
+    const changed = new Set(reconciliations.keys());
+    reconciliations = new Map((state.devices || []).map(function (entry) {
+      changed.add(entry.device_id);
+      return [entry.device_id, entry];
+    }));
+    const bridge = window.__stylyPushJobsV1Bridge;
+    if (bridge && bridge.invalidateDevice) changed.forEach(function (id) { bridge.invalidateDevice(id); });
+    if (bridge && bridge.refreshAttention) bridge.refreshAttention();
+  }
+
   let bufferedUpdates = new Map();
 
   function uuid() {
@@ -900,6 +916,22 @@
     const result = assignment.result || {};
     const failure = assignment.failure || {};
     const jobFailure = job.failure || {};
+    const probe = reconciliations.get(deviceId);
+    const fence = assignment.device_fence;
+    const requiresReconciliation = assignment.state === 'reconciling' ||
+      assignment.state === 'unconfirmed' || !!fence;
+    let checkedIdentity = { job_id: job.job_id, attempt: assignment.attempt,
+      artifact_id: (job.artifact || {}).artifact_id || null };
+    if (fence && fence.blocking_opaque_identity) {
+      try { checkedIdentity = JSON.parse(fence.blocking_opaque_identity); }
+      catch (_ignored) { checkedIdentity = null; }
+    } else if (fence && fence.blocking_job_id && fence.blocking_job_id !== job.job_id) {
+      checkedIdentity = { job_id: fence.blocking_job_id, attempt: fence.blocking_attempt };
+    }
+    const reconciliationStatus = probe && checkedIdentity && requiresReconciliation &&
+      probe.job_id === checkedIdentity.job_id && probe.attempt === checkedIdentity.attempt &&
+      (checkedIdentity.artifact_id === undefined || probe.artifact_id === checkedIdentity.artifact_id)
+      ? probe.status : null;
     const success = assignment.state === 'succeeded';
     const terminal = ['succeeded', 'failed', 'interrupted', 'unconfirmed'].indexOf(assignment.state) >= 0;
     const cancelled = failure.code === 'cancelled';
@@ -922,6 +954,8 @@
       resumePending: resumePending,
       cancelPending: cancelPending,
       needsAttention: !!needsAttention,
+      reconciliationStatus: reconciliationStatus,
+      requiresReconciliation: requiresReconciliation,
       job_id: job.job_id,
       client_request_id: job.client_request_id,
       revision: job.revision,
@@ -1010,10 +1044,14 @@
     let message;
     try { message = JSON.parse(event.data); } catch (_ignored) { return; }
     if (!message || !message.type) return;
-    if (message.type === 'PUSH_JOBS_SNAPSHOT') {
+    if (message.type === 'PUSH_RECONCILIATION_STATE') {
+      event.stopImmediatePropagation();
+      if (socket === currentAdminSocket) applyReconciliationState(message);
+    } else if (message.type === 'PUSH_JOBS_SNAPSHOT') {
       event.stopImmediatePropagation();
       if (socket !== currentAdminSocket) return;
       replaceJobs(message.jobs);
+      applyReconciliationState(message.reconciliation);
       awaitingInitialSnapshot = false;
     } else if (message.type === 'PUSH_JOB_UPDATED') {
       event.stopImmediatePropagation();
@@ -1076,6 +1114,8 @@
       : new NativeWebSocket(url, protocols);
     if (String(url).indexOf('/ws/admin') >= 0) {
       currentAdminSocket = socket;
+      reconciliationRevision = -1;
+      reconciliations = new Map();
       awaitingInitialSnapshot = true;
       bufferedUpdates = new Map();
     }

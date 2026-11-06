@@ -1362,11 +1362,10 @@ test('offline push rows retain unfinished jobs without claiming current executio
     device.status = connectivity;
     state.status = 'reconciling';
     const html = context.pushTaskCellHtml('D1', state);
-    assert.match(html, /Awaiting status confirmation/);
-    assert.equal(html.includes(' · offline'), connectivity === 'offline');
+    assert.match(html, connectivity === 'offline' ? /Waiting for device to reconnect/ : /Awaiting status confirmation/);
     assert.doesNotMatch(html, /Job pending|spinner|Pushing|failed/);
     state.status = 'unconfirmed';
-    assert.match(context.pushTaskCellHtml('D1', state), /Status unknown/);
+    assert.match(context.pushTaskCellHtml('D1', state), connectivity === 'offline' ? /Waiting for device to reconnect/ : /Status unknown/);
   }
   device.status = 'offline';
   state.status = 'success';
@@ -2360,4 +2359,71 @@ test('all-rejected Cancel clears only its request and never logs cancellation re
   const lines = h.logContainer.children.map(entry => entry.children[1].textContent);
   assert.ok(lines.some(line => /Cancel failed.*D1: Already resumed/.test(line)));
   assert.equal(lines.some(line => /Cancel (?:partially )?recorded/.test(line)), false);
+});
+
+test('bounded status checks render checking, exhaustion and reconnect wait without granting actions', () => {
+  let online = true;
+  const h = openIntegratedConsole({ isDeviceOnline: () => online });
+  const job = snapshot('status-job', 1, 'D1', 'reconciling', 1);
+  job.artifact = { artifact_id: 'artifact' };
+  job.devices.D1.attempt = 1;
+  h.socket.snapshot(job);
+  const state = (revision, status, jobId = job.job_id) => ({
+    type: 'PUSH_RECONCILIATION_STATE', revision,
+    devices: [{ device_id: 'D1', job_id: jobId, attempt: 1, artifact_id: 'artifact', status }],
+  });
+  h.socket.emit(state(1, 'checking'));
+  assert.match(h.html(), /Checking device status/);
+  h.socket.emit(state(2, 'unavailable'));
+  assert.match(h.html(), /Unable to confirm device status/);
+  assert.equal(window.__stylyPushJobsV1Actions.assignmentFor('D1').canResume, false);
+  assert.deepEqual(h.socket.sent, []);
+  h.socket.emit(state(1, 'checking'));
+  assert.match(h.html(), /Unable to confirm device status/, 'late status must not restart checking');
+  online = false;
+  window.__stylyPushJobsV1Actions.refreshConnectivity();
+  assert.match(h.html(), /Waiting for device to reconnect/);
+  online = true;
+  h.socket.emit(state(3, 'checking', 'different-job'));
+  assert.match(h.html(), /Awaiting status confirmation/);
+  assert.doesNotMatch(h.html(), /Checking device status|Unable to confirm/);
+});
+
+test('status snapshots survive browser reconnect and ignore older initial snapshots and retired sockets', () => {
+  const h = openConsole();
+  const job = snapshot('status-snapshot', 1, 'D1', 'unconfirmed', 1);
+  job.devices.D1.attempt = 1;
+  const entry = { device_id: 'D1', job_id: job.job_id, attempt: 1, artifact_id: null, status: 'unavailable' };
+  const fresh = new window.WebSocket('ws://server/ws/admin');
+  fresh.emit({ type: 'PUSH_RECONCILIATION_STATE', revision: 5, devices: [entry] });
+  fresh.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job], reconciliation: { revision: 4, devices: [] } });
+  const api = window.__stylyPushJobsV1Actions;
+  assert.equal(api.assignmentFor('D1').reconciliationStatus, 'unavailable');
+  h.socket.emit({ type: 'PUSH_RECONCILIATION_STATE', revision: 50, devices: [] });
+  assert.equal(api.assignmentFor('D1').reconciliationStatus, 'unavailable');
+  fresh.emit({ type: 'PUSH_RECONCILIATION_STATE', revision: 6, devices: [] });
+  assert.equal(api.assignmentFor('D1').reconciliationStatus, null);
+  const afterRestart = new window.WebSocket('ws://server/ws/admin');
+  afterRestart.emit({ type: 'PUSH_JOBS_SNAPSHOT', jobs: [job], reconciliation: { revision: 1, devices: [entry] } });
+  assert.equal(api.assignmentFor('D1').reconciliationStatus, 'unavailable');
+});
+
+test('status checks for an unknown old execution appear on its blocked device row', () => {
+  let online = true;
+  const h = openIntegratedConsole({ isDeviceOnline: () => online });
+  const job = snapshot('blocked-job', 1, 'D1', 'failed', 1);
+  job.devices.D1.device_fence = {
+    blocking_opaque_identity: JSON.stringify({ job_id: 'unknown-old-job', attempt: 1, artifact_id: 'old-artifact' }),
+  };
+  h.socket.snapshot(job);
+  h.socket.emit({ type: 'PUSH_RECONCILIATION_STATE', revision: 1, devices: [{
+    device_id: 'D1', job_id: 'unknown-old-job', attempt: 1, artifact_id: 'old-artifact', status: 'unavailable',
+  }] });
+  assert.match(h.html(), /Unable to confirm device status/);
+  online = false;
+  h.socket.emit({ type: 'PUSH_RECONCILIATION_STATE', revision: 2, devices: [] });
+  window.__stylyPushJobsV1Actions.refreshConnectivity();
+  assert.match(h.html(), /Waiting for device to reconnect/);
+  h.socket.update({ ...job, revision: 2, devices: { D1: { ...job.devices.D1, device_fence: null } } });
+  assert.doesNotMatch(h.html(), /Unable to confirm device status|Waiting for device to reconnect/);
 });

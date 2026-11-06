@@ -1,6 +1,7 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
@@ -696,6 +697,7 @@ def _publication_runtime(legacy):
     runtime.artifact_gc_task = None
     runtime.legacy = legacy
     runtime.pending_publications = {}
+    runtime.pending_reconciliation_state = None
     runtime.publication_revisions = {}
     runtime.publication_wake = asyncio.Event()
     runtime.publication_stopping = False
@@ -1024,3 +1026,22 @@ async def test_reconciliation_housekeeping_isolates_query_and_row_errors(monkeyp
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_publication_coalesces_status_without_changing_job_revisions():
+    legacy = _PublicationLegacy()
+    runtime = _publication_runtime(legacy)
+    revision = 1
+    runtime.scheduler = SimpleNamespace(reconciliation_snapshot=lambda: {
+        "revision": revision, "devices": [],
+    })
+    runtime._reconciliation_changed()
+    revision = 2
+    runtime._reconciliation_changed()
+    await asyncio.wait_for(legacy.sent.wait(), 1)
+    runtime.publication_stopping = True
+    runtime.publication_wake.set()
+    await runtime.publication_task
+    assert legacy.events == [{"type": "PUSH_RECONCILIATION_STATE", "revision": 2, "devices": []}]
+    assert runtime.publication_revisions == {}

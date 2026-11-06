@@ -112,6 +112,33 @@ class PushJobManager:
     async def active_assignment_for_device(self, device_id: str) -> dict[str, Any] | None:
         return await self.store.active_assignment_for_device(device_id)
 
+    async def reconciliation_target_for_device(
+        self, device_id: str, *, job_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Select unresolved ownership, or check the specified execution only."""
+        if job_id is None:
+            assignment = await self.active_assignment_for_device(device_id)
+            if assignment is None or assignment["state"] != DeviceState.RECONCILING.value:
+                pending = await self.pending_cancellations_for_device(device_id)
+                assignment = pending[0] if pending else None
+        else:
+            assignment = await self.assignment(job_id, device_id)
+        if assignment is not None and (
+            assignment["state"] == DeviceState.RECONCILING.value
+            or (assignment.get("cancel_requested_at") is not None
+                and assignment["state"] not in {"failed", "succeeded", "interrupted"})
+        ):
+            return assignment
+        fence = await self.fenced_assignment_for_device(device_id)
+        if (fence and fence.get("blocking_job_id") and fence.get("blocking_attempt") == 1
+                and (job_id is None or fence["blocking_job_id"] == job_id)):
+            return {
+                "job_id": fence["blocking_job_id"], "attempt": 1,
+                "artifact_id": fence.get("artifact_id"),
+            }
+        opaque = await self.opaque_reconcile_target(device_id)
+        return opaque if opaque and (job_id is None or opaque["job_id"] == job_id) else None
+
     def gc_artifacts_sync(
         self, artifact_root: Path, *, retry_window_ms: int, timestamp: int | None = None,
     ) -> list[str]:

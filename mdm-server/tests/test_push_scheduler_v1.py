@@ -99,35 +99,6 @@ def test_active_reconnect_keeps_the_existing_transfer_slot():
     asyncio.run(scenario())
 
 
-def test_exact_reconcile_can_reuse_held_owner_lock():
-    async def scenario():
-        lock = asyncio.Lock()
-        ws = _Ws()
-        session = __import__(
-            'styly_mdm.push_scheduler', fromlist=['LiveSession']
-        ).LiveSession(
-            device_id='D1',
-            session_id='session',
-            ws=ws,
-            capabilities=frozenset({'push_job_id_v1'}),
-            process_instance_id='process',
-            owner_lock=lock,
-            http_base='http://server',
-        )
-        scheduler = object.__new__(PushScheduler)
-        scheduler.send_timeout = 0.5
-        scheduler.sessions = lambda: {'D1': session}
-        async with lock:
-            await asyncio.wait_for(
-                scheduler.send_exact_reconcile(
-                    session, 'job', 1, 'artifact', owner_lock_held=True
-                ),
-                timeout=0.5,
-            )
-        assert ws.messages[0]['type'] == 'PUSH_RECONCILE_REQUEST'
-
-    asyncio.run(scenario())
-
 
 @pytest.mark.asyncio
 async def test_resume_after_disconnect_does_not_duplicate_a_slot_waiting_task(

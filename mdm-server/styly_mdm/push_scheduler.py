@@ -52,6 +52,16 @@ class LiveSession:
     push_state_available: bool = True
 
 
+@dataclass(slots=True)
+class ReconciliationProbe:
+    session: LiveSession
+    job_id: str
+    attempt: int
+    artifact_id: str | None
+    status: str = "checking"
+    task: asyncio.Task[None] | None = None
+
+
 class PushScheduler:
     def __init__(
         self,
@@ -66,6 +76,7 @@ class PushScheduler:
         accept_reconciliation_timeout: float,
         reconciliation_timeout: float,
         leases: PushTransferLeases,
+        reconciliation_changed: Callable[[], None] | None = None,
     ) -> None:
         self.manager = manager
         self.transfer_registry = transfer_registry
@@ -77,6 +88,9 @@ class PushScheduler:
         self.accept_reconciliation_timeout = accept_reconciliation_timeout
         self.reconciliation_timeout = reconciliation_timeout
         self.leases = leases
+        self.reconciliation_changed = reconciliation_changed
+        self.reconciliation_probes: dict[str, ReconciliationProbe] = {}
+        self.reconciliation_revision = 0
         self._wake = asyncio.Event()
         self._runner: asyncio.Task[None] | None = None
         self._stopping = False
@@ -100,6 +114,9 @@ class PushScheduler:
 
     async def stop(self) -> None:
         self._stopping = True
+        probe_tasks = [probe.task for probe in self.reconciliation_probes.values() if probe.task]
+        for device_id in tuple(self.reconciliation_probes):
+            self.forget_reconciliation(device_id)
         if self._runner is not None:
             self._runner.cancel()
         for task in tuple(self._dispatch_tasks):
@@ -109,7 +126,7 @@ class PushScheduler:
                 task
                 for task in (
                     ([self._runner] if self._runner else [])
-                    + list(self._dispatch_tasks)
+                    + list(self._dispatch_tasks) + probe_tasks
                 )
             ),
             return_exceptions=True,
@@ -409,6 +426,7 @@ class PushScheduler:
         if not self._transfer_is_stalled(lease):
             return False
         persistence_error: Exception | None = None
+        snapshot = None
         try:
             active = await self.manager.active_assignment_for_device(key.device_id)
             if (
@@ -468,6 +486,12 @@ class PushScheduler:
             self.transfer_registry.release_exact(key, "transfer_stalled")
         if persistence_error is not None:
             raise persistence_error
+        session = self.sessions().get(key.device_id)
+        if snapshot is not None and session is not None:
+            try:
+                await self.send_reconcile(session, snapshot, key.device_id)
+            except (ConnectionError, asyncio.TimeoutError):
+                log.info("Could not probe stalled Push transfer for %s/%s", key.job_id, key.device_id)
         return True
 
     def _clear_dispatch_waiters(
@@ -907,37 +931,128 @@ class PushScheduler:
         *,
         owner_lock_held: bool = False,
     ) -> None:
-        if not session.push_state_available:
-            # Registration or a Push-state refresh asks again once state is available.
-            log.info(
-                "Deferring Push reconciliation for %s: durable Push state is unavailable",
-                session.device_id,
-            )
+        if (not session.push_state_available or self._stopping
+                or self.sessions().get(session.device_id) is not session):
             return
-        payload = {
-            "type": "PUSH_RECONCILE_REQUEST",
-            "jobs": [
-                {
-                    "job_id": job_id,
-                    "attempt": attempt,
-                    "artifact_id": artifact_id,
-                }
+        existing = self.reconciliation_probes.get(session.device_id)
+        if existing is not None:
+            if (existing.session is session and existing.job_id == job_id
+                    and existing.attempt == attempt and existing.artifact_id == artifact_id):
+                return
+            self.forget_reconciliation(session.device_id)
+        probe = ReconciliationProbe(session, job_id, attempt, artifact_id)
+        self.reconciliation_probes[session.device_id] = probe
+        self._notify_reconciliation()
+        try:
+            if owner_lock_held:
+                await self._send_probe(probe)
+            else:
+                async with session.owner_lock:
+                    await self._send_probe(probe)
+        finally:
+            if not self._stopping and self.reconciliation_probes.get(session.device_id) is probe:
+                probe.task = asyncio.create_task(
+                    self._retry_reconciliation(probe), name=f"push-reconcile-{session.device_id}"
+                )
+
+    def reconciliation_snapshot(self) -> dict[str, Any]:
+        return {
+            "revision": self.reconciliation_revision,
+            "devices": [
+                {"device_id": device_id, "job_id": probe.job_id,
+                 "attempt": probe.attempt, "artifact_id": probe.artifact_id,
+                 "status": probe.status}
+                for device_id, probe in self.reconciliation_probes.items()
             ],
         }
 
-        async def send_owned() -> None:
-            if self.sessions().get(session.device_id) is not session:
-                raise ConnectionOwnerChanged("device owner changed before reconcile request")
-            await asyncio.wait_for(
-                session.ws.send_str(json.dumps(payload, separators=(",", ":"))),
-                self.send_timeout,
-            )
+    def _notify_reconciliation(self) -> None:
+        self.reconciliation_revision += 1
+        if self.reconciliation_changed is not None and not self._stopping:
+            self.reconciliation_changed()
 
-        if owner_lock_held:
-            await send_owned()
-        else:
-            async with session.owner_lock:
-                await send_owned()
+    def forget_reconciliation(self, device_id: str) -> None:
+        probe = self.reconciliation_probes.pop(device_id, None)
+        if probe is None:
+            return
+        if probe.task is not None and probe.task is not asyncio.current_task():
+            probe.task.cancel()
+        self._notify_reconciliation()
+
+    async def refresh_reconciliation(self, session: LiveSession) -> None:
+        """Drop a probe only after canonical state proves it no longer needs checking.
+
+        Called with the device owner lock held after processing device evidence.
+        An interrupted cleanup report alone is insufficient: keep probing until
+        exact absence confirms that the old worker has released ownership.
+        """
+        probe = self.reconciliation_probes.get(session.device_id)
+        if probe is not None:
+            try:
+                needed = await self._probe_needed(probe)
+            except Exception:
+                log.exception("Could not refresh Push reconciliation for %s", session.device_id)
+                return
+            if not needed:
+                self.forget_reconciliation(session.device_id)
+
+    async def _probe_needed(self, probe: ReconciliationProbe) -> bool:
+        session = probe.session
+        if self.sessions().get(session.device_id) is not session or not session.push_state_available:
+            return False
+        target = await self.manager.reconciliation_target_for_device(
+            session.device_id, job_id=probe.job_id,
+        )
+        return bool(target and target["attempt"] == probe.attempt
+                    and target.get("artifact_id") == probe.artifact_id)
+
+    async def _send_probe(self, probe: ReconciliationProbe) -> None:
+        session = probe.session
+        if self.sessions().get(session.device_id) is not session:
+            raise ConnectionOwnerChanged("device owner changed before reconcile request")
+        payload = {"type": "PUSH_RECONCILE_REQUEST", "jobs": [{
+            "job_id": probe.job_id, "attempt": probe.attempt,
+            "artifact_id": probe.artifact_id,
+        }]}
+        await asyncio.wait_for(
+            session.ws.send_str(json.dumps(payload, separators=(",", ":"))), self.send_timeout,
+        )
+
+    async def _retry_reconciliation(self, probe: ReconciliationProbe) -> None:
+        try:
+            # The initial probe has already been sent. Keep one bounded cycle per
+            # connection/execution, including after exhaustion; repeated triggers
+            # must not restart the cycle on an otherwise unchanged connection.
+            for retry_index, delay in enumerate((1, 2, 4, 8, 8)):
+                await asyncio.sleep(delay)
+                async with probe.session.owner_lock:
+                    if self.reconciliation_probes.get(probe.session.device_id) is not probe:
+                        return
+                    try:
+                        needed = await self._probe_needed(probe)
+                    except Exception:
+                        log.exception("Could not read Push reconciliation for %s", probe.session.device_id)
+                        if retry_index < 4:
+                            continue
+                        needed = True
+                    if not needed:
+                        self.forget_reconciliation(probe.session.device_id)
+                        return
+                    if retry_index == 4:
+                        probe.status = "unavailable"
+                        self._notify_reconciliation()
+                        return
+                    try:
+                        await self._send_probe(probe)
+                    except (ConnectionError, asyncio.TimeoutError):
+                        pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Could not check Push reconciliation for %s", probe.session.device_id)
+            if self.reconciliation_probes.get(probe.session.device_id) is probe:
+                probe.status = "unavailable"
+                self._notify_reconciliation()
 
     async def handle_late_command_response(
         self,

@@ -39,6 +39,16 @@ a fresh Resume. Both interruption and timeout cleanup preserve replacement waite
 Retry and late recovery protect newer work at equal, parent, and child destinations;
 SQL decisions and batched snapshots share the canonical directory-overlap predicate.
 
+`PushScheduler` owns bounded, connection/execution-specific reconciliation probes;
+the Manager shares target selection for initial and exact-execution checks.
+Resolution, disconnect, unavailable Push state, shutdown, or exhaustion stop
+probes without changing durable safety gates. The existing publication worker
+coalesces independently revisioned `PUSH_RECONCILIATION_STATE` updates; the optional
+initial snapshot field `reconciliation` restores them after browser reconnect.
+These admin-only additions require no APK or DB migration. Timing, cancellation,
+transfer stalls, and reconnect behavior are specified in
+[PUSH_JOBS.md](PUSH_JOBS.md#operator-controls).
+
 On Android, `PushJobCoordinator` serializes events through its actor and uses
 durable `state.active` as the execution owner. `PushFilesWorker` downloads and
 validates the artifact, then waits for a durable applying checkpoint before

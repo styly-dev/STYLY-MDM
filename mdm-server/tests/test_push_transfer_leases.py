@@ -107,6 +107,7 @@ def test_stalled_transfer_stops_http_stream_before_releasing_its_slot(monkeypatc
         )
         scheduler.publish = publish
         scheduler.reconciliation_timeout = 60
+        scheduler.sessions = lambda: {}
         registry = TransferRegistry(
             before_release=lambda _key: order.append(("slot_released", stream.done()))
         )

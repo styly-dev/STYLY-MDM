@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 
 from styly_mdm.push_artifacts import ArtifactStore
 from styly_mdm.push_job_manager import PushJobManager
@@ -177,8 +178,14 @@ class Scheduler:
     def wake(self):
         self.wake_count += 1
 
-    async def send_reconcile(self, session, snapshot, device_id):
-        self.reconcile_calls.append((session, snapshot, device_id))
+    async def refresh_reconciliation(self, session):
+        pass
+
+    def forget_reconciliation(self, device_id):
+        pass
+
+    async def send_exact_reconcile(self, session, job_id, attempt, artifact_id):
+        self.reconcile_calls.append((session, job_id, attempt, artifact_id))
 
     async def reconcile_active_transfer(self, job_id, device_id, attempt):
         self.active_transfer_slots.append((job_id, device_id, attempt))
@@ -227,33 +234,34 @@ def session_runtime_for(manager):
     return runtime, session
 
 
-class OperatorScheduler:
-    """Keep scheduling deterministic while exercising the real reconcile lock path."""
+@pytest_asyncio.fixture
+async def operator_runtime():
+    """Exercise real reconciliation; count dispatch wakes and join owned tasks."""
+    schedulers = []
 
-    send_exact_reconcile = PushScheduler.send_exact_reconcile
+    def create(manager, artifact_root):
+        runtime, session = session_runtime_for(manager)
+        runtime.device_locks = {"D1": session.owner_lock}
+        runtime.admin_send_timeout = 0.5
+        runtime.artifacts = SimpleNamespace(artifact_root=artifact_root)
+        runtime.legacy.MAX_CONCURRENT_TRANSFERS = 5
+        scheduler = dispatch_scheduler(
+            manager, runtime.transfers, runtime.leases, runtime.sessions, asyncio.Semaphore(1),
+        )
+        scheduler.sessions = lambda: runtime.sessions
+        scheduler.wake_count = 0
 
-    def __init__(self, runtime):
-        self.runtime = runtime
-        self.send_timeout = 0.5
-        self.wake_count = 0
+        def wake():
+            scheduler.wake_count += 1
 
-    def sessions(self):
-        return self.runtime.sessions
+        scheduler.wake = wake
+        runtime.scheduler = scheduler
+        schedulers.append(scheduler)
+        return runtime, session, Ws()
 
-    def wake(self):
-        self.wake_count += 1
-
-
-def operator_runtime(manager, artifact_root):
-    """Add admin command dependencies and an admin socket to the session runtime."""
-    runtime, session = session_runtime_for(manager)
-    runtime.device_locks = {"D1": session.owner_lock}
-    runtime.admin_send_timeout = 0.5
-    runtime.artifacts = SimpleNamespace(artifact_root=artifact_root)
-    runtime.legacy.MAX_CONCURRENT_TRANSFERS = 5
-    runtime.legacy.devices = {}
-    runtime.scheduler = OperatorScheduler(runtime)
-    return runtime, session, Ws()
+    yield create
+    for scheduler in schedulers:
+        await scheduler.stop()
 
 
 async def admin_action(runtime, admin, message_type, job_id, **fields):

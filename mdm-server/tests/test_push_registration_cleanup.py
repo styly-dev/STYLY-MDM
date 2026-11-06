@@ -63,9 +63,8 @@ async def test_unknown_interrupted_registration_is_rejected_then_push_can_dispat
         assert rejection["revision"] == 7
         assert await runtime.manager.opaque_reconcile_target(device_id) is not None
 
-        # A manual reconcile of the still-interrupted state retries rejection and
-        # must not clear ownership until the client confirms exact absence.
-        await admin.send_json({"type": "RECONCILE_PUSH_DEVICE", "device_id": device_id})
+        # Registration automatically probes the still-interrupted state. A reply
+        # retries rejection without releasing ownership before exact absence.
         probe = await recv_type(device, "PUSH_RECONCILE_REQUEST")
         assert probe["jobs"] == [{
             "job_id": unknown_job_id,
@@ -101,7 +100,7 @@ async def test_unknown_interrupted_registration_is_rejected_then_push_can_dispat
         await recv_type(device, "REGISTERED")
         assert await runtime.manager.opaque_reconcile_target(device_id) is not None
 
-        await admin.send_json({"type": "RECONCILE_PUSH_DEVICE", "device_id": device_id})
+        # The bounded retry loop probes again without an operator command.
         probe = await recv_type(device, "PUSH_RECONCILE_REQUEST")
         assert probe["jobs"][0]["job_id"] == unknown_job_id
 
