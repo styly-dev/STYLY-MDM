@@ -1,6 +1,10 @@
 package com.styly.mdmclient
 
 import android.app.Application
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Environment
 import android.util.Log
 import com.pvr.tobservice.ToBServiceHelper
@@ -34,6 +38,14 @@ class MdmClientApplication : Application() {
         // The coordinator is Application-scoped: Service recreation or a transient
         // WebSocket reconnect cannot create a second Push/Sync worker.
         coordinator = PushJobCoordinator(this)
+        // Registered for the process lifetime; Android sends this before normal shutdown.
+        registerReceiver(object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action == Intent.ACTION_SHUTDOWN) {
+                    coordinator?.checkpointBeforeShutdown()
+                }
+            }
+        }, IntentFilter(Intent.ACTION_SHUTDOWN))
         identityResolver = DeviceIdentityResolver.create(this).also {
             it.startInitialLookup()
         }
