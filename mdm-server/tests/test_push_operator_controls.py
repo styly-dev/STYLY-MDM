@@ -145,8 +145,8 @@ async def test_admin_retry_creates_enabled_job_reusing_artifact_and_failed_targe
     original = await completed(manager, tmp_path)
     runtime, session, admin = operator_runtime(manager, tmp_path)
     runtime.sessions = {device: session for device in ("failed", "interrupted", "unknown")}
-    await admin_action(runtime, admin, "RETRY_FAILED_PUSH_JOB", original["job_id"],
-                       client_request_id=str(uuid.uuid4()))
+    await admin_action(runtime, admin, "RETRY_PUSH_DEVICES", original["job_id"],
+                       client_request_id=str(uuid.uuid4()), target_devices=["failed", "interrupted", "unknown"])
     retry_id = admin.messages[-1]["job_id"]
     assert retry_id != original["job_id"]
     retry = await manager.get_snapshot(retry_id)
@@ -496,12 +496,12 @@ async def test_retry_request_replay_preserves_dispatch_authority(operator_runtim
     if paused == "ready":
         _, retry = await manager.retry_failed(
             original["job_id"], request_id, artifact_root=tmp_path,
-            online_devices=runtime.sessions,
+            target_devices=runtime.sessions, online_devices=runtime.sessions,
         )
         retry_id = retry["job_id"]
     else:
-        await admin_action(runtime, admin, "RETRY_FAILED_PUSH_JOB", original["job_id"],
-                           client_request_id=request_id)
+        await admin_action(runtime, admin, "RETRY_PUSH_DEVICES", original["job_id"],
+                           client_request_id=request_id, target_devices=["failed", "interrupted", "unknown"])
         retry_id = admin.messages[-1]["job_id"]
         if paused == "restart":
             manager.store.recover_startup_sync(
@@ -519,8 +519,8 @@ async def test_retry_request_replay_preserves_dispatch_authority(operator_runtim
     rows_before = {d: await manager.assignment(retry_id, d) for d in before["devices"]}
     # A request replay must also work when none of the original targets are online.
     runtime.sessions.clear()
-    await admin_action(runtime, admin, "RETRY_FAILED_PUSH_JOB", original["job_id"],
-                       client_request_id=request_id)
+    await admin_action(runtime, admin, "RETRY_PUSH_DEVICES", original["job_id"],
+                       client_request_id=request_id, target_devices=["failed", "interrupted", "unknown"])
     assert admin.messages[-1]["job_id"] == retry_id
     assert await manager.get_snapshot(retry_id) == before
     assert {d: await manager.assignment(retry_id, d) for d in before["devices"]} == rows_before
@@ -565,7 +565,7 @@ async def test_cancel_returns_one_correlated_outcome_for_every_target(
     assert response["target_devices"] == requested
     assert response["accepted_devices"] == accepted
     assert set(response["rejected_devices"]) == set(rejected_targets)
-    assert all("Only paused, interrupted" in reason for reason in response["rejected_devices"].values())
+    assert all("Only paused transfers or Retry candidates" in reason for reason in response["rejected_devices"].values())
     assert runtime.scheduler.wake_count == bool(accepted)
     for device_id in rejected_targets:
         assert await manager.assignment(job_id, device_id) == before_rejected[device_id]
@@ -638,8 +638,11 @@ async def test_invalid_operator_action_returns_correlated_error(operator_runtime
 
 
 @pytest.mark.asyncio
-async def test_resume_acknowledgement_echoes_requested_targets_before_online_filter(operator_runtime, manager, tmp_path):
-    original = await two_device_job(manager, interrupted=True)
+@pytest.mark.parametrize('interrupted', [False, True])
+async def test_resume_acknowledgement_echoes_requested_targets_before_online_filter(
+    operator_runtime, manager, tmp_path, interrupted,
+):
+    original = await two_device_job(manager, interrupted=interrupted)
     runtime, _session, admin = operator_runtime(manager, tmp_path)
     await admin_action(runtime, admin, "PUSH_FILES", original["job_id"],
                        target_devices=["D2", "D1", "D2"], request_id="resume-request")
@@ -649,9 +652,10 @@ async def test_resume_acknowledgement_echoes_requested_targets_before_online_fil
     assert response["request_id"] == "resume-request"
     assert response["target_devices"] == ["D2", "D1"]
     assert response["target_count"] == 1
+    assert response["accepted_devices"] == ["D1"]
     current = await manager.get_snapshot(original["job_id"])
-    assert current["devices"]["D1"]["queue_reason"] == "resumable_replay"
-    assert current["devices"]["D2"]["queue_reason"] == "download_interrupted"
+    assert current["devices"]["D1"]["queue_reason"] == ('resumable_replay' if interrupted else 'awaiting_dispatch')
+    assert current["devices"]["D2"]["queue_reason"] == ('download_interrupted' if interrupted else 'dispatch_paused')
 
 
 @pytest.mark.asyncio
@@ -721,3 +725,125 @@ async def test_socket_wrapper_correlates_unexpected_failure_without_claiming_out
         assert not current["devices"]["D2"]["cancel_requested"]
     else:
         assert all(device["queue_reason"] == "resumable_replay" for device in current["devices"].values())
+
+
+@pytest.mark.asyncio
+async def test_targeted_retry_ack_and_error_correlate_source_and_request(operator_runtime, manager, tmp_path):
+    original = await completed(manager, tmp_path)
+    runtime, session, admin = operator_runtime(manager, tmp_path)
+    runtime.sessions = {device: session for device in ('failed', 'interrupted')}
+    request = {
+        'type': 'RETRY_PUSH_DEVICES', 'job_id': original['job_id'],
+        'client_request_id': str(uuid.uuid4()), 'target_devices': ['failed'],
+    }
+    assert await runtime.handle_admin_message(admin, request)
+    ack = admin.messages[-1]
+    assert ack['type'] == 'PUSH_JOB_ACTION_SENT'
+    assert ack['source_job_id'] == original['job_id']
+    assert ack['client_request_id'] == request['client_request_id']
+    assert ack['target_devices'] == ['failed']
+    assert set((await manager.get_snapshot(ack['job_id']))['devices']) == {'failed'}
+    assert (await manager.get_snapshot(original['job_id']))['devices']['interrupted'] == original['devices']['interrupted']
+    await runtime.handle_admin_message(admin, {**request, 'target_devices': ['interrupted']})
+    error = admin.messages[-1]
+    assert error['type'] == 'ERROR' and 'different request' in error['message']
+    assert error['job_id'] == request['job_id']
+    assert error['client_request_id'] == request['client_request_id']
+    assert error['target_devices'] == ['interrupted']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('targets', [None, [], 'failed', ['foreign'], ['failed', 1]])
+async def test_retry_rejects_missing_or_invalid_scope_from_old_or_invalid_console(
+    operator_runtime, manager, tmp_path, targets,
+):
+    original = await completed(manager, tmp_path)
+    runtime, session, admin = operator_runtime(manager, tmp_path)
+    runtime.sessions = {'failed': session}
+    request = {
+        'type': 'RETRY_PUSH_DEVICES', 'job_id': original['job_id'],
+        'client_request_id': str(uuid.uuid4()),
+    }
+    if targets is not None:
+        request['target_devices'] = targets
+    await runtime.handle_admin_message(admin, request)
+    assert admin.messages[-1]['type'] == 'ERROR'
+    assert admin.messages[-1]['client_request_id'] == request['client_request_id']
+    assert await manager.get_snapshot(original['job_id']) == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('device_id,dispatched', [('failed', False), ('failed', True), ('interrupted', True), ('unknown', True)])
+async def test_cancel_withdraws_terminal_candidate_without_device_io_or_rewriting_result(
+    operator_runtime, manager, tmp_path, device_id, dispatched,
+):
+    original = await completed(manager, tmp_path)
+    job_id = original['job_id']
+    await manager.store._call(lambda conn: (
+        conn.execute('DELETE FROM push_device_fences WHERE device_id=?', (device_id,)),
+        conn.execute('UPDATE push_job_devices SET dispatch_revision=? WHERE job_id=? AND device_id=?',
+                     (1 if dispatched else None, job_id, device_id)),
+    ))
+    before = await manager.assignment(job_id, device_id)
+    original = await manager.get_snapshot(job_id)
+    runtime, session, admin = operator_runtime(manager, tmp_path)
+    runtime.sessions = {device_id: session}
+    await admin_action(runtime, admin, 'CANCEL_PUSH_JOB', job_id, target_devices=[device_id])
+    cancelled = await manager.get_snapshot(job_id)
+    row = await manager.assignment(job_id, device_id)
+    assert row['cancel_requested_at'] is not None
+    assert {k: v for k, v in row.items() if k not in {'cancel_requested_at', 'updated_at'}} == {
+        k: v for k, v in before.items() if k not in {'cancel_requested_at', 'updated_at'}
+    }
+    assert not cancelled['devices'][device_id]['retryable']
+    assert not cancelled['devices'][device_id]['cancellable']
+    assert not cancelled['devices'][device_id]['resume_required']
+    for peer in original['devices'].keys() - {device_id}:
+        assert cancelled['devices'][peer] == original['devices'][peer]
+    assert session.ws.messages == []
+    assert await manager.pending_cancellations_for_device(device_id) == []
+    assert await manager.reconciliation_target_for_device(device_id, job_id=job_id) is None
+    assert await manager.confirm_cancel(job_id, device_id) == []
+    assert await manager.cancel_interrupted(job_id, device_id) == cancelled
+    manager.store.recover_startup_sync(accept_reconciliation_timeout_ms=1000, reconciliation_timeout_ms=1000)
+    after_restart = await manager.get_snapshot(job_id)
+    assert after_restart['devices'][device_id]['cancel_requested']
+    assert not after_restart['devices'][device_id]['retryable']
+
+
+@pytest.mark.asyncio
+async def test_retired_job_wide_retry_is_rejected_without_dispatch(operator_runtime, manager, tmp_path):
+    original = await completed(manager, tmp_path)
+    runtime, session, admin = operator_runtime(manager, tmp_path)
+    runtime.sessions = {device: session for device in ('failed', 'interrupted', 'unknown')}
+    assert await runtime.handle_admin_message(admin, {
+        'type': 'RETRY_FAILED_PUSH_JOB', 'job_id': original['job_id'],
+        'client_request_id': str(uuid.uuid4()),
+    })
+    assert admin.messages[-1]['type'] == 'ERROR'
+    assert 'retired' in admin.messages[-1]['message']
+    assert await manager.get_snapshot(original['job_id']) == original
+    assert await manager.store._call(lambda conn: conn.execute('SELECT COUNT(*) FROM push_jobs').fetchone()[0]) == 1
+    assert runtime.scheduler.wake_count == 0
+
+
+@pytest.mark.asyncio
+async def test_withdrawing_failed_candidate_preserves_unrelated_opaque_owner(
+    operator_runtime, manager, tmp_path,
+):
+    original = await completed(manager, tmp_path)
+    job_id = original['job_id']
+    identity = manager.opaque_identity_for_active({'job_id': str(uuid.uuid4()), 'attempt': 1})
+    await manager.add_opaque_fence('failed', identity, ProtocolMode.JOB_V1, 'process-a', 'unknown active job')
+    before = await manager.get_snapshot(job_id)
+    fence = before['devices']['failed']['device_fence']
+    runtime, session, admin = operator_runtime(manager, tmp_path)
+    runtime.sessions = {'failed': session}
+    await admin_action(runtime, admin, 'CANCEL_PUSH_JOB', job_id, target_devices=['failed'])
+    after = await manager.get_snapshot(job_id)
+    assert after['devices']['failed']['cancel_requested']
+    assert not after['devices']['failed']['retryable']
+    assert after['devices']['failed']['device_fence'] == fence
+    assert after['devices']['failed']['failure'] == before['devices']['failed']['failure']
+    assert (await manager.fenced_assignment_for_device('failed'))['blocking_opaque_identity'] == identity
+    assert session.ws.messages == []

@@ -110,7 +110,7 @@ async def test_unchanged_old_history_is_not_revised_or_republished(manager, tmp_
             (original["artifact"]["artifact_id"],)))
     elif reason == "retried":
         await manager.retry_failed(original["job_id"], str(uuid.uuid4()),
-                                   artifact_root=tmp_path, online_devices={"failed"})
+                                   artifact_root=tmp_path, target_devices={"failed"}, online_devices={"failed"})
     else:
         await newer_job(store, original)
     await store.drain_retry_publications()
@@ -177,13 +177,13 @@ async def test_retry_creation_notifies_original_and_replay_is_quiet(manager, tmp
     original = await completed(manager, tmp_path)
     request_id = str(uuid.uuid4())
     _, retry = await manager.retry_failed(original["job_id"], request_id,
-                                         artifact_root=tmp_path, online_devices={"failed"})
+                                         artifact_root=tmp_path, target_devices={"failed"}, online_devices={"failed"})
     updated, = await store.drain_retry_publications()
     assert updated["revision"] > original["revision"]
     assert updated["devices"]["failed"]["retry_job_id"] == retry["job_id"]
     assert not updated["devices"]["failed"]["retryable"]
     created, _ = await manager.retry_failed(original["job_id"], request_id,
-                                           artifact_root=tmp_path, online_devices={"failed"})
+                                           artifact_root=tmp_path, target_devices={"failed"}, online_devices={"failed"})
     assert not created
     assert await store.drain_retry_publications() == []
 

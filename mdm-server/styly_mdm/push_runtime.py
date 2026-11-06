@@ -82,13 +82,15 @@ def _uuid_v4_or_none(value: Any) -> str | None:
 
 
 def _operator_action_context(payload: dict[str, Any]) -> dict[str, Any]:
-    """Correlate both expected and unexpected Resume/Cancel responses."""
+    """Correlate expected and unexpected operator-action responses."""
     message_type = payload.get("type")
-    if message_type not in ("CANCEL_PUSH_JOB", "PUSH_FILES"):
+    if message_type not in ("CANCEL_PUSH_JOB", "PUSH_FILES", "RETRY_PUSH_DEVICES"):
         return {}
     context = {"action": message_type, "job_id": payload.get("job_id")}
     if isinstance(payload.get("request_id"), str):
         context["request_id"] = payload["request_id"]
+    if isinstance(payload.get("client_request_id"), str):
+        context["client_request_id"] = payload["client_request_id"]
     if "target_devices" in payload:
         context["target_devices"] = payload["target_devices"]
     return context
@@ -1872,6 +1874,15 @@ class PushRuntime:
         message_type = payload.get("type")
         action_context = _operator_action_context(payload)
 
+        if message_type == "RETRY_FAILED_PUSH_JOB":
+            # Do not reinterpret a job-wide request as a selected-device action.
+            await self.admin_send(ws, {
+                "type": "ERROR", "action": message_type,
+                "job_id": payload.get("job_id"),
+                "message": "Job-wide Retry is retired; reload the console to select devices",
+            })
+            return True
+
         if (
             "target_connections" in payload
             and message_type not in {"REBOOT_DEVICE", "POWER_OFF_DEVICE"}
@@ -1882,12 +1893,15 @@ class PushRuntime:
                 **action_context,
             }))
             return True
-        if message_type in {"CANCEL_PUSH_JOB", "RETRY_FAILED_PUSH_JOB"}:
+        if message_type in {"CANCEL_PUSH_JOB", "RETRY_PUSH_DEVICES"}:
             job_id = payload.get("job_id")
             try:
                 if not isinstance(job_id, str):
                     raise StoreConflict("job_id is required")
-                if message_type == "RETRY_FAILED_PUSH_JOB":
+                if message_type == "RETRY_PUSH_DEVICES":
+                    targets = self._job_action_targets(payload)
+                    if targets is None:
+                        raise StoreConflict("Retry requires explicit target_devices; reload the console")
                     # Same live eligibility as job creation, so a target that cannot
                     # receive Push now stays eligible for a later Retry.
                     eligible = [
@@ -1898,6 +1912,7 @@ class PushRuntime:
                     ]
                     created, snapshot = await self.manager.retry_failed(
                         job_id, payload.get("client_request_id"),
+                        target_devices=targets,
                         artifact_root=self.artifacts.artifact_root,
                         online_devices=eligible,
                     )
@@ -1945,7 +1960,9 @@ class PushRuntime:
                     self.scheduler.wake()
                 await self.admin_send(ws, {
                     "type": "PUSH_JOB_ACTION_SENT", "job_id": snapshot["job_id"],
-                    "action": message_type,
+                    "action": message_type, "source_job_id": job_id,
+                    "client_request_id": snapshot["client_request_id"],
+                    "target_devices": list(snapshot["devices"]),
                 })
             except (StoreConflict, StoreNotFound, ValueError) as exc:
                 error = {"type": "ERROR", "message": str(exc), **action_context}
@@ -1959,7 +1976,7 @@ class PushRuntime:
                 targets = self._job_action_targets(payload)
                 current = await self.store.get_snapshot(job_id)
                 requested = targets if targets is not None else list(current["devices"])
-                if current["state"] in {JobState.RUNNING.value, JobState.RECONCILING.value}:
+                if targets is not None or current["state"] in {JobState.RUNNING.value, JobState.RECONCILING.value}:
                     if not set(requested) <= current["devices"].keys():
                         raise StoreConflict("Resume targets must belong to this job")
                     targets = [
@@ -2010,6 +2027,7 @@ class PushRuntime:
                     "type": "PUSH_FILES_SENT",
                     **action_context,
                     "target_devices": requested,
+                    **({"accepted_devices": targets} if targets is not None else {}),
                     "revision": snapshot["revision"],
                     "state": snapshot["state"],
                     "dispatch_enabled": snapshot["dispatch_enabled"],
@@ -2104,7 +2122,12 @@ class PushRuntime:
                 "Wait for the connected device to report interruption before cancelling"
             )
         snapshot = await self.manager.cancel_interrupted(job_id, device_id)
-        if snapshot["devices"][device_id]["state"] == DeviceState.FAILED.value:
+        target = snapshot["devices"][device_id]
+        fence = target.get("device_fence") or {}
+        if target["state"] in {DeviceState.FAILED.value, DeviceState.INTERRUPTED.value} or (
+            target["state"] == DeviceState.UNCONFIRMED.value
+            and (fence.get("blocking_job_id"), fence.get("blocking_attempt")) != (job_id, 1)
+        ):
             return snapshot
         key = TransferKey("push", device_id, job_id, 1)
         token = self.leases.token(key)

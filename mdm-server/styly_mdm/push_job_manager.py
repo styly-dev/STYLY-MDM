@@ -26,7 +26,6 @@ from .push_jobs import (
     ProtocolMode,
     ProgressEvent,
     TERMINAL_DEVICE_STATES,
-    assignment_actions,
     DispatchPermission,
     can_replay_unaccepted,
     canonicalize_create_request,
@@ -126,7 +125,7 @@ class PushJobManager:
         if assignment is not None and (
             assignment["state"] == DeviceState.RECONCILING.value
             or (assignment.get("cancel_requested_at") is not None
-                and assignment["state"] not in {"failed", "succeeded", "interrupted"})
+                and assignment["state"] not in TERMINAL_DEVICE_STATES)
         ):
             return assignment
         fence = await self.fenced_assignment_for_device(device_id)
@@ -288,19 +287,26 @@ class PushJobManager:
         job_id: str,
         client_request_id: str,
         *,
+        target_devices: Iterable[str],
         artifact_root: Path,
         online_devices: Iterable[str],
     ) -> tuple[bool, dict[str, Any]]:
-        """Queue unsuccessful online targets in a new job, retaining history and fences.
+        """Retry selected unsuccessful online targets, retaining history and fences.
 
         Like a new job, Retry targets only online devices. Offline targets stay
         unsuccessful in the original job and remain eligible for a later Retry,
         so a device never starts this work merely because it reconnects.
         """
         online = set(online_devices)
+        if isinstance(target_devices, (str, bytes)):
+            raise StoreConflict("target_devices must be a nonempty list of device IDs")
+        targets = list(target_devices)
+        if not targets or any(not isinstance(value, str) or not value for value in targets):
+            raise StoreConflict("target_devices must be a nonempty list of device IDs")
+        requested = set(targets)
         job_id = require_uuid(job_id, "job_id")
         client_request_id = require_uuid(client_request_id, "client_request_id")
-        fingerprint = "retry_failed:" + job_id
+        fingerprint = "retry_failed:" + json.dumps([job_id, sorted(requested)])
         root = artifact_root.resolve()
 
         def op(conn: sqlite3.Connection) -> tuple[bool, dict[str, Any]]:
@@ -330,12 +336,13 @@ class PushJobManager:
                 if not self._artifact_file_available(artifact, root):
                     raise StoreConflict("retry artifact is missing or incomplete; upload a new job")
                 # The snapshot's retryable flag is the single eligibility rule.
+                assignments = self.store._snapshot(conn, job_id)["devices"]
+                if not requested <= assignments.keys():
+                    raise StoreConflict("Retry targets must belong to this job")
                 eligible = {
                     device_id
-                    for device_id, assignment in self.store._snapshot(conn, job_id)[
-                        "devices"
-                    ].items()
-                    if assignment["retryable"]
+                    for device_id, assignment in assignments.items()
+                    if device_id in requested and assignment["retryable"]
                 }
                 targets = [
                     row
@@ -1229,42 +1236,22 @@ class PushJobManager:
         return await self.store._call(op)
 
     async def cancel_interrupted(self, job_id: str, device_id: str) -> dict[str, Any]:
-        """Cancel unsent work, or retain dispatched ownership until cleanup evidence."""
+        """Withdraw terminal candidates or cancel paused work, retaining ownership."""
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
             self.store._begin(conn)
             try:
                 row = conn.execute(
-                    "SELECT d.*, j.state AS job_state, j.dispatch_enabled "
-                    "FROM push_job_devices d JOIN push_jobs j ON j.job_id=d.job_id "
-                    "WHERE d.job_id=? AND d.device_id=?",
+                    "SELECT * FROM push_job_devices WHERE job_id=? AND device_id=?",
                     (job_id, device_id),
                 ).fetchone()
                 if row is None:
                     raise StoreNotFound(f"{job_id}/{device_id}")
                 if row["cancel_requested_at"] is None and row["failure_code"] != "cancelled":
-                    blocking_fence = conn.execute(
-                        "SELECT 1 FROM push_device_fences "
-                        "WHERE device_id=? AND blocking_job_id=? AND blocking_attempt=?",
-                        (device_id, job_id, row["attempt"]),
-                    ).fetchone() is not None
-                    actions = assignment_actions(
-                        job_state=row["job_state"],
-                        dispatch_enabled=bool(row["dispatch_enabled"]),
-                        state=row["state"],
-                        queue_reason=row["queue_reason"],
-                        cancel_requested=False,
-                        retried=device_id in self.store._retry_job_ids(conn, job_id),
-                        resume_supported=self.store._resume_supported(row),
-                        never_dispatched=(
-                            row["protocol_mode"] == ProtocolMode.JOB_V1.value
-                            and row["dispatch_revision"] is None
-                        ),
-                        blocking_fence=blocking_fence,
-                    )
-                    if not actions.cancellable:
-                        raise StoreConflict("Only paused, interrupted or unconfirmed transfers can be cancelled")
+                    # Enforce exactly the canonical permissions shown in the console.
+                    if not self.store._snapshot(conn, job_id)["devices"][device_id]["cancellable"]:
+                        raise StoreConflict("Only paused transfers or Retry candidates can be cancelled")
                     timestamp = now_ms()
-                    if row["dispatch_revision"] is None:
+                    if row["dispatch_revision"] is None and row["state"] not in TERMINAL_DEVICE_STATES:
                         # No command was sent, so no client cleanup evidence is needed.
                         conn.execute(
                             "UPDATE push_job_devices SET state='failed', queue_reason=NULL, "
@@ -1275,6 +1262,7 @@ class PushJobManager:
                         self.store._invalidate_retry_dependents(conn, job_id, timestamp)
                         self.store._rederive_job(conn, job_id, timestamp)
                     else:
+                        # Preserve recorded outcomes and any dispatched ownership.
                         conn.execute(
                             "UPDATE push_job_devices SET cancel_requested_at=?, updated_at=? "
                             "WHERE job_id=? AND device_id=?",
@@ -1293,7 +1281,10 @@ class PushJobManager:
         return await self.store._call(lambda conn: [dict(row) for row in conn.execute(
             "SELECT d.*, j.artifact_id FROM push_job_devices d JOIN push_jobs j ON j.job_id=d.job_id "
             "WHERE d.device_id=? AND d.cancel_requested_at IS NOT NULL "
-            "AND d.state NOT IN ('failed','succeeded','interrupted')", (device_id,)).fetchall()])
+            "AND (d.state NOT IN ('failed','succeeded','interrupted','unconfirmed') "
+            "OR (d.state='unconfirmed' AND EXISTS (SELECT 1 FROM push_device_fences f "
+            "WHERE f.device_id=d.device_id AND f.blocking_job_id=d.job_id "
+            "AND f.blocking_attempt=d.attempt)))", (device_id,)).fetchall()])
 
     async def confirm_cancel(self, job_id: str, device_id: str) -> list[dict[str, Any]]:
         """Caller must verify exact absent or terminal evidence from the live owner."""
@@ -1303,6 +1294,13 @@ class PushJobManager:
                 row = conn.execute("SELECT * FROM push_job_devices WHERE job_id=? AND device_id=?",
                                    (job_id, device_id)).fetchone()
                 if row is None or row["cancel_requested_at"] is None or row["state"] in {"failed", "succeeded", "interrupted"}:
+                    self.store._commit(conn)
+                    return []
+                if row["state"] == DeviceState.UNCONFIRMED.value and conn.execute(
+                    "SELECT 1 FROM push_device_fences WHERE device_id=? "
+                    "AND blocking_job_id=? AND blocking_attempt=?",
+                    (device_id, job_id, row["attempt"]),
+                ).fetchone() is None:
                     self.store._commit(conn)
                     return []
                 timestamp = now_ms()

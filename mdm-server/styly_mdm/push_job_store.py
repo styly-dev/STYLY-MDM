@@ -1464,7 +1464,10 @@ class PushJobStore:
                           SELECT 1 FROM push_job_devices d
                           JOIN push_jobs j ON j.job_id=d.job_id
                           WHERE j.artifact_id=a.artifact_id
-                            AND (d.cancel_requested_at IS NOT NULL AND d.state='unconfirmed' OR d.state IN (
+                            AND ((d.cancel_requested_at IS NOT NULL AND d.state='unconfirmed'
+                                AND EXISTS (SELECT 1 FROM push_device_fences f
+                                    WHERE f.device_id=d.device_id AND f.blocking_job_id=d.job_id
+                                      AND f.blocking_attempt=d.attempt)) OR d.state IN (
                                 'queued','waiting_transfer','dispatching','downloading',
                                 'validating','applying','reconciling'
                             ))

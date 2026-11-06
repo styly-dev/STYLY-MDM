@@ -106,6 +106,10 @@ async def test_fail_pre_dispatch_settles_job_and_queued_targets(store, phase, te
     assert_settled(snapshot, await records(store, job["job_id"]),
                    state=terminal.value, code="upload_failed", detail="source rejected")
     assert all(not item["retryable"] for item in snapshot["devices"].values())
+    assert all(not item["cancellable"] for item in snapshot["devices"].values())
+    with pytest.raises(StoreConflict):
+        await PushJobManager(store).cancel_interrupted(job["job_id"], "D1")
+    assert await store.get_snapshot(job["job_id"]) == snapshot
 
 
 @pytest.mark.asyncio
@@ -307,7 +311,7 @@ async def test_retry_endpoint_still_validates_retained_artifact_bytes(store, tmp
     before = await records(store, job_id)
     with pytest.raises(StoreConflict, match="artifact"):
         await PushJobManager(store).retry_failed(
-            job_id, str(uuid.uuid4()), artifact_root=tmp_path, online_devices={"D1", "D2"})
+            job_id, str(uuid.uuid4()), artifact_root=tmp_path, target_devices={"D1", "D2"}, online_devices={"D1", "D2"})
     assert await records(store, job_id) == before
     assert await store._call(lambda conn: conn.execute("SELECT COUNT(*) FROM push_jobs").fetchone()[0]) == 1
 

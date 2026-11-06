@@ -138,7 +138,7 @@ async def test_retry_job_is_linked_by_indexed_column(tmp_path):
         original = await _ready_job(manager, tmp_path, {'D1': 'failed', 'D2': 'succeeded'})
         _, retry = await manager.retry_failed(
             original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path,
-            online_devices={'D1', 'D2'},
+            target_devices={'D1', 'D2'}, online_devices={'D1', 'D2'},
         )
         linked = await store._call(lambda conn: conn.execute(
             'SELECT retry_of_job_id FROM push_jobs WHERE job_id=?', (retry['job_id'],),
@@ -232,6 +232,7 @@ def _actions(**overrides):
         job_state='running', dispatch_enabled=True, state='queued',
         queue_reason='download_interrupted', cancel_requested=False, retried=False,
         resume_supported=True, blocking_fence=False,
+        artifact_available=True,
     )
     values.update(overrides)
     return assignment_actions(**values)
@@ -246,8 +247,15 @@ def test_assignment_actions_rules():
     assert paused_job.resume_required and not paused_job.cancellable
     assert not _actions(resume_supported=False).cancellable
     assert _actions(state='reconciling', queue_reason=None).cancellable
-    assert not _actions(state='unconfirmed', queue_reason=None).cancellable
+    assert _actions(state='unconfirmed', queue_reason=None).cancellable
     assert _actions(state='unconfirmed', queue_reason=None, blocking_fence=True).cancellable
+    for state in ('failed', 'interrupted', 'unconfirmed'):
+        assert _actions(state=state, resume_supported=False).cancellable
+        assert not _actions(state=state, resume_supported=False, artifact_available=False).cancellable
+        assert not _actions(state=state, resume_supported=False, superseded=True).cancellable
+    assert _actions(state='unconfirmed', blocking_fence=True, artifact_available=False).cancellable
+    assert not _actions(state='succeeded').cancellable
+    assert not _actions(state='failed', failure_code='cancelled').cancellable
     for closed in ({'cancel_requested': True}, {'retried': True}):
         flags = _actions(**closed)
         assert not flags.resume_required and not flags.cancellable
@@ -267,10 +275,62 @@ async def test_retried_target_is_not_cancellable_in_snapshot_or_store(tmp_path):
         ))
         assert (await manager.get_snapshot(job_id))['devices']['D1']['cancellable'] is True
         await manager.retry_failed(
-            job_id, str(uuid.uuid4()), artifact_root=tmp_path, online_devices={'D1'},
+            job_id, str(uuid.uuid4()), artifact_root=tmp_path, target_devices={'D1'}, online_devices={'D1'},
         )
         assert (await manager.get_snapshot(job_id))['devices']['D1']['cancellable'] is False
         with pytest.raises(StoreConflict):
             await manager.cancel_interrupted(job_id, 'D1')
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fence_owner', ['none', 'self', 'other'])
+async def test_withdrawn_unconfirmed_history_retains_artifact_only_for_its_cleanup(tmp_path, fence_owner):
+    store = PushJobStore(tmp_path / 'jobs.sqlite3')
+    manager = PushJobManager(store)
+    try:
+        original = await _ready_job(manager, tmp_path, {'D1': 'unconfirmed'})
+        job_id = original['job_id']
+        other_job = await _ready_job(manager, tmp_path, {'D1': 'unconfirmed'}) if fence_owner == 'other' else None
+        if other_job:
+            await store._call(lambda conn: conn.execute(
+                "UPDATE push_jobs SET dest_path='/sdcard/STYLY/other' WHERE job_id=?", (other_job['job_id'],),
+            ))
+        if fence_owner != 'none':
+            await store._call(lambda conn: conn.execute(
+                "INSERT INTO push_device_fences(device_id,blocking_job_id,blocking_attempt,"
+                "protocol_mode,reason,created_at,updated_at) VALUES ('D1',?,1,'job_v1','timeout',1,1)",
+                (job_id if fence_owner == 'self' else other_job['job_id'],),
+            ))
+        cancelled = await manager.cancel_interrupted(job_id, 'D1')
+        assert cancelled['devices']['D1']['state'] == 'unconfirmed'
+        assert not cancelled['devices']['D1']['retryable']
+        removed = manager.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=10)
+        assert (original['artifact']['artifact_id'] in removed) == (fence_owner != 'self')
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reason', ['expired', 'superseded'])
+async def test_non_retryable_terminal_history_cannot_be_withdrawn(tmp_path, reason):
+    store = PushJobStore(tmp_path / 'jobs.sqlite3')
+    manager = PushJobManager(store)
+    try:
+        original = await _ready_job(manager, tmp_path, {'D1': 'failed'})
+        if reason == 'expired':
+            await store._call(lambda conn: conn.execute(
+                "UPDATE push_artifacts SET retention_state='deleted' WHERE artifact_id=?",
+                (original['artifact']['artifact_id'],),
+            ))
+        else:
+            await _ready_job(manager, tmp_path, {'D1': 'succeeded'})
+        before = await manager.get_snapshot(original['job_id'])
+        assert not before['devices']['D1']['retryable']
+        assert not before['devices']['D1']['cancellable']
+        with pytest.raises(StoreConflict):
+            await manager.cancel_interrupted(original['job_id'], 'D1')
+        assert await manager.get_snapshot(original['job_id']) == before
     finally:
         store.close()

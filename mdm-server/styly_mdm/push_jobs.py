@@ -234,10 +234,20 @@ def assignment_actions(
             )
         )
     )
+    retryable = (
+        open_for_action
+        and artifact_available
+        and not superseded
+        and state
+        in {DeviceState.FAILED.value, DeviceState.INTERRUPTED.value, DeviceState.UNCONFIRMED.value}
+        and failure_code not in {"cancelled", "artifact_missing"}
+    )
     cancellable = (
         open_for_action
+        and failure_code != "cancelled"
         and (
-            (
+            retryable
+            or (
                 never_dispatched
                 and state == DeviceState.QUEUED.value
                 and job_state in {JobState.RUNNING.value, JobState.RECONCILING.value}
@@ -252,14 +262,6 @@ def assignment_actions(
                 )
             )
         )
-    )
-    retryable = (
-        open_for_action
-        and artifact_available
-        and not superseded
-        and state
-        in {DeviceState.FAILED.value, DeviceState.INTERRUPTED.value, DeviceState.UNCONFIRMED.value}
-        and failure_code not in {"cancelled", "artifact_missing"}
     )
     return AssignmentActions(manual_wait, resume_required, cancellable, retryable)
 

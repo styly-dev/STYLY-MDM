@@ -15,7 +15,7 @@ A browser creates a job before uploading bytes:
 Issue #94 upgrades the released Issue #91 `push_jobs.sqlite3` schema directly
 from version 1 to version 3. It adds an immutable per-device dispatch revision,
 nullable `cancel_requested_at`, and an indexed `retry_of_job_id` link from a
-Retry failed devices job to its original job, without discarding existing jobs.
+Retry job to its original job, without discarding existing jobs.
 The upgrade runs in one transaction. Before it starts, the server writes a
 consistent copy of the old database to `push_jobs.sqlite3.v1.bak` in the same
 data directory (SQLite backup API, written to a temporary file and then renamed).
@@ -297,7 +297,7 @@ These optional fields require no client APK or database migration; older console
 ignore them. There is no Reconcile button in the console.
 
 - **Offline devices never start queued work by reconnecting.** Job creation and
-  Retry failed devices accept only online targets, and the initial dispatch of a
+  Retry accept only online targets, and the initial dispatch of a
   job skips any target that went offline while the job was uploading. When a
   device disconnects, or is offline when its queue turn arrives, its queued or
   slot-waiting work in a dispatch-enabled job is settled at once
@@ -313,48 +313,53 @@ ignore them. There is no Reconcile button in the console.
   pending cancellations are unchanged. Work the device has already accepted
   (downloading, validating, applying) is not stopped by a management WebSocket
   disconnect.
-- **Resume** is available only for online devices. **Resume all** excludes offline
-  devices, preserving their manual wait and Needs attention entry. Offline timed-out
-  devices support **Cancel** only; reconnect alone never grants resume permission.
-- **Resume** clears current per-device retry-exhaustion waits and reopens a
-  restart-paused dispatch gate. It does not rerun terminal failures, reset the first
-  interruption timestamp, or authorize new interruptions reported after the action.
-  Each device's Progress cell exposes its own Resume/Cancel actions, which send
-  `target_devices: [device_id]`. Omitting targets means all applicable assignments;
-  empty, malformed or foreign targets are rejected. With no checked Push/Sync
-  devices, the attention panel offers **Resume all** and **Cancel all**. Checking
-  any device switches them to **Resume selection** and **Cancel selection**, which
-  include only eligible selected devices; no eligible selection disables the action
-  rather than targeting all. Selection persists through live updates until it is
-  explicitly cleared or the operator leaves Needs attention. Shift-click applies the
-  clicked checkbox's next state to the inclusive range in the displayed order, matching
-  Devices and provisional connection checkboxes; each panel keeps its own selection and
-  anchor. If the anchor is no longer displayed, the click toggles only that row and makes
-  it the new anchor. Clearing or leaving Needs attention resets its selection and anchor.
-  Provisional connection checkboxes are separate and do not scope these actions.
-  **Retry failed devices** remains job-scoped. Resuming one device after a server restart keeps all other queued
-  or interrupted devices paused until their own Resume or Resume all.
-  A storage write failure with an exact retained partial uses the same manual
-  Resume gate; the operator must free or repair device storage first.
+- **Resume** is available only for online devices and retains the validated partial.
+  It clears current per-device retry-exhaustion waits and reopens a restart-paused
+  dispatch gate. It does not rerun terminal failures, reset the first interruption
+  timestamp, or authorize new interruptions reported after the action. Reconnecting
+  never grants Resume permission. For storage failures, repair/free device storage first.
+- Each Progress cell shows delivery context and state beside a right-aligned,
+  vertically centered Resume / Retry / Cancel control column. Needs attention has
+  one selected-device toolbar with the same actions; no job cards or job-wide Retry.
+  With no selection all toolbar actions are disabled. Both row and selected actions
+  send explicit `target_devices` for the displayed assignment only; an ineligible
+  selection never falls back to all devices or hidden older assignments.
+  After active/queued work, the newest remaining retryable candidate is shown
+  before terminal history, so failures at other destinations remain reachable.
+  Accepted targets leave the selection; rejected targets remain selected. Selection
+  otherwise survives updates until cleared or the operator leaves Needs attention.
+  Shift-click changes the inclusive displayed range using an independent anchor;
+  a missing anchor makes the clicked row the new anchor. Provisional connection
+  checkboxes remain independent. Resuming one device keeps every other paused
+  device behind its own Resume gate.
 - **Cancel** finishes a never-dispatched queued target immediately on the server
   when a running/reconciling job requires Resume, including offline targets after
   server restart. It records `failed/cancelled` without a pending cancellation or
   device command; no client owns that assignment. Cancelling the final unfinished
   target terminalizes the job and allows normal artifact expiry.
-  For dispatched interrupted or unresolved work, Cancel persists an operator
+  For terminal `failed`/`interrupted`, or `unconfirmed` without its own fence,
+  Cancel withdraws that device's Retry candidate using `cancel_requested_at`.
+  Without a Retry candidate (including unpublished, expired, or superseded history),
+  terminal history has no Cancel action.
+  The recorded state, failure, result, and terminal time remain intact; no device
+  command is needed. Successful or already-retried targets cannot be withdrawn.
+  For dispatched paused or unresolved work, Cancel persists an operator
   cancellation request, including offline status-confirmation waits. It revokes a still-active
   HTTP lease and stops its stream even when the management WebSocket is offline.
-  An online active worker is not directly cancellable. Pending cancellation disappears from Needs attention because no
-  further operator action is needed, but remains visible in Devices. Ownership and
+  An online active worker is not directly cancellable. Cancellation of its own
+  execution leaves Needs attention and remains visible in Devices. A different or
+  opaque execution fence keeps the device visible with its unresolved status, even
+  after withdrawing a Retry candidate. Fenced ownership takes display priority over
+  other queued work or candidate history. Ownership and
   fences remain until exact absence or a terminal result confirms release; the next
   job for that device cannot start earlier. For an online device, Cancel sends an
-  exact `PUSH_RECONCILE_REQUEST` whatever the assignment state: a client that no
+  exact `PUSH_RECONCILE_REQUEST` for unresolved ownership: a client that no
   longer holds the identity answers `absent`, which confirms the cancellation at
   once. When the client reports interrupted work, the server sends the existing
   `PUSH_RESUME_REJECTED` with exact identity to discard it. Reconnection never authorizes a cancelled assignment. Already-applied files
   are not rolled back. Work already received and validating on an offline device
-  may finish before cancellation is observed. Individual **Cancel** and **Cancel all**
-  ask for confirmation; the latter shows the number of affected devices. Only
+  may finish before cancellation is observed. Individual and selected **Cancel**
+  ask for confirmation with the affected device count. Only
   dispatched assignments with `push_resume_v1` can use client-confirmed cancellation;
   the snapshot exposes this as `resume_supported`. Never-dispatched paused targets
   can have `cancellable: true` while `resume_supported: false`.
@@ -362,7 +367,12 @@ ignore them. There is no Reconcile button in the console.
   operation errors echo it with `job_id`, `action`, and `target_devices`.
   `target_devices` in the response identifies the requested set, even when Resume
   excludes targets that became offline. Request IDs correlate responses, not
-  durable idempotency keys. Cancel returns `accepted_devices` and
+  durable idempotency keys. Resume returns `accepted_devices` after filtering live
+  targets, including when resuming an uploaded ready job. The console clears only
+  those requested IDs on the correlated acknowledgement, regardless of snapshot
+  arrival order. Counts and canonical state changes cannot identify acceptance;
+  without an acknowledgement, pending controls use their bounded timeout/disconnect
+  cleanup and selection is retained. Cancel returns `accepted_devices` and
   `rejected_devices` (device ID to rejection reason). All accepted targets produce
   `PUSH_JOB_ACTION_SENT` with `status: accepted`; mixed results use `status: partial`.
   All rejected targets produce one correlated `ERROR` with `status: rejected` and
@@ -376,12 +386,12 @@ ignore them. There is no Reconcile button in the console.
 - Each snapshot assignment carries server-computed action flags from
   `push_jobs.assignment_actions`: `manual_wait` (a per-device wait for Resume),
   `resume_required`, `cancellable` (the same rule `CANCEL_PUSH_JOB` enforces), and
-  `retryable` (the rule `RETRY_FAILED_PUSH_JOB` enforces before its online check).
-  The console only combines them with live connectivity: Resume needs an online
-  device, and a reconciling assignment is cancellable only while its device is
-  offline. Targets already moved to a retry job expose no Resume/Cancel actions;
+  `retryable` (the rule `RETRY_PUSH_DEVICES` enforces before its online check).
+  The console adds live connectivity and pending-request gates: Resume/Retry
+  require an online device; reconciling assignments are cancellable only while
+  the device is offline. Targets already moved to a retry job expose no Resume/Retry/Cancel actions;
   a remaining device fence still keeps the device in Needs attention.
-- **Retry failed devices** creates and dispatches a new job for online `failed`,
+- **Retry** creates and dispatches a new internal job for selected online `failed`,
   `interrupted`, and `unconfirmed` targets, excluding `failure_code: cancelled`.
   A target is also excluded when a later job for the same device was dispatched
   or is still pending at the same destination, an ancestor, or a descendant:
@@ -394,7 +404,21 @@ ignore them. There is no Reconcile button in the console.
   device fences intact. Offline targets are skipped and stay eligible for a later
   Retry; the request fails when no eligible target is online. Fenced targets wait
   for evidence that the previous worker is gone. Expired/missing artifacts require
-  a new upload. The request UUID makes replay idempotent: a repeated request returns
+  a new upload. Required nonempty `target_devices` restricts the operation to that
+  source job's explicitly selected devices. The request fingerprint includes the
+  source job and sorted unique target set. Reusing a UUID for another target set
+  is rejected. The new `RETRY_PUSH_DEVICES` admin message replaces the retired
+  job-wide `RETRY_FAILED_PUSH_JOB`. The new server rejects the retired message;
+  an old server does not recognize the new one, so mixed versions cannot silently
+  expand the target scope. Restart the server and reload consoles when upgrading.
+  Missing targets are rejected. Resume/Cancel retain optional targets for scripts;
+  no APK, database, or device-protocol migration is needed.
+  Retry acknowledgements return the child `job_id`, `source_job_id`,
+  `client_request_id`, and actual child `target_devices`. Errors echo the source
+  job, client request ID, and requested targets, including unexpected failures.
+  The console matches these fields and the owning socket, or the canonical child
+  snapshot's client request ID; an uncorrelated response cannot settle Retry.
+  The request UUID makes replay idempotent: a repeated request returns
   the existing retry job without enabling dispatch or clearing manual waits. A ready
   retry job whose initial dispatch did not complete needs explicit dispatch/Resume.
   Shared artifact retention
@@ -632,7 +656,7 @@ On server restart:
 - dispatched phases become `reconciling`;
 - active download URLs are not recovered after process restart; the old URL is rejected and the device must report `server_lease_revoked` before manual Resume can issue a new lease. The server maps this reason to the existing `download_interrupted` gate;
 - dispatch is paused and no command is automatically resent;
-- the operator re-enables an existing job through **Resume** or **Resume all** in Needs attention, which sends `PUSH_FILES` for the selected target devices; this also covers an uploaded `ready` job whose original dispatch send was lost;
+- the operator re-enables an existing job through **Resume** in Needs attention, which sends `PUSH_FILES` for the selected target devices; this also covers an uploaded `ready` job whose original dispatch send was lost;
 - scheduler wake-up immediately follows the durable re-enable and does not wait for its direct admin acknowledgement.
 
 A missing DB-referenced immutable artifact is never substituted. Startup fails the work that still needs that artifact. Canonical UUID-named artifact files with no owning DB row are treated as publication-crash orphans and removed; unknown files are left for the general stale-file policy.
@@ -765,7 +789,7 @@ sequenceDiagram
                 S->>DB: reopen manual wait + clear exact fence + revise affected jobs
             end
             B->>S: PUSH_FILES(job_id, target_devices, request_id)
-            S-->>B: PUSH_FILES_SENT(request_id, requested targets)
+            S-->>B: PUSH_FILES_SENT(request_id, requested targets, accepted_devices)
             S->>D: EXECUTE_PUSH_FILES with same assignment revision
             D->>S: HTTP Range + If-Match + identity encoding
         end
@@ -803,12 +827,11 @@ sequenceDiagram
         Note over S,DB: Probe exhaustion never clears fences or grants Resume
     end
     opt Operator retries failed targets
-        B->>S: RETRY_FAILED_PUSH_JOB(job_id, request UUID)
+        B->>S: RETRY_PUSH_DEVICES(job_id, target_devices, client_request_id)
         S->>DB: new job + unsuccessful online targets + shared artifact lease
         Note over S,D: Successful/cancelled/offline targets excluded; fences remain
     end
 ```
 
-Activity log is read-only history. Needs attention contains Resume all, Cancel
-all and Retry failed devices; eligible device rows have individual
-Resume and Cancel controls.
+Activity log retains internal job history. Needs attention offers Resume / Retry /
+Cancel for explicitly selected devices and individual rows.

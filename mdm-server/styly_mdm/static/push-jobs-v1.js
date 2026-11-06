@@ -379,11 +379,15 @@
     return error;
   }
 
-  function settlePendingAction(key) {
+  function settlePendingAction(key, completedTargets) {
     const pending = pendingActions.get(key);
     if (!pending) return false;
     clearTimeout(pending.timer);
     pendingActions.delete(key);
+    const bridge = window.__stylyPushJobsV1Bridge;
+    if (Array.isArray(completedTargets) && bridge && bridge.clearAttentionSelection) {
+      bridge.clearAttentionSelection(completedTargets.filter(function (id) { return pending.targets.indexOf(id) >= 0; }));
+    }
     refreshPendingActionDevices(pending.targets);
     renderPausedJobs();
     return true;
@@ -399,14 +403,6 @@
 
   function actionKey(action, jobId, targets) {
     return action + ':' + jobId + ':' + Array.from(targets || []).slice().sort().join(',');
-  }
-
-  function isActionPending(action, jobId) {
-    let found = false;
-    pendingActions.forEach(function (pending) {
-      if (pending.action === action && (!jobId || pending.jobId === jobId)) found = true;
-    });
-    return found;
   }
 
   function isDeviceActionPending(action, jobId, deviceId) {
@@ -440,32 +436,37 @@
   }
 
   function settleTargetedAction(socket, action, message) {
-    const messageAction = action === 'resume' ? 'PUSH_FILES' : 'CANCEL_PUSH_JOB';
+    const messageAction = { resume: 'PUSH_FILES', retry: 'RETRY_PUSH_DEVICES', cancel: 'CANCEL_PUSH_JOB' }[action];
     if (message.action !== undefined && message.action !== messageAction) return;
     pendingActions.forEach(function (pending, key) {
-      if (pending.action !== action || pending.jobId !== message.job_id || pending.socket !== socket) return;
+      const sourceJobId = action === 'retry' && message.type !== 'ERROR' ? message.source_job_id : message.job_id;
+      if (pending.action !== action || pending.jobId !== sourceJobId || pending.socket !== socket) return;
       // An old response for the same targets must not settle a newer request.
-      if (message.request_id === pending.requestId) settlePendingAction(key);
+      const matches = action === 'retry' ? message.client_request_id === pending.clientRequestId : message.request_id === pending.requestId;
+      if (!matches) return;
+      let completed = null;
+      if (message.type !== 'ERROR') {
+        completed = action === 'retry' ? message.target_devices : message.accepted_devices;
+      }
+      settlePendingAction(key, completed);
     });
   }
 
   function settleActionsFromJob(job) {
     pendingActions.forEach(function (pending, key) {
       if (pending.action === 'retry') {
-        if (job.client_request_id === pending.clientRequestId) settlePendingAction(key);
+        if (job.client_request_id === pending.clientRequestId) settlePendingAction(key, Object.keys(job.devices || {}));
         return;
       }
-      if (pending.jobId !== job.job_id) return;
+      // A state change cannot identify which subset a Resume request accepted.
+      if (pending.action !== 'cancel' || pending.jobId !== job.job_id) return;
       const assignments = pending.targets.map(function (deviceId) {
         return job.devices && job.devices[deviceId];
       });
-      if (pending.action === 'resume' && assignments.every(function (assignment) {
-        return !!assignment && assignment.resume_required !== true;
-      })) settlePendingAction(key);
-      else if (pending.action === 'cancel' && assignments.every(function (assignment) {
+      if (assignments.every(function (assignment) {
         return !!assignment && (assignment.cancel_requested === true ||
-          ['succeeded', 'failed', 'interrupted'].indexOf(assignment.state) >= 0);
-      })) settlePendingAction(key);
+          (assignment.failure || {}).code === 'cancelled');
+      })) settlePendingAction(key, pending.targets);
     });
   }
 
@@ -513,9 +514,7 @@
 
   function pruneRetryRequestIds(jobs) {
     retryRequestIds.forEach(function (_requestId, key) {
-      const separator = key.lastIndexOf(':');
-      const jobId = key.slice(0, separator);
-      const revision = Number(key.slice(separator + 1));
+      const [jobId, revision] = JSON.parse(key);
       const current = jobs.get(jobId);
       if (!current || (Number.isFinite(revision) && revision < current.revision)) {
         retryRequestIds.delete(key);
@@ -616,52 +615,27 @@
     container.scrollTop = container.scrollHeight;
   }
 
-  // Operator-action rules live on the server (push_jobs.assignment_actions); the
-  // console reads the snapshot flags and only adds live connectivity.
-  function needsDispatchAction(job) {
-    return ['ready', 'running', 'reconciling'].indexOf(job.state) >= 0 &&
-      Object.values(job.devices || {}).some(function (d) { return d.resume_required === true; });
-  }
-
+  // Operator-action rules live on the server; only connectivity and pending
+  // requests are added here, always for the assignment displayed on the row.
   function isDeviceOnline(deviceId) {
     const bridge = window.__stylyPushJobsV1Bridge;
     return !!(bridge && bridge.isDeviceOnline && bridge.isDeviceOnline(deviceId));
   }
 
-  // A job stays listed for review while any target is retryable, as offline
-  // Resume targets do; the Retry command itself needs a connected target.
-  function hasRetryableAssignments(job) {
-    return Object.values(job.devices || {}).some(function (d) { return d.retryable === true; });
-  }
-
-  function hasRetryTargets(job) {
-    return Object.keys(job.devices || {}).some(function (deviceId) {
-      return job.devices[deviceId].retryable === true && isDeviceOnline(deviceId);
+  function deviceActionGroups(action, deviceIds) {
+    const groups = new Map();
+    new Set(deviceIds).forEach(function (deviceId) {
+      const selected = selectedAssignmentFor(deviceId);
+      if (!selected) return;
+      const view = assignmentView(selected, deviceId);
+      const allowed = action === 'resume' ? view.canResume :
+        action === 'retry' ? view.canRetry : action === 'cancel' && view.canCancel;
+      if (!allowed) return;
+      const jobId = selected.job.job_id;
+      if (!groups.has(jobId)) groups.set(jobId, { job: selected.job, targetDevices: [] });
+      groups.get(jobId).targetDevices.push(deviceId);
     });
-  }
-
-  function needsFenceReconciliation(assignment) {
-    // Retry creates new work but does not prove that the old worker has stopped.
-    return !!assignment.device_fence && !assignment.cancel_requested;
-  }
-
-  function actionTargetsForJob(job, action) {
-    return Object.keys(job.devices || {}).filter(function (deviceId) {
-      const assignment = job.devices[deviceId];
-      const view = assignmentView({ job: job, assignment: assignment }, deviceId);
-      return action === 'resume' ? view.canResume : action === 'cancel' ? view.canCancel : false;
-    });
-  }
-
-  function bulkActionGroups(action) {
-    const selected = new Set(attentionSelection());
-    return Array.from(pushJobs.values()).map(function (job) {
-      return { job: job, targetDevices: actionTargetsForJob(job, action).filter(function (id) {
-        return !selected.size || selected.has(id);
-      }) };
-    }).filter(function (group) {
-      return group.targetDevices.length > 0;
-    });
+    return Array.from(groups.values());
   }
 
   function attentionSelection() {
@@ -669,22 +643,24 @@
     return bridge && bridge.selectedAttentionDeviceIds ? bridge.selectedAttentionDeviceIds() : [];
   }
 
-  function sendBulkAction(action) {
-    if (isActionPending(action)) return false;
-    const groups = bulkActionGroups(action);
+  function sendDeviceActions(action, deviceIds) {
+    const groups = deviceActionGroups(action, deviceIds);
     if (!groups.length || !currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return false;
-    const messageType = action === 'resume' ? 'PUSH_FILES' : 'CANCEL_PUSH_JOB';
-    const label = (action === 'resume' ? 'Resume' : 'Cancel') + (attentionSelection().length ? ' selection' : ' all');
+    const messageType = { resume: 'PUSH_FILES', retry: 'RETRY_PUSH_DEVICES', cancel: 'CANCEL_PUSH_JOB' }[action];
     const targetCount = groups.reduce(function (count, group) {
       return count + group.targetDevices.length;
     }, 0);
-    const scope = targetCount + (attentionSelection().length ? ' selected eligible' : '') + ' device(s) across ' + groups.length + ' job(s)';
     if (action === 'cancel' && typeof window.confirm === 'function' &&
-        !window.confirm('Cancel Push / Sync for ' + scope + '?')) return false;
+        !window.confirm('Cancel Push / Sync for ' + targetCount + ' selected eligible device(s)?')) return false;
     try {
       groups.forEach(function (group) {
-        const key = actionKey(action, group.job.job_id, group.targetDevices);
-        const pending = trackAction(action, group.job.job_id, group.targetDevices, null, false);
+        let clientRequestId = null;
+        if (action === 'retry') {
+          const key = JSON.stringify([group.job.job_id, group.job.revision, group.targetDevices.slice().sort()]);
+          if (!retryRequestIds.has(key)) retryRequestIds.set(key, uuid());
+          clientRequestId = retryRequestIds.get(key);
+        }
+        const pending = trackAction(action, group.job.job_id, group.targetDevices, clientRequestId, false);
         if (!pending) return;
         try {
           const payload = {
@@ -693,161 +669,82 @@
             target_devices: group.targetDevices,
           };
           if (pending.requestId) payload.request_id = pending.requestId;
+          if (clientRequestId) payload.client_request_id = clientRequestId;
           nativeSend.call(currentAdminSocket, JSON.stringify(payload));
         } catch (error) {
-          settlePendingAction(key);
+          settlePendingAction(pending.key);
           throw error;
         }
       });
       renderPausedJobs();
     } catch (error) {
-      appendLog('Could not ' + label.toLowerCase() + ': ' + error.message, 'fail');
-      return false;
-    }
-    appendLog(label + ' requested for ' + scope, 'info');
-    return true;
-  }
-
-  function sendRetryJobAction(job) {
-    if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return false;
-    if (isActionPending('retry')) return false;
-    const key = job.job_id + ':' + job.revision;
-    if (!retryRequestIds.has(key)) retryRequestIds.set(key, uuid());
-    const clientRequestId = retryRequestIds.get(key);
-    if (!trackAction('retry', job.job_id, [], clientRequestId)) return false;
-    const payload = {
-      type: 'RETRY_FAILED_PUSH_JOB',
-      job_id: job.job_id,
-      client_request_id: clientRequestId,
-    };
-    try {
-      nativeSend.call(currentAdminSocket, JSON.stringify(payload));
-    } catch (error) {
-      settlePendingAction(actionKey('retry', job.job_id, []));
-      appendLog('Could not retry failed devices: ' + error.message, 'fail');
+      appendLog('Could not ' + action + ' selected devices: ' + error.message, 'fail');
       return false;
     }
     return true;
   }
 
-  function renderAttentionTabActions(paused, resumeGroups, cancelGroups) {
+  function renderAttentionTabActions(attentionCount) {
     const container = document.getElementById('pushJobsTabActions');
     if (!container) return;
     container.replaceChildren();
-    if (!paused.length) return;
-
-    resumeGroups = resumeGroups || bulkActionGroups('resume');
-    cancelGroups = cancelGroups || bulkActionGroups('cancel');
-    const resumeTargets = resumeGroups.reduce(function (count, group) {
-      return count + group.targetDevices.length;
-    }, 0);
-    const cancelTargets = cancelGroups.reduce(function (count, group) {
-      return count + group.targetDevices.length;
-    }, 0);
+    if (!attentionCount) return;
     const head = document.createElement('div');
     head.className = 'attention-tab-actions-head';
     const copy = document.createElement('div');
     copy.className = 'attention-tab-actions-copy';
-    const title = document.createElement('div');
+    const title = document.createElement('h3');
     title.className = 'attention-tab-actions-title';
-    title.textContent = 'Push / Sync actions';
+    const selectedCount = attentionSelection().length;
+    title.textContent = 'Selected devices · ' + selectedCount;
     const note = document.createElement('div');
     note.className = 'attention-tab-actions-note';
-    const selectedCount = attentionSelection().length;
-    note.textContent = selectedCount
-      ? selectedCount + ' device(s) selected. Resume and Cancel apply only to eligible selected devices.'
-      : 'Resume and Cancel apply to every eligible device across all Push / Sync jobs.';
+    note.textContent = selectedCount ? 'Actions apply to eligible selected devices.' : 'Select devices to resume, retry, or cancel.';
     copy.appendChild(title);
     copy.appendChild(note);
     const buttons = document.createElement('div');
     buttons.className = 'attention-tab-actions-buttons';
-
-    function bulkButton(action, label, pendingLabel, targetCount) {
+    ['resume', 'retry', 'cancel'].forEach(function (action) {
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'push-job-action attention-tab-action';
       button.dataset.action = action;
-      button.textContent = label;
-      button.title = targetCount + ' eligible device(s)';
-      button.disabled = targetCount === 0 || isActionPending(action);
-      if (isActionPending(action)) button.textContent = pendingLabel;
-      button.addEventListener('click', function () {
-        if (!sendBulkAction(action)) return;
-      });
-      return button;
-    }
-
-    const suffix = selectedCount ? ' selection' : ' all';
-    buttons.appendChild(bulkButton('resume', 'Resume' + suffix, 'Resuming…', resumeTargets));
-    buttons.appendChild(bulkButton('cancel', 'Cancel' + suffix, 'Cancelling…', cancelTargets));
+      const count = deviceActionGroups(action, attentionSelection()).reduce(function (total, group) { return total + group.targetDevices.length; }, 0);
+      button.textContent = { resume: 'Resume', retry: 'Retry', cancel: 'Cancel' }[action];
+      button.title = count + ' eligible selected device(s)';
+      button.disabled = count === 0;
+      button.addEventListener('click', function () { sendDeviceActions(action, attentionSelection()); });
+      buttons.appendChild(button);
+    });
     head.appendChild(copy);
     head.appendChild(buttons);
     container.appendChild(head);
-
-    const actionJobs = paused.filter(hasRetryableAssignments);
-    if (!actionJobs.length) return;
-    const jobList = document.createElement('div');
-    jobList.className = 'attention-tab-job-list';
-    const jobScope = document.createElement('div');
-    jobScope.className = 'attention-tab-actions-note';
-    jobScope.textContent = 'Retry below applies to each job, independently of the checkbox selection.';
-    jobList.appendChild(jobScope);
-    actionJobs.forEach(function (job) {
-      const row = document.createElement('div');
-      row.className = 'attention-tab-job';
-      const label = document.createElement('span');
-      label.className = 'attention-tab-job-label';
-      label.textContent = (job.mode === 'sync' ? 'Sync' : 'Push') + ' #' +
-        job.job_id.slice(0, 8) + ' → ' + job.dest_path;
-      const rowButtons = document.createElement('div');
-      rowButtons.className = 'attention-tab-job-buttons';
-      if (hasRetryableAssignments(job)) {
-        const retry = document.createElement('button');
-        retry.type = 'button';
-        retry.className = 'push-job-action';
-        retry.textContent = 'Retry failed devices';
-        if (isActionPending('retry', job.job_id)) {
-          retry.disabled = true;
-          retry.textContent = 'Retry requested…';
-        } else if (!hasRetryTargets(job)) {
-          retry.disabled = true;
-          retry.title = 'Every device to retry is offline';
-        }
-        retry.addEventListener('click', function () {
-          sendRetryJobAction(job, retry);
-        });
-        rowButtons.appendChild(retry);
-      }
-      row.appendChild(label);
-      row.appendChild(rowButtons);
-      jobList.appendChild(row);
-    });
-    container.appendChild(jobList);
   }
 
   function renderPausedJobs() {
-    const paused = Array.from(pushJobs.values()).filter(function (job) {
-      return needsDispatchAction(job) || hasRetryableAssignments(job) ||
-        Object.values(job.devices || {}).some(needsFenceReconciliation);
+    const deviceIds = new Set();
+    pushJobs.forEach(function (job) {
+      Object.keys(job.devices || {}).forEach(function (id) { deviceIds.add(id); });
     });
-    const resumeGroups = bulkActionGroups('resume');
-    const cancelGroups = bulkActionGroups('cancel');
-    renderAttentionTabActions(paused, resumeGroups, cancelGroups);
+    const count = Array.from(deviceIds).filter(function (id) {
+      const selected = selectedAssignmentFor(id);
+      return selected && assignmentView(selected, id).needsAttention;
+    }).length;
+    renderAttentionTabActions(count);
     const container = document.getElementById('pushJobsAttention');
     if (!container) return;
     container.replaceChildren();
-    container.style.display = paused.length ? '' : 'none';
-    if (!paused.length) return;
-
+    container.style.display = count ? '' : 'none';
+    if (!count) return;
     const title = document.createElement('div');
     title.className = 'push-attention-title';
-    title.textContent = 'Push / Sync jobs need attention';
+    title.textContent = 'Devices need attention';
     container.appendChild(title);
     const summary = document.createElement('div');
     summary.className = 'push-attention-summary';
     const message = document.createElement('span');
     message.className = 'push-attention-message';
-    message.textContent = paused.length + ' Push / Sync job(s) need review in the Needs attention tab.';
+    message.textContent = count + ' device(s) need review in the Needs attention tab.';
     const open = document.createElement('button');
     open.type = 'button';
     open.className = 'push-job-action push-attention-open';
@@ -867,14 +764,14 @@
       const assignment = job.devices && job.devices[deviceId];
       if (assignment) candidates.push({ job: job, assignment: assignment });
     });
+    const fenced = candidates.find(function (candidate) { return !!candidate.assignment.device_fence; });
+    if (fenced) return fenced;
     const activeStates = new Set([
       'waiting_transfer', 'dispatching', 'downloading', 'validating',
       'applying', 'reconciling',
     ]);
     const active = candidates.filter(function (candidate) {
-      return activeStates.has(candidate.assignment.state) ||
-        (candidate.assignment.state === 'unconfirmed' &&
-         !!candidate.assignment.device_fence);
+      return activeStates.has(candidate.assignment.state);
     }).sort(function (left, right) {
       return left.assignment.enqueue_seq - right.assignment.enqueue_seq;
     });
@@ -896,7 +793,11 @@
       if (enqueueDelta) return enqueueDelta;
       return (right.job.updated_at || 0) - (left.job.updated_at || 0);
     });
-    return terminal.length ? terminal[0] : null;
+    // With no job cards, unresolved candidates at other destinations must remain
+    // reachable after newer work completes or its candidate is withdrawn.
+    return terminal.find(function (candidate) {
+      return candidate.assignment.retryable === true;
+    }) || terminal[0] || null;
   }
 
   function displayStatus(state) {
@@ -918,6 +819,9 @@
     const jobFailure = job.failure || {};
     const probe = reconciliations.get(deviceId);
     const fence = assignment.device_fence;
+    const ownFence = !!fence && fence.blocking_job_id === job.job_id &&
+      fence.blocking_attempt === assignment.attempt;
+    const foreignFence = !!fence && !ownFence;
     const requiresReconciliation = assignment.state === 'reconciling' ||
       assignment.state === 'unconfirmed' || !!fence;
     let checkedIdentity = { job_id: job.job_id, attempt: assignment.attempt,
@@ -939,18 +843,23 @@
     const online = isDeviceOnline(deviceId);
     const resumePending = isDeviceActionPending('resume', job.job_id, deviceId);
     const cancelPending = isDeviceActionPending('cancel', job.job_id, deviceId);
-    const canResume = resumeRequired && online;
+    const retryPending = isDeviceActionPending('retry', job.job_id, deviceId);
+    const pending = resumePending || retryPending || cancelPending;
+    const canResume = resumeRequired && online && !pending;
+    const canRetry = assignment.retryable === true && online && !pending;
     // The server refuses to cancel a reconciling assignment while its device is
     // online, because that device can still report its outcome.
-    const canCancel = assignment.cancellable === true &&
+    const canCancel = assignment.cancellable === true && !pending &&
       !(online && assignment.state === 'reconciling');
-    const needsAttention = needsFenceReconciliation(assignment) ||
-      (!assignment.cancel_requested && !assignment.retry_job_id && !success && !cancelled && (resumeRequired ||
-        assignment.state === 'reconciling' || assignment.retryable === true));
+    const needsAttention = foreignFence || (!assignment.cancel_requested && (ownFence ||
+      (!assignment.retry_job_id && !success && !cancelled && (resumeRequired ||
+        assignment.state === 'reconciling' || assignment.retryable === true))));
     return {
       device_id: deviceId,
       canResume: canResume,
       canCancel: canCancel,
+      canRetry: canRetry,
+      retryPending: retryPending,
       resumePending: resumePending,
       cancelPending: cancelPending,
       needsAttention: !!needsAttention,
@@ -960,13 +869,15 @@
       client_request_id: job.client_request_id,
       revision: job.revision,
       enqueue_seq: assignment.enqueue_seq,
-      status: cancelled ? 'cancelled' : (assignment.cancel_requested && (!terminal || (assignment.state === 'unconfirmed' && assignment.device_fence))) ? 'cancel_pending' :
+      status: foreignFence ? 'unconfirmed' : cancelled ? 'cancelled' :
+        (assignment.cancel_requested && (!terminal || (assignment.state === 'unconfirmed' && ownFence))) ? 'cancel_pending' :
         resumeRequired ? 'resume_required' : displayStatus(assignment.state),
       verb: job.mode === 'sync' ? 'Sync' : 'Push',
       filename: job.dest_path || '',
       note: success ? '+' + (result.added || 0) + ' ~' +
         (result.updated || 0) + ' -' + (result.deleted || 0) : '',
-      detail: failure.detail || failure.code || jobFailure.detail || jobFailure.code ||
+      detail: foreignFence ? (fence.reason || 'Another device execution is unresolved') :
+        failure.detail || failure.code || jobFailure.detail || jobFailure.code ||
         assignment.reconciliation_reason ||
         ((assignment.state === 'unconfirmed') ? 'result unconfirmed' : ''),
     };
@@ -987,31 +898,7 @@
     sendDeviceAction: function (deviceId, jobId, action) {
       const selected = selectedAssignmentFor(deviceId);
       if (!selected || selected.job.job_id !== jobId) return false;
-      const view = assignmentView(selected, deviceId);
-      if ((action === 'resume' && !view.canResume) ||
-          (action === 'cancel' && !view.canCancel) ||
-          ['resume', 'cancel'].indexOf(action) < 0) return false;
-      if (isDeviceActionPending(action, jobId, deviceId)) return false;
-      if (!currentAdminSocket || currentAdminSocket.readyState !== NativeWebSocket.OPEN) return false;
-      if (action === 'cancel' && typeof window.confirm === 'function' &&
-          !window.confirm('Cancel Push / Sync for ' + deviceId + '?')) return false;
-      const pending = trackAction(action, jobId, [deviceId], null, false);
-      if (!pending) return false;
-      try {
-        const payload = {
-          type: action === 'resume' ? 'PUSH_FILES' : 'CANCEL_PUSH_JOB',
-          job_id: jobId,
-          target_devices: [deviceId],
-        };
-        if (pending.requestId) payload.request_id = pending.requestId;
-        nativeSend.call(currentAdminSocket, JSON.stringify(payload));
-        renderPausedJobs();
-        return true;
-      } catch (error) {
-        settlePendingAction(actionKey(action, jobId, [deviceId]));
-        appendLog('Could not ' + action + ' device job: ' + error.message, 'fail');
-        return false;
-      }
+      return sendDeviceActions(action, [deviceId]);
     },
   };
 
@@ -1059,7 +946,7 @@
       if (awaitingInitialSnapshot) bufferJob(message.job);
       else applyJob(message.job);
     } else if (message.type === 'PUSH_JOB_ACTION_SENT') {
-      // Acknowledgement for job-level operator actions owned by this adapter.
+      // Acknowledgements for device actions owned by this adapter.
       event.stopImmediatePropagation();
       if (socket !== currentAdminSocket) return;
       const shortId = String(message.job_id || '').slice(0, 8);
@@ -1073,14 +960,11 @@
           appendLog((rejected.length ? 'Cancel partially recorded' : 'Cancel recorded') +
             ' for job #' + shortId + ': ' + accepted.join(', ') +
             (rejected.length ? '; rejected: ' + rejected.join('; ') : '') +
-            '; outstanding device cleanup still needs confirmation', rejected.length ? 'warn' : 'info');
+            '; device cleanup continues where required', rejected.length ? 'warn' : 'info');
         }
-      } else if (message.action === 'RETRY_FAILED_PUSH_JOB') {
-        const retries = Array.from(pendingActions.values()).filter(function (pending) {
-          return pending.action === 'retry';
-        });
-        if (retries.length === 1) settlePendingAction(retries[0].key);
-        appendLog('Created retry job #' + shortId + ' for unsuccessful devices', 'info');
+      } else if (message.action === 'RETRY_PUSH_DEVICES') {
+        settleTargetedAction(socket, 'retry', message);
+        appendLog('Created retry job #' + shortId + ' for device(s): ' + (message.target_devices || []).join(', '), 'info');
       }
     } else if (message.type === 'PUSH_FILES_SENT' && message.job_id) {
       if (socket !== currentAdminSocket) {
@@ -1093,14 +977,15 @@
         settleTargetedAction(socket, 'resume', message);
       }
     } else if (message.type === 'ERROR') {
-      const action = message.action === 'CANCEL_PUSH_JOB' ? 'cancel' :
+      const action = message.action === 'RETRY_PUSH_DEVICES' ? 'retry' :
+        message.action === 'CANCEL_PUSH_JOB' ? 'cancel' :
         message.action === 'PUSH_FILES' && (message.request_id !== undefined ||
           Array.isArray(message.target_devices)) ? 'resume' : null;
       if (action) event.stopImmediatePropagation();
       if (socket !== currentAdminSocket) return;
       if (action) {
         settleTargetedAction(socket, action, message);
-        appendLog((action === 'cancel' ? 'Cancel' : 'Resume') + ' failed for job #' + String(message.job_id || '').slice(0, 8) +
+        appendLog(({ cancel: 'Cancel', resume: 'Resume', retry: 'Retry' })[action] + ' failed for job #' + String(message.job_id || '').slice(0, 8) +
           ': ' + message.message, 'fail');
       }
       // Other uncorrelated errors remain with the legacy log handler and cannot

@@ -237,7 +237,7 @@ async def test_late_recovery_cannot_overrule_a_later_decision(manager, tmp_path,
     if condition == "cancel":
         await manager.cancel_interrupted(job_id, "D1")
     elif condition == "retry":
-        await manager.retry_failed(job_id, str(uuid.uuid4()), artifact_root=tmp_path, online_devices=["D1"])
+        await manager.retry_failed(job_id, str(uuid.uuid4()), artifact_root=tmp_path, target_devices=["D1"], online_devices=["D1"])
     elif condition in {"new_pending", "new_child", "new_parent", "new_dispatched", "other_owner"}:
         destination = {
             "new_child": job["dest_path"] + "/eventA",
@@ -325,7 +325,7 @@ async def test_timeout_and_report_transactions_converge_to_manual_wait(manager, 
 async def test_recovery_orders_atomically_with_retry_cancel_and_gc(manager, tmp_path, recovery_first, decision):
     job, report = await interrupted(manager, tmp_path)
     if decision == "retry":
-        action = manager.retry_failed(job["job_id"], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=["D1"])
+        action = manager.retry_failed(job["job_id"], str(uuid.uuid4()), artifact_root=tmp_path, target_devices=["D1"], online_devices=["D1"])
     elif decision == "cancel":
         action = manager.cancel_interrupted(job["job_id"], "D1")
     else:

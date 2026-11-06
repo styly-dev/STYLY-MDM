@@ -1,4 +1,5 @@
 """Retry only unsuccessful targets while preserving bytes, history, and fences."""
+import asyncio
 import uuid
 import pytest
 from styly_mdm.push_job_store import StoreConflict, now_ms
@@ -12,7 +13,7 @@ ONLINE = {'success', 'failed', 'interrupted', 'unknown', 'cancelled', 'active'}
 @pytest.mark.asyncio
 async def test_retry_selects_unsuccessful_targets_preserving_history_and_fence(manager, tmp_path):
     original = await completed(manager, tmp_path)
-    created, retry = await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
+    created, retry = await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, target_devices=ONLINE, online_devices=ONLINE)
     assert created and retry['job_id'] != original['job_id']
     assert retry['state'] == 'ready' and retry['dispatch_enabled'] is False
     assert retry['mode'] == 'sync' and retry['dest_path'] == original['dest_path']
@@ -33,12 +34,12 @@ async def test_retry_selects_unsuccessful_targets_preserving_history_and_fence(m
 async def test_retry_idempotency_survives_original_result_change(manager, tmp_path):
     original = await completed(manager, tmp_path)
     request_id = str(uuid.uuid4())
-    _, first = await manager.retry_failed(original['job_id'], request_id, artifact_root=tmp_path, online_devices=ONLINE)
+    _, first = await manager.retry_failed(original['job_id'], request_id, artifact_root=tmp_path, target_devices=ONLINE, online_devices=ONLINE)
     await manager.store._call(lambda conn: conn.execute("UPDATE push_job_devices SET state='succeeded' WHERE job_id=?", (original['job_id'],)))
-    created, replay = await manager.retry_failed(original['job_id'], request_id, artifact_root=tmp_path, online_devices=ONLINE)
+    created, replay = await manager.retry_failed(original['job_id'], request_id, artifact_root=tmp_path, target_devices=ONLINE, online_devices=ONLINE)
     assert not created and replay == first
     with pytest.raises(StoreConflict, match='different request'):
-        await manager.retry_failed(str(uuid.uuid4()), request_id, artifact_root=tmp_path, online_devices=ONLINE)
+        await manager.retry_failed(str(uuid.uuid4()), request_id, artifact_root=tmp_path, target_devices=ONLINE, online_devices=ONLINE)
 
 
 @pytest.mark.asyncio
@@ -53,7 +54,7 @@ async def test_retry_rejects_unavailable_artifact_atomically(manager, tmp_path, 
     else:
         (tmp_path / (artifact_id + '.zip')).write_bytes(b'')
     with pytest.raises(StoreConflict, match='artifact'):
-        await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
+        await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, target_devices=ONLINE, online_devices=ONLINE)
     assert await manager.store._call(lambda conn: conn.execute('SELECT COUNT(*) FROM push_jobs').fetchone()[0]) == 1
 
 
@@ -61,7 +62,7 @@ async def test_retry_rejects_unavailable_artifact_atomically(manager, tmp_path, 
 async def test_retry_ready_job_prevents_gc_past_original_deadline(manager, tmp_path):
     original = await completed(manager, tmp_path)
     await manager.store._call(lambda conn: conn.execute("UPDATE push_job_devices SET state='failed' WHERE device_id='active'"))
-    _, retry = await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
+    _, retry = await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, target_devices=ONLINE, online_devices=ONLINE)
     assert manager.gc_artifacts_sync(tmp_path, retry_window_ms=0, timestamp=now_ms() + 1) == []
     assert (tmp_path / (retry['artifact']['artifact_id'] + '.zip')).is_file()
 
@@ -71,14 +72,14 @@ async def test_retry_rejects_only_success_or_cancelled_targets(manager, tmp_path
     original = await completed(manager, tmp_path)
     await manager.store._call(lambda conn: conn.execute("UPDATE push_job_devices SET state='succeeded' WHERE failure_code IS NULL OR failure_code <> 'cancelled'"))
     with pytest.raises(StoreConflict, match='no unsuccessful'):
-        await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
+        await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, target_devices=ONLINE, online_devices=ONLINE)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('terminal_at', [200, None])
 async def test_shared_artifact_gc_uses_latest_reference_end(manager, tmp_path, terminal_at):
     original = await completed(manager, tmp_path)
-    _, retry = await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
+    _, retry = await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, target_devices=ONLINE, online_devices=ONLINE)
     artifact_id = original['artifact']['artifact_id']
 
     def finish(conn):
@@ -97,11 +98,11 @@ async def test_shared_artifact_gc_uses_latest_reference_end(manager, tmp_path, t
 @pytest.mark.asyncio
 async def test_old_failure_cannot_be_retried_twice_but_new_failure_can(manager, tmp_path):
     original = await completed(manager, tmp_path)
-    _, retry = await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
+    _, retry = await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, target_devices=ONLINE, online_devices=ONLINE)
     with pytest.raises(StoreConflict, match='no unsuccessful'):
-        await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
+        await manager.retry_failed(original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, target_devices=ONLINE, online_devices=ONLINE)
     await manager.store._call(lambda conn: conn.execute("UPDATE push_job_devices SET state='failed' WHERE job_id=?", (retry['job_id'],)))
-    _, again = await manager.retry_failed(retry['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
+    _, again = await manager.retry_failed(retry['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, target_devices=retry['devices'], online_devices=ONLINE)
     assert set(again['devices']) == set(retry['devices'])
     assert (await manager.get_snapshot(retry['job_id']))['devices']['failed']['retry_job_id'] == again['job_id']
 
@@ -154,7 +155,7 @@ async def test_retry_skips_targets_superseded_by_later_overlapping_work(
     listed = {job['job_id']: job for job in await manager.list_snapshots(100, 0)}
     assert listed[original['job_id']] == current
     _, retry = await manager.retry_failed(
-        original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, online_devices=ONLINE)
+        original['job_id'], str(uuid.uuid4()), artifact_root=tmp_path, target_devices=ONLINE, online_devices=ONLINE)
     assert set(retry['devices']) == expected
 
 
@@ -178,3 +179,67 @@ async def test_never_dispatched_later_failure_does_not_supersede_retry(manager, 
     await manager.store._call(fail_before_dispatch)
     current = await manager.get_snapshot(original['job_id'])
     assert current['devices']['failed']['retryable'] is True
+
+
+@pytest.mark.asyncio
+async def test_retry_targets_are_explicit_and_same_job_peers_remain_independent(manager, tmp_path):
+    original = await completed(manager, tmp_path)
+    job_id = original['job_id']
+    request_id = str(uuid.uuid4())
+    _, retry = await manager.retry_failed(
+        job_id, request_id, target_devices=['failed', 'failed'],
+        artifact_root=tmp_path, online_devices=ONLINE,
+    )
+    assert set(retry['devices']) == {'failed'}
+    previous = await manager.get_snapshot(job_id)
+    assert previous['devices']['interrupted'] == original['devices']['interrupted']
+    assert previous['devices']['unknown'] == original['devices']['unknown']
+    assert previous['devices']['failed']['retry_job_id'] == retry['job_id']
+    created, replay = await manager.retry_failed(
+        job_id, request_id, target_devices=['failed'],
+        artifact_root=tmp_path, online_devices=[],
+    )
+    assert not created and replay == retry
+    with pytest.raises(StoreConflict, match='different request'):
+        await manager.retry_failed(
+            job_id, request_id, target_devices=['interrupted'],
+            artifact_root=tmp_path, online_devices=ONLINE,
+        )
+    _, peer_retry = await manager.retry_failed(
+        job_id, str(uuid.uuid4()), target_devices=['interrupted'],
+        artifact_root=tmp_path, online_devices=ONLINE,
+    )
+    assert set(peer_retry['devices']) == {'interrupted'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('targets', [[], ['foreign'], ['failed', 'foreign'], [''], [1], 'failed'])
+async def test_invalid_retry_targets_are_rejected_without_mutation(manager, tmp_path, targets):
+    original = await completed(manager, tmp_path)
+    with pytest.raises(StoreConflict):
+        await manager.retry_failed(
+            original['job_id'], str(uuid.uuid4()), target_devices=targets,
+            artifact_root=tmp_path, online_devices=ONLINE,
+        )
+    assert await manager.get_snapshot(original['job_id']) == original
+    assert await manager.store._call(lambda conn: conn.execute('SELECT COUNT(*) FROM push_jobs').fetchone()[0]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cancel_first', [False, True])
+async def test_retry_and_candidate_withdrawal_cannot_both_win(manager, tmp_path, cancel_first):
+    original = await completed(manager, tmp_path)
+    job_id = original['job_id']
+    retry = manager.retry_failed(
+        job_id, str(uuid.uuid4()), target_devices=['failed'],
+        artifact_root=tmp_path, online_devices=ONLINE,
+    )
+    cancel = manager.cancel_interrupted(job_id, 'failed')
+    results = await asyncio.gather(
+        *([cancel, retry] if cancel_first else [retry, cancel]), return_exceptions=True,
+    )
+    assert sum(isinstance(result, StoreConflict) for result in results) == 1
+    current = (await manager.get_snapshot(job_id))['devices']['failed']
+    assert bool(current['retry_job_id']) != current['cancel_requested']
+    assert current['state'] == original['devices']['failed']['state']
+    assert current['failure'] == original['devices']['failed']['failure']

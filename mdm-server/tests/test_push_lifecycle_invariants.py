@@ -380,7 +380,7 @@ async def test_newer_success_supersedes_retry_even_with_equal_creation_time(
     with pytest.raises(StoreConflict, match="no unsuccessful targets to retry"):
         await manager.retry_failed(
             older["job_id"], str(uuid.uuid4()), artifact_root=tmp_path,
-            online_devices={"D1"},
+            target_devices={"D1"}, online_devices={"D1"},
         )
 
     def unexpected_per_job_lookup(*_args, **_kwargs):

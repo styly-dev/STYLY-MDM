@@ -142,18 +142,13 @@
     }
     .attention-tab-actions-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     .attention-tab-actions-copy { min-width: 0; }
-    .attention-tab-actions-title { color: var(--text-primary); font-size: 13px; font-weight: 600; }
+    .attention-tab-actions-title { margin: 0; color: var(--text-primary); font-size: 13px; font-weight: 600; }
     .attention-tab-actions-note { margin-top: 3px; color: var(--text-secondary); font-size: 11px; line-height: 1.4; }
     .attention-tab-actions-buttons { display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto; }
     .attention-tab-action[data-action="resume"] { background: var(--warning); border-color: var(--warning); color: #17130a; }
     .attention-tab-action[data-action="resume"]:hover:not(:disabled) { background: #f5b91e; border-color: #f5b91e; color: #17130a; }
     .attention-tab-action[data-action="cancel"] { color: var(--danger); border-color: rgba(248, 113, 113, .55); }
     .attention-tab-action[data-action="cancel"]:hover:not(:disabled) { border-color: var(--danger); background: rgba(248, 113, 113, .08); }
-    .attention-tab-job-list { display: flex; flex-direction: column; gap: 7px; margin-top: 11px; padding-top: 10px; border-top: 1px solid var(--border-soft); }
-    .attention-tab-job { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12px; }
-    .attention-tab-job-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); }
-    .attention-tab-job-buttons { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
-    .attention-tab-job-buttons .push-job-action { min-height: 26px; padding: 3px 8px; font-size: 11px; }
 
     .targets-body { padding: 0; flex: 1 1 0; min-height: 0; overflow-y: auto; }
 
@@ -256,7 +251,11 @@
     .battery-note { color: var(--text-muted); font-size: 11px; margin-left: 4px; }
     .battery-muted { color: var(--text-dim); }
     .dev-task { font-size: 12px; padding-right: 14px; }
-    .push-job-actions { display: inline-flex; align-items: center; gap: 6px; margin-left: 6px; vertical-align: middle; }
+    .attention-row .dev-task { padding-right: 0; }
+    .push-device-progress { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: 18px; }
+    .push-device-status { min-width: 0; }
+    .push-job-actions { display: inline-flex; align-items: center; gap: 6px; justify-self: end; }
+    .push-delivery-context { color: var(--text-secondary); font-size: 11px; margin-bottom: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .push-job-action {
       display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
       min-height: 28px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px;
@@ -1229,7 +1228,7 @@
             return '<div class="attention-row"><input type="checkbox" class="push-attention-checkbox" data-act="selectPushAttention" data-id="' + esc(id) + '"' +
               (selectedPushAttentionIds.has(id) ? ' checked' : '') + ' aria-label="Select ' + esc(labelFor(id)) + ' for Push / Sync actions"><div class="attention-device">' +
               '<div class="attention-model">' + esc(labelFor(id)) + '</div>' +
-              '<div class="attention-meta">' + esc(device.status || 'unknown') + ' · ' + esc(device.ip || '-') + '</div></div>' +
+              '<div class="attention-meta">' + deviceIdHtml(device, id) + ' · ' + esc(device.status || 'unknown') + ' · ' + esc(device.ip || '-') + '</div></div>' +
               '<div class="dev-task" data-task-id="' + esc(id) + '">' + progressCellHtml(id) + '</div></div>';
           }).join('') + '</div>' : '';
         if (!provisionalConnections.length) return jobs;
@@ -1545,17 +1544,21 @@
         if (assignment) {
           const actions = [];
           function button(action, label, pending) {
-            const pendingLabel = action === 'resume' ? 'Resuming…' : 'Cancelling…';
+            const pendingLabel = { resume: 'Resuming…', retry: 'Retry requested…', cancel: 'Cancelling…' }[action];
             return '<button class="push-job-action" data-act="pushDeviceAction" data-action="' + action +
               '" data-id="' + esc(id) + '" data-job-id="' + esc(assignment.job_id) + '"' +
               (pending ? ' disabled' : '') + '>' + (pending ? pendingLabel : label) + '</button>';
           }
           if (assignment.resumePending) actions.push(button('resume', 'Resume', true));
           else if (assignment.canResume) actions.push(button('resume', 'Resume', false));
+          if (assignment.retryPending) actions.push(button('retry', 'Retry', true));
+          else if (assignment.canRetry) actions.push(button('retry', 'Retry', false));
           if (assignment.cancelPending) actions.push(button('cancel', 'Cancel', true));
           else if (assignment.canCancel) actions.push(button('cancel', 'Cancel', false));
-          if (actions.length) task += '<span class="push-job-actions">' + actions.join('') + '</span>';
-          task = '<div><span class="ins-none">' + esc(assignment.verb) + ': </span>' + task + '</div>';
+          const context = assignment.verb + ' · ' + assignment.filename;
+          task = '<div class="push-device-progress"><div class="push-device-status">' +
+            '<div class="push-delivery-context" title="' + esc(context) + '">' + esc(context) + '</div><div>' + task + '</div></div>' +
+            '<span class="push-job-actions">' + actions.join('') + '</span></div>';
           const other = deviceTaskState[id];
           if (other) {
             const label = other.task === 'verify' ? (other.kind === 'dir' ? 'Verify Dir' : 'Verify APK') : 'Install';
@@ -1586,6 +1589,11 @@
         addLog: addLog,
         isDeviceOnline: function (id) { const d = deviceById(id); return !!d && d.status === 'online'; },
         selectedAttentionDeviceIds: function () { return Array.from(selectedPushAttentionIds); },
+        clearAttentionSelection: function (ids) {
+          ids.forEach(function (id) { selectedPushAttentionIds.delete(id); });
+          pushAttentionSelectionAnchorId = null;
+          renderActions();
+        },
         refreshAttention: function () {
           if (view !== 'console') return;
           renderTabs();
@@ -1604,7 +1612,7 @@
         const n = attentionMode ? selectedConnectionIds.size + selectedPushAttentionIds.size : selectedIds.size;
         let ctx;
         if (n === 0) ctx = 'Select devices or a group to act on';
-        else if (attentionMode) ctx = (selectedPushAttentionIds.size ? selectedPushAttentionIds.size + ' Push / Sync device(s) selected · Resume/Cancel above · ' : '') +
+        else if (attentionMode) ctx = (selectedPushAttentionIds.size ? selectedPushAttentionIds.size + ' Push / Sync device(s) selected · Resume/Retry/Cancel above · ' : '') +
           selectedConnectionIds.size + ' connection(s) selected for power control';
         else if (activeGroup) ctx = 'via group "' + esc(activeGroup) + '" · ' + on + ' online' + (off ? ' · ' + off + ' offline skipped' : '');
         else ctx = on + ' online' + (off ? ' · ' + off + ' offline skipped' : '') + ' · add or remove individually';

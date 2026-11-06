@@ -158,16 +158,16 @@ async def test_retry_failed_targets_only_online_devices(manager, tmp_path):
 
     with pytest.raises(StoreConflict, match='online'):
         await manager.retry_failed(
-            job_id, str(uuid.uuid4()), artifact_root=tmp_path, online_devices=set(),
+            job_id, str(uuid.uuid4()), artifact_root=tmp_path, target_devices={'ON', 'OFF'}, online_devices=set(),
         )
     _, retry = await manager.retry_failed(
-        job_id, str(uuid.uuid4()), artifact_root=tmp_path, online_devices={'ON'},
+        job_id, str(uuid.uuid4()), artifact_root=tmp_path, target_devices={'ON', 'OFF'}, online_devices={'ON'},
     )
     assert set(retry['devices']) == {'ON'}
     original = (await manager.get_snapshot(job_id))['devices']
     assert original['OFF']['retry_job_id'] is None
     _, later = await manager.retry_failed(
-        job_id, str(uuid.uuid4()), artifact_root=tmp_path, online_devices={'OFF'},
+        job_id, str(uuid.uuid4()), artifact_root=tmp_path, target_devices={'ON', 'OFF'}, online_devices={'OFF'},
     )
     assert set(later['devices']) == {'OFF'}
 
