@@ -1220,7 +1220,7 @@
       function renderAttentionHtml() {
         const canonical = pushAttentionDevices();
         if (!provisionalConnections.length && !canonical.length) return '<div class="empty">No devices need attention</div>';
-        const jobs = canonical.length ? '<div class="attention-list"><div class="zone-label">Push / Sync jobs and state</div>' +
+        const jobs = canonical.length ? '<div class="attention-list">' +
           '<div class="attention-head"><input type="checkbox" class="push-attention-checkbox" data-act="selectAllPushAttention" aria-label="Select all listed Push / Sync devices">' +
           '<div>Device</div><div>Push / Sync status</div></div>' +
           canonical.map(function (device) {
