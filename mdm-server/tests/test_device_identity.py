@@ -400,7 +400,7 @@ def test_canonical_registration_is_new_device_and_does_not_settle_legacy_update(
                 assert set(persisted["devices"]) == {"SERIAL-1", GUID}
                 assert persisted["devices"]["SERIAL-1"]["identity_kind"] == "legacy"
                 assert persisted["devices"][GUID]["identity_kind"] == "canonical"
-                assert persisted["groups"] == {"old-group": ["SERIAL-1"]}
+                assert persisted["groups"] == {"old-group": {"members": ["SERIAL-1"], "package_id": None}}
 
                 await legacy.close()
                 replacement_failed = await session.ws_connect(base + "/ws/device")

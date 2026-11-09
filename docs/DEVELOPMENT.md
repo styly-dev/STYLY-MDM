@@ -79,29 +79,89 @@ payloads and parser exception details that could contain artifact lease tokens.
 state transitions, Resume/Cancel/Retry eligibility, retention, recovery, deployment
 compatibility, and message sequences.
 
-### Group Wi-Fi auto-connect policy
+### Configuration packages
 
-PICO 4 Ultra Enterprise clients retain saved OS networks and apply explicit group
-policies by adding/updating credentials and switching per-network automatic
-connection. A fresh candidate SSID plus Wi-Fi IP within a fixed 60-second budget
-commits success locally. Failure restores pre-change flags and MDM-known old
-credentials; unknown overwritten passwords cannot be recovered. Precise location
-must be allowed all the time for background recovery on the tested PUI build. Interrupted work
-uses a durable journal. The successful policy is reapplied once per OS boot,
-unless explicitly deployed unmanaged. The server only sends to frozen online
-targets and returns transient delivery counts. Secret-free REGISTER/WIFI_STATE
-reports retain the latest device policy/result and receipt time for the console;
-there is no automatic replay. Unchanged verified policies avoid reconnecting.
-Content startup proceeds after Wi-Fi recovery completes or a 60-second maximum.
+A device belongs to at most one group. A group holds its members and an optional
+package reference. Multiple groups can reference the same package. Packages
+hold a draft and the current published snapshot. The editor exposes the PICO 4
+Ultra Enterprise settings catalog under **Manage Groups → Configuration Packages**.
 
-Plaintext policies share `device_registry.json` with group metadata (private file
-mode; backups also contain passwords). Unreadable old encrypted profiles disable
-only Wi-Fi management; their data is retained for optional one-time migration.
-Group overlaps are allowed and warned about in the console, never auto-removed. HTTP-only
-managed-LAN operation has no authentication. The console discards unsaved edits
-on navigation. The sole current wire capability is `wifi_settings_v4`; earlier
-unpublished state/protocol formats are unsupported. See [WIFI_SETTINGS.md](WIFI_SETTINGS.md)
-for setup, ownership, persistence and the credential-restoration boundary.
+Save updates the draft. Publish creates a new revision and distributes it to
+all groups assigned to that package. The confirmation includes every assigned
+group and every member, including offline devices. Publishing checks the draft
+revision and the displayed impact together. Group **Settings** assigns a package
+and shows the per-device results. Choose **Create package…** at the bottom of
+the assignment menu to open the package creation form. If the device's
+effective published snapshot omits a setting, the client releases management
+and leaves the device value in place. Deleting a group removes its reference
+and releases its members.
+A referenced package cannot be deleted.
+
+The server sends the effective published snapshot on canonical registration,
+publication, assignment changes, and group membership changes. It keeps no
+device delivery queue and uses device reports for display. A device that was
+offline receives the latest snapshot when it connects. The client compares
+`package_id` and `revision`. It applies a successful version once per OS boot
+after connecting and applies a newly published version during the same boot.
+Moving between groups with the same package does not require another application.
+PUI 5.15.7 can reset sleep settings after Android boot completion. The first
+write waits until at least 40 seconds of OS uptime and until TobService is ready.
+
+The client durably claims each attempt before writing. It reads back managed
+settings and records the result locally. Failed or interrupted versions stay
+blocked across reconnects and OS boots. The operator can Retry that version
+for an online device or publish a new revision. Retry sends one explicit token
+for the requested package and revision. A device consumes the token with its
+next attempt and checks that it previously failed or was interrupted. The
+server does not queue Retry for offline devices. Wi-Fi runs last through the
+existing journaled connection and rollback flow. See [Wi-Fi setup and recovery](WIFI_SETTINGS.md).
+
+Scalar settings use the pinned PICO Enterprise SDK and Android readback where
+needed. Sleep and screen-off delays are ordered so the screen-off delay never
+exceeds sleep. Scheduled shutdown uses local device time and a recurring weekday
+mask. An enabled recurring timer prevents the shared power-cycle fallback from
+overwriting it during self-update. The Guard path remains available. Auto-copy
+from USB uses the PICO system switch and reads back the firmware's saved value.
+See the [PICO Enterprise SDK reference](https://business.picoxr.com/us/doc/EnterpriseAPI-Intro).
+
+Under **USB & advanced**, **Developer options menu** controls the PUI Developer
+tab's visibility. PUI reads this setting when the headset's Settings screen
+opens. The client supports the existing PUI visibility flag with values 0 and
+1, as verified on PUI 5.15.7. The updated APK declares the optional
+`WRITE_SECURE_SETTINGS` permission for this item. Use the authorized headset's
+verified ADB connection to provision
+`pm grant --user 0 com.styly.mdmclient android.permission.WRITE_SECURE_SETTINGS`.
+The client reports `PERMISSION_DENIED` for this item when the permission is
+absent. Use `pm revoke --user 0 com.styly.mdmclient android.permission.WRITE_SECURE_SETTINGS`
+on the same headset to remove the grant.
+
+#### Package API and device reports
+
+| Surface | Contract |
+|---|---|
+| `GET /api/packages`, `POST /api/packages` | List packages or create one by name. |
+| `GET /api/packages/{id}` | Returns package identity and name, `draft_revision`, `published_revision`, `published_keys`, the saved draft `settings`, the editor `sections`, and `impact` with group and device counts and a token. A saved Wi-Fi password is represented by `password_present`. |
+| `PUT /api/packages/{id}` | Saves `settings` as `{id: {managed, value}}` and optionally updates `name`. Supply `expected_revision` equal to the loaded draft UUID or null for a new draft. |
+| `POST /api/packages/{id}/publish` | Publishes the saved draft with `expected_revision` and `expected_impact`. A successful publication creates a new revision UUID. |
+| `DELETE /api/packages/{id}` | Deletes an unassigned package. |
+| `PUT /api/group-package?name=...` | Assigns `package_id` to a group. Use null to clear the assignment. |
+| `POST /api/package-retry` | Requests Retry for a currently assigned and online `device_id` with its current `package_id` and `revision`. |
+| `CONFIGURATION_POLICY` | Server to canonical `configuration_packages_v1` client. Includes `package_id`, `revision`, managed `settings` and, for an explicit retry, `retry_id`. A null pair clears effective management. |
+| `REGISTER` and `CONFIGURATION_STATE` | The secret-free `configuration_state` has `package_id`, `revision`, `status` (`applying`, `complete`, `interrupted`, `already_attempted`) and per-setting `results`. |
+| `GROUP_LIST` and `DEVICE_LIST` | Group messages expose membership, package summaries, assignments, and deployment metadata. Device rows expose capability and the latest report. An offline row is last-known. |
+
+The private `device_registry.json` stores `packages` and each group's
+`members` and `package_id`. Wi-Fi passwords are plaintext in the registry
+and its backups. On upgrade, each current `group_settings` profile becomes
+one package. Draft and published values and revision UUIDs are preserved.
+If a device belongs to several legacy groups, the server keeps the first
+group by name and logs the choice. The older `wifi_profiles` prototype
+does not participate in migration.
+
+Upgrade the server and client and reload open consoles together. The first
+package delivery can reapply migrated settings under the new package identity. Existing
+Wi-Fi recovery journals continue to recover interrupted operations. Keep a
+separate compatible registry backup if a downgrade is needed.
 
 ## Building the MDM Client
 
@@ -569,8 +629,9 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `CREATE_GROUP` | Create a new, empty device group. Fields: `name` |
 | `RENAME_GROUP` | Rename a group, preserving its members. Fields: `name`, `new_name` |
 | `DELETE_GROUP` | Delete a group (member devices are not affected). Fields: `name` |
-| `SET_DEVICE_GROUPS` | Set the exact set of groups a device belongs to. Fields: `device_id`, `groups` (list of existing group names) |
-| `SET_GROUP_MEMBERS` | Set the exact member list of an existing group (group-centric). Fields: `name`, `members` (list of device IDs; offline/unknown IDs allowed) |
+| `SET_DEVICE_GROUPS` | Set a device's membership. Fields are `device_id` and `groups` (zero or one existing group name). |
+| `MOVE_GROUP_MEMBERS` | Set the members of an existing group and move listed devices from their previous groups. Fields are `name` and `members` (device IDs, including offline devices). |
+| `SET_GROUP_MEMBERS` | Legacy member update. Uses the same fields and rejects implicit moves from another group. |
 | `RETIRE_DEVICE` | Make target clients uninstall themselves (remotely irreversible — the console gates it behind its heaviest confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only). See [Device Retirement](#device-retirement). |
 
 ### Admin HTTP API
@@ -614,7 +675,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `SELF_UPDATE_VERIFIED` | Outcome of the automatic post-update `EXECUTE_VERIFY_APK` the server runs against the client's own package. Fields: `device_id`, `correlation_id`, `status` (`verified` / `mismatch` / `skipped` / `error`), `detail` |
 | `RETIRE_SENT` | Confirmation that `EXECUTE_SELF_UNINSTALL` commands were dispatched. Fields: `sent_count`, `target_count` |
 | `RETIRE_RESULT` | Outcome of a device retire. Success is settled by *silence*: the device announced, disconnected, and stayed away for the retire window. Failure means it re-registered, reported the uninstall failed, or was still connected at the deadline. Fields: `device_id`, `correlation_id`, `status` (`success` / `fail`), `detail` |
-| `GROUP_LIST` | Current device groups. Fields: `groups` (object mapping group name → array of member device IDs). The console derives each device's group membership from this; sent on connect and after any group change. |
+| `GROUP_LIST` | Current `groups`, package summaries in `packages`, group-to-package `assignments`, and published `deployments`. Sent on connect and after group or package changes. |
 | `GROUP_CREATED` / `GROUP_RENAMED` / `GROUP_DELETED` | Acknowledgements for group create / rename / delete. |
 | `DEVICE_GROUPS_SET` | Acknowledgement of a device's group membership change. Fields: `device_id`, `groups` |
 | `GROUP_MEMBERS_SET` | Acknowledgement of a group's member list change. Fields: `name`, `members` |
@@ -678,9 +739,9 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > repository's GitHub Releases page — the console alone is enough.
 
 > **Device groups** allow at most one group per `device_id`, persisted
-> server-side in `device_registry.json` (under a `groups` key). Legacy overlaps
-> migrate to the lexically first group. Selecting a group
-> in the console is a client-side convenience: it sets the device selection to that
+> server-side in `device_registry.json` under `groups`. Migration resolves
+> legacy overlaps by keeping the first group by name. Selecting a group in
+> the console sets the device selection to that
 > group's members (devices not in the group are deselected), so commands still
 > dispatch via the normal `target_devices` path (online members only). Group
 > membership can include offline devices.

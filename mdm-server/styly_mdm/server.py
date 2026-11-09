@@ -8,6 +8,7 @@ Static files for the web console are served from ./static/.
 import argparse
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import re
 import shutil
 import socket
 import sys
+import tempfile
 import time
 import uuid
 import zipfile
@@ -29,18 +31,11 @@ from .device_policy import (
     CommandNotAllowedError,
     command_allowed,
 )
+from . import configuration_packages
+from .configuration_packages import PackageError
 from .integrity import apk_cd_digest, file_sha256, is_os_metadata
 from .push_jobs import parse_capabilities
-from .wifi_settings import (
-    WiFiSettingsError,
-    WiFiSettingsStore,
-    WiFiStoreError,
-    decrypt_legacy_wifi_profiles,
-    normalize_revision,
-    public_networks,
-    public_wifi_state,
-    validate_profile_networks,
-)
+from .wifi_settings import normalize_revision, public_wifi_state
 
 logging.basicConfig(
     level=logging.INFO,
@@ -217,13 +212,13 @@ provisional_connections: dict[web.WebSocketResponse, dict] = {}
 # while offline. Survives restarts (persisted to REGISTRY_PATH).
 device_registry: dict[str, dict] = {}
 
-# Named device groups: group name -> list of member identities. A device can
-# belong to several groups; membership is keyed by identity so an
-# offline (or not-yet-registered) device can still be grouped. Persisted to
-# REGISTRY_PATH alongside the device registry.
+# Named groups map to device identities, including devices currently offline.
+# Membership is exclusive. Each group may reference a shared package.
 device_groups: dict[str, list[str]] = {}
-_wifi_profiles: dict | None = None
-_wifi_profiles_encrypted: str | None = None
+_group_assignments: dict[str, str] = {}
+_configuration_packages: dict[str, dict] | None = {}
+_registry_extras: dict = {}
+_registry_readable = True
 
 # Connected admin WebSocket sessions
 admin_connections: set[web.WebSocketResponse] = set()
@@ -312,6 +307,7 @@ def _coerce_record(value) -> dict | None:
             version_code = None
         version_name = value.get("version_name")
         return {
+            **{key: field for key, field in value.items() if key != "group_settings_state"},
             "label": label.strip() if isinstance(label, str) else "",
             "model": model if isinstance(model, str) else "",
             "ip": ip if isinstance(ip, str) else "",
@@ -326,6 +322,7 @@ def _coerce_record(value) -> dict | None:
                 if value.get("identity_kind") in {"canonical", "legacy"}
                 else "legacy"
             ),
+            "configuration_state": configuration_packages.public_configuration_state(value.get("configuration_state")),
             "wifi_state": public_wifi_state(value.get("wifi_state")),
             "wifi_state_updated_at": (
                 value.get("wifi_state_updated_at")
@@ -390,108 +387,158 @@ def _coerce_groups(value) -> dict[str, list[str]]:
     return result
 
 
+def _remove_duplicate_memberships(groups: dict[str, list[str]]) -> None:
+    owner: dict[str, str] = {}
+    for name, members in sorted(groups.items()):
+        unique = []
+        for device_id in members:
+            if device_id in owner:
+                log.warning("Duplicate group membership for %s: kept %r, removed from %r",
+                            device_id, owner[device_id], name)
+                continue
+            owner[device_id] = name
+            unique.append(device_id)
+        groups[name] = unique
+
+
+def _serialized_groups() -> dict:
+    return {
+        name: {"members": members, "package_id": _group_assignments.get(name)}
+        for name, members in device_groups.items()
+    }
+
+
+def _load_package_registry(raw: dict) -> None:
+    global _configuration_packages
+    raw_groups = raw.get("groups", {})
+    if not isinstance(raw_groups, dict):
+        raise PackageError("Invalid saved groups")
+    if "packages" in raw:
+        if "group_settings" in raw:
+            raise PackageError("Invalid package registry")
+        packages = configuration_packages.load_packages(raw["packages"])
+        assignments = {}
+        for name, entry in raw_groups.items():
+            if (not name or name != name.strip() or len(name) > MAX_GROUP_NAME_LEN
+                    or not isinstance(entry, dict) or set(entry) != {"members", "package_id"}
+                    or not isinstance(entry["members"], list)
+                    or any(not isinstance(member, str) or not member for member in entry["members"])):
+                raise PackageError("Invalid saved group")
+            package_id = entry["package_id"]
+            if package_id is not None:
+                if normalize_revision(package_id) is None or package_id not in packages:
+                    raise PackageError("Invalid saved package assignment")
+                assignments[name] = package_id
+    else:
+        if any(not isinstance(members, list) for members in raw_groups.values()):
+            raise PackageError("Invalid saved legacy groups")
+        packages, assignments = (
+            configuration_packages.migrate_group_settings(raw["group_settings"]) if "group_settings" in raw else ({}, {})
+        )
+
+    _configuration_packages = packages
+    _group_assignments.update({name: ref for name, ref in assignments.items() if name in device_groups})
+    needs_migration = (
+        "packages" not in raw or raw_groups != _serialized_groups()
+        or "wifi_profiles" in raw or "wifi_profiles_encrypted" in raw
+    )
+    if needs_migration and not save_registry():
+        raise PackageError("Configuration migration could not be saved")
+
+
 def load_registry() -> None:
-    """Load the per-device registry and groups from disk, tolerating a missing/corrupt file.
-
-    Accepts two on-disk shapes:
-    - Legacy flat: serial -> label string, or serial -> record dict (no groups).
-    - Current wrapped: {"devices": {serial -> record}, "groups": {name -> [serial]}}.
-
-    The wrapped shape is detected by a dict-valued "devices" key. Device serials
-    are formatted like "PA94U0...", so a real serial never collides with the
-    "devices"/"groups" keys. The server always writes the wrapped shape, so this
-    is a one-way auto-migration; an older server reading a new file would mistake
-    "devices"/"groups" for phantom devices (downgrade-only, acceptable).
-    """
-    global _wifi_profiles, _wifi_profiles_encrypted
+    """Load the registry and atomically migrate group settings to shared packages."""
+    global _configuration_packages, _registry_readable
     device_registry.clear()
     device_groups.clear()
-    _wifi_profiles = None
-    _wifi_profiles_encrypted = None
+    _group_assignments.clear()
+    _configuration_packages = {}
+    _registry_extras.clear()
+    _registry_readable = True
     try:
         raw = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("expected a JSON object")
+        if ("packages" in raw or "group_settings" in raw) and not isinstance(raw.get("devices"), dict):
+            raise ValueError("configuration registry is missing its device map")
     except FileNotFoundError:
         return
-    except (json.JSONDecodeError, OSError) as e:
-        log.warning("Ignoring unreadable device registry %s: %s", REGISTRY_PATH, e)
+    except (ValueError, OSError, RecursionError) as exc:
+        _registry_readable = False
+        _configuration_packages = None
+        log.warning("Device registry unavailable at %s: %s; saved data retained", REGISTRY_PATH, exc)
         return
-    if not isinstance(raw, dict):
-        log.warning("Device registry is not an object; ignoring")
-        return
 
-    loaded_groups: dict[str, list[str]] = {}
-    if isinstance(raw.get("devices"), dict):
-        devices_raw = raw["devices"]
-        loaded_groups = _coerce_groups(raw.get("groups"))
-        _wifi_profiles = raw.get("wifi_profiles")
-        _wifi_profiles_encrypted = raw.get("wifi_profiles_encrypted")
-    else:
-        devices_raw = raw  # legacy flat shape: the whole object is serial -> value
+    wrapped = isinstance(raw.get("devices"), dict)
+    devices_raw = raw["devices"] if wrapped else raw
+    for device_id, value in devices_raw.items():
+        if (record := _coerce_record(value)) is not None:
+            device_registry[device_id] = record
 
-    loaded_devices: dict[str, dict] = {}
-    for serial, value in devices_raw.items():
-        if not isinstance(serial, str):
-            continue
-        record = _coerce_record(value)
-        if record is not None:
-            loaded_devices[serial] = record
-
-    device_registry.update(loaded_devices)
-    device_groups.update(loaded_groups)
+    if wrapped:
+        raw_groups = raw.get("groups")
+        if isinstance(raw_groups, dict):
+            device_groups.update(_coerce_groups({
+                name: entry.get("members") if isinstance(entry, dict) else entry
+                for name, entry in raw_groups.items()
+            }))
+            _remove_duplicate_memberships(device_groups)
+        _registry_extras.update({
+            key: value for key, value in raw.items()
+            if key not in ("devices", "groups", "packages", "group_settings",
+                           "wifi_profiles", "wifi_profiles_encrypted")
+        })
+        try:
+            _load_package_registry(raw)
+        except PackageError as exc:
+            _configuration_packages = None
+            _group_assignments.clear()
+            _registry_extras.update({
+                key: raw[key] for key in ("groups", "packages", "group_settings") if key in raw
+            })
+            log.warning("Configuration packages unavailable: %s; saved data retained", exc)
     log.info("Loaded %d device(s) and %d group(s) from registry",
              len(device_registry), len(device_groups))
 
 
 def _registry_bytes() -> bytes:
-    payload = {"devices": device_registry, "groups": device_groups}
-    if _wifi_profiles is not None:
-        payload["wifi_profiles"] = _wifi_profiles
-    if _wifi_profiles_encrypted is not None:
-        payload["wifi_profiles_encrypted"] = _wifi_profiles_encrypted
-    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-
-
-def _persist_wifi_profiles(state: dict) -> None:
-    global _wifi_profiles, _wifi_profiles_encrypted
-    previous = _wifi_profiles, _wifi_profiles_encrypted
-    _wifi_profiles, _wifi_profiles_encrypted = state, None
-    if not save_registry():
-        _wifi_profiles, _wifi_profiles_encrypted = previous
-        raise WiFiStoreError("Wi-Fi profiles could not be persisted")
+    payload = {**_registry_extras, "devices": device_registry}
+    if _configuration_packages is not None:
+        payload["groups"] = _serialized_groups()
+        payload["packages"] = {"version": configuration_packages.VERSION, "packages": _configuration_packages}
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8", errors="backslashreplace")
 
 
 def save_registry() -> bool:
-    """Persist the per-device registry and groups atomically (temp file + replace)."""
-    tmp = REGISTRY_PATH.with_suffix(".json.tmp")
+    """Persist device and group state with one private, atomic registry replace."""
+    if not _registry_readable:
+        return False
+    tmp = None
     try:
-        tmp.write_bytes(_registry_bytes())
-        tmp.chmod(0o600)
+        with tempfile.NamedTemporaryFile(dir=REGISTRY_PATH.parent, delete=False) as output:
+            tmp = Path(output.name)
+            output.write(_registry_bytes())
         tmp.replace(REGISTRY_PATH)
         return True
     except OSError as e:
         log.error("Failed to persist device registry: %s", e)
-        tmp.unlink(missing_ok=True)
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
         return False
 
 
-def _persist_group_registry_mutation(
-    store: WiFiSettingsStore | None,
-    previous_groups: dict[str, list[str]],
-    previous_wifi_state: dict | None,
+def _save_group_change(
+    previous_groups: dict[str, list[str]], previous_assignments: dict[str, str] | None = None,
 ) -> bool:
-    """Save a group rename/delete and its profile in one registry replace."""
-    try:
-        if store is not None:
-            store.persist()
-        elif not save_registry():
-            raise OSError("registry write failed")
+    """Persist group changes or restore the prior membership and references."""
+    if _configuration_packages is not None and save_registry():
         return True
-    except (OSError, WiFiStoreError):
-        device_groups.clear()
-        device_groups.update(previous_groups)
-        if store is not None and previous_wifi_state is not None:
-            store.state = previous_wifi_state
-        return False
+    device_groups.clear()
+    device_groups.update(previous_groups)
+    if previous_assignments is not None:
+        _group_assignments.clear()
+        _group_assignments.update(previous_assignments)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +570,8 @@ def build_device_list_msg() -> str:
             "version_name": d.get("version_name", ""),
             # Live-only: whether the connected client can currently accept Push.
             "push_state_status": d.get("push_state_status"),
+            "configuration_supported": d.get("status") == "online" and _supports_configuration(d),
+            "configuration_state": d.get("configuration_state"),
             "wifi_state": d.get("wifi_state"),
             "wifi_state_updated_at": d.get("wifi_state_updated_at"),
         }
@@ -558,6 +607,8 @@ def build_device_list_msg() -> str:
             "version_name": rec.get("version_name", ""),
             "identity_kind": rec.get("identity_kind", "legacy"),
             "push_state_status": None,
+            "configuration_supported": False,
+            "configuration_state": rec.get("configuration_state"),
             "wifi_state": rec.get("wifi_state"),
             "wifi_state_updated_at": rec.get("wifi_state_updated_at"),
         })
@@ -597,16 +648,26 @@ async def broadcast_provisional_connection_list() -> None:
     await _broadcast_admin_message(build_provisional_connection_list_msg())
 
 
-def build_group_list_msg() -> str:
-    """Build a GROUP_LIST payload: every group with its member serials.
+def _public_packages() -> list[dict]:
+    packages = _configuration_packages or {}
+    return [
+        configuration_packages.public_summary(package_id, packages[package_id])
+        for package_id in sorted(packages, key=lambda key: (packages[key]["name"], key))
+    ]
 
-    This is the single source of truth for group membership; the admin console
-    derives the per-device "which groups" view from it. Groups are sorted by name
-    for a stable display, and members are emitted as plain serial lists (a serial
-    may reference an offline or not-yet-registered device).
-    """
+
+def build_group_list_msg() -> str:
+    """Build group membership, package references and public deployment metadata."""
     groups = {name: list(members) for name, members in sorted(device_groups.items())}
-    return json.dumps({"type": "GROUP_LIST", "groups": groups})
+    packages = _configuration_packages or {}
+    assignments = {name: _group_assignments[name] for name in groups if name in _group_assignments}
+    deployments = {
+        name: {"package_id": package_id, "revision": published["revision"], "keys": list(published["settings"])}
+        for name, package_id in assignments.items()
+        if (published := packages.get(package_id, {}).get("published")) is not None
+    }
+    return json.dumps({"type": "GROUP_LIST", "groups": groups, "assignments": assignments,
+                       "packages": _public_packages(), "deployments": deployments})
 
 
 async def broadcast_group_list():
@@ -1271,34 +1332,14 @@ def zip_tree(root: Path, dest_zip: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Wi-Fi settings API
+# Group settings API and policy publication
 # ---------------------------------------------------------------------------
 
-WIFI_REQUEST_MAX_BYTES = 256 * 1024
-WIFI_SEND_TIMEOUT = 5.0
+PACKAGE_REQUEST_MAX_BYTES = 256 * 1024
+CONFIGURATION_SEND_TIMEOUT = 5.0
 
 
-def _load_wifi_store() -> tuple[bool, WiFiSettingsStore | None]:
-    try:
-        state = _wifi_profiles
-        if _wifi_profiles_encrypted is not None:
-            if state is not None:
-                raise WiFiStoreError("conflicting saved Wi-Fi formats")
-            state = decrypt_legacy_wifi_profiles(
-                _wifi_profiles_encrypted, os.environ.get("MDM_WIFI_ENCRYPTION_KEY"),
-            )
-        store = WiFiSettingsStore(state, persist=_persist_wifi_profiles)
-        if _wifi_profiles_encrypted is not None:
-            store.persist()
-        return True, store
-    except WiFiStoreError as exc:
-        # Preserve the original bytes in subsequent registry writes. Core MDM
-        # remains available; no Wi-Fi mutations may overwrite unreadable data.
-        log.warning("Wi-Fi settings unavailable: %s; saved data retained", exc)
-        return False, None
-
-
-def _wifi_origin_allowed(request: web.Request) -> bool:
+def _package_origin_allowed(request: web.Request) -> bool:
     origin = request.headers.get("Origin")
     if origin is None:
         # Browsers send Origin for mutations. Native clients may omit it.
@@ -1307,195 +1348,261 @@ def _wifi_origin_allowed(request: web.Request) -> bool:
     return origin == expected
 
 
-def _wifi_store(request: web.Request) -> WiFiSettingsStore | None:
-    return request.app.get("wifi_store")
-
-
 async def _small_json_body(request: web.Request) -> dict:
-    if request.content_length is not None and request.content_length > WIFI_REQUEST_MAX_BYTES:
-        raise WiFiSettingsError("request body is too large", 413)
-    chunks: list[bytes] = []
-    size = 0
+    if (request.content_length is not None
+            and request.content_length > PACKAGE_REQUEST_MAX_BYTES):
+        raise PackageError("Request body is too large", 413)
+    body = bytearray()
     async for chunk in request.content.iter_chunked(8192):
-        size += len(chunk)
-        if size > WIFI_REQUEST_MAX_BYTES:
-            raise WiFiSettingsError("request body is too large", 413)
-        chunks.append(chunk)
+        body.extend(chunk)
+        if len(body) > PACKAGE_REQUEST_MAX_BYTES:
+            raise PackageError("Request body is too large", 413)
     try:
-        parsed = json.loads(b"".join(chunks).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise WiFiSettingsError("request body must be a JSON object") from None
+        parsed = json.loads(body.decode("utf-8"))
+    except (ValueError, RecursionError):
+        raise PackageError("Request body must be a JSON object") from None
     if not isinstance(parsed, dict):
-        raise WiFiSettingsError("request body must be a JSON object")
+        raise PackageError("Request body must be a JSON object")
     return parsed
 
 
-def _check_expected_revision(body: dict, current: dict | None, *, allow_new_profile: bool) -> None:
-    if "expected_revision" not in body:
-        raise WiFiSettingsError("expected_revision is required", 400)
-    expected = body["expected_revision"]
-    if expected is None:
-        if allow_new_profile and current is None:
-            return
-        raise WiFiSettingsError("the saved Wi-Fi profile changed; reload it", 409)
-    normalized = normalize_revision(expected)
-    if normalized is None:
-        raise WiFiSettingsError("expected_revision must be a canonical revision UUID", 400)
-    if current is None or normalized != current.get("revision"):
-        raise WiFiSettingsError("the saved Wi-Fi profile changed; reload it", 409)
-
-
-def _wifi_api_unavailable() -> web.Response:
-    return web.json_response({"error": "Wi-Fi settings are not enabled"}, status=503)
-
-
-def _wifi_name_from_request(request: web.Request) -> str:
-    name = request.match_info.get("name", "")
+def _group_assignment_name(request: web.Request) -> str:
+    names = request.query.getall("name", [])
+    if len(names) != 1:
+        raise PackageError("Exactly one group name is required")
+    name = names[0]
     if not name or name != name.strip() or len(name) > MAX_GROUP_NAME_LEN:
-        raise WiFiSettingsError("invalid group name", 400)
+        raise PackageError("Invalid group name")
     return name
 
 
-async def wifi_state_handler(request: web.Request) -> web.Response:
-    return web.json_response({"enabled": request.app.get("wifi_enabled") is True})
+def _require_packages() -> dict[str, dict]:
+    if _configuration_packages is None:
+        raise PackageError("Saved configuration packages are unavailable", 503)
+    return _configuration_packages
 
 
-async def wifi_group_handler(request: web.Request) -> web.Response:
-    if not request.app.get("wifi_enabled"):
-        return _wifi_api_unavailable()
-    store = _wifi_store(request)
-    if store is None:
-        return _wifi_api_unavailable()
+def _find_package(package_id: str) -> dict:
+    packages = _require_packages()
+    if package_id not in packages:
+        raise PackageError("Configuration package does not exist", 404)
+    return packages[package_id]
+
+
+def _save_package(package_id: str, profile: dict | None) -> None:
+    packages = _require_packages()
+    previous = packages.get(package_id)
+    if profile is None:
+        del packages[package_id]
+    else:
+        packages[package_id] = profile
+    if save_registry():
+        return
+    if previous is None:
+        del packages[package_id]
+    else:
+        packages[package_id] = previous
+    raise PackageError("Configuration package could not be saved", 500)
+
+
+def _package_impact(package_id: str, profile: dict) -> tuple[dict, list[str]]:
+    membership = {
+        name: sorted(device_groups[name])
+        for name, ref in sorted(_group_assignments.items()) if ref == package_id
+    }
+    revision = profile.get("published", {}).get("revision")
+    token = hashlib.sha256(json.dumps([package_id, revision, membership]).encode("utf-8")).hexdigest()
+    devices = sorted({device_id for members in membership.values() for device_id in members})
+    return {"groups": len(membership), "devices": len(devices), "token": token}, devices
+
+
+def _public_package(package_id: str, profile: dict) -> dict:
+    impact, _ = _package_impact(package_id, profile)
+    return configuration_packages.public_profile(package_id, profile, impact)
+
+
+def _require_package_origin(request: web.Request) -> None:
+    if not _package_origin_allowed(request):
+        raise PackageError("Invalid request origin", 403)
+
+
+async def package_catalog_handler(request: web.Request) -> web.Response:
     try:
-        name = _wifi_name_from_request(request)
-        if name not in device_groups:
-            raise WiFiSettingsError("group does not exist", 404)
-        if request.method == "GET":
-            profile = store.profile(name)
-            return web.json_response({
-                "name": name,
-                "revision": profile.get("revision") if profile else None,
-                "mode": profile.get("mode") if profile else None,
-                "networks": public_networks(profile["networks"]) if profile else [],
-            })
-
-        if request.method in {"PUT", "DELETE"} and not _wifi_origin_allowed(request):
-            return web.json_response({"error": "invalid request origin"}, status=403)
+        if request.method in ("GET", "HEAD"):
+            _require_packages()
+            return web.json_response({"packages": _public_packages()})
+        _require_package_origin(request)
         body = await _small_json_body(request)
-        # The request body read above yields to the event loop. A concurrent
-        # rename/delete may have removed this group in the meantime.
-        if name not in device_groups:
-            raise WiFiSettingsError("group does not exist", 404)
-        current = store.profile(name)
-        _check_expected_revision(body, current, allow_new_profile=True)
+        package_id = str(uuid.uuid4())
+        profile = {"name": configuration_packages.validate_name(body.get("name"))}
+        _save_package(package_id, profile)
+        response = _public_package(package_id, profile)
+        await broadcast_group_list()
+        return web.json_response(response)
+    except PackageError as exc:
+        return web.json_response({"error": str(exc)}, status=exc.status)
+
+
+async def package_handler(request: web.Request) -> web.Response:
+    try:
+        package_id = request.match_info["package_id"]
+        if request.method in ("GET", "HEAD"):
+            return web.json_response(_public_package(package_id, _find_package(package_id)))
+
+        _require_package_origin(request)
         if request.method == "DELETE":
-            # Save as unmanaged; the device changes only after explicit Deploy.
-            profile = store.put_profile(name, [], mode="unmanaged")
+            _find_package(package_id)
+            if package_id in _group_assignments.values():
+                raise PackageError("Configuration package is assigned to a group", 409)
+            _save_package(package_id, None)
+            response = {"deleted": True}
         else:
-            networks = validate_profile_networks(
-                body.get("networks"), current.get("networks") if current else None,
-            )
-            profile = store.put_profile(name, networks, mode="managed")
-        return web.json_response({
-            "name": name,
-            "revision": profile["revision"],
-            "mode": profile["mode"],
-            "networks": public_networks(profile["networks"]),
-        })
-    except WiFiSettingsError as exc:
+            body = await _small_json_body(request)
+            # Compare the revision and persist in one synchronous step.
+            profile = _find_package(package_id)
+            current = profile.get("draft")
+            configuration_packages.check_expected_revision(body, current, allow_new=True)
+            name = configuration_packages.validate_name(body.get("name", profile["name"]))
+            draft = configuration_packages.validate_draft(body.get("settings"), current["settings"] if current else None)
+            updated = {**profile, "name": name, "draft": configuration_packages.new_snapshot(draft)}
+            _save_package(package_id, updated)
+            response = _public_package(package_id, updated)
+        await broadcast_group_list()
+        return web.json_response(response)
+    except PackageError as exc:
         return web.json_response({"error": str(exc)}, status=exc.status)
-    except WiFiStoreError:
-        log.error("Wi-Fi profile persistence failed")
-        return web.json_response({"error": "Wi-Fi settings could not be saved"}, status=500)
 
 
-async def wifi_deploy_handler(request: web.Request) -> web.Response:
-    if not request.app.get("wifi_enabled"):
-        return _wifi_api_unavailable()
-    if not _wifi_origin_allowed(request):
-        return web.json_response({"error": "invalid request origin"}, status=403)
-    store = _wifi_store(request)
-    if store is None:
-        return _wifi_api_unavailable()
+async def package_publish_handler(request: web.Request) -> web.Response:
     try:
-        name = _wifi_name_from_request(request)
+        _require_package_origin(request)
+        body = await _small_json_body(request)
+        package_id = request.match_info["package_id"]
+        profile = _find_package(package_id)
+        draft = profile.get("draft")
+        configuration_packages.check_expected_revision(body, draft, allow_new=False)
+        expected_impact = body.get("expected_impact")
+        if not isinstance(expected_impact, str) or not expected_impact:
+            raise PackageError("expected_impact is required")
+        impact, devices = _package_impact(package_id, profile)
+        if expected_impact != impact["token"]:
+            raise PackageError("Publish impact changed. Reload and confirm the package.", 409)
+
+        published = configuration_packages.new_snapshot(configuration_packages.managed_settings(draft["settings"]))
+        updated = {**profile, "published": published}
+        _save_package(package_id, updated)
+        response = _public_package(package_id, updated)
+        await broadcast_group_list()
+        await _publish_configuration(devices)
+        return web.json_response(response)
+    except PackageError as exc:
+        return web.json_response({"error": str(exc)}, status=exc.status)
+
+
+async def group_package_handler(request: web.Request) -> web.Response:
+    try:
+        _require_package_origin(request)
+        name = _group_assignment_name(request)
         body = await _small_json_body(request)
         if name not in device_groups:
-            raise WiFiSettingsError("group does not exist", 404)
-        profile = store.profile(name)
-        if profile is None:
-            raise WiFiSettingsError("group has no saved Wi-Fi profile", 409)
-        _check_expected_revision(body, profile, allow_new_profile=False)
+            raise PackageError("Group does not exist", 404)
+        packages = _require_packages()
+        package_id = body.get("package_id")
+        if "package_id" not in body or (package_id is not None and normalize_revision(package_id) is None):
+            raise PackageError("package_id must be a canonical package UUID or null")
+        if package_id is not None and package_id not in packages:
+            raise PackageError("Configuration package does not exist", 404)
 
-        # Freeze the online membership and sockets before any network write.
-        # Offline devices are not queued and are never sent this revision later.
-        targets = [
-            (device_id, devices[device_id], devices[device_id].get("ws"))
-            for device_id in device_groups.get(name, [])
-            if isinstance(devices.get(device_id), dict)
-            and devices[device_id].get("status") == "online"
-        ]
-        results = [
-            {
-                "operation_id": str(uuid.uuid4()),
-                "device_id": device_id,
-                "status": "unknown",
-                "reason": "dispatch_not_confirmed",
-            }
-            for device_id, _entry, _ws in targets
-        ]
-
-        async def dispatch_one(target, result):
-            device_id, entry, ws = target
-            # Serialize commands to each device. A managed command already in
-            # send may be followed by an unmanaged command, but the order must
-            # never reverse and re-enable boot reapply after the unmanaged one.
-            # This is only a short-lived send lock, not a device operation fence.
-            send_lock = request.app["wifi_send_locks"].setdefault(device_id, asyncio.Lock())
-            async with send_lock:
-                if entry.get("identity_kind") != "canonical" or "wifi_settings_v4" not in entry.get("capabilities", []):
-                    status, reason = "failed", "unsupported"
-                elif devices.get(device_id) is not entry or not _owns_device(device_id, ws):
-                    status, reason = "failed", "socket_replaced"
-                elif ws is None or ws.closed:
-                    status, reason = "failed", "socket_unavailable"
+        previous = _group_assignments.get(name)
+        if previous != package_id:
+            if package_id is None:
+                _group_assignments.pop(name, None)
+            else:
+                _group_assignments[name] = package_id
+            if not save_registry():
+                if previous is None:
+                    _group_assignments.pop(name, None)
                 else:
-                    message = {
-                        "type": "EXECUTE_WIFI_APPLY",
-                        "operation_id": result["operation_id"],
-                        "revision": profile["revision"],
-                        "mode": profile["mode"],
-                        "networks": profile["networks"],
-                    }
-                    try:
-                        await asyncio.wait_for(
-                            ws.send_str(json.dumps(message, ensure_ascii=False)),
-                            timeout=WIFI_SEND_TIMEOUT,
-                        )
-                        status, reason = "sent", None
-                    except (ConnectionError, RuntimeError, asyncio.TimeoutError):
-                        # A send exception can happen after some bytes reached
-                        # the socket, so this is never reported as non-delivery.
-                        status, reason = "unknown", "socket_send_failed"
-
-                result["status"] = status
-                result["reason"] = reason
-
-        await asyncio.gather(*(
-            dispatch_one(target, result)
-            for target, result in zip(targets, results)
-        ))
-        return web.json_response({
-            "group": name,
-            "revision": profile["revision"],
-            "online_target_count": len(targets),
-            "operations": results,
-        })
-    except WiFiSettingsError as exc:
+                    _group_assignments[name] = previous
+                raise PackageError("Group package assignment could not be saved", 500)
+            members = tuple(device_groups[name])
+            await broadcast_group_list()
+            await _publish_configuration(members)
+        return web.json_response({"package_id": package_id})
+    except PackageError as exc:
         return web.json_response({"error": str(exc)}, status=exc.status)
-    except WiFiStoreError:
-        log.error("Wi-Fi profile persistence failed")
-        return web.json_response({"error": "Wi-Fi settings could not be saved"}, status=500)
+
+
+async def package_retry_handler(request: web.Request) -> web.Response:
+    try:
+        _require_package_origin(request)
+        body = await _small_json_body(request)
+        device_id = body.get("device_id")
+        package_id = body.get("package_id")
+        revision = body.get("revision")
+        if not isinstance(device_id, str) or not CANONICAL_DEVICE_ID_RE.fullmatch(device_id):
+            raise PackageError("device_id must be a canonical device ID")
+        if normalize_revision(package_id) is None or normalize_revision(revision) is None:
+            raise PackageError("package_id and revision must be canonical UUIDs")
+        entry = devices.get(device_id)
+        if entry is None or not await _send_configuration(device_id, entry, retry=(package_id, revision)):
+            raise PackageError("The device or published package is no longer available for retry", 409)
+        return web.json_response({"sent": True})
+    except PackageError as exc:
+        return web.json_response({"error": str(exc)}, status=exc.status)
+
+
+def _supports_configuration(entry: dict) -> bool:
+    return (entry.get("identity_kind") == "canonical"
+            and configuration_packages.CAPABILITY in entry.get("capabilities", ()))
+
+
+def _desired_configuration(device_id: str) -> dict:
+    packages = _configuration_packages or {}
+    for name, package_id in _group_assignments.items():
+        if device_id in device_groups[name]:
+            published = packages[package_id].get("published")
+            if published is not None:
+                return {"package_id": package_id, "revision": published["revision"],
+                        "settings": published["settings"]}
+            break
+    return {"package_id": None, "revision": None, "settings": {}}
+
+
+async def _send_configuration(
+    device_id: str, entry: dict, *, retry: tuple[str, str] | None = None,
+) -> bool:
+    if not _supports_configuration(entry):
+        return False
+    ws = entry["ws"]
+
+    async def send_current_policy() -> bool:
+        if (_configuration_packages is None or not _owns_device(device_id, ws) or ws.closed
+                or entry.get("status") != "online" or entry.get("registration_ready") is not True):
+            return False
+        # Resolve after acquiring the socket gate; delayed delivery must use the
+        # latest publication, assignment and membership.
+        policy = _desired_configuration(device_id)
+        if retry is not None:
+            if retry != (policy["package_id"], policy["revision"]):
+                return False
+            policy["retry_id"] = str(uuid.uuid4())
+        await ws.send_str(json.dumps({"type": "CONFIGURATION_POLICY", **policy}, ensure_ascii=False))
+        return True
+
+    async with entry["configuration_send_lock"]:
+        try:
+            return await asyncio.wait_for(send_current_policy(), timeout=CONFIGURATION_SEND_TIMEOUT)
+        except (ConnectionError, RuntimeError, asyncio.TimeoutError):
+            log.info("Configuration delivery could not be confirmed for %s", device_id)
+            return False
+
+
+async def _publish_configuration(device_ids) -> None:
+    await asyncio.gather(*(
+        _send_configuration(device_id, devices[device_id])
+        for device_id in device_ids if device_id in devices
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -1530,6 +1637,7 @@ def _parse_registration(data: dict, remote: str | None) -> tuple[str, dict] | tu
         "ip": _bounded_registration_text(data.get("ip"), remote or "unknown", MAX_DEVICE_IP_LEN),
         "version_name": _bounded_registration_text(data.get("version_name"), "", MAX_VERSION_NAME_LEN),
         "capabilities": capabilities,
+        "configuration_state": configuration_packages.public_configuration_state(data.get("configuration_state")),
         "wifi_state": public_wifi_state(data.get("wifi_state")),
     }
     version_code = data.get("version_code")
@@ -1670,6 +1778,8 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                             data,
                             idempotent=True,
                         )
+                        if _owns_device(device_id, ws):
+                            await _send_configuration(device_id, devices[device_id])
                         continue
                     if kind == "provisional":
                         now = time.time()
@@ -1718,6 +1828,12 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     device_id = new_device_id
                     socket_identity_kind = kind
                     push_state_status = parse_push_state_status(data.get("push_state"))
+                    supports_configuration = (
+                        kind == "canonical" and configuration_packages.CAPABILITY in registration["capabilities"]
+                    )
+                    current_configuration_state = (
+                        registration["configuration_state"] if supports_configuration else None
+                    )
                     devices[device_id] = {
                         "ws": ws,
                         "device_id": device_id,
@@ -1732,11 +1848,15 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "version_name": version_name,
                         "push_state_status": push_state_status,
                         "capabilities": registration["capabilities"],
+                        "configuration_send_lock": asyncio.Lock() if supports_configuration else None,
+                        "configuration_state": current_configuration_state,
                         "wifi_state": registration["wifi_state"] if kind == "canonical" else None,
                         "wifi_state_updated_at": time.time() if kind == "canonical" and registration["wifi_state"] is not None else None,
                     }
                     device_registry[device_id] = {
+                        **prev,
                         "label": prev.get("label", ""),
+                        "retired": False,
                         "model": model,
                         "ip": ip,
                         "last_seen": time.time(),
@@ -1745,6 +1865,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "version_code": version_code,
                         "version_name": version_name,
                         "identity_kind": kind,
+                        "configuration_state": current_configuration_state or prev.get("configuration_state"),
                         "wifi_state": devices[device_id]["wifi_state"],
                         "wifi_state_updated_at": devices[device_id]["wifi_state_updated_at"],
                     }
@@ -1761,12 +1882,27 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     if not _owns_device(device_id, ws):
                         continue
                     devices[device_id]["status"] = "online"
+                    await _send_configuration(device_id, devices[device_id])
+                    if not _owns_device(device_id, ws):
+                        continue
                     if prev.get("retired"):
                         log.info("Retired device re-registered, re-adopting: %s", device_id)
                     await _resolve_pending_retire(device_id)
                     await _resolve_pending_self_update(device_id, ws, version_code)
                     if kind == "canonical":
                         await broadcast_provisional_connection_list()
+                    await broadcast_device_list()
+
+                elif msg_type == "CONFIGURATION_STATE":
+                    entry = devices[device_id]
+                    if not _supports_configuration(entry) or entry.get("registration_ready") is not True:
+                        continue
+                    state = configuration_packages.public_configuration_state(data.get("configuration_state"))
+                    if state is None or state == entry.get("configuration_state"):
+                        continue
+                    entry["configuration_state"] = state
+                    device_registry[device_id]["configuration_state"] = state
+                    save_registry()
                     await broadcast_device_list()
 
                 elif msg_type == "WIFI_STATE":
@@ -2202,16 +2338,16 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     await handle_create_group(ws, data)
 
                 elif msg_type == "RENAME_GROUP":
-                    await handle_rename_group(ws, data, app=request.app)
+                    await handle_rename_group(ws, data)
 
                 elif msg_type == "DELETE_GROUP":
-                    await handle_delete_group(ws, data, app=request.app)
+                    await handle_delete_group(ws, data)
 
                 elif msg_type == "SET_DEVICE_GROUPS":
                     await handle_set_device_groups(ws, data)
 
-                elif msg_type == "SET_GROUP_MEMBERS":
-                    await handle_set_group_members(ws, data)
+                elif msg_type in ("SET_GROUP_MEMBERS", "MOVE_GROUP_MEMBERS"):
+                    await handle_set_group_members(ws, data, allow_move=msg_type == "MOVE_GROUP_MEMBERS")
 
                 else:
                     log.warning("Unknown message type from admin: %s", msg_type)
@@ -2305,7 +2441,7 @@ async def handle_forget_device(admin_ws: web.WebSocketResponse, data: dict):
             groups_changed = True
 
     if removed or groups_changed:
-        if not save_registry():
+        if (groups_changed and _configuration_packages is None) or not save_registry():
             device_registry.clear()
             device_registry.update(previous_devices)
             device_groups.clear()
@@ -2352,9 +2488,7 @@ async def handle_create_group(admin_ws: web.WebSocketResponse, data: dict):
 
     previous_groups = copy.deepcopy(device_groups)
     device_groups[name] = []
-    if not save_registry():
-        device_groups.clear()
-        device_groups.update(previous_groups)
+    if not _save_group_change(previous_groups):
         await admin_ws.send_str(json.dumps({
             "type": "ERROR",
             "message": "Could not persist the group change",
@@ -2372,8 +2506,6 @@ async def handle_create_group(admin_ws: web.WebSocketResponse, data: dict):
 async def handle_rename_group(
     admin_ws: web.WebSocketResponse,
     data: dict,
-    *,
-    app: web.Application | None = None,
 ):
     """Rename an existing group, preserving its membership."""
     name: str = (data.get("name") or "").strip()[:MAX_GROUP_NAME_LEN]
@@ -2400,14 +2532,12 @@ async def handle_rename_group(
         }))
         return
 
-    # Rebuild to preserve insertion order while swapping the key.
-    store = app.get("wifi_store") if app is not None else None
     previous_groups = copy.deepcopy(device_groups)
-    previous_wifi_state = copy.deepcopy(store.state) if store is not None else None
+    previous_assignments = _group_assignments.copy()
     device_groups[new_name] = device_groups.pop(name)
-    if store is not None:
-        store.rename_profile(name, new_name)
-    if not _persist_group_registry_mutation(store, previous_groups, previous_wifi_state):
+    if name in _group_assignments:
+        _group_assignments[new_name] = _group_assignments.pop(name)
+    if not _save_group_change(previous_groups, previous_assignments):
         await admin_ws.send_str(json.dumps({
             "type": "ERROR",
             "message": "Could not persist the group change",
@@ -2426,10 +2556,8 @@ async def handle_rename_group(
 async def handle_delete_group(
     admin_ws: web.WebSocketResponse,
     data: dict,
-    *,
-    app: web.Application | None = None,
 ):
-    """Delete a group. Devices are never affected, only the grouping is removed."""
+    """Remove the group and its package reference in one write."""
     name: str = (data.get("name") or "").strip()[:MAX_GROUP_NAME_LEN]
 
     if not name:
@@ -2439,20 +2567,18 @@ async def handle_delete_group(
         }))
         return
 
-    store = app.get("wifi_store") if app is not None else None
-
     if name in device_groups:
         previous_groups = copy.deepcopy(device_groups)
-        previous_wifi_state = copy.deepcopy(store.state) if store is not None else None
-        device_groups.pop(name, None)
-        if store is not None:
-            store.delete_profile(name)
-        if not _persist_group_registry_mutation(store, previous_groups, previous_wifi_state):
+        previous_assignments = _group_assignments.copy()
+        members = device_groups.pop(name)
+        _group_assignments.pop(name, None)
+        if not _save_group_change(previous_groups, previous_assignments):
             await admin_ws.send_str(json.dumps({
                 "type": "ERROR",
                 "message": "Could not persist the group change",
             }))
             return
+        await _publish_configuration(members)
         log.info("Group deleted: %r", name)
 
     await admin_ws.send_str(json.dumps({
@@ -2463,16 +2589,11 @@ async def handle_delete_group(
 
 
 async def handle_set_device_groups(admin_ws: web.WebSocketResponse, data: dict):
-    """Set the exact set of groups a device belongs to.
-
-    Every named group must already exist (created via CREATE_GROUP); unknown names
-    are rejected so typos never spawn phantom groups. Membership is keyed by serial
-    so an offline device can be (re)assigned.
-    """
+    """Assign a device to one existing group, or clear its membership."""
     serial: str = data.get("device_id", "")
     requested = data.get("groups", [])
 
-    if not serial:
+    if not isinstance(serial, str) or not serial:
         await admin_ws.send_str(json.dumps({
             "type": "ERROR",
             "message": "device_id is required",
@@ -2495,6 +2616,13 @@ async def handle_set_device_groups(admin_ws: web.WebSocketResponse, data: dict):
         if clean and clean not in target_names:
             target_names.append(clean)
 
+    if len(target_names) > 1:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "A device can belong to only one group",
+        }))
+        return
+
     unknown = [n for n in target_names if n not in device_groups]
     if unknown:
         await admin_ws.send_str(json.dumps({
@@ -2503,24 +2631,22 @@ async def handle_set_device_groups(admin_ws: web.WebSocketResponse, data: dict):
         }))
         return
 
-    # Rebuild membership so the device is in exactly the requested groups.
     previous_groups = copy.deepcopy(device_groups)
-    target_set = set(target_names)
+    target = target_names[0] if target_names else None
     for name, members in device_groups.items():
         in_group = serial in members
-        if name in target_set and not in_group:
+        if name == target and not in_group:
             members.append(serial)
-        elif name not in target_set and in_group:
+        elif name != target and in_group:
             members.remove(serial)
 
-    if not save_registry():
-        device_groups.clear()
-        device_groups.update(previous_groups)
+    if not _save_group_change(previous_groups):
         await admin_ws.send_str(json.dumps({
             "type": "ERROR",
             "message": "Could not persist the membership change",
         }))
         return
+    await _publish_configuration([serial])
     log.info("Device groups set: %s -> %s", serial, target_names)
 
     await admin_ws.send_str(json.dumps({
@@ -2531,13 +2657,8 @@ async def handle_set_device_groups(admin_ws: web.WebSocketResponse, data: dict):
     await broadcast_group_list()
 
 
-async def handle_set_group_members(admin_ws: web.WebSocketResponse, data: dict):
-    """Set the exact member list of a group (group-centric assignment).
-
-    The group must already exist. Members are stored as serials; offline or
-    not-yet-registered serials are allowed (a device can be grouped while offline),
-    so members are NOT filtered against the live device list.
-    """
+async def handle_set_group_members(admin_ws: web.WebSocketResponse, data: dict, *, allow_move: bool = False):
+    """Replace membership, moving selected identities only on an explicit move."""
     name: str = (data.get("name") or "").strip()[:MAX_GROUP_NAME_LEN]
     requested = data.get("members", [])
 
@@ -2562,21 +2683,31 @@ async def handle_set_group_members(admin_ws: web.WebSocketResponse, data: dict):
         }))
         return
 
-    members: list[str] = []
-    for serial in requested:
-        if isinstance(serial, str) and serial and serial not in members:
-            members.append(serial)
+    members = list(dict.fromkeys(serial for serial in requested if isinstance(serial, str) and serial))
+    moved = set(members)
+    other_groups = [
+        other for other, old_members in device_groups.items()
+        if other != name and not moved.isdisjoint(old_members)
+    ]
+    if other_groups and not allow_move:
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "Reload the console to move devices from other groups",
+        }))
+        return
 
     previous_groups = copy.deepcopy(device_groups)
+    affected = moved.union(device_groups[name])
+    for other in other_groups:
+        device_groups[other] = [serial for serial in device_groups[other] if serial not in moved]
     device_groups[name] = members
-    if not save_registry():
-        device_groups.clear()
-        device_groups.update(previous_groups)
+    if not _save_group_change(previous_groups):
         await admin_ws.send_str(json.dumps({
             "type": "ERROR",
             "message": "Could not persist the membership change",
         }))
         return
+    await _publish_configuration(affected)
     log.info("Group members set: %r -> %d member(s)", name, len(members))
 
     await admin_ws.send_str(json.dumps({
@@ -3504,21 +3635,19 @@ def create_app() -> web.Application:
     # Ensure the writable data directory exists before loading/saving the registry.
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     load_registry()
-    wifi_enabled, wifi_store = _load_wifi_store()
     app = web.Application(
         client_max_size=max(MAX_APK_SIZE, MAX_BUNDLE_SIZE) + 10 * 1024 * 1024)
-    app["wifi_enabled"] = wifi_enabled
-    app["wifi_store"] = wifi_store
-    app["wifi_send_locks"] = {}
 
-    # WebSocket endpoints
     app.router.add_get("/ws/device", device_ws_handler)
     app.router.add_get("/ws/admin", admin_ws_handler)
-    app.router.add_get("/api/wifi/state", wifi_state_handler)
-    app.router.add_route("GET", "/api/wifi/groups/{name}", wifi_group_handler)
-    app.router.add_route("PUT", "/api/wifi/groups/{name}", wifi_group_handler)
-    app.router.add_route("DELETE", "/api/wifi/groups/{name}", wifi_group_handler)
-    app.router.add_post("/api/wifi/groups/{name}/deploy", wifi_deploy_handler)
+    app.router.add_get("/api/packages", package_catalog_handler)
+    app.router.add_post("/api/packages", package_catalog_handler)
+    app.router.add_get("/api/packages/{package_id}", package_handler)
+    app.router.add_put("/api/packages/{package_id}", package_handler)
+    app.router.add_delete("/api/packages/{package_id}", package_handler)
+    app.router.add_post("/api/packages/{package_id}/publish", package_publish_handler)
+    app.router.add_put("/api/group-package", group_package_handler)
+    app.router.add_post("/api/package-retry", package_retry_handler)
     app.router.add_post("/api/apks", upload_apk_handler)
     app.router.add_post("/api/bundles", upload_bundle_handler)
 

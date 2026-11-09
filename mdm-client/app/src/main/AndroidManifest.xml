@@ -12,6 +12,10 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!-- Optional provisioning grant for PUI Developer tab visibility. -->
+    <uses-permission
+        android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
     <!-- Required so the PICO ToBService (a separate system-user process) can read the
          downloaded APK. App-scoped external storage is unreadable across UIDs, so the APK
          must be written to shared public storage that the privileged installer can access. -->

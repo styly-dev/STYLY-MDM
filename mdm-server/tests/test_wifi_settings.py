@@ -1,4 +1,4 @@
-"""Wi-Fi profile validation and registry persistence tests."""
+"""Wi-Fi validation and public telemetry tests."""
 
 from __future__ import annotations
 
@@ -8,8 +8,6 @@ import pytest
 
 from styly_mdm.wifi_settings import (
     WiFiSettingsError,
-    WiFiSettingsStore,
-    WiFiStoreError,
     public_networks,
     validate_profile_networks,
 )
@@ -24,46 +22,13 @@ def _networks(password: str | None = "correct-horse") -> list[dict]:
     }]
 
 
-def test_profile_state_round_trips_without_delivery_history():
-    store = WiFiSettingsStore()
-    profile = store.put_profile("Studio", validate_profile_networks(_networks()))
-
-    changed = store.put_profile("Studio", validate_profile_networks(_networks(None), profile["networks"]))
-    assert changed["revision"] != profile["revision"]
-    assert changed["networks"][0]["password"] == "correct-horse"
-    assert public_networks(changed["networks"]) == [{
-        "ssid": "Studio Wi-Fi",
-        "security": "WPA_PSK",
-        "password_present": True,
-        "hidden": False,
-    }]
-
-    restored = WiFiSettingsStore(store.state)
-    assert restored.profile("Studio") == changed
-    assert restored.state == {"version": 1, "profiles": {"Studio": changed}}
-
-
-def test_unmanaged_profile_is_empty_and_persisted():
-    store = WiFiSettingsStore()
-    profile = store.put_profile("Studio", [], mode="unmanaged")
-    assert profile["mode"] == "unmanaged"
-    assert profile["networks"] == []
-    assert WiFiSettingsStore(store.state).profile("Studio") == profile
-
-
-def test_failed_registry_persistence_rolls_back_profile_state():
-    def fail(_state: dict) -> None:
-        raise WiFiStoreError("injected persistence failure")
-
-    store = WiFiSettingsStore(persist=fail)
-    with pytest.raises(WiFiStoreError):
-        store.put_profile("Studio", validate_profile_networks(_networks()))
-    assert store.profile("Studio") is None
-
-
 def test_profile_validation_preserves_saved_password_and_accepts_overwrite():
     previous = validate_profile_networks(_networks())
-    assert validate_profile_networks(_networks(None), previous)[0]["password"] == "correct-horse"
+    retained = validate_profile_networks(_networks(None), previous)
+    assert retained[0]["password"] == "correct-horse"
+    assert public_networks(retained) == [{
+        "ssid": "Studio Wi-Fi", "security": "WPA_PSK", "password_present": True, "hidden": False,
+    }]
     assert validate_profile_networks(_networks("new-password"), previous)[0]["password"] == "new-password"
 
     assert validate_profile_networks([{
@@ -83,12 +48,6 @@ def test_profile_validation_preserves_saved_password_and_accepts_overwrite():
             validate_profile_networks([{
                 "ssid": "Office", "security": "WPA_PSK", "password": password, "hidden": False,
             }])
-
-
-def test_unreleased_previous_wifi_storage_formats_are_rejected():
-    wrong = {"version": 2, "profiles": {}, "devices": {}}
-    with pytest.raises(WiFiStoreError, match="unsupported format"):
-        WiFiSettingsStore(wrong)
 
 
 def test_wifi_state_never_forwards_credentials_or_unvalidated_results():

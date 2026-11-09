@@ -3,7 +3,6 @@ package com.styly.mdmclient
 import org.json.JSONArray
 import org.json.JSONObject
 
-internal const val WIFI_SETTINGS_CAPABILITY = "wifi_settings_v4"
 internal const val WIFI_MANUAL_TIMEOUT_MS = 60_000L
 internal const val WIFI_MAX_NETWORKS = 32
 internal const val WIFI_MAX_OPERATION_RECEIPTS = 500
@@ -83,7 +82,6 @@ internal data class WifiLocalState(
     val lastApplied: WifiSavedProfile? = null,
     val manualOperation: WifiManualOperation? = null,
     val latestResult: WifiManualResult? = null,
-    val bootGeneration: String? = null,
     val processedOperationIds: List<String> = emptyList(),
     val managedWifi: Boolean = true,
     val policyEpoch: Long = 0L,
@@ -188,7 +186,6 @@ internal object WifiSettingsCodec {
         put("last_applied", state.lastApplied?.let(::encodeSavedProfile) ?: JSONObject.NULL)
         put("manual_operation", state.manualOperation?.let(::encodeManualOperation) ?: JSONObject.NULL)
         put("latest_result", state.latestResult?.let(::encodeManualResult) ?: JSONObject.NULL)
-        put("boot_generation", state.bootGeneration ?: JSONObject.NULL)
         put("processed_operation_ids", JSONArray(state.processedOperationIds))
         put("managed_wifi", state.managedWifi)
         put("policy_epoch", state.policyEpoch)
@@ -204,7 +201,6 @@ internal object WifiSettingsCodec {
             lastApplied = root.optJSONObject("last_applied")?.let(::decodeSavedProfile),
             manualOperation = root.optJSONObject("manual_operation")?.let(::decodeManualOperation),
             latestResult = root.optJSONObject("latest_result")?.let(::decodeManualResult),
-            bootGeneration = optionalString(root, "boot_generation"),
             processedOperationIds = decodeOperationReceipts(root.optJSONArray("processed_operation_ids")),
             managedWifi = requiredBoolean(root, "managed_wifi", default = true),
             policyEpoch = root.optLong("policy_epoch", 0L).coerceAtLeast(0L),

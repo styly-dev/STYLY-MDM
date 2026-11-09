@@ -1,12 +1,9 @@
-"""Validation and registry persistence for Wi-Fi profiles."""
+"""Validation and public telemetry for group Wi-Fi settings."""
 
 from __future__ import annotations
 
-import copy
-import json
 import uuid
-from contextlib import contextmanager
-from typing import Any, Callable
+from typing import Any
 
 MAX_WIFI_NETWORKS = 32
 MAX_SSID_BYTES = 32
@@ -18,10 +15,6 @@ class WiFiSettingsError(ValueError):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
         self.status = status
-
-
-class WiFiStoreError(RuntimeError):
-    """The saved state could not be safely read or persisted."""
 
 
 def normalize_revision(value: Any) -> str | None:
@@ -155,97 +148,3 @@ def public_networks(networks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         for network in networks
     ]
-
-
-def decrypt_legacy_wifi_profiles(encrypted_state: str, key: str | None) -> dict:
-    """Read the former prototype format only when its optional dependency is present."""
-    if not key or not isinstance(encrypted_state, str):
-        raise WiFiStoreError("saved encrypted Wi-Fi profiles require their original key")
-    try:
-        from cryptography.fernet import Fernet, InvalidToken
-    except ImportError:
-        raise WiFiStoreError("install cryptography once to migrate encrypted Wi-Fi profiles") from None
-    try:
-        return json.loads(Fernet(key.encode("ascii")).decrypt(encrypted_state.encode("ascii")))
-    except (InvalidToken, ValueError, TypeError, UnicodeError):
-        raise WiFiStoreError("saved encrypted Wi-Fi profiles could not be read") from None
-
-
-class WiFiSettingsStore:
-    """Profiles persisted with group metadata in one atomic registry replacement."""
-
-    def __init__(
-        self,
-        state: dict | None = None,
-        persist: Callable[[dict], None] | None = None,
-    ):
-        self._persist = persist or (lambda _state: None)
-        if state is None:
-            state = {"version": 1, "profiles": {}}
-        if (
-            not isinstance(state, dict)
-            or type(state.get("version")) is not int
-            or state["version"] != 1
-            or not isinstance(state.get("profiles"), dict)
-        ):
-            raise WiFiStoreError("Wi-Fi state has an unsupported format")
-        self.state = copy.deepcopy(state)
-        for name, profile in self.state["profiles"].items():
-            if not isinstance(name, str) or not name or not isinstance(profile, dict):
-                raise WiFiStoreError("Wi-Fi profile failed validation")
-            mode = profile.get("mode")
-            networks = profile.get("networks")
-            if (mode not in ("managed", "unmanaged") or
-                not isinstance(networks, list) or
-                normalize_revision(profile.get("revision")) is None or
-                (mode == "managed" and not networks) or
-                (mode == "unmanaged" and networks)):
-                raise WiFiStoreError("Wi-Fi profile failed validation")
-            try:
-                if mode == "managed":
-                    validate_profile_networks(networks)
-            except WiFiSettingsError:
-                raise WiFiStoreError("Wi-Fi profile failed validation") from None
-
-    def persist(self) -> None:
-        self._persist(copy.deepcopy(self.state))
-
-    @contextmanager
-    def _transaction(self):
-        previous = self.state
-        self.state = copy.deepcopy(previous)
-        try:
-            yield
-            self.persist()
-        except Exception:
-            self.state = previous
-            raise
-
-    def profile(self, group_name: str) -> dict[str, Any] | None:
-        profile = self.state["profiles"].get(group_name)
-        return copy.deepcopy(profile) if isinstance(profile, dict) else None
-
-    def put_profile(
-        self,
-        group_name: str,
-        networks: list[dict[str, Any]],
-        *,
-        mode: str = "managed",
-    ) -> dict[str, Any]:
-        if not isinstance(mode, str) or mode not in {"managed", "unmanaged"} or not isinstance(networks, list):
-            raise WiFiSettingsError("invalid Wi-Fi profile mode or networks")
-        if (mode == "managed" and not networks) or (mode == "unmanaged" and networks):
-            raise WiFiSettingsError("Wi-Fi networks do not match the profile mode")
-        profile = {"revision": str(uuid.uuid4()), "mode": mode, "networks": copy.deepcopy(networks)}
-        with self._transaction():
-            self.state["profiles"][group_name] = profile
-        return copy.deepcopy(profile)
-
-    def rename_profile(self, old_name: str, new_name: str) -> None:
-        """Stage the rename; the caller saves group metadata and profiles together."""
-        if old_name in self.state["profiles"]:
-            self.state["profiles"][new_name] = self.state["profiles"].pop(old_name)
-
-    def delete_profile(self, group_name: str) -> None:
-        """Stage deletion for the caller's combined registry save."""
-        self.state["profiles"].pop(group_name, None)
