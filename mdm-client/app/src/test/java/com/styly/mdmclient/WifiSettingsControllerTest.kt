@@ -14,46 +14,22 @@ import java.util.concurrent.Executor
 
 class WifiSettingsControllerTest {
     @Test
-    fun `deferred startup waits for service readiness and duplicate starts recover only once`() {
-        val profile = network("successful-network")
+    fun `startup recovers journals without reapplying a cached Wi-Fi profile`() {
+        val baseline = savedProfile(network("successful-network"))
         val harness = Harness(
-            initialState = WifiLocalState(
-                lastApplied = WifiSavedProfile(REVISION, listOf(profile)),
-                bootGeneration = "previous-boot",
-            ),
-            initialNetworks = emptyList(),
+            initialState = WifiLocalState(lastApplied = baseline),
+            initialNetworks = listOf(network("current-network")),
             deferStartup = true,
         )
         assertFalse(harness.controller.startupCompletion().isDone)
-        assertTrue(harness.adapter.applyCalls.isEmpty())
 
         harness.controller.startStartupRecovery()
         harness.controller.startStartupRecovery()
         harness.operationExecutor.runAll()
 
         assertTrue(harness.controller.startupCompletion().join())
-        assertEquals(1, harness.adapter.applyCalls.size)
-        assertEquals("boot-a", harness.store.state.bootGeneration)
-        harness.controller.startStartupRecovery()
-        harness.operationExecutor.runAll()
-        assertEquals(1, harness.adapter.applyCalls.size)
-    }
-
-    @Test
-    fun `wifi command is ignored before canonical registration acknowledgement`() {
-        val harness = Harness()
-
-        assertTrue(
-            harness.controller.handleServerMessage(
-                "EXECUTE_WIFI_APPLY",
-                command(OPERATION_ID, REVISION, "unmanaged"),
-                canonicalRegistrationAcknowledged = false,
-            ),
-        )
-        harness.operationExecutor.runAll()
-
-        assertNull(harness.store.state.manualOperation)
-        assertTrue(harness.store.state.processedOperationIds.isEmpty())
+        assertTrue(harness.adapter.applyCalls.isEmpty())
+        assertEquals(baseline, harness.store.state.lastApplied)
     }
 
     @Test
@@ -328,7 +304,6 @@ class WifiSettingsControllerTest {
         val restarted = Harness(
             initialState = harness.store.state,
             initialNetworks = harness.adapter.current,
-            generation = "boot-a",
             sharedStore = harness.store,
             sharedAdapter = harness.adapter,
             sharedClock = harness.clock,
@@ -370,7 +345,6 @@ class WifiSettingsControllerTest {
         val restarted = Harness(
             initialState = harness.store.state,
             initialNetworks = harness.adapter.current,
-            generation = "boot-a",
             sharedStore = harness.store,
             sharedAdapter = harness.adapter,
             sharedClock = harness.clock,
@@ -387,7 +361,7 @@ class WifiSettingsControllerTest {
     }
 
     @Test
-    fun `unmanaged command disables boot replay without reading or changing Wi-Fi settings`() {
+    fun `unmanaged command preserves all configured Wi-Fi settings`() {
         val baseline = WifiSavedProfile(REVISION, listOf(network("saved-baseline")))
         val harness = Harness(
             initialState = WifiLocalState(lastApplied = baseline, managedWifi = true),
@@ -410,9 +384,8 @@ class WifiSettingsControllerTest {
 
         val callsBeforeRestart = harness.adapter.applyCalls.size
         val reboot = Harness(
-            initialState = harness.store.state.copy(bootGeneration = "boot-a"),
+            initialState = harness.store.state,
             initialNetworks = original,
-            generation = "boot-b",
             sharedStore = harness.store,
             sharedAdapter = harness.adapter,
         )
@@ -473,7 +446,7 @@ class WifiSettingsControllerTest {
     }
 
     @Test
-    fun `managed success reenables boot replay but failed managed apply preserves disabled policy`() {
+    fun `managed success updates ownership but failed managed apply preserves disabled policy`() {
         val baseline = WifiSavedProfile(REVISION_2, listOf(network("old-baseline")))
         val candidate = network("candidate")
         val success = Harness(initialState = WifiLocalState(lastApplied = baseline, managedWifi = false))
@@ -544,7 +517,6 @@ class WifiSettingsControllerTest {
         val restarted = Harness(
             initialState = harness.store.state,
             initialNetworks = harness.adapter.current,
-            generation = "boot-a",
             sharedStore = harness.store,
             sharedAdapter = harness.adapter,
             sharedClock = harness.clock,
@@ -581,65 +553,27 @@ class WifiSettingsControllerTest {
     }
 
     @Test
-    fun `actual boot reapplies last successful profile once unless unmanaged`() {
-        val baseline = WifiSavedProfile(REVISION, listOf(network("saved")))
-        val managed = Harness(
-            initialState = WifiLocalState(lastApplied = baseline, bootGeneration = "boot-a"),
-            initialNetworks = listOf(network("changed")),
-            generation = "boot-b",
-            deferStartup = true,
-        )
-        managed.adapter.beforeApply = {
-            assertEquals("boot-b", managed.store.state.bootGeneration)
-        }
-        managed.controller.startStartupRecovery()
-        managed.controller.startStartupRecovery()
-        managed.operationExecutor.runAll()
-        assertTrue(managed.controller.startupCompletion().join())
-        assertEquals(listOf(baseline.networks), managed.adapter.applyCalls.map { it.target })
-
-        val unmanagedStore = MemoryStore(
-            WifiLocalState(lastApplied = baseline, managedWifi = false, bootGeneration = "boot-a"),
-        )
-        val unmanaged = Harness(
-            initialState = unmanagedStore.state,
-            initialNetworks = listOf(network("changed")),
-            generation = "boot-b",
-            sharedStore = unmanagedStore,
-        )
-        assertTrue(unmanaged.controller.startupCompletion().join())
-        assertTrue(unmanaged.adapter.applyCalls.isEmpty())
-        assertEquals("boot-b", unmanaged.store.state.bootGeneration)
-
-        val empty = Harness(
-            initialState = WifiLocalState(bootGeneration = "boot-a"),
-            initialNetworks = listOf(network("changed")),
-            generation = "boot-b",
-        )
-        assertTrue(empty.controller.startupCompletion().join())
-        assertTrue(empty.adapter.applyCalls.isEmpty())
-        assertEquals("boot-b", empty.store.state.bootGeneration)
-    }
-
-    @Test
-    fun `unchanged verified connected policy commits without mutations or disconnect`() {
+    fun `same desired policy replaces credentials changed outside MDM`() {
         val candidate = network("known-network")
         val harness = Harness(
             initialState = WifiLocalState(lastApplied = savedProfile(candidate)),
-            initialNetworks = listOf(candidate),
+            initialNetworks = listOf(candidate.copy(password = "changed-by-operator")),
             initialWifi = listOf(observation(10, candidate.ssid, hasIp = true)),
         )
+        harness.adapter.afterDisconnect = { harness.connectivity.lose(10) }
+        harness.adapter.afterReconnect = { harness.connectivity.update(11, candidate.ssid, hasIp = true) }
+
         harness.apply(command(OPERATION_ID, REVISION_2, "managed", candidate))
+
         assertEquals("success", harness.store.state.latestResult?.status)
         assertEquals(REVISION_2, harness.store.state.policyRevision)
-        assertTrue(harness.adapter.applyCalls.isEmpty())
-        assertEquals(0, harness.adapter.disconnectCalls)
-        assertEquals(0, harness.adapter.captureRecoveryCalls)
-        assertTrue(harness.scheduledAlarmIds.isEmpty())
+        assertEquals(listOf(candidate), harness.adapter.current)
+        assertEquals(1, harness.adapter.disconnectCalls)
+        assertEquals(1, harness.adapter.captureRecoveryCalls)
     }
 
     @Test
-    fun `changed password or unverified policy never uses unchanged fast path`() {
+    fun `Wi-Fi deployment verifies a fresh connection across existing network configurations`() {
         val candidate = network("known-network")
         for (case in listOf("password", "autojoin", "hidden", "no-ip", "unknown-credentials")) {
             val harness = Harness(
@@ -663,14 +597,45 @@ class WifiSettingsControllerTest {
     }
 
     @Test
+    fun `new managed attempt recovers a settled rollback failure before writing Wi-Fi`() {
+        val original = network("office-old")
+        val candidate = network("office-new")
+        val harness = Harness(initialNetworks = listOf(original))
+        harness.adapter.restoreFailure = WifiReason.RESTORE_FAILED
+
+        harness.apply(command(OPERATION_ID, REVISION, "managed", candidate))
+        harness.timeout()
+        assertEquals(OPERATION_ID, harness.store.state.manualOperation?.operationId)
+
+        harness.apply(command(OPERATION_ID_2, REVISION, "managed", candidate))
+        assertEquals(OPERATION_ID, harness.store.state.manualOperation?.operationId)
+        assertEquals(OPERATION_ID_2, harness.store.state.latestResult?.operationId)
+        assertEquals(WifiReason.RESTORE_FAILED, harness.store.state.latestResult?.reason)
+        assertEquals(2, harness.adapter.restoreCalls.size)
+        assertEquals(1, harness.adapter.applyCalls.size)
+
+        harness.adapter.restoreFailure = null
+        harness.adapter.afterReconnect = { harness.connectivity.update(11, candidate.ssid, hasIp = true) }
+        harness.apply(command(OPERATION_ID_3, REVISION, "managed", candidate))
+
+        assertNull(harness.store.state.manualOperation)
+        assertEquals(OPERATION_ID_3, harness.store.state.latestResult?.operationId)
+        assertEquals("success", harness.store.state.latestResult?.status)
+        assertEquals(3, harness.adapter.restoreCalls.size)
+        assertEquals(2, harness.adapter.applyCalls.size)
+    }
+
+    @Test
     fun `unmanaged abandons completed restore failure and stale rollback cannot mutate later`() {
         val candidate = network("candidate")
-        val harness = Harness()
+        val harness = Harness(initialState = WifiLocalState(managedWifi = false))
         harness.adapter.restoreFailure = WifiReason.RESTORE_FAILED
         harness.apply(command(OPERATION_ID, REVISION, "managed", candidate))
         harness.timeout()
         assertNotNull(harness.store.state.manualOperation)
-        harness.apply(command(OPERATION_ID_2, REVISION_2, "unmanaged"))
+        assertTrue(harness.controller.readyForPolicy())
+        harness.controller.stopManagingPolicy(REVISION_2)
+        harness.operationExecutor.runAll()
         assertNull(harness.store.state.manualOperation)
         assertFalse(harness.store.state.managedWifi)
         val restoreCount = harness.adapter.restoreCalls.size
@@ -688,6 +653,7 @@ class WifiSettingsControllerTest {
         val harness = Harness()
         harness.apply(command(OPERATION_ID, REVISION, "managed", network("candidate")))
         harness.adapter.beforeRestore = {
+            assertFalse(harness.controller.readyForPolicy())
             harness.apply(command(OPERATION_ID_2, REVISION_2, "unmanaged"))
             assertNotNull(harness.store.state.manualOperation)
             assertTrue(harness.controller.stateSnapshot().getBoolean("busy"))
@@ -766,7 +732,6 @@ class WifiSettingsControllerTest {
         initialState: WifiLocalState = WifiLocalState(),
         initialNetworks: List<WifiNetworkProfile> = emptyList(),
         initialWifi: List<WifiLocalNetworkObservation> = emptyList(),
-        generation: String? = "boot-a",
         val sharedStore: MemoryStore? = null,
         val sharedAdapter: FakeAdapter? = null,
         val sharedClock: MutableClock? = null,
@@ -790,7 +755,6 @@ class WifiSettingsControllerTest {
                 adapter = adapter,
                 connectivity = connectivity,
                 nowElapsed = { clock.value },
-                bootGeneration = { generation },
                 scheduleAlarm = { operationId, _ -> scheduledAlarmIds.add(operationId); true },
                 cancelAlarm = { operationId ->
                     beforeCancelAlarm?.invoke(operationId)
@@ -807,11 +771,7 @@ class WifiSettingsControllerTest {
         init { if (!deferStartup) operationExecutor.runAll() }
 
         fun enqueue(payload: JSONObject) {
-            controller.handleServerMessage(
-                "EXECUTE_WIFI_APPLY",
-                payload,
-                canonicalRegistrationAcknowledged = true,
-            )
+            controller.applyPolicy(payload)
         }
 
         fun apply(payload: JSONObject) {

@@ -172,7 +172,6 @@
     .group-name { font-weight: 600; font-size: 15px; }
     .group-count { font-size: 12px; color: var(--text-secondary); }
     .group-members { font-size: 12px; color: var(--text-secondary); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .group-overlap-note { margin-top: 3px; color: var(--warning); font-size: 11px; line-height: 1.35; white-space: normal; overflow-wrap: anywhere; }
     .group-empty { font-size: 12px; color: var(--text-muted); margin-top: 3px; font-style: italic; }
     .badge-offline { font-size: 10px; color: var(--warning); border: 1px solid #5a4a1c; border-radius: 4px; padding: 0 6px; }
     .badge-startup { font-size: 10px; color: var(--success); border: 1px solid #2c5a48; border-radius: 4px; padding: 0 5px; }
@@ -370,6 +369,8 @@
 
     /* Manage Groups */
     .manage-grid { display: grid; grid-template-columns: 240px minmax(0, 1fr); }
+    .manage-grid[hidden] { display: none; }
+    .manage-mode-switch { margin-left: auto; }
     .mg-main { min-width: 0; container-type: inline-size; }
     .mg-tabs { padding-top: 0; }
     .mg-sidebar { background: var(--bg-actions); border-right: 1px solid var(--border); padding: 14px 12px; }
@@ -404,19 +405,53 @@
     .btn-text { background: none; border: none; color: var(--text-secondary); font-size: 13px; cursor: pointer; font-family: inherit; padding: 9px 16px; }
     .mg-footer .btn-primary { width: auto; margin: 0; padding: 9px 20px; font-size: 13px; }
 
-    .wifi-status-area { padding: 12px 20px; }
-    .wifi-feedback { color: var(--text-secondary); font-size: 12px; }
-    .wifi-feedback.wifi-muted { color: var(--text-muted); }
-    .wifi-feedback { display: block; margin: 8px 0; }
-    .wifi-feedback.wifi-danger { color: var(--danger); }
-    #wifiGroupPanel { padding: 18px 20px 22px; border-top: 1px solid var(--border); }
-    .wifi-section { max-width: 980px; }
-    .wifi-section h3 { font-size: 16px; }
-    .wifi-section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 14px; }
-    .wifi-section-head p { color: var(--text-secondary); font-size: 12px; margin-top: 3px; }
-    .wifi-meta { color: var(--text-muted); font-size: 11px; }
-    .wifi-network-list { display: flex; flex-direction: column; gap: 9px; }
-    .wifi-network { padding: 12px; background: var(--bg-actions); border: 1px solid var(--border-soft); border-radius: 8px; }
+    #groupSettingsPanel, #configurationPackagePanel { padding: 18px 20px 22px; }
+    .settings-package-item { font-family: inherit; color: inherit; background: none; border: 0; text-align: left; }
+    .settings-package-item .mg-item-name { min-width: 0; overflow-wrap: anywhere; }
+    .settings-package-head, .settings-assignment { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
+    .settings-package-head { justify-content: space-between; }
+    .settings-package-head .btn-outline:disabled, .settings-device-result .btn-outline:disabled { opacity: .4; cursor: not-allowed; }
+    .settings-name { display: block; width: min(100%, 360px); margin-top: 12px; color: var(--text-secondary); font-size: 12px; }
+    .settings-name .field { display: block; margin-top: 5px; }
+    .settings-assignment .settings-name { flex: 1 1 180px; }
+    .settings-section { max-width: 980px; }
+    .settings-section h3 { font-size: 16px; }
+    .settings-section header p { color: var(--text-secondary); font-size: 12px; margin-top: 3px; }
+    .settings-meta { color: var(--text-muted); font-size: 11px; }
+    .settings-editor, .settings-value { border: 0; padding: 0; margin: 0; min-width: 0; }
+    .settings-editor { display: flex; flex-direction: column; gap: 9px; margin-top: 14px; }
+    .settings-group { background: var(--bg-actions); border: 1px solid var(--border); border-radius: 8px; }
+    .settings-group-head { display: flex; gap: 14px; align-items: center; padding: 14px 16px; cursor: pointer; }
+    .settings-group-head::-webkit-details-marker { display: none; }
+    .settings-group-head:hover { background: rgba(255, 255, 255, .025); }
+    .settings-group-head strong { display: block; font-size: 13px; }
+    .settings-group-head small { display: block; color: var(--text-secondary); font-size: 11px; margin-top: 3px; }
+    .settings-count { margin-left: auto; color: var(--text-muted); font-size: 11px; white-space: nowrap; }
+    .settings-chevron::before { content: "▸"; color: var(--text-secondary); }
+    .settings-group[open] .settings-chevron::before { content: "▾"; }
+    .settings-content { border-top: 1px solid var(--border-soft); padding: 4px 16px 12px; }
+    .settings-row { display: grid; grid-template-columns: 24px minmax(180px, 1fr) minmax(175px, .6fr); align-items: center; gap: 18px; padding: 13px 0; border-bottom: 1px solid var(--border-soft); }
+    .settings-row:last-child { border-bottom: 0; }
+    .settings-wide { grid-template-columns: 24px minmax(180px, .75fr) minmax(250px, 1fr); align-items: start; }
+    .settings-wide .settings-manage { padding-top: 3px; }
+    .settings-label strong { display: block; font-size: 12px; font-weight: 600; }
+    .settings-label small { display: block; color: var(--text-muted); font-size: 11px; margin-top: 3px; }
+    .settings-manage { display: flex; align-items: center; cursor: pointer; }
+    .settings-value:disabled { opacity: .4; }
+    .settings-editor :disabled { cursor: not-allowed; }
+    .settings-value > .field { max-width: 260px; }
+    .settings-radios, .settings-schedule, .settings-range { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+    .settings-radios { gap: 18px; }
+    .settings-radios label, .settings-schedule label, .settings-days label { display: flex; align-items: center; gap: 5px; }
+    .settings-schedule { flex-wrap: wrap; }
+    .settings-schedule .field { width: 115px; }
+    .settings-days { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 9px; font-size: 11px; color: var(--text-secondary); }
+    .settings-range input { flex: 1; min-width: 0; }
+    .settings-range output { min-width: 4ch; text-align: right; font-variant-numeric: tabular-nums; }
+    .settings-networks { display: flex; flex-direction: column; gap: 8px; align-items: stretch; }
+    .settings-networks .push-note { margin-top: 0; }
+    .settings-networks > .btn-outline { align-self: flex-start; }
+    .wifi-network { padding: 12px; background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 8px; }
     .wifi-network-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
     .wifi-network-head strong { font-size: 12px; color: var(--text-secondary); }
     .wifi-remove { width: auto; margin: 0; }
@@ -428,35 +463,34 @@
     .wifi-row-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 5px; }
     .wifi-row-foot small { color: var(--text-muted); font-size: 10px; }
     .wifi-check { display: inline-flex !important; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer; }
-    .wifi-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
-    .wifi-action-right { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-    .wifi-actions .btn, .wifi-actions .btn-outline { width: auto; margin: 0; padding: 9px 14px; font-size: 13px; font-weight: 600; line-height: 18px; }
-    .wifi-actions .btn { border: 1px solid transparent; }
-    .wifi-empty { padding: 14px; color: var(--text-muted); font-size: 12px; }
-    .wifi-warning { color: var(--warning); border-color: #665321; background: #2a2415; }
-    .group-overlap-warning { color: var(--warning); font-size: 11px; }
-    .wifi-results-section { margin-top: 16px; }
-    .wifi-results-section h4 { margin: 0 0 4px; font-size: 13px; }
-    .wifi-results-section > p { margin: 0 0 8px; color: var(--text-muted); font-size: 11px; }
-    .wifi-device-results { display: flex; flex-direction: column; gap: 6px; }
-    .wifi-device-result { padding: 8px 10px; background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 6px; }
-    .wifi-device-result-head { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; }
-    .wifi-result-status { font-weight: 700; color: var(--text-secondary); }
-    .wifi-device-result.success .wifi-result-status { color: var(--success); }
-    .wifi-device-result.failed .wifi-result-status, .wifi-device-result.unavailable .wifi-result-status { color: var(--danger); }
-    .wifi-device-result.pending .wifi-result-status, .wifi-device-result.stale .wifi-result-status { color: var(--warning); }
-    .wifi-result-detail, .wifi-result-meta { margin-top: 3px; font-size: 11px; color: var(--text-secondary); overflow-wrap: anywhere; }
-    .wifi-result-meta { color: var(--text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .wifi-latest-result { margin-top: 4px; font-size: 11px; color: var(--text-secondary); overflow-wrap: anywhere; }
-    .wifi-latest-result.failed { color: var(--danger); }
-    .wifi-latest-result.unknown { color: var(--warning); }
-    .mg-dev-overlap { color: var(--warning); font-size: 11px; }
+    .settings-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
+    .settings-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+    .settings-buttons .btn, .settings-buttons .btn-outline { width: auto; margin: 0; padding: 9px 14px; font-size: 13px; font-weight: 600; line-height: 18px; }
+    .settings-buttons .btn { border: 1px solid transparent; }
+    .settings-buttons .btn-outline:disabled, .settings-networks .btn-outline:disabled { opacity: .4; cursor: not-allowed; }
+    .settings-feedback { color: var(--text-secondary); font-size: 12px; margin-top: 8px; }
+    .settings-feedback:empty { margin-top: 0; }
+    .settings-error { color: var(--danger); font-size: 12px; margin-bottom: 8px; }
+    .settings-results { margin-top: 16px; }
+    .settings-results h4 { margin-bottom: 4px; font-size: 13px; }
+    .settings-device-results { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+    .settings-device-result { display: flex; align-items: center; gap: 12px; padding: 8px 10px; background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 6px; }
+    .settings-result-body { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+    .settings-device-result > .btn-outline { flex-shrink: 0; }
+    .settings-result-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 3px; font-size: 12px; }
+    .settings-result-head > span { font-weight: 700; color: var(--text-secondary); }
+    .settings-device-result.success .settings-result-head > span { color: var(--success); }
+    .settings-device-result.failed .settings-result-head > span, .settings-device-result.unavailable .settings-result-head > span { color: var(--danger); }
+    .settings-device-result.pending .settings-result-head > span { color: var(--warning); }
+    .settings-readback { color: var(--text-secondary); font-size: 11px; margin-top: 4px; }
+    .settings-readback summary { cursor: pointer; }
+    .settings-readback ul { padding-left: 18px; }
+    .mg-dev-overlap { color: var(--warning); font-size: 11px; overflow-wrap: anywhere; }
 
     @container (max-width: 600px) {
+      .settings-row, .settings-wide { grid-template-columns: 24px minmax(0, 1fr); gap: 9px; }
+      .settings-row .settings-value { grid-column: 1 / -1; }
       .wifi-fields { grid-template-columns: minmax(0, 1fr); }
-      .wifi-section-head { flex-direction: column; }
-      .wifi-actions, .wifi-action-right { align-items: stretch; flex-direction: column; }
-      .wifi-actions .btn, .wifi-actions .btn-outline { width: 100%; }
       .wifi-row-foot { align-items: flex-start; flex-direction: column; }
     }
 
@@ -478,13 +512,10 @@
       .subtab { padding-left: 10px; padding-right: 10px; }
       .manage-grid { grid-template-columns: 1fr; }
       .mg-sidebar { border-right: none; border-bottom: 1px solid var(--border); }
-      .wifi-fields { grid-template-columns: 1fr; }
-      .wifi-actions, .wifi-action-right { align-items: stretch; flex-direction: column; }
-      .wifi-section-head { flex-direction: column; }
     }
   </style>
   <script src="/static/push-jobs-v1.js"></script>
-  <script src="/static/wifi-console-v1.js"></script>
+  <script src="/static/configuration-packages-v1.js"></script>
 </head>
 
 <body>
@@ -688,15 +719,34 @@
       <div class="topbar topbar-link">
         <button class="back-link" data-act="back">← Back to console</button>
         <span class="bar-sep"></span>
-        <span class="bar-title">Manage Groups</span>
+        <span class="bar-title" id="manageTitle">Manage Groups</span>
+        <button type="button" class="btn-outline manage-mode-switch" data-act="manageMode">Configuration Packages</button>
       </div>
-      <div class="wifi-status-area" id="wifiStatusPanel" hidden></div>
-      <div class="manage-grid">
-        <div class="mg-sidebar" id="mgSidebar"></div>
+      <div class="manage-grid" id="manageGroupsGrid">
+        <div class="mg-sidebar" id="mgSidebar">
+          <div class="mg-create">
+            <input class="mg-new" data-mg-new aria-label="New group name" placeholder="New group name…" maxlength="64">
+            <button type="button" class="btn-mini btn-save" data-act="addGroup">Add</button>
+          </div>
+          <div class="mg-list" id="mgList"></div>
+        </div>
         <div class="mg-main">
           <div id="mgDetail"></div>
-          <div id="wifiGroupPanel" hidden></div>
+          <div id="groupSettingsPanel" hidden></div>
         </div>
+      </div>
+      <div class="manage-grid" id="configurationPackagesGrid" hidden>
+        <div class="mg-sidebar">
+          <form id="createConfigurationPackage">
+            <div class="mg-create">
+              <input class="mg-new" aria-label="New package name" placeholder="New package name…" maxlength="64" required>
+              <button type="submit" class="btn-mini btn-save">Add</button>
+            </div>
+            <p class="settings-feedback" role="status"></p>
+          </form>
+          <div class="mg-list" id="configurationPackagesList"></div>
+        </div>
+        <div class="mg-main" id="configurationPackagePanel"></div>
       </div>
     </div>
   </div>
@@ -754,6 +804,7 @@
       // Manage view
       let manageSelectedGroup = null;
       let manageTab = 'devices';
+      let managePackages = false;
       let manageMembers = new Set();
       let manageSearch = '';
       let manageSort = 'label-asc';
@@ -817,13 +868,20 @@
       const btnClearLog = document.getElementById('btnClearLog');
       const mgSidebar = document.getElementById('mgSidebar');
       const mgDetail = document.getElementById('mgDetail');
-      const wifiGroupPanel = document.getElementById('wifiGroupPanel');
-      const wifiStatusPanel = document.getElementById('wifiStatusPanel');
-      const wifiController = window.MdmWifiConsole.createController({
-        statusPanel: wifiStatusPanel,
-        groupPanel: wifiGroupPanel,
+      const groupSettingsPanel = document.getElementById('groupSettingsPanel');
+      const manageGroupsGrid = document.getElementById('manageGroupsGrid');
+      const packagesGrid = document.getElementById('configurationPackagesGrid');
+      const manageTitle = document.getElementById('manageTitle');
+      const manageModeSwitch = manageView.querySelector('[data-act="manageMode"]');
+      const configurationController = window.MdmConfigurationPackages.createController({
+        groupPanel: groupSettingsPanel,
+        packagePanel: document.getElementById('configurationPackagePanel'),
+        packageList: document.getElementById('configurationPackagesList'),
+        createForm: document.getElementById('createConfigurationPackage'),
         getDevices: function () { return devices; },
         getGroups: function () { return groups; },
+        openPackages: function () { managePackages = true; render(); },
+        deviceIdHtml,
       });
 
       // ---------------- Helpers ----------------
@@ -1093,7 +1151,6 @@
           }
           case 'DEVICE_LIST': {
             devices = msg.devices || [];
-            wifiController.updateDevices(devices);
             const selectedBefore = selectedIds.size;
             const cur = knownIds();
             selectedIds.forEach(function (id) { if (!cur.has(id)) selectedIds.delete(id); });
@@ -1127,11 +1184,19 @@
             break;
           }
           case 'GROUP_LIST': {
+            const previousMembers = groups[manageSelectedGroup] || [];
             groups = msg.groups || {};
-            wifiController.updateGroups(groups);
+            configurationController.updateSnapshot(msg);
             groupsLoaded = true;
             if (pendingSelectGroup && (pendingSelectGroup in groups)) { selectManageGroup(pendingSelectGroup); pendingSelectGroup = null; }
             else if (manageSelectedGroup && !(manageSelectedGroup in groups)) { manageSelectedGroup = null; manageMembers = new Set(); }
+            else if (manageSelectedGroup) {
+              // Keep staged adds/removals, and follow current membership for untouched devices.
+              const canonicalId = function (id) { const d = deviceById(id); return d ? getDeviceId(d) : id; };
+              manageMembers = window.MdmConfigurationPackages.syncMemberSelection(
+                previousMembers.map(canonicalId), (groups[manageSelectedGroup] || []).map(canonicalId),
+                new Set(Array.from(manageMembers, canonicalId)));
+            }
             // Keep the active-group selection current: a group whose membership was
             // just edited must not dispatch to the old member set (PR #29 P1).
             syncActiveGroupSelection();
@@ -1247,8 +1312,16 @@
         if (view === 'manage') {
           manageView.style.display = '';
           consoleView.style.display = 'none';
-          renderManageSidebar();
-          renderManageDetail();
+          manageGroupsGrid.hidden = managePackages;
+          packagesGrid.hidden = !managePackages;
+          manageTitle.textContent = managePackages ? 'Configuration Packages' : 'Manage Groups';
+          manageModeSwitch.textContent = managePackages ? '← Manage Groups' : 'Configuration Packages';
+          if (managePackages) {
+            configurationController.renderGroup(null);
+          } else {
+            renderManageSidebar();
+            renderManageDetail();
+          }
         } else {
           consoleView.style.display = '';
           manageView.style.display = 'none';
@@ -1370,13 +1443,6 @@
           const off = offlineMembers(name);
           const on = activeGroup === name;
           const expanded = expandedGroups.has(name);
-          const overlaps = window.MdmWifiConsole.groupMembershipOverlaps(name, groups, devices);
-          const overlapNames = Array.from(new Set(overlaps.reduce(function (all, item) {
-            return all.concat(item.otherGroups);
-          }, []))).sort();
-          const overlapNote = overlaps.length
-            ? '<div class="group-overlap-note">' + overlaps.length + ' shared device(s) · also in ' + esc(overlapNames.join(', ')) + '</div>'
-            : '';
           // Collapsed rows show a one-line member preview; expanded rows show the
           // per-device status list below instead (so the preview is redundant).
           const preview = expanded ? '' : (count
@@ -1389,7 +1455,7 @@
             '<span class="group-count">' + (count === 1 ? '1 device' : count + ' devices') + '</span>' +
             '<button class="group-expand" data-act="toggleExpand" data-group="' + esc(name) + '" title="' + (expanded ? 'Collapse' : 'Show devices') + '">' + (expanded ? '▾' : '▸') + '</button>' +
             (off ? '<span class="badge-offline">' + off + ' offline</span>' : '') +
-            '</div>' + overlapNote + preview + '</div>' +
+            '</div>' + preview + '</div>' +
             '<button class="btn-edit" data-act="editGroup" data-group="' + esc(name) + '">✏ Edit</button>' +
             '</div>';
           const body = expanded ? '<div class="group-devs">' + renderGroupDevsHtml(members) + '</div>' : '';
@@ -1457,7 +1523,6 @@
 
       function deviceRowHtml(d) {
         const id = getDeviceId(d);
-        const groupMemberships = window.MdmWifiConsole.membershipGroups(id, groups, [d.serial_number]);
         const checked = selectedIds.has(id);
         const off = !isOnline(d);
         const kept = keptBySelection(d);
@@ -1488,8 +1553,7 @@
             (startup ? '<span class="badge-startup" title="' + esc(startup) + '">★</span>' : '') +
             '</div>';
         }
-        deviceCell += '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.ip || '-') +
-          (groupMemberships.length > 1 ? ' · <span class="group-overlap-warning" title="This device belongs to multiple groups">Groups: ' + esc(groupMemberships.join(', ')) + '</span>' : '') + '</div>';
+        deviceCell += '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.ip || '-') + '</div>';
 
         let status;
         if (d.status === 'registering') {
@@ -2335,16 +2399,17 @@
       function sendCreateGroup(name) { wsSend({ type: 'CREATE_GROUP', name: name }, 'create group'); }
       function sendRenameGroup(name, nn) { wsSend({ type: 'RENAME_GROUP', name: name, new_name: nn }, 'rename group'); }
       function sendDeleteGroup(name) { wsSend({ type: 'DELETE_GROUP', name: name }, 'delete group'); }
-      function sendSetGroupMembers(name, members) { wsSend({ type: 'SET_GROUP_MEMBERS', name: name, members: members }, 'save members'); }
+      function sendMoveGroupMembers(name, members) { wsSend({ type: 'MOVE_GROUP_MEMBERS', name: name, members: members }, 'save members'); }
 
       // ---------------- Manage Groups view ----------------
       function openManage(group) {
         view = 'manage';
+        managePackages = false;
         if (group && (group in groups)) selectManageGroup(group);
         render();
       }
       function backToConsole() {
-        wifiController.renderGroup(null);
+        configurationController.renderGroup(null);
         view = 'console'; renamingManageGroup = false; renameGroupDraft = '';
         renameGroupCaret = null; renameGroupRefocus = false; render();
       }
@@ -2367,31 +2432,21 @@
               '<span class="mg-item-count">' + (groups[n] || []).length + '</span></div>';
           }).join('')
           : '<div class="empty small">' + (groupsLoaded ? 'No groups — create one' : 'Waiting for server…') + '</div>';
-        mgSidebar.innerHTML =
-          '<div class="mg-create"><input class="mg-new" data-mg-new placeholder="New group name…" maxlength="64">' +
-          '<button class="btn-mini btn-save" data-act="addGroup">Add</button></div>' +
-          '<div class="mg-list">' + list + '</div>';
+        document.getElementById('mgList').innerHTML = list;
       }
 
       function renderManageDetail() {
         const hadRenameFocus = renameInputFocused();
         if (!manageSelectedGroup || !(manageSelectedGroup in groups)) {
           mgDetail.innerHTML = '<div class="mg-detail-empty">Select a group, or create one.</div>';
-          wifiGroupPanel.hidden = true;
-          wifiController.renderGroup(null);
+          groupSettingsPanel.hidden = true;
+          configurationController.renderGroup(null);
           return;
         }
         const name = manageSelectedGroup;
-        const memArr = manageTab === 'wifi' ? (groups[name] || []) : Array.from(manageMembers);
+        const memArr = manageTab === 'settings' ? (groups[name] || []) : Array.from(manageMembers);
         const offCount = memArr.filter(function (s) { const d = deviceById(s); return !d || !isOnline(d); }).length;
         const onCount = memArr.length - offCount;
-        const overlaps = window.MdmWifiConsole.groupMembershipOverlaps(name, groups, devices);
-        const otherGroupNames = Array.from(new Set(overlaps.reduce(function (all, item) {
-          return all.concat(item.otherGroups);
-        }, []))).sort();
-        const overlapNotice = overlaps.length
-          ? '<div class="wifi-feedback wifi-warning" role="status">' + overlaps.length + ' device(s) are also in ' + otherGroupNames.map(esc).join(', ') + '. If these groups have Wi-Fi policies, the last explicit deploy that succeeds on each device takes effect. Policies are not resent automatically.</div>'
-          : '';
         const head = renamingManageGroup
           ? '<div class="dev-edit"><input class="label-input" data-mg-rename maxlength="64" value="' + esc(renameGroupDraft) + '">' +
             '<button class="btn-mini btn-save" data-act="saveRename">Save</button>' +
@@ -2401,19 +2456,18 @@
             '<button class="btn btn-danger-outline" data-act="deleteGroup" data-group="' + esc(name) + '">Delete</button></div>';
         mgDetail.innerHTML =
           '<div class="mg-detail-head">' + head + '</div>' +
-          overlapNotice +
           '<div class="subtabs mg-tabs"><button class="subtab' + (manageTab === 'devices' ? ' active' : '') + '" data-act="manageTab" data-manage-tab="devices" aria-pressed="' + (manageTab === 'devices') + '">Devices</button>' +
-          '<button class="subtab' + (manageTab === 'wifi' ? ' active' : '') + '" data-act="manageTab" data-manage-tab="wifi" aria-pressed="' + (manageTab === 'wifi') + '">Wi-Fi</button><div class="subtabs-fill"></div></div>' +
-          '<div' + (manageTab === 'wifi' ? ' hidden' : '') + '><div class="mg-search"><input class="mg-search-input" data-mg-search placeholder="⌕ Search devices to add…" value="' + esc(manageSearch) + '">' +
+          '<button class="subtab' + (manageTab === 'settings' ? ' active' : '') + '" data-act="manageTab" data-manage-tab="settings" aria-pressed="' + (manageTab === 'settings') + '">Settings</button><div class="subtabs-fill"></div></div>' +
+          '<div' + (manageTab === 'settings' ? ' hidden' : '') + '><div class="mg-search"><input class="mg-search-input" data-mg-search placeholder="⌕ Search devices to add…" value="' + esc(manageSearch) + '">' +
           '<button class="mg-sort-btn" data-act="sortManage" title="Sort by name">Name<span class="sort-arrow">' + (manageSort === 'label-desc' ? '▼' : '▲') + '</span></button></div>' +
           '<div class="mg-dev-list" id="mgDevList">' + renderMgDevListHtml() + '</div>' +
           '<div class="mg-footer"><span class="mg-foot-count">' + manageMembers.size + ' selected</span>' +
           '<div class="spacer"></div>' +
           '<button class="btn-text" data-act="cancelMembers">Cancel</button>' +
           '<button class="btn btn-primary" data-act="saveMembers">Save</button></div></div>';
-        wifiGroupPanel.hidden = manageTab !== 'wifi';
+        groupSettingsPanel.hidden = manageTab !== 'settings';
         restoreRenameGroupFocus(hadRenameFocus);
-        wifiController.renderGroup(manageTab === 'wifi' ? name : null);
+        configurationController.renderGroup(manageTab === 'settings' ? name : null);
       }
 
       function renameInputFocused() {
@@ -2468,13 +2522,13 @@
         if (!list.length) return '<div class="empty small">No matching devices</div>';
         return list.map(function (d) {
           const id = getDeviceId(d); const mem = manageGroupHasDevice(id); const off = !isOnline(d);
-          const otherGroups = window.MdmWifiConsole.membershipGroups(id, groups, [d.serial_number]).filter(function (name) { return name !== manageSelectedGroup; });
+          const otherGroups = window.MdmConfigurationPackages.membershipGroups(id, groups, [d.serial_number]).filter(function (name) { return name !== manageSelectedGroup; });
           return '<div class="mg-dev" data-act="toggleMember" data-id="' + esc(id) + '">' +
             '<div class="selbox ' + (mem ? 'on' : '') + '">' + (mem ? '✓' : '') + '</div>' +
             '<div class="mg-dev-main">' +
             '<div>' + (d.label ? '<span class="dev-label">' + esc(d.label) + '</span>' : '<span class="dev-label unlabeled">— unlabeled</span>') + '</div>' +
             '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.model || '-') + ' · ' + esc(d.ip || '-') +
-            (otherGroups.length ? '<div class="mg-dev-overlap">Also in: ' + esc(otherGroups.join(', ')) + '</div>' : '') + '</div></div>' +
+            (otherGroups.length ? '<div class="mg-dev-overlap" data-member-move="' + esc(otherGroups.join(', ')) + '">' + (mem ? 'Moves from ' : 'Adding moves from ') + esc(otherGroups.join(', ')) + '</div>' : '') + '</div></div>' +
             '<div class="mg-dev-status"><span class="dot ' + (off ? 'off' : '') + '"></span>' + (off ? 'Offline' : 'Online') + '</div>' +
             '</div>';
         }).join('');
@@ -3196,6 +3250,10 @@
         const act = t.dataset.act;
         if (act === 'copyDeviceId') { e.stopPropagation(); copyDeviceId(t); }
         else if (act === 'back') backToConsole();
+        else if (act === 'manageMode') {
+          if (managePackages) { managePackages = false; render(); }
+          else configurationController.showPackages();
+        }
         else if (act === 'manageTab') {
           manageTab = t.dataset.manageTab;
           renderManageDetail();
@@ -3223,16 +3281,18 @@
           // Update only the clicked row + counts so the list keeps its scroll position.
           const box = t.querySelector('.selbox');
           if (box) { box.classList.toggle('on', nowMember); box.textContent = nowMember ? '✓' : ''; }
+          const move = t.querySelector('[data-member-move]');
+          if (move) move.textContent = (nowMember ? 'Moves from ' : 'Adding moves from ') + move.dataset.memberMove;
           updateMgCounts();
         }
         else if (act === 'saveMembers') {
-          sendSetGroupMembers(manageSelectedGroup, Array.from(manageMembers));
+          sendMoveGroupMembers(manageSelectedGroup, Array.from(manageMembers));
         }
         else if (act === 'cancelMembers') { manageMembers = new Set(groups[manageSelectedGroup] || []); renderManageDetail(); }
         else if (act === 'renameGroup') openRenameGroupEditor();
         else if (act === 'saveRename') commitRenameGroup();
         else if (act === 'cancelRename') closeRenameGroupEditor();
-        else if (act === 'deleteGroup') { const name = t.dataset.group; if (confirm('Delete group "' + name + '"?\nDevices are not removed, only the group.\n\nExisting device Wi-Fi settings and startup policies stay unchanged. To stop startup reapplication, first deploy Do not manage Wi-Fi.')) sendDeleteGroup(name); }
+        else if (act === 'deleteGroup') { const name = t.dataset.group; if (confirm('Delete group "' + name + '"?\nThis removes the group and its package assignment. Existing values on devices stay in place.')) sendDeleteGroup(name); }
       });
       // Manage search + keyboard
       manageView.addEventListener('input', function (e) {

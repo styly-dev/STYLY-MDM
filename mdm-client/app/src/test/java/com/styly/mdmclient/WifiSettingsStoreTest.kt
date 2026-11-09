@@ -37,7 +37,6 @@ class WifiSettingsStoreTest {
             lastApplied = WifiSavedProfile(operation.revision, listOf(oldProfile)),
             manualOperation = operation,
             latestResult = WifiManualResult(operation.operationId, operation.revision, "unknown", WifiReason.UNKNOWN, false),
-            bootGeneration = "count:42",
             processedOperationIds = listOf(operation.operationId),
             managedWifi = false,
             policyEpoch = 6L,
@@ -80,7 +79,7 @@ class WifiSettingsStoreTest {
         val store = WifiSettingsStore(file) { throw IllegalStateException("directory sync failed") }
 
         assertThrows(IllegalStateException::class.java) {
-            store.write(WifiLocalState(bootGeneration = "count:1"))
+            store.write(WifiLocalState())
         }
 
         assertEquals(false, File(directory, "state.json.tmp").exists())

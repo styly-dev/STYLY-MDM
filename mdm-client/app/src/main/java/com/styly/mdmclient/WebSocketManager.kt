@@ -233,6 +233,7 @@ class WebSocketManager internal constructor(
 
     private val pushCoordinator = MdmClientApplication.pushJobCoordinator()
     private val wifiController = MdmClientApplication.wifiSettingsController()
+    private val configurationPackages = MdmClientApplication.configurationPackageController()
     @Volatile
     private var webSocket: WebSocket? = null
     private var isRunning = false
@@ -242,6 +243,9 @@ class WebSocketManager internal constructor(
     private val wifiStateListener: () -> Unit = {
         reconnectHandler.post { publishWifiState() }
     }
+    private val configurationListener: () -> Unit = {
+        reconnectHandler.post { publishConfigurationState() }
+    }
 
     private fun publishWifiState() {
         val socket = webSocket ?: return
@@ -250,6 +254,15 @@ class WebSocketManager internal constructor(
             put("type", "WIFI_STATE")
             put("wifi_state", wifiController.stateSnapshot())
         }.toString())
+    }
+
+    private fun publishConfigurationState() {
+        val socket = webSocket ?: return
+        if (!isRunning || !registration.isCanonicalAcknowledged(socket)) return
+        val state = configurationPackages.snapshot() ?: return
+        socket.send(JSONObject()
+            .put("type", "CONFIGURATION_STATE")
+            .put("configuration_state", state).toString())
     }
 
     private val scheduler = ConnectionScheduler {
@@ -304,6 +317,7 @@ class WebSocketManager internal constructor(
         isRunning = true
         identityResolver.addListener(identityListener)
         wifiController.addStateListener(wifiStateListener)
+        configurationPackages.addStateListener(configurationListener)
         onStatusChanged(false, "Waiting for network...")
         // The connection window is anchored on network availability, not on
         // service start: the callback fires immediately when a network is
@@ -317,6 +331,7 @@ class WebSocketManager internal constructor(
         isRunning = false
         identityResolver.removeListener(identityListener)
         wifiController.removeStateListener(wifiStateListener)
+        configurationPackages.removeStateListener(configurationListener)
         if (networkCallbackRegistered) {
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             cm.unregisterNetworkCallback(networkCallback)
@@ -492,6 +507,7 @@ class WebSocketManager internal constructor(
                             ) {
                                 startBatteryTelemetry()
                                 publishWifiState()
+                                publishConfigurationState()
                                 wifiController.refreshReadiness()
                                 publishConnectedStatus(identityResolver.snapshot())
                             }
@@ -517,12 +533,9 @@ class WebSocketManager internal constructor(
                         json.optString("connection_id", "") != registration.provisionalConnectionId(webSocket)
                     ) {
                         Log.w(TAG, "Ignoring $logType for a different provisional connection")
-                    } else if (type == "EXECUTE_WIFI_APPLY" || type.startsWith("WIFI_")) {
-                        wifiController.handleServerMessage(
-                            type,
-                            json,
-                            registration.isCanonicalAcknowledged(webSocket),
-                        )
+                    } else if (type == "CONFIGURATION_POLICY" && supportsPico4UltraEnterpriseSettings()) {
+                        val owner = commandContext(webSocket) ?: return
+                        configurationPackages.receive(json, owner::isActive)
                     } else if (type.isNotEmpty() && !pushCoordinator.handleServerMessage(type, json)) {
                         onCommand(type, json, commandContext(webSocket))
                     }
@@ -639,10 +652,9 @@ class WebSocketManager internal constructor(
                 put("device_id", identity.deviceId)
                 put("process_instance_id", pushFields!!.getString("process_instance_id"))
                 val capabilities = JSONArray(pushFields.getJSONArray("capabilities").toString())
-                if (supportsWifiSettingsPlatform() &&
-                    (0 until capabilities.length()).none { capabilities.optString(it) == WIFI_SETTINGS_CAPABILITY }
-                ) {
-                    capabilities.put(WIFI_SETTINGS_CAPABILITY)
+                if (supportsPico4UltraEnterpriseSettings()) {
+                    capabilities.put(CONFIGURATION_PACKAGES_CAPABILITY)
+                    configurationPackages.snapshot()?.let { put("configuration_state", it) }
                 }
                 put("capabilities", capabilities)
                 put("push_state", pushFields.getJSONObject("push_state"))

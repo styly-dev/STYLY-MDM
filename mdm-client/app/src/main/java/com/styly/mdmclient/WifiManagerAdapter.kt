@@ -54,9 +54,8 @@ internal fun wifiRecoveryAutoJoinTargets(
     return expected
 }
 
-internal fun supportsWifiSettingsPlatform(): Boolean =
-    Build.MODEL in setOf("A9210", "A94U0") &&
-        Build.MANUFACTURER.equals("Pico", ignoreCase = true) && Build.VERSION.SDK_INT >= 34
+internal fun supportsPico4UltraEnterpriseSettings(): Boolean =
+    Build.MODEL == "A94U0" && Build.MANUFACTURER.equals("Pico", ignoreCase = true)
 
 internal class WifiAdapterFailure(val reason: WifiReason) : Exception()
 
@@ -255,7 +254,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
 
     private fun requireAuthority() {
         // PUI exposes A94U0 to application processes and A9210 through ADB on this device.
-        if (!supportsWifiSettingsPlatform()) throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
+        if (!supportsPico4UltraEnterpriseSettings()) throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
         if (appContext.checkSelfPermission("android.permission.ACCESS_FINE_LOCATION") != PackageManager.PERMISSION_GRANTED ||
             appContext.checkSelfPermission("android.permission.ACCESS_BACKGROUND_LOCATION") != PackageManager.PERMISSION_GRANTED
         ) {
