@@ -9,6 +9,7 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiInfo
 import android.content.pm.PackageManager
+import android.os.Build
 import java.util.concurrent.atomic.AtomicBoolean
 
 internal data class WifiLocalNetworkObservation(
@@ -16,6 +17,7 @@ internal data class WifiLocalNetworkObservation(
     val ssid: String?,
     val hasUsableIp: Boolean,
     val sequence: Long,
+    val security: String? = null,
 )
 
 internal sealed interface WifiLocalConnectivityEvent {
@@ -89,6 +91,7 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
     ) : WifiLocalConnectivitySession {
         private data class MutableObservation(
             var ssid: String? = null,
+            var security: String? = null,
             var hasUsableIp: Boolean = false,
             var sequence: Long = 0,
         )
@@ -111,6 +114,7 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
                 if (lostNetworkHandles.isLost(network.networkHandle)) return
                 val current = observations.getOrPut(network.networkHandle) { MutableObservation() }
                 current.ssid = info?.ssid?.normalizeSsid()
+                current.security = info?.currentNetworkSecurity()
                 current.sequence = ++sequence
                 WifiLocalConnectivityEvent.Updated(current.toObservation(network.networkHandle))
             }
@@ -165,6 +169,7 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
                     ) {
                         observations[network.networkHandle] = MutableObservation(
                             ssid = info?.ssid?.normalizeSsid(),
+                            security = info?.currentNetworkSecurity(),
                             hasUsableIp = links?.linkAddresses?.any { it.address.isUsableLocalAddress() } == true,
                             sequence = ++sequence,
                         )
@@ -204,6 +209,7 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
             ssid = ssid,
             hasUsableIp = hasUsableIp,
             sequence = sequence,
+            security = security,
         )
 
         private class LocationAwareWifiCallback(private val session: AndroidSession) :
@@ -221,6 +227,27 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
 private fun String.normalizeSsid(): String? = takeIf {
     it.isNotEmpty() && it != "<unknown ssid>" && it != "unknown ssid"
 }?.removeSurrounding("\"")
+
+private fun WifiInfo.currentNetworkSecurity(): String? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null
+    return when (currentSecurityType) {
+        WifiInfo.SECURITY_TYPE_OPEN -> "OPEN"
+        WifiInfo.SECURITY_TYPE_PSK -> "WPA_PSK"
+        WifiInfo.SECURITY_TYPE_SAE -> "SAE"
+        WifiInfo.SECURITY_TYPE_WEP -> "WEP"
+        WifiInfo.SECURITY_TYPE_EAP,
+        WifiInfo.SECURITY_TYPE_EAP_WPA3_ENTERPRISE,
+        WifiInfo.SECURITY_TYPE_EAP_WPA3_ENTERPRISE_192_BIT -> "EAP"
+        else -> null
+    }
+}
+
+internal fun wifiProfileAcceptsObservedSecurity(profile: WifiNetworkProfile, security: String?): Boolean = when {
+    profile.security == "OPEN" -> security == "OPEN"
+    profile.security != "WPA2_WPA3" -> false
+    profile.requiresSaeOnly -> security == "SAE"
+    else -> security == "WPA_PSK" || security == "SAE"
+}
 
 private fun java.net.InetAddress.isUsableLocalAddress(): Boolean =
     !isAnyLocalAddress && !isLoopbackAddress && !isLinkLocalAddress && !isMulticastAddress

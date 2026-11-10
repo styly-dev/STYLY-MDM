@@ -22,11 +22,143 @@ internal data class WifiConfiguredEntry(
     val identity: String get() = "$ssid\u0000$security"
 }
 
+internal data class WifiConfiguredView(
+    val entry: WifiConfiguredEntry,
+    val original: WifiConfiguration,
+)
+
+internal fun wifiSecurityViewMatchesProfile(profile: WifiNetworkProfile, security: String?): Boolean = when {
+    profile.security == "OPEN" -> security == "OPEN"
+    profile.security != "WPA2_WPA3" -> false
+    profile.requiresSaeOnly -> security == "SAE"
+    else -> security == "WPA_PSK" || security == "SAE"
+}
+
+internal fun desiredWifiSecurityView(profile: WifiNetworkProfile): String? = when {
+    profile.security == "OPEN" -> "OPEN"
+    profile.security == "WPA2_WPA3" && profile.requiresSaeOnly -> "SAE"
+    profile.security == "WPA2_WPA3" -> "WPA_PSK"
+    else -> null
+}
+
+internal fun preferredWifiSecurityView(
+    profile: WifiNetworkProfile,
+    securities: Collection<String?>,
+): String? {
+    val available = securities.filterNotNull().toSet()
+    return when {
+        profile.security == "OPEN" -> "OPEN".takeIf { it in available }
+        profile.requiresSaeOnly -> "SAE".takeIf { it in available }
+        profile.security == "WPA2_WPA3" -> listOf("WPA_PSK", "SAE").firstOrNull { it in available }
+        else -> null
+    }
+}
+
+/** Resolve a candidate's exact security view while treating same-ID views as one saved network. */
+internal fun resolveWifiProfileViewIndex(
+    profile: WifiNetworkProfile,
+    entries: List<WifiConfiguredEntry>,
+): Int? {
+    val matches = entries.indices.filter {
+        entries[it].ssid == profile.ssid && wifiSecurityViewMatchesProfile(profile, entries[it].security)
+    }
+    if (matches.map { entries[it].networkId }.distinct().size != 1) return null
+    val preferred = preferredWifiSecurityView(profile, matches.map { entries[it].security })
+    return matches.firstOrNull { entries[it].security == preferred }
+}
+
+/** Resolve the original security view even if Android reassigned the network ID after reboot. */
+internal fun resolveWifiRecoveryViewIndex(
+    old: WifiAutoJoinState,
+    security: String,
+    entries: List<WifiConfiguredEntry>,
+): Int? {
+    val oldEntry = resolveWifiRecoveryEntry(old, entries) ?: return null
+    return entries.indexOfFirst {
+        it.networkId == oldEntry.networkId && it.ssid == old.ssid && it.security == security
+    }.takeIf { it >= 0 }
+}
+
+internal fun resolveWifiRollbackNetworkId(
+    target: WifiRollbackTarget,
+    entries: List<WifiConfiguredEntry>,
+): Int? = entries.asSequence()
+    .filter { it.ssid == target.ssid && it.security == target.security }
+    .map { it.networkId }
+    .distinct()
+    .singleOrNull()
+
+internal data class WifiRecoveryAutoJoinPlan(
+    val targets: Map<Int, Boolean>,
+    val fullyResolved: Boolean,
+)
+
+/** Resolve only current network IDs whose SSID/security identity is unambiguous. */
+internal fun wifiRecoveryAutoJoinPlan(
+    snapshot: WifiRecoverySnapshot,
+    entries: List<WifiConfiguredEntry>,
+    candidate: List<WifiNetworkProfile>,
+): WifiRecoveryAutoJoinPlan {
+    val targets = linkedMapOf<Int, Boolean>()
+    val conflicts = linkedSetOf<Int>()
+    var fullyResolved = true
+    for (old in snapshot.networks) {
+        val current = resolveWifiRecoveryEntry(old, entries)
+        if (current == null) {
+            fullyResolved = false
+            continue
+        }
+        if (current.networkId in targets || current.networkId in conflicts) {
+            targets.remove(current.networkId)
+            conflicts.add(current.networkId)
+            fullyResolved = false
+        } else {
+            targets[current.networkId] = old.allowed
+        }
+    }
+    for (profile in candidate) {
+        val ids = entries.filter {
+            it.ssid == profile.ssid && wifiSecurityViewMatchesProfile(profile, it.security)
+        }.map { it.networkId }.distinct()
+        when (ids.size) {
+            0 -> Unit
+            1 -> if (ids.single() !in conflicts) targets.putIfAbsent(ids.single(), false)
+            else -> fullyResolved = false
+        }
+    }
+    return WifiRecoveryAutoJoinPlan(targets, fullyResolved)
+}
+
+/** Attempts every recovery phase and keeps any failure sticky. */
+internal fun restoreWifiRecoveryBestEffort(
+    restoreCredentials: () -> WifiReason,
+    restoreAutoJoin: () -> WifiReason,
+    reconnect: () -> WifiReason,
+    verify: () -> WifiReason,
+    onFailure: (String, WifiReason) -> Unit = { _, _ -> },
+): WifiReason {
+    var failed = false
+    fun attempt(operation: String, action: () -> WifiReason) {
+        val reason = try { action() } catch (_: Exception) { WifiReason.RESTORE_FAILED }
+        if (reason != WifiReason.NONE) {
+            failed = true
+            runCatching { onFailure(operation, reason) }
+        }
+    }
+    attempt("RESTORE", restoreCredentials)
+    attempt("AUTO_JOIN", restoreAutoJoin)
+    attempt("RESTORE", reconnect)
+    attempt("RESTORE", verify)
+    return if (failed) WifiReason.RESTORE_FAILED else WifiReason.NONE
+}
+
 /** PICO returns multiple security views for some saved network IDs. */
 internal fun wifiProfileReadback(entries: List<WifiConfiguredEntry>, profile: List<WifiNetworkProfile>): Boolean {
     val selected = linkedSetOf<Int>()
     for (network in profile) {
-        val matches = entries.filter { it.identity == network.identity }.distinctBy { it.networkId }
+        val matches = entries.filter {
+            it.ssid == network.ssid && wifiSecurityViewMatchesProfile(network, it.security)
+        }.distinctBy { it.networkId }
         val entry = matches.singleOrNull() ?: return false
         if (!selected.add(entry.networkId) || entry.hidden != network.hidden) return false
     }
@@ -35,23 +167,7 @@ internal fun wifiProfileReadback(entries: List<WifiConfiguredEntry>, profile: Li
 
 internal fun resolveWifiRecoveryEntry(old: WifiAutoJoinState, entries: List<WifiConfiguredEntry>): WifiConfiguredEntry? {
     val matches = entries.filter { it.ssid == old.ssid && it.security in old.securities }.distinctBy { it.networkId }
-    return matches.firstOrNull { it.networkId == old.networkId } ?: matches.singleOrNull()
-}
-
-internal fun wifiRecoveryAutoJoinTargets(
-    snapshot: WifiRecoverySnapshot,
-    entries: List<WifiConfiguredEntry>,
-    candidate: List<WifiNetworkProfile>,
-): Map<Int, Boolean>? {
-    val expected = linkedMapOf<Int, Boolean>()
-    for (old in snapshot.networks) {
-        val current = resolveWifiRecoveryEntry(old, entries) ?: return null
-        if (expected.put(current.networkId, old.allowed) != null) return null
-    }
-    for (entry in entries.filter { current -> candidate.any { it.identity == current.identity } }) {
-        expected.putIfAbsent(entry.networkId, false)
-    }
-    return expected
+    return matches.singleOrNull()
 }
 
 internal fun supportsPico4UltraEnterpriseSettings(): Boolean =
@@ -64,14 +180,28 @@ internal interface WifiSettingsAdapter {
     fun captureRecovery(knownProfiles: List<WifiNetworkProfile>): WifiRecoverySnapshot
     fun applyProfile(
         target: List<WifiNetworkProfile>,
+        prioritySelection: Boolean = false,
         shouldContinue: () -> Boolean = { true },
         beforeFirstMutation: () -> WifiReason? = { null },
+        onMutationStarted: () -> WifiReason? = { null },
+        onMutationFinished: () -> Unit = {},
+    ): WifiReason
+    fun selectNetwork(
+        profile: WifiNetworkProfile,
+        shouldContinue: () -> Boolean = { true },
         onMutationStarted: () -> WifiReason? = { null },
         onMutationFinished: () -> Unit = {},
     ): WifiReason
     fun restoreRecovery(
         snapshot: WifiRecoverySnapshot,
         candidate: List<WifiNetworkProfile>,
+        restoreTarget: WifiRollbackTarget? = null,
+        shouldContinue: () -> Boolean = { true },
+        onMutationStarted: () -> WifiReason? = { null },
+        onMutationFinished: () -> Unit = {},
+    ): WifiReason
+    fun connectToSavedNetwork(
+        target: WifiRollbackTarget,
         shouldContinue: () -> Boolean = { true },
         onMutationStarted: () -> WifiReason? = { null },
         onMutationFinished: () -> Unit = {},
@@ -88,21 +218,24 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
     private val mutationLock = ReentrantLock()
     private val autoJoinField by lazy { WifiConfiguration::class.java.getField("allowAutojoin") }
 
-    override fun readCurrent(): List<WifiConfiguredEntry> {
+    override fun readCurrent(): List<WifiConfiguredEntry> = configuredNetworkViews().map { it.entry }
+
+    private fun configuredNetworkViews(): List<WifiConfiguredView> {
         requireAuthority()
         return try {
             @Suppress("DEPRECATION")
             val configs = manager?.configuredNetworks ?: throw WifiAdapterFailure(WifiReason.CONFIG_READ_FAILED)
             configs.map { config ->
                 val security = when {
-                    config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.WPA_PSK) -> "WPA_PSK"
                     config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.SAE) -> "SAE"
+                    config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.WPA_PSK) -> "WPA_PSK"
                     config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.NONE) &&
                         config.wepKeys.all { it == null } -> "OPEN"
                     else -> "OTHER:${config.allowedKeyManagement}"
                 }
-                WifiConfiguredEntry(config.networkId, config.SSID.removeSurrounding("\""), security,
+                val entry = WifiConfiguredEntry(config.networkId, config.SSID.removeSurrounding("\""), security,
                     config.hiddenSSID, autoJoinField.getBoolean(config))
+                WifiConfiguredView(entry, config)
             }
         } catch (failure: WifiAdapterFailure) { throw failure
         } catch (_: SecurityException) { throw WifiAdapterFailure(WifiReason.PERMISSION_DENIED)
@@ -118,85 +251,288 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             }
             WifiAutoJoinState(id, views.first().ssid, views.mapNotNull { it.security }.distinct(), views.first().autoJoinEnabled)
         }
-        return WifiRecoverySnapshot(states, knownProfiles.filter { old -> entries.any { it.identity == old.identity } })
+        return WifiRecoverySnapshot(states, knownProfiles.filter { old -> entries.any {
+            it.ssid == old.ssid && wifiSecurityViewMatchesProfile(old, it.security)
+        } })
     }
 
     override fun applyProfile(
-        target: List<WifiNetworkProfile>, shouldContinue: () -> Boolean,
+        target: List<WifiNetworkProfile>, prioritySelection: Boolean, shouldContinue: () -> Boolean,
         beforeFirstMutation: () -> WifiReason?, onMutationStarted: () -> WifiReason?, onMutationFinished: () -> Unit,
     ): WifiReason = guarded {
         val wifi = manager ?: return@guarded WifiReason.UNSUPPORTED
-        val service = autoJoinService()
-        val initial = readCurrent()
+        val service = try {
+            autoJoinService()
+        } catch (failure: WifiAdapterFailure) {
+            logOperationFailure("AUTO_JOIN", failure.reason)
+            return@guarded failure.reason
+        } catch (_: Exception) {
+            logOperationFailure("AUTO_JOIN", WifiReason.UNSUPPORTED)
+            return@guarded WifiReason.UNSUPPORTED
+        }
+        val initialViews = configuredNetworkViews()
+        val initial = initialViews.map { it.entry }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@guarded WifiReason.UNSUPPORTED
+        if (target.any { it.requiresSaeOnly } &&
+            (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || wifi.isWpa3SaeSupported != true)
+        ) return@guarded WifiReason.UNSUPPORTED
         val selected = linkedSetOf<Int>()
         val mutate = Mutations(shouldContinue, beforeFirstMutation, onMutationStarted, onMutationFinished)
         for (network in target) {
-            val existing = initial.filter { it.identity == network.identity }.distinctBy { it.networkId }
+            val existing = initial.filter {
+                it.ssid == network.ssid && wifiSecurityViewMatchesProfile(network, it.security)
+            }.distinctBy { it.networkId }
             if (existing.size > 1) return@guarded WifiReason.VERIFY_FAILED
+            val existingIndex = resolveWifiProfileViewIndex(network, initial)
+            val existingView = existingIndex?.let(initialViews::get)
+            if (existing.isNotEmpty() && existingView == null) return@guarded WifiReason.VERIFY_FAILED
             var id = -1
             val failure = mutate.run {
-                @Suppress("DEPRECATION")
-                val config = configuration(network).apply { networkId = existing.singleOrNull()?.networkId ?: -1 }
-                @Suppress("DEPRECATION")
-                id = if (config.networkId < 0) wifi.addNetwork(config) else wifi.updateNetwork(config)
-                if (id < 0) WifiReason.UPDATE_FAILED else WifiReason.NONE
+                val operation = if (existingView == null) "ADD" else "UPDATE"
+                try {
+                    val config = configuration(network, existingView?.original)
+                    @Suppress("DEPRECATION")
+                    id = if (existingView == null) wifi.addNetwork(config) else wifi.updateNetwork(config)
+                    if (id < 0) {
+                        logOperationFailure(operation, WifiReason.UPDATE_FAILED)
+                        WifiReason.UPDATE_FAILED
+                    } else {
+                        WifiReason.NONE
+                    }
+                } catch (_: SecurityException) {
+                    logOperationFailure(operation, WifiReason.PERMISSION_DENIED)
+                    WifiReason.PERMISSION_DENIED
+                } catch (failure: WifiAdapterFailure) {
+                    logOperationFailure(operation, failure.reason)
+                    failure.reason
+                } catch (_: Exception) {
+                    logOperationFailure(operation, WifiReason.UPDATE_FAILED)
+                    WifiReason.UPDATE_FAILED
+                }
             }
             if (failure != WifiReason.NONE) return@guarded failure
             selected.add(id)
-            val enabled = mutate.run {
-                @Suppress("DEPRECATION")
-                if (wifi.enableNetwork(id, false)) WifiReason.NONE else WifiReason.UPDATE_FAILED
+            if (prioritySelection) continue
+            val enabled = try {
+                mutate.run {
+                    @Suppress("DEPRECATION")
+                    if (wifi.enableNetwork(id, false)) WifiReason.NONE else WifiReason.UPDATE_FAILED
+                }
+            } catch (_: SecurityException) {
+                WifiReason.PERMISSION_DENIED
+            } catch (_: Exception) {
+                WifiReason.UPDATE_FAILED
             }
-            if (enabled != WifiReason.NONE) return@guarded enabled
+            if (enabled != WifiReason.NONE) {
+                logOperationFailure("UPDATE", enabled)
+                return@guarded enabled
+            }
         }
         for (entry in readCurrent().distinctBy { it.networkId }) {
             val allowed = entry.networkId in selected
             if (entry.autoJoinEnabled == allowed) continue
-            val failure = mutate.run { setAutoJoin(service, entry.networkId, allowed) }
-            if (failure != WifiReason.NONE) return@guarded failure
+            val failure = try {
+                mutate.run { setAutoJoin(service, entry.networkId, allowed) }
+            } catch (_: SecurityException) {
+                WifiReason.PERMISSION_DENIED
+            } catch (_: Exception) {
+                WifiReason.UPDATE_FAILED
+            }
+            if (failure != WifiReason.NONE) {
+                logOperationFailure("AUTO_JOIN", failure)
+                return@guarded failure
+            }
         }
         if (!shouldContinue()) WifiReason.TIMEOUT_ROLLED_BACK
         else if (wifiProfileReadback(readCurrent(), target)) WifiReason.NONE else WifiReason.VERIFY_FAILED
     }
 
+    override fun selectNetwork(
+        profile: WifiNetworkProfile,
+        shouldContinue: () -> Boolean,
+        onMutationStarted: () -> WifiReason?,
+        onMutationFinished: () -> Unit,
+    ): WifiReason = guarded {
+        val wifi = manager ?: return@guarded WifiReason.UNSUPPORTED
+        val current = readCurrent()
+        val entry = resolveWifiProfileViewIndex(profile, current)?.let(current::get)
+            ?: return@guarded WifiReason.VERIFY_FAILED
+        val reason = try {
+            Mutations(shouldContinue, { null }, onMutationStarted, onMutationFinished).run {
+                @Suppress("DEPRECATION")
+                if (wifi.enableNetwork(entry.networkId, true)) WifiReason.NONE else WifiReason.UPDATE_FAILED
+            }
+        } catch (_: SecurityException) {
+            WifiReason.PERMISSION_DENIED
+        } catch (_: Exception) {
+            WifiReason.UPDATE_FAILED
+        }
+        if (reason != WifiReason.NONE) logOperationFailure("AUTO_JOIN", reason)
+        reason
+    }
+
+    override fun connectToSavedNetwork(
+        target: WifiRollbackTarget,
+        shouldContinue: () -> Boolean,
+        onMutationStarted: () -> WifiReason?,
+        onMutationFinished: () -> Unit,
+    ): WifiReason = guarded {
+        val wifi = manager ?: return@guarded WifiReason.UNSUPPORTED
+        val id = resolveWifiRollbackNetworkId(target, readCurrent())
+            ?: return@guarded WifiReason.VERIFY_FAILED
+        try {
+            val selected = Mutations(shouldContinue, { null }, onMutationStarted, onMutationFinished).run {
+                @Suppress("DEPRECATION")
+                if (wifi.enableNetwork(id, true)) WifiReason.NONE else WifiReason.UNREACHABLE
+            }
+            if (selected != WifiReason.NONE) return@guarded selected
+            Mutations(shouldContinue, { null }, onMutationStarted, onMutationFinished).run {
+                @Suppress("DEPRECATION")
+                if (wifi.reconnect()) WifiReason.NONE else WifiReason.UNREACHABLE
+            }
+        } catch (_: SecurityException) {
+            WifiReason.PERMISSION_DENIED
+        } catch (_: Exception) {
+            WifiReason.UNREACHABLE
+        }.also { if (it != WifiReason.NONE) logOperationFailure("RESTORE", it) }
+    }
+
     override fun restoreRecovery(
-        snapshot: WifiRecoverySnapshot, candidate: List<WifiNetworkProfile>, shouldContinue: () -> Boolean,
+        snapshot: WifiRecoverySnapshot, candidate: List<WifiNetworkProfile>, restoreTarget: WifiRollbackTarget?,
+        shouldContinue: () -> Boolean,
         onMutationStarted: () -> WifiReason?, onMutationFinished: () -> Unit,
     ): WifiReason = guarded {
         val wifi = manager ?: return@guarded WifiReason.UNSUPPORTED
-        val service = autoJoinService()
         val mutate = Mutations(shouldContinue, { null }, onMutationStarted, onMutationFinished)
-        var entries = readCurrent()
-        // Only credentials that MDM already knew and this attempt could overwrite are restored.
-        for (known in snapshot.knownCredentials.filter { old -> candidate.any { it.identity == old.identity } }) {
-            val original = snapshot.networks.singleOrNull { it.ssid == known.ssid && known.security in it.securities }
-                ?: return@guarded WifiReason.RESTORE_FAILED
-            val entry = resolveWifiRecoveryEntry(original, entries) ?: return@guarded WifiReason.RESTORE_FAILED
-            val failure = mutate.run {
-                @Suppress("DEPRECATION")
-                if (wifi.updateNetwork(configuration(known).apply { networkId = entry.networkId }) >= 0) WifiReason.NONE
-                else WifiReason.RESTORE_FAILED
-            }
-            if (failure != WifiReason.NONE) return@guarded failure
-        }
-        entries = readCurrent()
-        // A saved pre-change ID alone is insufficient after an OS restart.
-        val expected = wifiRecoveryAutoJoinTargets(snapshot, entries, candidate)
-            ?: return@guarded WifiReason.RESTORE_FAILED
-        for ((id, allowed) in expected) {
-            if (entries.filter { it.networkId == id }.all { it.autoJoinEnabled == allowed }) continue
-            val failure = mutate.run { setAutoJoin(service, id, allowed) }
-            if (failure != WifiReason.NONE) return@guarded failure
-        }
-        @Suppress("DEPRECATION")
-        val enabled = mutate.run {
-            for ((id, allowed) in expected) if (allowed && !wifi.enableNetwork(id, false)) return@run WifiReason.RESTORE_FAILED
-            if (wifi.reconnect()) WifiReason.NONE else WifiReason.RESTORE_FAILED
-        }
-        if (enabled != WifiReason.NONE) return@guarded enabled
-        val restored = readCurrent()
-        if (expected.all { (id, allowed) -> restored.any { it.networkId == id } && restored.filter { it.networkId == id }.all { it.autoJoinEnabled == allowed } }) WifiReason.NONE
-        else WifiReason.RESTORE_FAILED
+        var expectedAutoJoin = emptyMap<Int, Boolean>()
+        restoreWifiRecoveryBestEffort(
+            restoreCredentials = {
+                var failed = false
+                val views = try {
+                    configuredNetworkViews()
+                } catch (_: Exception) {
+                    return@restoreWifiRecoveryBestEffort WifiReason.RESTORE_FAILED
+                }
+                val entries = views.map { it.entry }
+                // Only credentials that MDM already knew and this attempt could overwrite are restored.
+                for (known in snapshot.knownCredentials.filter { old -> candidate.any { it.identity == old.identity } }) {
+                    val original = snapshot.networks.singleOrNull {
+                        it.ssid == known.ssid && it.securities.any { security ->
+                            wifiSecurityViewMatchesProfile(known, security)
+                        }
+                    }
+                    val originalSecurity = original?.let { preferredWifiSecurityView(known, it.securities) }
+                    val viewIndex = original?.let { old ->
+                        originalSecurity?.let { security -> resolveWifiRecoveryViewIndex(old, security, entries) }
+                    }
+                    val view = viewIndex?.let(views::get)
+                    if (view == null) {
+                        failed = true
+                        continue
+                    }
+                    val failure = try {
+                        mutate.run {
+                            @Suppress("DEPRECATION")
+                            if (wifi.updateNetwork(configuration(known, view.original)) >= 0) WifiReason.NONE
+                            else WifiReason.RESTORE_FAILED
+                        }
+                    } catch (_: SecurityException) {
+                        WifiReason.PERMISSION_DENIED
+                    } catch (_: Exception) {
+                        WifiReason.RESTORE_FAILED
+                    }
+                    if (failure != WifiReason.NONE) {
+                        failed = true
+                        logOperationFailure("UPDATE", failure)
+                    }
+                }
+                if (failed) WifiReason.RESTORE_FAILED else WifiReason.NONE
+            },
+            restoreAutoJoin = {
+                val serviceForRestore = try {
+                    autoJoinService()
+                } catch (_: Exception) {
+                    null
+                }
+                val views = try {
+                    configuredNetworkViews()
+                } catch (_: Exception) {
+                    null
+                }
+                val entries = views?.map { it.entry }
+                val plan = entries?.let { wifiRecoveryAutoJoinPlan(snapshot, it, candidate) }
+                    ?: WifiRecoveryAutoJoinPlan(emptyMap(), fullyResolved = false)
+                expectedAutoJoin = plan.targets
+                var failed = !plan.fullyResolved
+                for ((id, allowed) in expectedAutoJoin) {
+                    if (entries?.filter { it.networkId == id }?.all { it.autoJoinEnabled == allowed } == true) continue
+                    val service = serviceForRestore
+                    if (service == null) {
+                        failed = true
+                        continue
+                    }
+                    val failure = try {
+                        mutate.run { setAutoJoin(service, id, allowed) }
+                    } catch (_: Exception) {
+                        WifiReason.RESTORE_FAILED
+                    }
+                    if (failure != WifiReason.NONE) {
+                        failed = true
+                    }
+                }
+                if (failed) WifiReason.RESTORE_FAILED else WifiReason.NONE
+            },
+            reconnect = {
+                var selectedTargetId: Int? = null
+                val entries = runCatching { readCurrent() }.getOrNull().orEmpty()
+                if (restoreTarget != null) {
+                    selectedTargetId = resolveWifiRollbackNetworkId(restoreTarget, entries)
+                    val selection = selectedTargetId?.let { id ->
+                        runCatching {
+                            mutate.run {
+                                @Suppress("DEPRECATION")
+                                if (wifi.enableNetwork(id, true)) WifiReason.NONE else WifiReason.UNREACHABLE
+                            }
+                        }.getOrDefault(WifiReason.UNREACHABLE)
+                    } ?: WifiReason.VERIFY_FAILED
+                    if (selection != WifiReason.NONE) logOperationFailure("RESTORE", selection)
+                }
+                for ((id, allowed) in expectedAutoJoin) {
+                    if (!allowed || id == selectedTargetId) continue
+                    val failure = try {
+                        mutate.run {
+                            @Suppress("DEPRECATION")
+                            if (wifi.enableNetwork(id, false)) WifiReason.NONE else WifiReason.RESTORE_FAILED
+                        }
+                    } catch (_: Exception) {
+                        WifiReason.RESTORE_FAILED
+                    }
+                    if (failure != WifiReason.NONE) logOperationFailure("RESTORE", failure)
+                }
+                val reconnectFailure = try {
+                    mutate.run {
+                        @Suppress("DEPRECATION")
+                        if (wifi.reconnect()) WifiReason.NONE else WifiReason.RESTORE_FAILED
+                    }
+                } catch (_: Exception) {
+                    WifiReason.RESTORE_FAILED
+                }
+                if (reconnectFailure != WifiReason.NONE) logOperationFailure("RESTORE", reconnectFailure)
+                WifiReason.NONE
+            },
+            verify = {
+                val restored = try {
+                    readCurrent()
+                } catch (_: Exception) {
+                    return@restoreWifiRecoveryBestEffort WifiReason.RESTORE_FAILED
+                }
+                if (expectedAutoJoin.all { (id, allowed) ->
+                        restored.any { it.networkId == id } && restored.filter { it.networkId == id }.all { it.autoJoinEnabled == allowed }
+                    }
+                ) WifiReason.NONE else WifiReason.RESTORE_FAILED
+            },
+            onFailure = { operation, reason -> logOperationFailure(operation, reason) },
+        )
     }
 
     override fun disconnectCurrent(shouldContinue: () -> Boolean, onMutationStarted: () -> WifiReason?, onMutationFinished: () -> Unit): WifiReason = guarded {
@@ -274,13 +610,56 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         return reason
     }
 
-    private fun configuration(profile: WifiNetworkProfile) = WifiConfiguration().apply {
-        SSID = "\"${profile.ssid}\""
-        hiddenSSID = profile.hidden
-        if (profile.security == "OPEN") allowedKeyManagement.set(WifiConfiguration.KeyMgmt.NONE)
-        else {
-            allowedKeyManagement.set(WifiConfiguration.KeyMgmt.WPA_PSK)
-            preSharedKey = if (profile.password.length == 64) profile.password else "\"${profile.password}\""
+    private fun configuration(profile: WifiNetworkProfile, original: WifiConfiguration? = null): WifiConfiguration {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
+        val config = if (original == null) {
+            WifiConfiguration()
+        } else {
+            WifiConfiguration(original)
         }
+        return config.apply {
+            networkId = original?.networkId ?: -1
+            SSID = "\"${profile.ssid}\""
+            hiddenSSID = profile.hidden
+            val desiredSecurity = desiredWifiSecurityView(profile)
+                ?: throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
+            val originalSecurity = when {
+                original?.allowedKeyManagement?.get(WifiConfiguration.KeyMgmt.SAE) == true -> "SAE"
+                original?.allowedKeyManagement?.get(WifiConfiguration.KeyMgmt.WPA_PSK) == true -> "WPA_PSK"
+                original?.allowedKeyManagement?.get(WifiConfiguration.KeyMgmt.NONE) == true -> "OPEN"
+                else -> null
+            }
+            if (originalSecurity != desiredSecurity) {
+                when (desiredSecurity) {
+                    "OPEN" -> setSecurityParams(WifiConfiguration.SECURITY_TYPE_OPEN)
+                    "SAE" -> {
+                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || manager?.isWpa3SaeSupported != true) {
+                            throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
+                        }
+                        setSecurityParams(WifiConfiguration.SECURITY_TYPE_SAE)
+                    }
+                    "WPA_PSK" -> setSecurityParams(WifiConfiguration.SECURITY_TYPE_PSK)
+                }
+            }
+            when {
+                profile.security == "OPEN" -> {
+                    preSharedKey = null
+                }
+                profile.security == "WPA2_WPA3" && profile.requiresSaeOnly -> {
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || manager?.isWpa3SaeSupported != true) {
+                        throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
+                    }
+                    preSharedKey = "\"${profile.password}\""
+                }
+                profile.security == "WPA2_WPA3" -> {
+                    preSharedKey = "\"${profile.password}\""
+                }
+                else -> throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
+            }
+        }
+    }
+
+    private fun logOperationFailure(operation: String, reason: WifiReason) {
+        android.util.Log.w("WifiSettings", "Wi-Fi operation $operation failed: ${reason.wireValue}")
     }
 }

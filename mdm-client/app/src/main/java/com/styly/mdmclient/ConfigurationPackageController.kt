@@ -10,10 +10,12 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArraySet
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 internal const val CONFIGURATION_PACKAGES_CAPABILITY = "configuration_packages_v1"
+internal const val CONFIGURATION_SUMMARY_CAPABILITY = "configuration_summary_v1"
 
 // PUI 5.15.7 initializes the sleep policy about 28 seconds into boot, after
 // BOOT_COMPLETED and the TobService bind. Wait once, before claiming any write.
@@ -38,6 +40,7 @@ internal data class ConfigurationAttempt(
     val status: String = "applying",
     val results: JSONObject = JSONObject(),
     val retryIds: Set<String> = emptySet(),
+    val wifiOperationId: String? = null,
 ) {
     val needsRetry: Boolean
         get() = status == "interrupted" || (status == "complete" && results.keys().asSequence().any {
@@ -49,6 +52,7 @@ internal data class ConfigurationAttempt(
     fun saved(): JSONObject = report()
         .put("boot_count", bootCount)
         .put("retry_ids", JSONArray(retryIds))
+        .put("wifi_operation_id", wifiOperationId)
 
     companion object {
         fun restore(json: JSONObject): ConfigurationAttempt {
@@ -60,6 +64,8 @@ internal data class ConfigurationAttempt(
                 status = if (status == "applying") "interrupted" else status,
                 results = json.getJSONObject("results"),
                 retryIds = (0 until retryIds.length()).map(retryIds::getString).toSet(),
+                wifiOperationId = (json.opt("wifi_operation_id") as? String)
+                    ?.takeIf(WifiSettingsProtocol::isValidUuid),
             )
         }
     }
@@ -92,77 +98,202 @@ internal class ConfigurationJournal(private val attempts: List<ConfigurationAtte
     }
 }
 
+internal data class ConfigurationPackageDependencies(
+    val worker: Executor,
+    val scheduleSdkReady: (Runnable) -> Unit,
+    val bootCount: Int,
+    val readJournal: () -> String?,
+    val writeJournal: (String) -> Boolean,
+    val readLastPolicy: () -> String?,
+    val writeLastPolicy: (String?) -> Boolean,
+    val scalarWriter: () -> ((JSONObject) -> JSONObject)?,
+    val logJournalError: (String) -> Unit = {},
+)
+
+internal enum class ConfigurationApplyStatus { WAITING, APPLYING, APPLIED, INCOMPLETE }
+
+internal data class ConfigurationScreenState(
+    val groupKnown: Boolean,
+    val groupName: String?,
+    val version: ConfigurationVersion?,
+    val deployedAtMillis: Long?,
+    val applyStatus: ConfigurationApplyStatus?,
+    val canReapply: Boolean,
+)
+
 /** The process owns one apply worker, independent of WebSocket and Service lifetimes. */
 internal class ConfigurationPackageController(
-    private val context: Context,
+    private val dependencies: ConfigurationPackageDependencies,
     private val wifi: WifiSettingsController,
 ) {
+    constructor(context: Context, wifi: WifiSettingsController) : this(productionDependencies(context), wifi)
+
     private class Policy(
         val version: ConfigurationVersion?,
         val values: JSONObject,
+        val groupKnown: Boolean,
+        val groupName: String?,
+        val deployedAtMillis: Long?,
+        val supportsApply: Boolean,
+    ) {
+        fun encode(): String = checkNotNull(version).toJson()
+            .put("settings", values)
+            .put("group_name", if (groupKnown) groupName ?: JSONObject.NULL else null)
+            .put("deployed_at_ms", deployedAtMillis)
+            .toString()
+
+        companion object {
+            fun parse(payload: JSONObject, supportsApply: Boolean): Policy? {
+                val values = payload.optJSONObject("settings") ?: return null
+                val version = if (payload.opt("package_id") === JSONObject.NULL &&
+                    payload.opt("revision") === JSONObject.NULL
+                ) null else ConfigurationVersion.parse(payload) ?: return null
+                return Policy(
+                    version, values, payload.has("group_name"), payload.opt("group_name") as? String,
+                    (payload.opt("deployed_at_ms") as? Number)?.toLong()?.takeIf { it > 0 },
+                    supportsApply,
+                )
+            }
+        }
+    }
+
+    private class Delivery(
+        val policy: Policy,
         val retryId: String?,
         val isCurrent: () -> Boolean,
     )
 
-    private val worker = Executors.newSingleThreadScheduledExecutor()
-    private val preferences = context.getSharedPreferences("configuration-packages", Context.MODE_PRIVATE)
-    private val boot = Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT, -1)
+    private class WifiHandoff(val attempt: ConfigurationAttempt) {
+        var completion: ConfigurationAttempt? = null
+    }
+
+    private val worker = dependencies.worker
+    private val boot = dependencies.bootCount
     private val listeners = CopyOnWriteArraySet<() -> Unit>()
+    private val screenListeners = CopyOnWriteArraySet<() -> Unit>()
     private var journal = runCatching {
-        preferences.getString("journal", null)?.let(ConfigurationJournal::restore) ?: ConfigurationJournal()
+        dependencies.readJournal()?.let(ConfigurationJournal::restore) ?: ConfigurationJournal()
     }.onFailure {
-        Log.e("ConfigurationPackages", "Could not read package application journal")
+        dependencies.logJournalError("Could not read package application journal")
     }.getOrNull()
     @Volatile private var reported: ConfigurationAttempt? = null
-    private var pending: Policy? = null
+    @Volatile private var screenState: ConfigurationScreenState? = null
+    private var latestPolicy = runCatching {
+        dependencies.readLastPolicy()?.let {
+            requireNotNull(Policy.parse(JSONObject(it), supportsApply = true)?.takeIf { it.version != null })
+        }
+    }.onFailure {
+        dependencies.logJournalError("Could not read the last configuration package")
+    }.getOrNull()
+    private var pending: Delivery? = null
     private var sdkReady = false
-    private var wifiOperationId: String? = null
+    private var wifiHandoff = journal?.latest
+        ?.takeIf { it.status == "interrupted" && it.wifiOperationId != null }
+        ?.let(::WifiHandoff)
 
     fun addStateListener(listener: () -> Unit) { listeners.add(listener) }
     fun removeStateListener(listener: () -> Unit) { listeners.remove(listener) }
+    fun addScreenListener(listener: () -> Unit) { screenListeners.add(listener) }
+    fun removeScreenListener(listener: () -> Unit) { screenListeners.remove(listener) }
+    fun screenSnapshot(): ConfigurationScreenState? = screenState
 
     init {
+        publishScreenState()
         wifi.addStateListener { worker.execute(::reconcile) }
     }
 
     fun snapshot(): JSONObject? = reported?.report()
 
     fun onSdkReady() {
-        val delay = (PICO_BOOT_SETTLE_MS - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
-        worker.schedule({
+        dependencies.scheduleSdkReady {
             sdkReady = true
             reconcile()
-        }, delay, TimeUnit.MILLISECONDS)
+        }
     }
 
-    fun receive(payload: JSONObject, isCurrent: () -> Boolean) {
-        val values = payload.getJSONObject("settings")
-        val version = if (payload.opt("package_id") === JSONObject.NULL && payload.opt("revision") === JSONObject.NULL) {
-            null
-        } else {
-            ConfigurationVersion.parse(payload) ?: return
-        }
+    fun receive(payload: JSONObject, supportsApply: Boolean = true, isCurrent: () -> Boolean) {
+        val policy = Policy.parse(payload, supportsApply) ?: return
         val retryId = payload.opt("retry_id") as? String
         if (payload.has("retry_id") &&
-            (retryId == null || version == null || !WifiSettingsProtocol.isValidUuid(retryId))
+            (!supportsApply || retryId == null || policy.version == null || !WifiSettingsProtocol.isValidUuid(retryId))
         ) return
         worker.execute {
             if (!isCurrent()) return@execute
             // A routine repeat of the exact policy should not cancel a queued Retry.
-            val queuedRetry = pending?.takeIf { it.version == version && it.isCurrent() }?.retryId
-            pending = Policy(version, values, retryId ?: queuedRetry, isCurrent)
+            val queuedRetry = pending?.takeIf { it.policy.version == policy.version && it.isCurrent() }?.retryId
+            latestPolicy = policy
+            if (supportsApply) {
+                saveLastPolicy(policy)
+                pending = Delivery(policy, retryId ?: queuedRetry, isCurrent)
+            }
             reconcile()
         }
     }
 
+    private fun saveLastPolicy(policy: Policy) {
+        val encoded = policy.version?.let { policy.encode() }
+        if (runCatching { dependencies.writeLastPolicy(encoded) }.getOrDefault(false)) return
+        dependencies.logJournalError("Could not save the last configuration package")
+        // On a failed replacement, try to remove the older copy before a restart.
+        if (encoded != null && !runCatching { dependencies.writeLastPolicy(null) }.getOrDefault(false)) {
+            dependencies.logJournalError("Could not remove the stale configuration package")
+        }
+    }
+
+    fun reapply(expected: ConfigurationVersion, onFinished: (Boolean) -> Unit) {
+        worker.execute {
+            val policy = latestPolicy
+            val started = if (policy?.version == expected && canReapply(policy)) {
+                val applyScalars = dependencies.scalarWriter()
+                applyScalars != null && startAttempt(expected, policy.values, journal?.find(expected), null, applyScalars)
+            } else false
+            publishScreenState()
+            onFinished(started)
+        }
+    }
+
+    private fun canReapply(policy: Policy): Boolean =
+        policy.supportsApply && policy.version != null &&
+            pending == null && wifiHandoff == null && journal != null && boot >= 0 && sdkReady &&
+            journal?.find(policy.version)?.status != "applying" &&
+            (policy.values.optJSONObject("wifi") == null || wifi.readyForPolicy())
+
+    private fun publishScreenState() {
+        val policy = latestPolicy ?: return
+        val attempt = policy.version?.let { journal?.find(it) }
+        val applyStatus = if (policy.supportsApply && policy.version != null) when {
+            attempt?.status == "applying" -> ConfigurationApplyStatus.APPLYING
+            pending?.policy === policy && pending?.isCurrent() == true -> ConfigurationApplyStatus.WAITING
+            attempt == null -> ConfigurationApplyStatus.WAITING
+            attempt.needsRetry -> ConfigurationApplyStatus.INCOMPLETE
+            else -> ConfigurationApplyStatus.APPLIED
+        } else null
+        val next = ConfigurationScreenState(
+            policy.groupKnown, policy.groupName, policy.version, policy.deployedAtMillis, applyStatus,
+            canReapply(policy),
+        )
+        if (screenState == next) return
+        screenState = next
+        screenListeners.forEach { it() }
+    }
+
     private fun reconcile() {
+        try {
+            reconcilePending()
+        } finally {
+            publishScreenState()
+        }
+    }
+
+    private fun reconcilePending() {
         if (!finishWifiIfReady()) return
 
-        val policy = pending ?: return
-        if (!policy.isCurrent()) {
+        val delivery = pending ?: return
+        if (!delivery.isCurrent()) {
             pending = null
             return
         }
+        val policy = delivery.policy
         val version = policy.version
         if (version == null) {
             pending = null
@@ -171,16 +302,16 @@ internal class ConfigurationPackageController(
             return
         }
 
-        val networks = policy.values.optJSONArray("wifi")
+        val wifiPolicy = policy.values.optJSONObject("wifi")
         // Releasing Wi-Fi ownership requires no settings writes or SDK bind.
-        if (networks == null) wifi.stopManagingPolicy(version.revision)
+        if (wifiPolicy == null) wifi.stopManagingPolicy(version.revision)
         val current = journal
         if (current == null) {
             pending = null
             return
         }
         val previous = current.find(version)
-        if (!current.shouldApply(version, boot, policy.retryId)) {
+        if (!current.shouldApply(version, boot, delivery.retryId)) {
             pending = null
             if (previous?.needsRetry == true) {
                 publish(previous)
@@ -190,84 +321,131 @@ internal class ConfigurationPackageController(
             return
         }
         if (boot < 0 || !sdkReady) return
-        val service = ToBServiceHelper.getInstance().serviceBinder as? IToBServiceProxy ?: return
-        if (networks != null && !wifi.readyForPolicy()) return
+        val applyScalars = dependencies.scalarWriter() ?: return
+        if (wifiPolicy != null && !wifi.readyForPolicy()) return
 
         pending = null
+        if (delivery.isCurrent()) {
+            startAttempt(version, policy.values, previous, delivery.retryId, applyScalars)
+        }
+    }
+
+    private fun startAttempt(
+        version: ConfigurationVersion,
+        values: JSONObject,
+        previous: ConfigurationAttempt?,
+        retryId: String?,
+        applyScalars: (JSONObject) -> JSONObject,
+    ): Boolean {
         // Claim the pair and any explicit Retry before writing. Recovery still owns
         // the Wi-Fi journal if the process dies during a mutation.
         val attempt = ConfigurationAttempt(
-            version, boot, retryIds = previous?.retryIds.orEmpty() + listOfNotNull(policy.retryId),
+            version, boot, retryIds = previous?.retryIds.orEmpty() + listOfNotNull(retryId),
         )
-        if (!persist(attempt)) return
+        if (!persist(attempt)) return false
+        publishScreenState()
 
-        val results = PicoDeviceSettings(context, service).apply(policy.values)
-        for (key in policy.values.keys()) {
+        val wifiPolicy = values.optJSONObject("wifi")
+        val results = applyScalars(values)
+        for (key in values.keys()) {
             if (key != "wifi" && !results.has(key)) {
                 results.put(key, settingOutcome("unsupported", reason = "UNSUPPORTED"))
             }
         }
-        if (networks == null) {
+        if (wifiPolicy == null) {
             finish(attempt.copy(status = "complete", results = results))
         } else {
-            updateAttempt(attempt.copy(results = results))
             val operationId = UUID.randomUUID().toString()
-            wifiOperationId = operationId
-            wifi.applyPolicy(JSONObject()
-                .put("operation_id", operationId)
-                .put("revision", version.revision)
-                .put("mode", "managed")
-                .put("networks", networks))
-        }
-    }
-
-    private fun finishWifiIfReady(): Boolean {
-        val operationId = wifiOperationId ?: return true
-        val progress = wifi.policyProgress(operationId)
-        val result = progress.result
-        val outcome = when {
-            result != null -> {
-                val status = when {
-                    result.status == "success" -> "applied"
-                    result.reason == WifiReason.UNSUPPORTED -> "unsupported"
-                    else -> "failed"
-                }
-                settingOutcome(status, reason = result.reason.takeUnless { it == WifiReason.NONE }?.wireValue)
-                    .put("rolled_back", result.rolledBack)
+            val checkpoint = attempt.copy(results = results, wifiOperationId = operationId)
+            if (!persist(checkpoint)) {
+                // The durable claim still fences this attempt. Wi-Fi has not been queued.
+                updateAttempt(attempt.copy(status = "interrupted", results = results))
+                return true
             }
-            progress.storageError -> settingOutcome("failed", reason = "STORAGE_ERROR")
-            else -> return false
+            wifiHandoff = WifiHandoff(checkpoint)
+            wifi.applyManagedPolicy(operationId, version.revision, values)
         }
-        val current = checkNotNull(journal?.latest)
-        val status = if (progress.settled) "complete" else "applying"
-        if (current.status != status || current.results.optJSONObject("wifi")?.toString() != outcome.toString()) {
-            val results = JSONObject(current.results.toString()).put("wifi", outcome)
-            val next = current.copy(status = status, results = results)
-            if (progress.settled) finish(next) else updateAttempt(next)
-        }
-        if (progress.settled) wifiOperationId = null
-        return progress.settled
-    }
-
-    private fun persist(next: ConfigurationAttempt): Boolean {
-        val updated = checkNotNull(journal).withAttempt(next)
-        if (!preferences.edit().putString("journal", updated.encode()).commit()) {
-            Log.e("ConfigurationPackages", "Could not persist package application journal")
-            return false
-        }
-        journal = updated
-        publish(next)
         return true
     }
 
-    private fun finish(next: ConfigurationAttempt) {
-        // The durable claim still reads as interrupted on restart if this save fails.
-        if (!persist(next)) updateAttempt(next.copy(status = "interrupted"))
+    private fun finishWifiIfReady(): Boolean {
+        val handoff = wifiHandoff ?: return true
+        val attempt = handoff.attempt
+        val recovering = attempt.status == "interrupted"
+        // Settle a restored handoff before a live or manual application can overwrite the receipt.
+        if (recovering && latestPolicy == null) return true
+        val shouldReport = !recovering || latestPolicy?.takeIf { it.supportsApply }?.version == attempt.version
+        handoff.completion?.let { return persistWifiCompletion(it, shouldReport) }
+
+        val progress = wifi.policyProgress(checkNotNull(attempt.wifiOperationId), attempt.version.revision)
+        val result = progress.result
+        val outcome = result?.let {
+            val status = when {
+                it.status == "success" -> "applied"
+                it.reason.isUnsupported -> "unsupported"
+                else -> "failed"
+            }
+            settingOutcome(status, reason = it.reason.takeUnless { reason -> reason == WifiReason.NONE }?.wireValue)
+                .put("rolled_back", it.rolledBack)
+        }
+        val results = outcome?.let { JSONObject(attempt.results.toString()).put("wifi", it) } ?: attempt.results
+        if (!progress.settled) {
+            if (!recovering && outcome != null &&
+                reported?.results?.optJSONObject("wifi")?.toString() != outcome.toString()
+            ) publish(attempt.copy(results = results))
+            return false
+        }
+
+        when {
+            result?.status == "success" || result?.status == "failed" -> {
+                val complete = attempt.copy(status = "complete", results = results, wifiOperationId = null)
+                // Wi-Fi can publish other results while this exact package completion awaits a save.
+                handoff.completion = complete
+                return persistWifiCompletion(complete, shouldReport)
+            }
+            result != null || progress.storageError -> {
+                val interruptedResults = if (outcome != null) results else JSONObject(results.toString())
+                    .put("wifi", settingOutcome("failed", reason = "STORAGE_ERROR"))
+                finish(attempt.copy(status = "interrupted", results = interruptedResults, wifiOperationId = null), shouldReport)
+            }
+            !recovering -> return false // The live handoff may still be queued on the Wi-Fi worker.
+            // A restored attempt without exact terminal proof stays interrupted.
+        }
+        wifiHandoff = null
+        return true
     }
 
-    private fun updateAttempt(next: ConfigurationAttempt) {
+    private fun persistWifiCompletion(complete: ConfigurationAttempt, shouldReport: Boolean): Boolean {
+        // Keep the handoff and its proof while storage is unavailable. A later event can retry.
+        if (!persist(complete, shouldReport)) return false
+        wifiHandoff = null
+        return true
+    }
+
+    private fun persist(next: ConfigurationAttempt, shouldReport: Boolean = true): Boolean {
+        val updated = checkNotNull(journal).withAttempt(next)
+        val saved = try {
+            dependencies.writeJournal(updated.encode())
+        } catch (_: Exception) {
+            false
+        }
+        if (!saved) {
+            dependencies.logJournalError("Could not persist package application journal")
+            return false
+        }
+        journal = updated
+        if (shouldReport) publish(next)
+        return true
+    }
+
+    private fun finish(next: ConfigurationAttempt, shouldReport: Boolean = true) {
+        // The durable claim still reads as interrupted on restart if this save fails.
+        if (!persist(next, shouldReport)) updateAttempt(next.copy(status = "interrupted"), shouldReport)
+    }
+
+    private fun updateAttempt(next: ConfigurationAttempt, shouldReport: Boolean = true) {
         journal = checkNotNull(journal).withAttempt(next)
-        publish(next)
+        if (shouldReport) publish(next)
     }
 
     private fun publish(next: ConfigurationAttempt) {
@@ -275,4 +453,28 @@ internal class ConfigurationPackageController(
         reported = next
         listeners.forEach { it() }
     }
+}
+
+private fun productionDependencies(context: Context): ConfigurationPackageDependencies {
+    val worker = Executors.newSingleThreadScheduledExecutor()
+    val preferences = context.getSharedPreferences("configuration-packages", Context.MODE_PRIVATE)
+    return ConfigurationPackageDependencies(
+        worker = worker,
+        scheduleSdkReady = { task ->
+            val delay = (PICO_BOOT_SETTLE_MS - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+            worker.schedule(task, delay, TimeUnit.MILLISECONDS)
+        },
+        bootCount = Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT, -1),
+        readJournal = { preferences.getString("journal", null) },
+        writeJournal = { preferences.edit().putString("journal", it).commit() },
+        readLastPolicy = {
+            if (supportsPico4UltraEnterpriseSettings()) preferences.getString("last_policy", null) else null
+        },
+        writeLastPolicy = { preferences.edit().putString("last_policy", it).commit() },
+        scalarWriter = {
+            (ToBServiceHelper.getInstance().serviceBinder as? IToBServiceProxy)
+                ?.let { PicoDeviceSettings(context, it)::apply }
+        },
+        logJournalError = { Log.e("ConfigurationPackages", it) },
+    )
 }

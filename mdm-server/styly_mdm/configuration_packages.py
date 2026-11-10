@@ -12,11 +12,14 @@ from .wifi_settings import (
 )
 
 CAPABILITY = "configuration_packages_v1"
+SUMMARY_CAPABILITY = "configuration_summary_v1"
 VERSION = 1
 MAX_PACKAGE_NAME_LEN = 64
 _REASONS = WIFI_REASONS | {
     "READ_FAILED", "WRITE_FAILED", "READBACK_MISMATCH", "INVALID_VALUE",
     "DELAY_CONFLICT", "UPDATE_TIMER_ACTIVE", "CALLBACK_TIMEOUT", "STORAGE_ERROR",
+    "UNSUPPORTED_HIDDEN_NETWORK",
+    "UNSUPPORTED_PRIORITY_NETWORK_LIMIT",
 }
 
 
@@ -44,17 +47,18 @@ def _delays(*seconds):
 
 SECTIONS = [
     {"id": "basic", "title": "Basic settings", "description": "Display, sleep and power", "items": [
-        _item("brightness", "Screen brightness", "Screen brightness level.", "range", 70, min=0, max=100),
+        _item("brightness", "Screen brightness", "Screen brightness level.", "range", 70, min=1, max=100),
         _item("autoSleep", "Auto sleep", "Enable automatic sleep.", "bool", False),
         _item("sleepDelay", "Sleep delay", "Time before the headset sleeps.", "delay", -1,
-              options=_delays(-1, 15, 30, 60, 300, 600, 1800)),
+              options=_delays(-1, 300, 600, 1800)),
         _item("screenOff", "Screen off delay", "Time before the screen turns off.", "delay", -1,
-              options=_delays(-1, 3, 10, 30, 60, 300, 600)),
+              options=_delays(-1, 30, 60, 300, 600)),
         _item("shutdown", "Scheduled shutdown", "Set the local time and days for shutdown.",
               "schedule", {"enabled": False, "hour": 0, "minute": 0, "repeat": 127}),
     ]},
     {"id": "network", "title": "Network & connectivity", "description": "Wi-Fi and Bluetooth", "items": [
-        _item("wifi", "Wi-Fi networks", "Enable auto-connect for the listed networks.", "wifi", []),
+        _item("wifi", "Wi-Fi networks", "Prefer networks in the listed order and optionally return to a higher-priority network.",
+              "wifi", {"networks": [], "auto_return": False}),
         _item("bluetooth", "Bluetooth", "Enable Bluetooth.", "bool", False),
         _item("wifiPower", "Wi-Fi power control", "Keep Wi-Fi connected during sleep.", "bool", True),
     ]},
@@ -83,6 +87,11 @@ SECTIONS = [
 _ITEMS = {
     item["id"]: item for section in SECTIONS for item in section["items"]
     if item["kind"] != "unavailable"
+}
+_LEGACY_SCALAR_VALUES = {
+    "brightness": frozenset({0}),
+    "sleepDelay": frozenset({15, 30, 60}),
+    "screenOff": frozenset({3, 10}),
 }
 
 
@@ -117,23 +126,47 @@ def _validate_delays(settings):
         raise PackageError("Screen off delay must not exceed sleep delay")
 
 
+def _validate_wifi(value, *, managed, previous=None):
+    if not isinstance(value, dict) or set(value) != {"networks", "auto_return"}:
+        raise PackageError("Wi-Fi value must contain networks and auto_return")
+    auto_return = value["auto_return"]
+    if type(auto_return) is not bool:
+        raise PackageError("auto_return must be a boolean")
+    previous_networks = previous.get("networks") if isinstance(previous, dict) else None
+    try:
+        networks = validate_profile_networks(
+            value["networks"], previous_networks, allow_empty=not managed,
+        )
+    except WiFiSettingsError as exc:
+        raise PackageError(str(exc)) from None
+    if managed and auto_return and any(network["hidden"] for network in networks):
+        raise PackageError("Automatic Wi-Fi return is not supported with hidden networks")
+    return {"networks": networks, "auto_return": auto_return}
+
+
 def _validate_value(key, value, *, managed=True, previous=None):
     item = _ITEMS.get(key)
     if item is None:
         raise PackageError("Settings contain an unsupported item")
     if key == "wifi":
-        if not managed and value == []:
-            return []
-        try:
-            return validate_profile_networks(value, previous)
-        except WiFiSettingsError as exc:
-            raise PackageError(str(exc)) from None
+        return _validate_wifi(value, managed=managed, previous=previous)
     if not _valid_value(item, value):
         raise PackageError(f"Invalid value for {item['label']}")
     return value
 
 
-def validate_draft(settings, previous=None):
+def _is_legacy_scalar_value(key, value):
+    return type(value) is int and value in _LEGACY_SCALAR_VALUES.get(key, ())
+
+
+def has_legacy_values(settings):
+    """Whether a flat published settings snapshot contains retired scalar values."""
+    return isinstance(settings, dict) and any(
+        _is_legacy_scalar_value(key, value) for key, value in settings.items()
+    )
+
+
+def _validate_draft(settings, previous=None, *, allow_legacy=False):
     if not isinstance(settings, dict):
         raise PackageError("settings must be an object")
     previous = previous or {}
@@ -143,11 +176,19 @@ def validate_draft(settings, previous=None):
                 or type(entry["managed"]) is not bool):
             raise PackageError("Each setting must have managed and value fields")
         managed = entry["managed"]
-        value = _validate_value(key, entry["value"], managed=managed,
-                                previous=previous.get(key, {}).get("value"))
+        raw_value = entry["value"]
+        value = (raw_value if allow_legacy and _is_legacy_scalar_value(key, raw_value)
+                 else _validate_value(key, raw_value, managed=managed,
+                                      previous=previous.get(key, {}).get("value")))
         result[key] = {"managed": managed, "value": value}
-    _validate_delays(managed_settings(result))
+    managed = managed_settings(result)
+    _validate_delays(managed)
     return result
+
+
+def validate_draft(settings, previous=None):
+    """Validate new draft input using only the current setting catalog."""
+    return _validate_draft(settings, previous)
 
 
 def managed_settings(settings):
@@ -162,12 +203,15 @@ def validate_name(value):
 
 def public_summary(package_id, profile):
     published = profile.get("published")
-    return {
+    summary = {
         "package_id": package_id,
         "name": profile["name"],
         "has_draft": "draft" in profile,
         "published_revision": published["revision"] if published else None,
     }
+    if published and has_legacy_values(published["settings"]):
+        summary["publication_requires_review"] = True
+    return summary
 
 
 def public_profile(package_id, profile, impact):
@@ -175,8 +219,8 @@ def public_profile(package_id, profile, impact):
     published = profile.get("published")
     settings = copy.deepcopy(draft["settings"]) if draft else {}
     if "wifi" in settings:
-        settings["wifi"]["value"] = public_networks(settings["wifi"]["value"])
-    return {
+        settings["wifi"]["value"]["networks"] = public_networks(settings["wifi"]["value"]["networks"])
+    result = {
         "package_id": package_id,
         "name": profile["name"],
         "draft_revision": draft["revision"] if draft else None,
@@ -187,16 +231,18 @@ def public_profile(package_id, profile, impact):
         "impact": impact,
     }
 
+    if published and has_legacy_values(published["settings"]):
+        result["publication_requires_review"] = True
+    return result
 
-def check_expected_revision(body, draft, *, allow_new):
+
+def check_expected_revision(body, draft):
     if "expected_revision" not in body:
         raise PackageError("expected_revision is required")
     expected = body["expected_revision"]
-    if expected is None and allow_new and draft is None:
-        return
     if expected is not None and normalize_revision(expected) is None:
         raise PackageError("expected_revision must be a canonical revision UUID")
-    if draft is None or expected != draft["revision"]:
+    if expected != (draft["revision"] if draft is not None else None):
         raise PackageError("The saved package draft changed or is missing. Reload the package.", 409)
 
 
@@ -218,9 +264,16 @@ def _validate_snapshots(snapshots, published_phase):
                 or not isinstance(snapshot.get("settings"), dict)):
             raise PackageError("Invalid saved configuration snapshot")
         if phase == "draft":
-            validate_draft(snapshot["settings"])
+            _validate_draft(snapshot["settings"], allow_legacy=True)
         else:
-            values = {key: _validate_value(key, value) for key, value in snapshot["settings"].items()}
+            if "deployed_at_ms" in snapshot and (
+                not _bounded_int(snapshot["deployed_at_ms"], 1, 253402300799999)
+            ):
+                raise PackageError("Invalid configuration deployment time")
+            values = {
+                key: value if _is_legacy_scalar_value(key, value) else _validate_value(key, value)
+                for key, value in snapshot["settings"].items()
+            }
             _validate_delays(values)
 
 

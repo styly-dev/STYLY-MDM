@@ -533,9 +533,9 @@ class WebSocketManager internal constructor(
                         json.optString("connection_id", "") != registration.provisionalConnectionId(webSocket)
                     ) {
                         Log.w(TAG, "Ignoring $logType for a different provisional connection")
-                    } else if (type == "CONFIGURATION_POLICY" && supportsPico4UltraEnterpriseSettings()) {
+                    } else if (type == "CONFIGURATION_POLICY") {
                         val owner = commandContext(webSocket) ?: return
-                        configurationPackages.receive(json, owner::isActive)
+                        configurationPackages.receive(json, supportsPico4UltraEnterpriseSettings(), owner::isActive)
                     } else if (type.isNotEmpty() && !pushCoordinator.handleServerMessage(type, json)) {
                         onCommand(type, json, commandContext(webSocket))
                     }
@@ -652,6 +652,7 @@ class WebSocketManager internal constructor(
                 put("device_id", identity.deviceId)
                 put("process_instance_id", pushFields!!.getString("process_instance_id"))
                 val capabilities = JSONArray(pushFields.getJSONArray("capabilities").toString())
+                capabilities.put(CONFIGURATION_SUMMARY_CAPABILITY)
                 if (supportsPico4UltraEnterpriseSettings()) {
                     capabilities.put(CONFIGURATION_PACKAGES_CAPABILITY)
                     configurationPackages.snapshot()?.let { put("configuration_state", it) }

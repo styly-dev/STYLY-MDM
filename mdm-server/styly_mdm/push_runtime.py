@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import uuid
-from collections.abc import Iterator, MutableMapping
+from collections.abc import Callable, Iterator, MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -167,7 +167,14 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
         self._push_admin_snapshot_sent = False
 
     async def send_str(self, data: str, compress: int | None = None) -> None:
+        await self.send_current_text(lambda: data, compress=compress)
+
+    async def send_current_text(self, resolve: Callable[[], str | None], *, compress: int | None = None) -> bool:
+        """Resolve and authorize the message at the serialized socket write."""
         async with self._push_send_lock:
+            data = resolve()
+            if data is None:
+                return False
             if self._push_path == "/ws/device" and self._push_runtime is not None:
                 payload = json.loads(data)
                 message_type = payload.get("type", "")
@@ -201,6 +208,7 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
                             "Device is not ready or command is not allowed"
                         )
             await super().send_str(data, compress=compress)
+            return True
 
     async def prepare(self, request: aiohttp_web.Request) -> Any:
         result = await super().prepare(request)

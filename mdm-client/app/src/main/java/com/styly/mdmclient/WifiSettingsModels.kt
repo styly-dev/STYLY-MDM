@@ -4,7 +4,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 internal const val WIFI_MANUAL_TIMEOUT_MS = 60_000L
-internal const val WIFI_MAX_NETWORKS = 32
+internal const val WIFI_MAX_NETWORKS = 4
 internal const val WIFI_MAX_OPERATION_RECEIPTS = 500
 
 internal fun appendWifiOperationReceipt(existing: List<String>, operationId: String): List<String> =
@@ -16,15 +16,23 @@ internal enum class WifiReason(val wireValue: String) {
     NONE("NONE"),
     PERMISSION_DENIED("PERMISSION_DENIED"),
     UNSUPPORTED("UNSUPPORTED"),
+    UNSUPPORTED_HIDDEN_NETWORK("UNSUPPORTED_HIDDEN_NETWORK"),
+    UNSUPPORTED_NETWORK_LIMIT("UNSUPPORTED_PRIORITY_NETWORK_LIMIT"),
     CONFIG_READ_FAILED("CONFIG_READ_FAILED"),
     UPDATE_FAILED("UPDATE_FAILED"),
     VERIFY_FAILED("VERIFY_FAILED"),
     TIMEOUT_ROLLED_BACK("TIMEOUT_ROLLED_BACK"),
     RESTORE_FAILED("RESTORE_FAILED"),
+    RESTORE_UNCONFIRMED("RESTORE_UNCONFIRMED"),
     BUSY("BUSY"),
     UNREACHABLE("UNREACHABLE"),
     UNKNOWN("UNKNOWN"),
 }
+
+internal val WifiReason.isUnsupported: Boolean
+    get() = this == WifiReason.UNSUPPORTED ||
+        this == WifiReason.UNSUPPORTED_HIDDEN_NETWORK ||
+        this == WifiReason.UNSUPPORTED_NETWORK_LIMIT
 
 internal data class WifiNetworkProfile(
     val ssid: String,
@@ -33,12 +41,16 @@ internal data class WifiNetworkProfile(
     val hidden: Boolean,
 ) {
     val identity: String get() = "$ssid\u0000$security"
+    val requiresSaeOnly: Boolean get() = security == "WPA2_WPA3" && password.length in 1..7
 }
 
 internal data class WifiSavedProfile(
     val revision: String,
     val networks: List<WifiNetworkProfile>,
+    val autoReturn: Boolean = false,
 )
+
+internal data class WifiRollbackTarget(val ssid: String, val security: String)
 
 internal data class WifiAutoJoinState(
     val networkId: Int,
@@ -56,6 +68,7 @@ internal enum class WifiManualPhase(val wireValue: String) {
     PREPARED("prepared"),
     APPLYING("applying"),
     ROLLING_BACK("rolling_back"),
+    RESTORING_CONNECTION("restoring_connection"),
 }
 
 internal data class WifiManualOperation(
@@ -68,6 +81,18 @@ internal data class WifiManualOperation(
     val failureReason: WifiReason? = null,
     val settingsChanged: Boolean = false,
     val policyEpoch: Long = 0L,
+    val autoReturn: Boolean = false,
+    val selectionOnly: Boolean = false,
+    val selectionIndexes: List<Int>? = null,
+    val retryDisconnected: Boolean = false,
+    val priorConnectionHadUsableIp: Boolean = false,
+    val restoreTarget: WifiRollbackTarget? = null,
+    val settingsRestored: Boolean = false,
+    val restoreStartedElapsedMillis: Long? = null,
+    val restoreDeadlineElapsedMillis: Long? = null,
+    val restoreBootCount: Int? = null,
+    val restoreRetryCount: Int = 0,
+    val restoreUnconfirmedReported: Boolean = false,
 )
 
 internal data class WifiManualResult(
@@ -93,16 +118,18 @@ internal enum class WifiApplyMode(val wireValue: String) {
     UNMANAGED("unmanaged"),
 }
 
+internal class WifiPolicyFailure(val reason: WifiReason) : Exception()
+
 internal data class WifiApplyCommand(
     val operationId: String,
     val revision: String,
     val mode: WifiApplyMode,
     val networks: List<WifiNetworkProfile>,
+    val autoReturn: Boolean = false,
 )
 
 internal object WifiSettingsProtocol {
     private val UUID_V4 = Regex("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
-    private val RAW_PSK = Regex("^[0-9a-fA-F]{64}$")
 
     fun parseApplyCommand(payload: JSONObject): WifiApplyCommand {
         if (payload.has("recovery_scope")) {
@@ -114,8 +141,26 @@ internal object WifiSettingsProtocol {
         requireUuid(revision, "revision")
         val mode = WifiApplyMode.entries.firstOrNull { it.wireValue == requiredString(payload, "mode") }
             ?: throw IllegalArgumentException("unsupported Wi-Fi apply mode")
-        val networkArray = payload.optJSONArray("networks")
-            ?: throw IllegalArgumentException("networks must be an array")
+        val wifi = payload.optJSONObject("wifi")
+            ?: if (mode == WifiApplyMode.UNMANAGED) JSONObject() else throw IllegalArgumentException("wifi must be an object")
+        val networkArray = wifi.optJSONArray("networks")
+            ?: if (mode == WifiApplyMode.UNMANAGED) JSONArray() else throw IllegalArgumentException("wifi.networks must be an array")
+        val autoReturn = if (mode == WifiApplyMode.MANAGED) requiredBoolean(wifi, "auto_return") else false
+        if (mode == WifiApplyMode.MANAGED && networkArray.length() > WIFI_MAX_NETWORKS) {
+            throw WifiPolicyFailure(WifiReason.UNSUPPORTED_NETWORK_LIMIT)
+        }
+        if (autoReturn && networkArrayHasHidden(networkArray)) {
+            throw WifiPolicyFailure(WifiReason.UNSUPPORTED_HIDDEN_NETWORK)
+        }
+        val networks = parseNetworks(networkArray, mode)
+        return WifiApplyCommand(operationId, revision, mode, networks, autoReturn)
+    }
+
+    private fun networkArrayHasHidden(array: JSONArray): Boolean = (0 until array.length()).any { index ->
+        array.optJSONObject(index)?.optBoolean("hidden", false) == true
+    }
+
+    fun parseNetworks(networkArray: JSONArray, mode: WifiApplyMode): List<WifiNetworkProfile> {
         if (mode == WifiApplyMode.MANAGED && networkArray.length() !in 1..WIFI_MAX_NETWORKS) {
             throw IllegalArgumentException("managed networks must contain 1..$WIFI_MAX_NETWORKS items")
         }
@@ -138,7 +183,7 @@ internal object WifiSettingsProtocol {
             }
             networks.add(network)
         }
-        return WifiApplyCommand(operationId, revision, mode, networks)
+        return networks
     }
 
     fun validateNetwork(ssid: String, security: String, password: String) {
@@ -147,10 +192,10 @@ internal object WifiSettingsProtocol {
         require(ssid.none { it.isISOControl() || it == '"' || it == '\\' }) { "unsupported SSID characters" }
         when (security) {
             "OPEN" -> require(password.isEmpty()) { "OPEN networks must not have a password" }
-            "WPA_PSK" -> {
+            "WPA2_WPA3" -> {
                 val printableAscii = password.all { it.code in 0x20..0x7e }
-                require((printableAscii && password.length in 8..63) || RAW_PSK.matches(password)) {
-                    "invalid WPA PSK password"
+                require(printableAscii && password.length in 1..63) {
+                    "WPA2_WPA3 password must contain 1..63 printable ASCII characters"
                 }
             }
             else -> throw IllegalArgumentException("unsupported Wi-Fi security mode")
@@ -179,7 +224,7 @@ internal object WifiSettingsProtocol {
 }
 
 internal object WifiSettingsCodec {
-    private const val VERSION = 1
+    private const val VERSION = 2
 
     fun encode(state: WifiLocalState): String = JSONObject().apply {
         put("version", VERSION)
@@ -194,7 +239,15 @@ internal object WifiSettingsCodec {
 
     fun decode(text: String): WifiLocalState {
         val root = JSONObject(text)
-        if (root.optInt("version", -1) != VERSION) {
+        val version = root.optInt("version", -1)
+        if (version == 1) {
+            if (!root.has("manual_operation") || !root.isNull("manual_operation")) {
+                throw IllegalArgumentException("old Wi-Fi recovery must finish before updating")
+            }
+            // Completed prototype state is intentionally discarded; pending recovery is never.
+            return WifiLocalState(managedWifi = false)
+        }
+        if (version != VERSION) {
             throw IllegalArgumentException("unsupported Wi-Fi state version")
         }
         return WifiLocalState(
@@ -211,11 +264,13 @@ internal object WifiSettingsCodec {
     private fun encodeSavedProfile(profile: WifiSavedProfile) = JSONObject().apply {
         put("revision", profile.revision)
         put("networks", encodeNetworks(profile.networks))
+        put("auto_return", profile.autoReturn)
     }
 
     private fun decodeSavedProfile(json: JSONObject) = WifiSavedProfile(
         revision = json.getString("revision"),
         networks = decodeNetworks(json.getJSONArray("networks")),
+        autoReturn = requiredBoolean(json, "auto_return", default = false),
     )
 
     private fun encodeManualOperation(operation: WifiManualOperation) = JSONObject().apply {
@@ -228,6 +283,20 @@ internal object WifiSettingsCodec {
         put("failure_reason", operation.failureReason?.wireValue ?: JSONObject.NULL)
         put("settings_changed", operation.settingsChanged)
         put("policy_epoch", operation.policyEpoch)
+        put("auto_return", operation.autoReturn)
+        put("selection_only", operation.selectionOnly)
+        operation.selectionIndexes?.let { put("selection_indexes", JSONArray(it)) }
+        put("retry_disconnected", operation.retryDisconnected)
+        put("prior_connection_had_usable_ip", operation.priorConnectionHadUsableIp)
+        operation.restoreTarget?.let {
+            put("restore_target", JSONObject().put("ssid", it.ssid).put("security", it.security))
+        } ?: put("restore_target", JSONObject.NULL)
+        put("settings_restored", operation.settingsRestored)
+        put("restore_started_elapsed_ms", operation.restoreStartedElapsedMillis ?: JSONObject.NULL)
+        put("restore_deadline_elapsed_ms", operation.restoreDeadlineElapsedMillis ?: JSONObject.NULL)
+        put("restore_boot_count", operation.restoreBootCount ?: JSONObject.NULL)
+        put("restore_retry_count", operation.restoreRetryCount)
+        put("restore_unconfirmed_reported", operation.restoreUnconfirmedReported)
     }
 
     private fun decodeManualOperation(json: JSONObject) = WifiManualOperation(
@@ -241,6 +310,35 @@ internal object WifiSettingsCodec {
         failureReason = optionalString(json, "failure_reason")?.let(::reasonFromWire),
         settingsChanged = requiredBoolean(json, "settings_changed", default = false),
         policyEpoch = json.optLong("policy_epoch", 0L).coerceAtLeast(0L),
+        autoReturn = requiredBoolean(json, "auto_return", default = false),
+        selectionOnly = requiredBoolean(json, "selection_only", default = false),
+        selectionIndexes = json.optJSONArray("selection_indexes")?.let { array ->
+            val candidateCount = json.getJSONArray("candidate").length()
+            buildList {
+                for (index in 0 until array.length()) {
+                    val value = array.get(index)
+                    require(value is Int && value in 0 until candidateCount) {
+                        "invalid Wi-Fi selection index"
+                    }
+                    add(value)
+                }
+            }.also { indexes ->
+                require(indexes.isNotEmpty() && indexes.distinct().size == indexes.size) {
+                    "invalid Wi-Fi selection order"
+                }
+            }
+        },
+        retryDisconnected = requiredBoolean(json, "retry_disconnected", default = false),
+        priorConnectionHadUsableIp = requiredBoolean(json, "prior_connection_had_usable_ip", default = false),
+        restoreTarget = json.optJSONObject("restore_target")?.let {
+            WifiRollbackTarget(it.getString("ssid"), it.getString("security"))
+        },
+        settingsRestored = requiredBoolean(json, "settings_restored", default = false),
+        restoreStartedElapsedMillis = optionalLong(json, "restore_started_elapsed_ms"),
+        restoreDeadlineElapsedMillis = optionalLong(json, "restore_deadline_elapsed_ms"),
+        restoreBootCount = optionalLong(json, "restore_boot_count")?.toInt()?.takeIf { it >= 0 },
+        restoreRetryCount = json.optInt("restore_retry_count", 0).coerceAtLeast(0),
+        restoreUnconfirmedReported = requiredBoolean(json, "restore_unconfirmed_reported", default = false),
     )
 
     private fun encodeRecoverySnapshot(snapshot: WifiRecoverySnapshot) = JSONObject().apply {
@@ -350,6 +448,13 @@ internal object WifiSettingsCodec {
         val value = json.get(key)
         if (value !is Number) throw IllegalArgumentException("$key must be a number")
         return value.toLong()
+    }
+
+    private fun optionalBoolean(json: JSONObject, key: String): Boolean? {
+        if (!json.has(key) || json.isNull(key)) return null
+        val value = json.get(key)
+        if (value !is Boolean) throw IllegalArgumentException("$key must be a boolean")
+        return value
     }
 
     private fun requiredBoolean(json: JSONObject, key: String, default: Boolean): Boolean {

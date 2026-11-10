@@ -43,45 +43,123 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="@string/wifi_exact_alarm_label"
-            android:textSize="14sp"
-            android:layout_marginTop="8dp"
-            android:layout_marginBottom="8dp" />
-
-        <TextView
-            android:id="@+id/wifi_exact_alarm_status"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:textSize="14sp"
+            android:accessibilityHeading="true"
+            android:text="@string/configuration_section_label"
+            android:textSize="18sp"
             android:textStyle="bold"
             android:layout_marginBottom="8dp" />
 
         <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:id="@+id/configuration_group"
+            android:text="@string/configuration_group_unknown"
+            android:textSize="16sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:id="@+id/configuration_deployment"
+            android:textSize="14sp"
+            android:layout_marginTop="4dp"
+            android:visibility="gone" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:id="@+id/configuration_apply_status"
+            android:textSize="14sp"
+            android:layout_marginTop="4dp"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/configuration_reapply"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/configuration_reapply"
+            android:visibility="gone" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:accessibilityHeading="true"
+            android:text="@string/permissions_section_label"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp"
+            android:layout_marginTop="24dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/storage_permission_label"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:layout_marginTop="12dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:id="@+id/storage_permission_status"
+            android:textSize="14sp"
+            android:layout_marginTop="2dp" />
+
+        <Button
+            android:id="@+id/grant_storage_button"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/grant_all_files_access"
+            android:visibility="gone" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/wifi_location_permission_label"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:layout_marginTop="12dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
             android:id="@+id/wifi_location_permission_status"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
             android:textSize="14sp"
-            android:textStyle="bold"
-            android:layout_marginBottom="8dp" />
+            android:layout_marginTop="2dp" />
 
         <Button
             android:id="@+id/wifi_location_permission_button"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/wifi_location_permission_button"
-            android:layout_marginBottom="8dp" />
+            android:visibility="gone" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/wifi_exact_alarm_label"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:layout_marginTop="12dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:id="@+id/wifi_exact_alarm_status"
+            android:textSize="14sp"
+            android:layout_marginTop="2dp" />
 
         <Button
             android:id="@+id/wifi_exact_alarm_button"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/wifi_exact_alarm_button"
-            android:layout_marginBottom="24dp" />
+            android:visibility="gone" />
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/server_url_label"
+            android:layout_marginTop="32dp"
             android:textSize="14sp"
             android:layout_marginBottom="8dp" />
 
@@ -150,28 +228,6 @@
             android:textIsSelectable="true"
             android:textSize="16sp"
             android:textStyle="bold" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/storage_permission_label"
-            android:textSize="14sp"
-            android:layout_marginTop="32dp"
-            android:layout_marginBottom="8dp" />
-
-        <TextView
-            android:id="@+id/storage_permission_status"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:textSize="16sp"
-            android:textStyle="bold"
-            android:layout_marginBottom="8dp" />
-
-        <Button
-            android:id="@+id/grant_storage_button"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/grant_all_files_access" />
 
         <TextView
             android:layout_width="match_parent"

@@ -16,7 +16,7 @@ from styly_mdm.wifi_settings import (
 def _networks(password: str | None = "correct-horse") -> list[dict]:
     return [{
         "ssid": "Studio Wi-Fi",
-        "security": "WPA_PSK",
+        "security": "WPA2_WPA3",
         "password": password,
         "hidden": False,
     }]
@@ -27,7 +27,7 @@ def test_profile_validation_preserves_saved_password_and_accepts_overwrite():
     retained = validate_profile_networks(_networks(None), previous)
     assert retained[0]["password"] == "correct-horse"
     assert public_networks(retained) == [{
-        "ssid": "Studio Wi-Fi", "security": "WPA_PSK", "password_present": True, "hidden": False,
+        "ssid": "Studio Wi-Fi", "security": "WPA2_WPA3", "password_present": True, "hidden": False,
     }]
     assert validate_profile_networks(_networks("new-password"), previous)[0]["password"] == "new-password"
 
@@ -35,19 +35,43 @@ def test_profile_validation_preserves_saved_password_and_accepts_overwrite():
         "ssid": "日本語", "security": "OPEN", "password": "", "hidden": True,
     }])[0]["ssid"] == "日本語"
     assert validate_profile_networks([{
-        "ssid": "Office", "security": "WPA_PSK", "password": "a" * 64, "hidden": False,
-    }])[0]["password"] == "a" * 64
+        "ssid": "Office", "security": "WPA2_WPA3", "password": "a", "hidden": False,
+    }])[0]["password"] == "a"
 
     for ssid in ("", "a" * 33, "bad\nname", 'bad"name', "bad\\name", "\ud800"):
         with pytest.raises(WiFiSettingsError):
             validate_profile_networks([{
                 "ssid": ssid, "security": "OPEN", "password": "", "hidden": False,
             }])
-    for password in ("short", "пароль", "bad\npass"):
+    for password in ("", "a" * 64, "пароль", "bad\npass", "bad\x7fpass"):
         with pytest.raises(WiFiSettingsError):
             validate_profile_networks([{
-                "ssid": "Office", "security": "WPA_PSK", "password": password, "hidden": False,
+                "ssid": "Office", "security": "WPA2_WPA3", "password": password, "hidden": False,
             }])
+
+    assert validate_profile_networks([{
+        "ssid": "Office", "security": "WPA2_WPA3", "password": "a" * 63, "hidden": False,
+    }])[0]["password"] == "a" * 63
+
+
+def test_network_limit_empty_unmanaged_and_same_ssid_security_identity():
+    assert validate_profile_networks([], allow_empty=True) == []
+    with pytest.raises(WiFiSettingsError):
+        validate_profile_networks([])
+
+    same_ssid = [
+        {"ssid": "Dual", "security": "OPEN", "password": "", "hidden": False},
+        {"ssid": "Dual", "security": "WPA2_WPA3", "password": "secret", "hidden": False},
+    ]
+    assert len(validate_profile_networks(same_ssid)) == 2
+    duplicate = same_ssid + [same_ssid[1]]
+    with pytest.raises(WiFiSettingsError, match="duplicate SSID"):
+        validate_profile_networks(duplicate)
+    with pytest.raises(WiFiSettingsError, match="at most 4"):
+        validate_profile_networks([
+            {"ssid": f"Network {index}", "security": "OPEN", "password": "", "hidden": False}
+            for index in range(5)
+        ])
 
 
 def test_wifi_state_never_forwards_credentials_or_unvalidated_results():
