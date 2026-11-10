@@ -18,6 +18,8 @@ import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import java.text.DateFormat
+import java.util.Date
 
 /**
  * Settings screen for configuring the STYLY-MDM server address
@@ -39,6 +41,17 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var exactAlarmButton: Button
     private lateinit var wifiLocationStatus: TextView
     private lateinit var wifiLocationButton: Button
+    private lateinit var configurationGroup: TextView
+    private lateinit var configurationDeployment: TextView
+    private lateinit var configurationApplyStatus: TextView
+    private lateinit var reapplyButton: Button
+
+    private val configurationController get() = MdmClientApplication.configurationPackageController()
+    private var configurationVisible = false
+    private var reapplyPending = false
+    private val configurationListener: () -> Unit = {
+        runOnUiThread { if (configurationVisible) updateConfigurationUi() }
+    }
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -95,6 +108,10 @@ class SettingsActivity : AppCompatActivity() {
         exactAlarmButton = findViewById(R.id.wifi_exact_alarm_button)
         wifiLocationStatus = findViewById(R.id.wifi_location_permission_status)
         wifiLocationButton = findViewById(R.id.wifi_location_permission_button)
+        configurationGroup = findViewById(R.id.configuration_group)
+        configurationDeployment = findViewById(R.id.configuration_deployment)
+        configurationApplyStatus = findViewById(R.id.configuration_apply_status)
+        reapplyButton = findViewById(R.id.configuration_reapply)
 
         serverUrlInput.setText(WebSocketManager.getManualServerAddress(this).orEmpty())
 
@@ -137,6 +154,9 @@ class SettingsActivity : AppCompatActivity() {
         updateStoragePermissionUi()
         updateExactAlarmUi()
         updateWifiLocationUi()
+        configurationVisible = true
+        configurationController.addScreenListener(configurationListener)
+        updateConfigurationUi()
         permissionRecoveryPending = hasAllFilesAccess()
         MdmClientApplication.deviceIdentityResolver().addListener(identityListener)
         refreshJournal()
@@ -148,9 +168,64 @@ class SettingsActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        configurationVisible = false
+        configurationController.removeScreenListener(configurationListener)
         permissionRecoveryPending = false
         unregisterReceiver(statusReceiver)
         MdmClientApplication.deviceIdentityResolver().removeListener(identityListener)
+    }
+
+    private fun updateConfigurationUi() {
+        val state = configurationController.screenSnapshot()
+        val version = state?.version
+        configurationGroup.text = when {
+            state?.groupName != null -> getString(R.string.configuration_group, state.groupName)
+            state?.groupKnown == true -> getString(R.string.configuration_group_none)
+            else -> getString(R.string.configuration_group_unknown)
+        }
+        configurationDeployment.visibility =
+            if (version != null || state?.groupName != null) View.VISIBLE else View.GONE
+        configurationDeployment.text = when {
+            version == null -> getString(R.string.configuration_not_deployed)
+            state.deployedAtMillis == null -> getString(R.string.configuration_deployment_unknown)
+            else -> getString(
+                R.string.configuration_deployment,
+                DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
+                    .format(Date(state.deployedAtMillis)),
+            )
+        }
+        val status = state?.applyStatus
+        val statusText = when {
+            version == null -> 0
+            status == null -> R.string.configuration_unsupported
+            status == ConfigurationApplyStatus.APPLYING -> R.string.configuration_applying
+            status == ConfigurationApplyStatus.WAITING -> R.string.configuration_waiting
+            status == ConfigurationApplyStatus.APPLIED -> R.string.configuration_applied
+            else -> R.string.configuration_incomplete
+        }
+        configurationApplyStatus.visibility = if (statusText != 0) View.VISIBLE else View.GONE
+        if (statusText != 0) configurationApplyStatus.setText(statusText)
+        reapplyButton.visibility = if (status != null) View.VISIBLE else View.GONE
+        reapplyButton.isEnabled = state?.canReapply == true && !reapplyPending
+        reapplyButton.setOnClickListener {
+            if (version != null && !reapplyPending) reapplyConfiguration(version)
+        }
+    }
+
+    private fun reapplyConfiguration(version: ConfigurationVersion) {
+        reapplyPending = true
+        reapplyButton.isEnabled = false
+        configurationController.reapply(version) { started ->
+            runOnUiThread {
+                reapplyPending = false
+                if (configurationVisible) {
+                    updateConfigurationUi()
+                    if (!started) {
+                        Toast.makeText(this, R.string.configuration_reapply_unavailable, Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
     }
 
     private fun saveAndRestart() {

@@ -5,8 +5,11 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-MAX_WIFI_NETWORKS = 32
+MAX_WIFI_NETWORKS = 4
 MAX_SSID_BYTES = 32
+PRIORITY_MONITOR_STATES = frozenset({
+    "off", "monitoring", "degraded", "switching", "unsupported",
+})
 
 
 class WiFiSettingsError(ValueError):
@@ -30,7 +33,8 @@ def normalize_revision(value: Any) -> str | None:
 WIFI_REASONS = {
     "NONE", "PERMISSION_DENIED", "UNSUPPORTED", "CONFIG_READ_FAILED",
     "UPDATE_FAILED", "VERIFY_FAILED", "TIMEOUT_ROLLED_BACK", "RESTORE_FAILED",
-    "BUSY", "UNREACHABLE", "UNKNOWN",
+    "RESTORE_UNCONFIRMED", "BUSY", "UNREACHABLE", "UNKNOWN", "UNSUPPORTED_HIDDEN_NETWORK",
+    "UNSUPPORTED_PRIORITY_NETWORK_LIMIT",
 }
 
 
@@ -59,18 +63,24 @@ def public_wifi_state(raw: Any) -> dict | None:
     reason = raw.get("unavailable_reason")
     if reason is not None and reason not in tuple(WIFI_REASONS | {"INITIALIZING", "STORAGE_ERROR"}):
         return None
-    return {
+    state = {
         "managed": raw.get("managed"), "policy_revision": revision, "last_result": result,
         "busy": raw["busy"], "available": raw["available"], "unavailable_reason": reason,
     }
+    priority_monitor = raw.get("priority_monitor")
+    if isinstance(priority_monitor, str) and priority_monitor in PRIORITY_MONITOR_STATES:
+        state["priority_monitor"] = priority_monitor
+    return state
 
 
 def validate_profile_networks(
     raw_networks: Any,
     previous: list[dict[str, Any]] | None = None,
+    *,
+    allow_empty: bool = False,
 ) -> list[dict[str, Any]]:
-    """Validate submitted networks and preserve saved PSKs omitted by the form."""
-    if not isinstance(raw_networks, list) or not raw_networks:
+    """Validate ordered Wi-Fi networks and preserve omitted passwords by identity."""
+    if not isinstance(raw_networks, list) or (not raw_networks and not allow_empty):
         raise WiFiSettingsError("networks must be a non-empty list")
     if len(raw_networks) > MAX_WIFI_NETWORKS:
         raise WiFiSettingsError(f"networks may contain at most {MAX_WIFI_NETWORKS} entries")
@@ -100,8 +110,8 @@ def validate_profile_networks(
             raise WiFiSettingsError("ssid contains unsupported characters")
 
         security = raw.get("security")
-        if not isinstance(security, str) or security not in {"OPEN", "WPA_PSK"}:
-            raise WiFiSettingsError("security must be OPEN or WPA_PSK")
+        if not isinstance(security, str) or security not in {"OPEN", "WPA2_WPA3"}:
+            raise WiFiSettingsError("security must be OPEN or WPA2_WPA3")
         hidden = raw.get("hidden")
         if not isinstance(hidden, bool):
             raise WiFiSettingsError("hidden must be a boolean")
@@ -118,17 +128,15 @@ def validate_profile_networks(
         elif supplied_password is None:
             old = previous_by_identity.get(identity)
             if old is None or not isinstance(old.get("password"), str) or not old["password"]:
-                raise WiFiSettingsError("a password is required for a new WPA_PSK network")
+                raise WiFiSettingsError("a password is required for a new WPA2_WPA3 network")
             password = old["password"]
         elif isinstance(supplied_password, str):
             try:
                 encoded = supplied_password.encode("ascii")
             except UnicodeEncodeError:
-                raise WiFiSettingsError("WPA_PSK password must be ASCII") from None
-            is_hex_psk = len(encoded) == 64 and all(ch in b"0123456789abcdefABCDEF" for ch in encoded)
-            has_control = any(ord(char) < 0x20 or 0x7f <= ord(char) <= 0x9f for char in supplied_password)
-            if has_control or (not is_hex_psk and not 8 <= len(encoded) <= 63):
-                raise WiFiSettingsError("WPA_PSK password must be 8 to 63 ASCII characters or 64 hex digits")
+                raise WiFiSettingsError("WPA2_WPA3 password must be printable ASCII") from None
+            if not 1 <= len(encoded) <= 63 or any(byte < 0x20 or byte > 0x7e for byte in encoded):
+                raise WiFiSettingsError("WPA2_WPA3 password must be 1 to 63 printable ASCII characters")
             password = supplied_password
         else:
             raise WiFiSettingsError("password must be a string or null")
@@ -143,7 +151,7 @@ def public_networks(networks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         {
             "ssid": network["ssid"],
             "security": network["security"],
-            "password_present": network["security"] == "WPA_PSK" and bool(network.get("password")),
+            "password_present": network["security"] == "WPA2_WPA3" and bool(network.get("password")),
             "hidden": network["hidden"],
         }
         for network in networks

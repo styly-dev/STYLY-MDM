@@ -17,10 +17,10 @@ GUID = "64b19041-0b8c-4ef4-82fd-000000000000"
 
 @pytest.fixture(autouse=True)
 def reset_state(monkeypatch):
+    monkeypatch.setattr(server, "_configuration", server._ConfigurationRegistry())
     for collection in (
         server.devices,
         server.device_registry,
-        server.device_groups,
         server.provisional_connections,
         server.admin_connections,
         server.pending_self_updates,
@@ -360,6 +360,7 @@ def test_canonical_socket_rejects_identity_change(tmp_path):
 def test_canonical_registration_is_new_device_and_does_not_settle_legacy_update(tmp_path):
     async def body():
         server._apply_data_dir(str(tmp_path))
+        server.REGISTRY_PATH.write_text(json.dumps({"devices": {}, "groups": {"old-group": ["SERIAL-1"]}}))
         test_server = TestServer(server.create_app())
         await test_server.start_server()
         base = f"http://{test_server.host}:{test_server.port}"
@@ -374,7 +375,6 @@ def test_canonical_registration_is_new_device_and_does_not_settle_legacy_update(
                 })
                 await recv_type(legacy, "REGISTERED")
                 server.device_registry["SERIAL-1"]["label"] = "Old label"
-                server.device_groups["old-group"] = ["SERIAL-1"]
                 await legacy.send_json({
                     "type": "SELF_UPDATE_STARTING",
                     "correlation_id": "update-1",
@@ -394,7 +394,7 @@ def test_canonical_registration_is_new_device_and_does_not_settle_legacy_update(
                 assert "SERIAL-1" in server.device_registry
                 assert GUID in server.device_registry
                 assert server.device_registry[GUID]["label"] == ""
-                assert server.device_groups == {"old-group": ["SERIAL-1"]}
+                assert json.loads(server.build_group_list_msg())["groups"] == {"old-group": ["SERIAL-1"]}
                 assert "SERIAL-1" in server.pending_self_updates
                 persisted = json.loads(server.REGISTRY_PATH.read_text())
                 assert set(persisted["devices"]) == {"SERIAL-1", GUID}
@@ -519,7 +519,7 @@ def test_admin_label_and_group_survive_reload_without_mode(tmp_path, monkeypatch
             await recv_type(admin, "GROUP_MEMBERS_SET")
             server.load_registry()
             assert server.device_registry[GUID]["label"] == "Reserved"
-            assert server.device_groups["Old"] == ["SERIAL-1", GUID]
+            assert json.loads(server.build_group_list_msg())["groups"]["Old"] == ["SERIAL-1", GUID]
             device = await client.ws_connect(ts.make_url("/ws/device"))
             await device.send_json({"type": "REGISTER", "device_id": "SERIAL-1"})
             await recv_type(device, "REGISTERED")

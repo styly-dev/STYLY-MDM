@@ -5,7 +5,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class WifiProfileReadbackTest {
-    private val office = WifiNetworkProfile("office", "WPA_PSK", "test-key-123", false)
+    private val office = WifiNetworkProfile("office", "WPA2_WPA3", "test-key-123", false)
 
     @Test
     fun `multiple security views share the selected network and retain disabled unrelated settings`() {

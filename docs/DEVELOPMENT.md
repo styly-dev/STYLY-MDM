@@ -86,20 +86,43 @@ package reference. Multiple groups can reference the same package. Packages
 hold a draft and the current published snapshot. The editor exposes the PICO 4
 Ultra Enterprise settings catalog under **Manage Groups → Configuration Packages**.
 
-Save updates the draft. Publish creates a new revision and distributes it to
-all groups assigned to that package. The confirmation includes every assigned
-group and every member, including offline devices. Publishing checks the draft
-revision and the displayed impact together. Group **Settings** assigns a package
-and shows the per-device results. Choose **Create package…** at the bottom of
-the assignment menu to open the package creation form. If the device's
-effective published snapshot omits a setting, the client releases management
-and leaves the device value in place. Deleting a group removes its reference
-and releases its members.
+In the editor, **Save & deploy** saves the edits and publishes a new revision
+in one commit for all groups using the package. In group **Settings**, **Deploy**
+selects a package for the group and applies its current deployed version. If the
+package only has a saved draft, the operation assigns it to the group and deploys
+the first revision together. Deploying the package already selected for the group
+creates a new revision from its saved draft and deploys it to all groups using it.
+Select **No package** and **Deploy** to clear all managed settings for just that
+group. The client leaves current device values in place. There is no revision
+to report in **Device status** for that group.
+The confirmation counts every affected group and member, including offline
+devices. The server checks the revision and targets shown at confirmation. A
+disabled deployment button has an explanation next to it.
+**Device status** shows **Applied** as the number of members that reported
+success for the current deployed version out of all members, including offline
+members. The count is green when all devices succeeded, red when every device
+failed or could not apply the revision, and yellow while any other deployment
+is incomplete. Packages awaiting their first deployment and empty groups show
+a neutral count. In the console's **Groups** tab, the package name and the
+current revision's **Applied** count appear in the right column of each group
+card, beside the member preview. The column also identifies groups without a
+package or without a deployed revision.
+Choose **Create package…** from the **Package for this group**
+menu to open the package creation form. If the device's effective published
+snapshot omits a setting, the client releases management and leaves the device
+value in place. Deleting a group removes its reference and releases its members.
 A referenced package cannot be deleted.
 
+Groups, their package references and the package catalog form one committed
+registry snapshot. A mutation prepares the new snapshot and saves it before
+it becomes visible to readers or device delivery. Forgetting a device
+commits its record and membership removal together. The console keeps a
+group assignment acknowledgment separate from deployment status and waits
+for the group update before showing results for the new assignment.
+
 The server sends the effective published snapshot on canonical registration,
-publication, assignment changes, and group membership changes. It keeps no
-device delivery queue and uses device reports for display. A device that was
+publication, package assignment changes, group renames, and membership changes.
+It keeps no device delivery queue and uses device reports for display. A device that was
 offline receives the latest snapshot when it connects. The client compares
 `package_id` and `revision`. It applies a successful version once per OS boot
 after connecting and applies a newly published version during the same boot.
@@ -115,6 +138,43 @@ for the requested package and revision. A device consumes the token with its
 next attempt and checks that it previously failed or was interrupted. The
 server does not queue Retry for offline devices. Wi-Fi runs last through the
 existing journaled connection and rollback flow. See [Wi-Fi setup and recovery](WIFI_SETTINGS.md).
+
+A managed Wi-Fi setting contains an ordered network list and a package-wide
+automatic-return toggle. Update client APKs before deploying this format;
+earlier development Wi-Fi settings must be removed from the saved registry and
+recreated. The [Wi-Fi guide](WIFI_SETTINGS.md#operator-workflow) describes the
+registry reset boundary. Before changing Wi-Fi, the client waits for an
+identifiable previous connection. After a failed change with a prior usable
+connection, it retains recovery state until the previous SSID and IP are
+confirmed or a later policy supersedes the connection check. The client reports
+live priority-monitor and recovery state separately from the package result.
+An automatic-return attempt waits about five minutes before another one;
+this wait resets on app process restart and does not delay a new revision.
+Monitoring depends on fresh, potentially throttled Android scan results.
+
+The APK Settings screen puts file access, Wi-Fi configuration, and Wi-Fi
+rollback timer access in one **Permissions** section. **Device configuration**
+shows the assigned group and, when there is a deployed package, the published
+revision's deployment time in the headset's local time. Assigning an existing
+revision to another group or applying it again does not change that time.
+Older revisions without a recorded time display **time unknown** until a new
+revision is deployed.
+
+**Reapply settings** runs the last received package through the same readback
+and Wi-Fi rollback flow used at boot, including after an offline app restart.
+The app saves one package with its deployment information in private storage,
+including any managed Wi-Fi credentials. The next server policy replaces or
+clears that copy. A headset without a saved copy must receive a package once
+before it can reapply offline. Loading the copy makes it available for manual
+use. Automatic application still follows live server delivery. The button is
+disabled while an application or its Wi-Fi recovery is in progress.
+
+Before starting Wi-Fi, the client saves the scalar readbacks and the Wi-Fi
+operation ID in the package attempt. Wi-Fi owns a separate local recovery
+journal. On restart, a settled result that matches the operation ID and
+revision can complete the recorded attempt using its original boot count.
+Without exact terminal evidence, the attempt remains interrupted. The
+operation ID is private to the device and optional in older package records.
 
 Scalar settings use the pinned PICO Enterprise SDK and Android readback where
 needed. Sleep and screen-off delays are ordered so the screen-off delay never
@@ -135,33 +195,63 @@ The client reports `PERMISSION_DENIED` for this item when the permission is
 absent. Use `pm revoke --user 0 com.styly.mdmclient android.permission.WRITE_SECURE_SETTINGS`
 on the same headset to remove the grant.
 
+The group Devices editor sends only the changes staged by the operator. It
+checks the expected source group of each addition and the current owner of
+each removal before committing the entire edit. The station sends the
+committed group snapshot and acknowledges the save before delivering policy
+to affected devices. It also attempts delivery if the console disconnects.
+Update the station and reload the console together for scoped membership
+editing. The editor waits for the station to advertise support.
+
 #### Package API and device reports
 
 | Surface | Contract |
 |---|---|
-| `GET /api/packages`, `POST /api/packages` | List packages or create one by name. |
+| `GET /api/packages`, `POST /api/packages` | List packages or create one by name. A summary includes `publication_requires_review: true` for a publication with unsupported legacy values. |
 | `GET /api/packages/{id}` | Returns package identity and name, `draft_revision`, `published_revision`, `published_keys`, the saved draft `settings`, the editor `sections`, and `impact` with group and device counts and a token. A saved Wi-Fi password is represented by `password_present`. |
-| `PUT /api/packages/{id}` | Saves `settings` as `{id: {managed, value}}` and optionally updates `name`. Supply `expected_revision` equal to the loaded draft UUID or null for a new draft. |
-| `POST /api/packages/{id}/publish` | Publishes the saved draft with `expected_revision` and `expected_impact`. A successful publication creates a new revision UUID. |
+| `POST /api/packages/{id}/save-and-deploy` | Atomically saves `settings` as `{id: {managed, value}}` and deploys a new revision. Supply `expected_revision` equal to the loaded draft UUID (null for the first draft), and `expected_impact` from the preview. An optional `name` renames the package. |
 | `DELETE /api/packages/{id}` | Deletes an unassigned package. |
-| `PUT /api/group-package?name=...` | Assigns `package_id` to a group. Use null to clear the assignment. |
+| `GET`, `POST /api/group-package/deploy?name=...&package_id=...` | GET previews the deployment scope and whether it uses the current deployed version. An empty `package_id=` previews clearing management for the group and sets `clear` to true. POST accepts `expected_impact` from the preview and commits the group reference and any new revision together. |
 | `POST /api/package-retry` | Requests Retry for a currently assigned and online `device_id` with its current `package_id` and `revision`. |
-| `CONFIGURATION_POLICY` | Server to canonical `configuration_packages_v1` client. Includes `package_id`, `revision`, managed `settings` and, for an explicit retry, `retry_id`. A null pair clears effective management. |
+| `CONFIGURATION_POLICY` | Server to canonical `configuration_packages_v1` or `configuration_summary_v1` clients. Includes `package_id` and `revision` (a null pair means no effective deployment). Only package-capable clients receive managed `settings` and explicit `retry_id` values. Clients with summary capability also receive nullable `group_name` and `deployed_at_ms` (Unix epoch milliseconds); summary-only clients receive empty `settings`. |
 | `REGISTER` and `CONFIGURATION_STATE` | The secret-free `configuration_state` has `package_id`, `revision`, `status` (`applying`, `complete`, `interrupted`, `already_attempted`) and per-setting `results`. |
 | `GROUP_LIST` and `DEVICE_LIST` | Group messages expose membership, package summaries, assignments, and deployment metadata. Device rows expose capability and the latest report. An offline row is last-known. |
 
+Use the combined deployment routes to write a package or change an assignment.
+Upgrade or restart the server and reload the console together. A successful
+deployment response acknowledges the saved registry. The server broadcasts the
+committed group list and attempts device delivery in a task owned by the app.
+Offline devices resolve the latest eligible revision on registration.
+
+The server resolves the current package and validates a Retry request after
+taking the WebSocket send lock. A Retry that waited behind another send can
+return a conflict if the assignment or revision changed during the wait.
+
+The APK requires the updated server for the group and deployment summary.
+The new ordered Wi-Fi format requires updated clients and server; it is not
+projected into the previous Wi-Fi format. Update the clients before deploying
+the new Wi-Fi setting.
+
 The private `device_registry.json` stores `packages` and each group's
-`members` and `package_id`. Wi-Fi passwords are plaintext in the registry
-and its backups. On upgrade, each current `group_settings` profile becomes
-one package. Draft and published values and revision UUIDs are preserved.
+`members` and `package_id`. A published snapshot may have a `deployed_at_ms`
+field. Wi-Fi passwords are plaintext in the registry
+and its backups. On upgrade, each valid `group_settings` profile becomes one
+package. Draft and published values and revision UUIDs are preserved, except
+that the old development Wi-Fi format must first be removed as described in
+the [Wi-Fi guide](WIFI_SETTINGS.md#operator-workflow).
+Previously accepted brightness and delay values can still be read. A published
+revision containing one of those unsupported values requires review and its
+settings are withheld from devices. Edit the package and use **Save & deploy**
+to publish supported values. Valid packages remain available during review.
 If a device belongs to several legacy groups, the server keeps the first
 group by name and logs the choice. The older `wifi_profiles` prototype
 does not participate in migration.
 
 Upgrade the server and client and reload open consoles together. The first
-package delivery can reapply migrated settings under the new package identity. Existing
-Wi-Fi recovery journals continue to recover interrupted operations. Keep a
-separate compatible registry backup if a downgrade is needed.
+package delivery can reapply migrated settings under the new package identity.
+Finish any old-format Wi-Fi recovery before updating the client; new-format
+recovery journals resume after process restart. Keep a separate compatible
+registry backup if a downgrade is needed.
 
 ## Building the MDM Client
 
@@ -630,8 +720,8 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `RENAME_GROUP` | Rename a group, preserving its members. Fields: `name`, `new_name` |
 | `DELETE_GROUP` | Delete a group (member devices are not affected). Fields: `name` |
 | `SET_DEVICE_GROUPS` | Set a device's membership. Fields are `device_id` and `groups` (zero or one existing group name). |
-| `MOVE_GROUP_MEMBERS` | Set the members of an existing group and move listed devices from their previous groups. Fields are `name` and `members` (device IDs, including offline devices). |
-| `SET_GROUP_MEMBERS` | Legacy member update. Uses the same fields and rejects implicit moves from another group. |
+| `UPDATE_GROUP_MEMBERS` | Edit only selected members of an existing group. Fields are `name`, `add` (device IDs mapped to their expected current group, or null for unassigned), and `remove` (device IDs expected to belong to `name`). Offline device IDs are supported. If a touched device changed groups, the entire edit is rejected. |
+| `SET_GROUP_MEMBERS` | Legacy member-list replacement. Fields are `name` and `members`. Rejects implicit moves from another group. |
 | `RETIRE_DEVICE` | Make target clients uninstall themselves (remotely irreversible — the console gates it behind its heaviest confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only). See [Device Retirement](#device-retirement). |
 
 ### Admin HTTP API
@@ -675,11 +765,11 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `SELF_UPDATE_VERIFIED` | Outcome of the automatic post-update `EXECUTE_VERIFY_APK` the server runs against the client's own package. Fields: `device_id`, `correlation_id`, `status` (`verified` / `mismatch` / `skipped` / `error`), `detail` |
 | `RETIRE_SENT` | Confirmation that `EXECUTE_SELF_UNINSTALL` commands were dispatched. Fields: `sent_count`, `target_count` |
 | `RETIRE_RESULT` | Outcome of a device retire. Success is settled by *silence*: the device announced, disconnected, and stayed away for the retire window. Failure means it re-registered, reported the uninstall failed, or was still connected at the deadline. Fields: `device_id`, `correlation_id`, `status` (`success` / `fail`), `detail` |
-| `GROUP_LIST` | Current `groups`, package summaries in `packages`, group-to-package `assignments`, and published `deployments`. Sent on connect and after group or package changes. |
+| `GROUP_LIST` | Current `groups`, package summaries in `packages`, group-to-package `assignments`, and published `deployments`. Sent on connect and after group or package changes. `membership_edits: true` advertises support for `UPDATE_GROUP_MEMBERS`. |
 | `GROUP_CREATED` / `GROUP_RENAMED` / `GROUP_DELETED` | Acknowledgements for group create / rename / delete. |
 | `DEVICE_GROUPS_SET` | Acknowledgement of a device's group membership change. Fields: `device_id`, `groups` |
-| `GROUP_MEMBERS_SET` | Acknowledgement of a group's member list change. Fields: `name`, `members` |
-| `ERROR` | Error message. Fields: `message` |
+| `GROUP_MEMBERS_SET` | Acknowledgement of a group's committed member list change. Fields: `name`, `members`. Scoped edits also include `operation: UPDATE_GROUP_MEMBERS` |
+| `ERROR` | Error message. Fields: `message`. Rejected scoped membership edits also include `operation: UPDATE_GROUP_MEMBERS` and `name`. |
 
 > **Client/server compatibility** is keyed on `major.minor`. Policy: any change
 > that requires the client and server to move together (a wire-protocol or shared
