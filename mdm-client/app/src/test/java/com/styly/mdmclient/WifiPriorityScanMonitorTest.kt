@@ -102,6 +102,28 @@ class WifiPriorityScanMonitorTest {
         assertFalse(wifiScanMatchesProfile(transition, longKey.copy(ssid = "other")))
     }
 
+    @Test
+    fun `jitter spreads the first request and the regular interval`() {
+        val backend = FakeBackend().apply { accepted = true }
+        val scheduler = FakeScheduler(now = 100_000L)
+        val bounds = mutableListOf<Long>()
+        val source = WifiPriorityScanLoop(backend, scheduler, { scheduler.now }, jitter = { bound ->
+            bounds += bound
+            bound
+        })
+        val profile = network("preferred")
+        source.start(listOf(profile)) {}
+
+        assertEquals(WifiPriorityScanLoop.INITIAL_JITTER_MILLIS, scheduler.pending.single().delayMillis)
+        scheduler.runNext()
+        scheduler.pending.clear() // broadcast timeout
+        backend.emit(WifiScanBroadcast(true, listOf(sample(profile, scheduler.now))))
+
+        val interval = WifiPriorityScanLoop.REQUEST_INTERVAL_MILLIS
+        assertEquals(interval + interval / 10, scheduler.pending.single().delayMillis)
+        assertEquals(listOf(WifiPriorityScanLoop.INITIAL_JITTER_MILLIS, interval / 10), bounds)
+    }
+
     private fun network(ssid: String) = WifiNetworkProfile(ssid, "WPA2_WPA3", "correct-horse", false)
 
     private fun sample(profile: WifiNetworkProfile, timestamp: Long) =

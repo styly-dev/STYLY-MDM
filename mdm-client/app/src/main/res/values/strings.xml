@@ -22,7 +22,7 @@
     <string name="permissions_section_label">Permissions</string>
     <string name="wifi_exact_alarm_label">Wi-Fi rollback timer</string>
     <string name="wifi_exact_alarm_granted">Granted</string>
-    <string name="wifi_exact_alarm_missing">Exact alarm access is required before Wi-Fi changes can be applied</string>
+    <string name="wifi_exact_alarm_missing">Not granted (optional): Wi-Fi rollback may be delayed while the headset sleeps</string>
     <string name="wifi_exact_alarm_button">Open Exact Alarm Settings</string>
     <string name="wifi_exact_alarm_unavailable">Exact alarm settings are unavailable on this device</string>
     <string name="wifi_location_permission_label">Wi-Fi configuration</string>

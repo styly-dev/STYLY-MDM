@@ -883,6 +883,15 @@ class MdmClientService : Service() {
                         )
                         return
                     }
+                    PowerCycleTimers.ArmOutcome.REFUSED_SHUTDOWN_SCHEDULE -> {
+                        apkFile.delete()
+                        sendInstallResult(
+                            apkFilename, "fail",
+                            "Self-update recovery unavailable: the guard app is not running and the " +
+                                "device's recurring shutdown schedule is set or unreadable; refusing an update with no way back"
+                        )
+                        return
+                    }
                     PowerCycleTimers.ArmOutcome.REFUSED_UNSAFE -> {
                         apkFile.delete()
                         sendInstallResult(

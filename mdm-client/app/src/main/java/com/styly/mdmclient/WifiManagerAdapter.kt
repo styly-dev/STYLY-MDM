@@ -180,7 +180,6 @@ internal interface WifiSettingsAdapter {
     fun captureRecovery(knownProfiles: List<WifiNetworkProfile>): WifiRecoverySnapshot
     fun applyProfile(
         target: List<WifiNetworkProfile>,
-        prioritySelection: Boolean = false,
         shouldContinue: () -> Boolean = { true },
         beforeFirstMutation: () -> WifiReason? = { null },
         onMutationStarted: () -> WifiReason? = { null },
@@ -207,7 +206,6 @@ internal interface WifiSettingsAdapter {
         onMutationFinished: () -> Unit = {},
     ): WifiReason
     fun disconnectCurrent(shouldContinue: () -> Boolean, onMutationStarted: () -> WifiReason?, onMutationFinished: () -> Unit): WifiReason
-    fun reconnect(shouldContinue: () -> Boolean, onMutationStarted: () -> WifiReason?, onMutationFinished: () -> Unit): WifiReason
 }
 
 /** PICO 4 Ultra Enterprise: retain saved credentials and change per-network auto-join. */
@@ -257,7 +255,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
     }
 
     override fun applyProfile(
-        target: List<WifiNetworkProfile>, prioritySelection: Boolean, shouldContinue: () -> Boolean,
+        target: List<WifiNetworkProfile>, shouldContinue: () -> Boolean,
         beforeFirstMutation: () -> WifiReason?, onMutationStarted: () -> WifiReason?, onMutationFinished: () -> Unit,
     ): WifiReason = guarded {
         val wifi = manager ?: return@guarded WifiReason.UNSUPPORTED
@@ -311,22 +309,8 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                 }
             }
             if (failure != WifiReason.NONE) return@guarded failure
+            // The controller selects candidates in order afterwards; do not enable here.
             selected.add(id)
-            if (prioritySelection) continue
-            val enabled = try {
-                mutate.run {
-                    @Suppress("DEPRECATION")
-                    if (wifi.enableNetwork(id, false)) WifiReason.NONE else WifiReason.UPDATE_FAILED
-                }
-            } catch (_: SecurityException) {
-                WifiReason.PERMISSION_DENIED
-            } catch (_: Exception) {
-                WifiReason.UPDATE_FAILED
-            }
-            if (enabled != WifiReason.NONE) {
-                logOperationFailure("UPDATE", enabled)
-                return@guarded enabled
-            }
         }
         for (entry in readCurrent().distinctBy { it.networkId }) {
             val allowed = entry.networkId in selected
@@ -539,13 +523,6 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         Mutations(shouldContinue, { null }, onMutationStarted, onMutationFinished).run {
             @Suppress("DEPRECATION")
             if (manager?.disconnect() == true) WifiReason.NONE else WifiReason.UNREACHABLE
-        }
-    }
-
-    override fun reconnect(shouldContinue: () -> Boolean, onMutationStarted: () -> WifiReason?, onMutationFinished: () -> Unit): WifiReason = guarded {
-        Mutations(shouldContinue, { null }, onMutationStarted, onMutationFinished).run {
-            @Suppress("DEPRECATION")
-            if (manager?.reconnect() == true) WifiReason.NONE else WifiReason.UNREACHABLE
         }
     }
 
