@@ -49,3 +49,6 @@ mdm-server/push-artifacts/
 # === Misc ===
 nanobanana-output/*.png
 .claude/settings.local.json
+
+# The uv lockfile is generated locally and not committed
+mdm-server/uv.lock
