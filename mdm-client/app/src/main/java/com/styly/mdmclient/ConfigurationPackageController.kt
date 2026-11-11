@@ -322,11 +322,15 @@ internal class ConfigurationPackageController(
         }
         if (boot < 0 || !sdkReady) return
         val applyScalars = dependencies.scalarWriter() ?: return
-        if (wifiPolicy != null && !wifi.readyForPolicy()) return
+        // A new boot re-applies scalar settings (PUI resets some of them after boot), but
+        // the same Wi-Fi revision keeps its existing connection instead of reselecting.
+        val keepWifi = wifiPolicy != null && previous != null && delivery.retryId == null &&
+            previous.results.optJSONObject("wifi") != null && wifi.isPolicyApplied(version.revision)
+        if (wifiPolicy != null && !keepWifi && !wifi.readyForPolicy()) return
 
         pending = null
         if (delivery.isCurrent()) {
-            startAttempt(version, policy.values, previous, delivery.retryId, applyScalars)
+            startAttempt(version, policy.values, previous, delivery.retryId, applyScalars, keepWifi)
         }
     }
 
@@ -336,6 +340,7 @@ internal class ConfigurationPackageController(
         previous: ConfigurationAttempt?,
         retryId: String?,
         applyScalars: (JSONObject) -> JSONObject,
+        keepWifi: Boolean = false,
     ): Boolean {
         // Claim the pair and any explicit Retry before writing. Recovery still owns
         // the Wi-Fi journal if the process dies during a mutation.
@@ -352,7 +357,10 @@ internal class ConfigurationPackageController(
                 results.put(key, settingOutcome("unsupported", reason = "UNSUPPORTED"))
             }
         }
-        if (wifiPolicy == null) {
+        if (keepWifi) {
+            results.put("wifi", checkNotNull(previous).results.getJSONObject("wifi"))
+        }
+        if (wifiPolicy == null || keepWifi) {
             finish(attempt.copy(status = "complete", results = results))
         } else {
             val operationId = UUID.randomUUID().toString()

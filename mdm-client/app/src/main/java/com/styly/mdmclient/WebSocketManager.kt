@@ -247,12 +247,18 @@ class WebSocketManager internal constructor(
         reconnectHandler.post { publishConfigurationState() }
     }
 
+    // Main thread only. Internal journal writes notify often; send only public changes.
+    private var lastWifiState: Pair<WebSocket, String>? = null
+
     private fun publishWifiState() {
         val socket = webSocket ?: return
         if (!isRunning || !registration.isCanonicalAcknowledged(socket)) return
+        val state = wifiController.stateSnapshot().toString()
+        if (lastWifiState?.let { it.first === socket && it.second == state } == true) return
+        lastWifiState = socket to state
         socket.send(JSONObject().apply {
             put("type", "WIFI_STATE")
-            put("wifi_state", wifiController.stateSnapshot())
+            put("wifi_state", JSONObject(state))
         }.toString())
     }
 

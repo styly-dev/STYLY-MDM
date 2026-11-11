@@ -39,10 +39,8 @@ class WifiSettingsStoreTest {
             priorConnectionHadUsableIp = true,
             restoreTarget = WifiRollbackTarget("office", "WPA_PSK"),
             settingsRestored = true,
-            restoreStartedElapsedMillis = 10_000L,
             restoreDeadlineElapsedMillis = 70_000L,
             restoreBootCount = 133,
-            restoreRetryCount = 2,
             restoreUnconfirmedReported = true,
         )
         val expected = WifiLocalState(
@@ -62,57 +60,11 @@ class WifiSettingsStoreTest {
     }
 
     @Test
-    fun `completed version one state is discarded for the new Wi-Fi contract`() {
-        val profile = WifiNetworkProfile("office", "WPA2_WPA3", "correcthorsebattery", hidden = false)
-        val operation = WifiManualOperation(
-            operationId = "a4d13b84-1bd7-4bce-bd4d-d056801d4a3f",
-            revision = "91b831b3-884e-4e0e-8700-07d2fbe1c436",
-            candidate = listOf(profile),
-            recoverySnapshot = WifiRecoverySnapshot(emptyList(), emptyList()),
-            phase = WifiManualPhase.PREPARED,
-        )
-        val legacy = JSONObject(WifiSettingsCodec.encode(WifiLocalState(lastApplied = WifiSavedProfile(
-            operation.revision, listOf(profile), autoReturn = true,
-        )))).put("version", 1)
-
-        val restored = WifiSettingsCodec.decode(legacy.toString())
-
-        assertEquals(WifiLocalState(managedWifi = false), restored)
-    }
-
-    @Test
-    fun `version one pending recovery is never discarded`() {
-        val operation = WifiManualOperation(
-            operationId = "a4d13b84-1bd7-4bce-bd4d-d056801d4a3f",
-            revision = "91b831b3-884e-4e0e-8700-07d2fbe1c436",
-            candidate = listOf(WifiNetworkProfile("office", "WPA2_WPA3", "correcthorsebattery", false)),
-            recoverySnapshot = WifiRecoverySnapshot(emptyList(), emptyList()),
-            phase = WifiManualPhase.ROLLING_BACK,
-            settingsChanged = true,
-        )
-        val legacy = JSONObject(WifiSettingsCodec.encode(WifiLocalState(manualOperation = operation)))
-            .put("version", 1)
-
-        assertThrows(IllegalArgumentException::class.java) { WifiSettingsCodec.decode(legacy.toString()) }
-    }
-
-    @Test
-    fun `version one malformed or missing operation journal fails closed`() {
-        val base = JSONObject(WifiSettingsCodec.encode(WifiLocalState())).put("version", 1)
-        val malformed = listOf(
-            JSONObject(base.toString()).put("manual_operation", "not-json-object"),
-            JSONObject(base.toString()).put("manual_operation", JSONArray()),
-            JSONObject(base.toString()).apply { remove("manual_operation") },
-        )
-
-        for (state in malformed) {
-            assertThrows(IllegalArgumentException::class.java) { WifiSettingsCodec.decode(state.toString()) }
-        }
-    }
-
-    @Test
     fun `prototype and unknown state formats are rejected`() {
         val current = JSONObject(WifiSettingsCodec.encode(WifiLocalState()))
+        assertThrows(IllegalArgumentException::class.java) {
+            WifiSettingsCodec.decode(current.put("version", 1).toString())
+        }
         assertThrows(IllegalArgumentException::class.java) {
             WifiSettingsCodec.decode(current.put("version", 5).toString())
         }

@@ -61,6 +61,8 @@ internal class WifiPriorityScanLoop(
     private val requestIntervalMillis: Long = REQUEST_INTERVAL_MILLIS,
     private val broadcastTimeoutMillis: Long = BROADCAST_TIMEOUT_MILLIS,
     private val maxBackoffMillis: Long = MAX_BACKOFF_MILLIS,
+    /** Returns a delay in 0..bound. Spreads scans of headsets that start together. */
+    private val jitter: (Long) -> Long = { 0L },
 ) : WifiPriorityScanSource {
     private val lock = Any()
     private var generation = 0L
@@ -93,8 +95,10 @@ internal class WifiPriorityScanLoop(
             return
         }
         emit(token, WifiPriorityScanEvent(WifiPriorityMonitorStatus.MONITORING, detail = "waiting_for_scan"))
-        scheduleRequest(token, 0L)
+        scheduleRequest(token, jitter(INITIAL_JITTER_MILLIS))
     }
+
+    private fun nextIntervalMillis(): Long = requestIntervalMillis + jitter(requestIntervalMillis / 10)
 
     override fun stop() {
         val tasks = synchronized(lock) {
@@ -211,13 +215,13 @@ internal class WifiPriorityScanLoop(
             return
         }
         if (!claimFreshTimestamp(token, fresh)) {
-            scheduleRequest(token, requestIntervalMillis)
+            scheduleRequest(token, nextIntervalMillis())
             return
         }
         synchronized(lock) { if (active && generation == token) failures = 0 }
         val visible = visibleIdentities(token, fresh) ?: return
         emit(token, WifiPriorityScanEvent(WifiPriorityMonitorStatus.MONITORING, visible, "fresh_scan_results"))
-        scheduleRequest(token, requestIntervalMillis)
+        scheduleRequest(token, nextIntervalMillis())
     }
 
     private fun claimFreshTimestamp(token: Long, fresh: List<WifiScanSample>): Boolean {
@@ -271,6 +275,7 @@ internal class WifiPriorityScanLoop(
         const val REQUEST_INTERVAL_MILLIS = 5 * 60_000L
         const val BROADCAST_TIMEOUT_MILLIS = 20_000L
         const val MAX_BACKOFF_MILLIS = 30 * 60_000L
+        const val INITIAL_JITTER_MILLIS = 30_000L
         private const val FRESHNESS_TOLERANCE_MILLIS = 2_000L
         private const val MAX_RESULT_AGE_MILLIS = 30_000L
     }
@@ -339,6 +344,7 @@ internal fun systemWifiPriorityScanSource(context: Context): WifiPriorityScanSou
     backend = AndroidWifiPriorityScanBackend(context.applicationContext),
     scheduler = AndroidWifiPriorityScanScheduler(),
     nowElapsed = SystemClock::elapsedRealtime,
+    jitter = { bound -> kotlin.random.Random.nextLong(bound + 1) },
 )
 
 /** Match only security modes the Wi-Fi policy can configure. */

@@ -5,7 +5,8 @@ import org.json.JSONObject
 
 internal const val WIFI_MANUAL_TIMEOUT_MS = 60_000L
 internal const val WIFI_MAX_NETWORKS = 4
-internal const val WIFI_MAX_OPERATION_RECEIPTS = 500
+// Operation IDs are generated on the device; a short receipt list only fences duplicate queueing.
+internal const val WIFI_MAX_OPERATION_RECEIPTS = 32
 
 internal fun appendWifiOperationReceipt(existing: List<String>, operationId: String): List<String> =
     (existing.filterNot { it == operationId } + operationId)
@@ -88,10 +89,8 @@ internal data class WifiManualOperation(
     val priorConnectionHadUsableIp: Boolean = false,
     val restoreTarget: WifiRollbackTarget? = null,
     val settingsRestored: Boolean = false,
-    val restoreStartedElapsedMillis: Long? = null,
     val restoreDeadlineElapsedMillis: Long? = null,
     val restoreBootCount: Int? = null,
-    val restoreRetryCount: Int = 0,
     val restoreUnconfirmedReported: Boolean = false,
 )
 
@@ -132,9 +131,6 @@ internal object WifiSettingsProtocol {
     private val UUID_V4 = Regex("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 
     fun parseApplyCommand(payload: JSONObject): WifiApplyCommand {
-        if (payload.has("recovery_scope")) {
-            throw IllegalArgumentException("unsupported Wi-Fi apply command")
-        }
         val operationId = requiredString(payload, "operation_id")
         val revision = requiredString(payload, "revision")
         requireUuid(operationId, "operation_id")
@@ -240,13 +236,6 @@ internal object WifiSettingsCodec {
     fun decode(text: String): WifiLocalState {
         val root = JSONObject(text)
         val version = root.optInt("version", -1)
-        if (version == 1) {
-            if (!root.has("manual_operation") || !root.isNull("manual_operation")) {
-                throw IllegalArgumentException("old Wi-Fi recovery must finish before updating")
-            }
-            // Completed prototype state is intentionally discarded; pending recovery is never.
-            return WifiLocalState(managedWifi = false)
-        }
         if (version != VERSION) {
             throw IllegalArgumentException("unsupported Wi-Fi state version")
         }
@@ -292,10 +281,8 @@ internal object WifiSettingsCodec {
             put("restore_target", JSONObject().put("ssid", it.ssid).put("security", it.security))
         } ?: put("restore_target", JSONObject.NULL)
         put("settings_restored", operation.settingsRestored)
-        put("restore_started_elapsed_ms", operation.restoreStartedElapsedMillis ?: JSONObject.NULL)
         put("restore_deadline_elapsed_ms", operation.restoreDeadlineElapsedMillis ?: JSONObject.NULL)
         put("restore_boot_count", operation.restoreBootCount ?: JSONObject.NULL)
-        put("restore_retry_count", operation.restoreRetryCount)
         put("restore_unconfirmed_reported", operation.restoreUnconfirmedReported)
     }
 
@@ -334,10 +321,8 @@ internal object WifiSettingsCodec {
             WifiRollbackTarget(it.getString("ssid"), it.getString("security"))
         },
         settingsRestored = requiredBoolean(json, "settings_restored", default = false),
-        restoreStartedElapsedMillis = optionalLong(json, "restore_started_elapsed_ms"),
         restoreDeadlineElapsedMillis = optionalLong(json, "restore_deadline_elapsed_ms"),
         restoreBootCount = optionalLong(json, "restore_boot_count")?.toInt()?.takeIf { it >= 0 },
-        restoreRetryCount = json.optInt("restore_retry_count", 0).coerceAtLeast(0),
         restoreUnconfirmedReported = requiredBoolean(json, "restore_unconfirmed_reported", default = false),
     )
 
@@ -448,13 +433,6 @@ internal object WifiSettingsCodec {
         val value = json.get(key)
         if (value !is Number) throw IllegalArgumentException("$key must be a number")
         return value.toLong()
-    }
-
-    private fun optionalBoolean(json: JSONObject, key: String): Boolean? {
-        if (!json.has(key) || json.isNull(key)) return null
-        val value = json.get(key)
-        if (value !is Boolean) throw IllegalArgumentException("$key must be a boolean")
-        return value
     }
 
     private fun requiredBoolean(json: JSONObject, key: String, default: Boolean): Boolean {
