@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 
 import pytest
 
@@ -22,56 +23,84 @@ def _write_registry(tmp_path, **fields):
     server.REGISTRY_PATH.write_text(json.dumps({"devices": {}, "groups": {}, **fields}))
 
 
-def _legacy_profile():
+def _profile(name):
     return {
+        "name": name,
         "draft": configuration_packages.new_snapshot({"brightness": {"managed": True, "value": 70}}),
-        "deployed": configuration_packages.new_snapshot({"brightness": 45}),
+        "published": configuration_packages.new_snapshot({"brightness": 45}),
     }
 
 
-def test_migration_preserves_revisions_and_resolves_legacy_overlaps(tmp_path, caplog):
-    profile = _legacy_profile()
-    orphan = _legacy_profile()
+def _write_package_registry(tmp_path, groups, *, devices=None):
+    """Write the package format; groups map a name to (members, package name or None)."""
+    packages = {}
+    entries = {}
+    for name, (members, package_name) in groups.items():
+        package_id = None
+        if package_name is not None:
+            package_id = configuration_packages.new_snapshot({})["revision"]
+            packages[package_id] = _profile(package_name)
+        entries[name] = {"members": members, "package_id": package_id}
+    _write_registry(tmp_path, devices=devices or {}, groups=entries,
+                    packages={"version": configuration_packages.VERSION, "packages": packages})
+
+
+def _backups(tmp_path):
+    return sorted(tmp_path.glob(server.REGISTRY_PATH.name + ".*.bak"))
+
+
+def test_released_groups_migrate_once_with_backup_and_one_group_per_device(tmp_path, caplog):
     _write_registry(
         tmp_path,
         devices={"device-a": {"label": "Example", "other_field": {"preserve": True}}},
         groups={"Beta": ["device-a", "device-b"], "Alpha": ["device-a", "device-a"], "Gamma": []},
-        group_settings={"version": 1, "profiles": {"Alpha": profile, "Deleted": orphan}},
-        wifi_profiles={"discard": "legacy"}, wifi_profiles_encrypted="discard-legacy",
         another_section={"preserve": True},
     )
+    original = server.REGISTRY_PATH.read_bytes()
     server.load_registry()
 
     registry = json.loads(server.REGISTRY_PATH.read_text())
-    alpha_id = registry["groups"]["Alpha"]["package_id"]
-    packages = registry["packages"]["packages"]
     assert registry["groups"] == {
-        "Alpha": {"members": ["device-a"], "package_id": alpha_id},
+        "Alpha": {"members": ["device-a"], "package_id": None},
         "Beta": {"members": ["device-b"], "package_id": None},
         "Gamma": {"members": [], "package_id": None},
     }
-    assert packages[alpha_id] == {"name": "Alpha", "draft": profile["draft"], "published": profile["deployed"]}
-    assert [value for key, value in packages.items() if key != alpha_id] == [
-        {"name": "Deleted", "draft": orphan["draft"], "published": orphan["deployed"]},
-    ]
-    assert server._desired_configuration("device-a") == {"package_id": alpha_id, **profile["deployed"]}
+    assert registry["packages"] == {"version": configuration_packages.VERSION, "packages": {}}
     assert "kept 'Alpha', removed from 'Beta'" in caplog.text
-    assert not {"group_settings", "wifi_profiles", "wifi_profiles_encrypted"} & registry.keys()
     assert registry["another_section"] == {"preserve": True}
     assert registry["devices"]["device-a"]["other_field"] == {"preserve": True}
-    assert server.REGISTRY_PATH.stat().st_mode & 0o777 == 0o600
+
+    [backup] = _backups(tmp_path)
+    assert backup.read_bytes() == original
+    assert str(backup) in caplog.text
+    if os.name != "nt":
+        assert server.REGISTRY_PATH.stat().st_mode & 0o777 == 0o600
+        assert backup.stat().st_mode & 0o777 == 0o600
 
     before_bytes = server.REGISTRY_PATH.read_bytes()
     server.load_registry()
     assert server.REGISTRY_PATH.read_bytes() == before_bytes
-    assert server._configuration.packages == packages
+    assert _backups(tmp_path) == [backup]
+
+
+def test_migration_is_not_written_when_the_backup_fails(tmp_path, monkeypatch):
+    _write_registry(tmp_path, groups={"Alpha": ["device-a"], "Beta": ["device-a"]})
+    before_bytes = server.REGISTRY_PATH.read_bytes()
+
+    def fail_backup():
+        raise configuration_packages.PackageError("Registry backup could not be saved")
+
+    monkeypatch.setattr(server, "_backup_registry", fail_backup)
+    server.load_registry()
+    assert server._configuration.packages is None
+    assert server.REGISTRY_PATH.read_bytes() == before_bytes
 
 
 def test_group_rename_forget_and_delete_persist_references_and_keep_package(tmp_path, monkeypatch):
     async def body():
-        _write_registry(
-            tmp_path, devices={"device-a": {"label": "Example"}}, groups={"Alpha": ["device-a"], "Beta": []},
-            group_settings={"version": 1, "profiles": {"Alpha": _legacy_profile()}},
+        _write_package_registry(
+            tmp_path, {"Alpha": (["device-a"], "Alpha"), "Beta": ([], None)},
+            devices={"device-a": {"label": "Example"}},
         )
         server.load_registry()
         package_id = json.loads(server.build_group_list_msg())["assignments"]["Alpha"]
@@ -117,9 +146,9 @@ def test_group_rename_forget_and_delete_persist_references_and_keep_package(tmp_
 
 def test_failed_writes_keep_committed_device_and_configuration_state(tmp_path, monkeypatch):
     async def body():
-        _write_registry(
-            tmp_path, devices={"device-a": {"label": "Example"}}, groups={"Old": ["device-a"], "New": []},
-            group_settings={"version": 1, "profiles": {"Old": _legacy_profile()}},
+        _write_package_registry(
+            tmp_path, {"Old": (["device-a"], "Old"), "New": ([], None)},
+            devices={"device-a": {"label": "Example"}},
         )
         server.load_registry()
         package_id = json.loads(server.build_group_list_msg())["assignments"]["Old"]
@@ -146,7 +175,6 @@ def test_failed_writes_keep_committed_device_and_configuration_state(tmp_path, m
 
 
 @pytest.mark.parametrize(("field", "opaque", "groups"), [
-    ("group_settings", {"version": 99, "profiles": {}}, {"Alpha": ["same"]}),
     ("packages", {"version": 99, "packages": {}}, {"Alpha": {"members": ["same"], "package_id": None}}),
     ("packages", {"version": 1, "packages": {}}, {"Alpha": {"members": ["same"], "package_id": "invalid"}}),
 ])
@@ -162,36 +190,36 @@ def test_unreadable_configuration_survives_unrelated_write(tmp_path, field, opaq
     assert saved["groups"] == groups
 
 
-def test_failed_migration_does_not_expose_unpersisted_ids(tmp_path, monkeypatch):
-    legacy = {"version": 1, "profiles": {"Alpha": _legacy_profile()}}
-    _write_registry(tmp_path, groups={"Alpha": ["device-a"]}, group_settings=legacy,
-                    wifi_profiles={"prototype": "retained until migration succeeds"})
+def test_failed_migration_keeps_released_groups_until_it_can_be_saved(tmp_path, monkeypatch):
+    _write_registry(tmp_path, groups={"Alpha": ["device-a"]})
     before_bytes = server.REGISTRY_PATH.read_bytes()
     with monkeypatch.context() as patch:
         patch.setattr(server, "_write_registry", lambda *_: False)
         server.load_registry()
         assert server._configuration.packages is None
-        assert json.loads(server.build_group_list_msg())["assignments"] == {}
+        assert json.loads(server.build_group_list_msg())["groups"] == {"Alpha": ["device-a"]}
         assert json.loads(server.build_group_list_msg())["packages"] == []
         assert server.REGISTRY_PATH.read_bytes() == before_bytes
 
     server.device_registry["another"] = {"label": "Example"}
     assert server.save_registry()
-    saved = json.loads(server.REGISTRY_PATH.read_text())
-    assert saved["group_settings"] == legacy
-    assert saved["wifi_profiles"] == {"prototype": "retained until migration succeeds"}
+    assert json.loads(server.REGISTRY_PATH.read_text())["groups"] == {"Alpha": ["device-a"]}
     server.load_registry()
-    assert "wifi_profiles" not in json.loads(server.REGISTRY_PATH.read_text())
-    assert json.loads(server.build_group_list_msg())["assignments"]["Alpha"] in server._configuration.packages
+    assert json.loads(server.REGISTRY_PATH.read_text())["groups"] == {
+        "Alpha": {"members": ["device-a"], "package_id": None},
+    }
+    assert server._configuration.packages == {}
 
 
-def test_unreadable_registry_cannot_be_overwritten(tmp_path):
+def test_unreadable_registry_cannot_be_overwritten_and_is_reported_to_consoles(tmp_path):
     _write_registry(tmp_path)
+    assert json.loads(server.build_group_list_msg())["registry_writable"] is True
     server.REGISTRY_PATH.write_text('{"devices":')
     server.load_registry()
     server.device_registry["another"] = {"label": "Example"}
     assert not server.save_registry()
     assert server.REGISTRY_PATH.read_text() == '{"devices":'
+    assert json.loads(server.build_group_list_msg())["registry_writable"] is False
 
 
 def test_group_name_round_trip_and_upgrade_keep_membership_and_assignment(tmp_path):
@@ -237,89 +265,12 @@ def test_conflicting_normalized_group_names_are_preserved(tmp_path):
 
 
 @pytest.mark.parametrize(("key", "value"), [
-    ("brightness", 0),
-    ("sleepDelay", 15),
-    ("sleepDelay", 30),
-    ("sleepDelay", 60),
-    ("screenOff", 3),
-    ("screenOff", 10),
-])
-def test_inactive_legacy_draft_loads_beside_valid_package_without_weakening_new_writes(
-    tmp_path, key, value,
-):
-    legacy_id = configuration_packages.new_snapshot({})["revision"]
-    valid_id = configuration_packages.new_snapshot({})["revision"]
-    legacy_draft = configuration_packages.new_snapshot({
-        key: {"managed": False, "value": value},
-    })
-    valid_draft = configuration_packages.new_snapshot(configuration_packages.validate_draft({
-        "brightness": {"managed": True, "value": 45},
-    }))
-    valid_published = configuration_packages.new_snapshot({"brightness": 45})
-    packages = {
-        "version": 1,
-        "packages": {
-            legacy_id: {"name": "Legacy", "draft": legacy_draft},
-            valid_id: {"name": "Current", "draft": valid_draft, "published": valid_published},
-        },
-    }
-    _write_registry(tmp_path, packages=packages)
-
-    server.load_registry()
-
-    assert server._configuration.packages == packages["packages"]
-    assert server._configuration.packages[legacy_id]["draft"] == legacy_draft
-    assert configuration_packages.has_legacy_values(legacy_draft["settings"]) is False
-    assert "publication_requires_review" not in configuration_packages.public_summary(
-        legacy_id, server._configuration.packages[legacy_id],
-    )
-    assert "publication_requires_review" not in configuration_packages.public_summary(
-        valid_id, server._configuration.packages[valid_id],
-    )
-    with pytest.raises(configuration_packages.PackageError, match="Invalid value"):
-        configuration_packages.validate_draft({key: {"managed": True, "value": value}})
-
-
-@pytest.mark.parametrize(("key", "value"), [
-    ("brightness", 0),
-    ("sleepDelay", 15),
-    ("sleepDelay", 30),
-    ("sleepDelay", 60),
-    ("screenOff", 3),
-    ("screenOff", 10),
-])
-def test_migration_and_package_load_preserve_legacy_publication_for_review(key, value):
-    draft = configuration_packages.new_snapshot({
-        key: {"managed": False, "value": value},
-    })
-    deployed = configuration_packages.new_snapshot({key: value})
-    legacy = {"version": 1, "profiles": {"Alpha": {"draft": draft, "deployed": deployed}}}
-
-    migrated, assignments = configuration_packages.migrate_group_settings(legacy)
-    assert list(assignments) == ["Alpha"]
-    assigned_id = assignments["Alpha"]
-    assert migrated[assigned_id] == {
-        "name": "Alpha", "draft": draft, "published": deployed,
-    }
-    loaded = configuration_packages.load_packages({"version": 1, "packages": migrated})
-    assert loaded[assigned_id]["draft"] == draft
-    assert loaded[assigned_id]["draft"]["revision"] == draft["revision"]
-    assert loaded[assigned_id]["published"] == deployed
-    assert loaded[assigned_id]["published"]["revision"] == deployed["revision"]
-    assert configuration_packages.has_legacy_values(deployed["settings"])
-    assert configuration_packages.public_summary(
-        assigned_id, loaded[assigned_id],
-    )["publication_requires_review"] is True
-    assert configuration_packages.has_legacy_values({"brightness": False}) is False
-    assert configuration_packages.has_legacy_values({"sleepDelay": 15.0}) is False
-    with pytest.raises(configuration_packages.PackageError, match="Invalid value"):
-        configuration_packages.validate_draft({key: {"managed": True, "value": value}})
-
-
-@pytest.mark.parametrize(("key", "value"), [
     ("brightness", -1),
+    ("brightness", 0),
     ("brightness", False),
+    ("sleepDelay", 15),
     ("sleepDelay", 15.0),
+    ("screenOff", 10),
     ("screenOff", 31),
     ("unknown", 0),
 ])

@@ -243,11 +243,14 @@ def test_device_wifi_reports_survive_reconnect_and_reject_stale_socket(tmp_path)
             await live.send_json({"type": "WIFI_STATE", "wifi_state": failed})
             rows = await receive_device_list(admin, lambda row: row["wifi_state"] == failed)
             assert rows[0]["wifi_state"] == failed
-            assert rows[0]["wifi_state_updated_at"] > 0
+            # A repeated or invalid report changes nothing, so the next list is the battery update.
+            await live.send_json({"type": "WIFI_STATE", "wifi_state": failed})
             await live.send_json({"type": "WIFI_STATE", "wifi_state": {"password": "secret"}})
             await live.send_json({"type": "BATTERY_UPDATE", "level": 55, "charging": False})
-            rows = await receive_device_list(admin, lambda row: (row.get("battery") or {}).get("level") == 55)
+            rows = (await receive_type(admin, "DEVICE_LIST"))["devices"]
+            assert rows[0]["battery"]["level"] == 55
             assert rows[0]["wifi_state"] == failed
+            assert "wifi_state_updated_at" not in rows[0]
             assert "secret" not in json.dumps(rows)
             await old.close()
             await live.close()
@@ -255,6 +258,6 @@ def test_device_wifi_reports_survive_reconnect_and_reject_stale_socket(tmp_path)
         await test_server.close()
         server.load_registry()
         assert server.device_registry[DEVICE_V4]["wifi_state"] == failed
-        assert server.device_registry[DEVICE_V4]["wifi_state_updated_at"] > 0
+        assert "wifi_state_updated_at" not in server.device_registry[DEVICE_V4]
 
     asyncio.run(body())

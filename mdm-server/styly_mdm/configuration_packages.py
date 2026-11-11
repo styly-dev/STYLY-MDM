@@ -18,8 +18,6 @@ MAX_PACKAGE_NAME_LEN = 64
 _REASONS = WIFI_REASONS | {
     "READ_FAILED", "WRITE_FAILED", "READBACK_MISMATCH", "INVALID_VALUE",
     "DELAY_CONFLICT", "UPDATE_TIMER_ACTIVE", "CALLBACK_TIMEOUT", "STORAGE_ERROR",
-    "UNSUPPORTED_HIDDEN_NETWORK",
-    "UNSUPPORTED_PRIORITY_NETWORK_LIMIT",
 }
 
 
@@ -84,15 +82,7 @@ SECTIONS = [
     ]},
 ]
 
-_ITEMS = {
-    item["id"]: item for section in SECTIONS for item in section["items"]
-    if item["kind"] != "unavailable"
-}
-_LEGACY_SCALAR_VALUES = {
-    "brightness": frozenset({0}),
-    "sleepDelay": frozenset({15, 30, 60}),
-    "screenOff": frozenset({3, 10}),
-}
+_ITEMS = {item["id"]: item for section in SECTIONS for item in section["items"]}
 
 
 def _bounded_int(value, lower, upper):
@@ -155,18 +145,8 @@ def _validate_value(key, value, *, managed=True, previous=None):
     return value
 
 
-def _is_legacy_scalar_value(key, value):
-    return type(value) is int and value in _LEGACY_SCALAR_VALUES.get(key, ())
-
-
-def has_legacy_values(settings):
-    """Whether a flat published settings snapshot contains retired scalar values."""
-    return isinstance(settings, dict) and any(
-        _is_legacy_scalar_value(key, value) for key, value in settings.items()
-    )
-
-
-def _validate_draft(settings, previous=None, *, allow_legacy=False):
+def validate_draft(settings, previous=None):
+    """Validate draft settings against the current setting catalog."""
     if not isinstance(settings, dict):
         raise PackageError("settings must be an object")
     previous = previous or {}
@@ -176,19 +156,12 @@ def _validate_draft(settings, previous=None, *, allow_legacy=False):
                 or type(entry["managed"]) is not bool):
             raise PackageError("Each setting must have managed and value fields")
         managed = entry["managed"]
-        raw_value = entry["value"]
-        value = (raw_value if allow_legacy and _is_legacy_scalar_value(key, raw_value)
-                 else _validate_value(key, raw_value, managed=managed,
-                                      previous=previous.get(key, {}).get("value")))
+        value = _validate_value(key, entry["value"], managed=managed,
+                                previous=previous.get(key, {}).get("value"))
         result[key] = {"managed": managed, "value": value}
     managed = managed_settings(result)
     _validate_delays(managed)
     return result
-
-
-def validate_draft(settings, previous=None):
-    """Validate new draft input using only the current setting catalog."""
-    return _validate_draft(settings, previous)
 
 
 def managed_settings(settings):
@@ -203,15 +176,12 @@ def validate_name(value):
 
 def public_summary(package_id, profile):
     published = profile.get("published")
-    summary = {
+    return {
         "package_id": package_id,
         "name": profile["name"],
         "has_draft": "draft" in profile,
         "published_revision": published["revision"] if published else None,
     }
-    if published and has_legacy_values(published["settings"]):
-        summary["publication_requires_review"] = True
-    return summary
 
 
 def public_profile(package_id, profile, impact):
@@ -220,7 +190,7 @@ def public_profile(package_id, profile, impact):
     settings = copy.deepcopy(draft["settings"]) if draft else {}
     if "wifi" in settings:
         settings["wifi"]["value"]["networks"] = public_networks(settings["wifi"]["value"]["networks"])
-    result = {
+    return {
         "package_id": package_id,
         "name": profile["name"],
         "draft_revision": draft["revision"] if draft else None,
@@ -230,10 +200,6 @@ def public_profile(package_id, profile, impact):
         "sections": SECTIONS,
         "impact": impact,
     }
-
-    if published and has_legacy_values(published["settings"]):
-        result["publication_requires_review"] = True
-    return result
 
 
 def check_expected_revision(body, draft):
@@ -257,23 +223,20 @@ def _load_catalog(raw, key):
     return raw[key]
 
 
-def _validate_snapshots(snapshots, published_phase):
+def _validate_snapshots(snapshots):
     for phase, snapshot in snapshots.items():
-        if (phase not in ("draft", published_phase) or not isinstance(snapshot, dict)
+        if (phase not in ("draft", "published") or not isinstance(snapshot, dict)
                 or normalize_revision(snapshot.get("revision")) is None
                 or not isinstance(snapshot.get("settings"), dict)):
             raise PackageError("Invalid saved configuration snapshot")
         if phase == "draft":
-            _validate_draft(snapshot["settings"], allow_legacy=True)
+            validate_draft(snapshot["settings"])
         else:
             if "deployed_at_ms" in snapshot and (
                 not _bounded_int(snapshot["deployed_at_ms"], 1, 253402300799999)
             ):
                 raise PackageError("Invalid configuration deployment time")
-            values = {
-                key: value if _is_legacy_scalar_value(key, value) else _validate_value(key, value)
-                for key, value in snapshot["settings"].items()
-            }
+            values = {key: _validate_value(key, value) for key, value in snapshot["settings"].items()}
             _validate_delays(values)
 
 
@@ -284,24 +247,8 @@ def load_packages(raw):
             raise PackageError("Invalid saved package")
         if validate_name(profile.get("name")) != profile["name"]:
             raise PackageError("Invalid saved package name")
-        _validate_snapshots({key: value for key, value in profile.items() if key != "name"}, "published")
+        _validate_snapshots({key: value for key, value in profile.items() if key != "name"})
     return packages
-
-
-def migrate_group_settings(raw):
-    packages = {}
-    assignments = {}
-    for name, profile in _load_catalog(raw, "profiles").items():
-        if validate_name(name) != name or not isinstance(profile, dict):
-            raise PackageError("Invalid saved group settings")
-        _validate_snapshots(profile, "deployed")
-        package_id = str(uuid.uuid4())
-        packages[package_id] = {
-            "name": name,
-            **{"published" if phase == "deployed" else phase: snapshot for phase, snapshot in profile.items()},
-        }
-        assignments[name] = package_id
-    return packages, assignments
 
 
 def public_configuration_state(raw):
