@@ -124,8 +124,11 @@ The server sends the effective published snapshot on canonical registration,
 publication, package assignment changes, group renames, and membership changes.
 It keeps no device delivery queue and uses device reports for display. A device that was
 offline receives the latest snapshot when it connects. The client compares
-`package_id` and `revision`. It applies a successful version once per OS boot
-after connecting and applies a newly published version during the same boot.
+`package_id` and `revision`. It applies a newly published version immediately.
+After each OS boot it reapplies the scalar settings of a successful version
+once, but keeps Wi-Fi in place when the same Wi-Fi revision still owns Wi-Fi
+with no pending operation; it does not disconnect or reselect a network.
+**Reapply settings** and Retry apply Wi-Fi as well.
 Moving between groups with the same package does not require another application.
 PUI 5.15.7 can reset sleep settings after Android boot completion. The first
 write waits until at least 40 seconds of OS uptime and until TobService is ready.
@@ -140,20 +143,25 @@ server does not queue Retry for offline devices. Wi-Fi runs last through the
 existing journaled connection and rollback flow. See [Wi-Fi setup and recovery](WIFI_SETTINGS.md).
 
 A managed Wi-Fi setting contains an ordered network list and a package-wide
-automatic-return toggle. Update client APKs before deploying this format;
-earlier development Wi-Fi settings must be removed from the saved registry and
-recreated. The [Wi-Fi guide](WIFI_SETTINGS.md#operator-workflow) describes the
-registry reset boundary. Before changing Wi-Fi, the client waits for an
+automatic-return toggle. Update client APKs before deploying this format.
+Before changing Wi-Fi, the client waits for an
 identifiable previous connection. After a failed change with a prior usable
 connection, it retains recovery state until the previous SSID and IP are
 confirmed or a later policy supersedes the connection check. The client reports
 live priority-monitor and recovery state separately from the package result.
 An automatic-return attempt waits about five minutes before another one;
-this wait resets on app process restart and does not delay a new revision.
+consecutive failures double the wait up to 30 minutes. The wait resets on app
+process restart and does not delay a new revision.
 Monitoring depends on fresh, potentially throttled Android scan results.
+A release (package unassigned, or Wi-Fi no longer managed) that arrives during
+a Wi-Fi operation, including an automatic switch, is retained by the Wi-Fi
+controller and applied as soon as that operation settles; no new automatic
+switch starts meanwhile, and a newer managed policy supersedes it.
+The client sends `WIFI_STATE` only when its public state changes, and the
+server ignores a report equal to the stored one.
 
-The APK Settings screen puts file access, Wi-Fi configuration, and Wi-Fi
-rollback timer access in one **Permissions** section. **Device configuration**
+The APK Settings screen puts file access, Wi-Fi configuration, and the optional
+Wi-Fi rollback timer (exact alarm) access in one **Permissions** section. **Device configuration**
 shows the assigned group and, when there is a deployed package, the published
 revision's deployment time in the headset's local time. Assigning an existing
 revision to another group or applying it again does not change that time.
@@ -235,23 +243,21 @@ the new Wi-Fi setting.
 The private `device_registry.json` stores `packages` and each group's
 `members` and `package_id`. A published snapshot may have a `deployed_at_ms`
 field. Wi-Fi passwords are plaintext in the registry
-and its backups. On upgrade, each valid `group_settings` profile becomes one
-package. Draft and published values and revision UUIDs are preserved, except
-that the old development Wi-Fi format must first be removed as described in
-the [Wi-Fi guide](WIFI_SETTINGS.md#operator-workflow).
-Previously accepted brightness and delay values can still be read. A published
-revision containing one of those unsupported values requires review and its
-settings are withheld from devices. Edit the package and use **Save & deploy**
-to publish supported values. Valid packages remain available during review.
-If a device belongs to several legacy groups, the server keeps the first
-group by name and logs the choice. The older `wifi_profiles` prototype
-does not participate in migration.
+and its backups.
 
-Upgrade the server and client and reload open consoles together. The first
-package delivery can reapply migrated settings under the new package identity.
-Finish any old-format Wi-Fi recovery before updating the client; new-format
-recovery journals resume after process restart. Keep a separate compatible
-registry backup if a downgrade is needed.
+On upgrade, the released `{"groups": {name: [device_id]}}` format becomes the
+package format with no packages assigned. Released servers allowed a device in
+several groups; the server keeps such a device only in the first group by name
+and logs each removed membership. Before writing the migrated registry, the
+server copies the previous file to `<registry>.<YYYYMMDD-HHMMSS>.bak` next to it
+with the same private permissions and logs the path. If the backup cannot be
+saved, the migration is not written and packages stay unavailable. Older
+servers cannot read the migrated file; restore the backup to downgrade.
+Registries written by development builds of this feature are not supported.
+If the server cannot read the registry, it keeps the file unchanged, saves no
+device or group changes for that session, and the console shows a warning.
+
+Upgrade the server and client and reload open consoles together.
 
 ## Building the MDM Client
 
@@ -719,9 +725,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `CREATE_GROUP` | Create a new, empty device group. Fields: `name` |
 | `RENAME_GROUP` | Rename a group, preserving its members. Fields: `name`, `new_name` |
 | `DELETE_GROUP` | Delete a group (member devices are not affected). Fields: `name` |
-| `SET_DEVICE_GROUPS` | Set a device's membership. Fields are `device_id` and `groups` (zero or one existing group name). |
 | `UPDATE_GROUP_MEMBERS` | Edit only selected members of an existing group. Fields are `name`, `add` (device IDs mapped to their expected current group, or null for unassigned), and `remove` (device IDs expected to belong to `name`). Offline device IDs are supported. If a touched device changed groups, the entire edit is rejected. |
-| `SET_GROUP_MEMBERS` | Legacy member-list replacement. Fields are `name` and `members`. Rejects implicit moves from another group. |
 | `RETIRE_DEVICE` | Make target clients uninstall themselves (remotely irreversible — the console gates it behind its heaviest confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only). See [Device Retirement](#device-retirement). |
 
 ### Admin HTTP API
@@ -765,7 +769,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `SELF_UPDATE_VERIFIED` | Outcome of the automatic post-update `EXECUTE_VERIFY_APK` the server runs against the client's own package. Fields: `device_id`, `correlation_id`, `status` (`verified` / `mismatch` / `skipped` / `error`), `detail` |
 | `RETIRE_SENT` | Confirmation that `EXECUTE_SELF_UNINSTALL` commands were dispatched. Fields: `sent_count`, `target_count` |
 | `RETIRE_RESULT` | Outcome of a device retire. Success is settled by *silence*: the device announced, disconnected, and stayed away for the retire window. Failure means it re-registered, reported the uninstall failed, or was still connected at the deadline. Fields: `device_id`, `correlation_id`, `status` (`success` / `fail`), `detail` |
-| `GROUP_LIST` | Current `groups`, package summaries in `packages`, group-to-package `assignments`, and published `deployments`. Sent on connect and after group or package changes. `membership_edits: true` advertises support for `UPDATE_GROUP_MEMBERS`. |
+| `GROUP_LIST` | Current `groups`, package summaries in `packages`, group-to-package `assignments`, and published `deployments`. Sent on connect and after group or package changes. `registry_writable` is `false` when the server could not read its registry and is refusing to save changes; the console then shows a warning. |
 | `GROUP_CREATED` / `GROUP_RENAMED` / `GROUP_DELETED` | Acknowledgements for group create / rename / delete. |
 | `DEVICE_GROUPS_SET` | Acknowledgement of a device's group membership change. Fields: `device_id`, `groups` |
 | `GROUP_MEMBERS_SET` | Acknowledgement of a group's committed member list change. Fields: `name`, `members`. Scoped edits also include `operation: UPDATE_GROUP_MEMBERS` |

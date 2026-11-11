@@ -90,8 +90,20 @@ and [October hardware record](../tasks/wifi-hardware-validation-2026-10-20.md).
   location foreground service were insufficient for `getConfiguredNetworks()`
   after Wi-Fi disconnected. Granting `ACCESS_BACKGROUND_LOCATION` allowed
   recovery on that PUI build. Check the granted permissions and device state,
-  not just the manifest. The current managed flow also checks Device Owner and
-  exact-alarm access.
+  not just the manifest. The current managed flow also checks Device Owner.
+  Exact-alarm access is optional since 2026-11-11: without it, rollback relies
+  on the in-process watchdog and startup recovery and can be delayed while the
+  headset sleeps. `USE_EXACT_ALARM` is declared but its install-time grant has
+  not been verified on PUI.
+- The client SDK 4.3.16 also exposes `pbsControlSetAutoConnectWIFI(ssid,
+  password, int, IBoolCallback)`, a `...WithErrorCodeCallback` variant,
+  `pbsControlClearAutoConnectWIFI`, and `pbsGetAutoConnectWiFiConfig`. The PICO
+  documentation describes them only as setting "a default Wi-Fi connection".
+  They take a single network and offer no ordering, auto-join control for
+  other saved networks, or rollback, so they cannot express the ordered list of
+  up to four networks with journaled recovery. They were not tried on a device.
+  Revisit them if the policy is ever reduced to one network or if Device Owner
+  plus background location stops working on a PUI update.
 - PICO auto-join changes use the TobService `allow_wifi_auto_join` message.
   Read back the actual `WifiConfiguration.allowAutojoin` flag; do not infer the
   final saved state only from a successful request.
@@ -124,17 +136,24 @@ The operator-facing details are in [Wi-Fi settings](WIFI_SETTINGS.md).
   eight-second grace period before ordered reselection. Repeated disconnected
   reselection failures back off from five minutes to at most 30 minutes.
 - With automatic return on, the app looks for higher candidates while connected
-  to a lower one. The first scan may happen immediately, later requests target
-  about five minutes, and fresh passive results may also trigger a switch.
+  to a lower one. The first scan runs within about 30 seconds, later requests
+  target about five minutes plus up to 10% random delay, and fresh passive
+  results may also trigger a switch.
   Failed scan requests back off to as much as 30 minutes. Hidden SSIDs are not
   supported with automatic return on. With it off, a working lower connection is
   retained; ordered reselection still applies after a disconnect.
 - A failed automatic return was found in a host test to restart scanning and
   immediately attempt another switch after recovery. The final implementation
   waits five minutes after any automatic-return operation settles before
-  another one, even after a successful move. This in-memory wait resets on app
+  another one, even after a successful move. Since 2026-11-11 consecutive
+  failures double the wait up to 30 minutes. This in-memory wait resets on app
   process restart; a new package revision is not delayed by the old wait. The
-  delay change was host-tested and was **not** installed on the physical device.
+  delay changes were host-tested and were **not** installed on the physical
+  device; verify with a preferred AP that has a deliberately wrong password.
+- Until 2026-11-11 every OS boot re-applied the assigned Wi-Fi revision and
+  disconnected the current network about 40 seconds after boot. The client now
+  keeps an existing connection when the same Wi-Fi revision still owns Wi-Fi
+  and only reapplies scalar settings. Not yet verified on the device.
 - A failed switch restores saved auto-join flags and known credentials. If a
   usable connection existed before the attempt, restoration is confirmed only
   after the prior SSID and a usable IP are observed. If not confirmed within

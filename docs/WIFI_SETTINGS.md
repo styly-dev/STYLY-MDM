@@ -20,14 +20,18 @@ order during application and when disconnected. An existing connection is kept
 after restart, and the client does not switch solely because a higher-priority
 network reappears. With it on, the client checks for higher-priority networks
 while connected to a lower candidate, regardless of whether it was selected
-manually. The first check may run immediately, with later requests about five
-minutes apart; a fresh system scan can also trigger a switch earlier. No
+manually. The first check runs within about 30 seconds, with later requests
+about five minutes apart (each with a small random delay so headsets that start
+together do not scan together); a fresh system scan can also trigger a switch
+earlier. No
 priority scan is needed while connected to the first candidate. A switch can
 temporarily interrupt communication.
 After an automatic-return attempt settles, the client waits about five minutes
 before another automatic-return attempt, including when it moved to a higher
-candidate successfully. This also applies if someone selects a lower candidate
-in the meantime. A new package revision is not delayed by the previous wait;
+candidate successfully. Consecutive failed attempts, such as a visible preferred
+network with a wrong password or a weak signal, double the wait up to 30
+minutes; a success resets it. This also applies if someone selects a lower
+candidate in the meantime. A new package revision is not delayed by the previous wait;
 an app process restart clears it. When disconnected, the client waits eight
 seconds for a connection to return before selecting in order. Repeated failed
 selections while disconnected are retried after five minutes, with the delay
@@ -38,17 +42,10 @@ networks.
 WPA2/WPA3 Personal prefers WPA3 when supported and allows WPA2 fallback.
 Passwords contain 1–63 printable ASCII characters; passwords shorter than
 eight characters can connect only with WPA3. Update the client APK before
-deploying the new Wi-Fi format. Existing development Wi-Fi settings use an
-older format and must be recreated. A registry containing the old format cannot
-load its configuration packages until those entries are removed; the saved
-registry is retained. With the server stopped, back up the private registry and
-remove the obsolete `wifi` and `wifiPriority` entries from each package's draft
-and published `settings`. Give every modified draft or published snapshot a new
-revision UUID; a revision must not identify two different settings. Restart the
-server and recreate the Wi-Fi settings in the console. Other package settings
-and group assignments can be kept. The registry
-contains credentials; protect the backup accordingly. Before updating a client,
-let any in-progress Wi-Fi operation and package handoff finish or recover.
+deploying the Wi-Fi format. Settings and Wi-Fi journals written by development
+builds of this feature are not supported; recreate them. Before updating a
+client, let any in-progress Wi-Fi operation and package handoff finish or
+recover.
 The console shows the connected client's monitor status separately from the
 last package-application result.
 
@@ -80,8 +77,10 @@ effect. The draft retains the unchecked setting's values.
 
 ## Provisioning and recovery
 
-Managed Wi-Fi requires Device Owner, precise location allowed all the time with
-Location enabled, and exact-alarm special access. Provision Device Owner
+Managed Wi-Fi requires Device Owner and precise location allowed all the time
+with Location enabled. Exact-alarm access is optional: the APK declares
+`USE_EXACT_ALARM`, which Android 13 and later grant at install (not yet verified
+on a PICO device), and **Settings** shows its status. Provision Device Owner
 explicitly with `dpm set-device-owner`. Foreground-service location by itself
 did not preserve configured-network access after disconnection on the tested
 PUI build. The Wi-Fi worker starts recovery after foreground location promotion.
@@ -91,7 +90,10 @@ identities, auto-join flags, and any previous credentials known to MDM. It
 waits up to two seconds for the current connection to become identifiable;
 if a usable connection cannot be matched to one saved network, it fails before
 changing Wi-Fi. The first mutation starts a fixed 60-second elapsed-time budget
-with an exact alarm and an in-process watchdog. Each candidate can use up to
+with an in-process watchdog and, when access is granted, an exact alarm. The
+alarm wakes a sleeping headset and restarts a stopped client at the deadline.
+Without it, the watchdog still rolls back while the client runs, but a rollback
+can wait until the headset wakes or the client restarts. Each candidate can use up to
 12 seconds within that budget. The client must observe a fresh connection to a
 candidate SSID with a Wi-Fi IP. This test can succeed on an isolated network
 where the MDM server is unreachable. The report remains local until the client
@@ -127,11 +129,16 @@ Wi-Fi management can release a settled recovery journal without changing
 device values.
 An unreadable journal stays blocked. Content startup waits for interrupted
 Wi-Fi recovery for at most 60 seconds. The current Wi-Fi journal preserves
-recovery data and known credentials across process restarts. Completed state in
-the earlier development format is discarded on upgrade; an unfinished or
-unreadable old recovery journal must be resolved before updating. The client applies the assigned
-published version after connecting in each boot. A failed or interrupted
-version waits for Retry or a new publication.
+recovery data and known credentials across process restarts. After each boot
+the client reapplies the assigned version's scalar settings once, but leaves
+Wi-Fi in place when the same Wi-Fi revision still owns it: an existing
+connection is kept and no network is reselected. **Reapply settings** on the
+headset and Retry apply Wi-Fi again. A failed or interrupted version waits for
+Retry or a new publication.
+
+Releasing management (removing the package or clearing **Manage**) while a
+Wi-Fi operation or an automatic switch is in progress takes effect as soon as
+that operation settles. No new automatic switch starts while a release waits.
 
 The PICO auto-join API uses TobService's `allow_wifi_auto_join` message. Read
 the actual `WifiConfiguration.allowAutojoin` flag. A partial Wi-Fi configuration
