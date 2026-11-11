@@ -515,7 +515,8 @@ def test_admin_label_and_group_survive_reload_without_mode(tmp_path, monkeypatch
             await recv_type(admin, "DEVICE_LABEL_SET")
             await admin.send_json({"type": "CREATE_GROUP", "name": "Old"})
             await recv_type(admin, "GROUP_CREATED")
-            await admin.send_json({"type": "SET_GROUP_MEMBERS", "name": "Old", "members": ["SERIAL-1", GUID]})
+            await admin.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": "Old",
+                                  "add": {"SERIAL-1": None, GUID: None}, "remove": []})
             await recv_type(admin, "GROUP_MEMBERS_SET")
             server.load_registry()
             assert server.device_registry[GUID]["label"] == "Reserved"

@@ -505,6 +505,7 @@
     .settings-deploy-hint { color: var(--text-secondary); font-size: 12px; }
     .settings-actions + .settings-deploy-hint, .settings-assignment + .settings-deploy-hint { margin-top: 6px; text-align: right; }
     .settings-error { color: var(--danger); font-size: 12px; margin-bottom: 8px; }
+    .registry-warning { margin: 10px 16px 0; color: var(--danger); border-color: var(--danger); }
     .settings-results { margin-top: 16px; }
     .settings-results-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 4px; }
     .settings-results h4 { font-size: 13px; }
@@ -572,6 +573,7 @@
           <div class="conn"><span class="conn-dot" id="connDot"></span><span id="connText">Disconnected</span></div>
         </div>
       </div>
+      <div class="push-note registry-warning" id="registryWarning" role="alert" hidden>The server could not read its device registry, so changes to devices and groups are not saved. The file is kept unchanged. Fix or restore the registry, then restart the server.</div>
 
       <div class="zones">
         <!-- (1) Targets -->
@@ -853,7 +855,7 @@
       let manageMembers = new Set();
       let manageEditedMembers = new Set();
       let manageAddedOwners = new Map();
-      let membershipEditsSupported = null;
+      let membershipSnapshotReady = false;
       let membershipSave = null;
       let manageSearch = '';
       let manageSort = 'label-asc';
@@ -1163,12 +1165,12 @@
 
       function connect() {
         if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
-        membershipEditsSupported = null;
+        membershipSnapshotReady = false;
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
         ws = new WebSocket(proto + '//' + location.host + '/ws/admin');
         ws.onopen = function () { setConnStatus('connected'); addLog('Connected to server', 'info'); if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; } };
         ws.onclose = function () {
-          membershipEditsSupported = null;
+          membershipSnapshotReady = false;
           if (membershipSave?.state === 'saving') {
             showMembershipFeedback(membershipSave.name, 'Connection lost. Review the current group before saving again.', 'error');
           }
@@ -1243,7 +1245,8 @@
           case 'GROUP_LIST': {
             const previousMembers = groups[manageSelectedGroup] || [];
             groups = msg.groups || {};
-            membershipEditsSupported = msg.membership_edits === true;
+            membershipSnapshotReady = true;
+            document.getElementById('registryWarning').hidden = msg.registry_writable !== false;
             configurationController.updateSnapshot(msg);
             groupsLoaded = true;
             if (pendingSelectGroup && (pendingSelectGroup in groups)) { selectManageGroup(pendingSelectGroup); pendingSelectGroup = null; }
@@ -1318,7 +1321,6 @@
             if (activeGroup === msg.name) activeGroup = msg.new_name;
             break;
           case 'GROUP_DELETED': addLog('Group deleted: ' + (msg.name || '-'), 'success'); if (activeGroup === msg.name) activeGroup = null; break;
-          case 'DEVICE_GROUPS_SET': addLog('Groups set for ' + labelFor(msg.device_id) + ': ' + ((msg.groups && msg.groups.length) ? msg.groups.join(', ') : '(none)'), 'success'); break;
           case 'GROUP_MEMBERS_SET':
             if (msg.operation === 'UPDATE_GROUP_MEMBERS' && membershipSave?.name === msg.name && membershipSave.state === 'saving') {
               manageEditedMembers.clear();
@@ -2523,10 +2525,8 @@
       function saveGroupMembers() {
         const name = manageSelectedGroup;
         if (!name || membershipSave?.state === 'saving') return;
-        if (membershipEditsSupported !== true) {
-          showMembershipFeedback(name, membershipEditsSupported === false
-            ? 'Member editing requires the updated server. Reload the console after updating.'
-            : 'Wait for the current group list before saving.', 'error');
+        if (!membershipSnapshotReady) {
+          showMembershipFeedback(name, 'Wait for the current group list before saving.', 'error');
           return;
         }
         let edit;

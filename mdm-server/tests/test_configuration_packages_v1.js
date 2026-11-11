@@ -22,25 +22,22 @@ const sections = [
   ] },
   { id: 'advanced', title: 'USB & advanced', items: [
     { id: 'developerMenu', label: 'Developer options menu', kind: 'bool', default: false },
-    { id: 'unavailableExample', label: 'Unavailable example', kind: 'unavailable', default: null },
   ] },
 ];
 const wifiNetwork = { ssid: 'Studio', security: 'WPA2_WPA3', hidden: false, password_present: true };
 
-test('metadata defaults are visible in the draft, unmanaged, and exclude unsupported controls from writes', () => {
+test('metadata defaults are visible in the draft and unmanaged', () => {
   const saved = loadDraft(sections, {});
   const draft = structuredClone(saved);
   assert.deepEqual(saved.brightness, { managed: false, value: 50 });
   assert.deepEqual(saved.wifi, { managed: false, value: { networks: [], auto_return: false } });
   assert.deepEqual(saved.developerMenu, { managed: false, value: false });
-  assert.equal(saved.unavailableExample, undefined);
   draft.brightness.value = 64;
   draft.shutdown.value = { enabled: true, hour: 23, minute: 10, repeat: 65 };
   const payload = buildPayload(sections, draft, saved);
   assert.deepEqual(payload.brightness, { managed: false, value: 64 });
   assert.deepEqual(payload.shutdown, { managed: false, value: { enabled: true, hour: 23, minute: 10, repeat: 65 } });
   assert.deepEqual(payload.developerMenu, { managed: false, value: false });
-  assert.equal(payload.unavailableExample, undefined);
   assert.deepEqual(payload.wifi.value, { networks: [], auto_return: false });
   assert.equal(saved.shutdown.value.repeat, 127);
   assert.equal(sections[0].items.find(item => item.id === 'shutdown').default.repeat, 127);
@@ -71,30 +68,12 @@ test('inactive schedules fill only cleared time parts from saved time or catalog
   assert.throws(() => buildPayload(sections, draft, saved), /Enter a time for Scheduled shutdown/);
 });
 
-test('legacy scalar values stay reviewable, inactive writes use defaults, and active writes reject stale values', () => {
-  const saved = loadDraft(sections, {
-    brightness: { managed: false, value: 0 },
-    sleepDelay: { managed: false, value: 60 },
-    screenOff: { managed: false, value: 10 },
-  });
-  assert.equal(saved.brightness.value, 0);
-  assert.equal(saved.sleepDelay.value, 60);
-  assert.equal(saved.screenOff.value, 10);
-
-  const draft = structuredClone(saved);
-  draft.autoSleep = { managed: false, value: true };
-  const payload = buildPayload(sections, draft, saved);
-  assert.deepEqual(payload.brightness, { managed: false, value: 50 });
-  assert.deepEqual(payload.sleepDelay, { managed: false, value: 10 });
-  assert.deepEqual(payload.screenOff, { managed: false, value: -1 });
-  assert.deepEqual(payload.autoSleep, { managed: false, value: true });
-
-  for (const [id, value] of [['brightness', 0], ['sleepDelay', 15], ['sleepDelay', 30],
-    ['sleepDelay', 60], ['screenOff', 3], ['screenOff', 10]]) {
-    const legacy = loadDraft(sections, { [id]: { managed: false, value } });
-    const active = structuredClone(legacy);
-    active[id].managed = true;
-    assert.throws(() => buildPayload(sections, active, legacy), /Select a supported value/);
+test('managed writes reject values outside the catalog', () => {
+  for (const [id, value] of [['brightness', 0], ['sleepDelay', 15], ['screenOff', 10]]) {
+    const saved = loadDraft(sections, {});
+    const draft = structuredClone(saved);
+    draft[id] = { managed: true, value };
+    assert.throws(() => buildPayload(sections, draft, saved), /Select a supported value/);
   }
 });
 
@@ -236,6 +215,44 @@ test('managed Wi-Fi allows at most four candidates in the editor and payload', a
     { ssid: 'Network-5', security: 'OPEN', hidden: false, password: '' },
   );
   assert.throws(() => buildPayload(sections, overflow, saved), /Wi-Fi supports up to 4 networks/);
+});
+
+test('a new package gets its first Wi-Fi network after Manage and reopens with deploy available', async () => {
+  let latest = profile({ settings: {} });
+  const fixture = createHarness(({ method, body }) => {
+    if (method === 'GET') return response(latest);
+    const networks = body.settings.wifi.value.networks.map(({ password, ...network }) => ({
+      ...network, password_present: Boolean(password),
+    }));
+    latest = profile({ settings: { ...body.settings, wifi: { ...body.settings.wifi,
+      value: { ...body.settings.wifi.value, networks } } }, draftRevision: 'draft2', publishedRevision: 'r1' });
+    return response(latest);
+  });
+  fixture.broadcast();
+  await fixture.controller.showPackages('pkg');
+  assert.equal(fixture.addNetworkButton.disabled, true);
+
+  fixture.edit({ dataset: { manage: 'wifi' }, checked: true });
+  assert.equal(fixture.valueField.disabled, false);
+  assert.equal(fixture.addNetworkButton.disabled, false);
+
+  fixture.policyClick({ policyAction: 'add-network', setting: 'wifi' });
+  fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'ssid' }, value: 'Studio', type: 'text' });
+  fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'security' }, value: 'WPA2_WPA3', type: 'select-one' });
+  fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'password' }, value: 'studio-pass', type: 'password' });
+  // Rendering a second row must restore the typed password into the first row's new input.
+  fixture.policyClick({ policyAction: 'add-network', setting: 'wifi' });
+  assert.deepEqual(fixture.passwordInputs().map(input => input.value), ['studio-pass', '']);
+  fixture.policyClick({ policyAction: 'remove-network', setting: 'wifi', network: '1' });
+  await fixture.editClick('deploy');
+  assert.deepEqual(fixture.requests.at(-1).body.settings.wifi, { managed: true, value: {
+    auto_return: false, networks: [{ ssid: 'Studio', security: 'WPA2_WPA3', hidden: false, password: 'studio-pass' }],
+  } });
+
+  await fixture.controller.showPackages('pkg');
+  assert.deepEqual(fixture.passwordInputs().map(input => input.value), ['']);
+  assert.equal(fixture.editorButtons.deploy.disabled, false);
+  assert.doesNotMatch(fixture.packagePanel.innerHTML, /studio-pass/);
 });
 
 const pkg = { package_id: 'pkg', name: 'Studio', has_draft: true, published_revision: 'r0' };
@@ -482,11 +499,9 @@ function profile({
   settings = { brightness: { managed: true, value: 60 } },
   impact = { groups: 2, devices: 5, token: 'impact1' },
   itemSections = sections,
-  publicationRequiresReview = false,
 } = {}) {
   return { package_id: id, name, draft_revision: draftRevision, published_revision: publishedRevision,
-    published_keys: publishedRevision ? ['brightness'] : [], settings, sections: itemSections, impact,
-    publication_requires_review: publicationRequiresReview };
+    published_keys: publishedRevision ? ['brightness'] : [], settings, sections: itemSections, impact };
 }
 
 function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'] }, confirm = () => true } = {}) {
@@ -522,8 +537,25 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     '[data-settings-results]': createElement(),
     ...Object.fromEntries(Object.entries(groupButtons).map(([key, button]) => [`[data-group-action="${key}"]`, button])),
   };
+  // The rendered markup decides which password inputs exist and whether Add starts disabled,
+  // as in the browser. Each render replaces the inputs, so restored values are observable.
+  const addNetworkButton = { disabled: false };
+  let panelHtml = '';
+  let passwordInputs = [];
   const packagePanel = createElement({
     querySelector: selector => packagePanel.innerHTML.includes('settings-editor') ? editorControls[selector] : null,
+    querySelectorAll: selector => selector === '[data-field="password"]' ? passwordInputs : [],
+  });
+  Object.defineProperty(packagePanel, 'innerHTML', {
+    get: () => panelHtml,
+    set(html) {
+      panelHtml = html;
+      passwordInputs = [...html.matchAll(/<input[^>]*data-field="password"[^>]*>/g)].map(([tag]) => ({
+        dataset: { setting: tag.match(/data-setting="([^"]*)"/)[1], network: tag.match(/data-network="([^"]*)"/)[1] },
+        value: '',
+      }));
+      addNetworkButton.disabled = /data-policy-action="add-network"[^>]*disabled/.test(html);
+    },
   });
   const groupPanel = createElement({ querySelector: selector => groupControls[selector] });
   const packageList = createElement();
@@ -559,7 +591,6 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
   const wifiAutoReturnControl = { disabled: false };
   const wifiLimitWarning = { hidden: true };
   const wifiHiddenWarning = { hidden: true };
-  const addNetworkButton = { disabled: false };
   const wifiArticle = { querySelector: selector => selector === '[data-field="password"]' ? { disabled: false, value: '' } : ({ textContent: '' }) };
   const valueField = { disabled: true, querySelector: selector => selector === '[data-wifi-limit-warning]' ? wifiLimitWarning :
     selector === '[data-wifi-hidden-warning]' ? wifiHiddenWarning :
@@ -567,16 +598,13 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     selector.includes('move-network') ? moveButtons : [] };
   const policyClick = dataset => {
     const button = { dataset, disabled: dataset.policyAction === 'add-network' ? addNetworkButton.disabled : false };
-    const result = packagePanel.handlers.get('click')({ target: { closest: () => button } });
-    if (dataset.policyAction === 'add-network') {
-      addNetworkButton.disabled = /data-policy-action="add-network"[^>]*disabled/.test(packagePanel.innerHTML);
-    }
-    return result;
+    return packagePanel.handlers.get('click')({ target: { closest: () => button } });
   };
+  // A Manage checkbox sits beside the value fieldset, not inside it.
   const edit = ({ dataset, value, checked, type }) => packagePanel.handlers.get('input')({ target: {
     dataset, value, checked, type, matches: () => false, nextElementSibling: {},
     closest: selector => selector === '.settings-row' ? { querySelector: () => valueField } :
-      selector === '.settings-value' ? valueField :
+      selector === '.settings-value' ? (dataset.manage ? null : valueField) :
         selector === '.wifi-network' ? wifiArticle :
         { dataset: { settingsSection: 'basic' }, querySelector: () => ({}), querySelectorAll: () => [] },
   } });
@@ -597,6 +625,7 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
   return {
     controller, packagePanel, packageList, edit, editClick, policyClick, editorButtons, editorControls, groupControls,
     groupClick, groupButtons, select, broadcast, create, createControls, requests, confirmations,
+    passwordInputs: () => passwordInputs,
     valueField, moveButtons, wifiOrderNote, wifiAutoReturnControl, wifiLimitWarning, wifiHiddenWarning, addNetworkButton, footerStatus,
     opened: () => opened,
   };
@@ -700,72 +729,6 @@ test('Save & deploy fills a cleared shutdown time when the schedule is disabled 
       value: { enabled: mode !== 'disabled', hour: 22, minute: 15, repeat: 127 },
     });
   }
-});
-
-test('legacy scalar values remain visible and unrelated edits serialize supported inactive defaults', async () => {
-  let latest = profile({ settings: {
-    brightness: { managed: false, value: 0 },
-    sleepDelay: { managed: false, value: 60 },
-    screenOff: { managed: false, value: 10 },
-  } });
-  const fixture = createHarness(({ method, body }) => {
-    if (method === 'GET') return response(latest);
-    latest = profile({ settings: body.settings, draftRevision: 'draft2', publishedRevision: 'r1' });
-    return response(latest);
-  });
-  fixture.broadcast();
-  await fixture.controller.showPackages('pkg');
-  assert.match(fixture.packagePanel.innerHTML, /data-legacy-value="brightness"[^>]*>Saved value 0%/);
-  assert.match(fixture.packagePanel.innerHTML, /data-legacy-value="sleepDelay"[^>]*>Saved value 60/);
-  assert.match(fixture.packagePanel.innerHTML, /data-legacy-value="screenOff"[^>]*>Saved value 10/);
-  assert.match(fixture.packagePanel.innerHTML, /Saved value 60 \(legacy\)/);
-  assert.match(fixture.packagePanel.innerHTML, /Saved value 10 \(legacy\)/);
-
-  fixture.edit({ dataset: { packageName: '' }, value: 'Reviewed package' });
-  await fixture.editClick('deploy');
-  const submitted = fixture.requests.at(-1).body.settings;
-  assert.deepEqual(submitted.brightness, { managed: false, value: 50 });
-  assert.deepEqual(submitted.sleepDelay, { managed: false, value: 10 });
-  assert.deepEqual(submitted.screenOff, { managed: false, value: -1 });
-});
-
-test('all specified pre-catalog scalar values remain visible for review', async () => {
-  for (const [id, value] of [['brightness', 0], ['sleepDelay', 15], ['sleepDelay', 30],
-    ['sleepDelay', 60], ['screenOff', 3], ['screenOff', 10]]) {
-    const fixture = createHarness(() => response(profile({ settings: { [id]: { managed: false, value } } })));
-    fixture.broadcast();
-    await fixture.controller.showPackages('pkg');
-    const display = id === 'brightness' ? value + '%' : String(value);
-    assert.match(fixture.packagePanel.innerHTML,
-      new RegExp(`data-legacy-value="${id}"[^>]*>Saved value ${display}`));
-  }
-});
-
-test('review-needed publications are visible, blocked for group reuse, and remain editable', async () => {
-  let latest = profile({ publicationRequiresReview: true });
-  const fixture = createHarness(({ method, body }) => {
-    if (method === 'GET') return response(latest);
-    latest = profile({ name: body.name, settings: body.settings, draftRevision: 'draft2', publishedRevision: 'r2' });
-    return response(latest);
-  });
-  const blocked = { ...pkg, publication_requires_review: true };
-  fixture.broadcast({ packages: [blocked, pkg2], assignments: { 'The Lab': 'pkg2' } });
-  await fixture.controller.showPackages('pkg');
-  assert.match(fixture.packageList.innerHTML, /Review needed/);
-  assert.match(fixture.editorControls['[data-package-publication]'].textContent, /Review needed/);
-
-  fixture.controller.renderGroup('The Lab');
-  fixture.select('pkg');
-  assert.equal(fixture.groupButtons.deploy.disabled, true);
-  assert.match(fixture.groupControls['[data-deploy-hint]'].textContent, /needs review/);
-  assert.equal(fixture.groupButtons.edit.hidden, false);
-  assert.equal(fixture.groupButtons.edit.disabled, false);
-
-  fixture.edit({ dataset: { packageName: '' }, value: 'Reviewed Studio' });
-  await fixture.editClick('deploy');
-  assert.equal(fixture.requests.at(-1).url, '/api/packages/pkg/save-and-deploy');
-  assert.doesNotMatch(fixture.packageList.innerHTML, /Review needed/);
-  assert.equal(fixture.groupButtons.deploy.disabled, false);
 });
 
 test('a stale impact never republishes automatically and a subsequent confirmation uses the refreshed counts and token', async () => {

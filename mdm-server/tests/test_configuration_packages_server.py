@@ -191,7 +191,8 @@ def test_device_summary_tracks_group_and_deployment_without_sending_settings_to_
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == {
                     **NO_POLICY, "group_name": "Gallery", "deployed_at_ms": None,
                 }
-                await admin.send_json({"type": "SET_DEVICE_GROUPS", "device_id": DEVICE_ID, "groups": []})
+                await admin.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": "Gallery",
+                                       "add": {}, "remove": [DEVICE_ID]})
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == {
                     **NO_POLICY, "group_name": None, "deployed_at_ms": None,
                 }
@@ -315,14 +316,16 @@ def test_mutations_enforce_origin_draft_cas_impact_and_validation(tmp_path):
 
             # Both roster changes and moves within a shared package invalidate confirmation.
             async with session.ws_connect(base + "/ws/admin") as admin:
-                await admin.send_json({"type": "SET_DEVICE_GROUPS", "device_id": OFFLINE_ID, "groups": ["Studio"]})
-                await _receive_type(admin, "DEVICE_GROUPS_SET")
+                await admin.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": "Studio",
+                                       "add": {OFFLINE_ID: None}, "remove": []})
+                await _receive_type(admin, "GROUP_MEMBERS_SET")
                 await _deploy(session, base, first, status=409)
                 await _assign(session, base, "Gallery", first)
                 current = await _request(session, "GET", base, _path(first))
                 assert current["impact"]["groups"] == 2 and current["impact"]["devices"] == 3
-                await admin.send_json({"type": "SET_DEVICE_GROUPS", "device_id": OFFLINE_ID, "groups": ["Gallery"]})
-                await _receive_type(admin, "DEVICE_GROUPS_SET")
+                await admin.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": "Gallery",
+                                       "add": {OFFLINE_ID: "Studio"}, "remove": []})
+                await _receive_type(admin, "GROUP_MEMBERS_SET")
                 await _deploy(session, base, current, status=409)
 
             current = await _request(session, "GET", base, _path(first))
@@ -510,19 +513,17 @@ def test_group_assignment_and_membership_release_and_referenced_delete(tmp_path)
                 await _assign(session, base, "Studio", first)
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == _policy(first, {"brightness": 30})
                 await _request(session, "DELETE", base, _path(first), status=409)
-                await admin.send_json({"type": "SET_DEVICE_GROUPS", "device_id": DEVICE_ID, "groups": ["Studio", group]})
-                assert "only one group" in (await _receive_type(admin, "ERROR"))["message"]
-                await admin.send_json({"type": "SET_GROUP_MEMBERS", "name": group, "members": [DEVICE_ID]})
+                # A move must name the current owner, so a device never lands in two groups.
+                await admin.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": group,
+                                       "add": {DEVICE_ID: None}, "remove": []})
                 assert "Reload the console" in (await _receive_type(admin, "ERROR"))["message"]
                 await _assert_no_policy(ws)
 
                 await admin.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": group,
                                        "add": {DEVICE_ID: "Studio"}, "remove": []})
-                group_list = await _receive_type(admin, "GROUP_LIST")
                 updated = await _receive_type(admin, "GROUP_MEMBERS_SET")
                 assert updated["operation"] == "UPDATE_GROUP_MEMBERS"
                 assert updated["name"] == group
-                assert group_list["membership_edits"] is True
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == _policy(other, {"brightness": 75})
                 assert json.loads(server.build_group_list_msg())["groups"] == {"Studio": [], group: [DEVICE_ID]}
 
@@ -533,12 +534,14 @@ def test_group_assignment_and_membership_release_and_referenced_delete(tmp_path)
 
                 # Both groups now reference the same publication. The server sends
                 # it on the move and the device decides whether to reapply.
-                await admin.send_json({"type": "SET_DEVICE_GROUPS", "device_id": DEVICE_ID, "groups": ["Studio"]})
-                await _receive_type(admin, "DEVICE_GROUPS_SET")
+                await admin.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": "Studio",
+                                       "add": {DEVICE_ID: group}, "remove": []})
+                await _receive_type(admin, "GROUP_MEMBERS_SET")
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == _policy(first, {"brightness": 30})
 
-                await admin.send_json({"type": "SET_DEVICE_GROUPS", "device_id": DEVICE_ID, "groups": []})
-                await _receive_type(admin, "DEVICE_GROUPS_SET")
+                await admin.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": "Studio",
+                                       "add": {}, "remove": [DEVICE_ID]})
+                await _receive_type(admin, "GROUP_MEMBERS_SET")
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == NO_POLICY
                 await _request(session, "DELETE", base, _path(first), status=409)
                 assert await _request(session, "DELETE", base, _path(other)) == {"deleted": True}
@@ -616,7 +619,6 @@ def test_update_group_members_uses_expected_owners_from_each_console_snapshot(tm
                         session.ws_connect(base + "/ws/admin") as stale):
                 first_snapshot = await _receive_type(first, "GROUP_LIST")
                 stale_snapshot = await _receive_type(stale, "GROUP_LIST")
-                assert first_snapshot["membership_edits"] is True
                 assert stale_snapshot["groups"] == first_snapshot["groups"] == {
                     "A": [DEVICE_ID, OTHER_ID, legacy_id], "B": [],
                 }
@@ -909,7 +911,8 @@ def test_retry_sends_fresh_id_only_to_current_online_matching_device(tmp_path):
 
 def test_unreadable_configuration_does_not_release_connected_device(tmp_path):
     async def body():
-        async with _running_server(tmp_path, {"Studio": [DEVICE_ID]}, group_settings=None) as (session, base):
+        async with _running_server(tmp_path, {"Studio": [DEVICE_ID]},
+                                    packages={"version": 99, "packages": {}}) as (session, base):
             await _request(session, "GET", base, "/api/packages", status=503)
             async with session.ws_connect(base + "/ws/device", autoping=False) as ws:
                 await _register(ws)
@@ -1130,58 +1133,4 @@ def test_api_rejects_more_than_four_networks_with_auto_return_on_or_off(tmp_path
             assert current["published_revision"] is None
             assert current["draft_revision"] is None
 
-    asyncio.run(body())
-
-
-def test_legacy_publication_is_readable_but_cannot_be_sent_or_newly_assigned(tmp_path):
-    async def body():
-        legacy_id = OTHER_ID
-        valid_id = OFFLINE_ID
-        legacy = {
-            "name": "Historical",
-            "draft": configuration_packages.new_snapshot({"sleepDelay": {"managed": False, "value": 15}}),
-            "published": configuration_packages.new_snapshot({"sleepDelay": 15}),
-        }
-        valid = {
-            "name": "Current",
-            "draft": configuration_packages.new_snapshot(_brightness(45)),
-            "published": configuration_packages.new_snapshot({"brightness": 45}),
-        }
-        groups = {
-            "Historical": {"members": [DEVICE_ID], "package_id": legacy_id},
-            "Current": {"members": [OTHER_ID], "package_id": valid_id},
-            "Spare": {"members": [], "package_id": None},
-        }
-        catalog = {"version": 1, "packages": {legacy_id: legacy, valid_id: valid}}
-        async with _running_server(tmp_path, groups, packages=catalog) as (session, base):
-            stored = server.REGISTRY_PATH.read_bytes()
-            assert len((await _request(session, "GET", base, "/api/packages"))["packages"]) == 2
-            historical = await _request(session, "GET", base, "/api/packages/" + legacy_id)
-            assert historical["settings"] == legacy["draft"]["settings"]
-            assert historical["published_revision"] == legacy["published"]["revision"]
-            assert server.REGISTRY_PATH.read_bytes() == stored
-            path = _deployment_path("Spare", legacy_id)
-            await _request(session, "GET", base, path, status=409)
-            await _request(session, "POST", base, path, {"expected_impact": "unused"}, status=409)
-            await _deploy(session, base, historical, status=400)
-            assert server.REGISTRY_PATH.read_bytes() == stored
-
-            async with (session.ws_connect(base + "/ws/device", autoping=False) as old_device,
-                        session.ws_connect(base + "/ws/device", autoping=False) as current_device):
-                await _register(old_device)
-                await _assert_no_policy(old_device)
-                await _register(current_device, {**REGISTRATION, "device_id": OTHER_ID})
-                current = await _request(session, "GET", base, "/api/packages/" + valid_id)
-                assert await _receive_type(current_device, "CONFIGURATION_POLICY") == _policy(current, {"brightness": 45})
-                await _request(session, "POST", base, "/api/package-retry", {
-                    "device_id": DEVICE_ID, "package_id": legacy_id, "revision": historical["published_revision"],
-                }, status=409)
-                await _assert_no_policy(old_device)
-                deployed = await _deploy(session, base, current, settings=_brightness(60))
-                assert await _receive_type(current_device, "CONFIGURATION_POLICY") == _policy(deployed, {"brightness": 60})
-                repaired = await _deploy(session, base, historical, settings={
-                    "sleepDelay": {"managed": True, "value": 300},
-                })
-                assert await _receive_type(old_device, "CONFIGURATION_POLICY") == _policy(repaired, {"sleepDelay": 300})
-                await _assign(session, base, "Spare", repaired)
     asyncio.run(body())

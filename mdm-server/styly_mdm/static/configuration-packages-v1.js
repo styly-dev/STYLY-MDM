@@ -94,7 +94,6 @@
   function loadDraft(sections, settings) {
     const draft = {};
     for (const item of sections.flatMap(section => section.items)) {
-      if (item.kind === 'unavailable') continue;
       const saved = settings?.[item.id];
       let value = saved ? saved.value : item.default;
       if (item.kind === 'wifi') {
@@ -210,8 +209,7 @@
     return draft.wifi?.managed === true && draft.wifi.value.networks.length > MAX_WIFI_NETWORKS;
   }
 
-  function updateWifiWarnings(target, draft) {
-    const valuePanel = target.closest('.settings-value');
+  function updateWifiWarnings(valuePanel, draft) {
     const warning = valuePanel?.querySelector('[data-wifi-hidden-warning]');
     if (warning) warning.hidden = !hasWifiAutoReturnHiddenNetworkConflict(draft);
     const limitWarning = valuePanel?.querySelector('[data-wifi-limit-warning]');
@@ -248,8 +246,6 @@
         payloadValue = schedulePayload(item, value, saved[item.id]?.value, managed && value.enabled === true);
       } else if (managed && !supportedValue(item, value)) {
         throw new Error('Select a supported value for ' + item.label + '.');
-      } else if (!managed && !supportedValue(item, value)) {
-        payloadValue = item.default;
       }
       settings[item.id] = {
         managed,
@@ -371,10 +367,10 @@
         return `<div class="settings-radios">${[true, false].map(on =>
           `<label><input type="radio" name="setting-${esc(item.id)}" ${field} value="${on}" ${value === on ? 'checked' : ''}> ${on ? 'On' : 'Off'}</label>`).join('')}</div>`;
       case 'range':
-        return `<div class="settings-range"><input aria-label="${label}" type="range" min="${esc(item.min ?? 0)}" max="${esc(item.max ?? 100)}" ${field} value="${esc(supportedValue(item, value) ? value : item.default)}"><output>${esc(value)}%</output></div>${legacyValueNote(item, value)}`;
+        return `<div class="settings-range"><input aria-label="${label}" type="range" min="${esc(item.min ?? 0)}" max="${esc(item.max ?? 100)}" ${field} value="${esc(value)}"><output>${esc(value)}%</output></div>`;
       case 'delay':
-        return `<select class="field" aria-label="${label}" ${field}>${!supportedValue(item, value) ? `<option value="${esc(value)}" selected disabled>Saved value ${esc(value)} (legacy)</option>` : ''}${item.options.map(option =>
-          `<option value="${esc(option.value)}" ${supportedValue(item, value) && option.value === value ? 'selected' : ''}>${esc(option.label)}</option>`).join('')}</select>${legacyValueNote(item, value)}`;
+        return `<select class="field" aria-label="${label}" ${field}>${item.options.map(option =>
+          `<option value="${esc(option.value)}" ${option.value === value ? 'selected' : ''}>${esc(option.label)}</option>`).join('')}</select>`;
       case 'schedule':
         return `<div class="settings-schedule">
           <label><input type="checkbox" ${field} data-field="enabled" ${value.enabled ? 'checked' : ''}> Enable schedule</label>
@@ -386,12 +382,6 @@
       default:
         return '';
     }
-  }
-
-  function legacyValueNote(item, value) {
-    if (supportedValue(item, value)) return '';
-    const display = item.kind === 'range' ? value + '%' : String(value);
-    return `<small class="settings-meta" data-legacy-value="${esc(item.id)}">Saved value ${esc(display)} is no longer supported. Choose a current value to manage it.</small>`;
   }
 
   function renderItem(item, draft, saved, secretType) {
@@ -408,8 +398,7 @@
 
   function sectionCount(section, draft) {
     const managed = section.items.filter(item => draft[item.id]?.managed).length;
-    const supported = section.items.filter(item => item.kind !== 'unavailable').length;
-    return managed + ' / ' + supported + ' managed';
+    return managed + ' / ' + section.items.length + ' managed';
   }
 
   function renderSection(section, model, secretType) {
@@ -597,7 +586,7 @@
       const content = catalog?.map(pkg =>
         `<button type="button" class="mg-item settings-package-item${current?.id === pkg.package_id ? ' active' : ''}" data-package-id="${esc(pkg.package_id)}" aria-pressed="${current?.id === pkg.package_id}">
           <span class="mg-item-name">${esc(pkg.name)}</span>
-          <span class="mg-item-count">${pkg.publication_requires_review ? 'Review needed' : pkg.published_revision ? 'Deployed' : pkg.has_draft ? 'Draft' : 'New'}</span>
+          <span class="mg-item-count">${pkg.published_revision ? 'Deployed' : pkg.has_draft ? 'Draft' : 'New'}</span>
         </button>`).join('') || `<p class="empty small">${esc(catalog ? 'No packages yet.' : catalogError || 'Loading packages…')}</p>
         ${catalogError ? '<button type="button" class="btn-outline" data-refresh-packages>Reload packages</button>' : ''}`;
       if (catalogContent !== content) {
@@ -611,10 +600,9 @@
       if (!current || !target) return;
       const pkg = packageById(current.id);
       const revision = pkg ? pkg.published_revision : current.publishedRevision;
-      const needsReview = current.publicationRequiresReview === true;
       const deployment = revision ? 'Deployed version ' + revision : 'Not deployed yet';
       const refs = Object.values(snapshot?.assignments || {}).filter(id => id === current.id).length;
-      target.textContent = deployment + (needsReview ? ' · Review needed' : '') +
+      target.textContent = deployment +
         (snapshot ? ' · Used by ' + refs + ' ' + (refs === 1 ? 'group' : 'groups') : '');
     }
 
@@ -641,9 +629,7 @@
       catalog = (catalog || []).filter(pkg => pkg.package_id !== id);
       if (profile) {
         catalog.push({ package_id: id, name: profile.name, has_draft: Boolean(profile.draft_revision),
-          published_revision: profile.published_revision,
-          publication_requires_review: profile.publication_requires_review === true });
-        if (current?.id === id) current.publicationRequiresReview = profile.publication_requires_review === true;
+          published_revision: profile.published_revision });
         catalog.sort((a, b) => a.name.localeCompare(b.name));
       }
       renderCatalog();
@@ -717,7 +703,7 @@
         <button type="button" class="btn-outline" data-policy-action="reload" hidden>Reload package</button>
       </div>`;
       for (const input of packagePanel.querySelectorAll('[data-field="password"]')) {
-        input.value = model.draft[input.dataset.setting].value[Number(input.dataset.network)].password;
+        input.value = model.draft[input.dataset.setting].value.networks[Number(input.dataset.network)].password;
       }
       renderPublication();
       updateActions();
@@ -744,7 +730,6 @@
       }
       Object.assign(model, { sections: data.sections, draftRevision: data.draft_revision,
         publishedRevision: data.published_revision,
-        publicationRequiresReview: data.publication_requires_review === true,
         savedName: data.name, saved, name, draft });
       readSections(data.sections);
     }
@@ -914,7 +899,7 @@
       const select = groupPanel.querySelector('[data-group-package]');
       const known = packageById(selected);
       const options = '<option value="">No package</option>' +
-        (catalog || []).map(pkg => `<option value="${esc(pkg.package_id)}">${esc(pkg.name)}${pkg.publication_requires_review ? ' · Review needed' : ''}</option>`).join('') +
+        (catalog || []).map(pkg => `<option value="${esc(pkg.package_id)}">${esc(pkg.name)}</option>`).join('') +
         (selected && !known ? `<option value="${esc(selected)}" disabled>Package unavailable</option>` : '') +
         `<option value="${CREATE_PACKAGE_OPTION}">Create package…</option>`;
       if (select.packageOptions !== options) {
@@ -931,9 +916,6 @@
       else if (group.busy) deployReason = group.busy;
       else if (group.assignmentAck !== undefined) deployReason = 'Waiting for the group to show the package change.';
       else if (selected && !known) deployReason = 'This package is unavailable. Choose another package.';
-      else if (known?.publication_requires_review === true && selected !== assigned) {
-        deployReason = 'This published version needs review. Open Edit package and select Save & deploy to replace it.';
-      }
       else if (known && !known.has_draft && (selected === assigned || !known.published_revision)) {
         deployReason = 'Open Edit package and select Save & deploy to make this package ready.';
       }
@@ -942,10 +924,9 @@
       feedback.textContent = group.message || '';
       feedback.classList.toggle('settings-error', Boolean(group.error));
       const deployment = currentDeployment(group);
-      const assignedNeedsReview = selected === assigned && packageById(assigned)?.publication_requires_review === true;
       groupPanel.querySelector('[data-group-publication]').textContent = group.assignmentAck !== undefined
         ? 'Waiting for the group update.'
-        : deployment ? 'Deployed version ' + deployment.revision + (assignedNeedsReview ? ' · Review needed' : '')
+        : deployment ? 'Deployed version ' + deployment.revision
           : assigned ? 'Not deployed yet.' : 'No package set for this group.';
       renderResults();
     }
@@ -1108,7 +1089,7 @@
         if (manage === 'wifi') {
           const valuePanel = target.closest('.settings-row').querySelector('.settings-value');
           updateWifiMoveButtons(valuePanel, model.draft);
-          updateWifiWarnings(target, model.draft);
+          updateWifiWarnings(valuePanel, model.draft);
         }
         target.closest('.settings-row').querySelector('.settings-value').disabled = !target.checked;
         const section = target.closest('[data-settings-section]');
@@ -1128,10 +1109,10 @@
             if (password.disabled) row.password = password.value = '';
           }
           article.querySelector('[data-password-help]').textContent = wifiPasswordHelp(row, model.saved[setting].value.networks);
-          if (field === 'hidden') updateWifiWarnings(target, model.draft);
+          if (field === 'hidden') updateWifiWarnings(target.closest('.settings-value'), model.draft);
         } else if (setting === 'wifi' && field === 'auto_return') {
           value.auto_return = target.checked;
-          updateWifiWarnings(target, model.draft);
+          updateWifiWarnings(target.closest('.settings-value'), model.draft);
         } else if (field === 'enabled') {
           value.enabled = target.checked;
           target.closest('.settings-value').querySelectorAll('[data-field="time"], [data-field="day"]')
@@ -1148,9 +1129,6 @@
           entry.value = Number(target.value);
           if (target.type === 'range') target.nextElementSibling.value = target.value + '%';
         }
-        const item = items.get(setting);
-        const legacyNote = target.closest('.settings-value')?.querySelector?.('[data-legacy-value]');
-        if (legacyNote && item) legacyNote.hidden = supportedValue(item, entry.value);
       } else return;
       model.error = false;
       model.message = '';
