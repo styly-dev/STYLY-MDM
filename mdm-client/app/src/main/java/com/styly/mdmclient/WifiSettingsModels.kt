@@ -91,7 +91,6 @@ internal data class WifiManualOperation(
     val settingsRestored: Boolean = false,
     val restoreDeadlineElapsedMillis: Long? = null,
     val restoreBootCount: Int? = null,
-    val restoreUnconfirmedReported: Boolean = false,
 )
 
 internal data class WifiManualResult(
@@ -102,6 +101,12 @@ internal data class WifiManualResult(
     val rolledBack: Boolean,
 )
 
+/**
+ * A received release of Wi-Fi management that waits for the active operation to settle.
+ * It is journaled so a process restart cannot resume the released policy.
+ */
+internal data class WifiPendingRelease(val revision: String?)
+
 internal data class WifiLocalState(
     val lastApplied: WifiSavedProfile? = null,
     val manualOperation: WifiManualOperation? = null,
@@ -110,6 +115,7 @@ internal data class WifiLocalState(
     val managedWifi: Boolean = true,
     val policyEpoch: Long = 0L,
     val policyRevision: String? = null,
+    val pendingRelease: WifiPendingRelease? = null,
 )
 
 internal enum class WifiApplyMode(val wireValue: String) {
@@ -150,6 +156,20 @@ internal object WifiSettingsProtocol {
         }
         val networks = parseNetworks(networkArray, mode)
         return WifiApplyCommand(operationId, revision, mode, networks, autoReturn)
+    }
+
+    /** Parses a configuration package's `wifi` object without re-encoding it as a command payload. */
+    fun parseManagedPolicy(operationId: String, revision: String, wifi: JSONObject): WifiApplyCommand {
+        requireUuid(revision, "revision")
+        val networkArray = wifi.optJSONArray("networks")
+            ?: throw IllegalArgumentException("wifi.networks must be an array")
+        val autoReturn = requiredBoolean(wifi, "auto_return")
+        if (networkArray.length() > WIFI_MAX_NETWORKS) throw WifiPolicyFailure(WifiReason.UNSUPPORTED_NETWORK_LIMIT)
+        if (autoReturn && networkArrayHasHidden(networkArray)) {
+            throw WifiPolicyFailure(WifiReason.UNSUPPORTED_HIDDEN_NETWORK)
+        }
+        val networks = parseNetworks(networkArray, WifiApplyMode.MANAGED)
+        return WifiApplyCommand(operationId, revision, WifiApplyMode.MANAGED, networks, autoReturn)
     }
 
     private fun networkArrayHasHidden(array: JSONArray): Boolean = (0 until array.length()).any { index ->
@@ -231,6 +251,9 @@ internal object WifiSettingsCodec {
         put("managed_wifi", state.managedWifi)
         put("policy_epoch", state.policyEpoch)
         put("policy_revision", state.policyRevision ?: JSONObject.NULL)
+        put("pending_release", state.pendingRelease?.let {
+            JSONObject().put("revision", it.revision ?: JSONObject.NULL)
+        } ?: JSONObject.NULL)
     }.toString()
 
     fun decode(text: String): WifiLocalState {
@@ -247,6 +270,11 @@ internal object WifiSettingsCodec {
             managedWifi = requiredBoolean(root, "managed_wifi", default = true),
             policyEpoch = root.optLong("policy_epoch", 0L).coerceAtLeast(0L),
             policyRevision = optionalString(root, "policy_revision"),
+            pendingRelease = root.optJSONObject("pending_release")?.let { release ->
+                val revision = optionalString(release, "revision")
+                require(revision == null || WifiSettingsProtocol.isValidUuid(revision)) { "invalid pending release revision" }
+                WifiPendingRelease(revision)
+            },
         )
     }
 
@@ -283,7 +311,6 @@ internal object WifiSettingsCodec {
         put("settings_restored", operation.settingsRestored)
         put("restore_deadline_elapsed_ms", operation.restoreDeadlineElapsedMillis ?: JSONObject.NULL)
         put("restore_boot_count", operation.restoreBootCount ?: JSONObject.NULL)
-        put("restore_unconfirmed_reported", operation.restoreUnconfirmedReported)
     }
 
     private fun decodeManualOperation(json: JSONObject) = WifiManualOperation(
@@ -323,7 +350,6 @@ internal object WifiSettingsCodec {
         settingsRestored = requiredBoolean(json, "settings_restored", default = false),
         restoreDeadlineElapsedMillis = optionalLong(json, "restore_deadline_elapsed_ms"),
         restoreBootCount = optionalLong(json, "restore_boot_count")?.toInt()?.takeIf { it >= 0 },
-        restoreUnconfirmedReported = requiredBoolean(json, "restore_unconfirmed_reported", default = false),
     )
 
     private fun encodeRecoverySnapshot(snapshot: WifiRecoverySnapshot) = JSONObject().apply {

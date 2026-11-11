@@ -3,10 +3,9 @@
 
   const CREATE_PACKAGE_OPTION = 'create-package';
 
-  function membershipGroups(deviceId, groups, aliases) {
-    const identity = new Set([deviceId].concat(aliases || []).filter(Boolean));
+  function membershipGroups(deviceId, groups) {
     return Object.keys(groups || {}).filter(function (name) {
-      return (groups[name] || []).some(function (id) { return identity.has(id); });
+      return (groups[name] || []).includes(deviceId);
     }).sort();
   }
 
@@ -21,55 +20,50 @@
     return selection;
   }
 
-  function clearMembershipEditsThatMatch(selected, current, edited, expectedOwners, canonicalIdFor) {
-    const canonicalId = canonicalIdFor || (deviceId => deviceId);
-    const selection = new Set(Array.from(selected, canonicalId));
-    const members = new Set(Array.from(current, canonicalId));
+  function clearMembershipEditsThatMatch(selected, current, edited, expectedOwners) {
+    const members = new Set(current);
     for (const deviceId of edited) {
-      if (selection.has(deviceId) === members.has(deviceId)) {
+      if (selected.has(deviceId) === members.has(deviceId)) {
         edited.delete(deviceId);
         expectedOwners.delete(deviceId);
       }
     }
   }
 
-  function expectedMembershipOwner(deviceId, name, groups, aliases) {
-    const owners = membershipGroups(deviceId, groups, aliases);
+  function expectedMembershipOwner(deviceId, name, groups) {
+    const owners = membershipGroups(deviceId, groups);
     if (owners.length > 1) throw new Error('Resolve this device’s conflicting group memberships before editing it.');
     return owners[0] ?? null;
   }
 
-  function buildMembershipEdit(name, currentMembers, selectedMembers, groups, expectedOwners, aliasesFor, canonicalIdFor) {
-    const canonicalId = canonicalIdFor || (deviceId => deviceId);
-    const current = new Map();
-    for (const member of currentMembers) {
-      const id = canonicalId(member);
-      if (current.has(id)) throw new Error('Resolve duplicate device IDs in this group before editing it.');
-      current.set(id, member);
+  function buildMembershipEdit(name, currentMembers, selectedMembers, groups, expectedOwners) {
+    const current = new Set();
+    for (const deviceId of currentMembers) {
+      if (current.has(deviceId)) throw new Error('Resolve duplicate device IDs in this group before editing it.');
+      current.add(deviceId);
     }
-    const selected = new Set(Array.from(selectedMembers, canonicalId));
+    const selected = new Set(selectedMembers);
     const add = new Map();
     const remove = [];
 
     for (const deviceId of selected) {
       if (current.has(deviceId)) continue;
       if (!expectedOwners.has(deviceId)) throw new Error('Choose the source group for each device again before saving.');
-      const aliases = aliasesFor(deviceId);
-      const owners = membershipGroups(deviceId, groups, aliases);
+      const owners = membershipGroups(deviceId, groups);
       if (owners.includes(name) || owners.filter(group => group !== name).length > 1 ||
-          expectedMembershipOwner(deviceId, name, groups, aliases) !== expectedOwners.get(deviceId)) {
+          expectedMembershipOwner(deviceId, name, groups) !== expectedOwners.get(deviceId)) {
         throw new Error('Group membership changed. Remove and add the device again after reviewing its current group.');
       }
       add.set(deviceId, expectedOwners.get(deviceId));
     }
 
-    for (const [deviceId, wireId] of current) {
+    for (const deviceId of current) {
       if (selected.has(deviceId)) continue;
-      const owners = membershipGroups(deviceId, groups, aliasesFor(deviceId));
+      const owners = membershipGroups(deviceId, groups);
       if (!owners.includes(name) || owners.length !== 1) {
         throw new Error('Group membership changed. Review the current members before saving again.');
       }
-      remove.push(wireId);
+      remove.push(deviceId);
     }
 
     return { type: 'UPDATE_GROUP_MEMBERS', name, add: Object.fromEntries(add), remove };
@@ -154,14 +148,9 @@
   function wifiPayload(value, savedNetworks, managed) {
     const networks = value?.networks;
     if (!Array.isArray(networks)) throw new Error('Wi-Fi networks must be a list.');
-    if (networks.length > MAX_WIFI_NETWORKS) {
-      throw new Error('Wi-Fi supports up to 4 networks. Remove extra networks before saving.');
-    }
+    // buildPayload() has already rejected the wifiConflicts() cases (network limit, hidden + auto-return).
     if (managed && !networks.length) throw new Error('Add at least one Wi-Fi network when Wi-Fi is managed.');
     if (typeof value.auto_return !== 'boolean') throw new Error('Choose whether Wi-Fi should automatically return.');
-    if (managed && value.auto_return && networks.some(network => network.hidden)) {
-      throw new Error('Automatic return is not supported with hidden Wi-Fi networks. Turn off auto-return or clear Hidden network.');
-    }
     const identities = new Set();
     const payloadNetworks = networks.map(function (network, index) {
       const { ssid, security, hidden, password } = network;
@@ -200,20 +189,23 @@
     return true;
   }
 
-  function hasWifiAutoReturnHiddenNetworkConflict(draft) {
-    return draft.wifi?.managed === true && draft.wifi.value.auto_return === true &&
-      draft.wifi.value.networks.some(network => network.hidden);
-  }
-
-  function hasWifiNetworkLimitConflict(draft) {
-    return draft.wifi?.managed === true && draft.wifi.value.networks.length > MAX_WIFI_NETWORKS;
+  // Draft-wide Wi-Fi rules shared by the editor warnings and buildPayload(). The
+  // network limit applies even when Wi-Fi is unmanaged, as on the server.
+  function wifiConflicts(entry) {
+    const networks = Array.isArray(entry?.value?.networks) ? entry.value.networks : [];
+    return {
+      tooManyNetworks: networks.length > MAX_WIFI_NETWORKS,
+      autoReturnWithHidden: entry?.managed === true && entry.value.auto_return === true &&
+        networks.some(network => network.hidden),
+    };
   }
 
   function updateWifiWarnings(valuePanel, draft) {
+    const conflicts = wifiConflicts(draft.wifi);
     const warning = valuePanel?.querySelector('[data-wifi-hidden-warning]');
-    if (warning) warning.hidden = !hasWifiAutoReturnHiddenNetworkConflict(draft);
+    if (warning) warning.hidden = !conflicts.autoReturnWithHidden;
     const limitWarning = valuePanel?.querySelector('[data-wifi-limit-warning]');
-    if (limitWarning) limitWarning.hidden = !hasWifiNetworkLimitConflict(draft);
+    if (limitWarning) limitWarning.hidden = !conflicts.tooManyNetworks;
     const addButton = valuePanel?.querySelector('[data-policy-action="add-network"]');
     const networks = draft.wifi?.value.networks || [];
     if (addButton) addButton.disabled = draft.wifi?.managed !== true || networks.length >= MAX_WIFI_NETWORKS;
@@ -229,10 +221,11 @@
   }
 
   function buildPayload(sections, draft, saved) {
-    if (hasWifiAutoReturnHiddenNetworkConflict(draft)) {
+    const conflicts = wifiConflicts(draft.wifi);
+    if (conflicts.autoReturnWithHidden) {
       throw new Error('Automatic return is not supported with hidden Wi-Fi networks. Turn off auto-return or clear Hidden network.');
     }
-    if (hasWifiNetworkLimitConflict(draft)) {
+    if (conflicts.tooManyNetworks) {
       throw new Error('Wi-Fi supports up to 4 networks. Remove extra networks before saving.');
     }
     const settings = {};
@@ -338,13 +331,13 @@
         </div>
       </article>`;
     }).join('');
-    const hasHiddenNetwork = networks.some(network => network.hidden);
+    const conflicts = wifiConflicts({ managed, value });
     const priorityControls = `<div class="wifi-options">
       <small class="wifi-order-note" data-wifi-order-note>${WIFI_ORDER_HELP}</small>
       <label><input type="checkbox" data-setting="${esc(item.id)}" data-field="auto_return" ${value.auto_return ? 'checked' : ''}> Automatically return to a higher-priority network when it becomes available</label>
       <small>Checks for higher-priority networks about every 5 minutes while connected below the first choice, including after manual selection or fallback. The OS may delay switching; no priority scan is requested while on the first choice.</small>
-      <small class="wifi-warning" data-wifi-limit-warning role="alert" ${networks.length > MAX_WIFI_NETWORKS ? '' : 'hidden'}>Wi-Fi supports up to 4 networks. Remove extra networks before deploying.</small>
-      <small class="wifi-warning" data-wifi-hidden-warning role="alert" ${managed && value.auto_return && hasHiddenNetwork ? '' : 'hidden'}>Automatic return is not supported with hidden Wi-Fi networks. Turn off auto-return or clear Hidden network before deploying.</small>
+      <small class="wifi-warning" data-wifi-limit-warning role="alert" ${conflicts.tooManyNetworks ? '' : 'hidden'}>Wi-Fi supports up to 4 networks. Remove extra networks before deploying.</small>
+      <small class="wifi-warning" data-wifi-hidden-warning role="alert" ${conflicts.autoReturnWithHidden ? '' : 'hidden'}>Automatic return is not supported with hidden Wi-Fi networks. Turn off auto-return or clear Hidden network before deploying.</small>
     </div>`;
     return `<div class="settings-networks">
       <div class="push-note">Deploying managed Wi-Fi enables auto-connect for listed networks and disables it for other saved networks. Devices keep their saved networks. Replacing a password can limit recovery to passwords already held by MDM.</div>
@@ -523,9 +516,9 @@
     function groupOutcomes(name, packageId, deployment) {
       const outcomes = new Map();
       for (const member of getGroups()[name] || []) {
+        if (outcomes.has(member)) continue;
         const device = getDevice(member);
-        const id = device?.device_id || device?.serial_number || member;
-        if (!outcomes.has(id)) outcomes.set(id, { device, outcome: deviceOutcome(device, packageId, deployment) });
+        outcomes.set(member, { device, outcome: deviceOutcome(device, packageId, deployment) });
       }
       return outcomes;
     }
@@ -1046,7 +1039,7 @@
       const deployment = currentDeployment(model);
       const device = getDevice(deviceId);
       if (device?.device_id !== deviceId || !retryEligible(device, deployment) ||
-          !(getGroups()[model.name] || []).some(id => id === deviceId || id === device.serial_number)) return;
+          !(getGroups()[model.name] || []).includes(deviceId)) return;
       const key = retryKey(deviceId, deployment);
       const report = JSON.stringify(device.configuration_state);
       if (retrying.has(key)) return;

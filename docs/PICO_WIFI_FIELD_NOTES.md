@@ -20,9 +20,13 @@ The October test also used a PICO 4 Ultra Enterprise on Android 14 / PUI 5.15.7.
 That earlier record identified TobService 4.3.30 and client SDK 4.3.16; it does
 not establish the service version used in the November runs.
 
-Detailed observations are in the [November device log](../tasks/wifi-priority-2026-11-10/README.md),
-[November verification record](../tasks/wifi-priority-2026-11-10/VERIFY.md),
-and [October hardware record](../tasks/wifi-hardware-validation-2026-10-20.md).
+A follow-up run on 2026-11-11 used a PICO 4 Ultra Enterprise (PUI 5.15.7) with
+the branch's development APK as Device Owner, an isolated loopback server over
+a USB reverse tunnel, a WPA2/WPA3 office AP saved earlier in system Settings,
+and a guest AP added by the app.
+
+The raw device logs and verification records from these runs are kept outside
+the repository; this file is the maintained summary.
 
 ## Wi-Fi scans and connection observations
 
@@ -45,6 +49,16 @@ and [October hardware record](../tasks/wifi-hardware-validation-2026-10-20.md).
   run had them immediately. Treat the IP, SSID and security as observations
   for the same network, and allow for callback timing rather than mixing an IP
   from one connection with an SSID from another.
+- On 2026-11-11 a rollback's own reconnect to the prior network failed once
+  with an authentication error during rapid back-to-back switches. About 2.4
+  seconds later the OS auto-joined that network itself (Wi-Fi system UID), and
+  in a process-kill test the OS and the restarting app requested the same
+  network in the same millisecond. With auto-join enabled and the network
+  selection status enabled, the OS reconnects without the app.
+- The client's MDM WebSocket closes whenever Wi-Fi drops, even when the server
+  is reached through a USB reverse tunnel. A release or policy published while
+  a switch is in progress therefore reaches the device only after it
+  reconnects, typically while the rollback is confirming the prior network.
 - One device history showed a move between the test networks without proving
   the cause. Do not assume that every observed network change was made by the
   MDM app: correlate it with the app's operation ID and result where available.
@@ -65,6 +79,21 @@ and [October hardware record](../tasks/wifi-hardware-validation-2026-10-20.md).
   connection was verified. The exact missing field or firmware cause was not
   established. The implementation copies an existing configuration before
   changing it, instead of replacing it with a partial object.
+- On 2026-11-11 every managed apply failed with `UPDATE_FAILED` when a listed
+  SSID had been saved earlier in system Settings (creator UID 1000). The app's
+  copy from `getConfiguredNetworks()` reported `macRandomizationSetting = 0`
+  (NONE) for every network, while `dumpsys wifi` showed the stored value 3
+  (AUTO). Sending the copy back made the framework treat it as a MAC
+  randomization change, which it rejects ("does not have permission to modify
+  MAC randomization Settings") unless the caller holds `NETWORK_SETTINGS` or is
+  a Device Owner updating a network it created. Networks the app added were
+  unaffected. Since the stored value cannot be read, the adapter now sends AUTO
+  first and then NONE, PERSISTENT and NON_PERSISTENT until one is accepted;
+  a rejected update changes nothing. With this change the apply succeeded and
+  all saved networks kept setting 3. The NONE fallback (a network set to
+  "device MAC" in Settings) is host-tested only. The earlier partial
+  `WifiConfiguration` failure below may have had the same cause; that was not
+  rechecked.
 - The transition AP advertised PSK and SAE. A PSK configuration connected to
   it with Android security type `4` (SAE) and a usable IP. The WPA2-only AP was
   also observed with PSK and an IP. These runs do not prove behavior on a
@@ -93,8 +122,8 @@ and [October hardware record](../tasks/wifi-hardware-validation-2026-10-20.md).
   not just the manifest. The current managed flow also checks Device Owner.
   Exact-alarm access is optional since 2026-11-11: without it, rollback relies
   on the in-process watchdog and startup recovery and can be delayed while the
-  headset sleeps. `USE_EXACT_ALARM` is declared but its install-time grant has
-  not been verified on PUI.
+  headset sleeps. `USE_EXACT_ALARM` is declared and was granted at install on
+  PUI 5.15.7 (2026-11-11).
 - The client SDK 4.3.16 also exposes `pbsControlSetAutoConnectWIFI(ssid,
   password, int, IBoolCallback)`, a `...WithErrorCodeCallback` variant,
   `pbsControlClearAutoConnectWIFI`, and `pbsGetAutoConnectWiFiConfig`. The PICO
@@ -133,12 +162,16 @@ The operator-facing details are in [Wi-Fi settings](WIFI_SETTINGS.md).
   device as disconnected.
 - The initial mutation starts a 60-second overall budget; an individual
   candidate gets up to 12 seconds within it. A normal disconnect has an
-  eight-second grace period before ordered reselection. Repeated disconnected
-  reselection failures back off from five minutes to at most 30 minutes.
+  eight-second grace period (plus up to three seconds of random delay) before
+  ordered reselection. Since 2026-11-11 that reselection runs once per offline
+  period and is skipped for a single listed network; afterwards Android
+  auto-join reconnects (see the 2026-11-11 auto-join observation above). The
+  earlier five-to-30-minute retry backoff was removed.
 - With automatic return on, the app looks for higher candidates while connected
   to a lower one. The first scan runs within about 30 seconds, later requests
   target about five minutes plus up to 10% random delay, and fresh passive
-  results may also trigger a switch.
+  results may also trigger a switch. Any visible higher candidate triggers a
+  switch regardless of signal strength; this is an intentional product choice.
   Failed scan requests back off to as much as 30 minutes. Hidden SSIDs are not
   supported with automatic return on. With it off, a working lower connection is
   retained; ordered reselection still applies after a disconnect.
@@ -153,13 +186,24 @@ The operator-facing details are in [Wi-Fi settings](WIFI_SETTINGS.md).
 - Until 2026-11-11 every OS boot re-applied the assigned Wi-Fi revision and
   disconnected the current network about 40 seconds after boot. The client now
   keeps an existing connection when the same Wi-Fi revision still owns Wi-Fi
-  and only reapplies scalar settings. Not yet verified on the device.
+  and only reapplies scalar settings. A new package revision whose Wi-Fi list,
+  order, passwords and automatic-return setting equal the applied ones (for
+  example a brightness-only change) is adopted without touching Wi-Fi. On
+  2026-11-11 a brightness-only revision was adopted on the device with no
+  disconnect or reconnect; the boot path was not rebooted on the device.
 - A failed switch restores saved auto-join flags and known credentials. If a
   usable connection existed before the attempt, restoration is confirmed only
   after the prior SSID and a usable IP are observed. If not confirmed within
-  60 seconds, the result is recorded as unconfirmed and the saved connection
-  is retried about every five minutes. A later recovery does not turn the
-  original failed package application into a successful one.
+  60 seconds, the operation settles as unconfirmed and normal monitoring
+  resumes; Android auto-join reconnects to the restored network. The app's
+  own reconnect retries (5 to 30 minutes) were removed on 2026-11-11 after the
+  device showed the OS rejoining by itself. The rollback's single
+  `enableNetwork(id, true)` is no longer followed by `reconnect()`. A later
+  recovery does not turn the original failed package application into a
+  successful one.
+- If restoring saved settings itself fails (`RESTORE_FAILED`), the app retries
+  the restore after about 30 seconds, 2 minutes and 10 minutes. After that an
+  operator Retry or a Wi-Fi release is needed. Host-tested only.
 - SSID and IP constitute local Wi-Fi success only. They do not prove the MDM
   server is reachable, and a pending report may remain local while offline.
   The latest Wi-Fi recovery status is separate from the historical package
@@ -192,9 +236,15 @@ The operator-facing details are in [Wi-Fi settings](WIFI_SETTINGS.md).
   145 console tests with one existing skip, and 341 Android tests; the Android
   development APK also built. These are recorded results, not a claim that the
   tests were rerun when this note was written.
+- On 2026-11-11 the device also covered: a wrong guest password rolled back to
+  the office AP with `rolled_back=true`; releasing the policy while idle and
+  during a failing switch left the networks in place with no pending release;
+  and killing the app process during `applying` restored the office AP within
+  about two seconds of restart, with the package reported as `interrupted` and
+  the Wi-Fi result `UNKNOWN`, `rolled_back=true`.
 - Hardware gaps remain: a five-minute background cadence, prolonged sleep,
-  retry when the original AP is unavailable, restart during pending recovery,
-  a short-password WPA3-only AP, and a non-SAE client. Relevant timer and
+  OS rejoin after the original AP is unavailable for longer than the 60-second
+  confirmation, a short-password WPA3-only AP, and a non-SAE client. Relevant timer and
   recovery cases have host coverage, but that is not physical proof.
 - The new Wi-Fi format deliberately drops the development-only old format and
   requires updated clients. An existing registry containing old Wi-Fi entries

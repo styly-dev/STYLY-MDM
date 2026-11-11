@@ -27,6 +27,7 @@ internal data class WifiConfiguredView(
     val original: WifiConfiguration,
 )
 
+/** Whether a saved security view or an observed connection's security satisfies [profile]. */
 internal fun wifiSecurityViewMatchesProfile(profile: WifiNetworkProfile, security: String?): Boolean = when {
     profile.security == "OPEN" -> security == "OPEN"
     profile.security != "WPA2_WPA3" -> false
@@ -170,6 +171,30 @@ internal fun resolveWifiRecoveryEntry(old: WifiAutoJoinState, entries: List<Wifi
     return matches.singleOrNull()
 }
 
+/** MAC randomization settings to try on update, the platform default (AUTO) first. */
+internal val WIFI_MAC_RANDOMIZATION_TRIALS = listOf(
+    WifiConfiguration.RANDOMIZATION_AUTO,
+    WifiConfiguration.RANDOMIZATION_NONE,
+    WifiConfiguration.RANDOMIZATION_PERSISTENT,
+    WifiConfiguration.RANDOMIZATION_NON_PERSISTENT,
+)
+
+/**
+ * The app's copy of a saved network reports a masked MAC randomization setting (NONE on
+ * PICO OS 5.15.7, while the framework stores AUTO), and updateNetwork rejects a changed
+ * setting unless the caller holds NETWORK_SETTINGS or created the network. The stored
+ * value cannot be read, so send each candidate until the framework accepts one. A rejected
+ * update changes nothing, so a network saved in system Settings keeps its own setting.
+ */
+internal fun updateWithMacRandomizationFallback(update: (Int) -> Int): Int {
+    var id = -1
+    for (setting in WIFI_MAC_RANDOMIZATION_TRIALS) {
+        id = update(setting)
+        if (id >= 0) break
+    }
+    return id
+}
+
 internal fun supportsPico4UltraEnterpriseSettings(): Boolean =
     Build.MODEL == "A94U0" && Build.MANUFACTURER.equals("Pico", ignoreCase = true)
 
@@ -195,12 +220,6 @@ internal interface WifiSettingsAdapter {
         snapshot: WifiRecoverySnapshot,
         candidate: List<WifiNetworkProfile>,
         restoreTarget: WifiRollbackTarget? = null,
-        shouldContinue: () -> Boolean = { true },
-        onMutationStarted: () -> WifiReason? = { null },
-        onMutationFinished: () -> Unit = {},
-    ): WifiReason
-    fun connectToSavedNetwork(
-        target: WifiRollbackTarget,
         shouldContinue: () -> Boolean = { true },
         onMutationStarted: () -> WifiReason? = { null },
         onMutationFinished: () -> Unit = {},
@@ -290,7 +309,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                 try {
                     val config = configuration(network, existingView?.original)
                     @Suppress("DEPRECATION")
-                    id = if (existingView == null) wifi.addNetwork(config) else wifi.updateNetwork(config)
+                    id = if (existingView == null) wifi.addNetwork(config) else updateSavedNetwork(wifi, config)
                     if (id < 0) {
                         logOperationFailure(operation, WifiReason.UPDATE_FAILED)
                         WifiReason.UPDATE_FAILED
@@ -355,32 +374,6 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         reason
     }
 
-    override fun connectToSavedNetwork(
-        target: WifiRollbackTarget,
-        shouldContinue: () -> Boolean,
-        onMutationStarted: () -> WifiReason?,
-        onMutationFinished: () -> Unit,
-    ): WifiReason = guarded {
-        val wifi = manager ?: return@guarded WifiReason.UNSUPPORTED
-        val id = resolveWifiRollbackNetworkId(target, readCurrent())
-            ?: return@guarded WifiReason.VERIFY_FAILED
-        try {
-            val selected = Mutations(shouldContinue, { null }, onMutationStarted, onMutationFinished).run {
-                @Suppress("DEPRECATION")
-                if (wifi.enableNetwork(id, true)) WifiReason.NONE else WifiReason.UNREACHABLE
-            }
-            if (selected != WifiReason.NONE) return@guarded selected
-            Mutations(shouldContinue, { null }, onMutationStarted, onMutationFinished).run {
-                @Suppress("DEPRECATION")
-                if (wifi.reconnect()) WifiReason.NONE else WifiReason.UNREACHABLE
-            }
-        } catch (_: SecurityException) {
-            WifiReason.PERMISSION_DENIED
-        } catch (_: Exception) {
-            WifiReason.UNREACHABLE
-        }.also { if (it != WifiReason.NONE) logOperationFailure("RESTORE", it) }
-    }
-
     override fun restoreRecovery(
         snapshot: WifiRecoverySnapshot, candidate: List<WifiNetworkProfile>, restoreTarget: WifiRollbackTarget?,
         shouldContinue: () -> Boolean,
@@ -416,8 +409,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                     }
                     val failure = try {
                         mutate.run {
-                            @Suppress("DEPRECATION")
-                            if (wifi.updateNetwork(configuration(known, view.original)) >= 0) WifiReason.NONE
+                            if (updateSavedNetwork(wifi, configuration(known, view.original)) >= 0) WifiReason.NONE
                             else WifiReason.RESTORE_FAILED
                         }
                     } catch (_: SecurityException) {
@@ -468,6 +460,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             },
             reconnect = {
                 var selectedTargetId: Int? = null
+                var targetSelected = false
                 val entries = runCatching { readCurrent() }.getOrNull().orEmpty()
                 if (restoreTarget != null) {
                     selectedTargetId = resolveWifiRollbackNetworkId(restoreTarget, entries)
@@ -479,7 +472,8 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                             }
                         }.getOrDefault(WifiReason.UNREACHABLE)
                     } ?: WifiReason.VERIFY_FAILED
-                    if (selection != WifiReason.NONE) logOperationFailure("RESTORE", selection)
+                    targetSelected = selection == WifiReason.NONE
+                    if (!targetSelected) logOperationFailure("RESTORE", selection)
                 }
                 for ((id, allowed) in expectedAutoJoin) {
                     if (!allowed || id == selectedTargetId) continue
@@ -493,6 +487,9 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                     }
                     if (failure != WifiReason.NONE) logOperationFailure("RESTORE", failure)
                 }
+                // enableNetwork(id, true) already starts the connection (observed on PUI 5.15.7).
+                // Without a selected target, ask the OS to rejoin any restored network.
+                if (targetSelected) return@restoreWifiRecoveryBestEffort WifiReason.NONE
                 val reconnectFailure = try {
                     mutate.run {
                         @Suppress("DEPRECATION")
@@ -633,6 +630,16 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                 }
                 else -> throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
             }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun updateSavedNetwork(wifi: WifiManager, config: WifiConfiguration): Int {
+        // The setting has no public accessor before Android 13.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return wifi.updateNetwork(config)
+        return updateWithMacRandomizationFallback { setting ->
+            config.macRandomizationSetting = setting
+            wifi.updateNetwork(config)
         }
     }
 

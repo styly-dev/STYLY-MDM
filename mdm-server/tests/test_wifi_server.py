@@ -9,6 +9,7 @@ import aiohttp
 from aiohttp.test_utils import TestServer
 
 from styly_mdm import configuration_packages, server
+from server_test_helpers import reset_server_state
 
 
 DEVICE_V4 = "11111111-1111-4111-8111-111111111111"

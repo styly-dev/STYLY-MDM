@@ -41,7 +41,6 @@ class WifiSettingsStoreTest {
             settingsRestored = true,
             restoreDeadlineElapsedMillis = 70_000L,
             restoreBootCount = 133,
-            restoreUnconfirmedReported = true,
         )
         val expected = WifiLocalState(
             lastApplied = WifiSavedProfile(operation.revision, listOf(oldProfile), autoReturn = false),

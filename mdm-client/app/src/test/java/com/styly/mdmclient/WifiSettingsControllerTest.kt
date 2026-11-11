@@ -515,7 +515,54 @@ class WifiSettingsControllerTest {
     }
 
     @Test
-    fun `auto return on retries ordinary disconnected reconnection after a bounded backoff`() {
+    fun `disconnected reselection keeps a connection the OS joins during prior observation`() {
+        val preferred = network("preferred")
+        val fallback = network("fallback")
+        val saved = WifiSavedProfile(REVISION, listOf(preferred, fallback), false)
+        val priorResult = WifiManualResult(OPERATION_ID, REVISION, "success", WifiReason.NONE, false)
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = saved, latestResult = priorResult, policyRevision = REVISION),
+            initialNetworks = saved.networks,
+            initialWifi = listOf(observation(10, fallback.ssid, hasIp = true)),
+        )
+
+        harness.connectivity.lose(10)
+        harness.operationExecutor.runAll()
+        harness.priorityTimeouts.last().task.run()
+        harness.operationExecutor.runAll()
+        assertTrue(requireNotNull(harness.store.state.manualOperation).retryDisconnected)
+        harness.connectivity.update(20, fallback.ssid, hasIp = true)
+        harness.operationExecutor.runAll()
+        harness.expirePriorConnectionObservation()
+        harness.operationExecutor.runAll()
+
+        assertNull(harness.store.state.manualOperation)
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+        assertEquals(0, harness.adapter.disconnectCalls)
+        assertEquals(priorResult, harness.store.state.latestResult)
+    }
+
+    @Test
+    fun `a single managed network is left to OS auto-join after a disconnect`() {
+        val only = network("only")
+        val saved = WifiSavedProfile(REVISION, listOf(only), false)
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = saved, policyRevision = REVISION),
+            initialNetworks = saved.networks,
+            initialWifi = listOf(observation(10, only.ssid, hasIp = true)),
+        )
+
+        harness.connectivity.lose(10)
+        harness.operationExecutor.runAll()
+        harness.priorityTimeouts.toList().forEach { it.task.run() }
+        harness.operationExecutor.runAll()
+
+        assertNull(harness.store.state.manualOperation)
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+    }
+
+    @Test
+    fun `disconnected reselection runs once per offline period and then leaves reconnection to the OS`() {
         val preferred = network("preferred")
         val fallback = network("fallback")
         val saved = WifiSavedProfile(REVISION, listOf(preferred, fallback), true)
@@ -534,11 +581,11 @@ class WifiSettingsControllerTest {
 
         harness.connectivity.lose(10)
         harness.operationExecutor.runAll()
-        val disconnectGrace = harness.priorityTimeouts.last()
-        disconnectGrace.task.run()
+        harness.priorityTimeouts.last().task.run()
         harness.operationExecutor.runAll()
         harness.expirePriorConnectionObservation()
         harness.rollbackExecutor.runAll()
+        harness.operationExecutor.runAll()
 
         assertEquals(listOf(preferred, fallback), harness.adapter.selectCalls)
         val result = requireNotNull(harness.store.state.latestResult)
@@ -547,9 +594,27 @@ class WifiSettingsControllerTest {
         assertEquals(WifiReason.UNREACHABLE, result.reason)
         assertTrue(result.rolledBack)
         assertNull(harness.store.state.manualOperation)
-        assertTrue(harness.priorityTimeouts.last().delayMillis >= 5 * 60_000L)
-        assertEquals(WifiPriorityMonitorStatus.DEGRADED.wireValue,
-            harness.controller.stateSnapshot().getString("priority_monitor"))
+
+        // Still offline: no second ordered reselection and no long retry timer.
+        harness.priorityTimeouts.toList().forEach { it.task.run() }
+        harness.operationExecutor.runAll()
+        assertEquals(2, harness.adapter.selectCalls.size)
+        assertTrue(harness.priorityTimeouts.none { it.delayMillis >= 60_000L })
+
+        // The OS joins a network; a later disconnect starts a new offline period.
+        harness.connectivity.update(20, fallback.ssid, hasIp = true)
+        harness.operationExecutor.runAll()
+        harness.adapter.selectFailure = null
+        harness.adapter.afterSelect = { profile -> harness.connectivity.update(21, profile.ssid, hasIp = true) }
+        harness.connectivity.lose(20)
+        harness.operationExecutor.runAll()
+        harness.priorityTimeouts.last().task.run()
+        harness.operationExecutor.runAll()
+        harness.expirePriorConnectionObservation()
+        harness.operationExecutor.runAll()
+
+        assertEquals(preferred, harness.adapter.selectCalls.last())
+        assertEquals(3, harness.adapter.selectCalls.size)
     }
 
     @Test
@@ -872,7 +937,7 @@ class WifiSettingsControllerTest {
     }
 
     @Test
-    fun `known restored SSID is retried after unconfirmed deadline and later confirms same operation`() {
+    fun `unconfirmed restore settles at the deadline and leaves reconnection to the OS`() {
         val original = network("office-old")
         val candidate = network("office-new")
         val harness = Harness(
@@ -882,30 +947,25 @@ class WifiSettingsControllerTest {
         )
         val pending = createUnconfirmedRestore(harness, original, candidate)
         val unconfirmed = requireNotNull(harness.store.state.latestResult)
+        assertEquals(pending.operationId, unconfirmed.operationId)
         assertEquals(WifiReason.RESTORE_UNCONFIRMED, unconfirmed.reason)
         assertFalse(unconfirmed.rolledBack)
-        assertTrue(requireNotNull(harness.store.state.manualOperation).settingsRestored)
-        assertTrue(requireNotNull(harness.store.state.manualOperation).restoreUnconfirmedReported)
+        assertNull(harness.store.state.manualOperation)
         assertTrue(harness.controller.policyProgress(pending.operationId, pending.revision).settled)
 
-        harness.adapter.afterSavedReconnect = { target ->
-            harness.connectivity.update(90, target.ssid, hasIp = true, security = target.security)
-        }
-        val retry = requireNotNull(harness.watchdogs.lastOrNull { it.delayMillis == 5 * 60_000L })
-        harness.clock.value += retry.delayMillis
-        retry.task.run()
+        // The OS rejoins the restored network later; the settled result is not rewritten.
+        harness.connectivity.loseAll()
+        harness.connectivity.update(90, original.ssid, hasIp = true, security = "WPA_PSK")
+        harness.operationExecutor.runAll()
         harness.rollbackExecutor.runAll()
 
-        val restored = requireNotNull(harness.store.state.latestResult)
-        assertEquals(pending.operationId, restored.operationId)
-        assertEquals(WifiReason.TIMEOUT_ROLLED_BACK, restored.reason)
-        assertTrue(restored.rolledBack)
+        assertEquals(unconfirmed, harness.store.state.latestResult)
         assertNull(harness.store.state.manualOperation)
-        assertEquals(listOf(WifiRollbackTarget(original.ssid, "WPA_PSK")), harness.adapter.connectCalls)
+        assertTrue(harness.store.state.managedWifi)
     }
 
     @Test
-    fun `process restart after restore unconfirmed resumes observation and saved reconnect retry`() {
+    fun `process restart during restore confirmation re-arms the deadline and then settles`() {
         val original = network("office-old")
         val candidate = network("office-new")
         val before = Harness(
@@ -913,12 +973,12 @@ class WifiSettingsControllerTest {
             initialNetworks = listOf(original),
             initialWifi = listOf(observation(10, original.ssid, hasIp = true)),
         )
-        val pending = createUnconfirmedRestore(before, original, candidate)
+        val pending = createPendingRestore(before, original, candidate)
 
         val after = Harness(
             initialState = before.store.state,
             initialNetworks = before.adapter.current,
-            initialWifi = listOf(observation(40, "unrelated-network", hasIp = true)),
+            initialWifi = listOf(observation(40, "unrelated-network", hasIp = false)),
             sharedStore = before.store,
             sharedAdapter = before.adapter,
             sharedClock = before.clock,
@@ -932,21 +992,15 @@ class WifiSettingsControllerTest {
         assertEquals(pending.operationId, resumed.operationId)
         assertEquals(WifiManualPhase.RESTORING_CONNECTION, resumed.phase)
         assertEquals(134, resumed.restoreBootCount)
-        assertTrue(resumed.restoreUnconfirmedReported)
-        assertEquals(WifiReason.RESTORE_UNCONFIRMED, after.store.state.latestResult?.reason)
-        assertNotNull(after.watchdogs.lastOrNull { it.delayMillis == 5 * 60_000L })
-
-        after.adapter.afterSavedReconnect = { target ->
-            after.connectivity.update(90, target.ssid, hasIp = true, security = target.security)
-        }
-        val retry = requireNotNull(after.watchdogs.lastOrNull { it.delayMillis == 5 * 60_000L })
-        after.clock.value += retry.delayMillis
-        retry.task.run()
-        after.rollbackExecutor.runAll()
+        val deadline = requireNotNull(resumed.restoreDeadlineElapsedMillis)
+        val timeout = requireNotNull(after.watchdogs.lastOrNull { it.delayMillis == RESTORE_CONFIRM_TIMEOUT_MS })
+        after.clock.value = deadline
+        timeout.task.run()
+        after.operationExecutor.runAll()
 
         val result = requireNotNull(after.store.state.latestResult)
         assertEquals(pending.operationId, result.operationId)
-        assertTrue(result.rolledBack)
+        assertEquals(WifiReason.RESTORE_UNCONFIRMED, result.reason)
         assertNull(after.store.state.manualOperation)
     }
 
@@ -961,7 +1015,6 @@ class WifiSettingsControllerTest {
             initialWifi = listOf(observation(10, original.ssid, hasIp = true)),
         )
         createUnconfirmedRestore(harness, original, candidate)
-        val oldRetry = requireNotNull(harness.watchdogs.lastOrNull { it.delayMillis == 5 * 60_000L })
         harness.adapter.afterDisconnect = { harness.connectivity.loseAll() }
         harness.adapter.afterSelect = { profile -> harness.connectivity.update(91, profile.ssid, hasIp = true) }
         // The current connection is identifiable, but it does not satisfy the older restore target.
@@ -976,13 +1029,10 @@ class WifiSettingsControllerTest {
 
         harness.connectivity.update(90, original.ssid, hasIp = true, security = "WPA_PSK")
         harness.operationExecutor.runAll()
-        harness.clock.value += oldRetry.delayMillis
-        oldRetry.task.run()
         harness.rollbackExecutor.runAll()
 
         assertEquals(listOf(next), harness.store.state.lastApplied?.networks)
         assertNull(harness.store.state.manualOperation)
-        assertTrue(harness.adapter.connectCalls.isEmpty())
         assertEquals(OPERATION_ID_2, harness.store.state.latestResult?.operationId)
     }
 
@@ -995,8 +1045,7 @@ class WifiSettingsControllerTest {
             initialNetworks = listOf(original),
             initialWifi = listOf(observation(10, original.ssid, hasIp = true)),
         )
-        createUnconfirmedRestore(harness, original, candidate)
-        val oldRetry = requireNotNull(harness.watchdogs.lastOrNull { it.delayMillis == 5 * 60_000L })
+        createPendingRestore(harness, original, candidate)
 
         harness.controller.stopManagingPolicy(REVISION_2)
         harness.operationExecutor.runAll()
@@ -1005,13 +1054,12 @@ class WifiSettingsControllerTest {
 
         harness.connectivity.update(90, original.ssid, hasIp = true, security = "WPA_PSK")
         harness.operationExecutor.runAll()
-        harness.clock.value += oldRetry.delayMillis
-        oldRetry.task.run()
-        harness.rollbackExecutor.runAll()
+        harness.watchdogs.toList().forEach { it.task.run() }
+        harness.operationExecutor.runAll()
 
         assertFalse(harness.store.state.managedWifi)
         assertNull(harness.store.state.manualOperation)
-        assertTrue(harness.adapter.connectCalls.isEmpty())
+        assertEquals(REVISION_2, harness.store.state.policyRevision)
     }
 
     @Test
@@ -2012,6 +2060,193 @@ class WifiSettingsControllerTest {
     }
 
     @Test
+    fun `release after a failed first deployment ends the pending restore`() {
+        val original = network("office-old")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = savedProfile(original)),
+            initialNetworks = listOf(original),
+            initialWifi = listOf(observation(10, original.ssid, hasIp = true)),
+        )
+        createPendingRestore(harness, original, network("office-new"))
+        assertNull(harness.store.state.policyRevision)
+
+        harness.controller.stopManagingPolicy(REVISION_2)
+        harness.operationExecutor.runAll()
+
+        assertNull(harness.store.state.manualOperation)
+        assertNull(harness.store.state.pendingRelease)
+        assertFalse(harness.store.state.managedWifi)
+        harness.watchdogs.toList().forEach { it.task.run() }
+        harness.operationExecutor.runAll()
+        assertNull(harness.store.state.manualOperation)
+        assertFalse(harness.store.state.managedWifi)
+    }
+
+    @Test
+    fun `a journaled release survives a restart during an automatic switch`() {
+        val preferred = network("preferred")
+        val current = network("current")
+        val before = Harness(
+            initialState = WifiLocalState(
+                lastApplied = WifiSavedProfile(REVISION, listOf(preferred, current), autoReturn = true),
+                policyRevision = REVISION,
+            ),
+            initialNetworks = listOf(preferred, current),
+            initialWifi = listOf(observation(10, current.ssid, hasIp = true)),
+        )
+        before.adapter.afterDisconnect = { before.connectivity.loseAll() }
+        before.priorityScanSource.emit(WifiPriorityScanEvent(
+            WifiPriorityMonitorStatus.MONITORING, setOf(preferred.identity), "fresh_scan_results",
+        ))
+        before.operationExecutor.runAll()
+        assertNotNull(before.store.state.manualOperation)
+        before.controller.stopManagingPolicy(REVISION_2)
+        before.operationExecutor.runAll()
+        assertEquals(WifiPendingRelease(REVISION_2), before.store.state.pendingRelease)
+        assertTrue(before.store.state.managedWifi)
+
+        val after = Harness(
+            initialState = before.store.state,
+            sharedStore = before.store,
+            sharedAdapter = before.adapter,
+            sharedClock = before.clock,
+            initialWifi = listOf(observation(20, current.ssid, hasIp = true)),
+            bootCount = 134,
+        )
+        after.rollbackExecutor.runAll()
+        after.operationExecutor.runAll()
+
+        assertNull(after.store.state.manualOperation)
+        assertNull(after.store.state.pendingRelease)
+        assertFalse(after.store.state.managedWifi)
+        val scansBefore = after.priorityScanSource.startCalls
+        after.priorityScanSource.emit(WifiPriorityScanEvent(
+            WifiPriorityMonitorStatus.MONITORING, setOf(preferred.identity), "fresh_scan_results",
+        ))
+        after.operationExecutor.runAll()
+        assertEquals(scansBefore, after.priorityScanSource.startCalls)
+        assertNull(after.store.state.manualOperation)
+    }
+
+    @Test
+    fun `a new revision with unchanged Wi-Fi keeps the connection and adopts the revision`() {
+        val preferred = network("preferred")
+        val fallback = network("fallback")
+        val harness = PackageHarness(
+            wifi = Harness(
+                initialState = WifiLocalState(
+                    lastApplied = WifiSavedProfile(REVISION_2, listOf(preferred, fallback), autoReturn = false),
+                    policyRevision = REVISION_2,
+                ),
+                initialNetworks = listOf(preferred, fallback),
+                initialWifi = listOf(observation(10, fallback.ssid, hasIp = true)),
+            ),
+        )
+
+        harness.receive(packagePolicy(networks = listOf(preferred, fallback)))
+        harness.runWifiTasks()
+        harness.worker.runAll()
+
+        assertEquals(0, harness.wifi.adapter.disconnectCalls)
+        assertTrue(harness.wifi.adapter.applyCalls.isEmpty())
+        assertEquals(1, harness.scalarWrites.count)
+        assertEquals(REVISION, harness.wifi.store.state.policyRevision)
+        assertEquals(REVISION, harness.wifi.store.state.lastApplied?.revision)
+        val attempt = requireNotNull(harness.store.attempt())
+        assertEquals("complete", attempt.status)
+        assertEquals("applied", attempt.results.getJSONObject("wifi").getString("status"))
+    }
+
+    @Test
+    fun `a new revision with a changed password or order applies Wi-Fi`() {
+        val preferred = network("preferred")
+        val fallback = network("fallback")
+        for (networks in listOf(
+            listOf(preferred.copy(password = "another-secret"), fallback),
+            listOf(fallback, preferred),
+        )) {
+            val harness = PackageHarness(
+                wifi = Harness(
+                    initialState = WifiLocalState(
+                        lastApplied = WifiSavedProfile(REVISION_2, listOf(preferred, fallback), autoReturn = false),
+                        policyRevision = REVISION_2,
+                    ),
+                    initialNetworks = listOf(preferred, fallback),
+                    initialWifi = listOf(observation(10, fallback.ssid, hasIp = true)),
+                ),
+            )
+            harness.receive(packagePolicy(networks = networks))
+            harness.runWifiTasks()
+            assertEquals(1, harness.wifi.adapter.applyCalls.size)
+        }
+    }
+
+    @Test
+    fun `a processed operation whose result was replaced is reported as lost or inferred`() {
+        val other = WifiManualResult(OPERATION_ID_2, REVISION, "success", WifiReason.NONE, false)
+        val failed = Harness(initialState = WifiLocalState(
+            lastApplied = savedProfile(network("old")),
+            policyRevision = REVISION_2,
+            latestResult = other,
+            processedOperationIds = listOf(OPERATION_ID),
+        ))
+        val lost = failed.controller.policyProgress(OPERATION_ID, REVISION)
+        assertTrue(lost.settled)
+        assertTrue(lost.resultLost)
+        assertNull(lost.result)
+
+        val applied = Harness(initialState = WifiLocalState(
+            lastApplied = WifiSavedProfile(REVISION, listOf(network("new")), autoReturn = true),
+            policyRevision = REVISION,
+            latestResult = other,
+            processedOperationIds = listOf(OPERATION_ID),
+        ))
+        val inferred = applied.controller.policyProgress(OPERATION_ID, REVISION)
+        assertFalse(inferred.resultLost)
+        assertEquals("success", inferred.result?.status)
+
+        val unprocessed = Harness(initialState = WifiLocalState(latestResult = other))
+        assertFalse(unprocessed.controller.policyProgress(OPERATION_ID, REVISION).resultLost)
+    }
+
+    @Test
+    fun `a restore failure is retried automatically a bounded number of times`() {
+        val original = network("office-old")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = savedProfile(original)),
+            initialNetworks = listOf(original),
+        )
+        harness.adapter.restoreFailure = WifiReason.RESTORE_FAILED
+        harness.apply(command(OPERATION_ID, REVISION, "managed", network("office-new")))
+        harness.timeout()
+        assertEquals(WifiReason.RESTORE_FAILED, harness.store.state.manualOperation?.failureReason)
+        val restores = harness.adapter.restoreCalls.size
+
+        for ((index, delay) in listOf(30_000L, 2 * 60_000L, 10 * 60_000L).withIndex()) {
+            val retry = requireNotNull(harness.watchdogs.lastOrNull { it.delayMillis == delay })
+            retry.task.run()
+            harness.rollbackExecutor.runAll()
+            assertEquals(restores + index + 1, harness.adapter.restoreCalls.size)
+        }
+        // Three retries at most; an operator Retry or release handles anything longer.
+        assertTrue(harness.watchdogs.none { it.delayMillis > 10 * 60_000L })
+
+        // A transient failure recovers on the first automatic retry.
+        val retried = Harness(
+            initialState = WifiLocalState(lastApplied = savedProfile(original)),
+            initialNetworks = listOf(original),
+        )
+        retried.adapter.restoreFailure = WifiReason.RESTORE_FAILED
+        retried.apply(command(OPERATION_ID, REVISION, "managed", network("office-new")))
+        retried.timeout()
+        retried.adapter.restoreFailure = null
+        requireNotNull(retried.watchdogs.lastOrNull { it.delayMillis == 30_000L }).task.run()
+        retried.rollbackExecutor.runAll()
+        retried.operationExecutor.runAll()
+        assertTrue(retried.store.state.manualOperation?.phase != WifiManualPhase.ROLLING_BACK)
+    }
+
+    @Test
     fun `repeated failed automatic returns back off`() {
         val preferred = network("preferred")
         val current = network("current")
@@ -2060,7 +2295,8 @@ class WifiSettingsControllerTest {
         assertEquals(0, notifications)
     }
 
-    private fun createUnconfirmedRestore(
+    /** A failed apply whose restored settings wait for the prior connection. */
+    private fun createPendingRestore(
         harness: Harness,
         original: WifiNetworkProfile,
         candidate: WifiNetworkProfile,
@@ -2074,6 +2310,16 @@ class WifiSettingsControllerTest {
         val pending = requireNotNull(harness.store.state.manualOperation)
         assertEquals(WifiManualPhase.RESTORING_CONNECTION, pending.phase)
         assertEquals(WifiRollbackTarget(original.ssid, "WPA_PSK"), pending.restoreTarget)
+        return pending
+    }
+
+    /** The prior connection is not observed by the deadline, so the restore settles. */
+    private fun createUnconfirmedRestore(
+        harness: Harness,
+        original: WifiNetworkProfile,
+        candidate: WifiNetworkProfile,
+    ): WifiManualOperation {
+        val pending = createPendingRestore(harness, original, candidate)
         val deadline = requireNotNull(pending.restoreDeadlineElapsedMillis)
         val timeout = requireNotNull(harness.watchdogs.lastOrNull { it.delayMillis == RESTORE_CONFIRM_TIMEOUT_MS })
         harness.clock.value = deadline
@@ -2081,8 +2327,9 @@ class WifiSettingsControllerTest {
         harness.operationExecutor.runAll()
 
         assertEquals(WifiReason.RESTORE_UNCONFIRMED, harness.store.state.latestResult?.reason)
-        assertEquals(pending.operationId, harness.store.state.manualOperation?.operationId)
-        return requireNotNull(harness.store.state.manualOperation)
+        assertEquals(pending.operationId, harness.store.state.latestResult?.operationId)
+        assertNull(harness.store.state.manualOperation)
+        return pending
     }
 
     private class PackageHarness(
@@ -2410,17 +2657,14 @@ class WifiSettingsControllerTest {
         val applyCalls = mutableListOf<ApplyCall>()
         val restoreCalls = mutableListOf<WifiRecoverySnapshot>()
         val restoreCandidates = mutableListOf<List<WifiNetworkProfile>>()
-        val connectCalls = mutableListOf<WifiRollbackTarget>()
         val selectCalls = mutableListOf<WifiNetworkProfile>()
         var captureRecoveryCalls = 0
         var beforeApply: (() -> Unit)? = null
         var applyFailure: WifiReason? = null
         var restoreFailure: WifiReason? = null
-        var connectFailure: WifiReason? = null
         var beforeRestore: (() -> Unit)? = null
         var afterCandidateMutationStarted: (() -> Unit)? = null
         var afterDisconnect: (() -> Unit)? = null
-        var afterSavedReconnect: ((WifiRollbackTarget) -> Unit)? = null
         var afterSelect: ((WifiNetworkProfile) -> Unit)? = null
         var afterRestore: ((WifiRollbackTarget?) -> Unit)? = null
         var selectFailure: ((WifiNetworkProfile) -> WifiReason?)? = null
@@ -2576,26 +2820,6 @@ class WifiSettingsControllerTest {
             }
             afterRestore?.invoke(restoreTarget)
             return WifiReason.NONE
-        }
-
-        override fun connectToSavedNetwork(
-            target: WifiRollbackTarget,
-            shouldContinue: () -> Boolean,
-            onMutationStarted: () -> WifiReason?,
-            onMutationFinished: () -> Unit,
-        ): WifiReason {
-            connectCalls += target
-            if (!shouldContinue()) return WifiReason.TIMEOUT_ROLLED_BACK
-            onMutationStarted()?.let { return it }
-            return try {
-                if (!shouldContinue()) WifiReason.TIMEOUT_ROLLED_BACK
-                else connectFailure ?: run {
-                    afterSavedReconnect?.invoke(target)
-                    WifiReason.NONE
-                }
-            } finally {
-                onMutationFinished()
-            }
         }
 
         override fun disconnectCurrent(

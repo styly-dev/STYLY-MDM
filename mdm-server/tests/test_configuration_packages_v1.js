@@ -442,7 +442,7 @@ test('membership edits include only local changes and preserve untouched remote 
   const stagedOwners = new Map([
     ['local-add', expectedMembershipOwner('local-add', 'Studio', currentGroups)],
   ]);
-  const payload = buildMembershipEdit('Studio', current, selection, currentGroups, stagedOwners, () => []);
+  const payload = buildMembershipEdit('Studio', current, selection, currentGroups, stagedOwners);
   assert.deepEqual(payload, {
     type: 'UPDATE_GROUP_MEMBERS', name: 'Studio', add: { 'local-add': null }, remove: [],
   });
@@ -453,13 +453,13 @@ test('membership additions reject a changed source group until reviewed again', 
   const original = { Studio: [], LabA: ['headset'] };
   const expectedOwners = new Map([['headset', expectedMembershipOwner('headset', 'Studio', original)]]);
   const changed = { Studio: [], LabB: ['headset'] };
-  assert.throws(() => buildMembershipEdit('Studio', [], ['headset'], changed, expectedOwners, () => []),
+  assert.throws(() => buildMembershipEdit('Studio', [], ['headset'], changed, expectedOwners),
     /Group membership changed/);
   assert.throws(() => expectedMembershipOwner('headset', 'Studio', {
     Studio: [], LabA: ['headset'], LabB: ['headset'],
   }), /conflicting group memberships/);
   assert.deepEqual(buildMembershipEdit('Studio', [], ['headset'], changed,
-    new Map([['headset', 'LabB']]), () => []), {
+    new Map([['headset', 'LabB']])), {
     type: 'UPDATE_GROUP_MEMBERS', name: 'Studio', add: { headset: 'LabB' }, remove: [],
   });
 });
@@ -480,14 +480,6 @@ test('a reverted local toggle is cleared before a later remote add', () => {
 
   const next = syncMemberSelection([], ['headset'], selected, edited);
   assert.deepEqual(next, new Set(['headset']));
-});
-
-test('membership edits normalize legacy IDs but send the stored ID for removal', () => {
-  const groups = { Studio: ['legacy-serial'] };
-  const canonicalId = id => id === 'legacy-serial' ? 'device-uuid' : id;
-  assert.deepEqual(buildMembershipEdit('Studio', ['legacy-serial'], [], groups, new Map(), () => ['legacy-serial'], canonicalId), {
-    type: 'UPDATE_GROUP_MEMBERS', name: 'Studio', add: {}, remove: ['legacy-serial'],
-  });
 });
 
 function response(data, status = 200) {
@@ -571,8 +563,7 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
   const controller = createController({
     groupPanel, packagePanel, packageList, createForm,
     getGroups: () => groups,
-    getDevice: id => devices.find(device => device.device_id === id) ||
-      devices.find(device => device.serial_number === id),
+    getDevice: id => devices.find(device => device.device_id === id),
     openPackages: () => { opened++; },
     confirmAction: message => { confirmations.push(message); return confirm(message); },
     fetch: async (url, init) => {
@@ -633,11 +624,11 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
 
 test('group cards use the committed assignment and count only reports for its deployed revision', () => {
   const devices = [
-    { ...online, serial_number: 'legacy', status: 'offline', configuration_state: applied },
+    { ...online, status: 'offline', configuration_state: applied },
     { ...online, device_id: 'stale', configuration_state: { ...applied, revision: 'old' } },
     { ...online, device_id: 'other', configuration_state: { ...applied, package_id: 'other' } },
   ];
-  const groups = { 'The Lab': ['headset', 'legacy', 'stale', 'other', 'missing'], Empty: [], Draft: [], None: [] };
+  const groups = { 'The Lab': ['headset', 'stale', 'other', 'missing'], Empty: [], Draft: [], None: [] };
   const fixture = createHarness(() => assert.fail('group cards should not fetch data'), { groups, devices });
   fixture.broadcast({
     assignments: { 'The Lab': 'pkg', Empty: 'pkg', Draft: 'pkg2' },

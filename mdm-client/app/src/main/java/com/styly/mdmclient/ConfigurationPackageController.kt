@@ -322,10 +322,11 @@ internal class ConfigurationPackageController(
         }
         if (boot < 0 || !sdkReady) return
         val applyScalars = dependencies.scalarWriter() ?: return
-        // A new boot re-applies scalar settings (PUI resets some of them after boot), but
-        // the same Wi-Fi revision keeps its existing connection instead of reselecting.
-        val keepWifi = wifiPolicy != null && previous != null && delivery.retryId == null &&
-            previous.results.optJSONObject("wifi") != null && wifi.isPolicyApplied(version.revision)
+        // A new boot re-applies scalar settings (PUI resets some of them after boot), and a new
+        // revision may change only other settings. When the applied Wi-Fi settings are unchanged,
+        // keep the existing connection instead of reselecting. An explicit Retry always applies.
+        val keepWifi = wifiPolicy != null && delivery.retryId == null && delivery.isCurrent() &&
+            wifi.keepAppliedPolicy(version.revision, wifiPolicy)
         if (wifiPolicy != null && !keepWifi && !wifi.readyForPolicy()) return
 
         pending = null
@@ -358,7 +359,7 @@ internal class ConfigurationPackageController(
             }
         }
         if (keepWifi) {
-            results.put("wifi", checkNotNull(previous).results.getJSONObject("wifi"))
+            results.put("wifi", settingOutcome("applied", reason = null).put("rolled_back", false))
         }
         if (wifiPolicy == null || keepWifi) {
             finish(attempt.copy(status = "complete", results = results))
@@ -415,6 +416,12 @@ internal class ConfigurationPackageController(
                 val interruptedResults = if (outcome != null) results else JSONObject(results.toString())
                     .put("wifi", settingOutcome("failed", reason = "STORAGE_ERROR"))
                 finish(attempt.copy(status = "interrupted", results = interruptedResults, wifiOperationId = null), shouldReport)
+            }
+            progress.resultLost -> {
+                // A later Wi-Fi operation replaced the exact outcome; never wait for it forever.
+                val lostResults = JSONObject(results.toString())
+                    .put("wifi", settingOutcome("failed", reason = WifiReason.UNKNOWN.wireValue))
+                finish(attempt.copy(status = "interrupted", results = lostResults, wifiOperationId = null), shouldReport)
             }
             !recovering -> return false // The live handoff may still be queued on the Wi-Fi worker.
             // A restored attempt without exact terminal proof stays interrupted.

@@ -126,12 +126,17 @@ for the group update before showing results for the new assignment.
 
 The server sends the effective published snapshot on canonical registration,
 publication, package assignment changes, group renames, and membership changes.
+Headset delivery and the admin `GROUP_LIST` fan-out run concurrently after the
+registry save, so a slow console never delays delivery.
 It keeps no device delivery queue and uses device reports for display. A device that was
 offline receives the latest snapshot when it connects. The client compares
 `package_id` and `revision`. It applies a newly published version immediately.
 After each OS boot it reapplies the scalar settings of a successful version
 once, but keeps Wi-Fi in place when the same Wi-Fi revision still owns Wi-Fi
 with no pending operation; it does not disconnect or reselect a network.
+A new revision whose Wi-Fi networks, order, passwords and automatic-return
+setting equal the applied ones (for example a brightness-only change) adopts
+the revision without touching Wi-Fi and reports Wi-Fi as applied.
 **Reapply settings** and Retry apply Wi-Fi as well.
 Moving between groups with the same package does not require another application.
 PUI 5.15.7 can reset sleep settings after Android boot completion. The first
@@ -151,18 +156,31 @@ automatic-return toggle. Update client APKs before deploying this format.
 Before changing Wi-Fi, the client waits for an
 identifiable previous connection. After a failed change with a prior usable
 connection, it retains recovery state until the previous SSID and IP are
-confirmed or a later policy supersedes the connection check. The client reports
+confirmed, the 60-second confirmation deadline passes, or a later policy
+supersedes the connection check. An unconfirmed restore settles at the deadline
+and leaves reconnection to Android auto-join. A disconnected headset runs one
+ordered reselection per offline period (none with a single listed network) and
+then relies on auto-join; a connection that Android joins during that
+reselection's prior-connection check is kept. A failed settings restore (`RESTORE_FAILED`) is retried three times
+(about 30 s, 2 min, 10 min). The client reports
 live priority-monitor and recovery state separately from the package result.
 An automatic-return attempt waits about five minutes before another one;
 consecutive failures double the wait up to 30 minutes. The wait resets on app
-process restart and does not delay a new revision.
+process restart and does not delay a new revision. Any visible higher
+candidate triggers automatic return regardless of signal strength. Disconnect grace and retry timers
+carry random delay so headsets that lose the same AP do not retry in lockstep.
 Monitoring depends on fresh, potentially throttled Android scan results.
-A release (package unassigned, or Wi-Fi no longer managed) that arrives during
-a Wi-Fi operation, including an automatic switch, is retained by the Wi-Fi
-controller and applied as soon as that operation settles; no new automatic
-switch starts meanwhile, and a newer managed policy supersedes it.
+A release (package unassigned, or Wi-Fi no longer managed) is journaled in
+`wifi-settings.json` (`pending_release`) before anything else. While an
+operation, including an automatic switch or a restore reconnect, can still
+mutate Wi-Fi, the release waits and is applied as soon as that operation
+settles, including after a process restart; no new automatic switch starts
+meanwhile, and a newer managed policy supersedes it.
 The client sends `WIFI_STATE` only when its public state changes, and the
-server ignores a report equal to the stored one.
+server ignores a report equal to the stored one. Telemetry (`BATTERY_UPDATE`,
+`WIFI_STATE`, `CONFIGURATION_STATE`) registry saves are coalesced to one per
+second and the admin `DEVICE_LIST` to one per 150 ms; pending telemetry is
+saved on shutdown. Admin and package changes still save immediately.
 
 The APK Settings screen puts file access, Wi-Fi configuration, and the optional
 Wi-Fi rollback timer (exact alarm) access in one **Permissions** section. **Device configuration**
@@ -185,7 +203,10 @@ Before starting Wi-Fi, the client saves the scalar readbacks and the Wi-Fi
 operation ID in the package attempt. Wi-Fi owns a separate local recovery
 journal. On restart, a settled result that matches the operation ID and
 revision can complete the recorded attempt using its original boot count.
-Without exact terminal evidence, the attempt remains interrupted. The
+Without exact terminal evidence, the attempt remains interrupted. If a later
+Wi-Fi operation (such as an automatic switch) replaced the result, the attempt
+is marked applied when its revision became the applied Wi-Fi revision and
+interrupted otherwise, so it never waits indefinitely. The
 operation ID is private to the device and optional in older package records.
 
 Scalar settings use the pinned PICO Enterprise SDK and Android readback where
@@ -219,7 +240,7 @@ editing. The editor waits for the station to advertise support.
 
 | Surface | Contract |
 |---|---|
-| `GET /api/packages`, `POST /api/packages` | List packages or create one by name. A summary includes `publication_requires_review: true` for a publication with unsupported legacy values. |
+| `GET /api/packages`, `POST /api/packages` | List packages or create one by name. |
 | `GET /api/packages/{id}` | Returns package identity and name, `draft_revision`, `published_revision`, `published_keys`, the saved draft `settings`, the editor `sections`, and `impact` with group and device counts and a token. A saved Wi-Fi password is represented by `password_present`. |
 | `POST /api/packages/{id}/save-and-deploy` | Atomically saves `settings` as `{id: {managed, value}}` and deploys a new revision. Supply `expected_revision` equal to the loaded draft UUID (null for the first draft), and `expected_impact` from the preview. An optional `name` renames the package. |
 | `DELETE /api/packages/{id}` | Deletes an unassigned package. |
@@ -775,7 +796,6 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `RETIRE_RESULT` | Outcome of a device retire. Success is settled by *silence*: the device announced, disconnected, and stayed away for the retire window. Failure means it re-registered, reported the uninstall failed, or was still connected at the deadline. Fields: `device_id`, `correlation_id`, `status` (`success` / `fail`), `detail` |
 | `GROUP_LIST` | Current `groups`, package summaries in `packages`, group-to-package `assignments`, and published `deployments`. Sent on connect and after group or package changes. `registry_writable` is `false` when the server could not read its registry and is refusing to save changes; the console then shows a warning. |
 | `GROUP_CREATED` / `GROUP_RENAMED` / `GROUP_DELETED` | Acknowledgements for group create / rename / delete. |
-| `DEVICE_GROUPS_SET` | Acknowledgement of a device's group membership change. Fields: `device_id`, `groups` |
 | `GROUP_MEMBERS_SET` | Acknowledgement of a group's committed member list change. Fields: `name`, `members`. Scoped edits also include `operation: UPDATE_GROUP_MEMBERS` |
 | `ERROR` | Error message. Fields: `message`. Rejected scoped membership edits also include `operation: UPDATE_GROUP_MEMBERS` and `name`. |
 

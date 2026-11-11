@@ -12,6 +12,7 @@ import pytest
 from aiohttp.test_utils import TestServer
 
 from styly_mdm import configuration_packages, server
+from server_test_helpers import reset_server_state
 
 
 DEVICE_ID = "11111111-1111-4111-8111-111111111111"
@@ -550,7 +551,8 @@ def test_group_assignment_and_membership_release_and_referenced_delete(tmp_path)
 
 
 @pytest.mark.parametrize("disconnect_on_ack", [False, True], ids=["saved", "console-disconnected"])
-def test_membership_save_ack_precedes_policy_delivery(tmp_path, monkeypatch, disconnect_on_ack):
+def test_membership_save_precedes_policy_delivery(tmp_path, monkeypatch, disconnect_on_ack):
+    """The durable save precedes delivery; console replies and delivery do not wait on each other."""
     async def body():
         release_delivery = asyncio.Event()
         delivery_started = asyncio.Event()
@@ -594,12 +596,77 @@ def test_membership_save_ack_precedes_policy_delivery(tmp_path, monkeypatch, dis
                         assert ack["operation"] == "UPDATE_GROUP_MEMBERS"
                         assert ack["members"] == [DEVICE_ID]
                     await asyncio.wait_for(delivery_started.wait(), 2)
-                    assert ack_failed.is_set() == disconnect_on_ack
+                    if disconnect_on_ack:
+                        await asyncio.wait_for(ack_failed.wait(), 2)
                     stored_groups = json.loads(server.REGISTRY_PATH.read_text())["groups"]
                     assert stored_groups["Gallery"]["members"] == [DEVICE_ID]
                 finally:
                     release_delivery.set()
                 assert await _receive_type(device, "CONFIGURATION_POLICY") == _policy(package, {"brightness": 75})
+
+    asyncio.run(body())
+
+
+def test_slow_admin_fan_out_does_not_delay_policy_delivery(tmp_path, monkeypatch):
+    async def body():
+        release_admins = asyncio.Event()
+        broadcast_group_list = server.broadcast_group_list
+
+        async def slow_group_list():
+            await release_admins.wait()
+            await broadcast_group_list()
+
+        async with _running_server(tmp_path, {"Gallery": [DEVICE_ID]}) as (session, base):
+            package = await _create(session, base, "Gallery")
+            package = await _deploy(session, base, await _seed_draft(session, base, package, _brightness(75)))
+            async with session.ws_connect(base + "/ws/device") as device:
+                await _register(device)
+                assert await _receive_type(device, "CONFIGURATION_POLICY") == NO_POLICY
+                monkeypatch.setattr(server, "broadcast_group_list", slow_group_list)
+                try:
+                    await _assign(session, base, "Gallery", package)
+                    assert await _receive_type(device, "CONFIGURATION_POLICY") == _policy(package, {"brightness": 75})
+                finally:
+                    release_admins.set()
+
+    asyncio.run(body())
+
+
+def test_device_label_reports_a_registry_save_failure(tmp_path, monkeypatch):
+    async def body():
+        async with _running_server(tmp_path, {}) as (session, base):
+            monkeypatch.setattr(server, "_write_registry", lambda configuration, records: False)
+            async with session.ws_connect(base + "/ws/admin") as admin:
+                await admin.send_json({"type": "SET_DEVICE_LABEL", "device_id": OTHER_ID, "label": "Spare"})
+                error = await _receive_type(admin, "ERROR")
+            assert error["message"] == "Could not persist the device label"
+            assert OTHER_ID not in server.device_registry
+
+    asyncio.run(body())
+
+
+def test_telemetry_coalescer_runs_once_with_the_latest_state_and_flushes():
+    async def body():
+        state = {"value": 0}
+        runs = []
+        coalescer = server._Coalescer(0.05, lambda: runs.append(state["value"]), "test")
+        for value in (1, 2, 3):
+            state["value"] = value
+            coalescer.schedule()
+        await asyncio.sleep(0.1)
+        assert runs == [3]
+
+        state["value"] = 4
+        coalescer.schedule()
+        await coalescer.flush(run=True)
+        assert runs == [3, 4]
+        await coalescer.flush(run=True)
+        assert runs == [3, 4]
+
+        coalescer.schedule()
+        await coalescer.flush(run=False)
+        await asyncio.sleep(0.1)
+        assert runs == [3, 4]
 
     asyncio.run(body())
 

@@ -242,12 +242,5 @@ private fun WifiInfo.currentNetworkSecurity(): String? {
     }
 }
 
-internal fun wifiProfileAcceptsObservedSecurity(profile: WifiNetworkProfile, security: String?): Boolean = when {
-    profile.security == "OPEN" -> security == "OPEN"
-    profile.security != "WPA2_WPA3" -> false
-    profile.requiresSaeOnly -> security == "SAE"
-    else -> security == "WPA_PSK" || security == "SAE"
-}
-
 private fun java.net.InetAddress.isUsableLocalAddress(): Boolean =
     !isAnyLocalAddress && !isLoopbackAddress && !isLinkLocalAddress && !isMulticastAddress

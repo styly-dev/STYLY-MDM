@@ -8,7 +8,7 @@ import android.net.wifi.ScanResult
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
-import android.os.Looper
+import android.os.HandlerThread
 import android.os.SystemClock
 
 internal enum class WifiPriorityMonitorStatus(val wireValue: String) {
@@ -281,7 +281,10 @@ internal class WifiPriorityScanLoop(
     }
 }
 
-internal class AndroidWifiPriorityScanBackend(context: Context) : WifiPriorityScanBackend {
+internal class AndroidWifiPriorityScanBackend(
+    context: Context,
+    private val handler: Handler,
+) : WifiPriorityScanBackend {
     private val appContext = context.applicationContext
     private val manager = appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
     private var receiver: BroadcastReceiver? = null
@@ -306,10 +309,10 @@ internal class AndroidWifiPriorityScanBackend(context: Context) : WifiPrioritySc
         if (Build.VERSION.SDK_INT >= 33) {
             // PUI delivers scan results through the Wi-Fi system process. The probe APK
             // received this protected system broadcast as an exported dynamic receiver.
-            appContext.registerReceiver(nextReceiver, filter, Context.RECEIVER_EXPORTED)
+            appContext.registerReceiver(nextReceiver, filter, null, handler, Context.RECEIVER_EXPORTED)
         } else {
-            @Suppress("DEPRECATION")
-            appContext.registerReceiver(nextReceiver, filter)
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            appContext.registerReceiver(nextReceiver, filter, null, handler)
         }
         receiver = nextReceiver
     }
@@ -334,18 +337,25 @@ internal class AndroidWifiPriorityScanBackend(context: Context) : WifiPrioritySc
     }
 }
 
-internal class AndroidWifiPriorityScanScheduler : WifiPriorityScanScheduler {
-    private val handler = Handler(Looper.getMainLooper())
+internal class AndroidWifiPriorityScanScheduler(private val handler: Handler) : WifiPriorityScanScheduler {
     override fun schedule(task: Runnable, delayMillis: Long) { handler.postDelayed(task, delayMillis) }
     override fun cancel(task: Runnable) { handler.removeCallbacks(task) }
 }
 
-internal fun systemWifiPriorityScanSource(context: Context): WifiPriorityScanSource = WifiPriorityScanLoop(
-    backend = AndroidWifiPriorityScanBackend(context.applicationContext),
-    scheduler = AndroidWifiPriorityScanScheduler(),
-    nowElapsed = SystemClock::elapsedRealtime,
-    jitter = { bound -> kotlin.random.Random.nextLong(bound + 1) },
-)
+/**
+ * Scan requests and scan-result reads are Binder calls, so they run on a dedicated thread
+ * instead of the main thread. The controller is a process-wide singleton, so one thread suffices.
+ */
+internal fun systemWifiPriorityScanSource(context: Context): WifiPriorityScanSource {
+    val thread = HandlerThread("wifi-priority-scan").apply { start() }
+    val handler = Handler(thread.looper)
+    return WifiPriorityScanLoop(
+        backend = AndroidWifiPriorityScanBackend(context.applicationContext, handler),
+        scheduler = AndroidWifiPriorityScanScheduler(handler),
+        nowElapsed = SystemClock::elapsedRealtime,
+        jitter = { bound -> kotlin.random.Random.nextLong(bound + 1) },
+    )
+}
 
 /** Match only security modes the Wi-Fi policy can configure. */
 internal fun wifiScanMatchesProfile(sample: WifiScanSample, profile: WifiNetworkProfile): Boolean {

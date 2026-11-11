@@ -1,11 +1,34 @@
 package com.styly.mdmclient
 
+import android.net.wifi.WifiConfiguration
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class WifiManagerAdapterRecoveryTest {
+    @Test
+    fun `saved network update tries the default MAC setting first and stops at the accepted one`() {
+        val tried = mutableListOf<Int>()
+        // A network saved in system Settings with "device MAC" accepts only NONE.
+        val id = updateWithMacRandomizationFallback { setting ->
+            tried += setting
+            if (setting == WifiConfiguration.RANDOMIZATION_NONE) 7 else -1
+        }
+
+        assertEquals(7, id)
+        assertEquals(listOf(WifiConfiguration.RANDOMIZATION_AUTO, WifiConfiguration.RANDOMIZATION_NONE), tried)
+    }
+
+    @Test
+    fun `saved network update reports failure after every MAC setting is rejected`() {
+        val tried = mutableListOf<Int>()
+
+        assertEquals(-1, updateWithMacRandomizationFallback { tried += it; -1 })
+        assertEquals(WIFI_MAC_RANDOMIZATION_TRIALS, tried)
+        assertEquals(4, tried.toSet().size)
+    }
+
     @Test
     fun `profile update resolves the matching security view when PICO exposes duplicate ID views`() {
         val profile = WifiNetworkProfile("transition", "WPA2_WPA3", "test-password", false)

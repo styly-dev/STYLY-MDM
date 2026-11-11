@@ -428,6 +428,7 @@
     .btn-text { background: none; border: none; color: var(--text-secondary); font-size: 13px; cursor: pointer; font-family: inherit; padding: 9px 16px; }
     .mg-footer .btn-primary { width: auto; margin: 0; padding: 9px 20px; font-size: 13px; }
 
+    input[type="checkbox"] { accent-color: var(--accent); }
     #groupSettingsPanel, #configurationPackagePanel { padding: 18px 20px 22px; }
     .settings-package-item { font-family: inherit; color: inherit; background: none; border: 0; text-align: left; }
     .settings-package-item .mg-item-name { min-width: 0; overflow-wrap: anywhere; }
@@ -1046,7 +1047,6 @@
           devices.forEach(function (d) {
             const key = getDeviceId(d);
             if (!deviceIndex.has(key)) deviceIndex.set(key, d);
-            if (d.serial_number && !deviceIndex.has(d.serial_number)) deviceIndex.set(d.serial_number, d);
           });
           deviceIndexSource = devices;
         }
@@ -1137,11 +1137,6 @@
       }
       function groupNames() { return Object.keys(groups).sort(); }
       function offlineMembers(name) { return (groups[name] || []).filter(function (s) { const d = deviceById(s); return d && !isOnline(d); }).length; }
-      function manageGroupHasDevice(id) {
-        const device = deviceById(id);
-        const identities = [id, device && device.device_id, device && device.serial_number].filter(Boolean);
-        return Array.from(manageMembers).some(function (memberId) { return identities.indexOf(memberId) >= 0; });
-      }
       function batteryHtml(d) {
         const b = d && d.battery;
         if (!b || typeof b.level !== 'number') return '<span class="battery-muted">—</span>';
@@ -1253,16 +1248,10 @@
             else if (manageSelectedGroup && !(manageSelectedGroup in groups)) { manageSelectedGroup = null; manageMembers = new Set(); }
             else if (manageSelectedGroup) {
               // Keep staged adds/removals, and follow current membership for untouched devices.
-              const canonicalId = function (id) { const d = deviceById(id); return d ? getDeviceId(d) : id; };
               manageMembers = window.MdmConfigurationPackages.syncMemberSelection(
-                previousMembers.map(canonicalId), (groups[manageSelectedGroup] || []).map(canonicalId),
-                new Set(Array.from(manageMembers, canonicalId)),
-                new Set(Array.from(manageEditedMembers, canonicalId)));
-              manageEditedMembers = new Set(Array.from(manageEditedMembers, canonicalId));
-              manageAddedOwners = new Map(Array.from(manageAddedOwners, ([id, owner]) => [canonicalId(id), owner]));
+                previousMembers, groups[manageSelectedGroup] || [], manageMembers, manageEditedMembers);
               window.MdmConfigurationPackages.clearMembershipEditsThatMatch(
-                manageMembers, groups[manageSelectedGroup] || [], manageEditedMembers,
-                manageAddedOwners, canonicalDeviceId);
+                manageMembers, groups[manageSelectedGroup] || [], manageEditedMembers, manageAddedOwners);
             }
             // Keep the active-group selection current: a group whose membership was
             // just edited must not dispatch to the old member set (PR #29 P1).
@@ -1325,7 +1314,7 @@
             if (msg.operation === 'UPDATE_GROUP_MEMBERS' && membershipSave?.name === msg.name && membershipSave.state === 'saving') {
               manageEditedMembers.clear();
               manageAddedOwners.clear();
-              manageMembers = new Set((groups[msg.name] || []).map(canonicalDeviceId));
+              manageMembers = new Set(groups[msg.name] || []);
               showMembershipFeedback(msg.name, 'Members saved.', 'saved');
             }
             addLog('Group "' + (msg.name || '-') + '" saved: ' + ((msg.members && msg.members.length) || 0) + ' device(s)', 'success');
@@ -2494,16 +2483,6 @@
       function sendRenameGroup(name, nn) { wsSend({ type: 'RENAME_GROUP', name: name, new_name: nn }, 'rename group'); }
       function sendDeleteGroup(name) { wsSend({ type: 'DELETE_GROUP', name: name }, 'delete group'); }
 
-      function canonicalDeviceId(id) {
-        const device = deviceById(id);
-        return device ? getDeviceId(device) : id;
-      }
-
-      function membershipAliases(id) {
-        const device = deviceById(id);
-        return device ? [device.device_id, device.serial_number].filter(Boolean) : [];
-      }
-
       function showMembershipFeedback(name, message, state) {
         membershipSave = { name, message, state };
         renderMembershipFeedback();
@@ -2532,7 +2511,7 @@
         let edit;
         try {
           edit = window.MdmConfigurationPackages.buildMembershipEdit(
-            name, groups[name] || [], manageMembers, groups, manageAddedOwners, membershipAliases, canonicalDeviceId);
+            name, groups[name] || [], manageMembers, groups, manageAddedOwners);
         } catch (error) {
           showMembershipFeedback(name, error.message, 'error');
           return;
@@ -2565,7 +2544,7 @@
       function selectManageGroup(name) {
         if (membershipSave?.state === 'saving') return;
         manageSelectedGroup = name;
-        manageMembers = new Set((groups[name] || []).map(canonicalDeviceId));
+        manageMembers = new Set(groups[name] || []);
         manageEditedMembers = new Set();
         manageAddedOwners = new Map();
         membershipSave = null;
@@ -2676,8 +2655,8 @@
         const list = filterSortDevices(manageSearch, manageSort);
         if (!list.length) return '<div class="empty small">No matching devices</div>';
         return list.map(function (d) {
-          const id = getDeviceId(d); const mem = manageGroupHasDevice(id); const off = !isOnline(d);
-          const otherGroups = window.MdmConfigurationPackages.membershipGroups(id, groups, [d.serial_number]).filter(function (name) { return name !== manageSelectedGroup; });
+          const id = getDeviceId(d); const mem = manageMembers.has(id); const off = !isOnline(d);
+          const otherGroups = window.MdmConfigurationPackages.membershipGroups(id, groups).filter(function (name) { return name !== manageSelectedGroup; });
           return '<div class="mg-dev" data-act="toggleMember" data-id="' + esc(id) + '">' +
             '<div class="selbox ' + (mem ? 'on' : '') + '">' + (mem ? '✓' : '') + '</div>' +
             '<div class="mg-dev-main">' +
@@ -3428,35 +3407,31 @@
         else if (act === 'toggleMember') {
           if (membershipSave?.state === 'saving' && membershipSave.name === manageSelectedGroup) return;
           const id = t.dataset.id;
-          const wasMember = manageGroupHasDevice(id);
-          const nowMember = !wasMember;
-          const device = deviceById(id);
-          const identities = [id, device && device.device_id, device && device.serial_number].filter(Boolean);
-          if (wasMember) identities.forEach(function (memberId) { manageMembers.delete(memberId); });
-          if (nowMember) manageMembers.add(canonicalDeviceId(id));
-          else manageMembers.delete(canonicalDeviceId(id));
+          const nowMember = !manageMembers.has(id);
+          if (nowMember) manageMembers.add(id);
+          else manageMembers.delete(id);
 
           const committed = window.MdmConfigurationPackages.membershipGroups(
-            id, groups, membershipAliases(id)).includes(manageSelectedGroup);
+            id, groups).includes(manageSelectedGroup);
           if (nowMember === committed) {
-            manageEditedMembers.delete(canonicalDeviceId(id));
-            manageAddedOwners.delete(canonicalDeviceId(id));
+            manageEditedMembers.delete(id);
+            manageAddedOwners.delete(id);
           } else {
-            manageEditedMembers.add(canonicalDeviceId(id));
+            manageEditedMembers.add(id);
             if (nowMember) {
               let owner;
               try {
                 owner = window.MdmConfigurationPackages.expectedMembershipOwner(
-                  id, manageSelectedGroup, groups, membershipAliases(id));
+                  id, manageSelectedGroup, groups);
               } catch (error) {
-                manageMembers.delete(canonicalDeviceId(id));
-                manageEditedMembers.delete(canonicalDeviceId(id));
+                manageMembers.delete(id);
+                manageEditedMembers.delete(id);
                 showMembershipFeedback(manageSelectedGroup, error.message, 'error');
                 return;
               }
-              manageAddedOwners.set(canonicalDeviceId(id), owner);
+              manageAddedOwners.set(id, owner);
             } else {
-              manageAddedOwners.delete(canonicalDeviceId(id));
+              manageAddedOwners.delete(id);
             }
           }
           // Update only the clicked row + counts so the list keeps its scroll position.
@@ -3469,7 +3444,7 @@
         else if (act === 'saveMembers') saveGroupMembers();
         else if (act === 'cancelMembers') {
           if (membershipSave?.state === 'saving' && membershipSave.name === manageSelectedGroup) return;
-          manageMembers = new Set((groups[manageSelectedGroup] || []).map(canonicalDeviceId));
+          manageMembers = new Set(groups[manageSelectedGroup] || []);
           manageEditedMembers.clear();
           manageAddedOwners.clear();
           membershipSave = null;

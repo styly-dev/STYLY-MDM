@@ -543,6 +543,79 @@ def save_registry() -> bool:
     return _write_registry(_configuration, device_registry)
 
 
+TELEMETRY_SAVE_DELAY = 1.0
+DEVICE_LIST_BROADCAST_DELAY = 0.15
+
+
+class _Coalescer:
+    """Run ``work`` once after ``delay``; requests made while it waits share that run.
+
+    The work reads current state when it runs, so the latest state always wins.
+    """
+
+    def __init__(self, delay: float, work, label: str) -> None:
+        self._delay = delay
+        self._work = work
+        self._label = label
+        self._task: asyncio.Task | None = None
+        # The event loop keeps only weak references to tasks; keep running ones alive.
+        self._running: set[asyncio.Task] = set()
+
+    def schedule(self) -> None:
+        loop = asyncio.get_running_loop()
+        task = self._task
+        if task is not None and not task.done() and task.get_loop() is loop:
+            return
+        self._task = loop.create_task(self._run(), name=self._label)
+        self._running.add(self._task)
+        self._task.add_done_callback(self._running.discard)
+
+    async def _run(self) -> None:
+        await asyncio.sleep(self._delay)
+        # A request after this point needs a new run because this one may already have read state.
+        self._task = None
+        await self._invoke()
+
+    async def _invoke(self) -> None:
+        try:
+            result = self._work()
+            if asyncio.iscoroutine(result):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("%s failed", self._label)
+
+    async def flush(self, *, run: bool) -> None:
+        """Cancel a waiting run; ``run`` performs the pending work now instead."""
+        task, self._task = self._task, None
+        if task is None or task.done():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if run:
+            await self._invoke()
+
+
+# Telemetry (battery, Wi-Fi and configuration state) changes often across many headsets.
+# Coalesce its registry writes and admin list fan-out. Devices resend state on REGISTER, so
+# a crash loses at most one delay of telemetry. Admin and package changes still save at once.
+_telemetry_save = _Coalescer(TELEMETRY_SAVE_DELAY, save_registry, "telemetry-registry-save")
+_device_list_broadcast = _Coalescer(
+    DEVICE_LIST_BROADCAST_DELAY, lambda: broadcast_device_list(), "device-list-broadcast",
+)
+
+
+def _record_telemetry() -> None:
+    _telemetry_save.schedule()
+    _device_list_broadcast.schedule()
+
+
+async def _flush_telemetry(app: web.Application) -> None:
+    await _device_list_broadcast.flush(run=False)
+    await _telemetry_save.flush(run=True)
+
+
 def _commit_configuration(
     candidate: _ConfigurationRegistry, *, records: dict[str, dict] | None = None,
 ) -> bool:
@@ -1643,16 +1716,28 @@ async def _send_configuration(
         return False
 
 
+async def _publish_group_change(device_ids, admin_update=None) -> None:
+    """Deliver a committed group change to headsets and admins independently.
+
+    A slow admin console must not delay delivery to headsets. ``admin_update`` replaces
+    the default group-list fan-out when the caller also answers the requesting console.
+    """
+    results = await asyncio.gather(
+        admin_update if admin_update is not None else broadcast_group_list(),
+        _publish_configuration(device_ids),
+        return_exceptions=True,
+    )
+    for error, message in zip(results, ("Could not notify admins of the committed group change",
+                                        "Could not publish the committed configuration")):
+        if isinstance(error, asyncio.CancelledError):
+            raise error
+        if isinstance(error, BaseException):
+            log.error(message, exc_info=error)
+
+
 def _schedule_configuration_publication(app: web.Application, device_ids: list[str]) -> None:
     async def publish() -> None:
-        try:
-            await broadcast_group_list()
-        except Exception:
-            log.exception("Could not broadcast the committed group list")
-        try:
-            await _publish_configuration(device_ids)
-        except Exception:
-            log.exception("Could not publish the committed configuration")
+        await _publish_group_change(device_ids)
 
     tasks = app[_CONFIGURATION_PUBLICATIONS]
     task = asyncio.create_task(publish(), name="configuration-publication")
@@ -1972,8 +2057,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         continue
                     entry["configuration_state"] = state
                     device_registry[device_id]["configuration_state"] = state
-                    save_registry()
-                    await broadcast_device_list()
+                    _record_telemetry()
 
                 elif msg_type == "WIFI_STATE":
                     state = public_wifi_state(data.get("wifi_state"))
@@ -1982,8 +2066,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         continue
                     devices[device_id]["wifi_state"] = state
                     device_registry[device_id]["wifi_state"] = state
-                    save_registry()
-                    await broadcast_device_list()
+                    _record_telemetry()
 
                 elif msg_type == "BATTERY_UPDATE":
                     if not device_id:
@@ -2007,12 +2090,11 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     if rec is not None:
                         rec["battery"] = battery
                         rec["last_seen"] = time.time()
-                    save_registry()
                     log.info(
                         "Battery update from %s: %d%% charging=%s",
                         device_id, battery["level"], battery["charging"],
                     )
-                    await broadcast_device_list()
+                    _record_telemetry()
 
                 elif msg_type == "DOWNLOAD_COMPLETE":
                     # Primary transfer-slot release: the network-heavy download has
@@ -2457,13 +2539,17 @@ async def handle_set_device_label(admin_ws: web.WebSocketResponse, data: dict):
 
     # Upsert the record. An empty label clears the assignment but keeps the device
     # known, so it stays listed as offline until explicitly forgotten.
-    rec = device_registry.get(serial)
-    if rec is None:
-        rec = {"label": "", "model": "", "ip": "", "last_seen": None, "startup_app": None}
-        device_registry[serial] = rec
+    records = device_registry.copy()
+    rec = dict(records.get(serial) or
+               {"label": "", "model": "", "ip": "", "last_seen": None, "startup_app": None})
     rec["label"] = label
-
-    save_registry()
+    records[serial] = rec
+    if not _commit_configuration(_configuration, records=records):
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "Could not persist the device label",
+        }))
+        return
     log.info("Device label set: %s -> %r", serial, label)
 
     await admin_ws.send_str(json.dumps({
@@ -2606,9 +2692,7 @@ async def handle_rename_group(
         "name": name,
         "new_name": new_name,
     }))
-    await broadcast_group_list()
-    if new_name != name:
-        await _publish_configuration(groups[new_name].members)
+    await _publish_group_change(groups[new_name].members if new_name != name else ())
 
 
 async def handle_delete_group(
@@ -2634,14 +2718,16 @@ async def handle_delete_group(
                 "message": "Could not persist the group change",
             }))
             return
-        await _publish_configuration(group.members)
         log.info("Group deleted: %r", name)
+        members = group.members
+    else:
+        members = ()
 
     await admin_ws.send_str(json.dumps({
         "type": "GROUP_DELETED",
         "name": name,
     }))
-    await broadcast_group_list()
+    await _publish_group_change(members)
 
 
 async def handle_update_group_members(admin_ws: web.WebSocketResponse, data: dict):
@@ -2732,13 +2818,15 @@ async def handle_update_group_members(admin_ws: web.WebSocketResponse, data: dic
         "name": name,
         "members": list(groups[name].members),
     })
-    try:
+    async def notify_admins() -> None:
         if changed:
             await broadcast_group_list()
         await admin_ws.send_str(result)
-    finally:
-        if changed:
-            await _publish_configuration(sorted(changed))
+
+    if changed:
+        await _publish_group_change(sorted(changed), notify_admins())
+    else:
+        await notify_admins()
 
 
 async def handle_launch_app(admin_ws: web.WebSocketResponse, data: dict):
@@ -3473,7 +3561,11 @@ async def handle_set_startup_app(admin_ws: web.WebSocketResponse, data: dict):
             except ConnectionResetError:
                 log.warning("Failed to send SET_STARTUP_APP to %s (disconnected)", did)
 
-    save_registry()
+    if not save_registry():
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "The startup app was sent but could not be saved on the server",
+        }))
     log.info("SET_STARTUP_APP: %s to %d/%d devices", package_name, sent_count, len(target_ids))
 
     await admin_ws.send_str(json.dumps({
@@ -3517,7 +3609,11 @@ async def handle_clear_startup_app(admin_ws: web.WebSocketResponse, data: dict):
             except ConnectionResetError:
                 log.warning("Failed to send CLEAR_STARTUP_APP to %s (disconnected)", did)
 
-    save_registry()
+    if not save_registry():
+        await admin_ws.send_str(json.dumps({
+            "type": "ERROR",
+            "message": "The startup app was cleared but the change could not be saved on the server",
+        }))
     log.info("CLEAR_STARTUP_APP: sent to %d/%d devices", sent_count, len(target_ids))
 
     await admin_ws.send_str(json.dumps({
@@ -3663,6 +3759,7 @@ def create_app() -> web.Application:
 
     app[_CONFIGURATION_PUBLICATIONS] = set()
     app.on_cleanup.append(_stop_configuration_publications)
+    app.on_cleanup.append(_flush_telemetry)
     app.router.add_get("/ws/device", device_ws_handler)
     app.router.add_get("/ws/admin", admin_ws_handler)
     app.router.add_get("/api/packages", package_catalog_handler)
