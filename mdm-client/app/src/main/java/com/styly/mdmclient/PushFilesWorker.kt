@@ -239,7 +239,7 @@ class PushFilesWorker internal constructor(
         val workDirectory: File,
     )
 
-    private data class FailurePolicy(
+    internal data class FailurePolicy(
         val interruptionReason: String? = null,
         val retainPartial: Boolean = false,
         val recovery: PushFailureRecovery = PushFailureRecovery.TerminalFailure,
@@ -291,7 +291,7 @@ class PushFilesWorker internal constructor(
             )
         } catch (error: Throwable) {
             val failure = error as? PushWorkerException
-            val policy = failurePolicy(command, failure)
+            val policy = failurePolicy(command, error)
             interruptionReason = policy.interruptionReason
             PushProtocol.Result(
                 jobId = command.jobId,
@@ -301,8 +301,9 @@ class PushFilesWorker internal constructor(
                 added = 0,
                 updated = 0,
                 deleted = 0,
-                failureCode = failure?.code ?: classifyFailure(error),
-                detail = error.message ?: error.javaClass.simpleName,
+                failureCode = if (error.hasStorageCleanupFailure() && error.isRecoverableDownloadFailure())
+                    "storage_write_failed" else failure?.code ?: classifyFailure(error),
+                detail = downloadFailureDetail(error),
             )
         }
         // The coordinator persists this execution outcome before terminal cleanup;
@@ -564,9 +565,7 @@ class PushFilesWorker internal constructor(
                     )
                 } catch (error: Exception) {
                     val policy = failurePolicy(command, error)
-                    if (error is PushWorkerException) {
-                        discardPartialOnFailure(command, partial, error, policy = policy)
-                    }
+                    discardPartialOnFailure(command, partial, error, policy = policy)
                     when (policy.recovery) {
                         PushFailureRecovery.RetryWithinDeadline -> Unit
                         PushFailureRecovery.AwaitOperatorResume,
@@ -591,12 +590,16 @@ class PushFilesWorker internal constructor(
         return completed
     }
 
-    private fun failurePolicy(
+    internal fun failurePolicy(
         command: PushProtocol.Command,
         error: Throwable?,
     ): FailurePolicy {
         if (error == null) return FailurePolicy()
-        val failure = error as? PushWorkerException ?: return FailurePolicy(
+        val failure = error as? PushWorkerException
+        if (error.isRecoverableDownloadFailure() && error.hasStorageCleanupFailure()) {
+            return failurePolicy(command, PushWorkerException("storage_write_failed", "Download cleanup failed"))
+        }
+        if (failure == null) return FailurePolicy(
             retainPartial = error is IOException,
             recovery = if (error is IOException) PushFailureRecovery.RetryWithinDeadline
                 else PushFailureRecovery.TerminalFailure,
@@ -636,7 +639,7 @@ class PushFilesWorker internal constructor(
     private fun discardPartialOnFailure(
         command: PushProtocol.Command,
         partial: File,
-        failure: PushWorkerException,
+        failure: Throwable,
         invalidateMetadata: Boolean = false,
         policy: FailurePolicy = failurePolicy(command, failure),
     ) {
@@ -681,6 +684,7 @@ class PushFilesWorker internal constructor(
         var received = 0L
         input.use {
             val output = openStorageOutput(partial, append)
+            var primaryFailure: Throwable? = null
             try {
                 digest.beginWrite(append)
                 val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
@@ -697,24 +701,24 @@ class PushFilesWorker internal constructor(
                     digest.update(buffer, 0, read)
                     onBytesWritten()
                 }
-            } finally {
-                try {
-                    // Persist the exact bytes already written even when the network
-                    // read or idle deadline failed, before retry or local validation.
-                    storageWrite {
-                        output.flush()
-                        output.fd.sync()
-                    }
-                } finally {
-                    storageWrite { output.close() }
+                if (expectedLength != null && received != expectedLength) {
+                    throw PushWorkerException(
+                        "download_failed", "HTTP body ended before its declared range",
+                        recovery = PushFailureRecovery.RetryWithinDeadline,
+                    )
                 }
+            } catch (error: Throwable) {
+                primaryFailure = error
+                throw error
+            } finally {
+                // Attempt every persistence/close step without hiding the body failure.
+                finishDownloadOutput(
+                    primaryFailure,
+                    { output.flush() },
+                    { output.fd.sync() },
+                    { output.close() },
+                )
             }
-        }
-        if (expectedLength != null && received != expectedLength) {
-            throw PushWorkerException(
-                "download_failed", "HTTP body ended before its declared range",
-                recovery = PushFailureRecovery.RetryWithinDeadline,
-            )
         }
     }
 
@@ -1034,3 +1038,33 @@ class PushWorkerException(
     val recovery: PushFailureRecovery = PushFailureRecovery.TerminalFailure,
 ) : Exception(message, cause)
 
+/** Preserve the body failure while recording every failed persistence/close operation. */
+internal fun finishDownloadOutput(primaryFailure: Throwable?, vararg operations: () -> Unit) {
+    var failure = primaryFailure
+    for (operation in operations) {
+        try {
+            operation()
+        } catch (error: IOException) {
+            val storageFailure = PushWorkerException(
+                "storage_write_failed", error.message ?: "Could not persist download data", error,
+            )
+            if (failure == null) failure = storageFailure else failure.addSuppressed(storageFailure)
+        }
+    }
+    if (primaryFailure == null && failure != null) throw failure
+}
+
+internal fun downloadFailureDetail(error: Throwable): String = buildString {
+    append(error.message ?: error.javaClass.simpleName)
+    error.suppressed.forEach {
+        append("; cleanup: ")
+        append(it.message ?: it.javaClass.simpleName)
+    }
+}
+
+private fun Throwable.hasStorageCleanupFailure(): Boolean = suppressed.any {
+    it is PushWorkerException && it.code == "storage_write_failed"
+}
+
+private fun Throwable.isRecoverableDownloadFailure(): Boolean = this is IOException ||
+    this is PushWorkerException && recovery != PushFailureRecovery.TerminalFailure

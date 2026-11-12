@@ -25,6 +25,68 @@ class PushFilesWorkerTest {
     val tmp = TemporaryFolder()
 
     @Test
+    fun `cleanup preserves network error and attempts every operation`() {
+        val network = java.io.IOException("connection reset")
+        val operations = mutableListOf<String>()
+        finishDownloadOutput(network,
+            { operations += "flush"; throw java.io.IOException("flush failed") },
+            { operations += "sync"; throw java.io.IOException("sync failed") },
+            { operations += "close"; throw java.io.IOException("close failed") },
+        )
+        assertEquals(listOf("flush", "sync", "close"), operations)
+        assertEquals(3, network.suppressed.size)
+        assertTrue(network.suppressed.all { (it as PushWorkerException).code == "storage_write_failed" })
+        assertEquals("connection reset; cleanup: flush failed; cleanup: sync failed; cleanup: close failed",
+            downloadFailureDetail(network))
+    }
+
+    @Test
+    fun `cleanup alone throws first storage failure and retains later failures`() {
+        val failure = assertThrows(PushWorkerException::class.java) {
+            finishDownloadOutput(null,
+                { throw java.io.IOException("flush failed") },
+                { throw java.io.IOException("sync failed") },
+                { throw java.io.IOException("close failed") },
+            )
+        }
+        assertEquals("storage_write_failed", failure.code)
+        assertEquals("flush failed", failure.message)
+        assertEquals(listOf("sync failed", "close failed"), failure.suppressed.map { it.message })
+    }
+
+    @Test
+    fun `cleanup failure stops retries and requires validated partial for manual resume`() {
+        val work = File(tmp.root, "cleanup-work")
+        val command = command(artifactSize = 100)
+        val worker = worker(work)
+        val network = java.io.IOException("connection reset")
+        finishDownloadOutput(network, { throw java.io.IOException("sync failed") })
+        seedResume(work, command, ByteArray(40))
+        val resumable = worker.failurePolicy(command, network)
+        assertEquals(PushFailureRecovery.AwaitOperatorResume, resumable.recovery)
+        assertEquals("storage_write_failed", resumable.interruptionReason)
+        assertTrue(resumable.retainPartial)
+        File(work, "metadata.json").delete()
+        val invalid = worker.failurePolicy(command, network)
+        assertEquals(PushFailureRecovery.TerminalFailure, invalid.recovery)
+        assertFalse(invalid.retainPartial)
+    }
+
+    @Test
+    fun `cleanup failure never masks integrity failure or changes ordinary network retry`() {
+        val command = command()
+        val worker = worker(File(tmp.root, "integrity-work"))
+        val integrity = PushWorkerException("artifact_identity_mismatch", "wrong range")
+        finishDownloadOutput(integrity, { throw java.io.IOException("sync failed") })
+        val policy = worker.failurePolicy(command, integrity)
+        assertEquals(PushFailureRecovery.TerminalFailure, policy.recovery)
+        assertFalse(policy.retainPartial)
+        assertEquals("wrong range; cleanup: sync failed", downloadFailureDetail(integrity))
+        assertEquals(PushFailureRecovery.RetryWithinDeadline,
+            worker.failurePolicy(command, java.io.IOException("connection reset")).recovery)
+    }
+
+    @Test
     fun `connection errors interrupt resumable download at its idle deadline`() {
         val unavailablePort = ServerSocket(0, 1, InetAddress.getLoopbackAddress()).use {
             it.localPort

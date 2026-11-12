@@ -19,6 +19,8 @@ class PushTransferLease:
     artifact_id: str
     token: str
     last_progress: float
+    accepted: bool = False
+    started: bool = False
     task: asyncio.Task[Any] | None = None
     transport: Any = None
     claim_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -42,6 +44,14 @@ class PushTransferLeases:
     def is_current(self, lease: PushTransferLease) -> bool:
         """Return whether this exact lease has not been revoked or replaced."""
         return self._by_key.get(lease.key) is lease
+
+    def accept(self, key: TransferKey, token: str | None) -> None:
+        """Start one bounded preparation window, without extending an active stream."""
+        lease = self._by_key.get(key)
+        if lease is not None and lease.token == token and not lease.accepted:
+            lease.accepted = True
+            if not lease.started:
+                lease.last_progress = time.monotonic()
 
     def last_progress(self, key: TransferKey) -> float | None:
         lease = self._by_key.get(key)
@@ -77,6 +87,9 @@ class PushTransferLeases:
                 await asyncio.gather(previous_task, return_exceptions=True)
                 if self._by_token.get(token) is not lease:
                     return "revoked"
+            if not lease.started:
+                lease.started = True
+                lease.last_progress = time.monotonic()
             lease.task = task
             lease.transport = transport
             return "claimed"

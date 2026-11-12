@@ -38,6 +38,8 @@ other owner. Recovery and every fence-visible revision commit together and requi
 a fresh Resume. Both interruption and timeout cleanup preserve replacement waiters.
 Retry and late recovery protect newer work at equal, parent, and child destinations;
 SQL decisions and batched snapshots share the canonical directory-overlap predicate.
+Overlap comparison uses conservative Unicode canonical caseless matching without
+changing stored paths, transmitted paths, or fingerprints.
 
 The Needs attention console offers Resume / Retry / Cancel per device and for
 explicitly selected devices, without job cards. Rows reuse the Devices tab's
@@ -62,6 +64,8 @@ changing destination files. Registration, saved interruptions, and storage recov
 share one replay path for current interrupted ownership and pending results.
 Download failure policy explicitly chooses bounded retry, operator Resume, or
 terminal failure, independently of partial retention and reported reason.
+Download cleanup preserves both body and persistence failures. A persistence failure
+prevents automatic network retry; integrity failures retain terminal priority.
 
 The console's `push-jobs-v1.js` keeps revisioned canonical snapshots and exposes an
 asynchronous submission API to the existing file panels. Submission request IDs

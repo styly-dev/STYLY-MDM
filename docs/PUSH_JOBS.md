@@ -152,8 +152,10 @@ Response handling is fail-closed:
 
 The client deadline measures bytes received and saved on the device; the server
 measures bytes successfully written to the HTTP response. These clocks can differ
-because of buffering. The server renews the job-v1 lease only after successful HTTP
-writes. After 60 seconds without such progress, it revokes the URL, aborts and awaits
+because of buffering. After command acceptance, the server allows 60 seconds for
+the first HTTP GET. That first GET starts a separate 60-second progress window;
+only successful HTTP writes renew it. Duplicate acceptance and reconnects do not
+reset either window. After 60 seconds without progress, it revokes the URL, aborts and awaits
 the matching HTTP handler, then releases that assignment's slot. A healthy transfer
 can continue beyond the previous 600-second timeout. Once revoked, the old URL cannot
 reconnect without a new operator-authorized Resume, so it cannot restart outside the

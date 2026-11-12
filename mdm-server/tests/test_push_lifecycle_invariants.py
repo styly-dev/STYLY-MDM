@@ -277,7 +277,6 @@ async def test_stalled_transfer_db_failure_releases_http_slot_then_outer_recover
     leases = PushTransferLeases()
     registry = TransferRegistry(leases.revoke_now)
     lease = leases.issue(key, artifact_id)
-    lease.last_progress -= TRANSFER_IDLE_SECONDS + 1
     future = asyncio.get_running_loop().create_future()
     registry.register(key, future)
     stream = asyncio.create_task(asyncio.Event().wait())
@@ -288,6 +287,7 @@ async def test_stalled_transfer_db_failure_releases_http_slot_then_outer_recover
             aborts.append(True)
 
     assert await leases.claim(artifact_id, lease.token, stream, Transport()) == "claimed"
+    lease.last_progress -= TRANSFER_IDLE_SECONDS + 1
     slot = asyncio.Semaphore(1)
     scheduler = object.__new__(PushScheduler)
     scheduler.manager = manager

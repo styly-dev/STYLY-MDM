@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import posixpath
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
@@ -428,7 +429,10 @@ def canonical_destination(value: Any) -> str:
 
 
 def destinations_overlap(left: str, right: str) -> bool:
-    """Compare canonical destinations at directory boundaries."""
+    """Conservatively compare canonical destinations without changing stored paths."""
+    # Canonical caseless matching is a safety check, not an exact filesystem model.
+    left = unicodedata.normalize("NFD", unicodedata.normalize("NFD", left).casefold())
+    right = unicodedata.normalize("NFD", unicodedata.normalize("NFD", right).casefold())
     return left == right or left.startswith(right + "/") or right.startswith(left + "/")
 
 

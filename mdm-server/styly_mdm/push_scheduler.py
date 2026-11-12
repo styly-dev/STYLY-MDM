@@ -674,6 +674,7 @@ class PushScheduler:
             return True
 
         if outcome == "accepted":
+            self.leases.accept(key, lease_token)
             try:
                 progress = await self.manager.record_progress(
                     job_id, device_id, ProgressEvent.ACCEPTED,
