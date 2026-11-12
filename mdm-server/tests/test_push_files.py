@@ -1,12 +1,7 @@
-"""Tests for the push-files (file/folder full-mirror sync) feature.
+"""Tests for Push job packaging safety and the retired pre-job API boundary."""
 
-Covers the pure path/bundle helpers, the destination-safety guard, the bundle upload
-endpoint (multipart tree -> zip), and the PUSH_FILES command fan-out. No real network is
-used: async handlers run via asyncio.run with in-memory fakes / the aiohttp test client.
-"""
-
-import asyncio
 import json
+import uuid
 import zipfile
 
 import aiohttp
@@ -14,22 +9,18 @@ from aiohttp.test_utils import TestClient, TestServer
 import pytest
 
 import styly_mdm
-from styly_mdm import integrity, server
+from styly_mdm import server
 
-
-# ---------------------------------------------------------------------------
-# Pure helpers
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
     "raw, expected",
     [
         ("a.txt", "a.txt"),
         ("folder/sub/a.txt", "folder/sub/a.txt"),
-        ("folder\\sub\\a.txt", "folder/sub/a.txt"),   # backslashes normalized
-        ("./a/./b.txt", "a/b.txt"),                    # '.' segments dropped
-        ("/abs/path.txt", "abs/path.txt"),             # leading slash -> relative
-        ("../secret", None),                           # parent traversal rejected
+        ("folder\\sub\\a.txt", "folder/sub/a.txt"),
+        ("./a/./b.txt", "a/b.txt"),
+        ("/abs/path.txt", "abs/path.txt"),
+        ("../secret", None),
         ("a/../../b", None),
         ("", None),
         ("   ", None),
@@ -40,58 +31,13 @@ def test_sanitize_relpath(raw, expected):
     assert server.sanitize_relpath(raw) == expected
 
 
-@pytest.mark.parametrize(
-    "dest",
-    [
-        "/sdcard/STYLY/content",
-        "/storage/emulated/0/STYLY/content",
-        "/sdcard/a",
-        "/sdcard/STYLY/content/",       # trailing slash tolerated
-    ],
-)
-def test_validate_dest_path_accepts_safe(dest):
-    assert server.validate_dest_path(dest) is None
-
-
-@pytest.mark.parametrize(
-    "dest",
-    [
-        "", "   ", None,
-        "relative/path",                 # not absolute
-        "/sdcard",                       # storage root, no subdir
-        "/sdcard/",                      # storage root
-        "/storage/emulated/0",           # storage root
-        "/sdcard/Download",              # protected top-level dir
-        "/sdcard/download/x",            # protected (case-insensitive)
-        "/sdcard/Android/data/x",        # protected
-        "/sdcard/DCIM/x",                # protected
-        "/sdcard/STYLY/../content",      # contains '..'
-        "/etc/passwd",                   # outside shared storage
-    ],
-)
-def test_validate_dest_path_rejects_unsafe(dest):
-    assert server.validate_dest_path(dest) is not None
-
-
-def test_bundle_basename():
-    assert server.bundle_basename(["config.txt"]) == "config"
-    assert server.bundle_basename(["myfolder/a.txt", "myfolder/b.txt"]) == "myfolder"
-    assert server.bundle_basename(["x/a.txt", "y/b.txt"]) == "bundle"
-    assert server.bundle_basename([]) == "bundle"
-
-
-def test_unique_bundle_path_avoids_collision(tmp_path):
-    server._apply_data_dir(str(tmp_path))
-    server.BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
-
-    first = server.unique_bundle_path("content.zip")
-    assert first == server.BUNDLE_DIR / "content.zip"
-
-    first.write_bytes(b"x")  # occupy the name
-    second = server.unique_bundle_path("content.zip")
-    assert second != first
-    assert second.name.startswith("content-")
-    assert second.suffix == ".zip"
+def test_strip_common_root():
+    assert server.strip_common_root(["myfolder/a.txt", "myfolder/sub/b.txt"]) == (
+        "myfolder", ["a.txt", "sub/b.txt"]
+    )
+    assert server.strip_common_root(["a.txt", "b.txt"]) == (None, ["a.txt", "b.txt"])
+    assert server.strip_common_root(["config.json"]) == (None, ["config.json"])
+    assert server.strip_common_root(["x/a.txt", "y/b.txt"]) == (None, ["x/a.txt", "y/b.txt"])
 
 
 def test_zip_tree_stores_forward_slash_relative_names(tmp_path):
@@ -103,366 +49,149 @@ def test_zip_tree_stores_forward_slash_relative_names(tmp_path):
 
     server.zip_tree(root, dest_zip)
 
-    with zipfile.ZipFile(dest_zip) as z:
-        assert set(z.namelist()) == {"a.txt", "sub/b.txt"}
-        assert z.read("sub/b.txt") == b"BBB"
+    with zipfile.ZipFile(dest_zip) as archive:
+        assert set(archive.namelist()) == {"a.txt", "sub/b.txt"}
+        assert archive.read("sub/b.txt") == b"BBB"
 
 
-# ---------------------------------------------------------------------------
-# Route registration
-# ---------------------------------------------------------------------------
-
-def test_create_app_registers_bundle_routes(tmp_path):
+@pytest.mark.asyncio
+async def test_retired_bundle_api_fails_fast_and_does_not_serve_existing_files(tmp_path):
     server._apply_data_dir(str(tmp_path))
+    old_bundle_dir = server.BUNDLE_DIR
+    old_bundle_dir.mkdir(parents=True)
+    old_bundle = old_bundle_dir / "existing.zip"
+    old_bundle.write_bytes(b"preserve")
     app = styly_mdm.create_app()
-    method_paths = {(route.method, route.resource.canonical) for route in app.router.routes()}
-    canonicals = {resource.canonical for resource in app.router.resources()}
-    assert ("POST", "/api/bundles") in method_paths
-    assert any(c.startswith("/bundles") for c in canonicals)
-    assert (tmp_path / "bundles").is_dir()
 
+    methods = {(route.method, route.resource.canonical) for route in app.router.routes()}
+    assert ("POST", "/api/bundles") in methods
+    assert ("POST", "/api/push-jobs/{job_id}/upload") in methods
+    assert not any(resource.canonical.startswith("/bundles") for resource in app.router.resources())
 
-# ---------------------------------------------------------------------------
-# Bundle upload endpoint (multipart tree -> zip)
-# ---------------------------------------------------------------------------
-
-async def _upload(app, parts):
-    """POST parts (list of (relpath, bytes)) to /api/bundles; return (status, json)."""
     async with TestClient(TestServer(app)) as client:
-        data = aiohttp.FormData()
-        for relpath, content in parts:
-            data.add_field("files", content, filename=relpath,
-                           content_type="application/octet-stream")
-        resp = await client.post("/api/bundles", data=data)
-        return resp.status, await resp.json()
+        form = aiohttp.FormData()
+        form.add_field("files", b"payload", filename="payload.txt")
+        response = await client.post("/api/bundles", data=form)
+        assert response.status == 410
+        body = await response.json()
+        assert "/api/push-jobs" in body["error"]
+
+        response = await client.get("/bundles/existing.zip")
+        assert response.status == 404
+
+    assert old_bundle.read_bytes() == b"preserve"
 
 
-def test_strip_common_root():
-    # Folder pick: shared top dir stripped so the bundle mirrors its contents.
-    assert server.strip_common_root(["myfolder/a.txt", "myfolder/sub/b.txt"]) == (
-        "myfolder", ["a.txt", "sub/b.txt"])
-    # A bare top-level file among the entries -> no shared root, unchanged.
-    assert server.strip_common_root(["a.txt", "b.txt"]) == (None, ["a.txt", "b.txt"])
-    assert server.strip_common_root(["config.json"]) == (None, ["config.json"])
-    # Two distinct roots -> unchanged.
-    assert server.strip_common_root(["x/a.txt", "y/b.txt"]) == (None, ["x/a.txt", "y/b.txt"])
+async def _registered_push_device(session, base):
+    device_id = str(uuid.uuid4())
+    device = await session.ws_connect(base + "/ws/device")
+    await device.send_json({
+        "type": "REGISTER",
+        "identity_scheme": server.IDENTITY_SCHEME,
+        "device_id": device_id,
+        "model": "PICO 4 Ultra Enterprise",
+        "ip": "127.0.0.1",
+        "version_code": 11,
+        "version_name": "test",
+        "capabilities": ["push_job_id_v1", "push_resume_v1"],
+        "process_instance_id": str(uuid.uuid4()),
+        "push_state": {"status": "available"},
+        "push_runtime": {"active": None},
+    })
+    while True:
+        message = await device.receive()
+        if message.type == aiohttp.WSMsgType.TEXT and json.loads(message.data).get(
+            "type"
+        ) == "REGISTERED":
+            return device_id, device
 
 
-@pytest.mark.parametrize("relpath", [
-    ".DS_Store",
-    "sub/.DS_Store",
-    "sub/.ds_store",                       # case-insensitive
-    "._resourcefork.txt",                  # AppleDouble sidecar
-    "sub/._a.txt",
-    "Thumbs.db",
-    "sub/thumbs.db",
-    "ehthumbs.db",
-    "desktop.ini",
-    ".directory",
-    ".apdisk",
-    ".VolumeIcon.icns",
-    ".Spotlight-V100/store.db",            # excluded via the directory segment
-    ".Trashes/501/x",
-    ".fseventsd/000",
-    ".TemporaryItems/a",
-    ".DocumentRevisions-V100/a",
-    "__MACOSX/._a.txt",
-    "$RECYCLE.BIN/a",
-    ".Trash-1000/files/a",                 # Linux per-user trash on removable media
-])
-def test_is_os_metadata_matches_os_metadata(relpath):
-    assert integrity.is_os_metadata(relpath) is True
+async def _create_job(session, base, device_id):
+    response = await session.post(base + "/api/push-jobs", json={
+        "client_request_id": str(uuid.uuid4()),
+        "target_devices": [device_id],
+        "mode": "push",
+        "dest_path": "/sdcard/STYLY/content",
+        "source": {
+            "display_name": "myfolder",
+            "declared_file_count": 4,
+            "declared_total_bytes": 64,
+        },
+    })
+    assert response.status == 201
+    return await response.json()
 
 
-@pytest.mark.parametrize("relpath", [
-    "a.txt",
-    "sub/b.bin",
-    ".gitignore",                          # a dotfile the user authored stays
-    ".git/config",                         # VCS is deliberately NOT excluded
-    "scene.unity.meta",                    # Unity metadata is real content here
-    "_underscore.txt",                     # only "._" prefixes are AppleDouble
-    "my.DS_Store.txt",                     # substring, not the whole segment
-    "desktop.ini.bak",
-])
-def test_is_os_metadata_keeps_real_content(relpath):
-    assert integrity.is_os_metadata(relpath) is False
-
-
-def test_upload_bundle_drops_os_metadata_and_reports_the_count(tmp_path):
+@pytest.mark.asyncio
+async def test_job_upload_packages_folder_without_os_metadata(tmp_path):
     server._apply_data_dir(str(tmp_path))
-    app = styly_mdm.create_app()
-
-    status, body = asyncio.run(_upload(app, [
-        ("myfolder/a.txt", b"AAA"),
-        ("myfolder/.DS_Store", b"junk"),
-        ("myfolder/sub/b.txt", b"BBBBB"),
-        ("myfolder/sub/.DS_Store", b"junk"),
-        ("myfolder/sub/._b.txt", b"junk"),
-    ]))
-
-    assert status == 200
-    assert body["entry_count"] == 2
-    assert body["skipped_count"] == 3
-    with zipfile.ZipFile(server.BUNDLE_DIR / body["bundle_filename"]) as z:
-        assert set(z.namelist()) == {"a.txt", "sub/b.txt"}
-
-
-def test_upload_bundle_rejects_an_upload_that_is_only_os_metadata(tmp_path):
-    # Excluding everything must fail loudly rather than build an empty bundle that a
-    # Sync Folder would then use to wipe the destination.
-    server._apply_data_dir(str(tmp_path))
-    app = styly_mdm.create_app()
-
-    status, body = asyncio.run(_upload(app, [
-        ("myfolder/.DS_Store", b"junk"),
-        ("myfolder/sub/._a.txt", b"junk"),
-    ]))
-
-    assert status == 400
-    assert "OS metadata" in body["error"]
-
-
-def test_upload_bundle_folder_pick_mirrors_contents(tmp_path):
-    # A folder pick nests files under the folder name; the bundle must contain the
-    # folder's *contents* (root stripped) so it mirrors into the destination directly,
-    # while the bundle is still named after the picked folder.
-    server._apply_data_dir(str(tmp_path))
-    app = styly_mdm.create_app()
-
-    status, body = asyncio.run(_upload(app, [
-        ("myfolder/a.txt", b"AAA"),
-        ("myfolder/sub/b.txt", b"BBBBB"),
-    ]))
-
-    assert status == 200
-    assert body["entry_count"] == 2
-    assert body["bundle_filename"].startswith("myfolder")
-    zip_path = server.BUNDLE_DIR / body["bundle_filename"]
-    assert zip_path.is_file()
-    with zipfile.ZipFile(zip_path) as z:
-        assert set(z.namelist()) == {"a.txt", "sub/b.txt"}  # root stripped
-    # The transient staging directory must be cleaned up, leaving only the zip.
-    assert [p.name for p in server.BUNDLE_DIR.iterdir()] == [body["bundle_filename"]]
-
-
-def test_upload_bundle_multiple_files_keep_flat_names(tmp_path):
-    # Multiple individually-picked files share no folder root -> archived as-is.
-    server._apply_data_dir(str(tmp_path))
-    app = styly_mdm.create_app()
-    status, body = asyncio.run(_upload(app, [("a.txt", b"A"), ("b.txt", b"B")]))
-    assert status == 200
-    assert body["entry_count"] == 2
-    with zipfile.ZipFile(server.BUNDLE_DIR / body["bundle_filename"]) as z:
-        assert set(z.namelist()) == {"a.txt", "b.txt"}
-
-
-def test_upload_bundle_single_file(tmp_path):
-    server._apply_data_dir(str(tmp_path))
-    app = styly_mdm.create_app()
-    status, body = asyncio.run(_upload(app, [("config.json", b"{}")]))
-    assert status == 200
-    assert body["entry_count"] == 1
-    assert body["bundle_filename"].startswith("config")
-
-
-def test_upload_bundle_rejects_traversal_filename(tmp_path):
-    server._apply_data_dir(str(tmp_path))
-    app = styly_mdm.create_app()
-    status, _ = asyncio.run(_upload(app, [("../evil.txt", b"x")]))
-    assert status == 400
-
-
-def test_upload_bundle_requires_files(tmp_path):
-    server._apply_data_dir(str(tmp_path))
-    app = styly_mdm.create_app()
-
-    async def _empty():
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post("/api/bundles", data=aiohttp.FormData())
-            return resp.status
-
-    assert asyncio.run(_empty()) == 400
-
-
-# ---------------------------------------------------------------------------
-# PUSH_FILES command fan-out
-# ---------------------------------------------------------------------------
-
-class FakeWS:
-    """Captures messages sent to it as parsed dicts."""
-
-    def __init__(self):
-        self.sent = []
-
-    async def send_str(self, text):
-        self.sent.append(json.loads(text))
-
-
-def _register_online_device(did):
-    ws = FakeWS()
-    server.devices[did] = {
-        "ws": ws, "device_id": did, "model": "PICO 4E",
-        "ip": "192.168.1.10", "status": "online", "startup_app": None, "battery": None,
-        "identity_kind": "canonical", "registration_ready": True,
-    }
-    return ws
-
-
-@pytest.fixture(autouse=True)
-def _reset_transfer_state():
-    """PUSH_FILES now dispatches as a background job against the shared slot pool."""
-    for coll in (server.devices, server.admin_connections,
-                 server.pending_transfers, server._transfer_tasks):
-        coll.clear()
-    server.reset_transfer_slots()
-    yield
-    for coll in (server.devices, server.admin_connections,
-                 server.pending_transfers, server._transfer_tasks):
-        coll.clear()
-    server.reset_transfer_slots()
-
-
-async def _drain_push_job(*device_ids):
-    """Let the spawned job dispatch, free each device's slot, and await the job."""
-    for _ in range(40):
-        await asyncio.sleep(0)
-    for did in device_ids:
-        server.release_transfer_slot(did, "download_complete", task=server.TASK_PUSH)
-    if server._transfer_tasks:
-        await asyncio.wait_for(asyncio.gather(*server._transfer_tasks), 1)
-
-
-def test_handle_push_files_fans_out_to_online_devices(tmp_path):
-    async def body():
-        server._apply_data_dir(str(tmp_path))
-        dev_ws = _register_online_device("dev-1")
-        admin = FakeWS()
-
-        await server.handle_push_files(admin, {
-            "target_devices": ["*"],
-            "bundle_url": "http://host/bundles/b.zip",
-            "bundle_filename": "b.zip",
-            "dest_path": "/sdcard/STYLY/content",
-        })
-
-        # The ack lands before any device is dispatched: the fan-out is throttled and
-        # runs in the background, so the admin is not blocked on it.
-        sent_ack = admin.sent[-1]
-        assert sent_ack["type"] == "PUSH_FILES_SENT"
-        assert sent_ack["target_count"] == 1
-        assert sent_ack["max_concurrent"] == server.MAX_CONCURRENT_TRANSFERS
-        assert sent_ack["dest_path"] == "/sdcard/STYLY/content"
-
-        await _drain_push_job("dev-1")
-
-        assert dev_ws.sent[0]["type"] == "EXECUTE_PUSH_FILES"
-        assert dev_ws.sent[0]["bundle_url"] == "http://host/bundles/b.zip"
-        assert dev_ws.sent[0]["dest_path"] == "/sdcard/STYLY/content"
-
-    asyncio.run(body())
-
-
-@pytest.mark.parametrize(
-    "sent_value, expected",
-    [
-        # A push (copy) and an explicit sync (mirror) round-trip their flag verbatim.
-        (False, False),
-        (True, True),
-        # Everything else must decode to "do not delete". An omitted field is the case that
-        # matters most: a console that predates the flag must never trigger a mirror.
-        (None, False),
-        ("true", False),
-        (1, False),
-    ],
-)
-def test_handle_push_files_only_a_literal_true_requests_deletion(tmp_path, sent_value, expected):
-    async def body():
-        server._apply_data_dir(str(tmp_path))
-        dev_ws = _register_online_device("dev-1")
-        admin = FakeWS()
-
-        data = {
-            "target_devices": ["*"],
-            "bundle_url": "http://host/bundles/b.zip",
-            "bundle_filename": "b.zip",
-            "dest_path": "/sdcard/STYLY/content",
-        }
-        if sent_value is not None:
-            data["delete_extras"] = sent_value
-
-        await server.handle_push_files(admin, data)
-        assert admin.sent[-1]["delete_extras"] is expected
-
-        await _drain_push_job("dev-1")
-        assert dev_ws.sent[0]["delete_extras"] is expected
-
-    asyncio.run(body())
-
-
-def test_handle_push_files_rejects_unsafe_dest(tmp_path):
-    async def body():
-        server._apply_data_dir(str(tmp_path))
-        dev_ws = _register_online_device("dev-1")
-        admin = FakeWS()
-
-        await server.handle_push_files(admin, {
-            "target_devices": ["*"],
-            "bundle_url": "http://host/bundles/b.zip",
-            "bundle_filename": "b.zip",
-            "dest_path": "/sdcard/Download",   # protected -> must be rejected
-        })
-
-        assert admin.sent[-1]["type"] == "ERROR"
-        assert not server._transfer_tasks   # no job spawned
-        assert dev_ws.sent == []            # nothing dispatched to the device
-
-    asyncio.run(body())
-
-
-def test_handle_push_files_requires_bundle_url(tmp_path):
-    async def body():
-        server._apply_data_dir(str(tmp_path))
-        admin = FakeWS()
-        await server.handle_push_files(admin, {
-            "target_devices": ["*"], "dest_path": "/sdcard/STYLY/content",
-        })
-        assert admin.sent[-1]["type"] == "ERROR"
-        assert not server._transfer_tasks
-
-    asyncio.run(body())
-
-
-@pytest.mark.parametrize("replacement", [
-    None,
-    {"identity_kind": "canonical", "registration_ready": False},
-    {"identity_kind": "legacy", "registration_ready": True},
-])
-def test_queued_push_rechecks_command_policy_before_send(monkeypatch, replacement):
-    async def body():
-        original_ws = _register_online_device("queued-device")
-        replacement_ws = FakeWS()
-        gate = asyncio.Semaphore(1)
-        await gate.acquire()
-        monkeypatch.setattr(server, "transfer_slots", lambda: gate)
-        task = asyncio.create_task(server._run_push_job(
-            "http://host/bundles/b.zip", "b.zip", "/sdcard/STYLY/content",
-            False, ["queued-device"],
-        ))
+    async with TestClient(TestServer(styly_mdm.create_app())) as client:
+        base = str(client.make_url("/"))[:-1]
+        device_id, device = await _registered_push_device(client.session, base)
         try:
-            await asyncio.sleep(0)
-            assert not task.done()
-            if replacement is None:
-                server.devices.pop("queued-device")
-            else:
-                server.devices["queued-device"] = {**replacement, "ws": replacement_ws}
-            gate.release()
-            await asyncio.wait_for(task, 1)
-            assert original_ws.sent == []
-            assert replacement_ws.sent == []
-            assert not server.pending_transfers
-        finally:
-            if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+            job = await _create_job(client.session, base, device_id)
+            # Browser FormData sends the filename path literally. Disabling aiohttp's
+            # default quote_fields behavior keeps this test transport-equivalent.
+            form = aiohttp.FormData(quote_fields=False)
+            form.add_field("files", b"AAA", filename="myfolder/a.txt")
+            form.add_field("files", b"junk", filename="myfolder/.DS_Store")
+            form.add_field("files", b"literal", filename="myfolder/percent%2Fname.txt")
+            form.add_field("files", b"BBBBB", filename="myfolder/sub/b.txt")
+            response = await client.session.post(base + job["upload_url"], data=form)
 
-    asyncio.run(body())
+            assert response.status == 200
+            snapshot = await response.json()
+            assert snapshot["state"] == "ready"
+            assert snapshot["actual_file_count"] == 3
+            assert snapshot["actual_total_bytes"] == 15
+            runtime = client.server.app["push_runtime"]
+            artifact = await runtime.store.artifact_record(snapshot["artifact"]["artifact_id"])
+            archive_path = runtime.artifacts.path_for_record(artifact)
+            with zipfile.ZipFile(archive_path) as archive:
+                assert archive.namelist() == ["a.txt", "percent%2Fname.txt", "sub/b.txt"]
+                assert archive.read("percent%2Fname.txt") == b"literal"
+        finally:
+            await device.close()
+
+
+@pytest.mark.asyncio
+async def test_job_upload_rejects_traversal_path(tmp_path):
+    server._apply_data_dir(str(tmp_path))
+    async with TestClient(TestServer(styly_mdm.create_app())) as client:
+        base = str(client.make_url("/"))[:-1]
+        device_id, device = await _registered_push_device(client.session, base)
+        try:
+            job = await _create_job(client.session, base, device_id)
+            form = aiohttp.FormData(quote_fields=False)
+            form.add_field("files", b"bad", filename="../outside.txt")
+            response = await client.session.post(base + job["upload_url"], data=form)
+            assert response.status == 422
+            assert "unsafe uploaded path" in (await response.json())["error"]
+            assert not (tmp_path / "outside.txt").exists()
+        finally:
+            await device.close()
+
+
+@pytest.mark.asyncio
+async def test_identityless_push_command_returns_job_migration_error():
+    class Admin:
+        def __init__(self):
+            self.sent = []
+
+        async def send_str(self, message):
+            self.sent.append(json.loads(message))
+
+    admin = Admin()
+    await server.handle_push_files(admin, {
+        "target_devices": ["D1"],
+        "bundle_url": "http://old-server/bundles/content.zip",
+        "dest_path": "/sdcard/STYLY/content",
+    })
+
+    assert admin.sent == [{
+        "type": "ERROR",
+        "message": (
+            "Push/Sync requires a job_id. Create a job through /api/push-jobs, "
+            "upload to its upload_url, then send PUSH_FILES with that job_id."
+        ),
+    }]

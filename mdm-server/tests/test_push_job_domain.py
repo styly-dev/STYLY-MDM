@@ -16,6 +16,7 @@ from styly_mdm.push_jobs import (
     canonical_destination,
     canonicalize_create_request,
     derive_dispatched_job_state,
+    destinations_overlap,
     parse_capabilities,
     validate_device_transition,
 )
@@ -81,6 +82,31 @@ def test_create_request_is_canonical_and_fingerprint_is_order_independent():
     assert first.target_devices == ("A", "B")
     assert first.dest_path == "/sdcard/STYLY/content"
     assert first.fingerprint == second.fingerprint
+
+
+@pytest.mark.parametrize("left,right,expected", [
+    ("/sdcard/Content", "/sdcard/content", True),
+    ("/sdcard/Content", "/sdcard/content/child", True),
+    ("/sdcard/Café", "/sdcard/CAFE\u0301/child", True),
+    ("/sdcard/\u0390", "/sdcard/\u03aa\u0301", True),
+    ("/sdcard/Content", "/sdcard/content2", False),
+    ("/sdcard/Content/a", "/sdcard/content/b", False),
+    ("/sdcard/Café", "/sdcard/Cafe", False),
+    ("/storage/emulated/0/Content/", "/sdcard/content", True),
+])
+def test_destination_overlap_uses_canonical_caseless_directory_boundaries(left, right, expected):
+    left, right = canonical_destination(left), canonical_destination(right)
+    assert destinations_overlap(left, right) is expected
+    assert destinations_overlap(right, left) is expected
+
+
+def test_destination_comparison_does_not_change_paths_or_fingerprints():
+    first = canonicalize_create_request(request(dest_path="/sdcard/Café"))
+    second = canonicalize_create_request(request(dest_path="/sdcard/CAFE\u0301"))
+    assert destinations_overlap(first.dest_path, second.dest_path)
+    assert first.dest_path == "/sdcard/Café"
+    assert second.dest_path == "/sdcard/CAFE\u0301"
+    assert first.fingerprint != second.fingerprint
 
 
 def test_duplicate_targets_are_rejected_before_fingerprinting():
