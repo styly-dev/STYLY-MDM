@@ -53,6 +53,7 @@ class RegistrationManager:
 
 def runtime_for(manager):
     runtime = object.__new__(PushRuntime)
+    runtime.leases = PushTransferLeases()
     runtime.pending_disconnects = set()
     runtime.disconnect_recovery_tasks = {}
     runtime.artifact_gc_task = None
@@ -998,6 +999,8 @@ async def test_registration_active_report_preserves_offline_timeout_fence(tmp_pa
 
         ws = Ws()
         runtime = object.__new__(PushRuntime)
+        runtime.leases = PushTransferLeases()
+        runtime.transfers = TransferRegistry()
         runtime.pending_disconnects = set()
         runtime.disconnect_recovery_tasks = {}
         runtime.artifact_gc_task = None
@@ -1166,6 +1169,8 @@ async def test_registration_active_artifact_conflict_fails_and_fences(tmp_path):
         active = await downloading_job(store, manager)
         job_id = active["job_id"]
         runtime = object.__new__(PushRuntime)
+        runtime.leases = PushTransferLeases()
+        runtime.transfers = TransferRegistry()
         runtime.pending_disconnects = set()
         runtime.disconnect_recovery_tasks = {}
         runtime.artifact_gc_task = None
@@ -1337,6 +1342,7 @@ async def test_interrupted_registration_uses_revision_without_session_resume_cap
     assignment = await manager.assignment(job_id, "D1")
     ws = Ws()
     runtime = object.__new__(PushRuntime)
+    runtime.leases = PushTransferLeases()
     runtime.pending_disconnects = set()
     runtime.disconnect_recovery_tasks = {}
     runtime.artifact_gc_task = None

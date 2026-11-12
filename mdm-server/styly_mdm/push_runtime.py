@@ -1189,6 +1189,8 @@ class PushRuntime:
                 "REGISTER reported malformed active Push/Sync state",
             )
 
+        transfer_key = TransferKey("push", device_id, job_id, 1)
+        transfer_owner = (self.leases.token(transfer_key), self.transfers.get(transfer_key))
         assignment = await self.manager.assignment(job_id, device_id)
         if assignment is None:
             snapshots = await self.manager.add_opaque_fence(
@@ -1285,7 +1287,7 @@ class PushRuntime:
             if phase == "downloading":
                 if self.scheduler is not None:
                     await self.scheduler.reconcile_active_transfer(
-                        job_id, device_id, 1
+                        job_id, device_id, 1, owner=transfer_owner
                     )
             else:
                 # The download finished while offline, so the transfer slot and its
@@ -1410,6 +1412,8 @@ class PushRuntime:
         if message_type == "PUSH_JOB_ACCEPTED" and isinstance(job_id, str):
             if payload.get("attempt") != 1:
                 return True
+            transfer_key = TransferKey("push", device_id, job_id, 1)
+            transfer_owner = (self.leases.token(transfer_key), self.transfers.get(transfer_key))
             delivered = False
             if self.scheduler is not None:
                 delivered = self.scheduler.command_response(
@@ -1425,21 +1429,25 @@ class PushRuntime:
             if not delivered:
                 assignment = await self.manager.assignment(job_id, device_id)
                 if assignment and assignment["state"] == DeviceState.RECONCILING.value:
+                    reported_phase = payload.get("phase")
+                    if not isinstance(reported_phase, str):
+                        reported_phase = "downloading"
                     try:
                         outcome, snapshots = await self.manager.reconcile_report(
                             job_id,
                             device_id,
                             1,
                             "active",
-                            payload.get("phase")
-                            if isinstance(payload.get("phase"), str)
-                            else "downloading",
+                            reported_phase,
                             None,
                         )
                         if outcome == "active":
+                            if reported_phase == "downloading" and self.scheduler is not None:
+                                await self.scheduler.reconcile_active_transfer(
+                                    job_id, device_id, 1, owner=transfer_owner,
+                                )
                             for snapshot in snapshots:
                                 await self.publish(snapshot)
-                            reported_phase = payload.get("phase")
                             if reported_phase in {"validating", "applying"}:
                                 self.transfers.release_exact(
                                     TransferKey("push", device_id, job_id, 1),
@@ -1757,6 +1765,8 @@ class PushRuntime:
             or status not in {"active", "absent", "interrupted"}
         ):
             return
+        transfer_key = TransferKey("push", device_id, job_id, 1)
+        transfer_owner = (self.leases.token(transfer_key), self.transfers.get(transfer_key))
         if status == "absent":
             matched, opaque_snapshots = await self.manager.clear_matching_opaque_fence(
                 device_id,
@@ -1840,14 +1850,16 @@ class PushRuntime:
             )
         except (StoreConflict, StoreNotFound):
             return
-        for snapshot in snapshots:
-            await self.publish(snapshot)
         if (
             outcome == "active"
             and payload.get("phase") == "downloading"
             and self.scheduler is not None
         ):
-            await self.scheduler.reconcile_active_transfer(job_id, device_id, 1)
+            await self.scheduler.reconcile_active_transfer(
+                job_id, device_id, 1, owner=transfer_owner
+            )
+        for snapshot in snapshots:
+            await self.publish(snapshot)
         if outcome in {"requeued", "interrupted"} or (
             outcome == "active" and payload.get("phase") in {"validating", "applying"}
         ):

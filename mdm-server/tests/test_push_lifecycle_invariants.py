@@ -36,7 +36,7 @@ def _registration_runtime(manager, ws):
         wake=lambda: None,
         forget_reconciliation=lambda _device_id: None,
         refresh_reconciliation=lambda _session: asyncio.sleep(0),
-        reconcile_active_transfer=lambda *_args: asyncio.sleep(0),
+        reconcile_active_transfer=lambda *_args, **_kwargs: asyncio.sleep(0),
     )
     runtime.publish = lambda _snapshot: asyncio.sleep(0)
     runtime.request_reconcile = lambda _device_id: asyncio.sleep(0)

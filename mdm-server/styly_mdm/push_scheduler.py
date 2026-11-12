@@ -161,20 +161,36 @@ class PushScheduler:
             for task, (key, _transfer_future, accept_future) in self._dispatch_waiters.items()
         )
 
-    async def reconcile_active_transfer(
-        self, job_id: str, device_id: str, attempt: int
-    ) -> None:
-        """Resolve acceptance and revoke an orphaned lease for active work."""
+    def transfer_owner(self, key: TransferKey) -> tuple[str | None, asyncio.Future[str] | None]:
+        """Capture HTTP ownership before awaiting a report's durable validation."""
+        return self.leases.token(key), self.transfer_registry.get(key)
 
+    async def reconcile_active_transfer(
+        self, job_id: str, device_id: str, attempt: int,
+        *, owner: tuple[str | None, asyncio.Future[str] | None] | None = None,
+    ) -> None:
+        """Confirm acceptance only for the report's original, uncancelled owner."""
         key = TransferKey("push", device_id, job_id, attempt)
+        token, future = owner if owner is not None else self.transfer_owner(key)
+        assignment = await self.manager.assignment(job_id, device_id)
+        if (
+            token is None or self.leases.token(key) != token
+            or self.transfer_registry.get(key) is not future
+        ):
+            return
+        if future is None or future.done():
+            self.leases.revoke_now(key)
+            return
+        if (
+            assignment is None or assignment.get("attempt") != attempt
+            or assignment.get("cancel_requested_at") is not None
+            or assignment["state"] != DeviceState.DOWNLOADING.value
+        ):
+            return
+        self.leases.accept(key, token)
         accept_waiter = self._accept_waiters.get((job_id, device_id, attempt))
         if accept_waiter is not None and not accept_waiter.done():
             accept_waiter.set_result(("accepted", {}))
-
-        current = self.transfer_registry.get(key)
-        if current is not None and not current.done():
-            return
-        self.leases.revoke_now(key)
 
     async def _run(self) -> None:
         while True:
@@ -685,7 +701,9 @@ class PushScheduler:
             return True
 
         if outcome == "busy":
-            continue_transfer = await self._handle_busy(snapshot, device_id, payload)
+            continue_transfer = await self._handle_busy(
+                snapshot, device_id, payload, owner=(lease_token, transfer_future),
+            )
             if continue_transfer:
                 return True
             self.transfer_registry.release_exact(key, "device_busy")
@@ -735,8 +753,10 @@ class PushScheduler:
         payload: dict[str, Any],
         *,
         owner_lock_held: bool = False,
+        owner: tuple[str | None, asyncio.Future[str] | None] | None = None,
     ) -> bool:
         job_id = snapshot["job_id"]
+        key = TransferKey("push", device_id, job_id, 1)
         active = payload.get("active_job")
         if not isinstance(active, dict):
             active = {}
@@ -744,12 +764,14 @@ class PushScheduler:
         active_attempt = active.get("attempt")
 
         if active_job_id == job_id and active_attempt == 1:
+            owner = owner if owner is not None else self.transfer_owner(key)
             # A duplicate-safe client should normally answer ACCEPTED, but treating
             # this exact identity as accepted is safer than creating a second worker.
             try:
                 progress = await self.manager.record_progress(
                     job_id, device_id, ProgressEvent.ACCEPTED,
                 )
+                await self.reconcile_active_transfer(job_id, device_id, 1, owner=owner)
                 await self.publish(progress.snapshot)
             except StoreConflict:
                 return False
@@ -1066,10 +1088,11 @@ class PushScheduler:
     ) -> None:
         """Apply a command response that arrived after the acceptance waiter expired."""
 
+        key = TransferKey("push", device_id, job_id, 1)
+        owner = self.transfer_owner(key)
         assignment = await self.manager.assignment(job_id, device_id)
         if assignment is None or assignment["state"] != DeviceState.RECONCILING.value:
             return
-        key = TransferKey("push", device_id, job_id, 1)
         if outcome == "busy":
             snapshot = await self.manager.get_snapshot(job_id)
             keep_transfer = await self._handle_busy(
@@ -1077,6 +1100,7 @@ class PushScheduler:
                 device_id,
                 payload,
                 owner_lock_held=owner_lock_held,
+                owner=owner,
             )
             if not keep_transfer:
                 self.transfer_registry.release_exact(key, "late_device_busy")

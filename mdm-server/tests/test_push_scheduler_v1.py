@@ -88,6 +88,12 @@ def test_active_reconnect_keeps_the_existing_transfer_slot():
         future = asyncio.get_running_loop().create_future()
         scheduler.transfer_registry.register(key, future)
 
+        scheduler.leases = PushTransferLeases()
+        scheduler.leases.issue(key, "artifact")
+        scheduler.manager = type("Manager", (), {"assignment": AsyncMock(return_value={
+            "attempt": 1, "state": "downloading", "cancel_requested_at": None,
+        })})()
+
         await asyncio.wait_for(
             scheduler.reconcile_active_transfer("job", "D1", 1), timeout=0.5
         )

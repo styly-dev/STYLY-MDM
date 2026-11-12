@@ -187,7 +187,7 @@ class Scheduler:
     async def send_exact_reconcile(self, session, job_id, attempt, artifact_id):
         self.reconcile_calls.append((session, job_id, attempt, artifact_id))
 
-    async def reconcile_active_transfer(self, job_id, device_id, attempt):
+    async def reconcile_active_transfer(self, job_id, device_id, attempt, **_kwargs):
         self.active_transfer_slots.append((job_id, device_id, attempt))
 
 

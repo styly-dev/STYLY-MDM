@@ -165,6 +165,7 @@ class PushFilesWorker internal constructor(
     private val monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000L },
     private val noProgressTimeoutMs: Long = DOWNLOAD_NO_PROGRESS_TIMEOUT_MS,
     private val digestFactory: (File) -> PartialFileDigest = ::PartialFileDigest,
+    private val storageOutputFactory: (File, Boolean) -> FileOutputStream = ::FileOutputStream,
 ) {
     constructor() : this(
         hasExternalStorageAccess = {
@@ -507,7 +508,7 @@ class PushFilesWorker internal constructor(
 
     private fun openStorageOutput(file: File, append: Boolean): FileOutputStream =
         try {
-            FileOutputStream(file, append)
+            storageOutputFactory(file, append)
         } catch (error: IOException) {
             throw storageWriteFailure(error)
         }

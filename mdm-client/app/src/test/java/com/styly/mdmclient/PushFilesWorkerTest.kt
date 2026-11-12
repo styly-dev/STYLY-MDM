@@ -25,6 +25,101 @@ class PushFilesWorkerTest {
     val tmp = TemporaryFolder()
 
     @Test
+    fun `execute stops HTTP retries when interrupted body and persistence both fail`() {
+        for (failureStep in listOf("flush", "sync", "close")) {
+            for (validPartial in listOf(true, false)) {
+                val work = tmp.newFolder("compound-$failureStep-$validPartial")
+                val prefix = "partial".toByteArray()
+                val cleanupCalls = mutableListOf<String>()
+                val retries = mutableListOf<Long>()
+                val callbacks = mutableListOf<String>()
+                // A truncated fixed-length response causes a real OkHttp read failure.
+                val truncated = response("HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nContent-Length: 100", prefix)
+                TestHttpServer(listOf(truncated, truncated)).use { server ->
+                    val worker = PushFilesWorker(
+                        hasExternalStorageAccess = { true },
+                        attemptDirectoryProvider = { work },
+                        retryDelay = { retries += it; error("Must not retry storage failure") },
+                        storageOutputFactory = { file, append ->
+                            if (file.name != "artifact.part") FileOutputStream(file, append)
+                            else object : FileOutputStream(file, append) {
+                                override fun flush() {
+                                    cleanupCalls += "flush"
+                                    super.flush()
+                                    if (failureStep == "flush") throw java.io.IOException("injected flush failure")
+                                    // Make the real fd.sync() fail, not a replacement cleanup implementation.
+                                    if (failureStep == "sync") super.close()
+                                }
+                                override fun close() {
+                                    cleanupCalls += "close"
+                                    super.close()
+                                    if (!validPartial) assertTrue(File(work, "metadata.json").delete())
+                                    if (failureStep == "close") throw java.io.IOException("injected close failure")
+                                }
+                            }
+                        },
+                    )
+                    val command = command(artifactUrl = server.url, artifactSize = 100)
+                    val execution = worker.execute(command, workerCallbacks(callbacks))
+                    val detail: String?
+                    if (validPartial) {
+                        val outcome = execution.interruptedOutcome()
+                        assertEquals("storage_write_failed", outcome.reason)
+                        assertEquals("storage_write_failed", outcome.failureCode)
+                        detail = outcome.detail
+                        assertArrayEquals(prefix, File(work, "artifact.part").readBytes())
+                        assertEquals(prefix.size.toLong(), worker.validatedResumeOffset(command))
+                    } else {
+                        val result = execution.completedResult()
+                        assertEquals("fail", result.status)
+                        assertEquals("storage_write_failed", result.failureCode)
+                        detail = result.detail
+                        assertFalse(File(work, "artifact.part").exists())
+                    }
+                    assertTrue(detail.orEmpty().contains("unexpected end of stream"))
+                    assertTrue(detail.orEmpty().contains("cleanup:"))
+                    if (failureStep != "sync") assertTrue(detail.orEmpty().contains("injected $failureStep failure"))
+                    assertEquals(listOf("flush", "close"), cleanupCalls)
+                    assertEquals(1, server.requests.size)
+                    assertTrue(retries.isEmpty())
+                    assertTrue(callbacks.isEmpty())
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `execute preserves integrity failure over cleanup failure`() {
+        val work = tmp.newFolder("compound-integrity")
+        val retries = mutableListOf<Long>()
+        val oversized = response("HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nTransfer-Encoding: chunked",
+            "3\r\nabc\r\n0\r\n\r\n".toByteArray())
+        TestHttpServer(listOf(oversized, oversized)).use { server ->
+            val result = PushFilesWorker(
+                hasExternalStorageAccess = { true },
+                attemptDirectoryProvider = { work },
+                retryDelay = { retries += it; error("Must not retry integrity failure") },
+                storageOutputFactory = { file, append ->
+                    if (file.name != "artifact.part") FileOutputStream(file, append)
+                    else object : FileOutputStream(file, append) {
+                        override fun close() {
+                            super.close()
+                            throw java.io.IOException("injected close failure")
+                        }
+                    }
+                },
+            ).execute(command(artifactUrl = server.url, artifactSize = 1), workerCallbacks()).completedResult()
+            assertEquals("fail", result.status)
+            assertEquals("artifact_identity_mismatch", result.failureCode)
+            assertTrue(result.detail.orEmpty().contains("HTTP body exceeded its declared range"))
+            assertTrue(result.detail.orEmpty().contains("cleanup: injected close failure"))
+            assertFalse(File(work, "artifact.part").exists())
+            assertEquals(1, server.requests.size)
+            assertTrue(retries.isEmpty())
+        }
+    }
+
+    @Test
     fun `cleanup preserves network error and attempts every operation`() {
         val network = java.io.IOException("connection reset")
         val operations = mutableListOf<String>()
