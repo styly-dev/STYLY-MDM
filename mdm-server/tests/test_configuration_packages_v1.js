@@ -255,8 +255,8 @@ test('a new package gets its first Wi-Fi network after Manage and reopens with d
   assert.doesNotMatch(fixture.packagePanel.innerHTML, /studio-pass/);
 });
 
-const pkg = { package_id: 'pkg', name: 'Studio', has_draft: true, published_revision: 'r0' };
-const pkg2 = { package_id: 'pkg2', name: 'Night studio', has_draft: false, published_revision: null };
+const pkg = { package_id: 'pkg', name: 'Studio', published_revision: 'r0' };
+const pkg2 = { package_id: 'pkg2', name: 'Night studio', published_revision: null };
 const d1 = { package_id: 'pkg', revision: 'r1', keys: ['brightness'] };
 const online = { device_id: 'headset', label: 'DEV-003', status: 'online', configuration_supported: true };
 const applied = { ...d1, status: 'complete', results: { brightness: { status: 'applied', value: 60 } } };
@@ -628,16 +628,16 @@ test('group cards use the committed assignment and count only reports for its de
     { ...online, device_id: 'stale', configuration_state: { ...applied, revision: 'old' } },
     { ...online, device_id: 'other', configuration_state: { ...applied, package_id: 'other' } },
   ];
-  const groups = { 'The Lab': ['headset', 'stale', 'other', 'missing'], Empty: [], Draft: [], None: [] };
+  const groups = { 'The Lab': ['headset', 'stale', 'other', 'missing'], Empty: [], Undeployed: [], None: [] };
   const fixture = createHarness(() => assert.fail('group cards should not fetch data'), { groups, devices });
   fixture.broadcast({
-    assignments: { 'The Lab': 'pkg', Empty: 'pkg', Draft: 'pkg2' },
-    deployments: { 'The Lab': d1, Empty: d1, Draft: d1 },
+    assignments: { 'The Lab': 'pkg', Empty: 'pkg', Undeployed: 'pkg2' },
+    deployments: { 'The Lab': d1, Empty: d1, Undeployed: d1 },
   });
   const summary = name => fixture.controller.groupPackageSummary(name);
   assert.deepEqual(summary('The Lab'), { name: 'Studio', count: { text: 'Applied 1/4', state: 'pending' } });
   assert.deepEqual(summary('Empty'), { name: 'Studio', count: { text: 'Applied 0/0', state: '' } });
-  assert.deepEqual(summary('Draft'), { name: 'Night studio', count: null });
+  assert.deepEqual(summary('Undeployed'), { name: 'Night studio', count: null });
   assert.equal(summary('None'), null);
 
   devices[1].configuration_state = applied;
@@ -755,12 +755,12 @@ test('a revision changed by another console blocks publication before confirmati
   latest = profile({ draftRevision: 'remote' });
   await fixture.editClick('deploy');
   assert.equal(fixture.confirmations.length, 0);
-  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /The saved draft changed/);
+  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /The package changed/);
   assert.equal(fixture.editorButtons.reload.hidden, false);
   assert.equal(fixture.editorButtons.deploy.disabled, true);
 });
 
-test('a save conflict rebases unsaved name and setting edits onto the latest draft', async () => {
+test('a save conflict rebases unsaved name and setting edits onto the latest version', async () => {
   let latest = profile();
   const fixture = createHarness(({ method, body }) => {
     if (method === 'GET') return response(latest);
@@ -777,7 +777,7 @@ test('a save conflict rebases unsaved name and setting edits onto the latest dra
   fixture.edit({ dataset: { packageName: '' }, value: 'Local name' });
   fixture.edit({ dataset: { setting: 'brightness' }, type: 'range', value: '86' });
   await fixture.editClick('deploy');
-  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /saved draft or deployment targets changed/);
+  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /package or deployment targets changed/);
   assert.equal(fixture.editorButtons.deploy.disabled, true);
   await fixture.editClick('reload');
   assert.match(fixture.packagePanel.innerHTML, /data-package-name[^>]+value="Local name"/);
@@ -864,7 +864,7 @@ test('group deployment uses the assigned package for status and preserves a stag
     groups: { [name]: ['headset'] }, devices: [{ ...online, configuration_state: applied }],
   });
   const groupBroadcast = (assigned, deployment) => fixture.broadcast({
-    packages: [pkg, { ...pkg2, has_draft: true }],
+    packages: [pkg, { ...pkg2, published_revision: 'r2' }],
     assignments: { [name]: assigned }, deployments: deployment ? { [name]: deployment } : {},
   });
   const selection = fixture.groupControls['[data-group-package]'];
@@ -926,13 +926,14 @@ test('an assignment acknowledgment waits for the matching group snapshot before 
   assert.match(results.innerHTML, /Waiting for the device to report this deployment/);
 });
 
-test('Group Settings deploys a newly selected package only after confirming the shared targets', async () => {
+test('Group Settings redeploys the assigned package only after confirming the shared targets', async () => {
   let allowDeploy = false;
   const fixture = createHarness(({ method }) => method === 'POST'
     ? response({ package_id: 'pkg' }) : response(profile()), { confirm: () => allowDeploy });
   const name = 'The Lab';
   const hint = fixture.groupControls['[data-deploy-hint]'];
-  fixture.broadcast();
+  const deployRequests = () => fixture.requests.filter(request => request.url.startsWith('/api/group-package/'));
+  fixture.broadcast({ assignments: { [name]: 'pkg' }, deployments: { [name]: d1 } });
   fixture.controller.renderGroup(name);
   assert.equal(fixture.groupButtons.deploy.hidden, false);
   assert.equal(fixture.groupButtons.deploy.disabled, false);
@@ -942,14 +943,14 @@ test('Group Settings deploys a newly selected package only after confirming the 
   assert.match(hint.textContent, /Save & deploy/);
   assert.equal(fixture.groupButtons.edit.hidden, false);
   await fixture.groupClick('deploy');
-  assert.deepEqual(fixture.requests, []);
+  assert.deepEqual(deployRequests(), []);
 
   fixture.select('pkg');
   assert.equal(fixture.groupButtons.deploy.disabled, false);
   assert.equal(hint.hidden, true);
   await fixture.groupClick('deploy');
-  assert.match(fixture.confirmations[0], /Deploy "Studio" to 2 groups and 5 devices\?[\s\S]*"The Lab"[\s\S]*includes offline devices/);
-  assert.deepEqual(fixture.requests.map(request => request.method), ['GET']);
+  assert.match(fixture.confirmations[0], /Deploy "Studio" to 2 groups and 5 devices\?[\s\S]*again as a new version[\s\S]*includes offline devices/);
+  assert.deepEqual(deployRequests().map(request => request.method), ['GET']);
 
   allowDeploy = true;
   const deploying = fixture.groupClick('deploy');
@@ -957,7 +958,7 @@ test('Group Settings deploys a newly selected package only after confirming the 
   await fixture.groupClick('deploy');
   await deploying;
   const url = '/api/group-package/deploy?name=The+Lab&package_id=pkg';
-  assert.deepEqual(fixture.requests.slice(1), [
+  assert.deepEqual(deployRequests().slice(1), [
     { url, method: 'GET', body: undefined },
     { url, method: 'POST', body: { expected_impact: 'impact1' } },
   ]);

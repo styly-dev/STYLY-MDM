@@ -19,6 +19,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from aiohttp import WSCloseCode, web
@@ -496,7 +497,8 @@ def load_registry() -> None:
         })
         try:
             candidate = _read_configuration(raw)
-            if "packages" not in raw or raw_groups != _serialized_groups(candidate):
+            if ("packages" not in raw or raw["packages"]["version"] != configuration_packages.VERSION
+                    or raw_groups != _serialized_groups(candidate)):
                 _backup_registry()
                 if not _commit_configuration(candidate):
                     raise PackageError("Configuration migration could not be saved")
@@ -754,9 +756,10 @@ def build_group_list_msg() -> str:
     packages = _configuration.packages or {}
     assignments = {name: group.package_id for name, group in group_entries if group.package_id is not None}
     deployments = {
-        name: {"package_id": package_id, "revision": published["revision"], "keys": list(published["settings"])}
+        name: {"package_id": package_id, "revision": profile["published_revision"],
+               "keys": list(configuration_packages.published_settings(profile))}
         for name, package_id in assignments.items()
-        if (published := packages.get(package_id, {}).get("published")) is not None
+        if (profile := packages.get(package_id)) is not None and profile["published_revision"] is not None
     }
     return json.dumps({"type": "GROUP_LIST", "groups": groups, "assignments": assignments,
                        "packages": _public_packages(), "deployments": deployments,
@@ -769,13 +772,23 @@ async def broadcast_group_list():
 
 
 async def _broadcast_admin_message(message: str) -> None:
-    """Best-effort admin fan-out; one stale socket must not stop server work."""
+    await _queue_admin_message(message)
+
+
+def _queue_admin_message(
+    message: str,
+    *,
+    acknowledgement: tuple[web.WebSocketResponse, str] | None = None,
+) -> Awaitable[None]:
+    """Schedule best-effort sends now, with an optional first frame for one console."""
     async def send_one(ws: web.WebSocketResponse) -> None:
         lock = _admin_send_locks.setdefault(ws, asyncio.Lock())
         try:
             async with lock:
                 if ws not in admin_connections:
                     return
+                if acknowledgement is not None and ws is acknowledgement[0]:
+                    await asyncio.wait_for(ws.send_str(acknowledgement[1]), ADMIN_SEND_TIMEOUT)
                 await asyncio.wait_for(ws.send_str(message), ADMIN_SEND_TIMEOUT)
         except asyncio.CancelledError:
             raise
@@ -797,19 +810,18 @@ async def _broadcast_admin_message(message: str) -> None:
             except (Exception, asyncio.TimeoutError):
                 log.warning("Could not close failed admin WebSocket", exc_info=True)
 
-    connections = tuple(admin_connections)
-    if not connections:
-        return
+    fanout = asyncio.gather(*(send_one(ws) for ws in tuple(admin_connections)))
 
-    fanout = asyncio.gather(*(send_one(ws) for ws in connections))
-    try:
-        await asyncio.shield(fanout)
-    except asyncio.CancelledError:
-        # aiohttp may cancel a device request handler while its finally block is
-        # broadcasting the disconnect. Keep the already-bounded admin sends alive
-        # so the console receives that terminal state before cancellation escapes.
-        await asyncio.shield(fanout)
-        raise
+    async def finish() -> None:
+        try:
+            await asyncio.shield(fanout)
+        except asyncio.CancelledError:
+            # Keep already-bounded sends alive when aiohttp cancels a request
+            # handler while it is publishing its final state.
+            await asyncio.shield(fanout)
+            raise
+
+    return finish()
 
 
 async def forward_to_admins(payload: dict):
@@ -1433,13 +1445,14 @@ CONFIGURATION_SEND_TIMEOUT = 5.0
 _CONFIGURATION_PUBLICATIONS = web.AppKey("configuration_publications", set)
 
 
-def _package_origin_allowed(request: web.Request) -> bool:
+def _require_package_origin(request: web.Request) -> None:
     origin = request.headers.get("Origin")
     if origin is None:
         # Browsers send Origin for mutations. Native clients may omit it.
-        return True
+        return
     expected = f"{'https' if request.secure else 'http'}://{request.host}"
-    return origin == expected
+    if origin != expected:
+        raise PackageError("Invalid request origin", 403)
 
 
 async def _small_json_body(request: web.Request) -> dict:
@@ -1503,24 +1516,25 @@ def _package_impact(
         name: sorted(group.members)
         for name, group in sorted(groups.items()) if group.package_id == package_id
     }
-    revision = profile.get("published", {}).get("revision")
+    revision = profile["published_revision"]
     token = hashlib.sha256(json.dumps([package_id, revision, membership]).encode("utf-8")).hexdigest()
     devices = sorted({device_id for members in membership.values() for device_id in members})
     return {"groups": len(membership), "devices": len(devices), "token": token}, devices
 
 
-def _updated_package_draft(profile: dict, body: dict) -> dict:
-    current = profile.get("draft")
-    configuration_packages.check_expected_revision(body, current)
+def _updated_package(profile: dict, body: dict) -> dict:
+    configuration_packages.check_expected_revision(body, profile["draft_revision"])
     name = configuration_packages.validate_name(body.get("name", profile["name"]))
-    settings = configuration_packages.validate_draft(body.get("settings"), current["settings"] if current else None)
-    return {**profile, "name": name, "draft": configuration_packages.new_snapshot(settings)}
+    settings = configuration_packages.validate_draft(body.get("settings"), profile["settings"])
+    return {**profile, "name": name, "settings": settings, "draft_revision": str(uuid.uuid4())}
 
 
-def _deploy_saved_draft(profile: dict) -> dict:
-    settings = configuration_packages.managed_settings(profile["draft"]["settings"])
-    published = {**configuration_packages.new_snapshot(settings), "deployed_at_ms": time.time_ns() // 1_000_000}
-    return {**profile, "published": published}
+def _publish_package(profile: dict) -> dict:
+    return {
+        **profile,
+        "published_revision": str(uuid.uuid4()),
+        "deployed_at_ms": time.time_ns() // 1_000_000,
+    }
 
 
 def _check_deployment_impact(body: dict, token: str) -> None:
@@ -1536,11 +1550,6 @@ def _public_package(package_id: str, profile: dict) -> dict:
     return configuration_packages.public_profile(package_id, profile, impact)
 
 
-def _require_package_origin(request: web.Request) -> None:
-    if not _package_origin_allowed(request):
-        raise PackageError("Invalid request origin", 403)
-
-
 async def package_catalog_handler(request: web.Request) -> web.Response:
     try:
         if request.method in ("GET", "HEAD"):
@@ -1549,7 +1558,13 @@ async def package_catalog_handler(request: web.Request) -> web.Response:
         _require_package_origin(request)
         body = await _small_json_body(request)
         package_id = str(uuid.uuid4())
-        profile = {"name": configuration_packages.validate_name(body.get("name"))}
+        profile = {
+            "name": configuration_packages.validate_name(body.get("name")),
+            "settings": {},
+            "draft_revision": None,
+            "published_revision": None,
+            "deployed_at_ms": None,
+        }
         _save_package(package_id, profile)
         response = _public_package(package_id, profile)
         await broadcast_group_list()
@@ -1583,7 +1598,7 @@ async def package_save_and_deploy_handler(request: web.Request) -> web.Response:
         profile = _find_package(package_id)
         impact, devices = _package_impact(package_id, profile)
         _check_deployment_impact(body, impact["token"])
-        updated = _deploy_saved_draft(_updated_package_draft(profile, body))
+        updated = _publish_package(_updated_package(profile, body))
         _save_package(package_id, updated)
         _schedule_configuration_publication(request.app, devices)
         return web.json_response(_public_package(package_id, updated))
@@ -1609,18 +1624,19 @@ async def group_package_deploy_handler(request: web.Request) -> web.Response:
         profile = _find_package(package_id) if package_id is not None else None
         package_name = profile["name"] if profile is not None else "No package"
         groups = {**_configuration.groups, name: replace(group, package_id=package_id)}
-        published = profile.get("published") if profile is not None else None
-        use_current = published is not None and group.package_id != package_id
+        published_revision = profile["published_revision"] if profile is not None else None
+        if profile is not None and published_revision is None:
+            raise PackageError("Edit this package and select Save & deploy to deploy it first.", 409)
+        use_current = published_revision is not None and group.package_id != package_id
         if profile is None or use_current:
             devices = sorted(group.members)
             impact = {"groups": 1, "devices": len(devices)}
-            target = [published["revision"] if published is not None else None, devices]
+            target = [published_revision, devices]
         else:
-            draft = profile.get("draft")
-            if draft is None:
-                raise PackageError("Edit this package and select Save & deploy to deploy it first.", 409)
+            # Redeploying the group's current package republishes its saved settings
+            # as a new revision to every group that uses it.
             impact, devices = _package_impact(package_id, profile, groups)
-            target = [draft["revision"], impact["token"]]
+            target = [profile["draft_revision"], impact["token"]]
         # Bind the preview to the old assignment and the exact revision and device set.
         scope = [name, group.package_id, package_id, package_name, use_current, target]
         token = hashlib.sha256(json.dumps(scope).encode()).hexdigest()
@@ -1631,7 +1647,7 @@ async def group_package_deploy_handler(request: web.Request) -> web.Response:
             })
         _check_deployment_impact(body, token)
         if profile is not None and not use_current:
-            packages = {**packages, package_id: _deploy_saved_draft(profile)}
+            packages = {**packages, package_id: _publish_package(profile)}
         if not _commit_configuration(replace(_configuration, groups=groups, packages=packages)):
             raise PackageError("Group deployment could not be saved", 500)
         _schedule_configuration_publication(request.app, devices)
@@ -1673,14 +1689,16 @@ def _desired_configuration(device_id: str, *, include_summary: bool = False, inc
         if device_id in group.members:
             group_name = name
             if group.package_id is not None:
-                published = packages[group.package_id].get("published")
-                if published is not None:
+                profile = packages[group.package_id]
+                if profile["published_revision"] is not None:
                     package_id = group.package_id
+                    published = profile
             break
     policy = {
         "package_id": package_id,
-        "revision": published["revision"] if published is not None else None,
-        "settings": published["settings"] if published is not None and include_settings else {},
+        "revision": published["published_revision"] if published is not None else None,
+        "settings": (configuration_packages.published_settings(published)
+                     if published is not None and include_settings else {}),
     }
     if include_summary:
         policy["group_name"] = group_name
@@ -1735,12 +1753,18 @@ async def _publish_group_change(device_ids, admin_update=None) -> None:
             log.error(message, exc_info=error)
 
 
-def _schedule_configuration_publication(app: web.Application, device_ids: list[str]) -> None:
-    async def publish() -> None:
-        await _publish_group_change(device_ids)
+def _notify_committed_group_change(admin_ws: web.WebSocketResponse, message: dict) -> Awaitable[None]:
+    # Queue each socket's send before yielding after the commit. A concurrent
+    # snapshot that reflects this change must queue behind the requester's ACK.
+    return _queue_admin_message(
+        build_group_list_msg(),
+        acknowledgement=(admin_ws, json.dumps(message)),
+    )
 
+
+def _schedule_configuration_publication(app: web.Application, device_ids: list[str]) -> None:
     tasks = app[_CONFIGURATION_PUBLICATIONS]
-    task = asyncio.create_task(publish(), name="configuration-publication")
+    task = asyncio.create_task(_publish_group_change(device_ids), name="configuration-publication")
     tasks.add(task)
     task.add_done_callback(tasks.discard)
 
@@ -2687,12 +2711,14 @@ async def handle_rename_group(
         return
     log.info("Group renamed: %r -> %r", name, new_name)
 
-    await admin_ws.send_str(json.dumps({
-        "type": "GROUP_RENAMED",
-        "name": name,
-        "new_name": new_name,
-    }))
-    await _publish_group_change(groups[new_name].members if new_name != name else ())
+    await _publish_group_change(
+        groups[new_name].members if new_name != name else (),
+        _notify_committed_group_change(admin_ws, {
+            "type": "GROUP_RENAMED",
+            "name": name,
+            "new_name": new_name,
+        }),
+    )
 
 
 async def handle_delete_group(
@@ -2723,11 +2749,13 @@ async def handle_delete_group(
     else:
         members = ()
 
-    await admin_ws.send_str(json.dumps({
-        "type": "GROUP_DELETED",
-        "name": name,
-    }))
-    await _publish_group_change(members)
+    await _publish_group_change(
+        members,
+        _notify_committed_group_change(admin_ws, {
+            "type": "GROUP_DELETED",
+            "name": name,
+        }),
+    )
 
 
 async def handle_update_group_members(admin_ws: web.WebSocketResponse, data: dict):

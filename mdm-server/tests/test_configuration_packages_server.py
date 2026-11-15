@@ -3,8 +3,8 @@
 import asyncio
 import json
 import time
+import uuid
 from contextlib import asynccontextmanager
-from dataclasses import replace
 from urllib.parse import urlencode
 
 import aiohttp
@@ -21,6 +21,10 @@ OFFLINE_ID = "33333333-3333-4333-8333-333333333333"
 REGISTRATION = {"type": "REGISTER", "identity_scheme": server.IDENTITY_SCHEME,
                 "device_id": DEVICE_ID, "capabilities": ["configuration_packages_v1"]}
 NO_POLICY = {"type": "CONFIGURATION_POLICY", "package_id": None, "revision": None, "settings": {}}
+
+
+def _legacy_snapshot(settings):
+    return {"revision": str(uuid.uuid4()), "settings": settings}
 
 
 @asynccontextmanager
@@ -62,24 +66,6 @@ async def _assign(session, base, group, profile, **kwargs):
                           {"expected_impact": preview["impact"]["token"]}, **kwargs)
 
 
-def _seed_assignment(group, profile):
-    """Recreate an existing assignment to a not-yet-published historical package."""
-    groups = {**server._configuration.groups}
-    groups[group] = replace(groups[group], package_id=profile["package_id"])
-    assert server._save_groups(groups)
-
-
-async def _seed_draft(session, base, profile, settings, *, name=None):
-    """Seed a historical draft without inventing a replacement draft-only API."""
-    package_id = profile["package_id"]
-    current = server._find_package(package_id)
-    body = {"expected_revision": current.get("draft", {}).get("revision"), "settings": settings}
-    if name is not None:
-        body["name"] = name
-    server._save_package(package_id, server._updated_package_draft(current, body))
-    return await _request(session, "GET", base, _path(profile))
-
-
 async def _deploy(session, base, profile, *, settings=None, **kwargs):
     if settings is None:
         settings = json.loads(json.dumps(profile["settings"]))
@@ -90,6 +76,14 @@ async def _deploy(session, base, profile, *, settings=None, **kwargs):
         "expected_revision": profile["draft_revision"], "expected_impact": profile["impact"]["token"],
         "settings": settings,
     }, **kwargs)
+
+
+async def _deploy_to(session, base, profile, settings, *groups):
+    """Save & deploy the settings, then deploy the current version to each group."""
+    deployed = await _deploy(session, base, profile, settings=settings)
+    for group in groups:
+        await _assign(session, base, group, deployed)
+    return await _request(session, "GET", base, _path(deployed))
 
 
 def _brightness(value, *, managed=True):
@@ -147,8 +141,8 @@ def test_device_summary_tracks_group_and_deployment_without_sending_settings_to_
         package_id = OFFLINE_ID
         profile = {
             "name": "Office",
-            "draft": configuration_packages.new_snapshot(_brightness(45)),
-            "published": configuration_packages.new_snapshot({"brightness": 30}),
+            "draft": _legacy_snapshot(_brightness(45)),
+            "published": _legacy_snapshot({"brightness": 45}),
         }
         groups = {"Studio": {"members": [DEVICE_ID, OTHER_ID], "package_id": package_id}}
         catalog = {"version": 1, "packages": {package_id: profile}}
@@ -164,7 +158,8 @@ def test_device_summary_tracks_group_and_deployment_without_sending_settings_to_
                 await _register(summary_ws, summary)
                 old = await _receive_type(ws, "CONFIGURATION_POLICY")
                 assert old == {"type": "CONFIGURATION_POLICY", "package_id": package_id,
-                               **profile["published"], "group_name": "Studio", "deployed_at_ms": None}
+                               "revision": profile["published"]["revision"], "settings": {"brightness": 45},
+                               "group_name": "Studio", "deployed_at_ms": None}
                 assert await _receive_type(summary_ws, "CONFIGURATION_POLICY") == {**old, "settings": {}}
 
                 draft = await _request(session, "GET", base, "/api/packages/" + package_id)
@@ -204,7 +199,7 @@ def test_device_summary_tracks_group_and_deployment_without_sending_settings_to_
 def test_summary_only_client_gets_unified_wifi_revision_without_settings(tmp_path):
     async def body():
         package_id = OFFLINE_ID
-        published = configuration_packages.new_snapshot({
+        published = _legacy_snapshot({
             "wifi": _wifi_value(auto_return=False, hidden=True),
         })
         groups = {"Studio": {"members": [OTHER_ID], "package_id": package_id}}
@@ -239,34 +234,29 @@ def test_shared_publish_and_offline_reconnect_use_latest_published_snapshot(tmp_
         network = {"ssid": "Office", "security": "WPA2_WPA3", "password": secret, "hidden": False}
         async with _running_server(tmp_path, {"Studio": [DEVICE_ID], "Gallery": [OFFLINE_ID, OTHER_ID]}) as (session, base):
             empty = await _create(session, base, "Office")
-            _seed_assignment("Studio", empty)
-            _seed_assignment("Gallery", empty)
             async with (session.ws_connect(base + "/ws/device", autoping=False) as studio,
                         session.ws_connect(base + "/ws/device", autoping=False) as gallery):
                 await _register(studio)
                 await _register(gallery, {**REGISTRATION, "device_id": OTHER_ID})
                 assert await _receive_type(studio, "CONFIGURATION_POLICY") == NO_POLICY
                 assert await _receive_type(gallery, "CONFIGURATION_POLICY") == NO_POLICY
-                first = await _seed_draft(session, base, empty, {
+                first = await _deploy_to(session, base, empty, {
                     **_brightness(10),
                     "usbCopy": {"managed": True, "value": True},
                     "developerMenu": {"managed": True, "value": False},
-                })
+                }, "Studio", "Gallery")
                 assert first["impact"]["groups"] == 2 and first["impact"]["devices"] == 3
-                await _assert_no_policy(studio)
-                old = await _deploy(session, base, first)
-                first_policy = _policy(old, {"brightness": 10, "usbCopy": True, "developerMenu": False})
+                first_policy = _policy(first, {"brightness": 10, "usbCopy": True, "developerMenu": False})
                 assert await _receive_type(studio, "CONFIGURATION_POLICY") == first_policy
                 assert await _receive_type(gallery, "CONFIGURATION_POLICY") == first_policy
 
-                second = await _seed_draft(session, base, first, {
+                latest = await _deploy(session, base, first, settings={
                     **_brightness(25),
                     "usbCopy": {"managed": True, "value": False},
                     "developerMenu": {"managed": True, "value": True},
                     "wifi": {"managed": True, "value": _wifi_value(networks=[network])},
                 })
-                latest = await _deploy(session, base, second)
-                assert latest["published_revision"] != old["published_revision"]
+                assert latest["published_revision"] != first["published_revision"]
                 assert set(latest["published_keys"]) == {"brightness", "developerMenu", "usbCopy", "wifi"}
                 wanted = _policy(latest, {
                     "brightness": 25, "usbCopy": False, "developerMenu": True,
@@ -274,28 +264,25 @@ def test_shared_publish_and_offline_reconnect_use_latest_published_snapshot(tmp_
                 })
                 assert await _receive_type(studio, "CONFIGURATION_POLICY") == wanted
                 assert await _receive_type(gallery, "CONFIGURATION_POLICY") == wanted
+                assert secret not in json.dumps(latest)
 
-                changed = await _seed_draft(session, base, second, {
+        async with _running_server(tmp_path) as (session, base):
+            assert await _request(session, "GET", base, _path(latest)) == latest
+            async with session.ws_connect(base + "/ws/device") as ws:
+                await _register(ws, {**REGISTRATION, "device_id": OFFLINE_ID})
+                assert await _receive_type(ws, "CONFIGURATION_POLICY") == wanted
+                # Unmanaged settings keep their values, including the saved Wi-Fi password.
+                cleared = await _deploy(session, base, latest, settings={
                     **_brightness(90, managed=False),
                     "usbCopy": {"managed": False, "value": False},
                     "developerMenu": {"managed": False, "value": False},
                     "wifi": {"managed": False, "value": _wifi_value(
                         networks=[{k: v for k, v in network.items() if k != "password"}],
                     )},
-                }, name="New draft name")
-                assert changed["published_revision"] == latest["published_revision"]
-                assert changed["settings"]["wifi"]["value"]["networks"][0]["password_present"] is True
-                assert secret not in json.dumps([latest, changed])
-                await _assert_no_policy(gallery)
-
-        async with _running_server(tmp_path) as (session, base):
-            assert await _request(session, "GET", base, _path(changed)) == changed
-            async with session.ws_connect(base + "/ws/device") as ws:
-                await _register(ws, {**REGISTRATION, "device_id": OFFLINE_ID})
-                assert await _receive_type(ws, "CONFIGURATION_POLICY") == wanted
-                cleared = await _deploy(session, base, changed)
+                })
                 assert cleared["published_keys"] == []
-                assert cleared["settings"] == changed["settings"]
+                assert cleared["settings"]["wifi"]["value"]["networks"][0]["password_present"] is True
+                assert secret not in json.dumps(cleared)
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == _policy(cleared, {})
     asyncio.run(body())
 
@@ -368,16 +355,15 @@ def test_save_and_deploy_commits_draft_and_published_settings_together(tmp_path,
     async def body():
         async with _running_server(tmp_path, {"Studio": [DEVICE_ID]}) as (session, base):
             empty = await _create(session, base, "Studio")
-            _seed_assignment("Studio", empty)
-            package = await _request(session, "GET", base, _path(empty))
+            package = await _deploy_to(session, base, empty, _brightness(20), "Studio")
             path = _path(package) + "/save-and-deploy"
             request = {
-                "expected_revision": None, "expected_impact": package["impact"]["token"],
+                "expected_revision": package["draft_revision"], "expected_impact": package["impact"]["token"],
                 "settings": _brightness(40), "name": "Bright studio",
             }
             async with session.ws_connect(base + "/ws/device", autoping=False) as ws:
                 await _register(ws)
-                assert await _receive_type(ws, "CONFIGURATION_POLICY") == NO_POLICY
+                assert await _receive_type(ws, "CONFIGURATION_POLICY") == _policy(package, {"brightness": 20})
                 await _request(session, "POST", base, path, request, status=403, origin="http://other.invalid")
                 await _request(session, "POST", base, path, {**request, "expected_impact": "stale"}, status=409)
                 committed = server.REGISTRY_PATH.read_bytes()
@@ -390,7 +376,8 @@ def test_save_and_deploy_commits_draft_and_published_settings_together(tmp_path,
 
                 deployed = await _request(session, "POST", base, path, request)
                 assert deployed["name"] == "Bright studio"
-                assert deployed["draft_revision"] and deployed["published_revision"]
+                assert deployed["draft_revision"] != package["draft_revision"]
+                assert deployed["published_revision"] != package["published_revision"]
                 assert deployed["settings"] == _brightness(40)
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == _policy(deployed, {"brightness": 40})
                 await _request(session, "POST", base, path, request, status=409)
@@ -399,28 +386,34 @@ def test_save_and_deploy_commits_draft_and_published_settings_together(tmp_path,
     asyncio.run(body())
 
 
-def test_group_deploy_assigns_atomically_and_reuses_the_current_version_for_new_groups(tmp_path, monkeypatch):
+def test_group_deploy_assigns_atomically_redeploys_and_reuses_the_current_version(tmp_path, monkeypatch):
     async def body():
         groups = {"Studio": [DEVICE_ID], "Gallery": [OTHER_ID], "Later": [OFFLINE_ID]}
         async with _running_server(tmp_path, groups) as (session, base):
+            unpublished = await _create(session, base, "New")
+            response = await _request(session, "GET", base, _deployment_path("Studio", unpublished["package_id"]),
+                                      status=409)
+            assert response == {"error": "Edit this package and select Save & deploy to deploy it first."}
             empty = await _create(session, base, "Shared")
-            _seed_assignment("Gallery", empty)
-            package = await _seed_draft(session, base, empty, _brightness(30))
+            package = await _deploy_to(session, base, empty, _brightness(30), "Gallery")
             package_id = package["package_id"]
 
             def path(group):
-                return "/api/group-package/deploy?" + urlencode({"name": group, "package_id": package_id})
+                return _deployment_path(group, package_id)
 
             async with (session.ws_connect(base + "/ws/device", autoping=False) as studio,
                         session.ws_connect(base + "/ws/device", autoping=False) as gallery):
                 await _register(studio)
                 await _register(gallery, {**REGISTRATION, "device_id": OTHER_ID})
                 assert await _receive_type(studio, "CONFIGURATION_POLICY") == NO_POLICY
-                assert await _receive_type(gallery, "CONFIGURATION_POLICY") == NO_POLICY
+                assert await _receive_type(gallery, "CONFIGURATION_POLICY") == _policy(package, {"brightness": 30})
                 preview = await _request(session, "GET", base, path("Studio"))
-                assert preview["use_current"] is False
-                assert (preview["impact"]["groups"], preview["impact"]["devices"]) == (2, 2)
-                package = await _seed_draft(session, base, package, _brightness(40))
+                assert preview["use_current"] is True
+                assert (preview["impact"]["groups"], preview["impact"]["devices"]) == (1, 1)
+                # A newer version invalidates a preview bound to the previous one.
+                package = await _deploy(session, base, package, settings=_brightness(40))
+                policy = _policy(package, {"brightness": 40})
+                assert await _receive_type(gallery, "CONFIGURATION_POLICY") == policy
                 await _request(session, "POST", base, path("Studio"),
                                {"expected_impact": preview["impact"]["token"]}, status=409)
                 preview = await _request(session, "GET", base, path("Studio"))
@@ -436,17 +429,27 @@ def test_group_deploy_assigns_atomically_and_reuses_the_current_version_for_new_
                 await _assert_no_policy(gallery)
 
                 assert await _request(session, "POST", base, path("Studio"), request) == {"package_id": package_id}
-                deployed = await _request(session, "GET", base, _path(package))
-                policy = _policy(deployed, {"brightness": 40})
+                assert await _receive_type(studio, "CONFIGURATION_POLICY") == policy
+                await _assert_no_policy(gallery)
+
+                # Deploying the group's current package republishes the same settings
+                # as a new revision to every group that uses it.
+                preview = await _request(session, "GET", base, path("Studio"))
+                assert preview["use_current"] is False
+                assert (preview["impact"]["groups"], preview["impact"]["devices"]) == (2, 2)
+                await _request(session, "POST", base, path("Studio"), {"expected_impact": preview["impact"]["token"]})
+                redeployed = await _request(session, "GET", base, _path(package))
+                assert redeployed["published_revision"] != package["published_revision"]
+                assert redeployed["settings"] == package["settings"]
+                policy = _policy(redeployed, {"brightness": 40})
                 assert await _receive_type(studio, "CONFIGURATION_POLICY") == policy
                 assert await _receive_type(gallery, "CONFIGURATION_POLICY") == policy
 
-                newer_draft = await _seed_draft(session, base, deployed, _brightness(60))
                 preview = await _request(session, "GET", base, path("Later"))
                 assert preview["use_current"] is True
                 assert (preview["impact"]["groups"], preview["impact"]["devices"]) == (1, 1)
                 await _request(session, "POST", base, path("Later"), {"expected_impact": preview["impact"]["token"]})
-                assert (await _request(session, "GET", base, _path(newer_draft)))["published_revision"] == deployed["published_revision"]
+                assert (await _request(session, "GET", base, _path(package)))["published_revision"] == redeployed["published_revision"]
                 await _assert_no_policy(studio)
                 await _assert_no_policy(gallery)
                 async with session.ws_connect(base + "/ws/device") as later:
@@ -461,10 +464,7 @@ def test_deploy_no_package_clears_management_for_only_the_selected_group(tmp_pat
         groups = {"Studio": [DEVICE_ID, OFFLINE_ID], "Gallery": [OTHER_ID]}
         async with _running_server(tmp_path, groups) as (session, base):
             package = await _create(session, base, "Shared")
-            package = await _seed_draft(session, base, package, _brightness(40))
-            await _assign(session, base, "Studio", package)
-            await _assign(session, base, "Gallery", package)
-            package = await _deploy(session, base, await _request(session, "GET", base, _path(package)))
+            package = await _deploy_to(session, base, package, _brightness(40), "Studio", "Gallery")
             path = "/api/group-package/deploy?name=Studio&package_id="
             await _request(session, "GET", base, "/api/group-package/deploy?name=Studio", status=400)
 
@@ -503,9 +503,9 @@ def test_group_assignment_and_membership_release_and_referenced_delete(tmp_path)
         group = "A / B? # 日本語"
         async with _running_server(tmp_path, {"Studio": [DEVICE_ID], group: []}) as (session, base):
             first = await _create(session, base, "Office")
-            first = await _deploy(session, base, await _seed_draft(session, base, first, _brightness(30)))
+            first = await _deploy(session, base, first, settings=_brightness(30))
             other = await _create(session, base, "Gallery")
-            other = await _deploy(session, base, await _seed_draft(session, base, other, _brightness(75)))
+            other = await _deploy(session, base, other, settings=_brightness(75))
             assert await _assign(session, base, group, other) == {"package_id": other["package_id"]}
             async with (session.ws_connect(base + "/ws/device", autoping=False) as ws,
                         session.ws_connect(base + "/ws/admin") as admin):
@@ -567,7 +567,7 @@ def test_membership_save_precedes_policy_delivery(tmp_path, monkeypatch, disconn
 
         async with _running_server(tmp_path, {"Gallery": []}) as (session, base):
             package = await _create(session, base, "Gallery")
-            package = await _deploy(session, base, await _seed_draft(session, base, package, _brightness(75)))
+            package = await _deploy(session, base, package, settings=_brightness(75))
             await _assign(session, base, "Gallery", package)
 
             async with (session.ws_connect(base + "/ws/device") as device,
@@ -618,7 +618,7 @@ def test_slow_admin_fan_out_does_not_delay_policy_delivery(tmp_path, monkeypatch
 
         async with _running_server(tmp_path, {"Gallery": [DEVICE_ID]}) as (session, base):
             package = await _create(session, base, "Gallery")
-            package = await _deploy(session, base, await _seed_draft(session, base, package, _brightness(75)))
+            package = await _deploy(session, base, package, settings=_brightness(75))
             async with session.ws_connect(base + "/ws/device") as device:
                 await _register(device)
                 assert await _receive_type(device, "CONFIGURATION_POLICY") == NO_POLICY
@@ -783,22 +783,30 @@ def test_deploy_response_and_admin_metadata_do_not_wait_for_device_delivery(tmp_
         async with _running_server(tmp_path, {"Studio": [DEVICE_ID]}) as (session, base):
             secret = "office-secret"
             empty = await _create(session, base, "Office")
-            if deployment == "package":
-                _seed_assignment("Studio", empty)
-            saved = await _seed_draft(session, base, empty, _wifi_setting(networks=[{
+            settings = _wifi_setting(networks=[{
                 "ssid": "Office", "security": "WPA2_WPA3", "password": secret, "hidden": False,
-            }]))
+            }])
+            saved = (await _deploy_to(session, base, empty, settings, "Studio") if deployment == "package"
+                     else await _deploy(session, base, empty, settings=settings))
             released = asyncio.Event()
             entered = asyncio.Event()
+            holding = False
+            publish_configuration = server._publish_configuration
 
             async def hold_device_delivery(members):
+                if not holding:
+                    return await publish_configuration(members)
                 assert members == [DEVICE_ID]
                 entered.set()
                 await released.wait()
 
             monkeypatch.setattr(server, "_publish_configuration", hold_device_delivery)
             async with session.ws_connect(base + "/ws/admin") as other_console:
-                assert (await _receive_type(other_console, "GROUP_LIST"))["deployments"] == {}
+                before = (await _receive_type(other_console, "GROUP_LIST"))["deployments"]
+                assert before == ({} if deployment == "group" else {"Studio": {
+                    "package_id": saved["package_id"], "revision": saved["published_revision"], "keys": ["wifi"],
+                }})
+                holding = True
                 request = asyncio.create_task(_deploy(session, base, saved) if deployment == "package"
                                               else _assign(session, base, "Studio", saved))
                 try:
@@ -826,9 +834,7 @@ def test_failed_publish_and_cleanup_keep_saved_and_delivered_policy(tmp_path, mo
     async def body():
         async with _running_server(tmp_path, {"Studio": [DEVICE_ID]}) as (session, base):
             package = await _create(session, base, "Office")
-            _seed_assignment("Studio", package)
-            first = await _deploy(session, base, await _seed_draft(session, base, package, _brightness(30)))
-            changed = await _seed_draft(session, base, first, _brightness(80))
+            first = await _deploy_to(session, base, package, _brightness(30), "Studio")
             committed = server.REGISTRY_PATH.read_bytes()
             original_replace = server.Path.replace
             original_unlink = server.Path.unlink
@@ -852,10 +858,10 @@ def test_failed_publish_and_cleanup_keep_saved_and_delivered_policy(tmp_path, mo
             with monkeypatch.context() as patch:
                 patch.setattr(server.Path, "replace", deny_replace)
                 patch.setattr(server.Path, "unlink", deny_cleanup)
-                async with session.post(base + _path(changed) + "/save-and-deploy", json={
-                    "expected_revision": changed["draft_revision"],
-                    "settings": changed["settings"],
-                    "expected_impact": changed["impact"]["token"],
+                async with session.post(base + _path(first) + "/save-and-deploy", json={
+                    "expected_revision": first["draft_revision"],
+                    "settings": _brightness(80),
+                    "expected_impact": first["impact"]["token"],
                 }) as response:
                     status = response.status
                     error = await response.text()
@@ -872,8 +878,10 @@ def test_failed_publish_and_cleanup_keep_saved_and_delivered_policy(tmp_path, mo
                 await _register(ws)
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == _policy(first, {"brightness": 30})
 
-            assert (saved["packages"]["packages"][first["package_id"]]["published"]
-                    == json.loads(committed)["packages"]["packages"][first["package_id"]]["published"])
+            saved_package = saved["packages"]["packages"][first["package_id"]]
+            committed_package = json.loads(committed)["packages"]["packages"][first["package_id"]]
+            assert saved_package["published_revision"] == committed_package["published_revision"]
+            assert saved_package["settings"] == committed_package["settings"]
             assert status == 500
             assert json.loads(error) == {"error": "Configuration package could not be saved"}
 
@@ -884,8 +892,7 @@ def test_configuration_state_is_sanitized_and_has_no_effect_on_delivery(tmp_path
     async def body():
         async with _running_server(tmp_path, {"Studio": [DEVICE_ID, OTHER_ID, OFFLINE_ID]}) as (session, base):
             empty = await _create(session, base, "Office")
-            _seed_assignment("Studio", empty)
-            published = await _deploy(session, base, await _seed_draft(session, base, empty, _brightness(45)))
+            published = await _deploy_to(session, base, empty, _brightness(45), "Studio")
             ids = {"package_id": published["package_id"], "revision": published["published_revision"]}
             reported = {**ids, "status": "complete", "results": {
                 "brightness": {"status": "applied", "value": 45, "password": "secret"},
@@ -945,8 +952,7 @@ def test_retry_sends_fresh_id_only_to_current_online_matching_device(tmp_path):
         device_id = "11111111-1111-7111-8111-111111111111"
         async with _running_server(tmp_path, {"Studio": [device_id, OFFLINE_ID]}) as (session, base):
             empty = await _create(session, base, "Office")
-            _seed_assignment("Studio", empty)
-            published = await _deploy(session, base, await _seed_draft(session, base, empty, _brightness(45)))
+            published = await _deploy_to(session, base, empty, _brightness(45), "Studio")
             retry = {"device_id": device_id, "package_id": published["package_id"],
                      "revision": published["published_revision"]}
             await _request(session, "POST", base, "/api/package-retry", retry, status=409)
@@ -1046,12 +1052,10 @@ def test_unified_wifi_policy_is_sent_with_configuration_package_capability(tmp_p
     async def body():
         async with _running_server(tmp_path, {"Studio": [DEVICE_ID]}) as (session, base):
             profile = await _create(session, base, "Office")
-            _seed_assignment("Studio", profile)
             wifi_value = _wifi_value(auto_return=True)
-            profile = await _seed_draft(session, base, profile, {
+            published = await _deploy_to(session, base, profile, {
                 **_brightness(45), "wifi": {"managed": True, "value": wifi_value},
-            })
-            published = await _deploy(session, base, profile)
+            }, "Studio")
             client_without_separate_capability = {
                 **REGISTRATION, "capabilities": [configuration_packages.CAPABILITY],
             }
@@ -1093,10 +1097,8 @@ def test_unified_wifi_policy_publishes_networks_and_auto_return_together(tmp_pat
     async def body():
         async with _running_server(tmp_path, {"Studio": [DEVICE_ID]}) as (session, base):
             profile = await _create(session, base, "Office")
-            _seed_assignment("Studio", profile)
             value = _wifi_value(auto_return=False, hidden=True)
-            profile = await _seed_draft(session, base, profile, {"wifi": {"managed": True, "value": value}})
-            published = await _deploy(session, base, profile)
+            published = await _deploy_to(session, base, profile, {"wifi": {"managed": True, "value": value}}, "Studio")
             capable_client = {**REGISTRATION, "capabilities": [configuration_packages.CAPABILITY]}
 
             async with session.ws_connect(base + "/ws/device", autoping=False) as ws:
@@ -1199,5 +1201,97 @@ def test_api_rejects_more_than_four_networks_with_auto_return_on_or_off(tmp_path
             current = await _request(session, "GET", base, _path(profile))
             assert current["published_revision"] is None
             assert current["draft_revision"] is None
+
+    asyncio.run(body())
+
+
+@pytest.mark.parametrize("ack_stalls", [False, True])
+def test_group_edits_order_requester_ack_and_publish_to_other_connections(tmp_path, monkeypatch, ack_stalls):
+    monkeypatch.setattr(server, "_admin_send_locks", {})
+
+    async def body():
+        package = {
+            "name": "Office",
+            "published": _legacy_snapshot({"brightness": 45}),
+        }
+        groups = {"Studio": {"members": [DEVICE_ID], "package_id": OFFLINE_ID}}
+        registration = {**REGISTRATION, "capabilities": [
+            configuration_packages.CAPABILITY,
+            configuration_packages.SUMMARY_CAPABILITY,
+        ]}
+        release_ack = asyncio.Event()
+        ack_started = asyncio.Event()
+
+        class UnreachableAdmin:
+            closed = False
+
+            async def send_str(self, _message):
+                if ack_stalls:
+                    await asyncio.Future()
+                raise ConnectionResetError("admin disconnected after group commit")
+
+            async def close(self, **_kwargs):
+                self.closed = True
+
+        class RecordingAdmin:
+            def __init__(self):
+                self.messages = []
+                self.received = asyncio.Event()
+
+            async def send_str(self, raw):
+                self.messages.append(json.loads(raw))
+                self.received.set()
+
+        class SlowAdmin(RecordingAdmin):
+            async def send_str(self, raw):
+                if json.loads(raw)["type"] == "GROUP_RENAMED":
+                    ack_started.set()
+                    await release_ack.wait()
+                await super().send_str(raw)
+
+        async with _running_server(
+            tmp_path, groups, packages={"version": 1, "packages": {OFFLINE_ID: package}},
+        ) as (session, base):
+            async with session.ws_connect(base + "/ws/device") as device:
+                await _register(device, registration)
+                current = await _receive_type(device, "CONFIGURATION_POLICY")
+                assert current["group_name"] == "Studio"
+
+                requester = SlowAdmin()
+                peer = RecordingAdmin()
+                server.admin_connections.update((requester, peer))
+                rename = asyncio.create_task(server.handle_rename_group(
+                    requester, {"name": "Studio", "new_name": "Gallery"},
+                ))
+                # This broadcast starts after the commit and before the handler resumes.
+                concurrent_list = asyncio.create_task(server.broadcast_group_list())
+                try:
+                    await asyncio.wait_for(ack_started.wait(), 2)
+                    renamed = await _receive_type(device, "CONFIGURATION_POLICY")
+                    assert renamed["group_name"] == "Gallery"
+                    await asyncio.wait_for(peer.received.wait(), 2)
+                    assert peer.messages[0]["groups"] == {"Gallery": [DEVICE_ID]}
+                    assert not rename.done()
+                    assert requester.messages == []
+                finally:
+                    release_ack.set()
+                    await asyncio.gather(rename, concurrent_list)
+                assert [msg["type"] for msg in requester.messages] == [
+                    "GROUP_RENAMED", "GROUP_LIST", "GROUP_LIST",
+                ]
+                assert "Studio" not in server._configuration.groups
+                assert "Gallery" in server._configuration.groups
+
+                unreachable = UnreachableAdmin()
+                server.admin_connections.add(unreachable)
+                monkeypatch.setattr(server, "ADMIN_SEND_TIMEOUT", 0.05)
+                await asyncio.wait_for(server.handle_delete_group(unreachable, {"name": "Gallery"}), 2)
+                released = await _receive_type(device, "CONFIGURATION_POLICY")
+                assert released == {**NO_POLICY, "group_name": None, "deployed_at_ms": None}
+                assert unreachable.closed
+                assert unreachable not in server.admin_connections
+                assert unreachable not in server._admin_send_locks
+                assert peer.messages[-1]["groups"] == {}
+                assert "Gallery" not in server._configuration.groups
 
     asyncio.run(body())

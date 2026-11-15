@@ -84,7 +84,7 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
 
     private class SettingFailure(val reason: String) : Exception()
 
-    fun apply(values: JSONObject): JSONObject {
+    fun apply(values: JSONObject, overwrite: Boolean): JSONObject {
         val results = JSONObject()
         val written = linkedMapOf<String, Any>()
 
@@ -94,11 +94,11 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
             try {
                 val target = requested(key, values)
                 val current = read(key)
-                if (!matches(key, current, target)) {
+                if (overwrite || !matches(key, current, target)) {
                     error = "WRITE_FAILED"
                     write(key, target)
                     // Dependent settings such as screen-off delay read the current
-                    // sleep delay, so let the firmware finish each changed value.
+                    // sleep delay, so let the firmware finish each write.
                     awaitValue(key, target)
                 }
                 written[key] = target

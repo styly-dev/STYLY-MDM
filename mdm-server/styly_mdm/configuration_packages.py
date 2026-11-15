@@ -1,7 +1,6 @@
 """PICO 4 Ultra Enterprise configuration packages, validation, and public projections."""
 
 import copy
-import uuid
 
 from .wifi_settings import (
     WIFI_REASONS,
@@ -13,7 +12,7 @@ from .wifi_settings import (
 
 CAPABILITY = "configuration_packages_v1"
 SUMMARY_CAPABILITY = "configuration_summary_v1"
-VERSION = 1
+VERSION = 2
 MAX_PACKAGE_NAME_LEN = 64
 _REASONS = WIFI_REASONS | {
     "READ_FAILED", "WRITE_FAILED", "READBACK_MISMATCH", "INVALID_VALUE",
@@ -175,57 +174,44 @@ def validate_name(value):
 
 
 def public_summary(package_id, profile):
-    published = profile.get("published")
     return {
         "package_id": package_id,
         "name": profile["name"],
-        "has_draft": "draft" in profile,
-        "published_revision": published["revision"] if published else None,
+        "published_revision": profile["published_revision"],
     }
 
 
 def public_profile(package_id, profile, impact):
-    draft = profile.get("draft")
-    published = profile.get("published")
-    settings = copy.deepcopy(draft["settings"]) if draft else {}
+    settings = copy.deepcopy(profile["settings"])
     if "wifi" in settings:
         settings["wifi"]["value"]["networks"] = public_networks(settings["wifi"]["value"]["networks"])
     return {
         "package_id": package_id,
         "name": profile["name"],
-        "draft_revision": draft["revision"] if draft else None,
-        "published_revision": published["revision"] if published else None,
-        "published_keys": list(published["settings"]) if published else [],
+        "draft_revision": profile["draft_revision"],
+        "published_revision": profile["published_revision"],
+        "published_keys": list(published_settings(profile)),
         "settings": settings,
         "sections": SECTIONS,
         "impact": impact,
     }
 
 
-def check_expected_revision(body, draft):
+def check_expected_revision(body, current_revision):
     if "expected_revision" not in body:
         raise PackageError("expected_revision is required")
     expected = body["expected_revision"]
     if expected is not None and normalize_revision(expected) is None:
         raise PackageError("expected_revision must be a canonical revision UUID")
-    if expected != (draft["revision"] if draft is not None else None):
-        raise PackageError("The saved package draft changed or is missing. Reload the package.", 409)
-
-
-def new_snapshot(settings):
-    return {"revision": str(uuid.uuid4()), "settings": copy.deepcopy(settings)}
-
-
-def _load_catalog(raw, key):
-    if (not isinstance(raw, dict) or type(raw.get("version")) is not int
-            or raw["version"] != VERSION or not isinstance(raw.get(key), dict)):
-        raise PackageError("Unsupported configuration format")
-    return raw[key]
+    if expected != current_revision:
+        raise PackageError("The package changed. Reload the package.", 409)
 
 
 def _validate_snapshots(snapshots):
     for phase, snapshot in snapshots.items():
+        allowed_fields = {"revision", "settings"} | ({"deployed_at_ms"} if phase == "published" else set())
         if (phase not in ("draft", "published") or not isinstance(snapshot, dict)
+                or set(snapshot) - allowed_fields
                 or normalize_revision(snapshot.get("revision")) is None
                 or not isinstance(snapshot.get("settings"), dict)):
             raise PackageError("Invalid saved configuration snapshot")
@@ -240,15 +226,75 @@ def _validate_snapshots(snapshots):
             _validate_delays(values)
 
 
-def load_packages(raw):
-    packages = _load_catalog(raw, "packages")
+def _migrate_v1_packages(packages):
+    migrated = {}
     for package_id, profile in packages.items():
         if normalize_revision(package_id) is None or not isinstance(profile, dict):
             raise PackageError("Invalid saved package")
         if validate_name(profile.get("name")) != profile["name"]:
             raise PackageError("Invalid saved package name")
-        _validate_snapshots({key: value for key, value in profile.items() if key != "name"})
+        snapshots = {key: value for key, value in profile.items() if key != "name"}
+        _validate_snapshots(snapshots)
+        draft = snapshots.get("draft")
+        published = snapshots.get("published")
+
+        if draft is not None:
+            settings = copy.deepcopy(draft["settings"])
+            draft_revision = draft["revision"]
+            if published is not None and managed_settings(settings) != published["settings"]:
+                raise PackageError("Saved package draft differs from its published settings")
+        elif published is not None:
+            settings = {
+                key: {"managed": True, "value": copy.deepcopy(value)}
+                for key, value in published["settings"].items()
+            }
+            draft_revision = published["revision"]
+        else:
+            settings = {}
+            draft_revision = None
+
+        migrated[package_id] = {
+            "name": profile["name"],
+            "settings": settings,
+            "draft_revision": draft_revision,
+            "published_revision": published["revision"] if published is not None else None,
+            "deployed_at_ms": published.get("deployed_at_ms") if published is not None else None,
+        }
+    return migrated
+
+
+def load_packages(raw):
+    if (not isinstance(raw, dict) or type(raw.get("version")) is not int
+            or raw["version"] not in (1, VERSION) or not isinstance(raw.get("packages"), dict)):
+        raise PackageError("Unsupported configuration format")
+    packages = raw["packages"]
+    if raw["version"] == 1:
+        return _migrate_v1_packages(packages)
+
+    for package_id, profile in packages.items():
+        if normalize_revision(package_id) is None or not isinstance(profile, dict):
+            raise PackageError("Invalid saved package")
+        if (set(profile) != {"name", "settings", "draft_revision", "published_revision", "deployed_at_ms"}
+                or validate_name(profile.get("name")) != profile["name"]
+                or not isinstance(profile["settings"], dict)):
+            raise PackageError("Invalid saved package")
+        draft_revision = profile["draft_revision"]
+        published_revision = profile["published_revision"]
+        deployed_at_ms = profile["deployed_at_ms"]
+        if (draft_revision is not None and normalize_revision(draft_revision) is None
+                or published_revision is not None and normalize_revision(published_revision) is None
+                or deployed_at_ms is not None and not _bounded_int(deployed_at_ms, 1, 253402300799999)
+                or (deployed_at_ms is not None and published_revision is None)
+                or (draft_revision is None and (profile["settings"] or published_revision is not None))):
+            raise PackageError("Invalid saved package revisions")
+        validate_draft(profile["settings"])
     return packages
+
+
+def published_settings(profile):
+    if profile["published_revision"] is None:
+        return {}
+    return managed_settings(profile["settings"])
 
 
 def public_configuration_state(raw):

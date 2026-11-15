@@ -62,20 +62,14 @@ class WifiPriorityScanMonitorTest {
     }
 
     @Test
-    fun `security parsing preserves transition types and excludes unsupported modes`() {
-        assertEquals(setOf("WPA_PSK", "SAE"), wifiScanSecurity("[WPA2-PSK][RSN-PSK+SAE][ESS]"))
+    fun `scan security types preserve transition networks and exclude unsupported modes`() {
         assertEquals(setOf("WPA_PSK", "SAE"), wifiScanSecurityTypes(setOf(
             WifiInfo.SECURITY_TYPE_PSK,
             WifiInfo.SECURITY_TYPE_SAE,
         )))
         assertEquals(setOf("SAE"), wifiScanSecurityTypes(setOf(WifiInfo.SECURITY_TYPE_SAE)))
         assertEquals(setOf("OPEN"), wifiScanSecurityTypes(setOf(WifiInfo.SECURITY_TYPE_OPEN)))
-        assertEquals(setOf("OPEN"), wifiScanSecurity("[ESS]"))
-        assertEquals(emptySet<String>(), wifiScanSecurity("[WAPI-PSK][ESS]"))
-        assertEquals(emptySet<String>(), wifiScanSecurity("[OWE][ESS]"))
-        assertEquals(emptySet<String>(), wifiScanSecurity("[DPP][ESS]"))
-        assertEquals(emptySet<String>(), wifiScanSecurity("[PRIVACY][ESS]"))
-        assertEquals(emptySet<String>(), wifiScanSecurity("[WPA3-UNKNOWN][ESS]"))
+        assertEquals(emptySet<String>(), wifiScanSecurityTypes(setOf(WifiInfo.SECURITY_TYPE_WEP)))
         assertEquals(emptySet<String>(), wifiScanSecurityTypes(setOf(WifiInfo.SECURITY_TYPE_WAPI_PSK)))
         assertEquals(emptySet<String>(), wifiScanSecurityTypes(setOf(
             WifiInfo.SECURITY_TYPE_PSK,

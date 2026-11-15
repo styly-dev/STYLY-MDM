@@ -579,7 +579,7 @@
       const content = catalog?.map(pkg =>
         `<button type="button" class="mg-item settings-package-item${current?.id === pkg.package_id ? ' active' : ''}" data-package-id="${esc(pkg.package_id)}" aria-pressed="${current?.id === pkg.package_id}">
           <span class="mg-item-name">${esc(pkg.name)}</span>
-          <span class="mg-item-count">${pkg.published_revision ? 'Deployed' : pkg.has_draft ? 'Draft' : 'New'}</span>
+          <span class="mg-item-count">${pkg.published_revision ? 'Deployed' : 'New'}</span>
         </button>`).join('') || `<p class="empty small">${esc(catalog ? 'No packages yet.' : catalogError || 'Loading packages…')}</p>
         ${catalogError ? '<button type="button" class="btn-outline" data-refresh-packages>Reload packages</button>' : ''}`;
       if (catalogContent !== content) {
@@ -621,8 +621,7 @@
       if (snapshot !== before) return;
       catalog = (catalog || []).filter(pkg => pkg.package_id !== id);
       if (profile) {
-        catalog.push({ package_id: id, name: profile.name, has_draft: Boolean(profile.draft_revision),
-          published_revision: profile.published_revision });
+        catalog.push({ package_id: id, name: profile.name, published_revision: profile.published_revision });
         catalog.sort((a, b) => a.name.localeCompare(b.name));
       }
       renderCatalog();
@@ -650,7 +649,7 @@
       footer.querySelector('[data-policy-action="discard"]').disabled = locked || !changed;
       let deployReason = '';
       if (model.busy) deployReason = 'Wait for the current package operation to finish.';
-      else if (model.conflict) deployReason = 'Select Reload package and review the latest draft before deploying.';
+      else if (model.conflict) deployReason = 'Select Reload package and review the latest version before deploying.';
       else if (!model.name.trim()) deployReason = 'Enter a package name before deploying.';
       updateDeployAction(footer.querySelector('[data-policy-action="deploy"]'), packagePanel.querySelector('[data-deploy-hint]'), deployReason);
       packagePanel.querySelector('[data-policy-action="delete"]').disabled = locked;
@@ -755,7 +754,7 @@
           '" (' + deviceCount + ')?\n\n' + delivery);
       }
       const detail = groupName
-        ? 'This sets the package for "' + groupName + '" and deploys the saved settings to all groups using it.'
+        ? 'This deploys the saved settings again as a new version to all groups using it.'
         : 'This saves your edits and deploys them.';
       return confirmAction('Deploy "' + (editorName ?? profile.name) + '" to ' + groupCount + ' and ' + deviceCount +
         '?\n\n' + detail + ' ' + delivery);
@@ -777,7 +776,7 @@
         } else if (action === 'deploy') {
           const fresh = await api(path);
           if (fresh.draft_revision !== model.draftRevision) {
-            throw Object.assign(new Error('The saved draft changed. Reload and review the latest draft before deploying.'), { status: 409 });
+            throw Object.assign(new Error('The package changed. Reload and review the latest version before deploying.'), { status: 409 });
           }
           if (!confirmDeployment(fresh, { editorName: model.name.trim() })) return;
           writing = true;
@@ -796,7 +795,7 @@
         updateSummary(before, data, model.id);
         model.conflict = false;
         model.message = { deploy: 'Package saved. Deployment started.',
-          reload: hasChanges(model) ? 'Latest draft loaded. Review your unsaved edits before deploying.' : '' }[action];
+          reload: hasChanges(model) ? 'Latest version loaded. Review your unsaved edits before deploying.' : '' }[action];
       } catch (error) {
         model.error = true;
         if (writing && (!error.status || error.status >= 500)) {
@@ -805,7 +804,7 @@
         } else if (error.status === 409 && action !== 'delete') {
           model.conflict = true;
           model.message = action === 'deploy' && writing ?
-            'The saved draft or deployment targets changed. Reload and review before deploying again.' : error.message;
+            'The package or deployment targets changed. Reload and review before deploying again.' : error.message;
         } else {
           model.message = error.status ? error.message : 'Could not ' + action + ' the package.';
         }
@@ -909,8 +908,8 @@
       else if (group.busy) deployReason = group.busy;
       else if (group.assignmentAck !== undefined) deployReason = 'Waiting for the group to show the package change.';
       else if (selected && !known) deployReason = 'This package is unavailable. Choose another package.';
-      else if (known && !known.has_draft && (selected === assigned || !known.published_revision)) {
-        deployReason = 'Open Edit package and select Save & deploy to make this package ready.';
+      else if (known && !known.published_revision) {
+        deployReason = 'Open Edit package and select Save & deploy to deploy it first.';
       }
       updateDeployAction(groupPanel.querySelector('[data-group-action="deploy"]'), groupPanel.querySelector('[data-deploy-hint]'), deployReason);
       const feedback = groupPanel.querySelector('[data-assignment-feedback]');
@@ -1027,7 +1026,7 @@
         model.error = true;
         model.message = writing && (!error.status || error.status >= 500)
           ? 'Could not confirm deployment. Check the group package before trying again.'
-          : writing && error.status === 409 ? 'The saved draft or deployment targets changed. Select Deploy to review them again.'
+          : writing && error.status === 409 ? 'The package or deployment targets changed. Select Deploy to review them again.'
             : error.status ? error.message : 'Could not check the deployment targets.';
       } finally {
         model.busy = false;

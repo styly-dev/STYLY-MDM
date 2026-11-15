@@ -1,5 +1,6 @@
 package com.styly.mdmclient
 
+import android.annotation.TargetApi
 import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.content.pm.PackageManager
@@ -8,6 +9,7 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
+import androidx.annotation.ChecksSdkIntAtLeast
 import com.pvr.tobservice.ToBServiceHelper
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -27,7 +29,7 @@ internal data class WifiConfiguredView(
     val original: WifiConfiguration,
 )
 
-/** Whether a saved security view or an observed connection's security satisfies [profile]. */
+/** Whether a saved or observed security type satisfies a validated [profile]. */
 internal fun wifiSecurityViewMatchesProfile(profile: WifiNetworkProfile, security: String?): Boolean = when {
     profile.security == "OPEN" -> security == "OPEN"
     profile.security != "WPA2_WPA3" -> false
@@ -55,7 +57,7 @@ internal fun preferredWifiSecurityView(
     }
 }
 
-/** Resolve a candidate's exact security view while treating same-ID views as one saved network. */
+/** Return null for an absent candidate; reject an identity shared by distinct saved networks. */
 internal fun resolveWifiProfileViewIndex(
     profile: WifiNetworkProfile,
     entries: List<WifiConfiguredEntry>,
@@ -63,9 +65,13 @@ internal fun resolveWifiProfileViewIndex(
     val matches = entries.indices.filter {
         entries[it].ssid == profile.ssid && wifiSecurityViewMatchesProfile(profile, entries[it].security)
     }
-    if (matches.map { entries[it].networkId }.distinct().size != 1) return null
+    if (matches.isEmpty()) return null
+    if (matches.map { entries[it].networkId }.distinct().size != 1) {
+        throw WifiAdapterFailure(WifiReason.VERIFY_FAILED)
+    }
     val preferred = preferredWifiSecurityView(profile, matches.map { entries[it].security })
     return matches.firstOrNull { entries[it].security == preferred }
+        ?: throw WifiAdapterFailure(WifiReason.VERIFY_FAILED)
 }
 
 /** Resolve the original security view even if Android reassigned the network ID after reboot. */
@@ -153,6 +159,24 @@ internal fun restoreWifiRecoveryBestEffort(
     return if (failed) WifiReason.RESTORE_FAILED else WifiReason.NONE
 }
 
+internal fun reenableWifiRecoveryNetworks(
+    expectedAutoJoin: Map<Int, Boolean>,
+    selectedTargetId: Int?,
+    enableNetwork: (Int) -> WifiReason,
+): WifiReason {
+    var failed = false
+    for ((id, allowed) in expectedAutoJoin) {
+        if (!allowed || id == selectedTargetId) continue
+        val result = try {
+            enableNetwork(id)
+        } catch (_: Exception) {
+            WifiReason.RESTORE_FAILED
+        }
+        if (result != WifiReason.NONE) failed = true
+    }
+    return if (failed) WifiReason.RESTORE_FAILED else WifiReason.NONE
+}
+
 /** PICO returns multiple security views for some saved network IDs. */
 internal fun wifiProfileReadback(entries: List<WifiConfiguredEntry>, profile: List<WifiNetworkProfile>): Boolean {
     val selected = linkedSetOf<Int>()
@@ -197,6 +221,10 @@ internal fun updateWithMacRandomizationFallback(update: (Int) -> Int): Int {
 
 internal fun supportsPico4UltraEnterpriseSettings(): Boolean =
     Build.MODEL == "A94U0" && Build.MANUFACTURER.equals("Pico", ignoreCase = true)
+
+@ChecksSdkIntAtLeast(api = Build.VERSION_CODES.TIRAMISU)
+internal fun supportsManagedWifi(): Boolean =
+    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && supportsPico4UltraEnterpriseSettings()
 
 internal class WifiAdapterFailure(val reason: WifiReason) : Exception()
 
@@ -243,14 +271,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             @Suppress("DEPRECATION")
             val configs = manager?.configuredNetworks ?: throw WifiAdapterFailure(WifiReason.CONFIG_READ_FAILED)
             configs.map { config ->
-                val security = when {
-                    config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.SAE) -> "SAE"
-                    config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.WPA_PSK) -> "WPA_PSK"
-                    config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.NONE) &&
-                        config.wepKeys.all { it == null } -> "OPEN"
-                    else -> "OTHER:${config.allowedKeyManagement}"
-                }
-                val entry = WifiConfiguredEntry(config.networkId, config.SSID.removeSurrounding("\""), security,
+                val entry = WifiConfiguredEntry(config.networkId, config.SSID.removeSurrounding("\""), config.securityView(),
                     config.hiddenSSID, autoJoinField.getBoolean(config))
                 WifiConfiguredView(entry, config)
             }
@@ -289,20 +310,11 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         }
         val initialViews = configuredNetworkViews()
         val initial = initialViews.map { it.entry }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@guarded WifiReason.UNSUPPORTED
-        if (target.any { it.requiresSaeOnly } &&
-            (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || wifi.isWpa3SaeSupported != true)
-        ) return@guarded WifiReason.UNSUPPORTED
+        if (target.any { it.requiresSaeOnly } && !wifi.isWpa3SaeSupported) return@guarded WifiReason.UNSUPPORTED
         val selected = linkedSetOf<Int>()
         val mutate = Mutations(shouldContinue, beforeFirstMutation, onMutationStarted, onMutationFinished)
         for (network in target) {
-            val existing = initial.filter {
-                it.ssid == network.ssid && wifiSecurityViewMatchesProfile(network, it.security)
-            }.distinctBy { it.networkId }
-            if (existing.size > 1) return@guarded WifiReason.VERIFY_FAILED
-            val existingIndex = resolveWifiProfileViewIndex(network, initial)
-            val existingView = existingIndex?.let(initialViews::get)
-            if (existing.isNotEmpty() && existingView == null) return@guarded WifiReason.VERIFY_FAILED
+            val existingView = resolveWifiProfileViewIndex(network, initial)?.let(initialViews::get)
             var id = -1
             val failure = mutate.run {
                 val operation = if (existingView == null) "ADD" else "UPDATE"
@@ -459,12 +471,10 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                 if (failed) WifiReason.RESTORE_FAILED else WifiReason.NONE
             },
             reconnect = {
-                var selectedTargetId: Int? = null
-                var targetSelected = false
-                val entries = runCatching { readCurrent() }.getOrNull().orEmpty()
-                if (restoreTarget != null) {
-                    selectedTargetId = resolveWifiRollbackNetworkId(restoreTarget, entries)
-                    val selection = selectedTargetId?.let { id ->
+                val selectedTargetId = restoreTarget?.let { target ->
+                    val entries = runCatching { readCurrent() }.getOrNull().orEmpty()
+                    val targetId = resolveWifiRollbackNetworkId(target, entries)
+                    val selection = targetId?.let { id ->
                         runCatching {
                             mutate.run {
                                 @Suppress("DEPRECATION")
@@ -472,24 +482,20 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                             }
                         }.getOrDefault(WifiReason.UNREACHABLE)
                     } ?: WifiReason.VERIFY_FAILED
-                    targetSelected = selection == WifiReason.NONE
-                    if (!targetSelected) logOperationFailure("RESTORE", selection)
-                }
-                for ((id, allowed) in expectedAutoJoin) {
-                    if (!allowed || id == selectedTargetId) continue
-                    val failure = try {
-                        mutate.run {
-                            @Suppress("DEPRECATION")
-                            if (wifi.enableNetwork(id, false)) WifiReason.NONE else WifiReason.RESTORE_FAILED
-                        }
-                    } catch (_: Exception) {
-                        WifiReason.RESTORE_FAILED
+                    if (selection == WifiReason.NONE) targetId else {
+                        logOperationFailure("RESTORE", selection)
+                        null
                     }
-                    if (failure != WifiReason.NONE) logOperationFailure("RESTORE", failure)
+                }
+                val reenableFailure = reenableWifiRecoveryNetworks(expectedAutoJoin, selectedTargetId) { id ->
+                    mutate.run {
+                        @Suppress("DEPRECATION")
+                        if (wifi.enableNetwork(id, false)) WifiReason.NONE else WifiReason.RESTORE_FAILED
+                    }
                 }
                 // enableNetwork(id, true) already starts the connection (observed on PUI 5.15.7).
                 // Without a selected target, ask the OS to rejoin any restored network.
-                if (targetSelected) return@restoreWifiRecoveryBestEffort WifiReason.NONE
+                if (selectedTargetId != null) return@restoreWifiRecoveryBestEffort reenableFailure
                 val reconnectFailure = try {
                     mutate.run {
                         @Suppress("DEPRECATION")
@@ -499,7 +505,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                     WifiReason.RESTORE_FAILED
                 }
                 if (reconnectFailure != WifiReason.NONE) logOperationFailure("RESTORE", reconnectFailure)
-                WifiReason.NONE
+                reenableFailure
             },
             verify = {
                 val restored = try {
@@ -564,7 +570,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
 
     private fun requireAuthority() {
         // PUI exposes A94U0 to application processes and A9210 through ADB on this device.
-        if (!supportsPico4UltraEnterpriseSettings()) throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
+        if (!supportsManagedWifi()) throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
         if (appContext.checkSelfPermission("android.permission.ACCESS_FINE_LOCATION") != PackageManager.PERMISSION_GRANTED ||
             appContext.checkSelfPermission("android.permission.ACCESS_BACKGROUND_LOCATION") != PackageManager.PERMISSION_GRANTED
         ) {
@@ -584,8 +590,14 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         return reason
     }
 
+    // The configuration and update helpers run only inside guarded, which requires API 33.
+    @TargetApi(Build.VERSION_CODES.R)
     private fun configuration(profile: WifiNetworkProfile, original: WifiConfiguration? = null): WifiConfiguration {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
+        val desiredSecurity = desiredWifiSecurityView(profile)
+            ?: throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
+        if (desiredSecurity == "SAE" && manager?.isWpa3SaeSupported != true) {
+            throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
+        }
         val config = if (original == null) {
             WifiConfiguration()
         } else {
@@ -595,55 +607,33 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             networkId = original?.networkId ?: -1
             SSID = "\"${profile.ssid}\""
             hiddenSSID = profile.hidden
-            val desiredSecurity = desiredWifiSecurityView(profile)
-                ?: throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
-            val originalSecurity = when {
-                original?.allowedKeyManagement?.get(WifiConfiguration.KeyMgmt.SAE) == true -> "SAE"
-                original?.allowedKeyManagement?.get(WifiConfiguration.KeyMgmt.WPA_PSK) == true -> "WPA_PSK"
-                original?.allowedKeyManagement?.get(WifiConfiguration.KeyMgmt.NONE) == true -> "OPEN"
-                else -> null
-            }
-            if (originalSecurity != desiredSecurity) {
+            if (original?.securityView() != desiredSecurity) {
                 when (desiredSecurity) {
                     "OPEN" -> setSecurityParams(WifiConfiguration.SECURITY_TYPE_OPEN)
-                    "SAE" -> {
-                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || manager?.isWpa3SaeSupported != true) {
-                            throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
-                        }
-                        setSecurityParams(WifiConfiguration.SECURITY_TYPE_SAE)
-                    }
+                    "SAE" -> setSecurityParams(WifiConfiguration.SECURITY_TYPE_SAE)
                     "WPA_PSK" -> setSecurityParams(WifiConfiguration.SECURITY_TYPE_PSK)
                 }
             }
-            when {
-                profile.security == "OPEN" -> {
-                    preSharedKey = null
-                }
-                profile.security == "WPA2_WPA3" && profile.requiresSaeOnly -> {
-                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || manager?.isWpa3SaeSupported != true) {
-                        throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
-                    }
-                    preSharedKey = "\"${profile.password}\""
-                }
-                profile.security == "WPA2_WPA3" -> {
-                    preSharedKey = "\"${profile.password}\""
-                }
-                else -> throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
-            }
+            preSharedKey = if (desiredSecurity == "OPEN") null else "\"${profile.password}\""
         }
     }
 
+    @TargetApi(Build.VERSION_CODES.TIRAMISU)
     @Suppress("DEPRECATION")
-    private fun updateSavedNetwork(wifi: WifiManager, config: WifiConfiguration): Int {
-        // The setting has no public accessor before Android 13.
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return wifi.updateNetwork(config)
-        return updateWithMacRandomizationFallback { setting ->
+    private fun updateSavedNetwork(wifi: WifiManager, config: WifiConfiguration): Int =
+        updateWithMacRandomizationFallback { setting ->
             config.macRandomizationSetting = setting
             wifi.updateNetwork(config)
         }
-    }
 
     private fun logOperationFailure(operation: String, reason: WifiReason) {
         android.util.Log.w("WifiSettings", "Wi-Fi operation $operation failed: ${reason.wireValue}")
     }
+}
+
+private fun WifiConfiguration.securityView(): String = when {
+    allowedKeyManagement.get(WifiConfiguration.KeyMgmt.SAE) -> "SAE"
+    allowedKeyManagement.get(WifiConfiguration.KeyMgmt.WPA_PSK) -> "WPA_PSK"
+    allowedKeyManagement.get(WifiConfiguration.KeyMgmt.NONE) && wepKeys.all { it == null } -> "OPEN"
+    else -> "OTHER:$allowedKeyManagement"
 }

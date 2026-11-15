@@ -5,11 +5,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.net.wifi.ScanResult
+import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
+import androidx.annotation.RequiresApi
 
 internal enum class WifiPriorityMonitorStatus(val wireValue: String) {
     OFF("off"),
@@ -127,17 +129,13 @@ internal class WifiPriorityScanLoop(
     }
 
     private fun requestScan(token: Long) {
-        val shouldRequest = synchronized(lock) {
+        synchronized(lock) {
             if (!active || generation != token) return
             nextRequest = null
             requestedAtElapsedMillis = nowElapsed()
-            true
         }
-        if (!shouldRequest) return
         val accepted = try {
             backend.startScan()
-        } catch (_: SecurityException) {
-            false
         } catch (_: Exception) {
             false
         }
@@ -154,12 +152,10 @@ internal class WifiPriorityScanLoop(
             return
         }
         val timeout = Runnable { onBroadcastTimeout(token) }
-        val old = synchronized(lock) {
+        synchronized(lock) {
             if (!active || generation != token) return
             broadcastTimeout = timeout
-            null
         }
-        old?.let(scheduler::cancel)
         emit(token, WifiPriorityScanEvent(WifiPriorityMonitorStatus.MONITORING, detail = "scan_requested"))
         scheduler.schedule(timeout, broadcastTimeoutMillis)
     }
@@ -238,9 +234,11 @@ internal class WifiPriorityScanLoop(
             if (!active || generation != token) return null
             targets
         }
-        return fresh.mapNotNull { sample ->
-            availableTargets.filter { !it.hidden && wifiScanMatchesProfile(sample, it) }.map { it.identity }
-        }.flatten().toSet()
+        return buildSet {
+            for (target in availableTargets) {
+                if (!target.hidden && fresh.any { wifiScanMatchesProfile(it, target) }) add(target.identity)
+            }
+        }
     }
 
     private fun failedRequest(token: Long): Long = synchronized(lock) {
@@ -251,13 +249,11 @@ internal class WifiPriorityScanLoop(
     }
 
     private fun onBroadcastTimeout(token: Long) {
-        val pending = synchronized(lock) {
+        synchronized(lock) {
             if (!active || generation != token || requestedAtElapsedMillis == null) return
             requestedAtElapsedMillis = null
             broadcastTimeout = null
-            true
         }
-        if (!pending) return
         val delay = failedRequest(token)
         emit(token, WifiPriorityScanEvent(WifiPriorityMonitorStatus.DEGRADED, detail = "scan_broadcast_timeout"))
         scheduleRequest(token, delay)
@@ -281,6 +277,7 @@ internal class WifiPriorityScanLoop(
     }
 }
 
+@RequiresApi(Build.VERSION_CODES.TIRAMISU)
 internal class AndroidWifiPriorityScanBackend(
     context: Context,
     private val handler: Handler,
@@ -306,14 +303,8 @@ internal class AndroidWifiPriorityScanBackend(
             }
         }
         val filter = IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
-        if (Build.VERSION.SDK_INT >= 33) {
-            // PUI delivers scan results through the Wi-Fi system process. The probe APK
-            // received this protected system broadcast as an exported dynamic receiver.
-            appContext.registerReceiver(nextReceiver, filter, null, handler, Context.RECEIVER_EXPORTED)
-        } else {
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            appContext.registerReceiver(nextReceiver, filter, null, handler)
-        }
+        // PUI delivers this protected broadcast through the Wi-Fi system process.
+        appContext.registerReceiver(nextReceiver, filter, null, handler, Context.RECEIVER_EXPORTED)
         receiver = nextReceiver
     }
 
@@ -327,11 +318,7 @@ internal class AndroidWifiPriorityScanBackend(
 
     private fun ScanResult.toWifiScanSample(): WifiScanSample? {
         if (SSID.isEmpty()) return null
-        val observedSecurityTypes = if (Build.VERSION.SDK_INT >= 33) {
-            wifiScanSecurityTypes(securityTypes.toSet())
-        } else {
-            wifiScanSecurity(capabilities)
-        }
+        val observedSecurityTypes = wifiScanSecurityTypes(securityTypes.toSet())
         if (observedSecurityTypes.isEmpty()) return null
         return WifiScanSample(SSID, observedSecurityTypes, timestamp / 1_000L)
     }
@@ -346,6 +333,7 @@ internal class AndroidWifiPriorityScanScheduler(private val handler: Handler) : 
  * Scan requests and scan-result reads are Binder calls, so they run on a dedicated thread
  * instead of the main thread. The controller is a process-wide singleton, so one thread suffices.
  */
+@RequiresApi(Build.VERSION_CODES.TIRAMISU)
 internal fun systemWifiPriorityScanSource(context: Context): WifiPriorityScanSource {
     val thread = HandlerThread("wifi-priority-scan").apply { start() }
     val handler = Handler(thread.looper)
@@ -357,53 +345,20 @@ internal fun systemWifiPriorityScanSource(context: Context): WifiPriorityScanSou
     )
 }
 
-/** Match only security modes the Wi-Fi policy can configure. */
-internal fun wifiScanMatchesProfile(sample: WifiScanSample, profile: WifiNetworkProfile): Boolean {
-    if (sample.ssid != profile.ssid) return false
-    return when (profile.security) {
-        "OPEN" -> "OPEN" in sample.securityTypes
-        "WPA2_WPA3" -> when (profile.password.length) {
-            in 1..7 -> "SAE" in sample.securityTypes
-            in 8..63 -> "WPA_PSK" in sample.securityTypes || "SAE" in sample.securityTypes
-            else -> false
-        }
-        else -> false
-    }
-}
-
-/** Parse the supported subset without treating an unknown protected mode as open. */
-internal fun wifiScanSecurity(capabilities: String): Set<String> {
-    val tokens = Regex("\\[[^]]*]").findAll(capabilities.uppercase()).map { it.value }.toSet()
-    if (tokens.isEmpty()) return emptySet()
-
-    val unsupportedMarkers = listOf(
-        "WAPI", "OWE", "DPP", "OSEN", "SUITE_B", "EAP", "WEP", "FILS", "PASSPOINT",
-    )
-    if (unsupportedMarkers.any { marker -> tokens.any { marker in it } }) return emptySet()
-
-    val supported = buildSet {
-        if (tokens.any { "PSK" in it }) add("WPA_PSK")
-        if (tokens.any { "SAE" in it }) add("SAE")
-    }
-    if (supported.isNotEmpty()) return supported
-
-    // Do not classify an unfamiliar privacy/WPA/RSN advertisement as an open network.
-    if (tokens.any { "PRIVACY" in it || "WPA" in it || "RSN" in it || "SAE" in it || "PSK" in it }) {
-        return emptySet()
-    }
-    return if (tokens.all { it == "[ESS]" || it == "[IBSS]" }) setOf("OPEN") else emptySet()
-}
+/** Both the policy parser and saved profile decoder validate profiles before monitoring. */
+internal fun wifiScanMatchesProfile(sample: WifiScanSample, profile: WifiNetworkProfile): Boolean =
+    sample.ssid == profile.ssid && sample.securityTypes.any { wifiSecurityViewMatchesProfile(profile, it) }
 
 /** API 33 ScanResult can advertise PSK and SAE together for transition-mode APs. */
 internal fun wifiScanSecurityTypes(types: Set<Int>): Set<String> {
     val supported = setOf(
-        android.net.wifi.WifiInfo.SECURITY_TYPE_PSK,
-        android.net.wifi.WifiInfo.SECURITY_TYPE_SAE,
+        WifiInfo.SECURITY_TYPE_PSK,
+        WifiInfo.SECURITY_TYPE_SAE,
     )
-    if (types == setOf(android.net.wifi.WifiInfo.SECURITY_TYPE_OPEN)) return setOf("OPEN")
+    if (types == setOf(WifiInfo.SECURITY_TYPE_OPEN)) return setOf("OPEN")
     if (types.isEmpty() || types.any { it !in supported }) return emptySet()
     return buildSet {
-        if (android.net.wifi.WifiInfo.SECURITY_TYPE_PSK in types) add("WPA_PSK")
-        if (android.net.wifi.WifiInfo.SECURITY_TYPE_SAE in types) add("SAE")
+        if (WifiInfo.SECURITY_TYPE_PSK in types) add("WPA_PSK")
+        if (WifiInfo.SECURITY_TYPE_SAE in types) add("SAE")
     }
 }

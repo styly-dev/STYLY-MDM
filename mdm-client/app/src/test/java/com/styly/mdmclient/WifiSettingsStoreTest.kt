@@ -1,9 +1,9 @@
 package com.styly.mdmclient
 
 import java.io.File
-import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -42,11 +42,14 @@ class WifiSettingsStoreTest {
             restoreDeadlineElapsedMillis = 70_000L,
             restoreBootCount = 133,
         )
+        val result = WifiManualResult(
+            operation.operationId, operation.revision, "failed", WifiReason.RESTORE_UNCONFIRMED, false,
+        )
         val expected = WifiLocalState(
             lastApplied = WifiSavedProfile(operation.revision, listOf(oldProfile), autoReturn = false),
             manualOperation = operation,
-            latestResult = WifiManualResult(operation.operationId, operation.revision, "failed", WifiReason.RESTORE_UNCONFIRMED, false),
-            processedOperationIds = listOf(operation.operationId),
+            latestResult = result,
+            policyReceipt = WifiPolicyReceipt(operation.operationId, operation.revision, result),
             managedWifi = false,
             policyEpoch = 6L,
             policyRevision = operation.revision,
@@ -56,6 +59,23 @@ class WifiSettingsStoreTest {
 
         assertEquals(expected, store.read())
         assertEquals(2, JSONObject(file.readText()).getInt("version"))
+    }
+
+    @Test
+    fun `latest Wi-Fi telemetry alone cannot settle a package attempt`() {
+        val result = WifiManualResult(
+            "00000001-0000-4000-8000-000000000001",
+            "00000002-0000-4000-8000-000000000002",
+            "success", WifiReason.NONE, false,
+        )
+        val saved = JSONObject(WifiSettingsCodec.encode(WifiLocalState(latestResult = result))).apply {
+            remove("policy_receipt")
+        }
+
+        val decoded = WifiSettingsCodec.decode(saved.toString())
+
+        assertEquals(result, decoded.latestResult)
+        assertNull(decoded.policyReceipt)
     }
 
     @Test
@@ -70,18 +90,6 @@ class WifiSettingsStoreTest {
         assertThrows(IllegalArgumentException::class.java) {
             WifiSettingsCodec.decode(current.put("version", 3).toString())
         }
-    }
-
-    @Test
-    fun `operation receipts stay distinct and bounded`() {
-        val ids = (0..500).map(::operationId)
-        val encoded = JSONObject(WifiSettingsCodec.encode(WifiLocalState()))
-            .put("processed_operation_ids", JSONArray(ids))
-
-        val receipts = WifiSettingsCodec.decode(encoded.toString()).processedOperationIds
-
-        assertEquals(WIFI_MAX_OPERATION_RECEIPTS, receipts.size)
-        assertEquals(ids.takeLast(WIFI_MAX_OPERATION_RECEIPTS), receipts)
     }
 
     @Test
@@ -108,7 +116,4 @@ class WifiSettingsStoreTest {
 
         assertEquals(corrupt, file.readText())
     }
-
-    private fun operationId(value: Int): String =
-        "%08x-0000-4000-8000-%012x".format(value, value)
 }

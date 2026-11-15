@@ -34,15 +34,20 @@ internal data class WifiControllerDependencies(
     val schedulePriorityTimeout: (Runnable, Long) -> Unit = scheduleWatchdog,
     /** Returns a delay in 0..bound so headsets that lose Wi-Fi together do not retry together. */
     val jitter: (Long) -> Long = { 0L },
+    val platformSupported: Boolean = true,
 )
 
 internal data class WifiPolicyProgress(
     val result: WifiManualResult?,
     val settled: Boolean,
     val storageError: Boolean,
-    /** The operation was processed but a later Wi-Fi operation replaced its result. */
-    val resultLost: Boolean = false,
 )
+
+private enum class WifiRestoreProgress {
+    COMPLETE,
+    WAITING_FOR_CONNECTION,
+    FAILED,
+}
 
 internal const val WIFI_PRIOR_CONNECTION_OBSERVATION_MS = 2_000L
 
@@ -80,6 +85,17 @@ internal class WifiSettingsController internal constructor(
         var candidateIndex: Int = 0,
     )
 
+    private class PriorityRuntime(val epoch: Long) {
+        var connection: WifiLocalConnectivitySession? = null
+        var connectionToken: Any? = null
+        var scanToken: Any? = null
+        var disconnectCheck: Any? = null
+        var selectedWhileOffline = false
+        // Rollback also updates these fields under stateLock.
+        var retryAllowedAt = 0L
+        var failedReturns = 0
+    }
+
     companion object {
         private const val TAG = "WifiSettings"
         private const val WIFI_PRIORITY_CANDIDATE_TIMEOUT_MS = 12_000L
@@ -110,6 +126,7 @@ internal class WifiSettingsController internal constructor(
     private val bootCount = dependencies.bootCount
     private val readinessFailure = dependencies.readinessFailure
     private val jitter = dependencies.jitter
+    private val platformSupported = dependencies.platformSupported
     private val stateListeners = java.util.concurrent.CopyOnWriteArraySet<() -> Unit>()
     @Volatile private var unavailableReason: String? = "INITIALIZING"
     private val activeMutations = AtomicInteger(0)
@@ -119,20 +136,7 @@ internal class WifiSettingsController internal constructor(
     private var restoreOwnerOperationId: String? = null
     private var restoreSession: WifiLocalConnectivitySession? = null
     private var restoreSessionOperationId: String? = null
-    private var prioritySession: WifiLocalConnectivitySession? = null
-    private var prioritySessionRevision: String? = null
-    private var prioritySessionEpoch: Long? = null
-    private var priorityScanRevision: String? = null
-    private var priorityScanEpoch: Long? = null
-    // One ordered reselection per offline period; after that the OS auto-join takes over
-    // until a usable connection is seen again.
-    private var offlineSelectionRevision: String? = null
-    private var offlineSelectionEpoch = 0L
-    private var autoReturnRetryRevision: String? = null
-    private var autoReturnRetryEpoch = 0L
-    private var autoReturnRetryAllowedAtElapsedMillis = 0L
-    private var priorityDisconnectGeneration = 0L
-    private var autoReturnFailures = 0
+    private var priorityRuntime: PriorityRuntime? = null
     private var restoreFailureRetryOperationId: String? = null
     private var restoreFailureRetries = 0
     @Volatile private var priorityMonitorStatus = WifiPriorityMonitorStatus.OFF
@@ -192,7 +196,11 @@ internal class WifiSettingsController internal constructor(
     fun refreshReadiness() { operationExecutor.execute(::updateReadiness) }
 
     private fun updateReadiness() {
-        val next = try { readinessFailure()?.wireValue } catch (_: Exception) { WifiReason.UNKNOWN.wireValue }
+        val next = if (!platformSupported) WifiReason.UNSUPPORTED.wireValue else try {
+            readinessFailure()?.wireValue
+        } catch (_: Exception) {
+            WifiReason.UNKNOWN.wireValue
+        }
         if (next == unavailableReason) return
         unavailableReason = next
         notifyStateChanged()
@@ -214,7 +222,7 @@ internal class WifiSettingsController internal constructor(
     internal fun onRollbackDeadline(operationId: String, alarmDeadline: Long) {
         // Startup recovery is the sole restoration owner until it completes. It already
         // inspects every durable manual journal, so a cold-start alarm can safely defer.
-        if (!startup.isDone) return
+        if (!platformSupported || !startup.isDone) return
         val operation = synchronized(stateLock) { state?.manualOperation?.takeIf { it.operationId == operationId } }
             ?: return
         if (alarmDeadline < 0 || operation.deadlineElapsedMillis != alarmDeadline ||
@@ -223,50 +231,81 @@ internal class WifiSettingsController internal constructor(
         requestRollback(operationId, WifiReason.TIMEOUT_ROLLED_BACK)
     }
 
-    fun applyManagedPolicy(operationId: String, revision: String, settings: JSONObject) {
+    fun applyManagedPolicy(
+        operationId: String, revision: String, settings: JSONObject, reuseMatchingProfile: Boolean = false,
+    ) {
+        if (!WifiSettingsProtocol.isValidUuid(operationId) || !WifiSettingsProtocol.isValidUuid(revision)) return
+        val reuse = synchronized(stateLock) {
+            val current = state ?: return
+            if (current.policyReceipt?.operationId == operationId) return
+            val receipt = WifiPolicyReceipt(operationId, revision)
+            // The same commit claims the handoff and supersedes any earlier release. A later
+            // release is then durable even while the admitted request is still queued.
+            if (!writeAndCommit(current.copy(policyReceipt = receipt, pendingRelease = null))) return
+            reuseMatchingProfile && current.pendingRelease == null
+        }
         operationExecutor.execute {
-            // A newer managed policy supersedes a release that is still waiting.
-            synchronized(stateLock) {
-                state?.takeIf { it.pendingRelease != null }?.let { writeAndCommit(it.copy(pendingRelease = null)) }
-            }
             updateReadiness()
-            acceptManualCommand(operationId, revision) {
-                WifiSettingsProtocol.parseManagedPolicy(operationId, revision, settings.getJSONObject("wifi"))
+            acceptPolicyRequest(operationId, revision, settings, reuse)
+        }
+    }
+
+    /** Carries a verified profile forward without a platform write or reconnect. */
+    private fun reuseAppliedProfile(operationId: String, requested: WifiSavedProfile): Boolean {
+        synchronized(stateLock) {
+            val current = state ?: return false
+            val applied = current.lastApplied ?: return false
+            if (!startup.isDone || !storageHealthy || !current.managedWifi || current.policyRevision != applied.revision ||
+                current.manualOperation != null || current.policyReceipt?.operationId != operationId ||
+                !applied.hasSameSettings(requested)
+            ) return false
+            val result = WifiManualResult(operationId, requested.revision, "success", WifiReason.NONE, false)
+            if (!writeAndCommit(current.withAppliedProfile(requested).withOperationResult(result))) return true
+        }
+        reconcilePriorityRuntime()
+        return true
+    }
+
+    /** Reassignment resumes an already applied policy without repeating its settings writes. */
+    fun resumeAppliedPolicy(revision: String, wifi: JSONObject, isCurrent: () -> Boolean) {
+        if (!platformSupported) return
+        val requested = try {
+            WifiSettingsProtocol.parseManagedPolicy(revision, wifi)
+        } catch (_: Exception) {
+            return
+        }
+        startup.whenComplete { _, _ ->
+            operationExecutor.execute {
+                val resumed = synchronized(stateLock) {
+                    if (!isCurrent() || !storageHealthy) return@synchronized false
+                    val current = state ?: return@synchronized false
+                    val applied = current.lastApplied ?: return@synchronized false
+                    if (!applied.hasSameSettings(requested)) return@synchronized false
+                    val operation = current.manualOperation
+                    // A matching automatic selection can finish under its existing epoch.
+                    if (operation != null && (!operation.selectionOnly || operation.revision != revision ||
+                            applied.revision != revision)
+                    ) return@synchronized false
+                    val next = current.withAppliedProfile(requested).copy(pendingRelease = null)
+                    next != current && writeAndCommit(next)
+                }
+                if (resumed) reconcilePriorityRuntimeNow()
             }
         }
     }
 
-    /**
-     * Keeps the current connection when [revision] carries the Wi-Fi settings that are already
-     * applied. A package revision also changes when only unrelated settings change; reselecting
-     * Wi-Fi then would interrupt every headset for nothing. Returns false when Wi-Fi must be applied.
-     */
-    fun keepAppliedPolicy(revision: String, wifi: JSONObject): Boolean {
-        val requested = try {
-            WifiSettingsProtocol.parseManagedPolicy(UUID.randomUUID().toString(), revision, wifi)
-        } catch (_: Exception) {
-            return false
-        }
-        val adopted = synchronized(stateLock) {
-            val current = state ?: return false
-            val applied = current.lastApplied ?: return false
-            if (!startup.isDone || !storageHealthy || !current.managedWifi || current.manualOperation != null ||
-                current.pendingRelease != null || current.policyRevision != applied.revision ||
-                applied.networks != requested.networks || applied.autoReturn != requested.autoReturn
-            ) return false
-            if (applied.revision == revision) return true
-            val next = current.copy(
-                lastApplied = applied.copy(revision = revision),
-                policyRevision = revision,
-                latestResult = WifiManualResult(requested.operationId, revision, "success", WifiReason.NONE, false),
-            )
-            if (!writeAndCommit(next)) return false
-            if (autoReturnRetryRevision == applied.revision) autoReturnRetryRevision = revision
-            true
-        }
-        // The priority monitor is keyed by revision; move it to the adopted one without reselecting.
-        if (adopted) reconcilePriorityRuntime()
-        return adopted
+    private fun WifiLocalState.withAppliedProfile(
+        profile: WifiSavedProfile,
+        rewroteWifi: Boolean = false,
+    ): WifiLocalState {
+        val newGeneration = !managedWifi || lastApplied?.hasSameSettings(profile) != true ||
+            (rewroteWifi && policyRevision != profile.revision)
+        return copy(
+            managedWifi = true,
+            policyRevision = profile.revision,
+            lastApplied = profile,
+            policyEpoch = if (newGeneration) policyEpoch + 1 else policyEpoch,
+        )
     }
 
     /** Wait for a live rollback. A new policy attempt can retry a settled restore failure. */
@@ -275,22 +314,17 @@ internal class WifiSettingsController internal constructor(
     fun policyProgress(operationId: String, revision: String): WifiPolicyProgress = synchronized(stateLock) {
         val current = state
         val operation = current?.manualOperation?.takeIf { it.operationId == operationId }
-        val settledNow = readyForPolicyLocked()
-        // The receipt proves the Wi-Fi worker handled this operation. Without an active
-        // operation or a matching result, a later automatic operation replaced its result.
-        val replaced = settledNow && operation == null && current?.latestResult?.operationId != operationId &&
-            current?.processedOperationIds?.contains(operationId) == true
-        // Only a successful apply makes this revision the applied one, so that outcome is still known.
-        val inferredSuccess = replaced && current?.managedWifi == true && current.lastApplied?.revision == revision
-        val result = current?.latestResult?.takeIf { it.operationId == operationId && it.revision == revision }
-            ?: if (inferredSuccess) WifiManualResult(operationId, revision, "success", WifiReason.NONE, false) else null
+        val settledNow = readyForPolicyLocked() ||
+            (!storageHealthy && startup.isDone && current?.manualOperation == null && activeMutations.get() == 0)
+        val result = current?.policyReceipt?.takeIf {
+            it.operationId == operationId && it.revision == revision
+        }?.result
         val unconfirmedRestoreIsTerminal = operation?.settingsRestored == true &&
             result?.reason == WifiReason.RESTORE_UNCONFIRMED
         WifiPolicyProgress(
             result,
             settledNow || unconfirmedRestoreIsTerminal,
             !storageHealthy,
-            resultLost = replaced && !inferredSuccess,
         )
     }
 
@@ -307,18 +341,17 @@ internal class WifiSettingsController internal constructor(
      * once that operation settles, including after a process restart.
      */
     fun stopManagingPolicy(revision: String? = null) {
-        operationExecutor.execute {
-            val recorded = synchronized(stateLock) {
-                val current = state ?: return@execute
-                if (!releaseNeeded(current)) return@execute
-                val request = WifiPendingRelease(revision)
-                current.pendingRelease == request || writeAndCommit(current.copy(pendingRelease = request))
-            }
-            if (recorded) processPendingRelease()
+        synchronized(stateLock) {
+            val current = state ?: return
+            if (!releaseNeeded(current) && current.policyReceipt?.awaitsOperation(current) != true) return
+            val request = WifiPendingRelease(revision)
+            if (request != current.pendingRelease) writeAndCommit(current.copy(pendingRelease = request))
         }
     }
 
-    /** Whether anything is managed or an operation still owns Wi-Fi. */
+    private fun WifiPolicyReceipt.awaitsOperation(current: WifiLocalState): Boolean =
+        result == null && operationId != current.manualOperation?.operationId
+
     private fun releaseNeeded(current: WifiLocalState): Boolean =
         current.manualOperation != null || (current.managedWifi && current.policyRevision != null)
 
@@ -327,184 +360,174 @@ internal class WifiSettingsController internal constructor(
         if (waiting) operationExecutor.execute(::processPendingRelease)
     }
 
+    private fun releaseBlocksSelectionLocked(operation: WifiManualOperation): Boolean =
+        operation.selectionOnly && !operation.settingsChanged && state?.pendingRelease != null
+
+    private fun releaseWaitingForSelection(operationId: String): Boolean = synchronized(stateLock) {
+        state?.manualOperation?.let {
+            it.operationId == operationId && releaseBlocksSelectionLocked(it)
+        } == true
+    }
+
     /** Runs on the operation executor only. Clears the request only with the durable release. */
     private fun processPendingRelease() {
-        val command = synchronized(stateLock) {
+        var closeRestoreSession: WifiLocalConnectivitySession? = null
+        val abandoned = synchronized(stateLock) {
             val current = state ?: return
             val request = current.pendingRelease ?: return
-            // Startup recovery owns an interrupted journal until it completes.
-            if (!startup.isDone) return
-            val active = current.manualOperation
-            if (active == null && !releaseNeeded(current)) {
+            if (!startup.isDone || current.policyReceipt?.awaitsOperation(current) == true) return
+            if (!releaseNeeded(current)) {
                 writeAndCommit(current.copy(pendingRelease = null))
                 return
             }
+            val active = current.manualOperation
             if (active != null && !canReleaseDuring(active)) return
             val revision = request.revision ?: active?.revision ?: checkNotNull(current.policyRevision)
-            WifiApplyCommand(UUID.randomUUID().toString(), revision, WifiApplyMode.UNMANAGED, emptyList())
+            val terminal = WifiManualResult(UUID.randomUUID().toString(), revision, "success", WifiReason.NONE, false)
+            val receipt = current.policyReceipt
+            val next = current.copy(
+                managedWifi = false,
+                manualOperation = null,
+                policyEpoch = current.policyEpoch + 1L,
+                policyRevision = revision,
+                latestResult = terminal,
+                policyReceipt = if (receipt != null && receipt.result == null &&
+                    receipt.operationId == active?.operationId
+                ) receipt.interrupted() else receipt,
+                pendingRelease = null,
+            )
+            if (!writeAndCommit(next)) return
+            closeRestoreSession = active?.let { takeRestoreSessionLocked(it.operationId) }
+            active
         }
-        applyUnmanagedCommand(command)
+        closeRestoreSession?.close()
+        abandoned?.let {
+            cancelAlarm(it.operationId)
+            closeAttempt(it.operationId)
+        }
+        reconcilePriorityRuntimeNow()
     }
 
-    /** A release may end an operation only after its settings are restored and nothing mutates. */
+    private fun WifiPolicyReceipt.interrupted() =
+        copy(result = WifiManualResult(operationId, revision, "unknown", WifiReason.UNKNOWN, false))
+
+    /** A release can abandon an untouched selection or wait for an active mutation to settle. */
     private fun canReleaseDuring(operation: WifiManualOperation): Boolean =
         activeMutations.get() == 0 && restoreOwnerOperationId == null &&
-            ((operation.settingsRestored && operation.phase == WifiManualPhase.RESTORING_CONNECTION) ||
+            ((operation.selectionOnly && !operation.settingsChanged) ||
+                (operation.settingsRestored && operation.phase == WifiManualPhase.RESTORING_CONNECTION) ||
                 isAbandonable(operation))
 
     private fun isAbandonable(operation: WifiManualOperation): Boolean =
         operation.phase == WifiManualPhase.ROLLING_BACK && operation.failureReason == WifiReason.RESTORE_FAILED &&
             startup.isDone && activeMutations.get() == 0 && restoreOwnerOperationId == null
 
-    private fun acceptManualCommand(operationId: String, revision: String, parse: () -> WifiApplyCommand) {
-        if (!WifiSettingsProtocol.isValidUuid(operationId) || !WifiSettingsProtocol.isValidUuid(revision)) return
+    private fun acceptPolicyRequest(
+        operationId: String, revision: String, settings: JSONObject, reuseMatchingProfile: Boolean,
+    ) {
+        fun fail(reason: WifiReason) {
+            persist { it.withOperationResult(WifiManualResult(operationId, revision, "failed", reason, false)) }
+        }
 
-        if (synchronized(stateLock) { state?.processedOperationIds?.contains(operationId) == true }) return
-
+        val claimed = synchronized(stateLock) {
+            state?.policyReceipt?.let { it.operationId == operationId && it.result == null } == true
+        }
+        if (!claimed) return
         try {
-            val parsed = parse()
-            if (parsed.operationId != operationId || parsed.revision != revision) return
-            if (parsed.autoReturn && priorityScanSource == null) {
-                persistManualResult(WifiManualResult(operationId, revision, "failed", WifiReason.UNSUPPORTED, false))
+            val requested = WifiSettingsProtocol.parseManagedPolicy(revision, settings.getJSONObject("wifi"))
+            if (!platformSupported || (requested.autoReturn && priorityScanSource == null)) {
+                fail(WifiReason.UNSUPPORTED)
                 return
             }
             val unconfirmedRestore = synchronized(stateLock) {
                 state?.manualOperation?.takeIf { it.settingsRestored && it.phase == WifiManualPhase.RESTORING_CONNECTION }
             }
-            if (unconfirmedRestore != null && !supersedeRestoredConnection(unconfirmedRestore)) {
-                persistManualResult(WifiManualResult(operationId, revision, "failed", WifiReason.BUSY, false))
+            if (unconfirmedRestore != null && !supersedeRestoredConnection(unconfirmedRestore.operationId)) {
+                fail(WifiReason.BUSY)
                 return
             }
             val failedRestore = synchronized(stateLock) { state?.manualOperation?.takeIf(::isAbandonable) }
-            if (failedRestore != null && !restoreClaimedOperation(
+            if (failedRestore != null) {
+                when (restoreClaimedOperation(
                     failedRestore.operationId, WifiReason.RESTORE_FAILED, allowExistingClaim = true,
-                )
-            ) {
-                persistManualResult(WifiManualResult(operationId, revision, "failed", WifiReason.RESTORE_FAILED, false))
-                return
-            }
-            val current = synchronized(stateLock) {
-                val current = state ?: return@synchronized null
-                if (current.manualOperation != null) null else current
-            }
-            if (current == null) {
-                val current = synchronized(stateLock) { state }
-                val reason = when {
-                    current == null -> return
-                    current.manualOperation != null -> WifiReason.BUSY
-                    else -> WifiReason.UNKNOWN
+                )) {
+                    WifiRestoreProgress.COMPLETE -> Unit
+                    WifiRestoreProgress.FAILED -> {
+                        fail(WifiReason.RESTORE_FAILED)
+                        return
+                    }
+                    WifiRestoreProgress.WAITING_FOR_CONNECTION -> {
+                        if (!supersedeRestoredConnection(failedRestore.operationId)) {
+                            fail(WifiReason.BUSY)
+                            return
+                        }
+                    }
                 }
-                persistManualResult(WifiManualResult(operationId, revision, "failed", reason, false))
+            }
+            if (reuseMatchingProfile && reuseAppliedProfile(operationId, requested)) return
+            val current = synchronized(stateLock) { state } ?: return
+            if (current.manualOperation != null) {
+                fail(WifiReason.BUSY)
                 return
             }
             val observationFailure = connectivity.preflight()
             if (observationFailure != null) {
-                persistManualResult(WifiManualResult(operationId, revision, "failed", observationFailure, false))
+                fail(observationFailure)
                 return
             }
             val recoverySnapshot = adapter.captureRecovery(current.lastApplied?.networks.orEmpty())
             val operation = synchronized(stateLock) {
                 val old = state ?: return@synchronized null
-                if (old.manualOperation != null || old.lastApplied != current.lastApplied) return@synchronized null
-                val manualOperation = WifiManualOperation(
+                if (old.manualOperation != null || old.lastApplied != current.lastApplied ||
+                    old.policyReceipt?.operationId != operationId
+                ) return@synchronized null
+                val prepared = WifiManualOperation(
                     operationId = operationId,
-                    revision = parsed.revision,
-                    candidate = parsed.networks,
+                    revision = requested.revision,
+                    candidate = requested.networks,
                     recoverySnapshot = recoverySnapshot,
                     phase = WifiManualPhase.PREPARED,
                     policyEpoch = old.policyEpoch,
-                    autoReturn = parsed.autoReturn,
+                    autoReturn = requested.autoReturn,
                 )
-                val next = old.copy(
-                    manualOperation = manualOperation,
-                    processedOperationIds = appendWifiOperationReceipt(old.processedOperationIds, operationId),
-                )
-                if (writeAndCommit(next)) manualOperation else null
+                if (writeAndCommit(old.copy(manualOperation = prepared))) prepared else null
             }
             if (operation == null) {
-                persistManualResult(WifiManualResult(operationId, revision, "failed", WifiReason.BUSY, false))
+                fail(WifiReason.BUSY)
                 return
             }
 
             operationExecutor.execute { applyManual(operation) }
         } catch (failure: WifiAdapterFailure) {
-            persistManualResult(WifiManualResult(operationId, revision, "failed", failure.reason, false))
+            fail(failure.reason)
         } catch (failure: WifiPolicyFailure) {
-            persistManualResult(WifiManualResult(operationId, revision, "failed", failure.reason, false))
+            fail(failure.reason)
         } catch (_: IllegalArgumentException) {
-            persistManualResult(WifiManualResult(operationId, revision, "failed", WifiReason.UNSUPPORTED, false))
+            fail(WifiReason.UNSUPPORTED)
         } catch (_: Exception) {
-            persistManualResult(WifiManualResult(operationId, revision, "failed", WifiReason.CONFIG_READ_FAILED, false))
+            fail(WifiReason.CONFIG_READ_FAILED)
         }
     }
 
-    /** Called by [processPendingRelease] only when no operation can still mutate Wi-Fi. */
-    private fun applyUnmanagedCommand(command: WifiApplyCommand) {
-        var abandonedOperationId: String? = null
-        var closeRestoreSession: WifiLocalConnectivitySession? = null
-        val committed = synchronized(stateLock) {
-            val old = state ?: return
-            val pending = old.manualOperation
-            if (pending != null && !canReleaseDuring(pending)) return@synchronized false
-            val terminal = WifiManualResult(
-                command.operationId,
-                command.revision,
-                "success",
-                WifiReason.NONE,
-                rolledBack = false,
-            )
-            val next = old.copy(
-                managedWifi = false,
-                manualOperation = null,
-                policyEpoch = old.policyEpoch + 1L,
-                policyRevision = command.revision,
-                latestResult = terminal,
-                processedOperationIds = appendWifiOperationReceipt(old.processedOperationIds, command.operationId),
-                pendingRelease = null,
-            )
-            if (writeAndCommit(next)) {
-                abandonedOperationId = pending?.operationId
-                if (pending != null && restoreSessionOperationId == pending.operationId) {
-                    closeRestoreSession = restoreSession
-                    restoreSession = null
-                    restoreSessionOperationId = null
-                }
-                true
-            } else {
-                false
-            }
-        }
-        if (!committed) return
-        closeRestoreSession?.close()
-        abandonedOperationId?.let { operationId ->
-            cancelAlarm(operationId)
-            closeAttempt(operationId)
-        }
-        reconcilePriorityRuntime()
-    }
-
-    private fun supersedeRestoredConnection(operation: WifiManualOperation): Boolean {
-        var close: WifiLocalConnectivitySession? = null
-        val superseded = synchronized(stateLock) {
-            val old = state ?: return@synchronized false
-            val current = old.manualOperation?.takeIf { it.operationId == operation.operationId } ?: return@synchronized false
-            if (!current.settingsRestored || current.phase != WifiManualPhase.RESTORING_CONNECTION ||
+    private fun supersedeRestoredConnection(operationId: String): Boolean {
+        val close = synchronized(stateLock) {
+            val old = state ?: return false
+            // The previous connection may already have been confirmed by its callback.
+            val current = old.manualOperation ?: return storageHealthy
+            if (current.operationId != operationId || !current.settingsRestored ||
+                current.phase != WifiManualPhase.RESTORING_CONNECTION ||
                 activeMutations.get() > 0 || restoreOwnerOperationId != null
-            ) return@synchronized false
-            if (!writeAndCommit(old.copy(manualOperation = null, policyEpoch = old.policyEpoch + 1L))) return@synchronized false
-            if (restoreSessionOperationId == operation.operationId) {
-                close = restoreSession
-                restoreSession = null
-                restoreSessionOperationId = null
-            }
-            true
+            ) return false
+            if (!writeAndCommit(old.copy(manualOperation = null))) return false
+            takeRestoreSessionLocked(operationId)
         }
         close?.close()
-        cancelAlarm(operation.operationId)
-        return superseded
+        cancelAlarm(operationId)
+        return true
     }
 
     private fun applyManual(operation: WifiManualOperation) {
+        if (releaseWaitingForSelection(operation.operationId)) return
         val session = try {
             connectivity.observe { event -> onConnectivityEvent(operation.operationId, event) }
         } catch (_: SecurityException) {
@@ -564,6 +587,7 @@ internal class WifiSettingsController internal constructor(
         observationWindowExpired: Boolean,
         acceptIdentifiedConnection: Boolean = !observationWindowExpired,
     ) {
+        if (releaseWaitingForSelection(operationId)) return
         var joinedByOs = false
         val resolved = synchronized(stateLock) {
             val currentState = state ?: return
@@ -669,13 +693,6 @@ internal class WifiSettingsController internal constructor(
             return
         }
         if (applyReason == WifiReason.NONE) {
-            if (operationToApply.selectionOnly) {
-                val deadlineFailure = prepareManualDeadline(operationToApply.operationId)
-                if (deadlineFailure != null) {
-                    finishManualFailure(operationToApply.operationId, deadlineFailure, rolledBack = false)
-                    return
-                }
-            }
             beginLocalReconnectFlow(operationToApply.operationId)
             return
         }
@@ -869,6 +886,7 @@ internal class WifiSettingsController internal constructor(
                 it.operationId == operationId && it.phase == WifiManualPhase.APPLYING &&
                     it.policyEpoch == current.policyEpoch
             } ?: return
+            if (releaseBlocksSelectionLocked(operation)) return
             val active = localAttempt?.takeIf { it.operationId == operationId } ?: return
             if (active.candidateIndex != expectedIndex ||
                 active.phase !in setOf(LocalAttemptPhase.RECONNECTING, LocalAttemptPhase.WAITING_FOR_FRESH_NETWORK)
@@ -1039,14 +1057,11 @@ internal class WifiSettingsController internal constructor(
                 return@synchronized false
             }
             val terminal = WifiManualResult(operationId, operation.revision, "success", WifiReason.NONE, false)
-            val next = old.copy(
-                lastApplied = if (operation.selectionOnly) old.lastApplied else
-                    WifiSavedProfile(operation.revision, operation.candidate, operation.autoReturn),
-                managedWifi = if (operation.selectionOnly) old.managedWifi else true,
-                policyRevision = if (operation.selectionOnly) old.policyRevision else operation.revision,
-                manualOperation = null,
-                latestResult = terminal,
+            val applied = if (operation.selectionOnly) old else old.withAppliedProfile(
+                WifiSavedProfile(operation.revision, operation.candidate, operation.autoReturn),
+                rewroteWifi = true,
             )
+            val next = applied.copy(manualOperation = null).withOperationResult(terminal)
             if (writeAndCommit(next)) {
                 delayAutomaticReturn(operation, succeeded = true)
                 localAttempt = null
@@ -1073,8 +1088,9 @@ internal class WifiSettingsController internal constructor(
     }
 
     private fun failManualBeforeReadiness(operationId: String, reason: WifiReason) {
-        val operation = synchronized(stateLock) { state?.manualOperation?.takeIf { it.operationId == operationId } }
-            ?: return
+        val operation = synchronized(stateLock) {
+            state?.manualOperation?.takeIf { it.operationId == operationId && !releaseBlocksSelectionLocked(it) }
+        } ?: return
         if (operation.settingsChanged || activeMutations.get() > 0) {
             requestRollback(operationId, reason)
         } else {
@@ -1112,30 +1128,29 @@ internal class WifiSettingsController internal constructor(
 
     private fun prepareManualDeadline(operationId: String): WifiReason? {
         val deadline = nowElapsed() + WIFI_MANUAL_TIMEOUT_MS
-        val persistedDeadline = synchronized(stateLock) {
-            val old = state ?: return@synchronized null
+        synchronized(stateLock) {
+            val old = state ?: return WifiReason.UNKNOWN
             val operation = old.manualOperation?.takeIf { it.operationId == operationId }
-                ?: return@synchronized null
+                ?: return WifiReason.UNKNOWN
             if (operation.policyEpoch != old.policyEpoch ||
                 operation.phase !in setOf(WifiManualPhase.PREPARED, WifiManualPhase.APPLYING)
             ) {
-                return@synchronized null
+                return WifiReason.UNKNOWN
             }
-            operation.deadlineElapsedMillis?.let { return@synchronized it }
+            if (releaseBlocksSelectionLocked(operation)) return WifiReason.BUSY
+            if (operation.deadlineElapsedMillis != null) return null
             val nextOperation = operation.copy(
                 phase = WifiManualPhase.APPLYING,
                 deadlineElapsedMillis = deadline,
             )
-            if (writeAndCommit(old.copy(manualOperation = nextOperation))) deadline else null
+            if (!writeAndCommit(old.copy(manualOperation = nextOperation))) return WifiReason.UNKNOWN
         }
-        if (persistedDeadline == null) return WifiReason.UNKNOWN
-        if (persistedDeadline != deadline) return null
         // The exact alarm is best-effort: it wakes a sleeping device and restarts a dead
         // process at the deadline. Without it, the watchdog and startup recovery still roll back.
-        if (!scheduleAlarm(operationId, persistedDeadline)) {
+        if (!scheduleAlarm(operationId, deadline)) {
             Log.w(TAG, "Exact rollback alarm unavailable; rollback may be delayed while the device sleeps")
         }
-        val delay = (persistedDeadline - nowElapsed()).coerceAtLeast(0)
+        val delay = (deadline - nowElapsed()).coerceAtLeast(0)
         scheduleWatchdog(Runnable { requestRollback(operationId, WifiReason.TIMEOUT_ROLLED_BACK) }, delay)
         return null
     }
@@ -1150,6 +1165,7 @@ internal class WifiSettingsController internal constructor(
             ) {
                 return@synchronized WifiReason.TIMEOUT_ROLLED_BACK
             }
+            if (releaseBlocksSelectionLocked(operation)) return@synchronized WifiReason.BUSY
             if (!operation.settingsChanged && !writeAndCommit(
                     old.copy(manualOperation = operation.copy(settingsChanged = true)),
                 )
@@ -1190,7 +1206,7 @@ internal class WifiSettingsController internal constructor(
         operationId: String,
         reason: WifiReason,
         allowExistingClaim: Boolean = false,
-    ): Boolean {
+    ): WifiRestoreProgress {
         val pendingConfirmation = synchronized(stateLock) {
             state?.manualOperation?.takeIf {
                 it.operationId == operationId && it.settingsRestored &&
@@ -1199,13 +1215,14 @@ internal class WifiSettingsController internal constructor(
         }
         if (pendingConfirmation != null) {
             resumeRestoreConfirmation(pendingConfirmation)
-            return false
+            return restoreProgress(operationId)
         }
-        val operation = claimRollback(operationId, reason, allowExistingClaim) ?: return false
+        val operation = claimRollback(operationId, reason, allowExistingClaim)
+            ?: return restoreProgress(operationId)
         closeAttempt(operationId)
         if (activeMutations.get() > 0) {
             finishManualUnknown(operationId)
-            return false
+            return WifiRestoreProgress.FAILED
         }
         val reserved = synchronized(stateLock) {
             val current = state?.manualOperation?.takeIf {
@@ -1214,7 +1231,7 @@ internal class WifiSettingsController internal constructor(
             if (activeMutations.get() != 0 || restoreOwnerOperationId != null) return@synchronized null
             restoreOwnerOperationId = operationId
             current
-        } ?: return false
+        } ?: return restoreProgress(operationId)
         val restoreReason = try {
             adapter.restoreRecovery(
                 snapshot = reserved.recoverySnapshot,
@@ -1250,7 +1267,17 @@ internal class WifiSettingsController internal constructor(
         } else {
             finishManualRestoreFailure(operationId)
         }
-        return synchronized(stateLock) { state?.manualOperation?.operationId != operationId }
+        return restoreProgress(operationId)
+    }
+
+    private fun restoreProgress(operationId: String): WifiRestoreProgress = synchronized(stateLock) {
+        val current = state?.manualOperation?.takeIf { it.operationId == operationId }
+        when {
+            current == null -> WifiRestoreProgress.COMPLETE
+            current.settingsRestored && current.phase == WifiManualPhase.RESTORING_CONNECTION ->
+                WifiRestoreProgress.WAITING_FOR_CONNECTION
+            else -> WifiRestoreProgress.FAILED
+        }
     }
 
     private fun beginRestoreConfirmation(operationId: String) {
@@ -1270,24 +1297,7 @@ internal class WifiSettingsController internal constructor(
             if (!writeAndCommit(old.copy(manualOperation = restoring))) return
             restoring
         }
-        if (!operation.priorConnectionHadUsableIp) {
-            // There is no previous connection whose recovery could be confirmed. The saved
-            // settings have been restored, so report the original operation failure with a
-            // completed rollback instead of turning an already-offline device into an
-            // unconfirmed connection restore.
-            finishManualFailure(
-                operation.operationId,
-                operation.failureReason ?: WifiReason.UNKNOWN,
-                rolledBack = true,
-            )
-            return
-        }
-        if (operation.restoreTarget == null) {
-            finishRestoreUnconfirmed(operation.operationId, operation.policyEpoch, deadline = null)
-            return
-        }
-        startRestoreObservation(operation)
-        scheduleRestoreDeadline(operation)
+        resumeRestoreConfirmation(operation)
     }
 
     private fun resumeRestoreConfirmation(operation: WifiManualOperation) {
@@ -1404,13 +1414,8 @@ internal class WifiSettingsController internal constructor(
             } ?: return
             val reason = operation.failureReason ?: WifiReason.UNKNOWN
             val terminal = WifiManualResult(operationId, operation.revision, "failed", reason, rolledBack = true)
-            if (!writeAndCommit(old.copy(manualOperation = null, latestResult = terminal))) return
-            delayAutomaticReturn(operation, succeeded = false)
-            if (restoreSessionOperationId == operationId) {
-                close = restoreSession
-                restoreSession = null
-                restoreSessionOperationId = null
-            }
+            if (!settleLocked(old, operation, terminal)) return
+            close = takeRestoreSessionLocked(operationId)
         }
         close?.close()
         cancelAlarm(operationId)
@@ -1448,13 +1453,8 @@ internal class WifiSettingsController internal constructor(
                 WifiReason.RESTORE_UNCONFIRMED,
                 rolledBack = false,
             )
-            if (!writeAndCommit(old.copy(manualOperation = null, latestResult = terminal))) return
-            delayAutomaticReturn(operation, succeeded = false)
-            if (restoreSessionOperationId == operationId) {
-                close = restoreSession
-                restoreSession = null
-                restoreSessionOperationId = null
-            }
+            if (!settleLocked(old, operation, terminal)) return
+            close = takeRestoreSessionLocked(operationId)
         }
         close?.close()
         cancelAlarm(operationId)
@@ -1468,14 +1468,8 @@ internal class WifiSettingsController internal constructor(
             val operation = old.manualOperation?.takeIf { it.operationId == operationId } ?: return
             if (restoreOwnerOperationId == operationId) restoreOwnerOperationId = null
             val terminal = WifiManualResult(operationId, operation.revision, "failed", reason, rolledBack)
-            val next = old.copy(
-                manualOperation = null,
-                latestResult = terminal,
-            )
-            if (!writeAndCommit(next)) return
-            delayAutomaticReturn(operation, succeeded = false)
+            if (!settleLocked(old, operation, terminal)) return
             resumeMonitoring = operation.selectionOnly
-            terminal
         }
         cancelAlarm(operationId)
         closeAttempt(operationId)
@@ -1492,10 +1486,8 @@ internal class WifiSettingsController internal constructor(
                     phase = WifiManualPhase.ROLLING_BACK,
                     failureReason = operation.failureReason ?: WifiReason.UNKNOWN,
                 ),
-                latestResult = terminal,
-            )
+            ).withOperationResult(terminal)
             if (!writeAndCommit(next)) return
-            terminal
         }
         // The recovery fence remains durable until the platform mutation finishes.
     }
@@ -1516,12 +1508,7 @@ internal class WifiSettingsController internal constructor(
                 phase = WifiManualPhase.ROLLING_BACK,
                 failureReason = WifiReason.RESTORE_FAILED,
             )
-            if (!writeAndCommit(old.copy(
-                    manualOperation = fenced,
-                    latestResult = terminal,
-                ))
-            ) return
-            terminal
+            if (!writeAndCommit(old.copy(manualOperation = fenced).withOperationResult(terminal))) return
         }
         // Keep the fence until recovery succeeds or an explicit unmanaged command abandons it.
         // A transient platform failure should not need an operator, so retry a few times.
@@ -1553,24 +1540,33 @@ internal class WifiSettingsController internal constructor(
             val old = state ?: return
             val operation = old.manualOperation?.takeIf { it.operationId == operationId } ?: return
             val terminal = WifiManualResult(operationId, operation.revision, "unknown", WifiReason.UNKNOWN, false)
-            val next = old.copy(
-                manualOperation = null,
-                latestResult = terminal,
-            )
-            if (!writeAndCommit(next)) return
-            delayAutomaticReturn(operation, succeeded = false)
-            terminal
+            if (!settleLocked(old, operation, terminal)) return
         }
         cancelAlarm(operationId)
     }
 
-    private fun persistManualResult(result: WifiManualResult) {
-        persist { old ->
-            old.copy(
-                latestResult = result,
-                processedOperationIds = appendWifiOperationReceipt(old.processedOperationIds, result.operationId),
-            )
-        }
+    private fun settleLocked(old: WifiLocalState, operation: WifiManualOperation, result: WifiManualResult): Boolean {
+        if (!writeAndCommit(old.copy(manualOperation = null).withOperationResult(result))) return false
+        delayAutomaticReturn(operation, succeeded = false)
+        return true
+    }
+
+    private fun takeRestoreSessionLocked(operationId: String): WifiLocalConnectivitySession? {
+        if (restoreSessionOperationId != operationId) return null
+        val session = restoreSession
+        restoreSession = null
+        restoreSessionOperationId = null
+        return session
+    }
+
+    private fun WifiLocalState.withOperationResult(result: WifiManualResult): WifiLocalState {
+        val receipt = policyReceipt
+        return copy(
+            latestResult = result,
+            policyReceipt = if (receipt != null && receipt.operationId == result.operationId &&
+                receipt.revision == result.revision
+            ) receipt.copy(result = result) else receipt,
+        )
     }
 
     /** The operation executor is the single owner of the priority session and scanner. */
@@ -1579,84 +1575,84 @@ internal class WifiSettingsController internal constructor(
     }
 
     private fun reconcilePriorityRuntimeNow() {
-        val current = synchronized(stateLock) {
-            state?.takeIf { startup.isDone && it.managedWifi && it.manualOperation == null }
-                ?.let { it to it.lastApplied }
+        val previous = priorityRuntime
+        val active = synchronized(stateLock) {
+            val profile = activePriorityProfileLocked() ?: return@synchronized null
+            val epoch = checkNotNull(state).policyEpoch
+            val runtime = previous?.takeIf { it.epoch == epoch } ?: PriorityRuntime(epoch).also {
+                priorityRuntime = it
+            }
+            runtime to profile
         }
-        val profile = current?.second
-        if (profile == null) {
-            stopPriorityRuntime()
+        if (previous != null && previous !== active?.first) {
+            stopPriorityScanner(previous)
+            previous.disconnectCheck = null
+            previous.connectionToken = null
+            previous.connection?.close()
+            previous.connection = null
+        }
+        if (active == null) {
+            setPriorityMonitorStatus(WifiPriorityMonitorStatus.OFF)
             return
         }
-        val epoch = current!!.first.policyEpoch
-        var session = prioritySession
-        if (session == null || prioritySessionRevision != profile.revision || prioritySessionEpoch != epoch) {
-            closePrioritySession()
-            session = try {
+        val (runtime, profile) = active
+        if (runtime.connection == null) {
+            val token = Any()
+            runtime.connectionToken = token
+            runtime.connection = try {
                 connectivity.observe { event ->
-                    operationExecutor.execute { onPriorityConnectivity(profile.revision, epoch, event) }
+                    operationExecutor.execute { onPriorityConnectivity(runtime, token, event) }
                 }
             } catch (_: Exception) {
+                runtime.connectionToken = null
                 setPriorityMonitorStatus(
                     if (profile.autoReturn) WifiPriorityMonitorStatus.UNSUPPORTED else WifiPriorityMonitorStatus.OFF,
                 )
                 return
             }
-            prioritySession = session
-            prioritySessionRevision = profile.revision
-            prioritySessionEpoch = epoch
         }
-
-        val liveSession = prioritySession ?: return
-        val connected = liveSession.snapshot().filter { it.hasUsableIp }
-        if (connected.isEmpty()) {
-            stopPriorityScanner()
+        val connected = currentPriorityConnection(runtime)
+        if (connected == null) {
+            stopPriorityScanner(runtime)
             setPriorityMonitorStatus(WifiPriorityMonitorStatus.OFF)
-            schedulePrioritySelectionAfterGrace(profile.revision, epoch)
+            schedulePrioritySelectionAfterGrace(runtime)
             return
         }
-        synchronized(stateLock) { offlineSelectionRevision = null }
-        val currentNetwork = connected.maxByOrNull { it.sequence }
-        val currentIndex = currentNetwork?.let { observation ->
-            profile.networks.indexOfFirst { observationMatches(it, observation) }
-        } ?: -1
-        if (!profile.autoReturn || currentIndex <= 0) {
-            stopPriorityScanner()
+        runtime.selectedWhileOffline = false
+        runtime.disconnectCheck = null
+        if (!profile.autoReturn || profile.networks.indexOfFirst { observationMatches(it, connected) } <= 0) {
+            stopPriorityScanner(runtime)
             setPriorityMonitorStatus(WifiPriorityMonitorStatus.OFF)
             return
         }
         val scanner = priorityScanSource
         if (scanner == null) {
             setPriorityMonitorStatus(WifiPriorityMonitorStatus.UNSUPPORTED)
-            return
-        }
-        if (priorityScanRevision != profile.revision || priorityScanEpoch != epoch) {
-            stopPriorityScanner()
-            priorityScanRevision = profile.revision
-            priorityScanEpoch = epoch
+        } else if (runtime.scanToken == null) {
+            val token = Any()
+            runtime.scanToken = token
             scanner.start(profile.networks) { event ->
-                operationExecutor.execute { onPriorityScanEvent(profile.revision, epoch, event) }
+                operationExecutor.execute { onPriorityScanEvent(runtime, token, event) }
             }
         }
     }
 
-    private fun stopPriorityScanner() {
+    private fun activePriorityProfileLocked(runtime: PriorityRuntime? = null): WifiSavedProfile? {
+        val current = state ?: return null
+        if (!platformSupported || !startup.isDone || !storageHealthy || !current.managedWifi ||
+            current.manualOperation != null || current.pendingRelease != null
+        ) return null
+        if (runtime != null && (priorityRuntime !== runtime || current.policyEpoch != runtime.epoch)) return null
+        return current.lastApplied?.takeIf { it.revision == current.policyRevision && it.networks.size >= 2 }
+    }
+
+    private fun currentPriorityConnection(runtime: PriorityRuntime): WifiLocalNetworkObservation? =
+        runtime.connection?.snapshot()?.filter { it.hasUsableIp }?.maxByOrNull { it.sequence }
+
+    private fun stopPriorityScanner(runtime: PriorityRuntime) {
+        if (runtime.scanToken == null) return
+        runtime.scanToken = null
         priorityScanSource?.stop()
-        priorityScanRevision = null
-        priorityScanEpoch = null
-    }
-
-    private fun stopPriorityRuntime() {
-        stopPriorityScanner()
-        closePrioritySession()
-        setPriorityMonitorStatus(WifiPriorityMonitorStatus.OFF)
-    }
-
-    private fun closePrioritySession() {
-        prioritySession?.close()
-        prioritySession = null
-        prioritySessionRevision = null
-        prioritySessionEpoch = null
     }
 
     private fun setPriorityMonitorStatus(status: WifiPriorityMonitorStatus) {
@@ -1665,74 +1661,39 @@ internal class WifiSettingsController internal constructor(
         notifyStateChanged()
     }
 
-    private fun onPriorityConnectivity(revision: String, epoch: Long, event: WifiLocalConnectivityEvent) {
-        synchronized(stateLock) {
-            val current = state ?: return
-            val saved = current.lastApplied ?: return
-            if (!current.managedWifi || current.policyEpoch != epoch || current.manualOperation != null ||
-                saved.revision != revision
-            ) return
+    private fun onPriorityConnectivity(runtime: PriorityRuntime, token: Any, event: WifiLocalConnectivityEvent) {
+        if (runtime.connectionToken !== token || synchronized(stateLock) { activePriorityProfileLocked(runtime) } == null) {
+            return
         }
-        if (event is WifiLocalConnectivityEvent.Updated) {
-            if (event.observation.hasUsableIp) {
-                synchronized(stateLock) {
-                    priorityDisconnectGeneration++
-                    offlineSelectionRevision = null
-                }
-                reconcilePriorityRuntime()
-            } else if (prioritySession?.snapshot()?.any { it.hasUsableIp } != true) {
-                stopPriorityScanner()
-                setPriorityMonitorStatus(WifiPriorityMonitorStatus.OFF)
-                schedulePrioritySelectionAfterGrace(revision, epoch)
-            } else {
-                reconcilePriorityRuntime()
-            }
-        } else if (event is WifiLocalConnectivityEvent.Lost) {
-            val stillConnected = prioritySession?.snapshot()?.any { it.hasUsableIp } == true
-            if (!stillConnected) {
-                stopPriorityScanner()
-                setPriorityMonitorStatus(WifiPriorityMonitorStatus.OFF)
-                schedulePrioritySelectionAfterGrace(revision, epoch)
-            } else {
-                reconcilePriorityRuntime()
-            }
+        if (event is WifiLocalConnectivityEvent.Updated && event.observation.hasUsableIp) {
+            runtime.selectedWhileOffline = false
+            runtime.disconnectCheck = null
         }
+        reconcilePriorityRuntimeNow()
     }
 
-    private fun schedulePrioritySelectionAfterGrace(revision: String, epoch: Long) {
-        val token = synchronized(stateLock) { ++priorityDisconnectGeneration }
+    private fun schedulePrioritySelectionAfterGrace(runtime: PriorityRuntime) {
+        if (runtime.disconnectCheck != null || runtime.selectedWhileOffline) return
+        val token = Any()
+        runtime.disconnectCheck = token
         schedulePriorityTimeout(Runnable {
             operationExecutor.execute {
-                val current = synchronized(stateLock) {
-                    val value = state ?: return@execute
-                    val saved = value.lastApplied ?: return@execute
-                    if (priorityDisconnectGeneration != token || !value.managedWifi || value.manualOperation != null ||
-                        value.policyEpoch != epoch || value.policyRevision != revision || saved.revision != revision
-                    ) return@execute
-                    value to saved
+                if (runtime.disconnectCheck !== token) return@execute
+                runtime.disconnectCheck = null
+                val profile = synchronized(stateLock) { activePriorityProfileLocked(runtime) } ?: return@execute
+                if (currentPriorityConnection(runtime) != null) {
+                    reconcilePriorityRuntimeNow()
+                } else {
+                    startPrioritySelection(runtime, profile.networks.indices.toList(), retryDisconnected = true)
                 }
-                val networks = prioritySession?.snapshot()?.filter { it.hasUsableIp }.orEmpty()
-                if (networks.isNotEmpty()) {
-                    reconcilePriorityRuntime()
-                    return@execute
-                }
-                // With one network there is no order to enforce; the OS auto-join rejoins it.
-                if (current.second.networks.size < 2) return@execute
-                startPrioritySelection(revision, epoch, current.second.networks.indices.toList(), retryDisconnected = true)
             }
             // Jitter keeps headsets that lost the same AP from reselecting in lockstep.
         }, WIFI_PRIORITY_DISCONNECT_GRACE_MS + jitter(WIFI_DISCONNECT_GRACE_JITTER_MS))
     }
 
-    private fun onPriorityScanEvent(revision: String, epoch: Long, event: WifiPriorityScanEvent) {
-        val saved = synchronized(stateLock) {
-            val current = state ?: return
-            val profile = current.lastApplied ?: return
-            if (!current.managedWifi || current.policyEpoch != epoch || current.manualOperation != null ||
-                profile.revision != revision || !profile.autoReturn
-            ) return
-            profile
-        }
+    private fun onPriorityScanEvent(runtime: PriorityRuntime, token: Any, event: WifiPriorityScanEvent) {
+        if (runtime.scanToken !== token) return
+        val saved = synchronized(stateLock) { activePriorityProfileLocked(runtime) } ?: return
         setPriorityMonitorStatus(event.status)
         event.detail?.let { detail ->
             if (event.status == WifiPriorityMonitorStatus.DEGRADED ||
@@ -1740,113 +1701,71 @@ internal class WifiSettingsController internal constructor(
             ) Log.w(TAG, "Wi-Fi priority monitor status=${event.status.wireValue} detail=$detail")
         }
         if (event.status != WifiPriorityMonitorStatus.MONITORING || event.visibleIdentities.isEmpty()) return
-        if (synchronized(stateLock) {
-                autoReturnRetryRevision == revision && autoReturnRetryEpoch == epoch &&
-                    nowElapsed() < autoReturnRetryAllowedAtElapsedMillis
-            }
-        ) return
+        if (synchronized(stateLock) { nowElapsed() < runtime.retryAllowedAt }) return
 
-        val currentObservation = prioritySession?.snapshot()?.filter { it.hasUsableIp }
-            ?.maxByOrNull { it.sequence }
-        val currentIndex = currentObservation?.let { observation ->
+        val connected = currentPriorityConnection(runtime)
+        val currentIndex = connected?.let { observation ->
             saved.networks.indexOfFirst { observationMatches(it, observation) }
         } ?: -1
         if (currentIndex <= 0) {
-            reconcilePriorityRuntime()
+            reconcilePriorityRuntimeNow()
             return
         }
-        val upperCandidates = saved.networks.indices.filter { index ->
-            index < currentIndex && saved.networks[index].identity in event.visibleIdentities
-        }
-        if (upperCandidates.isNotEmpty() &&
-            startPrioritySelection(revision, epoch, upperCandidates)
-        ) {
-            setPriorityMonitorStatus(WifiPriorityMonitorStatus.SWITCHING)
-        }
+        val upperCandidates = (0 until currentIndex).filter { saved.networks[it].identity in event.visibleIdentities }
+        if (upperCandidates.isNotEmpty()) startPrioritySelection(runtime, upperCandidates)
     }
 
-    // Called with stateLock held when an automatic-return operation settles. Repeated
-    // failures (an unusable preferred AP) back off so the working connection is not
-    // interrupted every five minutes indefinitely.
+    // Called with stateLock held when an automatic-return operation settles.
     private fun delayAutomaticReturn(operation: WifiManualOperation, succeeded: Boolean) {
         if (!operation.selectionOnly || operation.retryDisconnected) return
-        if (autoReturnRetryRevision != operation.revision || autoReturnRetryEpoch != operation.policyEpoch) {
-            autoReturnFailures = 0
-        }
-        autoReturnFailures = if (succeeded) 0 else (autoReturnFailures + 1).coerceAtMost(16)
-        val multiplier = 1L shl (autoReturnFailures - 1).coerceIn(0, 10)
-        autoReturnRetryRevision = operation.revision
-        autoReturnRetryEpoch = operation.policyEpoch
-        autoReturnRetryAllowedAtElapsedMillis = nowElapsed() +
+        val runtime = priorityRuntime?.takeIf { it.epoch == operation.policyEpoch } ?: return
+        runtime.failedReturns = if (succeeded) 0 else (runtime.failedReturns + 1).coerceAtMost(16)
+        val multiplier = 1L shl (runtime.failedReturns - 1).coerceIn(0, 10)
+        runtime.retryAllowedAt = nowElapsed() +
             (WIFI_AUTO_RETURN_RETRY_DELAY_MS * multiplier).coerceAtMost(WIFI_AUTO_RETURN_MAX_RETRY_DELAY_MS)
     }
 
     private fun startPrioritySelection(
-        revision: String,
-        epoch: Long,
-        indexes: List<Int>,
-        retryDisconnected: Boolean = false,
-    ): Boolean {
-        val normalizedIndexes = indexes.distinct().filter { it >= 0 }
-        if (normalizedIndexes.isEmpty()) return false
-        val current = synchronized(stateLock) {
-            val value = state ?: return@synchronized null
-            val saved = value.lastApplied ?: return@synchronized null
-            if (retryDisconnected && offlineSelectionRevision == revision && offlineSelectionEpoch == epoch) {
-                return@synchronized null
-            }
-            // Never start an automatic switch while a release is waiting.
-            if (!startup.isDone || !storageHealthy || value.manualOperation != null || !value.managedWifi ||
-                value.pendingRelease != null ||
-                value.policyEpoch != epoch || value.policyRevision != revision || saved.revision != revision ||
-                normalizedIndexes.any { it !in saved.networks.indices }
-            ) return@synchronized null
-            value to saved
-        } ?: return false
+        runtime: PriorityRuntime, indexes: List<Int>, retryDisconnected: Boolean = false,
+    ) {
+        if (retryDisconnected && runtime.selectedWhileOffline) return
+        val profile = synchronized(stateLock) { activePriorityProfileLocked(runtime) } ?: return
         connectivity.preflight()?.let { reason ->
-            if (current.second.autoReturn) setPriorityMonitorStatus(WifiPriorityMonitorStatus.DEGRADED)
+            if (profile.autoReturn) setPriorityMonitorStatus(WifiPriorityMonitorStatus.DEGRADED)
             Log.w(TAG, "Wi-Fi priority selection preflight failed: ${reason.wireValue}")
-            return false
+            return
         }
         val recovery = try {
-            adapter.captureRecovery(current.second.networks)
-        } catch (failure: WifiAdapterFailure) {
-            if (current.second.autoReturn) setPriorityMonitorStatus(WifiPriorityMonitorStatus.DEGRADED)
-            Log.w(TAG, "Wi-Fi priority selection snapshot failed: ${failure.reason.wireValue}")
-            return false
-        } catch (_: Exception) {
-            if (current.second.autoReturn) setPriorityMonitorStatus(WifiPriorityMonitorStatus.DEGRADED)
-            return false
+            adapter.captureRecovery(profile.networks)
+        } catch (failure: Exception) {
+            if (profile.autoReturn) setPriorityMonitorStatus(WifiPriorityMonitorStatus.DEGRADED)
+            val reason = (failure as? WifiAdapterFailure)?.reason ?: WifiReason.CONFIG_READ_FAILED
+            Log.w(TAG, "Wi-Fi priority selection snapshot failed: ${reason.wireValue}")
+            return
         }
         val operation = synchronized(stateLock) {
-            val old = state ?: return@synchronized null
-            val saved = old.lastApplied ?: return@synchronized null
-            if (old.manualOperation != null || !old.managedWifi || old.pendingRelease != null || old.policyEpoch != epoch ||
-                old.policyRevision != revision || saved.revision != revision || normalizedIndexes.any { it !in saved.networks.indices }
-            ) return@synchronized null
-            val nextOperation = WifiManualOperation(
+            val current = state ?: return
+            val saved = activePriorityProfileLocked(runtime) ?: return
+            if (current.policyReceipt?.awaitsOperation(current) == true) return
+            val prepared = WifiManualOperation(
                 operationId = UUID.randomUUID().toString(),
-                revision = revision,
+                revision = saved.revision,
                 candidate = saved.networks,
                 recoverySnapshot = recovery,
                 phase = WifiManualPhase.PREPARED,
-                policyEpoch = epoch,
+                policyEpoch = runtime.epoch,
                 autoReturn = saved.autoReturn,
                 selectionOnly = true,
-                selectionIndexes = normalizedIndexes,
+                selectionIndexes = indexes,
                 retryDisconnected = retryDisconnected,
             )
-            if (!writeAndCommit(old.copy(manualOperation = nextOperation))) return@synchronized null
-            if (retryDisconnected) {
-                offlineSelectionRevision = revision
-                offlineSelectionEpoch = epoch
-            }
-            nextOperation
-        } ?: return false
-        stopPriorityScanner()
-        if (current.second.autoReturn && !retryDisconnected) setPriorityMonitorStatus(WifiPriorityMonitorStatus.SWITCHING)
+            if (!writeAndCommit(current.copy(manualOperation = prepared))) return
+            prepared
+        }
+        if (retryDisconnected) runtime.selectedWhileOffline = true
+        stopPriorityScanner(runtime)
+        if (!retryDisconnected) setPriorityMonitorStatus(WifiPriorityMonitorStatus.SWITCHING)
         operationExecutor.execute { applyManual(operation) }
-        return true
     }
 
     private fun observationMatches(
@@ -1860,9 +1779,26 @@ internal class WifiSettingsController internal constructor(
     private fun recoverInterruptedOperation() {
         var completed = false
         try {
-            val current = synchronized(stateLock) { state }
-            if (current == null || !storageHealthy) return
+            val current = synchronized(stateLock) {
+                val loaded = state ?: return
+                if (!storageHealthy) return
+                val receipt = loaded.policyReceipt?.takeIf { it.awaitsOperation(loaded) }
+                if (receipt == null) loaded else {
+                    // The queue did not survive this process restart. Keep exact interruption
+                    // evidence and allow any journaled release to proceed.
+                    val interrupted = loaded.copy(policyReceipt = receipt.interrupted())
+                    if (!writeAndCommit(interrupted)) return
+                    interrupted
+                }
+            }
+            if (!platformSupported) {
+                completed = true
+                return
+            }
             current.manualOperation?.let { operation ->
+                if (operation.selectionOnly) synchronized(stateLock) {
+                    priorityRuntime = PriorityRuntime(operation.policyEpoch)
+                }
                 when {
                     operation.settingsRestored -> resumeRestoreConfirmation(operation)
                     operation.settingsChanged -> {
@@ -1874,7 +1810,7 @@ internal class WifiSettingsController internal constructor(
                         val pendingConfirmation = synchronized(stateLock) {
                             state?.manualOperation?.takeIf { it.operationId == operation.operationId }?.settingsRestored == true
                         }
-                        if (!restored && !pendingConfirmation) return
+                        if (restored == WifiRestoreProgress.FAILED && !pendingConfirmation) return
                     }
                     else -> finishManualNoChangeUnknown(operation.operationId)
                 }
@@ -1902,6 +1838,7 @@ internal class WifiSettingsController internal constructor(
     ): WifiManualOperation? = synchronized(stateLock) {
         val old = state ?: return@synchronized null
         val operation = old.manualOperation?.takeIf { it.operationId == operationId } ?: return@synchronized null
+        if (releaseBlocksSelectionLocked(operation)) return@synchronized null
         // Readiness claims the outcome under the same lock as timeout/rollback. If its
         // queued durable commit runs after the deadline, that earlier observation still
         // wins; persistence failure moves it to ROLLBACK_READY explicitly.
@@ -1970,7 +1907,8 @@ private fun productionDependencies(context: Context): WifiControllerDependencies
         scheduleAlarm = { operationId, deadline -> scheduleExactRollback(appContext, operationId, deadline) },
         cancelAlarm = { operationId -> cancelExactRollback(appContext, operationId) },
         connectivity = connectivity,
-        priorityScanSource = systemWifiPriorityScanSource(appContext),
+        priorityScanSource = if (supportsManagedWifi()) systemWifiPriorityScanSource(appContext) else null,
+        platformSupported = supportsManagedWifi(),
         bootCount = { Settings.Global.getInt(appContext.contentResolver, Settings.Global.BOOT_COUNT, -1) },
         operationExecutor = operationExecutor,
         rollbackExecutor = rollbackExecutor,

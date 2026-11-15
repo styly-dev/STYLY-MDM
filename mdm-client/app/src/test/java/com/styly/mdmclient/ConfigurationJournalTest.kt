@@ -12,16 +12,16 @@ class ConfigurationJournalTest {
     private val second = first.copy(packageId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
     private val updated = first.copy(revision = "22222222-2222-4222-8222-222222222222")
 
-    @Test fun `shared revision UUID is scoped to its package and a successful attempt repeats only after boot`() {
+    @Test fun `successful revision applies again after reboot or another package attempt`() {
         val firstAttempt = ConfigurationAttempt(first, 133, "complete")
         val secondAttempt = ConfigurationAttempt(second, 133, "complete")
         val journal = ConfigurationJournal().withAttempt(firstAttempt)
         assertFalse(journal.shouldApply(first, 133, null))
         assertTrue(journal.shouldApply(second, 133, null))
         val restored = ConfigurationJournal.restore(journal.withAttempt(secondAttempt).encode())
-        assertFalse(restored.shouldApply(first, 133, null))
+        assertTrue(restored.shouldApply(first, 133, null))
         assertFalse(restored.shouldApply(second, 133, null))
-        assertTrue(restored.shouldApply(first, 134, null))
+        assertTrue(restored.shouldApply(second, 134, null))
         assertTrue(restored.shouldApply(updated, 133, null))
     }
 
@@ -32,6 +32,7 @@ class ConfigurationJournalTest {
         val journal = ConfigurationJournal().withAttempt(failed)
             .withAttempt(ConfigurationAttempt(second, 133, "complete"))
         val restored = ConfigurationJournal.restore(journal.encode())
+        assertFalse(restored.shouldApply(first, 133, null))
         assertFalse(restored.shouldApply(first, 134, null))
         assertTrue(restored.shouldApply(first, 134, "retry-one"))
         assertTrue(restored.shouldApply(second, 134, null))

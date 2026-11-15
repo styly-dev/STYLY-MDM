@@ -1,8 +1,9 @@
 # Wi-Fi in configuration packages
 
-Wi-Fi settings support PICO 4 Ultra Enterprise on the managed LAN. See
-[configuration packages](DEVELOPMENT.md#configuration-packages) for draft,
-publication, assignment, and delivery behavior.
+Wi-Fi settings support PICO 4 Ultra Enterprise on Android 13 or later on the
+managed LAN. See
+[configuration packages](DEVELOPMENT.md#configuration-packages) for saving,
+deployment, assignment, and delivery behavior.
 
 ## Operator workflow
 
@@ -16,9 +17,8 @@ The group **Settings** tab shows Wi-Fi readiness and the last result.
 The list order defines priority: the first network is preferred, and a package
 can contain up to four networks. This setting applies to every group using the
 package. With the automatic-return option off, the client selects in priority
-order during application and when disconnected. An existing connection is kept
-after restart, and the client does not switch solely because a higher-priority
-network reappears. With it on, the client checks for higher-priority networks
+order during application and when disconnected. With it on, the client also
+checks for higher-priority networks
 while connected to a lower candidate, regardless of whether it was selected
 manually. The first check runs within about 30 seconds, with later requests
 about five minutes apart (each with a small random delay so headsets that start
@@ -31,15 +31,15 @@ before another automatic-return attempt, including when it moved to a higher
 candidate successfully. Consecutive failed attempts, such as a visible preferred
 network with a wrong password or a weak signal, double the wait up to 30
 minutes; a success resets it. This also applies if someone selects a lower
-candidate in the meantime. A new package revision is not delayed by the previous wait;
-an app process restart clears it. When disconnected, the client waits eight
+candidate in the meantime. A changed Wi-Fi policy can be applied during this
+wait. An app process restart clears it. When disconnected, the client waits eight
 seconds plus up to three random seconds for a connection to return before
 selecting in order. The ordered selection runs once per offline period; if it
 fails, the client leaves reconnection to Android auto-join, which stays enabled
 for every listed network, and selects in order again only after the headset has
 been online. If Android joins a network while the client is still checking the
-previous connection, the client keeps it. With a single listed network there is
-no order to enforce, so the client leaves the reconnection to Android.
+previous connection, the client keeps it. With a single listed network, the
+client leaves reconnection to Android without starting priority monitoring.
 Automatic return does not support hidden SSIDs; turn it off to use hidden
 networks.
 
@@ -51,12 +51,14 @@ builds of this feature are not supported; recreate them. Before updating a
 client, let any in-progress Wi-Fi operation and package handoff finish or
 recover.
 The console shows the connected client's monitor status separately from the
-last package-application result. **Applied** means the client applied and
-verified this Wi-Fi setting for the revision; it is a record of that
-application, not a live comparison with the headset's current Wi-Fi. Within the
-same boot, moving back to an earlier revision whose Wi-Fi is unchanged does not
-write Wi-Fi again, and someone changing Wi-Fi on the headset afterwards does
-not change the result. Use **Reapply settings** or Retry to write it again.
+last package-application result. **Applied** records a verified Wi-Fi profile.
+During the same OS boot, a new revision with matching verified Wi-Fi settings
+carries the result forward and keeps the connection and priority monitor.
+Returning to an earlier package compares its settings with the most recent
+completed attempt. If reassignment after **No package** does not start a new
+attempt, the client resumes Wi-Fi management when Wi-Fi previously applied
+and matches the saved profile. This also works across an OS reboot when
+another setting needs Retry.
 
 Automatic return depends on fresh Android scan results. Scan throttling,
 sleep, permissions, and radio conditions can delay detection or make monitoring
@@ -82,7 +84,7 @@ Managed Wi-Fi adds or updates the listed networks and enables their automatic
 connection. Other saved networks remain on the device with auto-join disabled.
 Clearing **Manage** and publishing leaves the device's existing networks and
 auto-join settings in place. Removing the package assignment has the same
-effect. The draft retains the unchecked setting's values.
+effect. The package keeps the unchecked setting's values for the editor.
 
 ## Provisioning and recovery
 
@@ -114,7 +116,8 @@ where the MDM server is unreachable. The report remains local until the client
 can reconnect.
 
 On failure, the client restores the captured auto-join flags and MDM-known
-credentials. Added candidates remain saved with auto-join disabled. **Unknown
+credentials. A failure to re-enable a previously eligible saved network is a
+restore failure. Added candidates remain saved with auto-join disabled. **Unknown
 overwritten passwords cannot be restored.** A restored configuration may still
 fail to connect if its AP or credentials changed. Applying a policy may overwrite
 the currently connected network even when its previous password is unknown to
@@ -131,7 +134,10 @@ the client does not keep forcing it. The original package result remains
 failed. If there was no usable
 prior connection, no reconnection check is required. A new policy or explicit
 management release can supersede a pending connection check after settings have
-been restored.
+been restored. This also applies when a new request retries a previously failed
+restore: once the settings are restored, it may supersede the old connection
+check and start its own attempt. Waiting for the old SSID is not a restore API
+failure. A delayed callback from that old check cannot settle the new operation.
 
 Interrupted Wi-Fi work recovers from the private `wifi-settings.json` journal
 before another Wi-Fi mutation. The package attempt records its scalar
@@ -142,27 +148,30 @@ After a failed restoration, the client retries the restore automatically after
 about 30 seconds, 2 minutes and 10 minutes. After that, Retry or a new managed
 Wi-Fi revision attempts to complete that restoration before writing new
 networks. If a later Wi-Fi operation, such as an automatic switch, replaced the
-exact result, the attempt is reported as applied when its revision became the
-applied Wi-Fi setting and as interrupted otherwise. Clearing
-Wi-Fi management can release a settled recovery journal without changing
-device values.
+latest telemetry result, the journal still retains the exact package-operation
+outcome separately. The device reserves one receipt with the operation ID
+and revision before queueing the operation. Late recovery of an older request
+leaves that receipt intact. A past success for the
+same revision never makes a failed Reapply successful. If no exact outcome survives, the package remains
+interrupted. Clearing Wi-Fi management can release a settled recovery journal
+without changing device values.
 An unreadable journal stays blocked. Content startup waits for interrupted
 Wi-Fi recovery for at most 60 seconds. The current Wi-Fi journal preserves
-recovery data and known credentials across process restarts. After each boot
-the client reapplies the assigned version's scalar settings once, but leaves
-Wi-Fi in place when the same Wi-Fi revision still owns it: an existing
-connection is kept and no network is reselected. **Reapply settings** on the
-headset and Retry apply Wi-Fi again. A new revision whose Wi-Fi networks,
-order, passwords and automatic-return setting equal the applied ones (for
-example a brightness-only change) is adopted without disconnecting. A failed
-or interrupted version waits for Retry or a new publication.
+recovery data and known credentials across process restarts. The client writes
+Wi-Fi during the first application after an OS boot, on **Reapply settings**
+or Retry, and when it applies changed Wi-Fi settings. A write enforces the
+auto-join settings and verifies a fresh connection. During a same-boot update
+with matching, previously verified Wi-Fi, the client carries the profile into
+the new revision and retains the automatic-return backoff. An unchanged failed
+Wi-Fi setting retains its failure result so the operator can Retry it.
 
-Releasing management (removing the package or clearing **Manage**) is saved in
-the Wi-Fi journal first. While a Wi-Fi operation, an automatic switch or a
-restore reconnect is in progress, it takes effect as soon as that operation
-settles, including after an app restart. A release also ends a pending
-connection check after a failed first deployment. No new automatic switch
-starts while a release waits.
+When the device accepts a release (removing the package or clearing
+**Manage**), it saves the release in the Wi-Fi journal before changing the
+cached package. The release prevents new automatic switches and cancels a
+prepared automatic switch before it changes Wi-Fi. An admitted package
+operation or an automatic switch that already changed Wi-Fi can finish before
+release takes effect. A pending release survives app restart and can end a
+pending connection check once the settings have been restored.
 
 The PICO auto-join API uses TobService's `allow_wifi_auto_join` message. Read
 the actual `WifiConfiguration.allowAutojoin` flag. A partial Wi-Fi configuration

@@ -86,16 +86,19 @@ compatibility, and message sequences.
 ### Configuration packages
 
 A device belongs to at most one group. A group holds its members and an optional
-package reference. Multiple groups can reference the same package. Packages
-hold a draft and the current published snapshot. The editor exposes the PICO 4
-Ultra Enterprise settings catalog under **Manage Groups → Configuration Packages**.
+package reference. Multiple groups can reference the same package. A package
+stores the editor's saved settings, including Wi-Fi passwords and the values of
+unchecked settings, along with the published revision and deployment time.
+The server derives the managed settings sent to devices from those saved values.
+The PICO 4 Ultra Enterprise settings catalog is under **Manage Groups →
+Configuration Packages**.
 
 In the editor, **Save & deploy** saves the edits and publishes a new revision
 in one commit for all groups using the package. In group **Settings**, **Deploy**
-selects a package for the group and applies its current deployed version. If the
-package only has a saved draft, the operation assigns it to the group and deploys
-the first revision together. Deploying the package already selected for the group
-creates a new revision from its saved draft and deploys it to all groups using it.
+selects a package for the group and applies its current deployed version. A new
+package must be deployed once from the editor before a group can use it.
+Deploying the package already selected for the group publishes its saved
+settings as a new revision for all groups using it.
 Select **No package** and **Deploy** to clear all managed settings for just that
 group. The client leaves current device values in place. There is no revision
 to report in **Device status** for that group.
@@ -123,29 +126,52 @@ it becomes visible to readers or device delivery. Forgetting a device
 commits its record and membership removal together. The console keeps a
 group assignment acknowledgment separate from deployment status and waits
 for the group update before showing results for the new assignment.
+After a rename or delete commits, the server queues the requester's
+acknowledgment before the group list. Both messages use the same console
+send lock and timeout. Other consoles and headsets receive updates
+independently of the requesting console.
 
 The server sends the effective published snapshot on canonical registration,
-publication, package assignment changes, group renames, and membership changes.
-Headset delivery and the admin `GROUP_LIST` fan-out run concurrently after the
-registry save, so a slow console never delays delivery.
+publication, package assignment changes, group renames/deletions, and membership changes.
+Headset delivery and admin notifications run concurrently after the registry
+save. A slow or disconnected requesting console cannot suppress the committed
+policy, including management release after group deletion.
 It keeps no device delivery queue and uses device reports for display. A device that was
 offline receives the latest snapshot when it connects. The client compares
-`package_id` and `revision`. It applies a newly published version immediately.
-After each OS boot it reapplies the scalar settings of a successful version
-once, but keeps Wi-Fi in place when the same Wi-Fi revision still owns Wi-Fi
-with no pending operation; it does not disconnect or reselect a network.
-A new revision whose Wi-Fi networks, order, passwords and automatic-return
-setting equal the applied ones (for example a brightness-only change) adopts
-the revision without touching Wi-Fi and reports Wi-Fi as applied.
-**Reapply settings** and Retry apply Wi-Fi as well.
-Moving between groups with the same package does not require another application.
-PUI 5.15.7 can reset sleep settings after Android boot completion. The first
-write waits until at least 40 seconds of OS uptime and until TobService is ready.
+`package_id` and `revision`. A new version applies as soon as TobService and
+any required Wi-Fi recovery are ready. During the same OS boot, automatic
+application compares the new values with the most recent completed package
+attempt. Only changed items and items with no matching prior result are
+applied. The client carries the results of matching items into the new
+revision, including failures. With a verified matching Wi-Fi profile it
+updates Wi-Fi management to the new revision and keeps the current connection,
+priority monitor and automatic-return backoff.
+Reapplication after an OS reboot and the headset's **Reapply settings** action
+write every managed setting, including values that already match. Retry
+processes the full managed package. A Wi-Fi profile write can drop the current
+connection temporarily while the client verifies a fresh one.
 
-The client durably claims each attempt before writing. It reads back managed
-settings and records the result locally. Failed or interrupted versions stay
-blocked across reconnects and OS boots. The operator can Retry that version
-for an online device or publish a new revision. Retry sends one explicit token
+Same-boot duplicate deliveries, including moves between groups with the same
+package, reuse the recorded attempt.
+When reassigning a version after **No package** does not trigger a new attempt,
+the client resumes Wi-Fi management if that version's Wi-Fi application
+succeeded and its networks and automatic-return setting still match the saved
+profile. This also works across an OS reboot when another setting still needs
+Retry. Resuming management keeps the connection and historical results. It runs
+on the Wi-Fi worker after startup recovery and checks that the delivery is still
+current.
+
+Unenroll headsets from PICO Business Device Manager before managing their
+settings with STYLY MDM. In the field comparison, the BDM-enrolled headset
+reapplied its sleep policy after connecting to Wi-Fi both at boot and on
+reconnection. STYLY MDM reports the readback at the time of each application.
+See the [PICO Wi-Fi field notes](PICO_WIFI_FIELD_NOTES.md).
+
+The client durably claims each attempt before writing. It reads back the
+settings it applies and records the result locally. Failed or interrupted
+versions stay blocked across reconnects and OS boots. The operator can Retry
+that version for an online device or publish a revision with corrected
+settings. Retry sends one explicit token
 for the requested package and revision. A device consumes the token with its
 next attempt and checks that it previously failed or was interrupted. The
 server does not queue Retry for offline devices. Wi-Fi runs last through the
@@ -165,17 +191,17 @@ reselection's prior-connection check is kept. A failed settings restore (`RESTOR
 (about 30 s, 2 min, 10 min). The client reports
 live priority-monitor and recovery state separately from the package result.
 An automatic-return attempt waits about five minutes before another one;
-consecutive failures double the wait up to 30 minutes. The wait resets on app
-process restart and does not delay a new revision. Any visible higher
+consecutive failures double the wait up to 30 minutes. The wait belongs to the
+applied Wi-Fi profile. It resets when the app process restarts or a new Wi-Fi
+configuration is verified. Any visible higher
 candidate triggers automatic return regardless of signal strength. Disconnect grace and retry timers
 carry random delay so headsets that lose the same AP do not retry in lockstep.
 Monitoring depends on fresh, potentially throttled Android scan results.
-A release (package unassigned, or Wi-Fi no longer managed) is journaled in
-`wifi-settings.json` (`pending_release`) before anything else. While an
-operation, including an automatic switch or a restore reconnect, can still
-mutate Wi-Fi, the release waits and is applied as soon as that operation
-settles, including after a process restart; no new automatic switch starts
-meanwhile, and a newer managed policy supersedes it.
+A release (package unassigned, or Wi-Fi no longer managed) is recorded as
+`pending_release` in `wifi-settings.json` when the package worker accepts it,
+before it changes the cached assignment. An admitted operation can finish
+while the release is pending. The release survives process restart and blocks
+new automatic switches. A newer managed policy supersedes it.
 The client sends `WIFI_STATE` only when its public state changes, and the
 server ignores a report equal to the stored one. Telemetry (`BATTERY_UPDATE`,
 `WIFI_STATE`, `CONFIGURATION_STATE`) registry saves are coalesced to one per
@@ -194,7 +220,10 @@ revision is deployed.
 and Wi-Fi rollback flow used at boot, including after an offline app restart.
 The app saves one package with its deployment information in private storage,
 including any managed Wi-Fi credentials. The next server policy replaces or
-clears that copy. A headset without a saved copy must receive a package once
+clears that copy. When a new delivery is waiting, the copy keeps the previous
+attempt's setting fingerprints for comparison after an app restart. The
+fingerprints are used only with the matching attempt record. A headset
+without a saved copy must receive a package once
 before it can reapply offline. Loading the copy makes it available for manual
 use. Automatic application still follows live server delivery. The button is
 disabled while an application or its Wi-Fi recovery is in progress.
@@ -203,11 +232,15 @@ Before starting Wi-Fi, the client saves the scalar readbacks and the Wi-Fi
 operation ID in the package attempt. Wi-Fi owns a separate local recovery
 journal. On restart, a settled result that matches the operation ID and
 revision can complete the recorded attempt using its original boot count.
-Without exact terminal evidence, the attempt remains interrupted. If a later
-Wi-Fi operation (such as an automatic switch) replaced the result, the attempt
-is marked applied when its revision became the applied Wi-Fi revision and
-interrupted otherwise, so it never waits indefinitely. The
-operation ID is private to the device and optional in older package records.
+The Wi-Fi journal reserves one `policy_receipt` before queueing the operation.
+It carries the operation ID, revision and eventual result. Automatic selection
+reports separate telemetry. Late recovery of an older operation leaves the
+current receipt intact. The package worker consumes the current result before
+starting another package attempt. If a restart interrupts an attempt before the
+Wi-Fi operation starts, the receipt records the interruption. A restored package
+attempt needs a terminal result in `policy_receipt` with a matching operation
+ID and revision. Without a match, it remains interrupted and can be retried.
+The operation ID is private to the device.
 
 Scalar settings use the pinned PICO Enterprise SDK and Android readback where
 needed. Sleep and screen-off delays are ordered so the screen-off delay never
@@ -241,10 +274,10 @@ editing. The editor waits for the station to advertise support.
 | Surface | Contract |
 |---|---|
 | `GET /api/packages`, `POST /api/packages` | List packages or create one by name. |
-| `GET /api/packages/{id}` | Returns package identity and name, `draft_revision`, `published_revision`, `published_keys`, the saved draft `settings`, the editor `sections`, and `impact` with group and device counts and a token. A saved Wi-Fi password is represented by `password_present`. |
-| `POST /api/packages/{id}/save-and-deploy` | Atomically saves `settings` as `{id: {managed, value}}` and deploys a new revision. Supply `expected_revision` equal to the loaded draft UUID (null for the first draft), and `expected_impact` from the preview. An optional `name` renames the package. |
+| `GET /api/packages/{id}` | Returns package identity and name, `draft_revision`, `published_revision`, `published_keys`, the saved editor `settings`, including unchecked settings, the editor `sections`, and `impact` with group and device counts and a token. A saved Wi-Fi password is represented by `password_present`. |
+| `POST /api/packages/{id}/save-and-deploy` | Atomically saves `settings` as `{id: {managed, value}}` and deploys a new revision. Supply `expected_revision` equal to the loaded `draft_revision` (null for a new package), and `expected_impact` from the preview. An optional `name` renames the package. |
 | `DELETE /api/packages/{id}` | Deletes an unassigned package. |
-| `GET`, `POST /api/group-package/deploy?name=...&package_id=...` | GET previews the deployment scope and whether it uses the current deployed version. An empty `package_id=` previews clearing management for the group and sets `clear` to true. POST accepts `expected_impact` from the preview and commits the group reference and any new revision together. |
+| `GET`, `POST /api/group-package/deploy?name=...&package_id=...` | GET previews the deployment scope and whether it uses the current deployed version. An empty `package_id=` previews clearing management for the group and sets `clear` to true. POST accepts `expected_impact` from the preview and commits the group reference and any new revision together. A package that has never been deployed returns 409. |
 | `POST /api/package-retry` | Requests Retry for a currently assigned and online `device_id` with its current `package_id` and `revision`. |
 | `CONFIGURATION_POLICY` | Server to canonical `configuration_packages_v1` or `configuration_summary_v1` clients. Includes `package_id` and `revision` (a null pair means no effective deployment). Only package-capable clients receive managed `settings` and explicit `retry_id` values. Clients with summary capability also receive nullable `group_name` and `deployed_at_ms` (Unix epoch milliseconds); summary-only clients receive empty `settings`. |
 | `REGISTER` and `CONFIGURATION_STATE` | The secret-free `configuration_state` has `package_id`, `revision`, `status` (`applying`, `complete`, `interrupted`, `already_attempted`) and per-setting `results`. |
@@ -266,19 +299,24 @@ projected into the previous Wi-Fi format. Update the clients before deploying
 the new Wi-Fi setting.
 
 The private `device_registry.json` stores `packages` and each group's
-`members` and `package_id`. A published snapshot may have a `deployed_at_ms`
-field. Wi-Fi passwords are plaintext in the registry
-and its backups.
+`members` and `package_id`. Wi-Fi passwords are plaintext in the registry and
+its backups.
 
 On upgrade, the released `{"groups": {name: [device_id]}}` format becomes the
 package format with no packages assigned. Released servers allowed a device in
 several groups; the server keeps such a device only in the first group by name
-and logs each removed membership. Before writing the migrated registry, the
+and logs each removed membership. Version 1 package catalogs migrate to version
+2 by keeping the saved editor values, edit and published revisions, deployment
+times, and group assignments. If a development registry has distinct draft and
+published managed values, the catalog stays unavailable and the original data
+is retained. Reconcile those values with a version 1 server before upgrading.
+Before writing a migrated registry, the
 server copies the previous file to `<registry>.<YYYYMMDD-HHMMSS>.bak` next to it
 with the same private permissions and logs the path. If the backup cannot be
 saved, the migration is not written and packages stay unavailable. Older
 servers cannot read the migrated file; restore the backup to downgrade.
-Registries written by development builds of this feature are not supported.
+Retired Wi-Fi value formats from development builds still require removal and
+recreation before the package catalog can load.
 If the server cannot read the registry, it keeps the file unchanged, saves no
 device or group changes for that session, and the console shows a warning.
 

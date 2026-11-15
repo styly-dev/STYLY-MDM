@@ -1,6 +1,7 @@
 package com.styly.mdmclient
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.LinkProperties
@@ -8,8 +9,8 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiInfo
-import android.content.pm.PackageManager
 import android.os.Build
+import androidx.annotation.RequiresApi
 import java.util.concurrent.atomic.AtomicBoolean
 
 internal data class WifiLocalNetworkObservation(
@@ -74,6 +75,7 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
     }
 
     override fun observe(listener: (WifiLocalConnectivityEvent) -> Unit): WifiLocalConnectivitySession {
+        if (!supportsManagedWifi()) throw IllegalStateException("Managed Wi-Fi is unsupported")
         val manager = connectivityManager ?: throw IllegalStateException("Connectivity service unavailable")
         val session = AndroidSession(manager, listener)
         try {
@@ -85,6 +87,7 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.S)
     private class AndroidSession(
         private val manager: ConnectivityManager,
         private val listener: (WifiLocalConnectivityEvent) -> Unit,
@@ -228,18 +231,16 @@ private fun String.normalizeSsid(): String? = takeIf {
     it.isNotEmpty() && it != "<unknown ssid>" && it != "unknown ssid"
 }?.removeSurrounding("\"")
 
-private fun WifiInfo.currentNetworkSecurity(): String? {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null
-    return when (currentSecurityType) {
-        WifiInfo.SECURITY_TYPE_OPEN -> "OPEN"
-        WifiInfo.SECURITY_TYPE_PSK -> "WPA_PSK"
-        WifiInfo.SECURITY_TYPE_SAE -> "SAE"
-        WifiInfo.SECURITY_TYPE_WEP -> "WEP"
-        WifiInfo.SECURITY_TYPE_EAP,
-        WifiInfo.SECURITY_TYPE_EAP_WPA3_ENTERPRISE,
-        WifiInfo.SECURITY_TYPE_EAP_WPA3_ENTERPRISE_192_BIT -> "EAP"
-        else -> null
-    }
+@RequiresApi(Build.VERSION_CODES.S)
+private fun WifiInfo.currentNetworkSecurity(): String? = when (currentSecurityType) {
+    WifiInfo.SECURITY_TYPE_OPEN -> "OPEN"
+    WifiInfo.SECURITY_TYPE_PSK -> "WPA_PSK"
+    WifiInfo.SECURITY_TYPE_SAE -> "SAE"
+    WifiInfo.SECURITY_TYPE_WEP -> "WEP"
+    WifiInfo.SECURITY_TYPE_EAP,
+    WifiInfo.SECURITY_TYPE_EAP_WPA3_ENTERPRISE,
+    WifiInfo.SECURITY_TYPE_EAP_WPA3_ENTERPRISE_192_BIT -> "EAP"
+    else -> null
 }
 
 private fun java.net.InetAddress.isUsableLocalAddress(): Boolean =

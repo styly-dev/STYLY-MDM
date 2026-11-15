@@ -180,17 +180,16 @@ The operator-facing details are in [Wi-Fi settings](WIFI_SETTINGS.md).
   waits five minutes after any automatic-return operation settles before
   another one, even after a successful move. Since 2026-11-11 consecutive
   failures double the wait up to 30 minutes. This in-memory wait resets on app
-  process restart; a new package revision is not delayed by the old wait. The
+  process restart. The
   delay changes were host-tested and were **not** installed on the physical
   device; verify with a preferred AP that has a deliberately wrong password.
-- Until 2026-11-11 every OS boot re-applied the assigned Wi-Fi revision and
-  disconnected the current network about 40 seconds after boot. The client now
-  keeps an existing connection when the same Wi-Fi revision still owns Wi-Fi
-  and only reapplies scalar settings. A new package revision whose Wi-Fi list,
-  order, passwords and automatic-return setting equal the applied ones (for
-  example a brightness-only change) is adopted without touching Wi-Fi. On
-  2026-11-11 a brightness-only revision was adopted on the device with no
-  disconnect or reconnect; the boot path was not rebooted on the device.
+- On 2026-11-11 a brightness-only revision kept the active connection through
+  the client's matching Wi-Fi shortcut. Same-boot updates now carry matching
+  Wi-Fi into the new revision without writing the profile or reconnecting.
+- On 2026-11-12 the BDM-enrolled DEV-001 reapplied its sleep policy through
+  `tobmdm` after Wi-Fi association at boot and again after a Wi-Fi reconnect.
+  DEV-005 kept its 1800-second sleep delay across both checks after it was
+  unenrolled. The fixed boot delay was removed based on this comparison.
 - A failed switch restores saved auto-join flags and known credentials. If a
   usable connection existed before the attempt, restoration is confirmed only
   after the prior SSID and a usable IP are observed. If not confirmed within

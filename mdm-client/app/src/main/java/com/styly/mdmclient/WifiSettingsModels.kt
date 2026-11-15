@@ -5,13 +5,6 @@ import org.json.JSONObject
 
 internal const val WIFI_MANUAL_TIMEOUT_MS = 60_000L
 internal const val WIFI_MAX_NETWORKS = 4
-// Operation IDs are generated on the device; a short receipt list only fences duplicate queueing.
-internal const val WIFI_MAX_OPERATION_RECEIPTS = 32
-
-internal fun appendWifiOperationReceipt(existing: List<String>, operationId: String): List<String> =
-    (existing.filterNot { it == operationId } + operationId)
-        .distinct()
-        .takeLast(WIFI_MAX_OPERATION_RECEIPTS)
 
 internal enum class WifiReason(val wireValue: String) {
     NONE("NONE"),
@@ -49,7 +42,10 @@ internal data class WifiSavedProfile(
     val revision: String,
     val networks: List<WifiNetworkProfile>,
     val autoReturn: Boolean = false,
-)
+) {
+    fun hasSameSettings(other: WifiSavedProfile): Boolean =
+        networks == other.networks && autoReturn == other.autoReturn
+}
 
 internal data class WifiRollbackTarget(val ssid: String, val security: String)
 
@@ -101,6 +97,13 @@ internal data class WifiManualResult(
     val rolledBack: Boolean,
 )
 
+/** One package handoff. Automatic selection has its own telemetry and cannot replace this receipt. */
+internal data class WifiPolicyReceipt(
+    val operationId: String,
+    val revision: String,
+    val result: WifiManualResult? = null,
+)
+
 /**
  * A received release of Wi-Fi management that waits for the active operation to settle.
  * It is journaled so a process restart cannot resume the released policy.
@@ -111,55 +114,19 @@ internal data class WifiLocalState(
     val lastApplied: WifiSavedProfile? = null,
     val manualOperation: WifiManualOperation? = null,
     val latestResult: WifiManualResult? = null,
-    val processedOperationIds: List<String> = emptyList(),
+    val policyReceipt: WifiPolicyReceipt? = null,
     val managedWifi: Boolean = true,
     val policyEpoch: Long = 0L,
     val policyRevision: String? = null,
     val pendingRelease: WifiPendingRelease? = null,
 )
 
-internal enum class WifiApplyMode(val wireValue: String) {
-    MANAGED("managed"),
-    UNMANAGED("unmanaged"),
-}
-
 internal class WifiPolicyFailure(val reason: WifiReason) : Exception()
-
-internal data class WifiApplyCommand(
-    val operationId: String,
-    val revision: String,
-    val mode: WifiApplyMode,
-    val networks: List<WifiNetworkProfile>,
-    val autoReturn: Boolean = false,
-)
 
 internal object WifiSettingsProtocol {
     private val UUID_V4 = Regex("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 
-    fun parseApplyCommand(payload: JSONObject): WifiApplyCommand {
-        val operationId = requiredString(payload, "operation_id")
-        val revision = requiredString(payload, "revision")
-        requireUuid(operationId, "operation_id")
-        requireUuid(revision, "revision")
-        val mode = WifiApplyMode.entries.firstOrNull { it.wireValue == requiredString(payload, "mode") }
-            ?: throw IllegalArgumentException("unsupported Wi-Fi apply mode")
-        val wifi = payload.optJSONObject("wifi")
-            ?: if (mode == WifiApplyMode.UNMANAGED) JSONObject() else throw IllegalArgumentException("wifi must be an object")
-        val networkArray = wifi.optJSONArray("networks")
-            ?: if (mode == WifiApplyMode.UNMANAGED) JSONArray() else throw IllegalArgumentException("wifi.networks must be an array")
-        val autoReturn = if (mode == WifiApplyMode.MANAGED) requiredBoolean(wifi, "auto_return") else false
-        if (mode == WifiApplyMode.MANAGED && networkArray.length() > WIFI_MAX_NETWORKS) {
-            throw WifiPolicyFailure(WifiReason.UNSUPPORTED_NETWORK_LIMIT)
-        }
-        if (autoReturn && networkArrayHasHidden(networkArray)) {
-            throw WifiPolicyFailure(WifiReason.UNSUPPORTED_HIDDEN_NETWORK)
-        }
-        val networks = parseNetworks(networkArray, mode)
-        return WifiApplyCommand(operationId, revision, mode, networks, autoReturn)
-    }
-
-    /** Parses a configuration package's `wifi` object without re-encoding it as a command payload. */
-    fun parseManagedPolicy(operationId: String, revision: String, wifi: JSONObject): WifiApplyCommand {
+    fun parseManagedPolicy(revision: String, wifi: JSONObject): WifiSavedProfile {
         requireUuid(revision, "revision")
         val networkArray = wifi.optJSONArray("networks")
             ?: throw IllegalArgumentException("wifi.networks must be an array")
@@ -168,20 +135,17 @@ internal object WifiSettingsProtocol {
         if (autoReturn && networkArrayHasHidden(networkArray)) {
             throw WifiPolicyFailure(WifiReason.UNSUPPORTED_HIDDEN_NETWORK)
         }
-        val networks = parseNetworks(networkArray, WifiApplyMode.MANAGED)
-        return WifiApplyCommand(operationId, revision, WifiApplyMode.MANAGED, networks, autoReturn)
+        val networks = parseNetworks(networkArray)
+        return WifiSavedProfile(revision, networks, autoReturn)
     }
 
     private fun networkArrayHasHidden(array: JSONArray): Boolean = (0 until array.length()).any { index ->
         array.optJSONObject(index)?.optBoolean("hidden", false) == true
     }
 
-    fun parseNetworks(networkArray: JSONArray, mode: WifiApplyMode): List<WifiNetworkProfile> {
-        if (mode == WifiApplyMode.MANAGED && networkArray.length() !in 1..WIFI_MAX_NETWORKS) {
+    private fun parseNetworks(networkArray: JSONArray): List<WifiNetworkProfile> {
+        if (networkArray.length() !in 1..WIFI_MAX_NETWORKS) {
             throw IllegalArgumentException("managed networks must contain 1..$WIFI_MAX_NETWORKS items")
-        }
-        if (mode == WifiApplyMode.UNMANAGED && networkArray.length() != 0) {
-            throw IllegalArgumentException("unmanaged mode must not include networks")
         }
         val networks = ArrayList<WifiNetworkProfile>(networkArray.length())
         val identities = HashSet<String>()
@@ -231,13 +195,10 @@ internal object WifiSettingsProtocol {
         return json.getString(key)
     }
 
-    private fun requiredBoolean(json: JSONObject, key: String): Boolean {
-        if (!json.has(key) || json.isNull(key) || json.get(key) !is Boolean) {
-            throw IllegalArgumentException("$key must be a boolean")
-        }
-        return json.getBoolean(key)
-    }
 }
+
+private fun requiredBoolean(json: JSONObject, key: String): Boolean =
+    json.opt(key) as? Boolean ?: throw IllegalArgumentException("$key must be a boolean")
 
 internal object WifiSettingsCodec {
     private const val VERSION = 2
@@ -247,7 +208,12 @@ internal object WifiSettingsCodec {
         put("last_applied", state.lastApplied?.let(::encodeSavedProfile) ?: JSONObject.NULL)
         put("manual_operation", state.manualOperation?.let(::encodeManualOperation) ?: JSONObject.NULL)
         put("latest_result", state.latestResult?.let(::encodeManualResult) ?: JSONObject.NULL)
-        put("processed_operation_ids", JSONArray(state.processedOperationIds))
+        put("policy_receipt", state.policyReceipt?.let {
+            JSONObject()
+                .put("operation_id", it.operationId)
+                .put("revision", it.revision)
+                .put("result", it.result?.let(::encodeOutcome) ?: JSONObject.NULL)
+        } ?: JSONObject.NULL)
         put("managed_wifi", state.managedWifi)
         put("policy_epoch", state.policyEpoch)
         put("policy_revision", state.policyRevision ?: JSONObject.NULL)
@@ -265,9 +231,9 @@ internal object WifiSettingsCodec {
         return WifiLocalState(
             lastApplied = root.optJSONObject("last_applied")?.let(::decodeSavedProfile),
             manualOperation = root.optJSONObject("manual_operation")?.let(::decodeManualOperation),
-            latestResult = root.optJSONObject("latest_result")?.let(::decodeManualResult),
-            processedOperationIds = decodeOperationReceipts(root.optJSONArray("processed_operation_ids")),
-            managedWifi = requiredBoolean(root, "managed_wifi", default = true),
+            latestResult = root.optJSONObject("latest_result")?.let { decodeManualResult(it) },
+            policyReceipt = decodePolicyReceipt(root),
+            managedWifi = requiredBoolean(root, "managed_wifi"),
             policyEpoch = root.optLong("policy_epoch", 0L).coerceAtLeast(0L),
             policyRevision = optionalString(root, "policy_revision"),
             pendingRelease = root.optJSONObject("pending_release")?.let { release ->
@@ -276,6 +242,18 @@ internal object WifiSettingsCodec {
                 WifiPendingRelease(revision)
             },
         )
+    }
+
+    private fun decodePolicyReceipt(root: JSONObject): WifiPolicyReceipt? {
+        if (root.isNull("policy_receipt")) return null
+        val receipt = root.getJSONObject("policy_receipt")
+        val operationId = receipt.getString("operation_id")
+        val revision = receipt.getString("revision")
+        require(WifiSettingsProtocol.isValidUuid(operationId) && WifiSettingsProtocol.isValidUuid(revision)) {
+            "invalid Wi-Fi package receipt identity"
+        }
+        val result = receipt.optJSONObject("result")?.let { decodeManualResult(it, operationId, revision) }
+        return WifiPolicyReceipt(operationId, revision, result)
     }
 
     private fun encodeSavedProfile(profile: WifiSavedProfile) = JSONObject().apply {
@@ -287,7 +265,7 @@ internal object WifiSettingsCodec {
     private fun decodeSavedProfile(json: JSONObject) = WifiSavedProfile(
         revision = json.getString("revision"),
         networks = decodeNetworks(json.getJSONArray("networks")),
-        autoReturn = requiredBoolean(json, "auto_return", default = false),
+        autoReturn = requiredBoolean(json, "auto_return"),
     )
 
     private fun encodeManualOperation(operation: WifiManualOperation) = JSONObject().apply {
@@ -322,10 +300,10 @@ internal object WifiSettingsCodec {
             ?: throw IllegalArgumentException("unknown Wi-Fi manual phase"),
         deadlineElapsedMillis = optionalLong(json, "deadline_elapsed_ms"),
         failureReason = optionalString(json, "failure_reason")?.let(::reasonFromWire),
-        settingsChanged = requiredBoolean(json, "settings_changed", default = false),
+        settingsChanged = requiredBoolean(json, "settings_changed"),
         policyEpoch = json.optLong("policy_epoch", 0L).coerceAtLeast(0L),
-        autoReturn = requiredBoolean(json, "auto_return", default = false),
-        selectionOnly = requiredBoolean(json, "selection_only", default = false),
+        autoReturn = requiredBoolean(json, "auto_return"),
+        selectionOnly = requiredBoolean(json, "selection_only"),
         selectionIndexes = json.optJSONArray("selection_indexes")?.let { array ->
             val candidateCount = json.getJSONArray("candidate").length()
             buildList {
@@ -342,12 +320,12 @@ internal object WifiSettingsCodec {
                 }
             }
         },
-        retryDisconnected = requiredBoolean(json, "retry_disconnected", default = false),
-        priorConnectionHadUsableIp = requiredBoolean(json, "prior_connection_had_usable_ip", default = false),
+        retryDisconnected = requiredBoolean(json, "retry_disconnected"),
+        priorConnectionHadUsableIp = requiredBoolean(json, "prior_connection_had_usable_ip"),
         restoreTarget = json.optJSONObject("restore_target")?.let {
             WifiRollbackTarget(it.getString("ssid"), it.getString("security"))
         },
-        settingsRestored = requiredBoolean(json, "settings_restored", default = false),
+        settingsRestored = requiredBoolean(json, "settings_restored"),
         restoreDeadlineElapsedMillis = optionalLong(json, "restore_deadline_elapsed_ms"),
         restoreBootCount = optionalLong(json, "restore_boot_count")?.toInt()?.takeIf { it >= 0 },
     )
@@ -382,17 +360,23 @@ internal object WifiSettingsCodec {
         knownCredentials = decodeNetworks(json.getJSONArray("known_credentials")),
     )
 
-    private fun encodeManualResult(result: WifiManualResult) = JSONObject().apply {
-        put("operation_id", result.operationId)
-        put("revision", result.revision)
+    private fun encodeManualResult(result: WifiManualResult) = encodeOutcome(result)
+        .put("operation_id", result.operationId)
+        .put("revision", result.revision)
+
+    private fun encodeOutcome(result: WifiManualResult) = JSONObject().apply {
         put("status", result.status)
         put("reason", result.reason.wireValue)
         put("rolled_back", result.rolledBack)
     }
 
-    private fun decodeManualResult(json: JSONObject) = WifiManualResult(
-        operationId = json.getString("operation_id"),
-        revision = json.getString("revision"),
+    private fun decodeManualResult(
+        json: JSONObject,
+        operationId: String = json.getString("operation_id"),
+        revision: String = json.getString("revision"),
+    ) = WifiManualResult(
+        operationId = operationId,
+        revision = revision,
         status = json.getString("status"),
         reason = reasonFromWire(json.getString("reason")),
         rolledBack = json.getBoolean("rolled_back"),
@@ -429,20 +413,6 @@ internal object WifiSettingsCodec {
         }
     }
 
-    private fun decodeOperationReceipts(array: JSONArray?): List<String> {
-        if (array == null) return emptyList()
-        if (array.length() > 100_000) throw IllegalArgumentException("too many Wi-Fi operation receipts")
-        return buildList {
-            for (index in 0 until array.length()) {
-                val item = array.get(index)
-                if (item !is String || !WifiSettingsProtocol.isValidUuid(item)) {
-                    throw IllegalArgumentException("invalid Wi-Fi operation receipt")
-                }
-                add(item)
-            }
-        }.distinct().takeLast(WIFI_MAX_OPERATION_RECEIPTS)
-    }
-
     private fun reasonFromWire(value: String): WifiReason =
         WifiReason.entries.firstOrNull { it.wireValue == value }
             ?: throw IllegalArgumentException("unknown Wi-Fi reason")
@@ -461,10 +431,4 @@ internal object WifiSettingsCodec {
         return value.toLong()
     }
 
-    private fun requiredBoolean(json: JSONObject, key: String, default: Boolean): Boolean {
-        if (!json.has(key) || json.isNull(key)) return default
-        val value = json.get(key)
-        if (value !is Boolean) throw IllegalArgumentException("$key must be a boolean")
-        return json.getBoolean(key)
-    }
 }

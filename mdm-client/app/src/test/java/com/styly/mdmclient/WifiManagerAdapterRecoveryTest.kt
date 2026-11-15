@@ -3,6 +3,7 @@ package com.styly.mdmclient
 import android.net.wifi.WifiConfiguration
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -59,7 +60,16 @@ class WifiManagerAdapterRecoveryTest {
             entry(8, "transition", "WPA_PSK"),
         )
 
-        assertNull(resolveWifiProfileViewIndex(profile, entries))
+        val failure = assertThrows(WifiAdapterFailure::class.java) { resolveWifiProfileViewIndex(profile, entries) }
+
+        assertEquals(WifiReason.VERIFY_FAILED, failure.reason)
+    }
+
+    @Test
+    fun `an unrelated security view for the same SSID does not block adding the profile`() {
+        val profile = WifiNetworkProfile("open", "OPEN", "", false)
+
+        assertNull(resolveWifiProfileViewIndex(profile, listOf(entry(4, "open", "OTHER:{0}"))))
     }
 
     @Test
@@ -103,6 +113,38 @@ class WifiManagerAdapterRecoveryTest {
     }
 
     @Test
+    fun `recovery re-enables every eligible network and reports any failure`() {
+        val attempted = mutableListOf<Int>()
+
+        val result = reenableWifiRecoveryNetworks(
+            expectedAutoJoin = linkedMapOf(1 to true, 2 to false, 3 to true, 4 to true),
+            selectedTargetId = 3,
+        ) { id ->
+            attempted += id
+            if (id == 1) WifiReason.RESTORE_FAILED else WifiReason.NONE
+        }
+
+        assertEquals(listOf(1, 4), attempted)
+        assertEquals(WifiReason.RESTORE_FAILED, result)
+    }
+
+    @Test
+    fun `without a selected target all eligible networks are re-enabled`() {
+        val attempted = mutableListOf<Int>()
+
+        val result = reenableWifiRecoveryNetworks(
+            expectedAutoJoin = linkedMapOf(3 to true, 4 to true),
+            selectedTargetId = null,
+        ) { id ->
+            attempted += id
+            WifiReason.NONE
+        }
+
+        assertEquals(listOf(3, 4), attempted)
+        assertEquals(WifiReason.NONE, result)
+    }
+
+    @Test
     fun `credential failure still restores auto join reconnects and verifies`() {
         val calls = mutableListOf<String>()
         val failures = mutableListOf<Pair<String, WifiReason>>()
@@ -137,6 +179,21 @@ class WifiManagerAdapterRecoveryTest {
         assertEquals(listOf("credentials", "auto-join", "reconnect", "verify"), calls)
         assertEquals(listOf("AUTO_JOIN" to WifiReason.UPDATE_FAILED), failures)
         assertTrue(calls.contains("reconnect"))
+    }
+
+    @Test
+    fun `recovery helper continues verification after a reconnect callback failure`() {
+        val calls = mutableListOf<String>()
+
+        val result = restoreWifiRecoveryBestEffort(
+            restoreCredentials = { calls += "credentials"; WifiReason.NONE },
+            restoreAutoJoin = { calls += "auto-join"; WifiReason.NONE },
+            reconnect = { calls += "reconnect"; WifiReason.RESTORE_FAILED },
+            verify = { calls += "verify"; WifiReason.NONE },
+        )
+
+        assertEquals(WifiReason.RESTORE_FAILED, result)
+        assertEquals(listOf("credentials", "auto-join", "reconnect", "verify"), calls)
     }
 
     private fun entry(id: Int, ssid: String, security: String) =
