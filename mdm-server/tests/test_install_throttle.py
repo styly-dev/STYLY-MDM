@@ -318,21 +318,19 @@ def test_release_transfer_slot_frees_only_the_named_task():
     asyncio.run(body())
 
 
-def test_disconnect_frees_every_slot_the_device_holds():
-    """A disconnect is task-agnostic: nothing the device was transferring survives it."""
+def test_disconnect_releases_only_the_devices_install_slot():
+    """Job-v1 Push ownership is separate from the established install mapping."""
     async def body():
         loop = asyncio.get_running_loop()
-        futs = {
-            task: loop.create_future() for task in (server.TASK_INSTALL, server.TASK_PUSH)
-        }
-        for task, fut in futs.items():
-            server.pending_transfers[("a", task)] = fut
+        install = loop.create_future()
+        server.pending_transfers[("a", server.TASK_INSTALL)] = install
         # A second device must not be touched by "a" disconnecting.
         other = loop.create_future()
         server.pending_transfers[("b", server.TASK_INSTALL)] = other
 
         assert server.release_transfer_slot("a", "disconnect") is True
-        assert all(f.done() and f.result() == "disconnect" for f in futs.values())
+        assert install.done()
+        assert install.result() == "disconnect"
         assert not other.done()
 
     asyncio.run(body())

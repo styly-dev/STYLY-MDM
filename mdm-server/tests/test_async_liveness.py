@@ -1,6 +1,7 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
@@ -9,6 +10,7 @@ from aiohttp.test_utils import TestServer
 from styly_mdm import push_runtime, push_scheduler, server
 from styly_mdm.push_runtime import PushRuntime
 from styly_mdm.push_scheduler import LiveSession, PushScheduler
+from styly_mdm.push_transfer_leases import PushTransferLeases
 from styly_mdm.transfer_registry import TransferKey, TransferRegistry
 
 
@@ -36,12 +38,11 @@ def _scheduler(manager):
         transfer_slots=lambda: None,
         sessions=lambda: {},
         publish=_publish,
+        leases=PushTransferLeases(),
         send_timeout=1,
         accept_timeout=1,
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
-        transfer_timeout=1,
-        allow_legacy=False,
     )
 
 
@@ -145,18 +146,18 @@ async def test_dispatch_exception_moves_uncertain_send_to_reconciliation(monkeyp
             }
 
     registry = TransferRegistry()
+    leases = PushTransferLeases()
     scheduler = PushScheduler(
         manager=Manager(),
         transfer_registry=registry,
         transfer_slots=lambda: None,
         sessions=lambda: {},
         publish=lambda snapshot: _record(published, snapshot),
+        leases=leases,
         send_timeout=1,
         accept_timeout=1,
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
-        transfer_timeout=1,
-        allow_legacy=False,
     )
     transfer_future = asyncio.get_running_loop().create_future()
     key = TransferKey("push", device_id, job_id, 1)
@@ -190,12 +191,11 @@ async def test_old_dispatch_cleanup_preserves_replacement_waiters():
         transfer_slots=lambda: asyncio.Semaphore(1),
         sessions=lambda: {},
         publish=lambda _snapshot: None,
+        leases=PushTransferLeases(),
         send_timeout=1,
         accept_timeout=1,
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
-        transfer_timeout=1,
-        allow_legacy=False,
     )
     scheduler.wake = lambda: None
     key = TransferKey("push", "D1", "job-1", 1)
@@ -238,18 +238,18 @@ async def test_accept_timeout_already_reconciled_keeps_exact_transfer_slot(monke
             }
 
     registry = TransferRegistry()
+    leases = PushTransferLeases()
     scheduler = PushScheduler(
         manager=Manager(),
         transfer_registry=registry,
         transfer_slots=lambda: asyncio.Semaphore(1),
         sessions=lambda: {},
         publish=_publish,
+        leases=leases,
         send_timeout=1,
         accept_timeout=0,
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
-        transfer_timeout=1,
-        allow_legacy=False,
     )
     sent = []
 
@@ -258,6 +258,7 @@ async def test_accept_timeout_already_reconciled_keeps_exact_transfer_slot(monke
 
     monkeypatch.setattr(scheduler, "send_reconcile", send_reconcile)
     key = TransferKey("push", "D1", "job-1", 1)
+    leases.issue(key, "artifact-1")
     transfer_future = asyncio.get_running_loop().create_future()
     registry.register(key, transfer_future)
     accepted = await scheduler._await_acceptance(
@@ -275,6 +276,58 @@ async def test_accept_timeout_already_reconciled_keeps_exact_transfer_slot(monke
     assert accepted is True
     assert registry.get(key) is transfer_future
     assert sent and sent[0][1] == "D1"
+
+
+@pytest.mark.asyncio
+async def test_accept_timeout_store_conflict_drops_slot_after_lease_revocation():
+    class Manager:
+        async def mark_acceptance_reconciling(self, *_args, **_kwargs):
+            raise push_scheduler.StoreConflict("assignment changed")
+
+        async def assignment(self, _job_id, _device_id):
+            return {
+                "state": "reconciling",
+                "attempt": 1,
+                "accepted_at": None,
+                "reconciliation_reason": "device_disconnect",
+                "accept_deadline": None,
+                "cancel_requested_at": None,
+            }
+
+    registry = TransferRegistry()
+    leases = PushTransferLeases()
+    scheduler = PushScheduler(
+        manager=Manager(),
+        transfer_registry=registry,
+        transfer_slots=lambda: asyncio.Semaphore(1),
+        sessions=lambda: {},
+        publish=_publish,
+        leases=leases,
+        send_timeout=1,
+        accept_timeout=0,
+        accept_reconciliation_timeout=1,
+        reconciliation_timeout=1,
+    )
+    key = TransferKey("push", "D1", "job-1", 1)
+    transfer_future = asyncio.get_running_loop().create_future()
+    registry.register(key, transfer_future)
+    leases.issue(key, "artifact-1")
+    # A fast HTTP completion can revoke the token before the awaited WebSocket
+    # send returns and _await_acceptance observes it.
+    leases.revoke_now(key)
+
+    accepted = await scheduler._await_acceptance(
+        object(),
+        {"job_id": "job-1", "devices": {"D1": {"attempt": 1}}},
+        "D1",
+        asyncio.get_running_loop().create_future(),
+        key,
+        1234,
+    )
+
+    assert accepted is False
+    assert not transfer_future.done()
+    transfer_future.cancel()
 
 
 async def _record(target, value):
@@ -302,8 +355,9 @@ class _DispatchManager:
                 "display_filename": "content.zip",
                 "byte_size": 1,
                 "sha256": "a" * 64,
+                "etag": '"' + "a" * 64 + '"',
             },
-            "devices": {"D1": {"attempt": 1}},
+            "devices": {"D1": {"attempt": 1, "state": "dispatching", "dispatch_revision": 1}},
         }
 
     async def claim_next(self, _online_device_ids):
@@ -315,6 +369,9 @@ class _DispatchManager:
             "device_id": "D1",
             "attempt": 1,
         }
+
+    async def assignment(self, job_id, device_id):
+        return self.snapshot["devices"][device_id]
 
     async def prepare_dispatch(self, *_args, **_kwargs):
         return self.snapshot
@@ -342,24 +399,24 @@ def _dispatch_scheduler(manager, websocket):
         device_id="D1",
         session_id="session-1",
         ws=websocket,
-        capabilities=frozenset({"push_job_id_v1"}),
+        capabilities=frozenset({"push_job_id_v1", "push_resume_v1"}),
         process_instance_id="process-1",
         owner_lock=asyncio.Lock(),
         http_base="http://server",
     )
     registry = TransferRegistry()
+    leases = PushTransferLeases()
     scheduler = PushScheduler(
         manager=manager,
         transfer_registry=registry,
         transfer_slots=_transfer_slot,
         sessions=lambda: {"D1": session},
         publish=_publish,
+        leases=leases,
         send_timeout=10,
         accept_timeout=1,
         accept_reconciliation_timeout=1,
         reconciliation_timeout=1,
-        transfer_timeout=1,
-        allow_legacy=False,
     )
     return scheduler, registry
 
@@ -372,6 +429,7 @@ async def test_dispatch_send_failure_cleans_all_registered_waiters():
     scheduler.start()
     try:
         await asyncio.wait_for(manager.transitioned.wait(), timeout=1)
+        assert websocket.started.is_set()
         assert manager.transitions == [push_scheduler.DeviceState.FAILED]
         assert len(registry) == 0
         assert scheduler._accept_waiters == {}
@@ -570,6 +628,9 @@ async def test_created_deadline_loop_survives_unexpected_publish_error(monkeypat
             self.wake_count += 1
 
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.manager = Manager()
     runtime.store = Store()
     runtime.artifacts = Artifacts()
@@ -625,9 +686,18 @@ class _PublicationLegacy:
 
 
 def _publication_runtime(legacy):
+    class Store:
+        async def drain_retry_publications(self):
+            return []
+
     runtime = object.__new__(PushRuntime)
+    runtime.store = Store()
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
     runtime.legacy = legacy
     runtime.pending_publications = {}
+    runtime.pending_reconciliation_state = None
     runtime.publication_revisions = {}
     runtime.publication_wake = asyncio.Event()
     runtime.publication_stopping = False
@@ -683,6 +753,10 @@ async def test_runtime_cleanup_drains_publication_before_store_close(tmp_path):
     class Store:
         def __init__(self):
             self.closed = False
+
+        async def drain_retry_publications(self):
+            assert not self.closed
+            return []
 
         def close(self):
             assert legacy.events
@@ -769,6 +843,11 @@ async def test_housekeeping_recovers_expired_acceptance_waiter(monkeypatch):
             self.wake_count += 1
 
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
+    # Artifact GC is covered separately; keep it out of this housekeeping loop.
+    runtime._next_artifact_gc_at = float("inf")
     runtime.manager = Manager()
     runtime.scheduler = Scheduler()
     runtime.accept_reconciliation_timeout = 60
@@ -831,6 +910,11 @@ async def test_housekeeping_leaves_live_acceptance_waiter_to_dispatch_task(monke
             raise AssertionError("a skipped live waiter must not wake the scheduler")
 
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
+    # Artifact GC is covered separately; keep it out of this housekeeping loop.
+    runtime._next_artifact_gc_at = float("inf")
     runtime.manager = Manager()
     runtime.scheduler = Scheduler()
     runtime.accept_reconciliation_timeout = 60
@@ -895,6 +979,10 @@ async def test_reconciliation_housekeeping_isolates_query_and_row_errors(monkeyp
     class Transfers:
         def __init__(self):
             self.released = []
+            self.waiter = object()
+
+        def get(self, key):
+            return self.waiter
 
         def release_exact(self, key, reason):
             self.released.append((key.job_id, reason))
@@ -907,10 +995,16 @@ async def test_reconciliation_housekeeping_isolates_query_and_row_errors(monkeyp
             self.wake_count += 1
 
     runtime = object.__new__(PushRuntime)
+    runtime.pending_disconnects = set()
+    runtime.disconnect_recovery_tasks = {}
+    runtime.artifact_gc_task = None
+    # Artifact GC is covered separately; keep it out of this housekeeping loop.
+    runtime._next_artifact_gc_at = float("inf")
     runtime.manager = Manager()
     runtime.sessions = {}
     runtime.transfers = Transfers()
     runtime.scheduler = Scheduler()
+    runtime.leases = push_runtime.PushTransferLeases()
 
     async def publish(snapshot):
         if snapshot["job_id"] == "publish-fail-job":
@@ -932,3 +1026,22 @@ async def test_reconciliation_housekeeping_isolates_query_and_row_errors(monkeyp
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_publication_coalesces_status_without_changing_job_revisions():
+    legacy = _PublicationLegacy()
+    runtime = _publication_runtime(legacy)
+    revision = 1
+    runtime.scheduler = SimpleNamespace(reconciliation_snapshot=lambda: {
+        "revision": revision, "devices": [],
+    })
+    runtime._reconciliation_changed()
+    revision = 2
+    runtime._reconciliation_changed()
+    await asyncio.wait_for(legacy.sent.wait(), 1)
+    runtime.publication_stopping = True
+    runtime.publication_wake.set()
+    await runtime.publication_task
+    assert legacy.events == [{"type": "PUSH_RECONCILIATION_STATE", "revision": 2, "devices": []}]
+    assert runtime.publication_revisions == {}

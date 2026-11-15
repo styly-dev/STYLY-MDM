@@ -30,6 +30,12 @@ import pytest
 from aiohttp.test_utils import TestServer
 
 from styly_mdm import integrity, server
+from ws_test_helpers import (
+    device_row_matches,
+    receive_device_list as _recv_device_list,
+    receive_type as _recv_type,
+    receive_type_recording as _recv_type_recording,
+)
 
 
 CLIENT_PKG = "com.styly.mdmclient"
@@ -524,35 +530,6 @@ def test_coerce_record_roundtrips_version_fields():
 # Integration tests — real WebSockets prove the handler wiring
 # ---------------------------------------------------------------------------
 
-async def _recv_type(ws, msg_type: str, timeout: float = 2.0) -> dict | None:
-    try:
-        while True:
-            msg = await asyncio.wait_for(ws.receive(), timeout)
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                data = json.loads(msg.data)
-                if data.get("type") == msg_type:
-                    return data
-            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING,
-                              aiohttp.WSMsgType.ERROR):
-                return None
-    except asyncio.TimeoutError:
-        return None
-
-
-async def _recv_type_recording(ws, msg_type: str, seen: list[dict], timeout: float = 2.0) -> dict:
-    """Like _recv_type but records every frame passed over; raises on timeout."""
-    async def poll():
-        while True:
-            msg = await ws.receive()
-            if msg.type != aiohttp.WSMsgType.TEXT:
-                continue
-            data = json.loads(msg.data)
-            seen.append(data)
-            if data.get("type") == msg_type:
-                return data
-    return await asyncio.wait_for(poll(), timeout)
-
-
 async def _register(session, base: str, device_id: str, version_code: int):
     ws = await session.ws_connect(base + "/ws/device")
     await ws.send_json({
@@ -577,7 +554,8 @@ def test_e2e_self_update_happy_path(tmp_path):
             async with aiohttp.ClientSession() as session:
                 d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000", version_code=6)
                 admin = await session.ws_connect(base + "/ws/admin")
-                assert await _recv_type(admin, "DEVICE_LIST") is not None
+                device_id = "64b19041-0b8c-4ef4-82fd-000000000000"
+                assert await _recv_device_list(admin, device_id, status="online") is not None
 
                 await admin.send_json({
                     "type": "INSTALL_APK", "target_devices": ["64b19041-0b8c-4ef4-82fd-000000000000"],
@@ -601,9 +579,8 @@ def test_e2e_self_update_happy_path(tmp_path):
                 await d0.close()
 
                 # The disconnect renders the row as updating, not offline.
-                dl = await _recv_type(admin, "DEVICE_LIST")
-                row = next(d for d in dl["devices"] if d["device_id"] == "64b19041-0b8c-4ef4-82fd-000000000000")
-                assert row["status"] == "updating"
+                dl = await _recv_device_list(admin, device_id, status="updating")
+                assert dl is not None
 
                 # The new build re-registers with the target versionCode.
                 d0b = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000", version_code=7)
@@ -614,6 +591,17 @@ def test_e2e_self_update_happy_path(tmp_path):
                 assert result["version_code"] == 7
 
                 # The server auto-verifies and consumes the raw result.
+                online_list = await _recv_type_recording(
+                    admin,
+                    "DEVICE_LIST",
+                    seen,
+                    predicate=lambda message: device_row_matches(
+                        message, device_id, status="online", version_code=7
+                    ),
+                )
+                assert device_row_matches(
+                    online_list, device_id, status="online", version_code=7
+                )
                 verify_cmd = await _recv_type(d0b, "EXECUTE_VERIFY_APK")
                 assert verify_cmd == {"type": "EXECUTE_VERIFY_APK", "package_name": CLIENT_PKG}
                 await d0b.send_json({
@@ -626,12 +614,10 @@ def test_e2e_self_update_happy_path(tmp_path):
                 assert all(f.get("type") != "VERIFY_APK_RESULT" for f in seen), \
                     "raw VERIFY_APK_RESULT must be consumed, not forwarded"
                 # The row is back online with the new version.
-                row = next(
-                    d for d in [f for f in seen if f.get("type") == "DEVICE_LIST"][-1]["devices"]
-                    if d["device_id"] == "64b19041-0b8c-4ef4-82fd-000000000000"
+                latest_list = [f for f in seen if f.get("type") == "DEVICE_LIST"][-1]
+                assert device_row_matches(
+                    latest_list, device_id, status="online", version_code=7
                 )
-                assert row["status"] == "online"
-                assert row["version_code"] == 7
 
                 await d0b.close()
                 await admin.close()
@@ -660,7 +646,8 @@ def test_e2e_self_update_verifies_against_dispatched_bytes_not_a_same_name_reupl
             async with aiohttp.ClientSession() as session:
                 d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000", version_code=6)
                 admin = await session.ws_connect(base + "/ws/admin")
-                assert await _recv_type(admin, "DEVICE_LIST") is not None
+                device_id = "64b19041-0b8c-4ef4-82fd-000000000000"
+                assert await _recv_device_list(admin, device_id, status="online") is not None
 
                 await admin.send_json({
                     "type": "INSTALL_APK", "target_devices": ["64b19041-0b8c-4ef4-82fd-000000000000"],
@@ -690,7 +677,7 @@ def test_e2e_self_update_verifies_against_dispatched_bytes_not_a_same_name_reupl
                 while state["state"] != "updating":
                     state = await _recv_type(admin, "INSTALL_DEVICE_STATE")
                 await d0.close()
-                assert (await _recv_type(admin, "DEVICE_LIST")) is not None
+                assert await _recv_device_list(admin, device_id, status="updating") is not None
 
                 # The device reports the dispatched bytes it actually installed, so
                 # auto-verify passes — it would have failed against the re-upload.
@@ -723,7 +710,7 @@ def test_e2e_second_self_update_starting_replaces_pending(tmp_path):
             async with aiohttp.ClientSession() as session:
                 d0 = await _register(session, base, "dev0", version_code=6)
                 admin = await session.ws_connect(base + "/ws/admin")
-                assert await _recv_type(admin, "DEVICE_LIST") is not None
+                assert await _recv_device_list(admin, "dev0", status="online") is not None
 
                 for corr, target in (("c-1", 7), ("c-2", 8)):
                     await d0.send_json({
@@ -769,7 +756,13 @@ def test_e2e_disconnect_mid_update_still_releases_transfer_slot(tmp_path):
                 d0 = await _register(session, base, "dev0", version_code=6)
                 d1 = await _register(session, base, "dev1", version_code=6)
                 admin = await session.ws_connect(base + "/ws/admin")
-                assert await _recv_type(admin, "DEVICE_LIST") is not None
+                assert await _recv_type(
+                    admin, "DEVICE_LIST",
+                    predicate=lambda message: (
+                        device_row_matches(message, "dev0", status="online")
+                        and device_row_matches(message, "dev1", status="online")
+                    ),
+                ) is not None
 
                 await admin.send_json({
                     "type": "INSTALL_APK", "target_devices": ["dev0", "dev1"],
@@ -790,9 +783,8 @@ def test_e2e_disconnect_mid_update_still_releases_transfer_slot(tmp_path):
                 await d0.close()
 
                 assert await _recv_type(d1, "EXECUTE_INSTALL") is not None
-                dl = await _recv_type(admin, "DEVICE_LIST")
-                row = next(d for d in dl["devices"] if d["device_id"] == "dev0")
-                assert row["status"] == "updating"
+                dl = await _recv_device_list(admin, "dev0", status="updating")
+                assert dl is not None
 
                 # Settle the pending update so no armed timeout task outlives the loop.
                 d0b = await _register(session, base, "dev0", version_code=7)
@@ -817,7 +809,7 @@ def test_e2e_legacy_timeout_reports_untracked_and_flips_offline(tmp_path):
             async with aiohttp.ClientSession() as session:
                 d0 = await _register(session, base, "dev0", version_code=6)
                 admin = await session.ws_connect(base + "/ws/admin")
-                assert await _recv_type(admin, "DEVICE_LIST") is not None
+                assert await _recv_device_list(admin, "dev0", status="online") is not None
 
                 await d0.send_json({
                     "type": "SELF_UPDATE_STARTING", "correlation_id": "c-1",
@@ -825,13 +817,13 @@ def test_e2e_legacy_timeout_reports_untracked_and_flips_offline(tmp_path):
                     "package_name": CLIENT_PKG, "apk_filename": "x.apk",
                 })
                 await d0.close()
-                dl = await _recv_type(admin, "DEVICE_LIST")
-                assert dl["devices"][0]["status"] == "updating"
+                dl = await _recv_device_list(admin, "dev0", status="updating")
+                assert dl is not None
 
                 result = await _recv_type(admin, "SELF_UPDATE_RESULT")
                 assert result["status"] == "untracked"
-                dl = await _recv_type(admin, "DEVICE_LIST")
-                assert dl["devices"][0]["status"] == "offline"
+                dl = await _recv_device_list(admin, "dev0", status="offline")
+                assert dl is not None
 
                 await admin.close()
         finally:

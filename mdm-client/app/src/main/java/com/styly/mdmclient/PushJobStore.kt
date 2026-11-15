@@ -6,6 +6,48 @@ import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
+import java.io.IOException
+
+internal sealed class PushStateLoadResult {
+    data class Valid(val state: PushProtocol.State) : PushStateLoadResult()
+    object Missing : PushStateLoadResult()
+    /** The file could not be read (I/O error); its content is unknown, so retry later. */
+    data class Unreadable(val error: IOException) : PushStateLoadResult()
+    /** Preserve the snapshot: dropping receipts would lose execution evidence. */
+    data class InvalidReceipts(val error: InvalidPushReceiptsException) : PushStateLoadResult()
+    /** Preserve unrecognized durable formats and keep device state unavailable. */
+    data class UnsupportedVersion(val error: UnsupportedPushStateVersionException) : PushStateLoadResult()
+    /** Preserve uncertain active ownership instead of claiming the device is idle. */
+    data class InvalidActive(val error: InvalidPushActiveException) : PushStateLoadResult()
+    /** The file was read but its content is not a valid durable state. */
+    data class Corrupt(val error: Exception) : PushStateLoadResult()
+}
+
+/**
+ * [fileExists] tells a missing file apart from one that exists but cannot be opened:
+ * EACCES and EMFILE also surface as [FileNotFoundException].
+ */
+internal fun loadPushState(
+    readText: () -> String,
+    normalize: (PushProtocol.State) -> PushProtocol.State,
+    fileExists: () -> Boolean,
+): PushStateLoadResult = try {
+    PushStateLoadResult.Valid(
+        normalize(PushProtocol.stateFromJson(JSONObject(readText()))),
+    )
+} catch (error: FileNotFoundException) {
+    if (fileExists()) PushStateLoadResult.Unreadable(error) else PushStateLoadResult.Missing
+} catch (error: IOException) {
+    PushStateLoadResult.Unreadable(error)
+} catch (error: InvalidPushReceiptsException) {
+    PushStateLoadResult.InvalidReceipts(error)
+} catch (error: UnsupportedPushStateVersionException) {
+    PushStateLoadResult.UnsupportedVersion(error)
+} catch (error: InvalidPushActiveException) {
+    PushStateLoadResult.InvalidActive(error)
+} catch (error: Exception) {
+    PushStateLoadResult.Corrupt(error)
+}
 
 internal fun normalizePushState(
     state: PushProtocol.State,
@@ -34,18 +76,21 @@ class PushJobStore(
     private val atomicFile = AtomicFile(File(directory, "state.json"))
 
     @Synchronized
-    fun load(): PushProtocol.State {
-        return try {
-            val text = atomicFile.openRead().bufferedReader(Charsets.UTF_8).use { it.readText() }
-            trim(PushProtocol.stateFromJson(JSONObject(text)))
-        } catch (_: FileNotFoundException) {
-            emptyState()
-        } catch (error: Exception) {
-            // A corrupt state file is serious, but crashing the foreground service would
-            // prevent registration and operational recovery. Keep the file for diagnosis.
-            Log.e(TAG, "Could not parse durable Push/Sync state", error)
-            emptyState()
-        }
+    internal fun load(): PushStateLoadResult = loadPushState(
+        readText = {
+            atomicFile.openRead().bufferedReader(Charsets.UTF_8).use { it.readText() }
+        },
+        normalize = ::trim,
+        fileExists = {
+            // AtomicFile restores a legacy ".bak" backup on read; either file is state.
+            atomicFile.baseFile.exists() || File(atomicFile.baseFile.path + ".bak").exists()
+        },
+    )
+
+    /** Deletes the durable state file and its backup. */
+    @Synchronized
+    internal fun discard() {
+        atomicFile.delete()
     }
 
     @Synchronized

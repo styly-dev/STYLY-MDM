@@ -28,6 +28,7 @@ import pytest
 from aiohttp.test_utils import TestServer
 
 from styly_mdm import server
+from ws_test_helpers import receive_device_list as _recv_device_list, receive_type as _recv_type
 
 
 CLIENT_PKG = "com.styly.mdmclient"
@@ -296,21 +297,6 @@ def test_forget_device_removes_retired_entry_and_cancels_pending(tmp_path):
 # Integration tests — real WebSockets prove the handler wiring
 # ---------------------------------------------------------------------------
 
-async def _recv_type(ws, msg_type: str, timeout: float = 2.0) -> dict | None:
-    try:
-        while True:
-            msg = await asyncio.wait_for(ws.receive(), timeout)
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                data = json.loads(msg.data)
-                if data.get("type") == msg_type:
-                    return data
-            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING,
-                              aiohttp.WSMsgType.ERROR):
-                return None
-    except asyncio.TimeoutError:
-        return None
-
-
 async def _register(session, base: str, device_id: str, version_code: int = 6):
     ws = await session.ws_connect(base + "/ws/device")
     await ws.send_json({
@@ -319,10 +305,6 @@ async def _register(session, base: str, device_id: str, version_code: int = 6):
     })
     await _recv_type(ws, "REGISTERED")
     return ws
-
-
-def _row(device_list: dict, device_id: str) -> dict:
-    return next(d for d in device_list["devices"] if d["device_id"] == device_id)
 
 
 def test_e2e_retire_happy_path(tmp_path):
@@ -336,7 +318,8 @@ def test_e2e_retire_happy_path(tmp_path):
             async with aiohttp.ClientSession() as session:
                 d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
-                assert await _recv_type(admin, "DEVICE_LIST") is not None
+                device_id = "64b19041-0b8c-4ef4-82fd-000000000000"
+                assert await _recv_device_list(admin, device_id, status="online") is not None
 
                 await admin.send_json({"type": "RETIRE_DEVICE", "target_devices": ["64b19041-0b8c-4ef4-82fd-000000000000"]})
                 ack = await _recv_type(admin, "RETIRE_SENT")
@@ -353,16 +336,16 @@ def test_e2e_retire_happy_path(tmp_path):
                 await d0.close()
 
                 # The disconnect renders the row as retiring, not offline.
-                dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "retiring"
+                dl = await _recv_device_list(admin, device_id, status="retiring")
+                assert dl is not None
 
                 # Silence past the window settles the retire as a success and the
                 # row lands in the terminal, persisted state.
                 result = await _recv_type(admin, "RETIRE_RESULT")
                 assert result["status"] == "success"
                 assert result["correlation_id"] == cmd["correlation_id"]
-                dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "retired"
+                dl = await _recv_device_list(admin, device_id, status="retired")
+                assert dl is not None
 
                 # A retired row is offline, so the existing forget path removes it.
                 await admin.send_json({"type": "FORGET_DEVICE", "device_id": "64b19041-0b8c-4ef4-82fd-000000000000"})
@@ -387,7 +370,8 @@ def test_e2e_reregister_within_timeout_is_failure_and_unretires(tmp_path):
             async with aiohttp.ClientSession() as session:
                 d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
-                assert await _recv_type(admin, "DEVICE_LIST") is not None
+                device_id = "64b19041-0b8c-4ef4-82fd-000000000000"
+                assert await _recv_device_list(admin, device_id, status="online") is not None
 
                 await admin.send_json({"type": "RETIRE_DEVICE", "target_devices": ["64b19041-0b8c-4ef4-82fd-000000000000"]})
                 cmd = await _recv_type(d0, "EXECUTE_SELF_UNINSTALL")
@@ -397,8 +381,8 @@ def test_e2e_reregister_within_timeout_is_failure_and_unretires(tmp_path):
                     "package_name": CLIENT_PKG, "version_code": 6,
                 })
                 await d0.close()
-                dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "retiring"
+                dl = await _recv_device_list(admin, device_id, status="retiring")
+                assert dl is not None
 
                 # The keep-alive restarted the merely-killed client: the retire
                 # failed, and the device is back to plain online.
@@ -406,8 +390,8 @@ def test_e2e_reregister_within_timeout_is_failure_and_unretires(tmp_path):
                 result = await _recv_type(admin, "RETIRE_RESULT")
                 assert result["status"] == "fail"
                 assert "re-registered" in result["detail"]
-                dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "online"
+                dl = await _recv_device_list(admin, device_id, status="online")
+                assert dl is not None
                 assert server.device_registry["64b19041-0b8c-4ef4-82fd-000000000000"].get("retired") is not True
 
                 await d0b.close()
@@ -429,7 +413,8 @@ def test_e2e_client_reported_failure_without_disconnect(tmp_path):
             async with aiohttp.ClientSession() as session:
                 d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
-                assert await _recv_type(admin, "DEVICE_LIST") is not None
+                device_id = "64b19041-0b8c-4ef4-82fd-000000000000"
+                assert await _recv_device_list(admin, device_id, status="online") is not None
 
                 await admin.send_json({"type": "RETIRE_DEVICE", "target_devices": ["64b19041-0b8c-4ef4-82fd-000000000000"]})
                 cmd = await _recv_type(d0, "EXECUTE_SELF_UNINSTALL")
@@ -473,7 +458,8 @@ def test_e2e_retire_announce_supersedes_pending_self_update(tmp_path):
             async with aiohttp.ClientSession() as session:
                 d0 = await _register(session, base, "64b19041-0b8c-4ef4-82fd-000000000000")
                 admin = await session.ws_connect(base + "/ws/admin")
-                assert await _recv_type(admin, "DEVICE_LIST") is not None
+                device_id = "64b19041-0b8c-4ef4-82fd-000000000000"
+                assert await _recv_device_list(admin, device_id, status="online") is not None
 
                 # A self-update is announced but never completes...
                 await d0.send_json({
@@ -492,8 +478,8 @@ def test_e2e_retire_announce_supersedes_pending_self_update(tmp_path):
                     "package_name": CLIENT_PKG, "version_code": 6,
                 })
                 await d0.close()
-                dl = await _recv_type(admin, "DEVICE_LIST")
-                assert _row(dl, "64b19041-0b8c-4ef4-82fd-000000000000")["status"] == "retiring"
+                dl = await _recv_device_list(admin, device_id, status="retiring")
+                assert dl is not None
                 assert "64b19041-0b8c-4ef4-82fd-000000000000" not in server.pending_self_updates
                 assert update_timeout.cancelled()
 

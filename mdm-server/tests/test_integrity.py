@@ -186,9 +186,9 @@ def test_dir_manifest_keeps_authored_dotfiles(tmp_path):
 def test_reference_matches_the_tree_that_push_delivers(tmp_path):
     """A folder picked as a reference must hash to what `push files` actually ships.
 
-    `upload_bundle_handler` drops OS metadata on the way into the bundle, so a device never
-    receives it. If the reference kept those files the console would report a permanent
-    `missing N` against a device that is in fact identical.
+    The Push job upload drops OS metadata before packaging, so a device never receives it.
+    If the reference kept those files the console would report a permanent `missing N`
+    against a device that is in fact identical.
     """
     source, delivered = tmp_path / "source", tmp_path / "delivered"
     for rel in ["Movies/clip.mp4", "Textures/a.png"]:
