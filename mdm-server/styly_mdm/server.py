@@ -106,7 +106,6 @@ ADMIN_SEND_TIMEOUT = max(0.1, float(os.environ.get("MDM_ADMIN_SEND_TIMEOUT", "5"
 # (an admin can push files to a group already installing an APK), so both the slot
 # registry and the release path are keyed by task, never by device alone.
 TASK_INSTALL = "install"
-TASK_PUSH = "push"
 
 # Seconds a self-updating client may stay away before the update is declared lost.
 # The client schedules a device power cycle (shutdown at +2 min, startup at +3 min)
@@ -217,6 +216,10 @@ device_registry: dict[str, dict] = {}
 class _DeviceGroup:
     members: tuple[str, ...] = ()
     package_id: str | None = None
+    deployment_revision: str | None = None
+
+    def effective_revision(self, profile: dict) -> str:
+        return self.deployment_revision or profile["published_revision"]
 
 
 @dataclass(frozen=True)
@@ -394,10 +397,13 @@ def _remove_duplicate_memberships(groups: dict[str, _DeviceGroup]) -> None:
 
 
 def _serialized_groups(configuration: _ConfigurationRegistry) -> dict:
-    return {
-        name: {"members": list(group.members), "package_id": group.package_id}
-        for name, group in configuration.groups.items()
-    }
+    groups = {}
+    for name, group in configuration.groups.items():
+        entry = {"members": list(group.members), "package_id": group.package_id}
+        if group.deployment_revision is not None:
+            entry["deployment_revision"] = group.deployment_revision
+        groups[name] = entry
+    return groups
 
 
 def _read_configuration(raw: dict) -> _ConfigurationRegistry:
@@ -411,14 +417,19 @@ def _read_configuration(raw: dict) -> _ConfigurationRegistry:
         for raw_name, entry in raw_groups.items():
             name = _group_name(raw_name)
             if (not name or name in groups or len(raw_name) > MAX_GROUP_NAME_LEN
-                    or not isinstance(entry, dict) or set(entry) != {"members", "package_id"}
+                    or not isinstance(entry, dict)
+                    or set(entry) - {"deployment_revision"} != {"members", "package_id"}
                     or not isinstance(entry["members"], list)
                     or any(not isinstance(member, str) or not member for member in entry["members"])):
                 raise PackageError("Invalid saved group")
             package_id = entry["package_id"]
             if package_id is not None and (normalize_revision(package_id) is None or package_id not in packages):
                 raise PackageError("Invalid saved package assignment")
-            groups[name] = _DeviceGroup(_coerce_group_members(entry["members"]), package_id)
+            revision = entry.get("deployment_revision")
+            if revision is not None and (normalize_revision(revision) is None or package_id is None
+                                        or packages[package_id]["published_revision"] is None):
+                raise PackageError("Invalid saved group deployment revision")
+            groups[name] = _DeviceGroup(_coerce_group_members(entry["members"]), package_id, revision)
     else:
         # Released servers saved {name: [device_id]} and allowed several groups per device.
         packages = {}
@@ -463,7 +474,7 @@ def _backup_registry() -> None:
 
 
 def load_registry() -> None:
-    """Load the registry and atomically migrate released groups to the package format."""
+    """Load the registry and atomically migrate supported older configurations."""
     global _configuration, _registry_readable
     device_registry.clear()
     _registry_extras.clear()
@@ -755,15 +766,23 @@ def build_group_list_msg() -> str:
     groups = {name: list(group.members) for name, group in group_entries}
     packages = _configuration.packages or {}
     assignments = {name: group.package_id for name, group in group_entries if group.package_id is not None}
-    deployments = {
-        name: {"package_id": package_id, "revision": profile["published_revision"],
-               "keys": list(configuration_packages.published_settings(profile))}
-        for name, package_id in assignments.items()
-        if (profile := packages.get(package_id)) is not None and profile["published_revision"] is not None
-    }
+    deployments = {}
+    for name, group in group_entries:
+        profile = packages.get(group.package_id)
+        if profile is None or profile["published_revision"] is None:
+            continue
+        settings = configuration_packages.published_settings(profile)
+        deployment = {
+            "package_id": group.package_id,
+            "revision": group.effective_revision(profile),
+            "keys": list(settings),
+        }
+        deployment["wifi_mode"] = _wifi_mode(settings)
+        deployments[name] = deployment
     return json.dumps({"type": "GROUP_LIST", "groups": groups, "assignments": assignments,
                        "packages": _public_packages(), "deployments": deployments,
-                       "registry_writable": _registry_readable})
+                       "registry_writable": _registry_readable,
+                       "configuration_available": _configuration.packages is not None})
 
 
 async def broadcast_group_list():
@@ -930,7 +949,7 @@ def reset_transfer_slots() -> None:
 
 
 def release_transfer_slot(device_id: str, reason: str, task: str | None = None) -> bool:
-    """Free the transfer slot(s) a device holds, if any.
+    """Free a device's pending install transfer, if any.
 
     Resolving the pending future wakes the dispatcher coroutine parked on it so the
     next queued device is dispatched. Safe to call for a device that holds no slot
@@ -938,10 +957,9 @@ def release_transfer_slot(device_id: str, reason: str, task: str | None = None) 
     more than once for the same device and task (e.g. DOWNLOAD_COMPLETE followed by
     INSTALL_RESULT) — the second call is a no-op.
 
-    ``task`` names which job to release: a device may be transferring for an install
-    and a push at the same time, and each job's terminal message must free only its
-    own slot. Pass None to free every slot the device holds, which is what a
-    disconnect means.
+    The pending-transfers view contains Install only. Push owns exact typed keys
+    and HTTP leases separately; a WebSocket disconnect must not release them.
+    Pass None on disconnect to release any pending Install for this device.
 
     Returns True only when this call actually released a live slot, so callers can
     tell a real transfer→apply transition from a late message for a device whose
@@ -1507,14 +1525,10 @@ def _save_package(package_id: str, profile: dict | None) -> None:
         raise PackageError("Configuration package could not be saved", 500)
 
 
-def _package_impact(
-    package_id: str, profile: dict, groups: dict[str, _DeviceGroup] | None = None,
-) -> tuple[dict, list[str]]:
-    if groups is None:
-        groups = _configuration.groups
+def _package_impact(package_id: str, profile: dict) -> tuple[dict, list[str]]:
     membership = {
         name: sorted(group.members)
-        for name, group in sorted(groups.items()) if group.package_id == package_id
+        for name, group in sorted(_configuration.groups.items()) if group.package_id == package_id
     }
     revision = profile["published_revision"]
     token = hashlib.sha256(json.dumps([package_id, revision, membership]).encode("utf-8")).hexdigest()
@@ -1523,18 +1537,23 @@ def _package_impact(
 
 
 def _updated_package(profile: dict, body: dict) -> dict:
-    configuration_packages.check_expected_revision(body, profile["draft_revision"])
+    configuration_packages.check_expected_revision(body, profile["edit_revision"])
     name = configuration_packages.validate_name(body.get("name", profile["name"]))
-    settings = configuration_packages.validate_draft(body.get("settings"), profile["settings"])
-    return {**profile, "name": name, "settings": settings, "draft_revision": str(uuid.uuid4())}
+    settings = configuration_packages.validate_settings(body.get("settings"), profile["settings"])
+    return {**profile, "name": name, "settings": settings, "edit_revision": str(uuid.uuid4())}
 
 
-def _publish_package(profile: dict) -> dict:
-    return {
+def _published_configuration(package_id: str, profile: dict) -> _ConfigurationRegistry:
+    published = {
         **profile,
         "published_revision": str(uuid.uuid4()),
         "deployed_at_ms": time.time_ns() // 1_000_000,
     }
+    groups = {
+        name: replace(group, deployment_revision=None) if group.package_id == package_id else group
+        for name, group in _configuration.groups.items()
+    }
+    return replace(_configuration, groups=groups, packages={**_require_packages(), package_id: published})
 
 
 def _check_deployment_impact(body: dict, token: str) -> None:
@@ -1561,7 +1580,7 @@ async def package_catalog_handler(request: web.Request) -> web.Response:
         profile = {
             "name": configuration_packages.validate_name(body.get("name")),
             "settings": {},
-            "draft_revision": None,
+            "edit_revision": None,
             "published_revision": None,
             "deployed_at_ms": None,
         }
@@ -1598,10 +1617,11 @@ async def package_save_and_deploy_handler(request: web.Request) -> web.Response:
         profile = _find_package(package_id)
         impact, devices = _package_impact(package_id, profile)
         _check_deployment_impact(body, impact["token"])
-        updated = _publish_package(_updated_package(profile, body))
-        _save_package(package_id, updated)
+        updated = _published_configuration(package_id, _updated_package(profile, body))
+        if not _commit_configuration(updated):
+            raise PackageError("Configuration package could not be saved", 500)
         _schedule_configuration_publication(request.app, devices)
-        return web.json_response(_public_package(package_id, updated))
+        return web.json_response(_public_package(package_id, _find_package(package_id)))
     except PackageError as exc:
         return web.json_response({"error": str(exc)}, status=exc.status)
 
@@ -1620,10 +1640,9 @@ async def group_package_deploy_handler(request: web.Request) -> web.Response:
         if len(ids) != 1 or (ids[0] and normalize_revision(ids[0]) is None):
             raise PackageError("Exactly one package_id is required, a canonical UUID or empty for No package")
         package_id = ids[0] or None
-        packages = _require_packages()
+        _require_packages()
         profile = _find_package(package_id) if package_id is not None else None
         package_name = profile["name"] if profile is not None else "No package"
-        groups = {**_configuration.groups, name: replace(group, package_id=package_id)}
         published_revision = profile["published_revision"] if profile is not None else None
         if profile is not None and published_revision is None:
             raise PackageError("Edit this package and select Save & deploy to deploy it first.", 409)
@@ -1635,20 +1654,32 @@ async def group_package_deploy_handler(request: web.Request) -> web.Response:
         else:
             # Redeploying the group's current package republishes its saved settings
             # as a new revision to every group that uses it.
-            impact, devices = _package_impact(package_id, profile, groups)
-            target = [profile["draft_revision"], impact["token"]]
-        # Bind the preview to the old assignment and the exact revision and device set.
-        scope = [name, group.package_id, package_id, package_name, use_current, target]
+            impact, devices = _package_impact(package_id, profile)
+            target = [profile["edit_revision"], impact["token"]]
+        # Bind the preview to the current assignment, settings revision, and device set.
+        current_revision = None
+        if group.package_id is not None:
+            current_profile = (_configuration.packages or {}).get(group.package_id)
+            if current_profile is not None and current_profile["published_revision"] is not None:
+                current_revision = group.effective_revision(current_profile)
+        scope = [name, group.package_id, group.deployment_revision, current_revision,
+                 package_id, package_name, use_current, target]
         token = hashlib.sha256(json.dumps(scope).encode()).hexdigest()
         if body is None:
             return web.json_response({
                 "name": package_name, "use_current": use_current, "clear": profile is None,
+                "wifi_mode": _group_wifi_mode(group),
                 "impact": {**impact, "token": token},
             })
         _check_deployment_impact(body, token)
         if profile is not None and not use_current:
-            packages = {**packages, package_id: _publish_package(profile)}
-        if not _commit_configuration(replace(_configuration, groups=groups, packages=packages)):
+            updated = _published_configuration(package_id, profile)
+        else:
+            # A scoped deployment uses the published settings with a fresh revision for this group.
+            revision = str(uuid.uuid4()) if use_current else None
+            assignment = replace(group, package_id=package_id, deployment_revision=revision)
+            updated = replace(_configuration, groups={**_configuration.groups, name: assignment})
+        if not _commit_configuration(updated):
             raise PackageError("Group deployment could not be saved", 500)
         _schedule_configuration_publication(request.app, devices)
         return web.json_response({"package_id": package_id})
@@ -1680,10 +1711,27 @@ def _supports_configuration(entry: dict) -> bool:
             and configuration_packages.CAPABILITY in entry.get("capabilities", ()))
 
 
+def _wifi_mode(settings: dict) -> str | None:
+    wifi = settings.get("wifi")
+    if not isinstance(wifi, dict):
+        return None
+    return "android_selection" if wifi.get("prioritize_networks") is False else "priority"
+
+
+def _group_wifi_mode(group: _DeviceGroup) -> str | None:
+    if group.package_id is None:
+        return None
+    profile = (_configuration.packages or {}).get(group.package_id)
+    if profile is None or profile["published_revision"] is None:
+        return None
+    return _wifi_mode(configuration_packages.published_settings(profile))
+
+
 def _desired_configuration(device_id: str, *, include_summary: bool = False, include_settings: bool = True) -> dict:
     packages = _configuration.packages or {}
     group_name = None
     package_id = None
+    revision = None
     published = None
     for name, group in _configuration.groups.items():
         if device_id in group.members:
@@ -1692,11 +1740,12 @@ def _desired_configuration(device_id: str, *, include_summary: bool = False, inc
                 profile = packages[group.package_id]
                 if profile["published_revision"] is not None:
                     package_id = group.package_id
+                    revision = group.effective_revision(profile)
                     published = profile
             break
     policy = {
         "package_id": package_id,
-        "revision": published["published_revision"] if published is not None else None,
+        "revision": revision,
         "settings": (configuration_packages.published_settings(published)
                      if published is not None and include_settings else {}),
     }
@@ -2010,7 +2059,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         kind == "canonical" and configuration_packages.CAPABILITY in registration["capabilities"]
                     )
                     current_configuration_state = (
-                        registration["configuration_state"]
+                        registration["configuration_state"] or prev.get("configuration_state")
                         if supports_configuration
                         else None
                     )
@@ -2046,7 +2095,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "configuration_state": (
                             current_configuration_state or prev.get("configuration_state")
                         ),
-                        "wifi_state": devices[device_id]["wifi_state"],
+                        "wifi_state": devices[device_id]["wifi_state"] or prev.get("wifi_state"),
                     }
                     save_registry()
 

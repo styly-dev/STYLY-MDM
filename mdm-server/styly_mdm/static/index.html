@@ -565,6 +565,8 @@
 
 <body>
   <div class="shell">
+    <div class="push-note registry-warning" id="registryWarning" role="alert" hidden>The server could not read its device registry, so changes to devices and groups are not saved. The file is kept unchanged. Fix or restore the registry, then restart the server.</div>
+    <div class="push-note registry-warning" id="configurationWarning" role="alert" hidden>The server could not read its saved configuration packages. Repair or restore the registry and restart the server to manage groups and packages.</div>
     <!-- ===================== CONSOLE VIEW ===================== -->
     <div id="consoleView" class="card">
       <div class="topbar">
@@ -574,8 +576,6 @@
           <div class="conn"><span class="conn-dot" id="connDot"></span><span id="connText">Disconnected</span></div>
         </div>
       </div>
-      <div class="push-note registry-warning" id="registryWarning" role="alert" hidden>The server could not read its device registry, so changes to devices and groups are not saved. The file is kept unchanged. Fix or restore the registry, then restart the server.</div>
-
       <div class="zones">
         <!-- (1) Targets -->
         <div class="targets">
@@ -1241,7 +1241,9 @@
             const previousMembers = groups[manageSelectedGroup] || [];
             groups = msg.groups || {};
             membershipSnapshotReady = true;
-            document.getElementById('registryWarning').hidden = msg.registry_writable !== false;
+            const registryUnreadable = msg.registry_writable === false;
+            document.getElementById('registryWarning').hidden = !registryUnreadable;
+            document.getElementById('configurationWarning').hidden = registryUnreadable || msg.configuration_available !== false;
             configurationController.updateSnapshot(msg);
             groupsLoaded = true;
             if (pendingSelectGroup && (pendingSelectGroup in groups)) { selectManageGroup(pendingSelectGroup); pendingSelectGroup = null; }

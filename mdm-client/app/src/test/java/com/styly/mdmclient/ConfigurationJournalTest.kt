@@ -25,19 +25,22 @@ class ConfigurationJournalTest {
         assertTrue(restored.shouldApply(updated, 133, null))
     }
 
-    @Test fun `failed revision waits across reboot even after an attempt for another package`() {
+    @Test fun `failed revision can apply once after reboot and waits for Retry during the same boot`() {
         val results = JSONObject().put("brightness", settingOutcome("applied", 60))
-            .put("wifi", settingOutcome("failed", reason = "TIMEOUT_ROLLED_BACK"))
+            .put("wifi", settingOutcome("failed", reason = "UNREACHABLE"))
         val failed = ConfigurationAttempt(first, 133, "complete", results)
         val journal = ConfigurationJournal().withAttempt(failed)
             .withAttempt(ConfigurationAttempt(second, 133, "complete"))
         val restored = ConfigurationJournal.restore(journal.encode())
         assertFalse(restored.shouldApply(first, 133, null))
-        assertFalse(restored.shouldApply(first, 134, null))
+        assertTrue(restored.shouldApply(first, 134, null))
+        val secondAppliedAfterReboot = restored.withAttempt(ConfigurationAttempt(second, 134, "complete"))
+        assertTrue(secondAppliedAfterReboot.shouldApply(first, 134, null))
+        assertFalse(secondAppliedAfterReboot.withAttempt(failed.copy(bootCount = 134)).shouldApply(first, 134, null))
         assertTrue(restored.shouldApply(first, 134, "retry-one"))
         assertTrue(restored.shouldApply(second, 134, null))
         assertTrue(restored.shouldApply(updated, 134, null))
-        assertEquals("TIMEOUT_ROLLED_BACK", restored.find(first)?.results?.getJSONObject("wifi")?.getString("reason"))
+        assertEquals("UNREACHABLE", restored.find(first)?.results?.getJSONObject("wifi")?.getString("reason"))
         assertNull(restored.withAttempt(ConfigurationAttempt(updated, 134)).find(first))
     }
 
@@ -47,7 +50,7 @@ class ConfigurationJournalTest {
         val interrupted = requireNotNull(restored.find(first))
         assertEquals("interrupted", interrupted.status)
         assertFalse(restored.shouldApply(first, 133, null))
-        assertFalse(restored.shouldApply(first, 134, null))
+        assertTrue(restored.shouldApply(first, 134, null))
         assertFalse(restored.shouldApply(first, 134, "retry-one"))
         assertFalse(restored.shouldApply(first, 134, "retry-two"))
         assertTrue(restored.shouldApply(first, 134, "retry-three"))
@@ -57,6 +60,7 @@ class ConfigurationJournalTest {
         assertEquals(first.revision, report.getString("revision"))
         assertFalse(report.has("boot_count"))
         assertFalse(report.has("retry_ids"))
+        assertFalse(report.has("scalar_targets"))
     }
 
     @Test fun `explicit retry cannot replay a successful or unattempted revision`() {
@@ -64,5 +68,18 @@ class ConfigurationJournalTest {
         assertFalse(journal.shouldApply(first, 133, "retry-one"))
         assertFalse(journal.shouldApply(first, 134, "retry-one"))
         assertFalse(journal.shouldApply(updated, 134, "retry-one"))
+    }
+
+    @Test fun `deferred Wi-Fi verification is refreshed when a different package was applied`() {
+        val results = JSONObject().put("wifi", settingOutcome("failed", reason = "VERIFY_AFTER_REBOOT"))
+        val deferred = ConfigurationAttempt(first, 133, "complete", results)
+        val journal = ConfigurationJournal().withAttempt(deferred)
+        assertTrue(deferred.needsRetry)
+        assertFalse(journal.shouldApply(first, 133, null))
+        assertFalse(journal.shouldApply(first, 133, "retry-one"))
+        assertTrue(journal.shouldApply(first, 134, null))
+
+        val replaced = journal.withAttempt(ConfigurationAttempt(second, 133, "complete"))
+        assertTrue(replaced.shouldApply(first, 133, null))
     }
 }

@@ -12,7 +12,7 @@ from .wifi_settings import (
 
 CAPABILITY = "configuration_packages_v1"
 SUMMARY_CAPABILITY = "configuration_summary_v1"
-VERSION = 2
+VERSION = 3
 MAX_PACKAGE_NAME_LEN = 64
 _REASONS = WIFI_REASONS | {
     "READ_FAILED", "WRITE_FAILED", "READBACK_MISMATCH", "INVALID_VALUE",
@@ -54,8 +54,8 @@ SECTIONS = [
               "schedule", {"enabled": False, "hour": 0, "minute": 0, "repeat": 127}),
     ]},
     {"id": "network", "title": "Network & connectivity", "description": "Wi-Fi and Bluetooth", "items": [
-        _item("wifi", "Wi-Fi networks", "Prefer networks in the listed order and optionally return to a higher-priority network.",
-              "wifi", {"networks": [], "auto_return": False}),
+        _item("wifi", "Wi-Fi networks", "Choose whether the client prioritizes this list or Android selects from saved networks.",
+              "wifi", {"networks": [], "auto_return": False, "prioritize_networks": True}),
         _item("bluetooth", "Bluetooth", "Enable Bluetooth.", "bool", False),
         _item("wifiPower", "Wi-Fi power control", "Keep Wi-Fi connected during sleep.", "bool", True),
     ]},
@@ -116,11 +116,17 @@ def _validate_delays(settings):
 
 
 def _validate_wifi(value, *, managed, previous=None):
-    if not isinstance(value, dict) or set(value) != {"networks", "auto_return"}:
-        raise PackageError("Wi-Fi value must contain networks and auto_return")
+    if (not isinstance(value, dict) or not {"networks", "auto_return"}.issubset(value)
+            or set(value) - {"networks", "auto_return", "prioritize_networks"}):
+        raise PackageError("Wi-Fi value must contain networks and auto_return, with optional prioritize_networks")
     auto_return = value["auto_return"]
     if type(auto_return) is not bool:
         raise PackageError("auto_return must be a boolean")
+    prioritize_networks = value.get("prioritize_networks", True)
+    if type(prioritize_networks) is not bool:
+        raise PackageError("prioritize_networks must be a boolean")
+    if not prioritize_networks and auto_return:
+        raise PackageError("auto_return must be false when prioritize_networks is false")
     previous_networks = previous.get("networks") if isinstance(previous, dict) else None
     try:
         networks = validate_profile_networks(
@@ -128,9 +134,12 @@ def _validate_wifi(value, *, managed, previous=None):
         )
     except WiFiSettingsError as exc:
         raise PackageError(str(exc)) from None
-    if managed and auto_return and any(network["hidden"] for network in networks):
+    if managed and prioritize_networks and auto_return and any(network["hidden"] for network in networks):
         raise PackageError("Automatic Wi-Fi return is not supported with hidden networks")
-    return {"networks": networks, "auto_return": auto_return}
+    result = {"networks": networks, "auto_return": auto_return}
+    if not prioritize_networks:
+        result["prioritize_networks"] = False
+    return result
 
 
 def _validate_value(key, value, *, managed=True, previous=None):
@@ -144,8 +153,8 @@ def _validate_value(key, value, *, managed=True, previous=None):
     return value
 
 
-def validate_draft(settings, previous=None):
-    """Validate draft settings against the current setting catalog."""
+def validate_settings(settings, previous=None):
+    """Validate package settings against the current setting catalog."""
     if not isinstance(settings, dict):
         raise PackageError("settings must be an object")
     previous = previous or {}
@@ -188,9 +197,8 @@ def public_profile(package_id, profile, impact):
     return {
         "package_id": package_id,
         "name": profile["name"],
-        "draft_revision": profile["draft_revision"],
+        "edit_revision": profile["edit_revision"],
         "published_revision": profile["published_revision"],
-        "published_keys": list(published_settings(profile)),
         "settings": settings,
         "sections": SECTIONS,
         "impact": impact,
@@ -207,87 +215,34 @@ def check_expected_revision(body, current_revision):
         raise PackageError("The package changed. Reload the package.", 409)
 
 
-def _validate_snapshots(snapshots):
-    for phase, snapshot in snapshots.items():
-        allowed_fields = {"revision", "settings"} | ({"deployed_at_ms"} if phase == "published" else set())
-        if (phase not in ("draft", "published") or not isinstance(snapshot, dict)
-                or set(snapshot) - allowed_fields
-                or normalize_revision(snapshot.get("revision")) is None
-                or not isinstance(snapshot.get("settings"), dict)):
-            raise PackageError("Invalid saved configuration snapshot")
-        if phase == "draft":
-            validate_draft(snapshot["settings"])
-        else:
-            if "deployed_at_ms" in snapshot and (
-                not _bounded_int(snapshot["deployed_at_ms"], 1, 253402300799999)
-            ):
-                raise PackageError("Invalid configuration deployment time")
-            values = {key: _validate_value(key, value) for key, value in snapshot["settings"].items()}
-            _validate_delays(values)
-
-
-def _migrate_v1_packages(packages):
-    migrated = {}
-    for package_id, profile in packages.items():
-        if normalize_revision(package_id) is None or not isinstance(profile, dict):
-            raise PackageError("Invalid saved package")
-        if validate_name(profile.get("name")) != profile["name"]:
-            raise PackageError("Invalid saved package name")
-        snapshots = {key: value for key, value in profile.items() if key != "name"}
-        _validate_snapshots(snapshots)
-        draft = snapshots.get("draft")
-        published = snapshots.get("published")
-
-        if draft is not None:
-            settings = copy.deepcopy(draft["settings"])
-            draft_revision = draft["revision"]
-            if published is not None and managed_settings(settings) != published["settings"]:
-                raise PackageError("Saved package draft differs from its published settings")
-        elif published is not None:
-            settings = {
-                key: {"managed": True, "value": copy.deepcopy(value)}
-                for key, value in published["settings"].items()
-            }
-            draft_revision = published["revision"]
-        else:
-            settings = {}
-            draft_revision = None
-
-        migrated[package_id] = {
-            "name": profile["name"],
-            "settings": settings,
-            "draft_revision": draft_revision,
-            "published_revision": published["revision"] if published is not None else None,
-            "deployed_at_ms": published.get("deployed_at_ms") if published is not None else None,
-        }
-    return migrated
-
-
 def load_packages(raw):
     if (not isinstance(raw, dict) or type(raw.get("version")) is not int
-            or raw["version"] not in (1, VERSION) or not isinstance(raw.get("packages"), dict)):
+            or raw["version"] not in (2, VERSION) or not isinstance(raw.get("packages"), dict)):
         raise PackageError("Unsupported configuration format")
-    packages = raw["packages"]
-    if raw["version"] == 1:
-        return _migrate_v1_packages(packages)
+    revision_key = "draft_revision" if raw["version"] == 2 else "edit_revision"
+    packages = {}
 
-    for package_id, profile in packages.items():
+    for package_id, profile in raw["packages"].items():
         if normalize_revision(package_id) is None or not isinstance(profile, dict):
             raise PackageError("Invalid saved package")
-        if (set(profile) != {"name", "settings", "draft_revision", "published_revision", "deployed_at_ms"}
+        if (set(profile) != {"name", "settings", revision_key, "published_revision", "deployed_at_ms"}
                 or validate_name(profile.get("name")) != profile["name"]
                 or not isinstance(profile["settings"], dict)):
             raise PackageError("Invalid saved package")
-        draft_revision = profile["draft_revision"]
+        edit_revision = profile[revision_key]
         published_revision = profile["published_revision"]
         deployed_at_ms = profile["deployed_at_ms"]
-        if (draft_revision is not None and normalize_revision(draft_revision) is None
+        if (edit_revision is not None and normalize_revision(edit_revision) is None
                 or published_revision is not None and normalize_revision(published_revision) is None
                 or deployed_at_ms is not None and not _bounded_int(deployed_at_ms, 1, 253402300799999)
                 or (deployed_at_ms is not None and published_revision is None)
-                or (draft_revision is None and (profile["settings"] or published_revision is not None))):
+                or (edit_revision is None and (profile["settings"] or published_revision is not None))):
             raise PackageError("Invalid saved package revisions")
-        validate_draft(profile["settings"])
+        validate_settings(profile["settings"])
+        if raw["version"] == 2:
+            profile = profile.copy()
+            profile["edit_revision"] = profile.pop(revision_key)
+        packages[package_id] = profile
     return packages
 
 
@@ -301,13 +256,11 @@ def public_configuration_state(raw):
     """Allow only bounded, non-credential status fields from device reports."""
     if (not isinstance(raw, dict) or normalize_revision(raw.get("package_id")) is None
             or normalize_revision(raw.get("revision")) is None
-            or raw.get("status") not in ("applying", "complete", "interrupted", "already_attempted")
+            or raw.get("status") not in ("applying", "complete", "interrupted")
             or not isinstance(raw.get("results"), dict)):
         return None
     state = {"package_id": raw["package_id"], "revision": raw["revision"], "status": raw["status"]}
     results = {}
-    if raw["status"] == "already_attempted":
-        return {**state, "results": results}
     for key, item in _ITEMS.items():
         result = raw["results"].get(key)
         if not isinstance(result, dict) or result.get("status") not in ("applied", "failed", "unsupported"):
@@ -319,7 +272,5 @@ def public_configuration_state(raw):
         reason = result.get("reason")
         if isinstance(reason, str) and reason in _REASONS:
             clean["reason"] = reason
-        if type(result.get("rolled_back")) is bool:
-            clean["rolled_back"] = result["rolled_back"]
         results[key] = clean
     return {**state, "results": results}

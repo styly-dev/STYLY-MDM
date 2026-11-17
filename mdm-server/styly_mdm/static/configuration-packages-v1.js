@@ -72,12 +72,7 @@
   const MAX_WIFI_NETWORKS = 4;
   const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   const WIFI_ORDER_HELP = 'Earlier networks in this list have higher priority.';
-  const WIFI_RECOVERY_FAILURE_REASONS = new Set([
-    'PERMISSION_DENIED', 'UNSUPPORTED', 'CONFIG_READ_FAILED', 'UPDATE_FAILED', 'VERIFY_FAILED',
-    'TIMEOUT_ROLLED_BACK', 'RESTORE_FAILED', 'BUSY', 'UNREACHABLE', 'UNKNOWN',
-    'UNSUPPORTED_HIDDEN_NETWORK', 'UNSUPPORTED_PRIORITY_NETWORK_LIMIT',
-  ]);
-  const WIFI_OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const WIFI_ANDROID_HELP = 'Android chooses among saved Wi-Fi networks. Listed SSID and security matches have auto-connect on. Other saved networks have auto-connect off.';
 
   function esc(value) {
     return String(value == null ? '' : value).replace(/[&<>"']/g, function (character) {
@@ -93,6 +88,7 @@
       if (item.kind === 'wifi') {
         value = {
           auto_return: value.auto_return === true,
+          prioritize_networks: value.prioritize_networks !== false,
           networks: value.networks.map(({ ssid, security, hidden, password_present }) => ({
             ssid, security, hidden, password_present, password: '',
           })),
@@ -151,6 +147,10 @@
     // buildPayload() has already rejected the wifiConflicts() cases (network limit, hidden + auto-return).
     if (managed && !networks.length) throw new Error('Add at least one Wi-Fi network when Wi-Fi is managed.');
     if (typeof value.auto_return !== 'boolean') throw new Error('Choose whether Wi-Fi should automatically return.');
+    if (typeof value.prioritize_networks !== 'boolean') throw new Error('Choose whether package Wi-Fi priority is enabled.');
+    if (!value.prioritize_networks && value.auto_return) {
+      throw new Error('Turn off automatic return when Android selects Wi-Fi networks.');
+    }
     const identities = new Set();
     const payloadNetworks = networks.map(function (network, index) {
       const { ssid, security, hidden, password } = network;
@@ -178,7 +178,9 @@
       }
       return result;
     });
-    return { networks: payloadNetworks, auto_return: value.auto_return };
+    const result = { networks: payloadNetworks, auto_return: value.auto_return };
+    if (!value.prioritize_networks) result.prioritize_networks = false;
+    return result;
   }
 
   function moveWifiNetwork(networks, index, direction) {
@@ -195,7 +197,7 @@
     const networks = Array.isArray(entry?.value?.networks) ? entry.value.networks : [];
     return {
       tooManyNetworks: networks.length > MAX_WIFI_NETWORKS,
-      autoReturnWithHidden: entry?.managed === true && entry.value.auto_return === true &&
+      autoReturnWithHidden: entry?.managed === true && entry.value.prioritize_networks !== false && entry.value.auto_return === true &&
         networks.some(network => network.hidden),
     };
   }
@@ -216,7 +218,7 @@
     valuePanel.querySelectorAll('[data-policy-action="move-network"]').forEach(button => {
       const index = Number(button.dataset.network);
       const boundary = button.dataset.direction === 'up' ? index === 0 : index === networks.length - 1;
-      button.disabled = draft.wifi?.managed !== true || boundary;
+      button.disabled = draft.wifi?.managed !== true || draft.wifi?.value.prioritize_networks === false || boundary;
     });
   }
 
@@ -254,12 +256,24 @@
     return Boolean(deployment && report?.package_id === deployment.package_id && report.revision === deployment.revision);
   }
 
+  function wifiAwaitingReboot(report) {
+    const result = report?.results?.wifi;
+    return result?.status === 'failed' && result.reason === 'VERIFY_AFTER_REBOOT';
+  }
+
+  function wifiIsOnlyPendingResult(report, deployment) {
+    return Boolean(deployment?.keys.includes('wifi') && wifiAwaitingReboot(report) &&
+      deployment.keys.every(key => key === 'wifi' || report.results?.[key]?.status === 'applied'));
+  }
+
   function retryEligible(device, deployment) {
     const report = device?.configuration_state;
-    return device?.status === 'online' && device.configuration_supported === true &&
-      matchesDeployment(report, deployment) &&
-      (report.status === 'interrupted' || (report.status === 'complete' && deployment.keys.some(key =>
-        ['failed', 'unsupported'].includes(report.results?.[key]?.status))));
+    if (device?.status !== 'online' || device.configuration_supported !== true ||
+        !matchesDeployment(report, deployment)) return false;
+    if (report.status === 'interrupted') return true;
+    if (report.status !== 'complete') return false;
+    return deployment.keys.some(key => ['failed', 'unsupported'].includes(report.results?.[key]?.status) &&
+      !(key === 'wifi' && wifiAwaitingReboot(report)));
   }
 
   function deviceOutcome(device, packageId, deployment) {
@@ -278,17 +292,19 @@
       return ['failed', 'Interrupted' + connection, 'Some settings may have changed. Retry when the device is online.'];
     }
     if (report.status === 'applying') return ['pending', 'Applying', 'The device is applying and checking managed settings.'];
-    if (report.status === 'already_attempted') {
-      return ['', 'Already attempted this boot' + connection, 'The device skipped reapplying this revision during the current boot.'];
-    }
     if (report.status !== 'complete') {
       return ['pending', 'Pending' + connection, 'Waiting for the device to report the outcome.'];
+    }
+    if (wifiIsOnlyPendingResult(report, deployment)) {
+      return ['pending', 'Saved. Verify after reboot.' + connection,
+        'Wi-Fi settings were saved. Restart the headset to verify the connection.'];
     }
     const results = deployment.keys.map(key => report.results?.[key]?.status);
     const applied = results.filter(status => status === 'applied').length;
     if (results.every(status => status === 'applied')) {
+      const wifiSaved = deployment.keys.includes('wifi') && report.results?.wifi?.reason === 'SAVED';
       return ['success', results.length ? 'Applied' + connection : 'No managed settings' + connection,
-        results.length ? 'All managed settings were verified.' : 'The device acknowledged this revision.'];
+        results.length ? wifiSaved ? 'Wi-Fi profiles and auto-connect flags were read back. Android selects the network.' : 'All managed settings were verified.' : 'The device acknowledged this revision.'];
     }
     if (results.every(status => status === 'unsupported')) {
       return ['unavailable', 'Unsupported' + connection, 'This device could not apply the managed settings.'];
@@ -309,11 +325,13 @@
     const rows = networks.map(function (network, index) {
       const field = `data-setting="${esc(item.id)}" data-network="${index}"`;
       const isOpen = network.security === 'OPEN';
-      return `<article class="wifi-network">
-        <div class="wifi-network-head"><strong>Wi-Fi ${index + 1}</strong>
-          <div class="wifi-network-actions">
+      const moveActions = value.prioritize_networks ? `
             <button class="btn-outline wifi-move" type="button" aria-label="Move Wi-Fi ${index + 1} up" data-policy-action="move-network" data-direction="up" ${field} ${!managed || index === 0 ? 'disabled' : ''}>Up</button>
-            <button class="btn-outline wifi-move" type="button" aria-label="Move Wi-Fi ${index + 1} down" data-policy-action="move-network" data-direction="down" ${field} ${!managed || index === networks.length - 1 ? 'disabled' : ''}>Down</button>
+            <button class="btn-outline wifi-move" type="button" aria-label="Move Wi-Fi ${index + 1} down" data-policy-action="move-network" data-direction="down" ${field} ${!managed || index === networks.length - 1 ? 'disabled' : ''}>Down</button>` : '';
+      return `<article class="wifi-network">
+        <div class="wifi-network-head">${value.prioritize_networks ? `<strong>Wi-Fi ${index + 1}</strong>` : ''}
+          <div class="wifi-network-actions">
+            ${moveActions}
           <button class="btn-outline btn-danger-outline wifi-remove" type="button" data-policy-action="remove-network" ${field}>Remove from package</button>
           </div>
         </div>
@@ -332,15 +350,17 @@
       </article>`;
     }).join('');
     const conflicts = wifiConflicts({ managed, value });
-    const priorityControls = `<div class="wifi-options">
-      <small class="wifi-order-note" data-wifi-order-note>${WIFI_ORDER_HELP}</small>
+    const strategyControls = value.prioritize_networks ? `<small class="wifi-order-note" data-wifi-order-note>${WIFI_ORDER_HELP}</small>
       <label><input type="checkbox" data-setting="${esc(item.id)}" data-field="auto_return" ${value.auto_return ? 'checked' : ''}> Automatically return to a higher-priority network when it becomes available</label>
-      <small>Checks for higher-priority networks about every 5 minutes while connected below the first choice, including after manual selection or fallback. The OS may delay switching; no priority scan is requested while on the first choice.</small>
+      <small>Checks for higher-priority networks about every 5 minutes while connected below the first choice, including after manual selection or fallback. If a move fails and the headset is still disconnected, it tries the previous network again. Android may delay detection.</small>` : '';
+    const priorityControls = `<div class="wifi-options">
+      <label><input type="checkbox" data-setting="${esc(item.id)}" data-field="prioritize_networks" ${value.prioritize_networks ? 'checked' : ''}> Prioritize package Wi-Fi networks</label>
+      ${strategyControls}
       <small class="wifi-warning" data-wifi-limit-warning role="alert" ${conflicts.tooManyNetworks ? '' : 'hidden'}>Wi-Fi supports up to 4 networks. Remove extra networks before deploying.</small>
       <small class="wifi-warning" data-wifi-hidden-warning role="alert" ${conflicts.autoReturnWithHidden ? '' : 'hidden'}>Automatic return is not supported with hidden Wi-Fi networks. Turn off auto-return or clear Hidden network before deploying.</small>
     </div>`;
     return `<div class="settings-networks">
-      <div class="push-note">Deploying managed Wi-Fi enables auto-connect for listed networks and disables it for other saved networks. Devices keep their saved networks. Replacing a password can limit recovery to passwords already held by MDM.</div>
+      <div class="push-note">${value.prioritize_networks ? 'Only the first listed Wi-Fi network is enabled for Android auto-connect. Other saved networks have auto-connect off. The headset tries listed networks in order when needed.' : WIFI_ANDROID_HELP} Devices can lose contact with MDM if none of the listed networks connects.</div>
       ${rows}
       ${priorityControls}
       <button type="button" class="btn-outline" data-policy-action="add-network" data-setting="${esc(item.id)}" ${!managed || networks.length >= MAX_WIFI_NETWORKS ? 'disabled' : ''}>Add Wi-Fi network</button>
@@ -423,18 +443,15 @@
       const item = items.get(key);
       const result = report.results?.[key];
       if (!result) return '';
-      const status = { applied: 'Applied', failed: 'Failed', unsupported: 'Unsupported' }[result.status];
+      const deferredWifi = key === 'wifi' && wifiAwaitingReboot(report);
+      const savedWifi = key === 'wifi' && result.status === 'applied' && result.reason === 'SAVED';
+      const status = deferredWifi ? 'Saved. Verify after reboot.' : savedWifi ? 'Saved. Android selects the network.' :
+        { applied: 'Applied', failed: 'Failed', unsupported: 'Unsupported' }[result.status];
       if (!status) return '';
       const actual = actualValue(item, result.value);
-      const wifiRecovery = key === 'wifi' && result.status === 'failed';
-      const reason = result.reason && !(wifiRecovery && result.reason === 'RESTORE_UNCONFIRMED')
+      const reason = result.reason && !deferredWifi && !savedWifi
         ? ' · ' + String(result.reason).replaceAll('_', ' ').toLowerCase() : '';
-      const recovery = wifiRecovery && result.reason === 'RESTORE_UNCONFIRMED'
-        ? ' · Wi-Fi settings restored; original SSID and usable IP not confirmed'
-        : wifiRecovery && result.rolled_back
-          ? ' · Wi-Fi settings restored; original SSID and usable IP verified when previously connected'
-          : result.rolled_back ? ' · Rolled back' : '';
-      return `<li>${esc(item?.label || key)} · ${status}${actual ? ' · ' + esc(actual) : ''}${esc(reason)}${esc(recovery)}</li>`;
+      return `<li>${esc(item?.label || key)} · ${status}${actual ? ' · ' + esc(actual) : ''}${esc(reason)}</li>`;
     }).filter(Boolean).join('');
     return lines ? `<details class="settings-readback" data-result-device="${esc(id)}" ${open ? 'open' : ''}><summary>Results at apply time</summary><ul>${lines}</ul></details>` : '';
   }
@@ -452,30 +469,14 @@
   }
 
   function wifiAutoReturnMonitor(device, deployment) {
-    if (device?.status !== 'online' || !deployment?.keys.includes('wifi')) return '';
+    if (device?.status !== 'online' || !deployment?.keys.includes('wifi') ||
+        deployment.wifi_mode === 'android_selection') return '';
     const labels = {
       off: 'Not scanning', monitoring: 'Monitoring', degraded: 'Degraded',
       switching: 'Switching', unsupported: 'Unsupported',
     };
     const label = labels[device.wifi_state?.priority_monitor];
     return label ? 'Wi-Fi auto-return monitor: ' + label + '.' : '';
-  }
-
-  function latestWifiRecoveryStatus(device, deployment) {
-    if (device?.status !== 'online' || !deployment?.keys.includes('wifi')) return '';
-    const result = device.wifi_state?.last_result;
-    if (!result || typeof result !== 'object' || Array.isArray(result) ||
-        typeof result.operation_id !== 'string' || !WIFI_OPERATION_ID_PATTERN.test(result.operation_id) ||
-        result.revision !== deployment.revision || result.status !== 'failed' ||
-        typeof result.reason !== 'string' || typeof result.rolled_back !== 'boolean') return '';
-
-    if (result.reason === 'RESTORE_UNCONFIRMED' && result.rolled_back === false) {
-      return 'Latest Wi-Fi operation: recovery pending; settings are restored, but the previous connection (if one existed) is not confirmed.';
-    }
-    if (result.rolled_back === true && WIFI_RECOVERY_FAILURE_REASONS.has(result.reason)) {
-      return 'Latest Wi-Fi operation: recovery confirmed; settings are restored, and the previous connection (if one existed) was verified.';
-    }
-    return '';
   }
 
   function createController({
@@ -720,7 +721,7 @@
           if (JSON.stringify(edited.value) !== JSON.stringify(previous.value)) draft[key].value = edited.value;
         }
       }
-      Object.assign(model, { sections: data.sections, draftRevision: data.draft_revision,
+      Object.assign(model, { sections: data.sections, editRevision: data.edit_revision,
         publishedRevision: data.published_revision,
         savedName: data.name, saved, name, draft });
       readSections(data.sections);
@@ -747,6 +748,9 @@
       if (profile.clear) {
         return confirmAction('Deploy No package to "' + groupName + '" (' + deviceCount + ')?\n\n' +
           'This stops managing all settings for this group and leaves current device values in place. ' +
+          (profile.wifi_mode === 'priority' || profile.wifi_mode === 'android_selection'
+            ? 'Wi-Fi auto-connect settings still apply after release. To let a network reconnect automatically, enable auto-connect for it on the headset. '
+            : '') +
           'Offline devices receive the updated policy when they connect.');
       }
       if (profile.use_current) {
@@ -775,7 +779,7 @@
           data = await api(path);
         } else if (action === 'deploy') {
           const fresh = await api(path);
-          if (fresh.draft_revision !== model.draftRevision) {
+          if (fresh.edit_revision !== model.editRevision) {
             throw Object.assign(new Error('The package changed. Reload and review the latest version before deploying.'), { status: 409 });
           }
           if (!confirmDeployment(fresh, { editorName: model.name.trim() })) return;
@@ -948,7 +952,6 @@
       for (const [id, { device, outcome: [state, label, detail] }] of outcomes) {
         const readiness = wifiReadiness(device, deployment);
         const priorityMonitor = wifiAutoReturnMonitor(device, deployment);
-        const wifiRecovery = latestWifiRecoveryStatus(device, deployment);
         let button = '';
         if (deployment) {
           const key = retryKey(id, deployment);
@@ -968,7 +971,6 @@
             <div class="settings-meta">${deviceIdHtml(device || {}, id)} · ${esc(detail)}</div>
             ${readiness ? `<div class="settings-meta">${readiness}</div>` : ''}
             ${priorityMonitor ? `<div class="settings-meta">${esc(priorityMonitor)}</div>` : ''}
-            ${wifiRecovery ? `<div class="settings-meta">${esc(wifiRecovery)}</div>` : ''}
             ${reportedResults(device?.configuration_state, deployment, items, id, openResults.has(id))}
           </div>${button}
         </article>`);
@@ -1105,6 +1107,14 @@
         } else if (setting === 'wifi' && field === 'auto_return') {
           value.auto_return = target.checked;
           updateWifiWarnings(target.closest('.settings-value'), model.draft);
+        } else if (setting === 'wifi' && field === 'prioritize_networks') {
+          value.prioritize_networks = target.checked;
+          if (!value.prioritize_networks) value.auto_return = false;
+          model.error = false;
+          model.message = '';
+          renderEditor();
+          packagePanel.querySelector('[data-field="prioritize_networks"]')?.focus({ preventScroll: true });
+          return;
         } else if (field === 'enabled') {
           value.enabled = target.checked;
           target.closest('.settings-value').querySelectorAll('[data-field="time"], [data-field="day"]')
@@ -1152,7 +1162,7 @@
           updateActions();
           return;
         }
-        return request(model, 'deploy', { expected_revision: model.draftRevision, settings,
+        return request(model, 'deploy', { expected_revision: model.editRevision, settings,
           ...(name !== model.savedName ? { name } : {}) });
       } else if (action === 'delete') {
         if (confirmAction('Delete configuration package "' + model.savedName + '"?')) return request(model, 'delete');

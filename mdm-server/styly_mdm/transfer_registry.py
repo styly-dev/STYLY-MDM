@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
@@ -62,6 +63,9 @@ class TransferRegistry:
 
     def get(self, key: TransferKey) -> asyncio.Future[str] | None:
         return self._futures.get(key)
+
+    def __iter__(self) -> Iterator[TransferKey]:
+        return iter(tuple(self._futures))
 
     def __len__(self) -> int:
         return len(self._futures)

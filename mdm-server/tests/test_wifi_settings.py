@@ -81,9 +81,70 @@ def test_wifi_state_never_forwards_credentials_or_unvalidated_results():
            "password": "secret", "last_result": {
                "operation_id": "22222222-2222-4222-8222-222222222222",
                "revision": "11111111-1111-4111-8111-111111111111", "status": "failed",
-               "reason": "PERMISSION_DENIED", "rolled_back": False, "password": "secret"}}
+               "reason": "PERMISSION_DENIED", "rolled_back": True, "password": "secret"}}
     state = public_wifi_state(raw)
     assert "secret" not in json.dumps(state)
+    assert "rolled_back" not in state["last_result"]
     for value in ([], {}, {**raw, "busy": "yes"}, {**raw, "last_result": {"status": "success"}},
                   {**raw, "unavailable_reason": ["secret"]}, {**raw, "policy_revision": "invalid"}):
         assert public_wifi_state(value) is None
+
+
+def test_wifi_state_accepts_fallback_and_rejects_retired_reasons():
+    from styly_mdm.wifi_settings import public_wifi_state
+
+    base = {
+        "managed": True,
+        "policy_revision": "11111111-1111-4111-8111-111111111111",
+        "busy": False,
+        "available": True,
+        "unavailable_reason": None,
+    }
+    fallback = public_wifi_state({**base, "last_result": {
+        "operation_id": "22222222-2222-4222-8222-222222222222",
+        "revision": base["policy_revision"], "status": "success", "reason": "FALLBACK",
+    }})
+    assert fallback["last_result"]["reason"] == "FALLBACK"
+
+    deferred = public_wifi_state({**base, "last_result": {
+        "operation_id": "22222222-2222-4222-8222-222222222222",
+        "revision": base["policy_revision"], "status": "failed", "reason": "VERIFY_AFTER_REBOOT",
+    }})
+    assert deferred["last_result"]["reason"] == "VERIFY_AFTER_REBOOT"
+
+    saved = public_wifi_state({**base, "last_result": {
+        "operation_id": "22222222-2222-4222-8222-222222222222",
+        "revision": base["policy_revision"], "status": "success", "reason": "SAVED",
+    }})
+    assert saved["last_result"]["reason"] == "SAVED"
+
+    for reason in ("REBOOT_REQUIRED", "PREVIOUS_CREDENTIAL_REQUIRED", "RESTORE_FAILED", "TIMEOUT_ROLLED_BACK"):
+        rejected = public_wifi_state({**base, "last_result": {
+            "operation_id": "22222222-2222-4222-8222-222222222222",
+            "revision": base["policy_revision"], "status": "failed", "reason": reason,
+        }})
+        assert rejected is None
+
+
+def test_configuration_result_preserves_verify_after_reboot_reason():
+    from styly_mdm.configuration_packages import public_configuration_state
+
+    revision = "11111111-1111-4111-8111-111111111111"
+    report = public_configuration_state({
+        "package_id": "22222222-2222-4222-8222-222222222222",
+        "revision": revision,
+        "status": "complete",
+        "results": {"wifi": {"status": "failed", "reason": "VERIFY_AFTER_REBOOT"}},
+    })
+
+    assert report["results"]["wifi"] == {
+        "status": "failed", "reason": "VERIFY_AFTER_REBOOT",
+    }
+
+    saved_report = public_configuration_state({
+        "package_id": "22222222-2222-4222-8222-222222222222",
+        "revision": revision,
+        "status": "complete",
+        "results": {"wifi": {"status": "applied", "reason": "SAVED"}},
+    })
+    assert saved_report["results"]["wifi"] == {"status": "applied", "reason": "SAVED"}

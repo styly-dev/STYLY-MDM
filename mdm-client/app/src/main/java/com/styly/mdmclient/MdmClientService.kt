@@ -100,7 +100,6 @@ class MdmClientService : Service() {
         private val HEX = "0123456789abcdef".toCharArray()
     }
 
-    private val startupLaunch = StartupLaunchGate()
     private val startupHandler = Handler(android.os.Looper.getMainLooper())
     @Volatile private var notificationStatus = "Initializing..."
     private lateinit var webSocketManager: WebSocketManager
@@ -155,7 +154,7 @@ class MdmClientService : Service() {
         // right call instead of leaving the two indistinguishable.
         promoteToForeground()
         UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_FOREGROUND_OK)
-        MdmClientApplication.wifiSettingsController().startStartupRecovery()
+        MdmClientApplication.wifiSettingsController().start()
 
         webSocketManager = WebSocketManager(
             context = this,
@@ -164,12 +163,7 @@ class MdmClientService : Service() {
         )
         webSocketManager.connect()
 
-        // Optional Wi-Fi recovery must never permanently suppress the startup application.
-        startupLaunch.start(
-            MdmClientApplication.wifiSettingsController().startupCompletion(),
-            post = { task, delay -> startupHandler.postDelayed(task, delay) },
-            launch = ::launchStartupAppIfConfigured,
-        )
+        launchStartupAppIfConfigured()
 
         guardEnsureThread = HandlerThread("guard-ensure").apply { start() }
         guardEnsure = Handler(guardEnsureThread.looper)
@@ -208,7 +202,6 @@ class MdmClientService : Service() {
 
     override fun onDestroy() {
         serviceDestroyed = true
-        startupLaunch.close()
         startupHandler.removeCallbacksAndMessages(null)
         Log.i(TAG, "MdmClientService destroyed")
         UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_DESTROYED)

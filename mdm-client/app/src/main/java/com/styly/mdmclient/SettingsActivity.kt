@@ -1,10 +1,13 @@
 package com.styly.mdmclient
 
+import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -12,12 +15,17 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.text.TextUtils
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
+import androidx.annotation.IdRes
+import androidx.annotation.StringRes
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.text.buildSpannedString
+import androidx.core.text.color
 import java.text.DateFormat
 import java.util.Date
 
@@ -37,10 +45,9 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var journalText: TextView
     private lateinit var journalRefreshButton: Button
     private lateinit var journalClearButton: Button
-    private lateinit var exactAlarmStatus: TextView
-    private lateinit var exactAlarmButton: Button
-    private lateinit var wifiLocationStatus: TextView
-    private lateinit var wifiLocationButton: Button
+    private lateinit var wifiPermissionHint: TextView
+    private lateinit var wifiPermissionButton: Button
+    private var hadWifiLocationPermissions = false
     private lateinit var configurationGroup: TextView
     private lateinit var configurationDeployment: TextView
     private lateinit var configurationApplyStatus: TextView
@@ -104,10 +111,8 @@ class SettingsActivity : AppCompatActivity() {
         journalText = findViewById(R.id.journal_text)
         journalRefreshButton = findViewById(R.id.journal_refresh_button)
         journalClearButton = findViewById(R.id.journal_clear_button)
-        exactAlarmStatus = findViewById(R.id.wifi_exact_alarm_status)
-        exactAlarmButton = findViewById(R.id.wifi_exact_alarm_button)
-        wifiLocationStatus = findViewById(R.id.wifi_location_permission_status)
-        wifiLocationButton = findViewById(R.id.wifi_location_permission_button)
+        wifiPermissionHint = findViewById(R.id.wifi_permission_hint)
+        wifiPermissionButton = findViewById(R.id.wifi_location_permission_button)
         configurationGroup = findViewById(R.id.configuration_group)
         configurationDeployment = findViewById(R.id.configuration_deployment)
         configurationApplyStatus = findViewById(R.id.configuration_apply_status)
@@ -136,14 +141,11 @@ class SettingsActivity : AppCompatActivity() {
             refreshJournal()
         }
 
-        exactAlarmButton.setOnClickListener { requestExactAlarmAccess() }
-        wifiLocationButton.setOnClickListener { requestWifiLocationPermission() }
+        wifiPermissionButton.setOnClickListener { requestWifiPermission() }
 
-        // Start the service if not already running
-        startForegroundService(
-            Intent(this, MdmClientService::class.java)
-                .putExtra(MdmClientService.EXTRA_START_REASON, MdmClientService.REASON_SETTINGS)
-        )
+        hadWifiLocationPermissions = hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) &&
+            hasPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        startMdmService()
     }
 
     override fun onResume() {
@@ -152,8 +154,7 @@ class SettingsActivity : AppCompatActivity() {
         registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         // Re-check here so returning from the system settings screen refreshes the UI.
         updateStoragePermissionUi()
-        updateExactAlarmUi()
-        updateWifiLocationUi()
+        refreshWifiPermissions()
         configurationVisible = true
         configurationController.addScreenListener(configurationListener)
         updateConfigurationUi()
@@ -259,11 +260,15 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun restartService(status: String) {
         stopService(Intent(this, MdmClientService::class.java))
+        startMdmService()
+        statusText.text = status
+    }
+
+    private fun startMdmService() {
         startForegroundService(
             Intent(this, MdmClientService::class.java)
                 .putExtra(MdmClientService.EXTRA_START_REASON, MdmClientService.REASON_SETTINGS)
         )
-        statusText.text = status
     }
 
     /**
@@ -278,7 +283,7 @@ class SettingsActivity : AppCompatActivity() {
     private fun updateStoragePermissionUi() {
         if (hasAllFilesAccess()) {
             storagePermissionStatus.setText(R.string.storage_permission_granted)
-            storagePermissionStatus.setTextColor(0xFF4CAF50.toInt())
+            storagePermissionStatus.setTextColor(getColor(R.color.permission_status_granted))
             grantStorageButton.visibility = View.GONE
         } else {
             storagePermissionStatus.setText(R.string.storage_permission_not_granted)
@@ -330,58 +335,98 @@ class SettingsActivity : AppCompatActivity() {
         Toast.makeText(this, R.string.storage_permission_settings_unavailable, Toast.LENGTH_LONG).show()
     }
 
-    private fun hasExactAlarmAccess(): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
-        val manager = getSystemService(ALARM_SERVICE) as? android.app.AlarmManager ?: return false
-        return manager.canScheduleExactAlarms()
-    }
+    private fun hasPermission(permission: String): Boolean =
+        checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
 
-    private fun updateExactAlarmUi() {
-        val granted = hasExactAlarmAccess()
-        exactAlarmStatus.setText(if (granted) R.string.wifi_exact_alarm_granted else R.string.wifi_exact_alarm_missing)
-        exactAlarmStatus.setTextColor(if (granted) 0xFF4CAF50.toInt() else 0xFFFF5722.toInt())
-        exactAlarmButton.visibility = if (granted) View.GONE else View.VISIBLE
-    }
+    private fun locationServicesEnabled(): Boolean =
+        getSystemService(LocationManager::class.java)?.isLocationEnabled == true
 
-    private fun hasWifiLocationPermission(): Boolean =
-        checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
-            android.content.pm.PackageManager.PERMISSION_GRANTED &&
-            checkSelfPermission(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
-            android.content.pm.PackageManager.PERMISSION_GRANTED
-
-    private fun updateWifiLocationUi() {
-        val granted = hasWifiLocationPermission()
-        val locationEnabled = (getSystemService(LOCATION_SERVICE) as? android.location.LocationManager)
-            ?.isLocationEnabled == true
-        val ready = granted && locationEnabled
-        wifiLocationStatus.setText(
-            if (ready) R.string.wifi_location_permission_granted
-            else if (granted) R.string.wifi_location_services_disabled
-            else R.string.wifi_location_permission_missing,
+    private fun refreshWifiPermissions() {
+        val preciseLocation = hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+        val backgroundLocation = hasPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        val overlay = hasManagedWifiReadAccess(this)
+        val locationEnabled = locationServicesEnabled()
+        val diagnostics = hasManagedWifiDiagnosticsAccess(this)
+        updateWifiPermissionRow(R.id.wifi_precise_location_status, R.string.wifi_precise_location, preciseLocation)
+        updateWifiPermissionRow(R.id.wifi_background_location_status, R.string.wifi_background_location, backgroundLocation)
+        updateWifiPermissionRow(R.id.wifi_overlay_status, R.string.wifi_overlay, overlay)
+        updateWifiPermissionRow(R.id.wifi_diagnostics_status, R.string.wifi_diagnostics, diagnostics)
+        updateWifiStatusRow(
+            R.id.wifi_location_services_status,
+            R.string.wifi_location_services,
+            getText(if (locationEnabled) R.string.wifi_location_services_on else R.string.wifi_location_services_off),
         )
-        wifiLocationStatus.setTextColor(if (ready) 0xFF4CAF50.toInt() else 0xFFFF5722.toInt())
-        wifiLocationButton.visibility = if (ready) View.GONE else View.VISIBLE
+
+        val settingsHint = when {
+            !preciseLocation -> R.string.wifi_precise_location_permission_missing
+            !backgroundLocation -> R.string.wifi_background_location_permission_missing
+            !overlay -> R.string.wifi_overlay_permission_missing
+            !locationEnabled -> R.string.wifi_location_services_disabled
+            else -> null
+        }
+        val hint = settingsHint ?: if (diagnostics) null else R.string.wifi_diagnostics_permission_missing
+        wifiPermissionHint.visibility = if (hint == null) View.GONE else View.VISIBLE
+        if (hint != null) wifiPermissionHint.setText(hint)
+        wifiPermissionButton.visibility = if (settingsHint == null) View.GONE else View.VISIBLE
+
+        val hasLocationPermissions = preciseLocation && backgroundLocation
+        val locationPermissionsAcquired = hasLocationPermissions && !hadWifiLocationPermissions
+        hadWifiLocationPermissions = hasLocationPermissions
+        if (locationPermissionsAcquired) {
+            // Returning from system settings does not deliver a runtime permission result.
+            startMdmService()
+        } else {
+            MdmClientApplication.wifiSettingsController().refreshReadiness()
+        }
     }
 
-    private fun requestWifiLocationPermission() {
-        if (checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) !=
-            android.content.pm.PackageManager.PERMISSION_GRANTED
-        ) {
+    private fun updateWifiPermissionRow(@IdRes viewId: Int, @StringRes label: Int, granted: Boolean) {
+        val status = if (granted) {
+            buildSpannedString {
+                color(getColor(R.color.permission_status_granted)) {
+                    append(getText(R.string.wifi_permission_granted))
+                }
+            }
+        } else {
+            getText(R.string.wifi_permission_not_granted)
+        }
+        updateWifiStatusRow(viewId, label, status)
+    }
+
+    private fun updateWifiStatusRow(@IdRes viewId: Int, @StringRes label: Int, status: CharSequence) {
+        findViewById<TextView>(viewId).text =
+            TextUtils.expandTemplate(getText(R.string.wifi_status_format), getText(label), status)
+    }
+
+    private fun requestWifiPermission() {
+        if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) {
             requestPermissions(
                 arrayOf(
-                    android.Manifest.permission.ACCESS_FINE_LOCATION,
-                    android.Manifest.permission.ACCESS_COARSE_LOCATION,
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION,
                 ),
                 REQUEST_WIFI_LOCATION_PERMISSION,
             )
-        } else {
-            try {
-                startActivity(if (!hasWifiLocationPermission()) {
-                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null))
-                } else Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
-            } catch (_: ActivityNotFoundException) {
-                Toast.makeText(this, R.string.wifi_location_settings_unavailable, Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val packageUri = Uri.fromParts("package", packageName, null)
+        val intent = when {
+            !hasPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) ->
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri)
+            !hasManagedWifiReadAccess(this) -> Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, packageUri)
+            !locationServicesEnabled() -> Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
+            else -> return
+        }
+        try {
+            startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+            val message = if (intent.action == Settings.ACTION_MANAGE_OVERLAY_PERMISSION) {
+                R.string.wifi_overlay_settings_unavailable
+            } else {
+                R.string.wifi_location_settings_unavailable
             }
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
         }
     }
 
@@ -392,22 +437,7 @@ class SettingsActivity : AppCompatActivity() {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_WIFI_LOCATION_PERMISSION) {
-            updateWifiLocationUi()
-            if (hasWifiLocationPermission()) {
-                startForegroundService(Intent(this, MdmClientService::class.java)
-                    .putExtra(MdmClientService.EXTRA_START_REASON, MdmClientService.REASON_SETTINGS))
-            }
-        }
-    }
-
-    private fun requestExactAlarmAccess() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
-        try {
-            startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.fromParts("package", packageName, null)))
-        } catch (_: ActivityNotFoundException) {
-            Toast.makeText(this, R.string.wifi_exact_alarm_unavailable, Toast.LENGTH_LONG).show()
-        }
+        if (requestCode == REQUEST_WIFI_LOCATION_PERMISSION) refreshWifiPermissions()
     }
 
     companion object {

@@ -7,185 +7,178 @@ deployment, assignment, and delivery behavior.
 
 ## Operator workflow
 
-Open **Manage Groups → Configuration Packages**, choose a package, then
-expand **Network & connectivity**. Select **Manage** on **Wi-Fi networks**
-and add Open or WPA2/WPA3 Personal networks. A blank password field
-keeps the saved key for the same SSID and security. Choose **Save & deploy**.
-The confirmation includes all assigned groups and members. Offline devices receive the latest revision when they connect.
-The group **Settings** tab shows Wi-Fi readiness and the last result.
+Open **Manage Groups → Configuration Packages**, choose a package, then expand
+**Network & connectivity**. Select **Manage** on **Wi-Fi networks** and add
+Open or WPA2/WPA3 Personal networks. A blank password field keeps the saved key
+for the same SSID and security. Choose **Save & deploy**. The confirmation
+includes all assigned groups and members. Offline devices receive the latest
+revision when they connect. Group **Settings** shows Wi-Fi readiness and the
+last package result.
 
-The list order defines priority: the first network is preferred, and a package
-can contain up to four networks. This setting applies to every group using the
-package. With the automatic-return option off, the client selects in priority
-order during application and when disconnected. With it on, the client also
-checks for higher-priority networks
-while connected to a lower candidate, regardless of whether it was selected
-manually. The first check runs within about 30 seconds, with later requests
-about five minutes apart (each with a small random delay so headsets that start
-together do not scan together); a fresh system scan can also trigger a switch
-earlier. No
-priority scan is needed while connected to the first candidate. A switch can
-temporarily interrupt communication.
-After an automatic-return attempt settles, the client waits about five minutes
-before another automatic-return attempt, including when it moved to a higher
-candidate successfully. Consecutive failed attempts, such as a visible preferred
-network with a wrong password or a weak signal, double the wait up to 30
-minutes; a success resets it. This also applies if someone selects a lower
-candidate in the meantime. A changed Wi-Fi policy can be applied during this
-wait. An app process restart clears it. When disconnected, the client waits eight
-seconds plus up to three random seconds for a connection to return before
-selecting in order. The ordered selection runs once per offline period; if it
-fails, the client leaves reconnection to Android auto-join, which stays enabled
-for every listed network, and selects in order again only after the headset has
-been online. If Android joins a network while the client is still checking the
-previous connection, the client keeps it. With a single listed network, the
-client leaves reconnection to Android without starting priority monitoring.
+In priority mode, a headset connected to the first listed network keeps that
+link when it is still usable after the save. When the deployment includes new
+or previously unknown credentials for that network, the console can show
+**Saved. Verify after reboot.** The headset checks the saved credentials on the
+next Android boot.
+
+**Prioritize package Wi-Fi networks** is on by default. In priority mode, only
+the first listed network is eligible for Android auto-join. The client selects
+saved candidates in list order when it needs a connection. A successful save
+of a lower-priority candidate still leaves auto-join reserved for the first.
+
+Turn priority off to let Android choose the connection. The device enables
+auto-join for every listed SSID and security match and turns it off for other
+saved networks. Android handles connection and reconnection. The result
+confirms saved settings and auto-join flags by readback. Install the current
+client APK on affected headsets before deploying Android selection.
+
+The headset keeps its saved profiles in both modes. When no candidate can be
+saved and read back, the client reports a failure before changing auto-join
+flags. If none of the listed networks connects, the device may lose contact
+with MDM. Include a backup candidate with a known password before changing the
+active network's password or deploying uncertain credentials.
+
+A package can contain up to four networks. In priority mode, the client tries
+the next candidate after an unsuccessful connection attempt. When all profiles
+and flags are saved and a verified lower-priority candidate connects, the
+result is applied with reason `FALLBACK`. A profile write or readback failure
+remains a failed Wi-Fi result even if another candidate connects. Typical
+failure reasons include `UNREACHABLE`, `UPDATE_FAILED`, and `VERIFY_FAILED`.
+Reconnect the headset manually if needed before retrying or deploying corrected
+settings.
+
+If the boot attempt saves and verifies the Wi-Fi settings before the access
+point becomes available, the console can initially show `UNREACHABLE`.
+The client marks Wi-Fi applied when it later observes an eligible listed
+network with a usable IP address during the same boot. It confirms the
+connection without rewriting settings or disconnecting the headset.
+
+Android does not let the client read a saved password back. In priority mode,
+a connected protected network's changed or previously unknown password stays
+unverified until the next OS boot. A usable connection to that candidate can
+report `VERIFY_AFTER_REBOOT` once profile and flag checks pass. Reconnection
+and automatic return still try that candidate in order and keep a usable
+connection. Automatic selection and app restarts preserve the pending result.
+Retry for another setting also carries it forward during the same boot.
+SSID and IP observations establish local connectivity. Credential
+verification and MDM reachability require their own checks.
+
+In priority mode, the client tries candidates in order when applying policy.
+When automatic return is on, it also checks for higher-priority networks while
+connected to a lower candidate, including after manual selection or fallback.
+This is useful when a backup network has no route to the MDM server. The first
+check runs within about 30 seconds, with later requests about five minutes
+apart plus a small random delay. A fresh system scan can trigger a switch
+earlier. No priority scan is needed while connected to the first candidate. A
+switch can temporarily interrupt communication. If a higher-priority attempt
+fails, the client explicitly tries the previous lower candidate when still
+disconnected, because its Android auto-join is off. After an automatic-return
+attempt settles, the client waits about five minutes before another attempt.
+Consecutive failures double the wait up to 30 minutes. A success resets it. A
+changed Wi-Fi policy can apply during this wait. An app process restart clears
+it.
+
+In priority mode, Android can reconnect to the first listed network after a
+disconnection. For a package with multiple candidates, or a cached fallback profile with
+auto-join off, the client waits about eight seconds plus up to three random
+seconds. If Android has already restored a usable connection, the client keeps
+it. Otherwise it explicitly selects saved candidates in package order without
+an app-initiated scan. If every candidate fails, it retries with an increasing
+delay capped at about one minute plus a small random delay, stopping when a
+candidate has a usable IP address. A single successfully saved primary network
+uses Android auto-join for reconnection.
 Automatic return does not support hidden SSIDs; turn it off to use hidden
 networks.
+
+A matching Wi-Fi setting with a successful result is reused on same-boot
+deployments. To apply Wi-Fi again, use **Reapply settings** on the headset or
+reboot it. Releasing the package stops management. The auto-join flags already
+written still apply until they are changed on the headset or by a later policy.
+The **No package** confirmation explains this for either Wi-Fi mode.
 
 WPA2/WPA3 Personal prefers WPA3 when supported and allows WPA2 fallback.
 Passwords contain 1–63 printable ASCII characters; passwords shorter than
 eight characters can connect only with WPA3. Update the client APK before
-deploying the Wi-Fi format. Settings and Wi-Fi journals written by development
-builds of this feature are not supported; recreate them. Before updating a
-client, let any in-progress Wi-Fi operation and package handoff finish or
-recover.
-The console shows the connected client's monitor status separately from the
-last package-application result. **Applied** records a verified Wi-Fi profile.
-During the same OS boot, a new revision with matching verified Wi-Fi settings
-carries the result forward and keeps the connection and priority monitor.
-Returning to an earlier package compares its settings with the most recent
-completed attempt. If reassignment after **No package** does not start a new
-attempt, the client resumes Wi-Fi management when Wi-Fi previously applied
-and matches the saved profile. This also works across an OS reboot when
-another setting needs Retry.
+deploying the ordered Wi-Fi format. The client stores Wi-Fi policy state in
+`wifi-policy.json` and does not migrate the previous Wi-Fi state file. Reapply
+the package policy after updating the APK.
 
-Automatic return depends on fresh Android scan results. Scan throttling,
-sleep, permissions, and radio conditions can delay detection or make monitoring
-degraded; no detection interval is guaranteed. A Wi-Fi IP on the selected
-SSID is a local connection check, not proof that the MDM server is reachable.
-When scan requests fail, the client also increases its request interval from
-ten minutes up to 30 minutes; fresh passive scans may still trigger detection.
+The console shows the connected client's auto-return monitor state separately
+from the package-application result. Successful Wi-Fi application includes
+readback of the saved profiles and the requested auto-join flags. Priority mode
+also confirms a local connection to a candidate. The `FALLBACK` reason indicates
+a connection to a lower-priority candidate after an earlier candidate failed.
+The monitor depends on fresh Android scan results. Scan throttling, sleep,
+permissions, and radio conditions can delay detection or make monitoring
+degraded; no detection interval is guaranteed. When scan requests fail, the
+client increases its request interval from ten minutes up to 30 minutes; fresh
+passive scans can still trigger detection.
 
-```mermaid
-flowchart TD
-    Package["Published priority-enabled Wi-Fi list"] --> Apply["Try candidates in order"]
-    Apply -->|"SSID and IP observed"| Applied["Report package result"]
-    Apply -->|"Failure or timeout"| Recover["Restore auto-join and known credentials"]
-    Recover --> Verify["Confirm the previous SSID and IP"]
-    Verify -->|"Not confirmed in 60 s"| Unconfirmed["Record unconfirmed; Android auto-join reconnects"]
-    Applied -->|"Auto-return enabled"| Scan["Monitor fresh scan results"]
-    Scan -->|"Higher candidate visible"| Switch["Attempt journaled switch"]
-    Switch -->|"Failure or timeout"| Recover
-    Switch -->|"SSID and IP observed"| Scan
+## Provisioning
+
+Provision PICO 4 Ultra Enterprise headsets without a Device Owner. Unenroll
+headsets provisioned as Device Owner with an earlier release before replacing
+the APK. Verify the owner list with `adb shell dpm list-owners`.
+
+Grant these permissions when installing the client for managed Wi-Fi.
+
+```sh
+adb shell pm grant com.styly.mdmclient android.permission.ACCESS_FINE_LOCATION
+adb shell pm grant com.styly.mdmclient android.permission.ACCESS_COARSE_LOCATION
+adb shell pm grant com.styly.mdmclient android.permission.ACCESS_BACKGROUND_LOCATION
+adb shell appops set com.styly.mdmclient SYSTEM_ALERT_WINDOW allow
 ```
 
-Managed Wi-Fi adds or updates the listed networks and enables their automatic
-connection. Other saved networks remain on the device with auto-join disabled.
-Clearing **Manage** and publishing leaves the device's existing networks and
-auto-join settings in place. Removing the package assignment has the same
-effect. The package keeps the unchecked setting's values for the editor.
+Also enable **Location** in the headset's system settings. The overlay app-op
+allows the client to read saved network IDs and auto-join flags on PUI. On the
+headset, **Permissions → Wi-Fi configuration** shows the individual grants and
+whether Location services are on. **Review Wi-Fi permissions** opens the next
+location or overlay setting that needs attention.
+Background location keeps saved-network reads available after disconnection.
 
-## Provisioning and recovery
+When provisioning with the ADBK Wi-Fi step, grant `DUMP` at the same time so
+MDM can update the initial saved network remotely. The grant is also needed for
+updates to profiles created in Android Settings and profiles whose MAC policy
+MDM has no record of. New profiles and auto-join changes use the basic grants.
 
-Managed Wi-Fi requires Device Owner and precise location allowed all the time
-with Location enabled. Exact-alarm access is optional: the APK declares
-`USE_EXACT_ALARM`, which Android 13 and later grant at install (verified on PUI
-5.15.7), and **Settings** shows its status. Provision Device Owner
-explicitly with `dpm set-device-owner`. PICO documents that while a Device
-Owner app is installed, other apps cannot use TobService advanced APIs such as
-silent install, shutdown and reboot, kill-app, OTA install and screen recording.
-The documentation lists PICO 4E and Neo3 models; the effect on PICO 4 Ultra
-Enterprise has not been verified, so check other enterprise apps on the target
-headsets before provisioning. Foreground-service location by itself
-did not preserve configured-network access after disconnection on the tested
-PUI build. The Wi-Fi worker starts recovery after foreground location promotion.
+```sh
+adb shell pm grant com.styly.mdmclient android.permission.DUMP
+```
 
-Before mutation, the client records the saved network IDs, SSID and security
-identities, auto-join flags, and any previous credentials known to MDM. It
-waits up to two seconds for the current connection to become identifiable;
-if a usable connection cannot be matched to one saved network, it fails before
-changing Wi-Fi. The first mutation starts a fixed 60-second elapsed-time budget
-with an in-process watchdog and, when access is granted, an exact alarm. The
-alarm wakes a sleeping headset and restarts a stopped client at the deadline.
-Without it, the watchdog still rolls back while the client runs, but a rollback
-can wait until the headset wakes or the client restarts. Each candidate can use up to
-12 seconds within that budget. The client must observe a fresh connection to a
-candidate SSID with a Wi-Fi IP. This test can succeed on an isolated network
-where the MDM server is unreachable. The report remains local until the client
-can reconnect.
+The client uses TobService's `allowWifiAutoJoin(null, networkId, allowed)`
+to set the flag by saved network ID. It reads `WifiConfiguration.allowAutojoin`
+through reflection to verify the saved value. When MDM creates a profile, it
+records the MAC policy it supplied for the SSID and security type. For an
+update, it resolves the current saved ID and passes that policy to
+`WifiManager.updateNetwork()`, which checks the app's update authority.
 
-On failure, the client restores the captured auto-join flags and MDM-known
-credentials. A failure to re-enable a previously eligible saved network is a
-restore failure. Added candidates remain saved with auto-join disabled. **Unknown
-overwritten passwords cannot be restored.** A restored configuration may still
-fail to connect if its AP or credentials changed. Applying a policy may overwrite
-the currently connected network even when its previous password is unknown to
-MDM; in that case a failed switch may require the operator to re-enter the old
-password. Reapplying a managed policy writes its credentials because Android
-cannot read them back for comparison.
+For an update that needs TobService, the client reads the current MAC policy
+for the target ID from `dumpsys wifi`. It rechecks the saved identity and uses
+the firmware's update-by-ID path. Missing `DUMP` or a diagnostic read failure
+fails that candidate. The device continues applying any other candidates in the
+package and reports the Wi-Fi failure.
 
-When a usable connection existed before the attempt, the client tries to
-reconnect to it and confirms its SSID and usable IP. It waits up to 60 seconds
-after restoring settings. If still unconfirmed, it records the operation as
-unconfirmed and resumes normal priority monitoring. The restored settings
-re-enable auto-join, so Android rejoins the network when it becomes available;
-the client does not keep forcing it. The original package result remains
-failed. If there was no usable
-prior connection, no reconnection check is required. A new policy or explicit
-management release can supersede a pending connection check after settings have
-been restored. This also applies when a new request retries a previously failed
-restore: once the settings are restored, it may supersede the old connection
-check and start its own attempt. Waiting for the old SSID is not a restore API
-failure. A delayed callback from that old check cannot settle the new operation.
+## Device evidence
 
-Interrupted Wi-Fi work recovers from the private `wifi-settings.json` journal
-before another Wi-Fi mutation. The package attempt records its scalar
-readbacks and the Wi-Fi operation ID before starting the switch. It waits
-for local recovery to settle and uses an exact terminal result to complete
-the attempt. A missing or unmatched result keeps the attempt interrupted.
-After a failed restoration, the client retries the restore automatically after
-about 30 seconds, 2 minutes and 10 minutes. After that, Retry or a new managed
-Wi-Fi revision attempts to complete that restoration before writing new
-networks. If a later Wi-Fi operation, such as an automatic switch, replaced the
-latest telemetry result, the journal still retains the exact package-operation
-outcome separately. The device reserves one receipt with the operation ID
-and revision before queueing the operation. Late recovery of an older request
-leaves that receipt intact. A past success for the
-same revision never makes a failed Reapply successful. If no exact outcome survives, the package remains
-interrupted. Clearing Wi-Fi management can release a settled recovery journal
-without changing device values.
-An unreadable journal stays blocked. Content startup waits for interrupted
-Wi-Fi recovery for at most 60 seconds. The current Wi-Fi journal preserves
-recovery data and known credentials across process restarts. The client writes
-Wi-Fi during the first application after an OS boot, on **Reapply settings**
-or Retry, and when it applies changed Wi-Fi settings. A write enforces the
-auto-join settings and verifies a fresh connection. During a same-boot update
-with matching, previously verified Wi-Fi, the client carries the profile into
-the new revision and retains the automatic-return backoff. An unchanged failed
-Wi-Fi setting retains its failure result so the operator can Retry it.
-
-When the device accepts a release (removing the package or clearing
-**Manage**), it saves the release in the Wi-Fi journal before changing the
-cached package. The release prevents new automatic switches and cancels a
-prepared automatic switch before it changes Wi-Fi. An admitted package
-operation or an automatic switch that already changed Wi-Fi can finish before
-release takes effect. A pending release survives app restart and can end a
-pending connection check once the settings have been restored.
-
-The PICO auto-join API uses TobService's `allow_wifi_auto_join` message. Read
-the actual `WifiConfiguration.allowAutojoin` flag. A partial Wi-Fi configuration
-can overwrite a network's security settings.
+On DEV-005 (PUI 5.15.7, TobService 4.3.30), an out-of-range first
+candidate led to a `FALLBACK` result and an iPhone hotspot connection with
+IPv4. Earlier tests kept both profiles enabled for auto-join. Priority mode
+enables it only for the first listed network.
+In a second run an incorrect password on the active 6 GHz network led to a
+5 GHz fallback. Over that connection the headset reported `FALLBACK` to the
+test server, received a corrected package, and rejoined 6 GHz after reboot. The
+[PICO Wi-Fi field notes](PICO_WIFI_FIELD_NOTES.md) detail the test setup and
+its limits.
 
 ## Supported inputs and credential storage
 
 Policies accept 1–4 networks, unique by SSID and security. SSIDs must contain
 1–32 UTF-8 bytes without control characters, quotes, or backslashes. WPA2/WPA3
 Personal passwords contain 1–63 printable ASCII characters; use at least eight
-characters to allow WPA2 fallback. Hidden networks are supported when automatic
-return is off.
+characters to allow WPA2 fallback. Hidden networks are supported when
+automatic return is off.
 
-The server keeps plaintext Wi-Fi credentials in the private package
-registry and backups. HTTP editor responses, device reports, and console logs
-omit passwords. The policy sent to an eligible member includes the credentials
+The server keeps plaintext Wi-Fi credentials in the private package registry
+and backups. HTTP editor responses, device reports, and console logs omit
+passwords. The policy sent to an eligible member includes the credentials
 required to configure its networks.

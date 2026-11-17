@@ -26,10 +26,13 @@ def _write_registry(tmp_path, **fields):
 
 
 def _profile(name):
+    revision = str(uuid.uuid4())
     return {
         "name": name,
-        "draft": _legacy_snapshot({"brightness": {"managed": True, "value": 45}}),
-        "published": _legacy_snapshot({"brightness": 45}),
+        "settings": {"brightness": {"managed": True, "value": 45}},
+        "edit_revision": revision,
+        "published_revision": revision,
+        "deployed_at_ms": None,
     }
 
 
@@ -51,7 +54,7 @@ def _write_package_registry(tmp_path, groups, *, devices=None):
             packages[package_id] = _profile(package_name)
         entries[name] = {"members": members, "package_id": package_id}
     _write_registry(tmp_path, devices=devices or {}, groups=entries,
-                    packages={"version": 1, "packages": packages})
+                    packages={"version": configuration_packages.VERSION, "packages": packages})
 
 
 def _backups(tmp_path):
@@ -92,59 +95,51 @@ def test_released_groups_migrate_once_with_backup_and_one_group_per_device(tmp_p
     assert _backups(tmp_path) == [backup]
 
 
-def test_v1_package_migration_preserves_editor_and_publication_without_duplicate_values(tmp_path):
+def test_v2_catalog_migrates_edit_tokens_once_with_backup(tmp_path):
     package_id = str(uuid.uuid4())
-    deployed_at_ms = 1_800_000_000_000
-    draft_revision = str(uuid.uuid4())
-    published_revision = str(uuid.uuid4())
-    settings = {
-        "brightness": {"managed": True, "value": 45},
-        "screenOff": {"managed": False, "value": 300},
-    }
-    profile = {
-        "name": "Office",
-        "draft": {"revision": draft_revision, "settings": settings},
-        "published": {
-            "revision": published_revision,
-            "settings": {"brightness": 45},
-            "deployed_at_ms": deployed_at_ms,
-        },
-    }
-    groups = {"Studio": {"members": ["device-a"], "package_id": package_id}}
+    empty_id = str(uuid.uuid4())
+    group_revision = str(uuid.uuid4())
+    profile = _profile("Office")
+    profile["edit_revision"] = str(uuid.uuid4())
+    profile["deployed_at_ms"] = 1_795_000_000_000
+    profile["settings"]["wifi"] = {"managed": True, "value": {"auto_return": False, "networks": [{
+        "ssid": "Office", "security": "WPA2_WPA3", "password": "test-password", "hidden": False,
+    }]}}
+    v2_profile = {**profile, "draft_revision": profile["edit_revision"]}
+    del v2_profile["edit_revision"]
+    empty = {"name": "Empty", "settings": {}, "published_revision": None, "deployed_at_ms": None}
+    groups = {"Studio": {"members": ["device-a"], "package_id": package_id,
+                         "deployment_revision": group_revision}}
     _write_registry(
         tmp_path,
+        devices={"device-a": {"label": "Example", "configuration_state": {
+            "package_id": package_id, "revision": group_revision, "status": "already_attempted", "results": {},
+        }}},
         groups=groups,
-        packages={"version": 1, "packages": {package_id: profile}},
+        packages={"version": 2, "packages": {package_id: v2_profile, empty_id: {**empty, "draft_revision": None}}},
     )
     original = server.REGISTRY_PATH.read_bytes()
 
     server.load_registry()
 
-    expected_profile = {
-        "name": "Office",
-        "settings": settings,
-        "draft_revision": draft_revision,
-        "published_revision": published_revision,
-        "deployed_at_ms": deployed_at_ms,
-    }
     saved = json.loads(server.REGISTRY_PATH.read_text())
-    assert saved["packages"] == {"version": 2, "packages": {package_id: expected_profile}}
-    assert server._configuration.packages == {package_id: expected_profile}
-    assert server._desired_configuration("device-a") == {
-        "package_id": package_id,
-        "revision": published_revision,
-        "settings": {"brightness": 45},
-    }
+    assert saved["packages"] == {"version": 3, "packages": {package_id: profile, empty_id: {
+        **empty, "edit_revision": None,
+    }}}
+    assert saved["groups"] == groups
+    assert saved["devices"]["device-a"]["label"] == "Example"
+    assert saved["devices"]["device-a"]["configuration_state"] is None
+    assert server._desired_configuration("device-a")["revision"] == group_revision
     [backup] = _backups(tmp_path)
     assert backup.read_bytes() == original
 
-    migrated = server.REGISTRY_PATH.read_bytes()
+    saved_bytes = server.REGISTRY_PATH.read_bytes()
     server.load_registry()
-    assert server.REGISTRY_PATH.read_bytes() == migrated
+    assert server.REGISTRY_PATH.read_bytes() == saved_bytes
     assert _backups(tmp_path) == [backup]
 
 
-def test_v1_divergent_draft_fails_closed_and_preserves_original_registry(tmp_path):
+def test_v1_package_catalog_is_unavailable_and_preserved(tmp_path):
     package_id = str(uuid.uuid4())
     profile = {
         "name": "Office",
@@ -164,6 +159,12 @@ def test_v1_divergent_draft_fails_closed_and_preserves_original_registry(tmp_pat
     assert server.REGISTRY_PATH.read_bytes() == original
     assert json.loads(server.REGISTRY_PATH.read_text())["packages"]["version"] == 1
     assert _backups(tmp_path) == []
+    assert json.loads(server.build_group_list_msg())["groups"] == {"Studio": ["device-a"]}
+
+    server.device_registry["device-b"] = {"label": "Preserve old catalog"}
+    assert server.save_registry()
+    saved = json.loads(server.REGISTRY_PATH.read_text())
+    assert saved["packages"] == {"version": 1, "packages": {package_id: profile}}
 
 
 def test_migration_is_not_written_when_the_backup_fails(tmp_path, monkeypatch):
@@ -315,11 +316,17 @@ def test_group_name_round_trip_and_upgrade_keep_membership_and_assignment(tmp_pa
         legacy_name = group + " "
         package_id = str(uuid.uuid4())
         published = _legacy_snapshot({"brightness": 45})
-        profile = {"name": "Office", "published": published}
+        profile = {
+            "name": "Office",
+            "settings": {"brightness": {"managed": True, "value": 45}},
+            "edit_revision": published["revision"],
+            "published_revision": published["revision"],
+            "deployed_at_ms": None,
+        }
         _write_registry(
             tmp_path,
             groups={legacy_name: {"members": ["device-a"], "package_id": package_id}},
-            packages={"version": 1, "packages": {package_id: profile}},
+            packages={"version": configuration_packages.VERSION, "packages": {package_id: profile}},
         )
         server.load_registry()
         saved = json.loads(server.REGISTRY_PATH.read_text())
@@ -336,7 +343,7 @@ def test_group_name_round_trip_and_upgrade_keep_membership_and_assignment(tmp_pa
         assert server._configuration.packages == {package_id: {
             "name": "Office",
             "settings": {"brightness": {"managed": True, "value": 45}},
-            "draft_revision": published["revision"],
+            "edit_revision": published["revision"],
             "published_revision": published["revision"],
             "deployed_at_ms": None,
         }}
@@ -350,7 +357,7 @@ def test_conflicting_normalized_group_names_are_preserved(tmp_path):
         "Studio": {"members": ["device-a"], "package_id": None},
         "Studio ": {"members": ["device-b"], "package_id": None},
     }
-    _write_registry(tmp_path, groups=groups, packages={"version": 1, "packages": {}})
+    _write_registry(tmp_path, groups=groups, packages={"version": configuration_packages.VERSION, "packages": {}})
     before_bytes = server.REGISTRY_PATH.read_bytes()
     server.load_registry()
     assert server._configuration.packages is None
@@ -372,10 +379,16 @@ def test_conflicting_normalized_group_names_are_preserved(tmp_path):
 ])
 def test_package_load_still_rejects_corrupt_or_unrecognized_saved_scalars(key, value):
     package_id = str(uuid.uuid4())
-    published = _legacy_snapshot({key: value})
+    revision = str(uuid.uuid4())
     with pytest.raises(configuration_packages.PackageError):
-        configuration_packages.load_packages({"version": 1, "packages": {
-            package_id: {"name": "Corrupt", "published": published},
+        configuration_packages.load_packages({"version": configuration_packages.VERSION, "packages": {
+            package_id: {
+                "name": "Corrupt",
+                "settings": {key: {"managed": True, "value": value}},
+                "edit_revision": revision,
+                "published_revision": revision,
+                "deployed_at_ms": None,
+            },
         }})
 
 
@@ -389,91 +402,129 @@ def test_wifi_uses_one_value_with_order_auto_return_and_managed_empty_rules():
             "auto_return": False,
         }},
     }
-    validated = configuration_packages.validate_draft(settings)
+    validated = configuration_packages.validate_settings(settings)
     assert validated == settings
     assert list(configuration_packages.managed_settings(validated)) == ["wifi"]
 
+    # Missing and explicit true both preserve the original wire shape.
+    prioritized = configuration_packages.validate_settings({
+        "wifi": {"managed": True, "value": {
+            "networks": settings["wifi"]["value"]["networks"],
+            "auto_return": False,
+            "prioritize_networks": True,
+        }},
+    })
+    assert prioritized["wifi"]["value"] == settings["wifi"]["value"]
+
+    android_selected = configuration_packages.validate_settings({
+        "wifi": {"managed": True, "value": {
+            "networks": settings["wifi"]["value"]["networks"],
+            "auto_return": False,
+            "prioritize_networks": False,
+        }},
+    })
+    assert android_selected["wifi"]["value"] == {
+        **settings["wifi"]["value"], "prioritize_networks": False,
+    }
+
     with pytest.raises(configuration_packages.PackageError, match="auto_return must be a boolean"):
-        configuration_packages.validate_draft({
+        configuration_packages.validate_settings({
             "wifi": {"managed": True, "value": {"networks": [], "auto_return": 1}},
         })
+    with pytest.raises(configuration_packages.PackageError, match="prioritize_networks must be a boolean"):
+        configuration_packages.validate_settings({
+            "wifi": {"managed": True, "value": {
+                "networks": [], "auto_return": False, "prioritize_networks": 0,
+            }},
+        })
+    with pytest.raises(configuration_packages.PackageError, match="auto_return must be false"):
+        configuration_packages.validate_settings({
+            "wifi": {"managed": True, "value": {
+                "networks": [], "auto_return": True, "prioritize_networks": False,
+            }},
+        })
     with pytest.raises(configuration_packages.PackageError, match="not supported with hidden networks"):
-        configuration_packages.validate_draft({
+        configuration_packages.validate_settings({
             "wifi": {"managed": True, "value": {
                 "networks": settings["wifi"]["value"]["networks"], "auto_return": True,
             }},
         })
     with pytest.raises(configuration_packages.PackageError, match="unsupported item"):
-        configuration_packages.validate_draft({
+        configuration_packages.validate_settings({
             **settings, "wifiPriority": {"managed": True, "value": False},
         })
     with pytest.raises(configuration_packages.PackageError, match="non-empty list"):
-        configuration_packages.validate_draft({
+        configuration_packages.validate_settings({
             "wifi": {"managed": True, "value": {"networks": [], "auto_return": False}},
         })
-    assert configuration_packages.validate_draft({
+    assert configuration_packages.validate_settings({
         "wifi": {"managed": False, "value": {"networks": [], "auto_return": False}},
     })["wifi"]["value"] == {"networks": [], "auto_return": False}
-    unmanaged_hidden = configuration_packages.validate_draft({
+    unmanaged_hidden = configuration_packages.validate_settings({
         "wifi": {"managed": False, "value": {
             "networks": settings["wifi"]["value"]["networks"], "auto_return": True,
         }},
     })
     assert unmanaged_hidden["wifi"]["value"]["auto_return"] is True
 
-    old_snapshot = _legacy_snapshot({"brightness": 45})
     package_id = str(uuid.uuid4())
-    migrated = {
+    revision = str(uuid.uuid4())
+    published = {
         "name": "Legacy",
         "settings": {"brightness": {"managed": True, "value": 45}},
-        "draft_revision": old_snapshot["revision"],
-        "published_revision": old_snapshot["revision"],
+        "edit_revision": revision,
+        "published_revision": revision,
         "deployed_at_ms": None,
     }
-    assert configuration_packages.load_packages({"version": 1, "packages": {
-        package_id: {"name": "Legacy", "published": old_snapshot},
-    }}) == {package_id: migrated}
+    assert configuration_packages.load_packages({"version": configuration_packages.VERSION, "packages": {
+        package_id: published,
+    }}) == {package_id: published}
 
-    draft_only = _legacy_snapshot({"brightness": {"managed": True, "value": 55}})
-    assert configuration_packages.load_packages({"version": 1, "packages": {
-        package_id: {"name": "Unpublished", "draft": draft_only},
-    }}) == {package_id: {
+    draft_only = {
         "name": "Unpublished",
-        "settings": draft_only["settings"],
-        "draft_revision": draft_only["revision"],
+        "settings": {"brightness": {"managed": True, "value": 55}},
+        "edit_revision": str(uuid.uuid4()),
         "published_revision": None,
         "deployed_at_ms": None,
-    }}
+    }
+    assert configuration_packages.load_packages({"version": configuration_packages.VERSION, "packages": {
+        package_id: draft_only,
+    }}) == {package_id: draft_only}
 
-    old_wifi_snapshot = _legacy_snapshot({
-        "wifi": [{"ssid": "Old Office", "security": "WPA_PSK",
-                  "password": "test-password", "hidden": False}],
-        "wifiPriority": False,
-    })
+    old_wifi = {
+        "name": "Old Wi-Fi shape",
+        "settings": {"wifi": {"managed": True, "value": [{
+            "ssid": "Old Office", "security": "WPA_PSK",
+            "password": "test-password", "hidden": False,
+        }]}, "wifiPriority": {"managed": True, "value": False}},
+        "edit_revision": str(uuid.uuid4()),
+        "published_revision": None,
+        "deployed_at_ms": None,
+    }
     with pytest.raises(configuration_packages.PackageError):
-        configuration_packages.load_packages({"version": 1, "packages": {
-            package_id: {"name": "Old Wi-Fi shape", "published": old_wifi_snapshot},
+        configuration_packages.load_packages({"version": configuration_packages.VERSION, "packages": {
+            package_id: old_wifi,
         }})
 
 
 def test_registry_recovers_after_retired_wifi_entries_are_removed_without_losing_assignment(tmp_path):
     package_id = str(uuid.uuid4())
-    old_networks = [{
-        "ssid": "Old Office", "security": "WPA_PSK", "password": "test-password", "hidden": False,
-    }]
+    revision = str(uuid.uuid4())
     profile = {
         "name": "Office",
-        "draft": _legacy_snapshot({
+        "settings": {
             "brightness": {"managed": True, "value": 45},
-            "wifi": {"managed": True, "value": old_networks},
+            "wifi": {"managed": True, "value": [{
+                "ssid": "Old Office", "security": "WPA_PSK", "password": "test-password", "hidden": False,
+            }]},
             "wifiPriority": {"managed": True, "value": False},
-        }),
-        "published": _legacy_snapshot({
-            "brightness": 45, "wifi": old_networks, "wifiPriority": False,
-        }),
+        },
+        "edit_revision": revision,
+        "published_revision": revision,
+        "deployed_at_ms": None,
     }
     groups = {"Studio": {"members": ["device-a"], "package_id": package_id}}
-    catalog = {"version": 1, "packages": {package_id: profile}}
+    catalog = {"version": configuration_packages.VERSION, "packages": {package_id: profile}}
     _write_registry(
         tmp_path, devices={"device-a": {"label": "Example"}},
         groups=groups, packages=catalog,
@@ -487,40 +538,30 @@ def test_registry_recovers_after_retired_wifi_entries_are_removed_without_losing
 
     cleaned = json.loads(before)
     saved_profile = cleaned["packages"]["packages"][package_id]
-    for phase in ("draft", "published"):
-        settings = saved_profile[phase]["settings"]
-        settings.pop("wifi", None)
-        settings.pop("wifiPriority", None)
+    saved_profile["settings"].pop("wifi")
+    saved_profile["settings"].pop("wifiPriority")
     server.REGISTRY_PATH.write_text(json.dumps(cleaned))
     server.load_registry()
 
-    migrated_profile = {
-        "name": saved_profile["name"],
-        "settings": saved_profile["draft"]["settings"],
-        "draft_revision": saved_profile["draft"]["revision"],
-        "published_revision": saved_profile["published"]["revision"],
-        "deployed_at_ms": None,
-    }
-    assert server._configuration.packages == {package_id: migrated_profile}
+    assert server._configuration.packages == {package_id: saved_profile}
     assert json.loads(server.build_group_list_msg())["assignments"] == {"Studio": package_id}
     assert server._desired_configuration("device-a") == {
-        "package_id": package_id, "revision": saved_profile["published"]["revision"],
+        "package_id": package_id, "revision": saved_profile["published_revision"],
         "settings": {"brightness": 45},
     }
-    assert server._desired_configuration("device-a")["settings"] == {"brightness": 45}
 
 def test_wifi_public_draft_redacts_password_and_keeps_nested_policy():
-    draft = _legacy_snapshot(configuration_packages.validate_draft({
+    settings = configuration_packages.validate_settings({
         "wifi": {"managed": True, "value": {
             "networks": [
                 {"ssid": "Hidden Office", "security": "WPA2_WPA3", "password": "test-password", "hidden": True},
             ],
             "auto_return": False,
         }},
-    }))
+    })
     profile = {
-        "name": "Office", "settings": draft["settings"],
-        "draft_revision": draft["revision"], "published_revision": None, "deployed_at_ms": None,
+        "name": "Office", "settings": settings,
+        "edit_revision": str(uuid.uuid4()), "published_revision": None, "deployed_at_ms": None,
     }
 
     public = configuration_packages.public_profile(
@@ -534,6 +575,12 @@ def test_wifi_public_draft_redacts_password_and_keeps_nested_policy():
     }
     assert "test-password" not in json.dumps(public)
 
+    settings["wifi"]["value"]["prioritize_networks"] = False
+    public = configuration_packages.public_profile(str(uuid.uuid4()), {
+        **profile, "settings": settings,
+    }, {})
+    assert public["settings"]["wifi"]["value"]["prioritize_networks"] is False
+
 
 def test_wifi_caps_networks_at_four_in_managed_drafts_and_snapshots():
     networks = [
@@ -542,16 +589,22 @@ def test_wifi_caps_networks_at_four_in_managed_drafts_and_snapshots():
     ]
     for auto_return in (False, True):
         with pytest.raises(configuration_packages.PackageError, match="at most 4"):
-            configuration_packages.validate_draft({
+            configuration_packages.validate_settings({
                 "wifi": {"managed": True, "value": {"networks": networks, "auto_return": auto_return}},
             })
 
     package_id = str(uuid.uuid4())
     for auto_return in (False, True):
-        priority_published = _legacy_snapshot({"wifi": {
-            "networks": networks, "auto_return": auto_return,
-        }})
+        revision = str(uuid.uuid4())
         with pytest.raises(configuration_packages.PackageError, match="at most 4"):
-            configuration_packages.load_packages({"version": 1, "packages": {
-                package_id: {"name": "Too many networks", "published": priority_published},
+            configuration_packages.load_packages({"version": configuration_packages.VERSION, "packages": {
+                package_id: {
+                    "name": "Too many networks",
+                    "settings": {"wifi": {"managed": True, "value": {
+                        "networks": networks, "auto_return": auto_return,
+                    }}},
+                    "edit_revision": revision,
+                    "published_revision": revision,
+                    "deployed_at_ms": None,
+                },
             }})

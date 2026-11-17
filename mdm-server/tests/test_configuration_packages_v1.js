@@ -18,19 +18,17 @@ const sections = [
     { id: 'shutdown', label: 'Scheduled shutdown', kind: 'schedule', default: { enabled: false, hour: 0, minute: 0, repeat: 127 } },
   ] },
   { id: 'network', title: 'Network & connectivity', items: [
-    { id: 'wifi', label: 'Wi-Fi networks', kind: 'wifi', default: { networks: [], auto_return: false } },
+    { id: 'wifi', label: 'Wi-Fi networks', kind: 'wifi', default: { networks: [], auto_return: false, prioritize_networks: true } },
   ] },
   { id: 'advanced', title: 'USB & advanced', items: [
     { id: 'developerMenu', label: 'Developer options menu', kind: 'bool', default: false },
   ] },
 ];
-const wifiNetwork = { ssid: 'Studio', security: 'WPA2_WPA3', hidden: false, password_present: true };
-
 test('metadata defaults are visible in the draft and unmanaged', () => {
   const saved = loadDraft(sections, {});
   const draft = structuredClone(saved);
   assert.deepEqual(saved.brightness, { managed: false, value: 50 });
-  assert.deepEqual(saved.wifi, { managed: false, value: { networks: [], auto_return: false } });
+  assert.deepEqual(saved.wifi, { managed: false, value: { networks: [], auto_return: false, prioritize_networks: true } });
   assert.deepEqual(saved.developerMenu, { managed: false, value: false });
   draft.brightness.value = 64;
   draft.shutdown.value = { enabled: true, hour: 23, minute: 10, repeat: 65 };
@@ -95,7 +93,7 @@ test('managed Wi-Fi preserves stored passwords without exposing them and reorder
         candidate.ssid === network.ssid && candidate.security === network.security && candidate.password_present)),
     }));
     latest = profile({ settings: { ...body.settings, wifi: { ...body.settings.wifi, value: { ...wifiValue, networks } } },
-      draftRevision: 'draft2', publishedRevision: 'r1' });
+      editRevision: 'edit2', publishedRevision: 'r1' });
     return response(latest);
   });
   fixture.broadcast();
@@ -147,7 +145,7 @@ test('auto-return is stored inside the Wi-Fi setting and hidden networks are rej
   } } } });
   const fixture = createHarness(({ method, body }) => {
     if (method === 'GET') return response(latest);
-    latest = profile({ settings: body.settings, draftRevision: 'draft2', publishedRevision: 'r1' });
+    latest = profile({ settings: body.settings, editRevision: 'edit2', publishedRevision: 'r1' });
     return response(latest);
   });
   fixture.broadcast();
@@ -155,8 +153,11 @@ test('auto-return is stored inside the Wi-Fi setting and hidden networks are rej
   assert.match(fixture.packagePanel.innerHTML, /data-manage="wifi"/);
   assert.doesNotMatch(fixture.packagePanel.innerHTML, /wifiPriority|priorityManage|Enable Wi-Fi priority/);
   assert.match(fixture.packagePanel.innerHTML, /data-setting="wifi" data-field="auto_return"/);
+  assert.match(fixture.packagePanel.innerHTML, /data-field="prioritize_networks" checked/);
   assert.match(fixture.packagePanel.innerHTML,
-    /about every 5 minutes while connected below the first choice, including after manual selection or fallback\. The OS may delay switching; no priority scan is requested while on the first choice/);
+    /about every 5 minutes while connected below the first choice, including after manual selection or fallback/);
+  assert.match(fixture.packagePanel.innerHTML, /tries the previous network again/);
+  assert.match(fixture.packagePanel.innerHTML, /Only the first listed Wi-Fi network is enabled for Android auto-connect/);
 
   fixture.edit({ dataset: { setting: 'wifi', field: 'auto_return' }, checked: true, type: 'checkbox' });
   await fixture.editClick('deploy');
@@ -185,6 +186,54 @@ test('auto-return is stored inside the Wi-Fi setting and hidden networks are rej
   assert.doesNotThrow(() => buildPayload(sections, hiddenDraft, hiddenSaved));
 });
 
+test('Wi-Fi Android selection disables ordering and auto-return, and saves explicit false', async () => {
+  let latest = profile({ settings: { wifi: { managed: true, value: {
+    prioritize_networks: true,
+    auto_return: true,
+    networks: [
+      { ssid: 'Studio', security: 'OPEN', hidden: false, password_present: false },
+      { ssid: 'Backup', security: 'OPEN', hidden: false, password_present: false },
+    ],
+  } } } });
+  const fixture = createHarness(({ method, body }) => {
+    if (method === 'GET') return response(latest);
+    latest = profile({ settings: body.settings, editRevision: 'edit2', publishedRevision: 'r1' });
+    return response(latest);
+  });
+  fixture.broadcast();
+  await fixture.controller.showPackages('pkg');
+  assert.match(fixture.packagePanel.innerHTML, /Only the first listed Wi-Fi network is enabled for Android auto-connect/);
+  assert.match(fixture.packagePanel.innerHTML, /data-policy-action="move-network"/);
+  assert.match(fixture.packagePanel.innerHTML, /data-field="auto_return" checked/);
+
+  fixture.edit({ dataset: { setting: 'wifi', field: 'prioritize_networks' }, checked: false, type: 'checkbox' });
+  assert.doesNotMatch(fixture.packagePanel.innerHTML, /data-policy-action="move-network"/);
+  assert.doesNotMatch(fixture.packagePanel.innerHTML, /data-field="auto_return"/);
+  assert.match(fixture.packagePanel.innerHTML, /Android chooses among saved Wi-Fi networks/);
+  assert.match(fixture.packagePanel.innerHTML, /Listed SSID and security matches have auto-connect on\. Other saved networks have auto-connect off/);
+  await fixture.editClick('deploy');
+
+  assert.deepEqual(fixture.requests.at(-1).body.settings.wifi.value, {
+    networks: [
+      { ssid: 'Studio', security: 'OPEN', hidden: false },
+      { ssid: 'Backup', security: 'OPEN', hidden: false },
+    ],
+    auto_return: false,
+    prioritize_networks: false,
+  });
+  const saved = loadDraft(sections, { wifi: { managed: true, value: {
+    prioritize_networks: false, auto_return: false,
+    networks: [{ ssid: 'Studio', security: 'OPEN', hidden: false, password_present: false }],
+  } } });
+  assert.equal(saved.wifi.value.prioritize_networks, false);
+  assert.deepEqual(buildPayload(sections, saved, saved).wifi.value, {
+    networks: [{ ssid: 'Studio', security: 'OPEN', hidden: false }],
+    auto_return: false, prioritize_networks: false,
+  });
+  saved.wifi.value.auto_return = true;
+  assert.throws(() => buildPayload(sections, saved, saved), /Turn off automatic return/);
+});
+
 test('managed Wi-Fi allows at most four candidates in the editor and payload', async () => {
   const networks = Array.from({ length: 3 }, (_, index) => ({
     ssid: `Network-${index + 1}`, security: 'OPEN', hidden: false, password_present: false,
@@ -192,7 +241,7 @@ test('managed Wi-Fi allows at most four candidates in the editor and payload', a
   let latest = profile({ settings: { wifi: { managed: true, value: { auto_return: false, networks } } } });
   const fixture = createHarness(({ method, body }) => {
     if (method === 'GET') return response(latest);
-    latest = profile({ settings: body.settings, draftRevision: 'draft2', publishedRevision: 'r1' });
+    latest = profile({ settings: body.settings, editRevision: 'edit2', publishedRevision: 'r1' });
     return response(latest);
   });
   fixture.broadcast();
@@ -225,7 +274,7 @@ test('a new package gets its first Wi-Fi network after Manage and reopens with d
       ...network, password_present: Boolean(password),
     }));
     latest = profile({ settings: { ...body.settings, wifi: { ...body.settings.wifi,
-      value: { ...body.settings.wifi.value, networks } } }, draftRevision: 'draft2', publishedRevision: 'r1' });
+      value: { ...body.settings.wifi.value, networks } } }, editRevision: 'edit2', publishedRevision: 'r1' });
     return response(latest);
   });
   fixture.broadcast();
@@ -263,7 +312,7 @@ const applied = { ...d1, status: 'complete', results: { brightness: { status: 'a
 const failed = { ...applied, results: { brightness: { status: 'failed', reason: 'WRITE_FAILED' } } };
 const unsupported = { ...applied, results: { brightness: { status: 'unsupported' } } };
 
-test('device status uses published keys and requires both IDs for current results and Retry', () => {
+test('device status uses deployment keys and requires both IDs for current results and Retry', () => {
   const device = (report, overrides) => ({ ...online, configuration_state: report, ...overrides });
   const status = (report, deployment = d1, overrides) => deviceOutcome(device(report, overrides), pkg.package_id, deployment)[1];
   assert.equal(status(applied), 'Applied');
@@ -274,8 +323,6 @@ test('device status uses published keys and requires both IDs for current result
   assert.equal(status({ ...applied, revision: 'old' }, d1, { status: 'offline' }), 'Pending · Offline');
   assert.equal(status({ ...applied, status: 'interrupted' }), 'Interrupted');
   assert.equal(status({ ...applied, status: 'applying' }), 'Applying');
-  assert.deepEqual(deviceOutcome(device({ ...applied, status: 'already_attempted' }), pkg.package_id, d1).slice(0, 2),
-    ['', 'Already attempted this boot']);
   assert.equal(status(applied, null), 'Waiting for deployment');
   assert.equal(status(unsupported), 'Unsupported');
   assert.equal(deviceOutcome(online, null, null)[1], 'No package');
@@ -288,7 +335,6 @@ test('device status uses published keys and requires both IDs for current result
   }
   assert.equal(retryEligible(device(applied), d1), false);
   assert.equal(retryEligible(device({ ...failed, status: 'applying' }), d1), false);
-  assert.equal(retryEligible(device({ ...failed, status: 'already_attempted' }), d1), false);
 });
 
 test('Wi-Fi deployment does not use the removed Wi-Fi priority client gate', () => {
@@ -298,104 +344,110 @@ test('Wi-Fi deployment does not use the removed Wi-Fi priority client gate', () 
   assert.equal(deviceOutcome(device, pkg.package_id, wifiDeployment)[1], 'Applied');
 });
 
-test('Wi-Fi recovery status stays failed until the original connection is verified', () => {
+test('priority and Android selection deployments use package support without a separate Wi-Fi gate', () => {
+  for (const wifiMode of ['priority', 'android_selection']) {
+    const deployment = { ...d1, keys: ['wifi'], wifi_mode: wifiMode };
+    const report = { ...deployment, status: 'complete', results: {
+      wifi: { status: 'failed', reason: 'WRITE_FAILED' },
+    } };
+    const device = { ...online, configuration_state: report };
+    assert.equal(deviceOutcome(device, pkg.package_id, deployment)[1], 'Apply failed');
+    assert.equal(retryEligible(device, deployment), true);
+  }
+});
+
+test('Wi-Fi SAVED reports verified profiles and leaves connection selection to Android', () => {
+  const deployment = { ...d1, keys: ['brightness', 'wifi'], wifi_mode: 'android_selection' };
+  const report = { ...deployment, status: 'complete', results: {
+    brightness: { status: 'applied', value: 60 },
+    wifi: { status: 'applied', reason: 'SAVED' },
+  } };
+  const device = { ...online, configuration_state: report };
+  assert.equal(deviceOutcome(device, pkg.package_id, deployment)[1], 'Applied');
+  assert.match(deviceOutcome(device, pkg.package_id, deployment)[2], /Wi-Fi profiles and auto-connect flags were read back\. Android selects the network/);
+
+  const fixture = createHarness(() => assert.fail('rendering results should not call the API'), { devices: [device] });
+  fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
+  fixture.controller.renderGroup('The Lab');
+  const results = fixture.groupControls['[data-settings-results]'].innerHTML;
+  assert.match(results, /wifi · Saved\. Android selects the network\./);
+  assert.doesNotMatch(results, /wifi · Applied · saved/);
+  assert.doesNotMatch(results, /Wi-Fi auto-return monitor/);
+});
+
+test('priority Wi-Fi deployments show their client auto-return monitor', () => {
+  const deployment = { ...d1, keys: ['wifi'], wifi_mode: 'priority' };
+  const device = { ...online, wifi_state: { priority_monitor: 'monitoring' } };
+  const fixture = createHarness(() => assert.fail('rendering status should not call the API'), { devices: [device] });
+  fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
+  fixture.controller.renderGroup('The Lab');
+  assert.match(fixture.groupControls['[data-settings-results]'].innerHTML, /Wi-Fi auto-return monitor: Monitoring/);
+});
+
+test('Wi-Fi fallback is reported as applied with its reason', () => {
   const deployment = { ...d1, keys: ['brightness', 'wifi'] };
   const report = { ...deployment, status: 'complete', results: {
     brightness: { status: 'applied', value: 60 },
-    wifi: { status: 'failed', reason: 'RESTORE_UNCONFIRMED', rolled_back: false },
+    wifi: { status: 'applied', reason: 'FALLBACK' },
   } };
-  const devices = [{ ...online, configuration_state: report, wifi_state: { managed: false, last_result: {
-    operation_id: '11111111-1111-4111-8111-111111111111', revision: deployment.revision,
-    status: 'failed', reason: 'RESTORE_UNCONFIRMED', rolled_back: false,
-  } } }];
+  const devices = [{ ...online, configuration_state: report }];
   const fixture = createHarness(() => assert.fail('rendering results should not call the API'), { devices });
   fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
   fixture.controller.renderGroup('The Lab');
 
-  let results = fixture.groupControls['[data-settings-results]'].innerHTML;
-  assert.match(results, /Partially applied/);
-  assert.match(results, /Results at apply time/);
-  assert.match(results, /wifi · Failed · Wi-Fi settings restored; original SSID and usable IP not confirmed/);
-  assert.match(results, /Latest Wi-Fi operation: recovery pending/);
-  assert.doesNotMatch(results, /wifi · Applied|Rolled back/);
-  assert.equal(deviceOutcome(devices[0], 'pkg', deployment)[1], 'Partially applied');
-  assert.equal(retryEligible(devices[0], deployment), true);
-
-  devices[0].wifi_state.last_result = {
-    operation_id: '11111111-1111-4111-8111-111111111111', revision: deployment.revision,
-    status: 'failed', reason: 'TIMEOUT_ROLLED_BACK', rolled_back: true,
-  };
-  fixture.controller.renderGroup('The Lab');
-  results = fixture.groupControls['[data-settings-results]'].innerHTML;
-  assert.match(results, /wifi · Failed · Wi-Fi settings restored; original SSID and usable IP not confirmed/);
-  assert.match(results, /Latest Wi-Fi operation: recovery confirmed/);
-  assert.doesNotMatch(results, /wifi · Failed · timeout rolled back|recovery pending/);
-  assert.equal(deviceOutcome(devices[0], 'pkg', deployment)[1], 'Partially applied');
-  assert.equal(retryEligible(devices[0], deployment), true);
-});
-
-test('auto-return selection recovery reports latest Wi-Fi state without changing apply-time results', () => {
-  const deployment = { ...d1, keys: ['wifi'] };
-  const report = { ...deployment, status: 'complete', results: { wifi: { status: 'applied' } } };
-  const devices = [{ ...online, configuration_state: report, wifi_state: { last_result: {
-    operation_id: '22222222-2222-4222-8222-222222222222', revision: deployment.revision,
-    status: 'failed', reason: 'RESTORE_UNCONFIRMED', rolled_back: false,
-  } } }];
-  const fixture = createHarness(() => assert.fail('rendering results should not call the API'), { devices });
-  fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
-  fixture.controller.renderGroup('The Lab');
-
-  let results = fixture.groupControls['[data-settings-results]'].innerHTML;
+  const results = fixture.groupControls['[data-settings-results]'].innerHTML;
   assert.match(results, /Applied/);
   assert.match(results, /Results at apply time/);
-  assert.match(results, /Latest Wi-Fi operation: recovery pending; settings are restored, but the previous connection \(if one existed\) is not confirmed\./);
-
-  devices[0].wifi_state.last_result = {
-    operation_id: '22222222-2222-4222-8222-222222222222', revision: deployment.revision,
-    status: 'failed', reason: 'TIMEOUT_ROLLED_BACK', rolled_back: true,
-    ssid: 'Private-network-name', ip: '192.0.2.8',
-  };
-  fixture.controller.renderGroup('The Lab');
-  results = fixture.groupControls['[data-settings-results]'].innerHTML;
-  assert.match(results, /Latest Wi-Fi operation: recovery confirmed; settings are restored, and the previous connection \(if one existed\) was verified\./);
-  assert.match(results, /Results at apply time/);
-  assert.match(results, /wifi · Applied/);
-  assert.doesNotMatch(results, /Private-network-name|192\.0\.2\.8/);
-  assert.doesNotMatch(results, /recovery pending/);
+  assert.match(results, /wifi · Applied · fallback/);
+  assert.doesNotMatch(results, /rolled back|restored|reboot required/i);
+  assert.equal(deviceOutcome(devices[0], 'pkg', deployment)[1], 'Applied');
 });
 
-test('latest Wi-Fi recovery status is hidden for stale, offline, or invalid telemetry', () => {
-  const deployment = { ...d1, keys: ['wifi'] };
-  const report = { ...deployment, status: 'complete', results: { wifi: { status: 'applied' } } };
-  const validPending = {
-    operation_id: '33333333-3333-4333-8333-333333333333', revision: deployment.revision,
-    status: 'failed', reason: 'RESTORE_UNCONFIRMED', rolled_back: false,
-  };
-  const devices = [{ ...online, configuration_state: report, wifi_state: { last_result: validPending } }];
+test('Wi-Fi failure keeps its result and exposes no rollback state', () => {
+  const deployment = { ...d1, keys: ['brightness', 'wifi'] };
+  const report = { ...deployment, status: 'complete', results: {
+    brightness: { status: 'applied', value: 60 },
+    wifi: { status: 'failed', reason: 'UNREACHABLE', rolled_back: true },
+  } };
+  const devices = [{ ...online, configuration_state: report, wifi_state: { last_result: {
+    operation_id: '22222222-2222-4222-8222-222222222222', revision: deployment.revision,
+    status: 'failed', reason: 'UNREACHABLE', rolled_back: true,
+  } } }];
   const fixture = createHarness(() => assert.fail('rendering results should not call the API'), { devices });
   fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
-  const render = () => {
-    fixture.controller.renderGroup('The Lab');
-    return fixture.groupControls['[data-settings-results]'].innerHTML;
-  };
+  fixture.controller.renderGroup('The Lab');
 
-  assert.match(render(), /Latest Wi-Fi operation: recovery pending/);
-  const invalidResults = [
-    { ...validPending, operation_id: 'not-a-uuid' },
-    { ...validPending, revision: 'old-revision' },
-    { ...validPending, status: 'unknown' },
-    { ...validPending, reason: 'PRIVATE_VALUE' },
-    { ...validPending, rolled_back: 'false' },
-    { ...validPending, reason: 'RESTORE_UNCONFIRMED', rolled_back: true },
-    { ...validPending, reason: 'PRIVATE_VALUE', rolled_back: true },
-  ];
-  for (const lastResult of invalidResults) {
-    devices[0].wifi_state.last_result = lastResult;
-    assert.doesNotMatch(render(), /Latest Wi-Fi operation:/);
-  }
-  devices[0].wifi_state.last_result = validPending;
-  devices[0].status = 'offline';
-  assert.doesNotMatch(render(), /Latest Wi-Fi operation:/);
+  const results = fixture.groupControls['[data-settings-results]'].innerHTML;
+  assert.match(results, /Partially applied/);
+  assert.match(results, /Results at apply time/);
+  assert.match(results, /wifi · Failed · unreachable/);
+  assert.doesNotMatch(results, /rolled back|restored|Latest Wi-Fi operation/i);
+  assert.equal(deviceOutcome(devices[0], 'pkg', deployment)[1], 'Partially applied');
+  assert.equal(retryEligible(devices[0], deployment), true);
+});
+
+test('saved Wi-Fi awaiting reboot has a clear result and no Wi-Fi-only Retry', () => {
+  const deployment = { ...d1, keys: ['brightness', 'wifi'] };
+  const report = { ...deployment, status: 'complete', results: {
+    brightness: { status: 'applied', value: 60 },
+    wifi: { status: 'failed', reason: 'VERIFY_AFTER_REBOOT' },
+  } };
+  const device = { ...online, configuration_state: report };
+  assert.equal(deviceOutcome(device, pkg.package_id, deployment)[0], 'pending');
+  assert.equal(deviceOutcome(device, pkg.package_id, deployment)[1], 'Saved. Verify after reboot.');
+  assert.match(deviceOutcome(device, pkg.package_id, deployment)[2], /Restart the headset/);
+  assert.equal(retryEligible(device, deployment), false);
+
+  const fixture = createHarness(() => assert.fail('rendering results should not call the API'), { devices: [device] });
+  fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
+  fixture.controller.renderGroup('The Lab');
+  const results = fixture.groupControls['[data-settings-results]'].innerHTML;
+  assert.match(results, /Saved\. Verify after reboot\./);
+  assert.doesNotMatch(results, /wifi · Failed|data-group-action="retry"/);
+
+  const retryableMixed = { ...report, results: { ...report.results,
+    brightness: { status: 'failed', reason: 'WRITE_FAILED' } } };
+  assert.equal(retryEligible({ ...device, configuration_state: retryableMixed }, deployment), true);
 });
 
 test('Group Settings reports live auto-return monitor status separately from applied revision results', () => {
@@ -487,13 +539,13 @@ function response(data, status = 200) {
 }
 
 function profile({
-  id = 'pkg', name = 'Studio', draftRevision = 'draft1', publishedRevision = 'r0',
+  id = 'pkg', name = 'Studio', editRevision = 'edit1', publishedRevision = 'r0',
   settings = { brightness: { managed: true, value: 60 } },
   impact = { groups: 2, devices: 5, token: 'impact1' },
   itemSections = sections,
 } = {}) {
-  return { package_id: id, name, draft_revision: draftRevision, published_revision: publishedRevision,
-    published_keys: publishedRevision ? ['brightness'] : [], settings, sections: itemSections, impact };
+  return { package_id: id, name, edit_revision: editRevision, published_revision: publishedRevision,
+    settings, sections: itemSections, impact };
 }
 
 function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'] }, confirm = () => true } = {}) {
@@ -578,8 +630,6 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     { dataset: { network: '1', direction: 'up' }, disabled: true },
     { dataset: { network: '1', direction: 'down' }, disabled: true },
   ];
-  const wifiOrderNote = { textContent: '' };
-  const wifiAutoReturnControl = { disabled: false };
   const wifiLimitWarning = { hidden: true };
   const wifiHiddenWarning = { hidden: true };
   const wifiArticle = { querySelector: selector => selector === '[data-field="password"]' ? { disabled: false, value: '' } : ({ textContent: '' }) };
@@ -617,7 +667,7 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     controller, packagePanel, packageList, edit, editClick, policyClick, editorButtons, editorControls, groupControls,
     groupClick, groupButtons, select, broadcast, create, createControls, requests, confirmations,
     passwordInputs: () => passwordInputs,
-    valueField, moveButtons, wifiOrderNote, wifiAutoReturnControl, wifiLimitWarning, wifiHiddenWarning, addNetworkButton, footerStatus,
+    valueField, moveButtons, wifiLimitWarning, wifiHiddenWarning, addNetworkButton, footerStatus,
     opened: () => opened,
   };
 }
@@ -654,11 +704,11 @@ test('group cards use the committed assignment and count only reports for its de
 
 test('save and deploy sends the edited name and settings in one confirmed request', async () => {
   let approve = false;
-  let draft = profile({ draftRevision: null, publishedRevision: null, settings: {} });
+  let draft = profile({ editRevision: null, publishedRevision: null, settings: {} });
   const fixture = createHarness(({ method, url, body }) => {
     if (url === '/api/packages' && method === 'POST') return response(draft);
     if (method === 'GET') return response(draft);
-    draft = { ...draft, name: body.name, settings: body.settings, draft_revision: 'draft2', published_revision: 'r1' };
+    draft = { ...draft, name: body.name, settings: body.settings, edit_revision: 'edit2', published_revision: 'r1' };
     return response(draft);
   }, { confirm: () => approve });
   fixture.broadcast({ packages: [] });
@@ -703,7 +753,7 @@ test('Save & deploy fills a cleared shutdown time when the schedule is disabled 
     } } } });
     const fixture = createHarness(({ method, body }) => {
       if (method === 'GET') return response(latest);
-      latest = profile({ settings: body.settings, draftRevision: 'draft2', publishedRevision: 'r1' });
+      latest = profile({ settings: body.settings, editRevision: 'edit2', publishedRevision: 'r1' });
       return response(latest);
     });
     fixture.broadcast();
@@ -742,7 +792,7 @@ test('a stale impact never republishes automatically and a subsequent confirmati
   assert.equal(fixture.requests.filter(request => request.method === 'POST').length, 1);
   await fixture.editClick('reload');
   await fixture.editClick('deploy');
-  assert.equal(fixture.requests.at(-1).body.expected_revision, 'draft1');
+  assert.equal(fixture.requests.at(-1).body.expected_revision, 'edit1');
   assert.equal(fixture.requests.at(-1).body.expected_impact, 'impact2');
   assert.match(fixture.confirmations.at(-1), /1 group and 4 devices/);
 });
@@ -752,7 +802,7 @@ test('a revision changed by another console blocks publication before confirmati
   const fixture = createHarness(() => response(latest));
   fixture.broadcast();
   await fixture.controller.showPackages('pkg');
-  latest = profile({ draftRevision: 'remote' });
+  latest = profile({ editRevision: 'remote' });
   await fixture.editClick('deploy');
   assert.equal(fixture.confirmations.length, 0);
   assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /The package changed/);
@@ -764,13 +814,13 @@ test('a save conflict rebases unsaved name and setting edits onto the latest ver
   let latest = profile();
   const fixture = createHarness(({ method, body }) => {
     if (method === 'GET') return response(latest);
-    if (body.expected_revision === 'draft1') {
-      latest = profile({ draftRevision: 'remote', settings: {
+    if (body.expected_revision === 'edit1') {
+      latest = profile({ editRevision: 'remote', settings: {
         brightness: { managed: true, value: 62 }, autoSleep: { managed: true, value: true },
       } });
       return response({ error: 'Draft changed.' }, 409);
     }
-    return response({ ...latest, draft_revision: 'draft2', settings: body.settings, name: body.name });
+    return response({ ...latest, edit_revision: 'edit2', settings: body.settings, name: body.name });
   });
   fixture.broadcast();
   await fixture.controller.showPackages('pkg');
@@ -820,7 +870,7 @@ test('WS catalog updates do not repaint draft inputs or yield to an older HTTP s
   fixture.broadcast({ packages: [{ ...pkg, name: 'Remote name', published_revision: 'newer' }, pkg2] });
   assert.equal(fixture.packagePanel.innerHTML, before);
   assert.match(fixture.editorControls['[data-package-publication]'].textContent, /Deployed version newer/);
-  finishSave(response(profile({ draftRevision: 'draft2', settings: { brightness: { managed: true, value: 63 } } })));
+  finishSave(response(profile({ editRevision: 'edit2', settings: { brightness: { managed: true, value: 63 } } })));
   await saving;
   assert.match(fixture.packagePanel.innerHTML, /type="range"[^>]+value="63"/);
   assert.match(fixture.packageList.innerHTML, /Remote name/);
@@ -970,7 +1020,8 @@ test('Group Settings deploys No package through the same confirmation flow', asy
   const fixture = createHarness(request => {
     if (request.url === '/api/packages/pkg') return response(profile());
     if (request.method === 'POST') return response({ package_id: null });
-    return response({ name: 'No package', clear: true, impact: { groups: 1, devices: 1, token: 'clear1' } });
+    return response({ name: 'No package', clear: true, wifi_mode: 'priority',
+      impact: { groups: 1, devices: 1, token: 'clear1' } });
   });
   const name = 'The Lab';
   fixture.broadcast({ assignments: { [name]: 'pkg' }, deployments: { [name]: d1 } });
@@ -980,7 +1031,7 @@ test('Group Settings deploys No package through the same confirmation flow', asy
   assert.equal(fixture.groupButtons.deploy.disabled, false);
   const requestCount = fixture.requests.length;
   await fixture.groupClick('deploy');
-  assert.match(fixture.confirmations[0], /Deploy No package to "The Lab" \(1 device\)\?[\s\S]*leaves current device values in place/);
+  assert.match(fixture.confirmations[0], /Deploy No package to "The Lab" \(1 device\)\?[\s\S]*leaves current device values in place[\s\S]*Wi-Fi auto-connect settings still apply after release[\s\S]*enable auto-connect for it on the headset/);
   assert.deepEqual(fixture.requests.slice(requestCount), [
     { url, method: 'GET', body: undefined },
     { url, method: 'POST', body: { expected_impact: 'clear1' } },
@@ -992,6 +1043,39 @@ test('Group Settings deploys No package through the same confirmation flow', asy
   assert.equal(fixture.groupControls['[data-deployment-count]'].hidden, true);
   assert.equal(fixture.groupButtons.deploy.disabled, false);
   assert.match(fixture.groupControls['[data-assignment-feedback]'].textContent, /No package deployed/);
+});
+
+test('No package for Android selection explains retained Wi-Fi auto-connect settings', async () => {
+  const url = '/api/group-package/deploy?name=The+Lab&package_id=';
+  const fixture = createHarness(request => {
+    if (request.url === '/api/packages/pkg') return response(profile());
+    if (request.method === 'POST') return response({ package_id: null });
+    return response({ name: 'No package', clear: true, wifi_mode: 'android_selection',
+      impact: { groups: 1, devices: 1, token: 'clear1' } });
+  });
+  const name = 'The Lab';
+  fixture.broadcast({ assignments: { [name]: 'pkg' }, deployments: { [name]: { ...d1, keys: ['wifi'], wifi_mode: 'android_selection' } } });
+  fixture.controller.renderGroup(name);
+  fixture.select('');
+  await fixture.groupClick('deploy');
+  assert.match(fixture.confirmations[0], /leaves current device values in place/);
+  assert.match(fixture.confirmations[0], /Wi-Fi auto-connect settings still apply after release/);
+  assert.match(fixture.confirmations[0], /enable auto-connect for it on the headset/);
+});
+
+test('No package for a scalar-only deployment has no Wi-Fi confirmation text', async () => {
+  const fixture = createHarness(request => {
+    if (request.method === 'POST') return response({ package_id: null });
+    return response({ name: 'No package', clear: true, wifi_mode: null,
+      impact: { groups: 1, devices: 1, token: 'clear1' } });
+  });
+  const name = 'The Lab';
+  fixture.broadcast({ assignments: { [name]: 'pkg' }, deployments: { [name]: d1 } });
+  fixture.controller.renderGroup(name);
+  fixture.select('');
+  await fixture.groupClick('deploy');
+  assert.match(fixture.confirmations[0], /leaves current device values in place/);
+  assert.doesNotMatch(fixture.confirmations[0], /first listed network|auto-connect state/);
 });
 
 test('deployment counts track current-revision results for online and offline members', () => {

@@ -355,6 +355,7 @@ class WebSocketManager internal constructor(
         socketOpen = false
         registration.clear()
         connectedServerAddress = null
+        lastWifiState = null
     }
 
     fun sendMessage(json: JSONObject) {

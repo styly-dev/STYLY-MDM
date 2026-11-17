@@ -15,10 +15,6 @@ PRIORITY_MONITOR_STATES = frozenset({
 class WiFiSettingsError(ValueError):
     """A validation or state transition error safe to return to an API client."""
 
-    def __init__(self, message: str, status: int = 400):
-        super().__init__(message)
-        self.status = status
-
 
 def normalize_revision(value: Any) -> str | None:
     if not isinstance(value, str):
@@ -32,8 +28,8 @@ def normalize_revision(value: Any) -> str | None:
 
 WIFI_REASONS = {
     "NONE", "PERMISSION_DENIED", "UNSUPPORTED", "CONFIG_READ_FAILED",
-    "UPDATE_FAILED", "VERIFY_FAILED", "TIMEOUT_ROLLED_BACK", "RESTORE_FAILED",
-    "RESTORE_UNCONFIRMED", "BUSY", "UNREACHABLE", "UNKNOWN", "UNSUPPORTED_HIDDEN_NETWORK",
+    "UPDATE_FAILED", "VERIFY_FAILED", "VERIFY_AFTER_REBOOT", "FALLBACK", "SAVED",
+    "BUSY", "UNREACHABLE", "UNKNOWN", "UNSUPPORTED_HIDDEN_NETWORK",
     "UNSUPPORTED_PRIORITY_NETWORK_LIMIT",
 }
 
@@ -54,11 +50,10 @@ def public_wifi_state(raw: Any) -> dict | None:
             normalize_revision(result.get("operation_id")) is None or
             normalize_revision(result.get("revision")) is None or
             result.get("status") not in ("success", "failed", "unknown") or
-            result.get("reason") not in tuple(WIFI_REASONS) or
-            type(result.get("rolled_back")) is not bool):
+            result.get("reason") not in tuple(WIFI_REASONS)):
             return None
         result = {key: result[key] for key in (
-            "operation_id", "revision", "status", "reason", "rolled_back",
+            "operation_id", "revision", "status", "reason",
         )}
     reason = raw.get("unavailable_reason")
     if reason is not None and reason not in tuple(WIFI_REASONS | {"INITIALIZING", "STORAGE_ERROR"}):

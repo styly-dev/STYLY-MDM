@@ -56,7 +56,7 @@ def test_priority_monitor_is_optional_allowlisted_and_unknown_values_are_ignored
 def test_priority_failure_reasons_survive_wifi_state_sanitization():
     revision = "44444444-4444-4444-8444-444444444444"
     for reason in (
-        "UNSUPPORTED_HIDDEN_NETWORK", "UNSUPPORTED_PRIORITY_NETWORK_LIMIT", "RESTORE_UNCONFIRMED",
+        "UNSUPPORTED_HIDDEN_NETWORK", "UNSUPPORTED_PRIORITY_NETWORK_LIMIT",
     ):
         raw = {
             "managed": True,
@@ -66,7 +66,6 @@ def test_priority_failure_reasons_survive_wifi_state_sanitization():
                 "revision": revision,
                 "status": "failed",
                 "reason": reason,
-                "rolled_back": False,
                 "password": "must-not-be-forwarded",
             },
             "busy": False,
@@ -80,15 +79,46 @@ def test_priority_failure_reasons_survive_wifi_state_sanitization():
             "revision": revision,
             "status": "failed",
             "reason": reason,
-            "rolled_back": False,
         }
         assert "must-not-be-forwarded" not in json.dumps(state)
+
+    rejected = server.public_wifi_state({
+        "managed": True,
+        "policy_revision": revision,
+        "last_result": {
+            "operation_id": DEVICE_OLD,
+            "revision": revision,
+            "status": "failed",
+            "reason": "RESTORE_FAILED",
+        },
+        "busy": False,
+        "available": True,
+        "unavailable_reason": None,
+    })
+    assert rejected is None
+
+    fallback = server.public_wifi_state({
+        "managed": True,
+        "policy_revision": revision,
+        "last_result": {
+            "operation_id": DEVICE_OLD,
+            "revision": revision,
+            "status": "success",
+            "reason": "FALLBACK",
+        },
+        "busy": False,
+        "available": True,
+        "unavailable_reason": None,
+    })
+    assert fallback["last_result"]["reason"] == "FALLBACK"
 
 
 def test_priority_unsupported_reasons_are_preserved_in_configuration_state():
     revision = "44444444-4444-4444-8444-444444444444"
-    for reason in (
-        "UNSUPPORTED_HIDDEN_NETWORK", "UNSUPPORTED_PRIORITY_NETWORK_LIMIT", "RESTORE_UNCONFIRMED",
+    for reason, result_status in (
+        ("UNSUPPORTED_HIDDEN_NETWORK", "unsupported"),
+        ("UNSUPPORTED_PRIORITY_NETWORK_LIMIT", "unsupported"),
+        ("FALLBACK", "applied"),
     ):
         state = configuration_packages.public_configuration_state({
             "package_id": revision,
@@ -96,7 +126,7 @@ def test_priority_unsupported_reasons_are_preserved_in_configuration_state():
             "status": "complete",
             "results": {
                 "wifi": {
-                    "status": "unsupported",
+                    "status": result_status,
                     "reason": reason,
                     "password": "must-not-be-forwarded",
                 },
@@ -106,7 +136,7 @@ def test_priority_unsupported_reasons_are_preserved_in_configuration_state():
             "package_id": revision,
             "revision": revision,
             "status": "complete",
-            "results": {"wifi": {"status": "unsupported", "reason": reason}},
+            "results": {"wifi": {"status": result_status, "reason": reason}},
         }
         assert "must-not-be-forwarded" not in json.dumps(state)
 
@@ -233,7 +263,7 @@ def test_device_wifi_reports_survive_reconnect_and_reject_stale_socket(tmp_path)
             await receive_type(live, "REGISTERED")
             await receive_type(admin, "DEVICE_LIST")
             failed = {**state, "last_result": {"operation_id": DEVICE_OLD, "revision": revision,
-                      "status": "failed", "reason": "PERMISSION_DENIED", "rolled_back": False}}
+                      "status": "failed", "reason": "PERMISSION_DENIED"}}
             await old.send_json({"type": "WIFI_STATE", "wifi_state": {**state, "managed": False}})
             # PONG proves the server read the preceding frame on this socket before
             # the live connection can overwrite an incorrectly accepted update.
@@ -253,6 +283,13 @@ def test_device_wifi_reports_survive_reconnect_and_reject_stale_socket(tmp_path)
             assert rows[0]["wifi_state"] == failed
             assert "wifi_state_updated_at" not in rows[0]
             assert "secret" not in json.dumps(rows)
+
+            reconnected = await session.ws_connect(base + "/ws/device")
+            await reconnected.send_json({key: value for key, value in registration.items() if key != "wifi_state"})
+            await receive_type(reconnected, "REGISTERED")
+            await receive_device_list(admin, lambda row: row["status"] == "online" and row["wifi_state"] is None)
+            assert server.device_registry[DEVICE_V4]["wifi_state"] == failed
+            await reconnected.close()
             await old.close()
             await live.close()
             await admin.close()

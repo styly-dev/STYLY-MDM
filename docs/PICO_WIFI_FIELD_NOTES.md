@@ -28,6 +28,13 @@ and a guest AP added by the app.
 The raw device logs and verification records from these runs are kept outside
 the repository; this file is the maintained summary.
 
+The hardware lifecycle observations below include runs with an earlier
+recovery implementation. Current priority mode keeps configured candidates,
+enables Android auto-join for the first listed profile, and explicitly tries
+candidates in priority order. The Android selection option enables auto-join
+for every listed profile and delegates connections to Android. The API probe
+and product deployment trials below cover the recorded builds and settings.
+
 ## Wi-Fi scans and connection observations
 
 - A scan request returning success does **not** establish that the results are
@@ -49,13 +56,14 @@ the repository; this file is the maintained summary.
   run had them immediately. Treat the IP, SSID and security as observations
   for the same network, and allow for callback timing rather than mixing an IP
   from one connection with an SSID from another.
-- On 2026-11-11 a rollback's own reconnect to the prior network failed once
-  with an authentication error during rapid back-to-back switches. About 2.4
+- In the 2026-11-11 recovery implementation, its reconnect to the prior network
+  failed once with an authentication error during rapid back-to-back switches. About 2.4
   seconds later the OS auto-joined that network itself (Wi-Fi system UID), and
   in a process-kill test the OS and the restarting app requested the same
   network in the same millisecond. With auto-join enabled and the network
   selection status enabled, the OS reconnects without the app.
-- The client's MDM WebSocket closes whenever Wi-Fi drops, even when the server
+- In the 2026-11-11 recovery implementation, the client's MDM WebSocket closed
+  whenever Wi-Fi dropped, even when the server
   is reached through a USB reverse tunnel. A release or policy published while
   a switch is in progress therefore reaches the device only after it
   reconnects, typically while the rollback is confirming the prior network.
@@ -87,21 +95,28 @@ the repository; this file is the maintained summary.
   randomization change, which it rejects ("does not have permission to modify
   MAC randomization Settings") unless the caller holds `NETWORK_SETTINGS` or is
   a Device Owner updating a network it created. Networks the app added were
-  unaffected. Since the stored value cannot be read, the adapter now sends AUTO
-  first and then NONE, PERSISTENT and NON_PERSISTENT until one is accepted;
-  a rejected update changes nothing. With this change the apply succeeded and
+  unaffected. The tested build tried AUTO, NONE, PERSISTENT, and NON_PERSISTENT
+  on its Device Owner path. With this change the apply succeeded and
   all saved networks kept setting 3. The NONE fallback (a network set to
   "device MAC" in Settings) is host-tested only. The earlier partial
   `WifiConfiguration` failure below may have had the same cause; that was not
   rechecked.
+- On 2026-11-16 the configured-networks dump on DEV-005 masked the first
+  `length / 4 + 1` UTF-16 code units of the displayed SSID. The client accepts
+  that format or the complete SSID and checks the same saved network ID.
+  The ownerless MDM package test confirmed an authentication failure on a
+  saved WPA2 network, recovery to a WPA3 hotspot with IPv4, and successful
+  redeployment of the corrected password to the original WPA2 network ID.
+  Android's selection status for the failed network was permanently disabled
+  with a wrong-password reason before the corrected deployment.
 - The transition AP advertised PSK and SAE. A PSK configuration connected to
   it with Android security type `4` (SAE) and a usable IP. The WPA2-only AP was
   also observed with PSK and an IP. These runs do not prove behavior on a
   WPA3-only AP, on a non-SAE client, or with a 1–7-character SAE password.
-- Android did not expose the saved Wi-Fi password to the app. Recovery can
-  restore credentials that MDM already knows, but cannot reconstruct an unknown
-  password after it has been overwritten. The chosen policy permits that
-  overwrite; the operator may need to re-enter the old password after failure.
+- Android did not expose the saved Wi-Fi password to the app. The current
+  priority policy keeps a usable first-candidate link after saving and records
+  current-boot credential uncertainty for a new or previously unknown key.
+  Ordered selection can use a saved candidate while verification is pending.
 - A first wrong-password trial unexpectedly connected after a changed password
   was published. Authentication caching is a plausible explanation, but was
   not established. The shell user could not flush PMKSA. After removing only a
@@ -109,6 +124,20 @@ the repository; this file is the maintained summary.
   wrong-password rejection and the client connected to the lower candidate.
   Do not use a successful SSID/IP check as proof that the newly supplied
   credential was freshly authenticated.
+- On DEV-005, an in-place password write on an active SAE connection reset
+  Android's `hasEverConnected` flag. Disconnecting before the write still
+  allowed same-boot success with an incorrect password. The device also
+  rejoined after a PICO radio-off/radio-on cycle that reached Android's
+  fully disabled state. The exact cache or retained session is unconfirmed.
+  SSID and IP alone must not be treated as proof that a changed credential was
+  used successfully.
+- On 2026-11-17 a diagnostic APK invoked the current adapter's save operation
+  on a connected 5 GHz test profile. Both the app-owned `WifiManager` path
+  and the TobService path for a profile owned by a separate diagnostic UID
+  accepted a same-key and a changed-key update. All four writes kept the same
+  network handle and usable IP through eight seconds of observation. The AP
+  kept its original key throughout. The diagnostic profiles and APKs were
+  removed and the original connection, saved flags and MDM APK were verified.
 - Wi-Fi credentials are stored in plaintext in the private server registry and
   backups, and are sent to the device when needed. Keep credentials out of
   logs and evidence, and protect registry backups and test files accordingly.
@@ -119,23 +148,37 @@ the repository; this file is the maintained summary.
   location foreground service were insufficient for `getConfiguredNetworks()`
   after Wi-Fi disconnected. Granting `ACCESS_BACKGROUND_LOCATION` allowed
   recovery on that PUI build. Check the granted permissions and device state,
-  not just the manifest. The current managed flow also checks Device Owner.
-  Exact-alarm access is optional since 2026-11-11: without it, rollback relies
-  on the in-process watchdog and startup recovery and can be delayed while the
-  headset sleeps. `USE_EXACT_ALARM` is declared and was granted at install on
-  PUI 5.15.7 (2026-11-11).
-- The client SDK 4.3.16 also exposes `pbsControlSetAutoConnectWIFI(ssid,
-  password, int, IBoolCallback)`, a `...WithErrorCodeCallback` variant,
-  `pbsControlClearAutoConnectWIFI`, and `pbsGetAutoConnectWiFiConfig`. The PICO
-  documentation describes them only as setting "a default Wi-Fi connection".
-  They take a single network and offer no ordering, auto-join control for
-  other saved networks, or rollback, so they cannot express the ordered list of
-  up to four networks with journaled recovery. They were not tried on a device.
-  Revisit them if the policy is ever reduced to one network or if Device Owner
-  plus background location stops working on a PUI update.
+  not just the manifest. The tested build also required Device Owner.
+  The 2026-11-11 development build used in these trials declared
+  `USE_EXACT_ALARM`, and PUI 5.15.7 granted it at install. That permission was
+  used by the retired Wi-Fi rollback flow and is not needed by the current
+  ordered-candidate policy.
+- On DEV-005 (Android 14, PUI 5.15.7, TobService 4.3.30), the Device Owner's
+  `pbsControlSetAutoConnectWIFI` call with `ext=0` stored one SSID and its
+  plaintext test password in `/sdcard/pre_resource/config/config.txt` before
+  completing the connection attempt. The boolean variant returned `false`
+  after about 100 seconds for an absent AP. The error-code variant returned
+  `4` for a second absent AP. Both failures left their Android profiles saved.
+  The second call replaced the single PICO default. After the test removed the
+  second Android profile, reboot recreated it from the remaining PICO default.
+  On that managed headset, a separate non-owner app received `2` from the
+  error-code setter. The same app cleared the PICO default with
+  `pbsControlClearAutoConnectWIFI`, leaving both Android profiles and auto-join
+  flags intact. On a reachable WPA2/WPA3 iPhone hotspot, the boolean setter
+  returned `true` after 3.4 seconds. Android reported WPA3-SAE and had a usable
+  IPv4 address. After removing the temporary Android profile before reboot,
+  the headset recreated it and reconnected with IPv4 during startup. Clearing
+  the PICO default while connected left the Android profile, association, and
+  IPv4 in place. The single default and its failure behavior do not provide
+  ordered candidate fallback required by the MDM policy.
 - PICO auto-join changes use the TobService `allow_wifi_auto_join` message.
   Read back the actual `WifiConfiguration.allowAutojoin` flag; do not infer the
   final saved state only from a successful request.
+- On 2026-11-17, an ownerless diagnostic app on DEV-005 (PUI 5.15.7, target
+  SDK 33) turned off auto-join for the connected saved network and disconnected
+  it. After IPv4 was lost, `WifiManager.enableNetwork(savedId, true)` rejoined
+  the same saved profile with IPv4 and left auto-join off. The test restored
+  the original flag and connection and removed the diagnostic app.
 - On the tested device, ADB reported model `A9210` while application processes
   reported `A94U0`. Model checks and diagnostic output can therefore differ
   depending on where they are read; do not treat these two values as evidence
@@ -145,113 +188,120 @@ the repository; this file is the maintained summary.
   serial alone is not a stable identity. If the transport drops, inspect the
   actual device state before deciding whether to retry a mutation.
 
-## Implementation decisions made from these findings
+## Current implementation decisions
 
-These are current product choices, not guarantees supplied by Android or PICO.
-The operator-facing details are in [Wi-Fi settings](WIFI_SETTINGS.md).
+These product choices are not guarantees supplied by Android or PICO. The
+operator-facing details are in [Wi-Fi settings](WIFI_SETTINGS.md).
 
 - One package setting contains an ordered list of up to four networks and a
   package-wide automatic-return toggle. Open and WPA2/WPA3 Personal are the
   supported choices. Passwords are 1–63 printable ASCII characters; 1–7
   characters are WPA3-only, while 8–63 permit WPA2 fallback.
-- Before a Wi-Fi mutation, the client records saved network identities,
-  auto-join flags and MDM-known credentials. It waits up to two seconds for a
-  usable current connection to become identifiable and match one saved
-  network. If a usable connection remains ambiguous, it fails before mutation;
-  if there is no usable connection after the observation window, it treats the
-  device as disconnected.
-- The initial mutation starts a 60-second overall budget; an individual
-  candidate gets up to 12 seconds within it. A normal disconnect has an
-  eight-second grace period (plus up to three seconds of random delay) before
-  ordered reselection. Since 2026-11-11 that reselection runs once per offline
-  period and is skipped for a single listed network; afterwards Android
-  auto-join reconnects (see the 2026-11-11 auto-join observation above). The
-  earlier five-to-30-minute retry backoff was removed.
-- With automatic return on, the app looks for higher candidates while connected
-  to a lower one. The first scan runs within about 30 seconds, later requests
-  target about five minutes plus up to 10% random delay, and fresh passive
-  results may also trigger a switch. Any visible higher candidate triggers a
-  switch regardless of signal strength; this is an intentional product choice.
-  Failed scan requests back off to as much as 30 minutes. Hidden SSIDs are not
-  supported with automatic return on. With it off, a working lower connection is
-  retained; ordered reselection still applies after a disconnect.
-- A failed automatic return was found in a host test to restart scanning and
-  immediately attempt another switch after recovery. The final implementation
-  waits five minutes after any automatic-return operation settles before
-  another one, even after a successful move. Since 2026-11-11 consecutive
-  failures double the wait up to 30 minutes. This in-memory wait resets on app
-  process restart. The
-  delay changes were host-tested and were **not** installed on the physical
-  device; verify with a preferred AP that has a deliberately wrong password.
+- After confirming at least one candidate save, the client sets Android
+  auto-join by saved ID. Priority mode enables the first listed network.
+  Android selection mode enables every listed SSID and security match and
+  delegates connections to Android. Auto-join is disabled for other saved IDs
+  in either mode, and the profiles are retained.
+- The client applies candidates in list order and keeps a usable primary link
+  after an unverified credential save. Connection attempts include candidates
+  with unverified credentials. A usable unverified connection reports
+  `VERIFY_AFTER_REBOOT` after profile and flag checks pass. A verified lower
+  candidate reports `FALLBACK`. Save and flag readback failures stay visible.
+- After disconnection, Android can reconnect to the first listed network. For
+  multiple candidates or a cached fallback profile, the client waits about
+  8–11 seconds, keeps a usable connection already restored by Android, and
+  otherwise explicitly tries saved candidates in order without an app scan.
+  After all fail, it retries with an increasing wait capped at about one
+  minute plus jitter, stopping when it obtains a usable IP. With automatic
+  return on, it looks for higher candidates while connected to a lower one;
+  if the higher attempt fails and disconnects the headset, it explicitly
+  reselects the previous lower candidate. The first scan runs within about 30
+  seconds, later requests target about five minutes plus up to 10% random
+  delay, and fresh passive results may also trigger a switch. Any visible
+  higher candidate triggers a switch regardless of signal strength. Failed
+  scan requests back off to as much as 30 minutes. Hidden SSIDs are not
+  supported with automatic return on.
+- A settled automatic-return attempt waits five minutes before another one,
+  even after a successful move. Consecutive failures double that wait up to 30
+  minutes. The in-memory wait resets on app process restart. The timer changes
+  were host-tested and were not installed on the physical device in the
+  recorded November runs.
 - On 2026-11-11 a brightness-only revision kept the active connection through
-  the client's matching Wi-Fi shortcut. Same-boot updates now carry matching
-  Wi-Fi into the new revision without writing the profile or reconnecting.
+  the client's matching Wi-Fi shortcut. Same-boot updates carry a matching
+  Wi-Fi profile into the new revision without rewriting or reconnecting.
 - On 2026-11-12 the BDM-enrolled DEV-001 reapplied its sleep policy through
-  `tobmdm` after Wi-Fi association at boot and again after a Wi-Fi reconnect.
-  DEV-005 kept its 1800-second sleep delay across both checks after it was
-  unenrolled. The fixed boot delay was removed based on this comparison.
-- A failed switch restores saved auto-join flags and known credentials. If a
-  usable connection existed before the attempt, restoration is confirmed only
-  after the prior SSID and a usable IP are observed. If not confirmed within
-  60 seconds, the operation settles as unconfirmed and normal monitoring
-  resumes; Android auto-join reconnects to the restored network. The app's
-  own reconnect retries (5 to 30 minutes) were removed on 2026-11-11 after the
-  device showed the OS rejoining by itself. The rollback's single
-  `enableNetwork(id, true)` is no longer followed by `reconnect()`. A later
-  recovery does not turn the original failed package application into a
-  successful one.
-- If restoring saved settings itself fails (`RESTORE_FAILED`), the app retries
-  the restore after about 30 seconds, 2 minutes and 10 minutes. After that an
-  operator Retry or a Wi-Fi release is needed. Host-tested only.
-- SSID and IP constitute local Wi-Fi success only. They do not prove the MDM
-  server is reachable, and a pending report may remain local while offline.
-  The latest Wi-Fi recovery status is separate from the historical package
-  application result.
+  `tobmdm` after Wi-Fi association at boot and after a Wi-Fi reconnect. DEV-005
+  kept its 1800-second sleep delay across both checks after it was unenrolled.
+  The fixed boot delay was removed based on this comparison.
+- SSID and IP show a local connection only. They do not prove that Android
+  authenticated with a newly supplied password or that the MDM server is
+  reachable. A report can remain local until the device reconnects to MDM.
 
 ## Testing and operational lessons
 
-- Test switching and recovery on the actual app execution path as well as with
-  a small diagnostic probe. The first complete package test failed with
-  `UPDATE_FAILED` and `RESTORE_FAILED` even though earlier saved-network
-  switching had worked. The corrected package flow was subsequently tested.
-- The first all-candidates-unreachable trial did **not** prove recovery: the
-  client reported `RESTORE_UNCONFIRMED` and lost the retry journal when the
-  prior SSID was not yet visible. A read-only probe exposed the observation
-  race. After the fix, the same kind of trial returned to the prior SSID with
-  IP and reported the failed operation with `rolled_back=true`.
-- Use an isolated loopback server and private registry for device trials.
-  A USB reverse tunnel proves policy delivery through that tunnel; it does not
+- Test Wi-Fi through the configuration-package path as well as with a small
+  diagnostic probe. A successful Android API return does not prove the target
+  authenticated or obtained an IP. Record the observed SSID, security, IP,
+  candidate order, result reason, and whether MDM reconnected.
+- On 2026-11-17 a diagnostic loaded the built DevDebug Wi-Fi controller with a
+  cached profile whose first candidate was unsaved. From a disconnected state,
+  it selected the known-good saved fallback, obtained IPv4, and reported
+  `FALLBACK` after 13.4 seconds. Auto-join remained off. The test restored the
+  four saved flags and the original connection, then removed the diagnostic.
+  It exercised offline candidate selection without changing credentials or
+  using a server. Multi-AP package deployment and automatic return remain
+  unverified in this build.
+- On 2026-11-17, ownerless DEV-005 on PUI 5.15.7 ran the package controller
+  and hybrid Wi-Fi adapter in a separate targetSdk 33 diagnostic APK. Auto-join
+  writes were scoped to two temporary profiles. App-created updates used
+  `WifiManager` without `DUMP`. A profile recreated by TobService under
+  the same SSID used the privileged update path despite the earlier app record.
+  Both paths kept the saved ID, MAC policy, and DHCP assignment and connected
+  to the test access point with IPv4. Mixed policies used both update paths.
+  With `DUMP` revoked and the external candidate first, the package reported
+  `PERMISSION_DENIED`, the app-created candidate still updated, and the test
+  device reconnected to the access point. Package payloads were injected locally.
+  Cleanup verified the original four profiles, their auto-join flags, and
+  the original Wi-Fi connection.
+- The recorded November hardware trials used the earlier recovery flow. They
+  covered authentication failure, recovery to a previous network, release,
+  process restart, SAE and PSK connections, and short automatic-return
+  observations. The old result `rolled_back=true` and recovery records do not
+  prove the current candidate-retention and fallback behavior.
+- The host checks recorded for that earlier implementation passed 926 server
+  tests, 145 console tests with one existing skip, and 341 Android tests; the
+  development APK also built. These are historical results, not a claim that
+  they were rerun for the current branch.
+- Use an isolated loopback server and private registry for device trials. A
+  USB reverse tunnel proves policy delivery through that tunnel; it does not
   prove MDM server reachability over Wi-Fi. Record the baseline, original APK,
-  app state, saved network identities and auto-join flags before mutation.
+  app state, saved network identities, and auto-join flags before mutation.
   Remove only test-created networks, then verify the original APK, connection,
-  settings, Device Owner and service. A running service alone does not prove
+  settings, Device Owner, and service. A running service alone does not prove
   registration to the original server; that registration was not checked in
   the final November cleanup. The user's correction of an initially invalid
-  saved 5 GHz credential was intentionally retained; later recovery checks
-  used that corrected baseline.
-- November verification covered the package flow, SAE and PSK connections,
-  wrong-password fallback, short ON/OFF automatic-return observations, and
-  recovery to the prior SSID/IP. The final host checks passed 926 server tests,
-  145 console tests with one existing skip, and 341 Android tests; the Android
-  development APK also built. These are recorded results, not a claim that the
-  tests were rerun when this note was written.
-- On 2026-11-11 the device also covered: a wrong guest password rolled back to
-  the office AP with `rolled_back=true`; releasing the policy while idle and
-  during a failing switch left the networks in place with no pending release;
-  and killing the app process during `applying` restored the office AP within
-  about two seconds of restart, with the package reported as `interrupted` and
-  the Wi-Fi result `UNKNOWN`, `rolled_back=true`.
-- Hardware gaps remain: a five-minute background cadence, prolonged sleep,
-  OS rejoin after the original AP is unavailable for longer than the 60-second
-  confirmation, a short-password WPA3-only AP, and a non-SAE client. Relevant timer and
-  recovery cases have host coverage, but that is not physical proof.
-- The new Wi-Fi format deliberately drops the development-only old format and
-  requires updated clients. An existing registry containing old Wi-Fi entries
-  cannot load the configuration-package catalog until those entries are
-  removed and recreated; the registry itself is retained. Finish old Wi-Fi
-  operations first, protect a registry backup, and follow the revision-reset
-  procedure in the [operator guide](WIFI_SETTINGS.md#operator-workflow).
-- During this work the shared, ignored `tasks/todo.md` was overwritten. Only
-  its last 80 recorded lines and the new task plan could be recovered. Ignored
-  files can still contain user work: inspect and preserve them before writing,
-  and coordinate a single writer for shared task notes.
+  saved 5 GHz credential was intentionally retained for the subsequent runs.
+- On 2026-11-16 the candidate-retention APK was tested on DEV-005 through the
+  device's configuration package controller. An out-of-range first candidate
+  led to `FALLBACK` in about 16 seconds and the iPhone fallback obtained IPv4.
+  Both saved profiles kept auto-join enabled. A subsequent revision selected
+  the iPhone as its first choice, and Android rejoined it after reboot. A
+  package with two out-of-range candidates reported `UNREACHABLE` in about 26
+  seconds and kept both profiles enabled. The test injected packages locally
+  through USB instrumentation, so it did not prove MDM transport over the
+  iPhone connection. The original APK, app settings and Wi-Fi profiles were
+  verified after cleanup.
+- A second run used 6 GHz as the primary and 5 GHz as the fallback, with the
+  running server bound to a Mac on the same LAN. A deployment changed the
+  primary credential to an incorrect value while DEV-005 was using 6 GHz.
+  The server received `FALLBACK` over the 5 GHz connection. Both profiles
+  kept their saved IDs and auto-join flags. While connected to 5 GHz, the
+  headset received the corrected deployment, switched back to 6 GHz, then
+  connected to 6 GHz again and appeared online after a full reboot. The AP
+  credentials were unchanged during this test. Cleanup verified the original
+  client APK, app state, and 6 GHz connection and removed the isolated test
+  registry.
+- See the [configuration package registry notes](DEVELOPMENT.md#configuration-packages)
+  for the supported catalog versions and backup behavior. The server retains
+  data from unsupported development catalogs and marks the package catalog
+  unavailable.

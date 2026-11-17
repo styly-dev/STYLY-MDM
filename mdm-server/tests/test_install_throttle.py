@@ -291,33 +291,6 @@ def test_release_transfer_slot_reports_whether_it_freed_a_slot():
     asyncio.run(body())
 
 
-def test_release_transfer_slot_frees_only_the_named_task():
-    """A device can hold an install slot and a push slot at once.
-
-    Each job's terminal message must free its own slot and leave the other alone,
-    or an INSTALL_RESULT would let an unrelated push's queue run ahead of its
-    transfer — the whole point of keying pending_transfers by task.
-    """
-    async def body():
-        loop = asyncio.get_running_loop()
-        install_fut = loop.create_future()
-        push_fut = loop.create_future()
-        server.pending_transfers[("a", server.TASK_INSTALL)] = install_fut
-        server.pending_transfers[("a", server.TASK_PUSH)] = push_fut
-
-        assert server.release_transfer_slot("a", "install_result", task=server.TASK_INSTALL) is True
-        assert install_fut.done() and not push_fut.done()
-
-        # No install slot left to free, and the push slot must survive the attempt.
-        assert server.release_transfer_slot("a", "install_result", task=server.TASK_INSTALL) is False
-        assert not push_fut.done()
-
-        assert server.release_transfer_slot("a", "push_files_result", task=server.TASK_PUSH) is True
-        assert push_fut.done()
-
-    asyncio.run(body())
-
-
 def test_disconnect_releases_only_the_devices_install_slot():
     """Job-v1 Push ownership is separate from the established install mapping."""
     async def body():

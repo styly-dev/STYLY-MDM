@@ -78,7 +78,7 @@ def reset_state():
 
 def prepare_job_v1_dispatch(manager, capabilities, snapshot, assignment, slots):
     from push_test_helpers import dispatch_scheduler
-    from styly_mdm.push_runtime import _LegacyTransferAdapter
+    from styly_mdm.push_runtime import _InstallTransferAdapter
     from styly_mdm.push_scheduler import LiveSession
     from styly_mdm.push_transfer_leases import PushTransferLeases
     from styly_mdm.transfer_registry import TransferKey, TransferRegistry
@@ -87,7 +87,7 @@ def prepare_job_v1_dispatch(manager, capabilities, snapshot, assignment, slots):
     registry = TransferRegistry(leases.revoke_now)
     # The install path still uses the tuple-key facade. Back it with the same typed
     # registry as Push-v1 so the tests exercise the production shared-release boundary.
-    server.pending_transfers = _LegacyTransferAdapter(registry)
+    server.pending_transfers = _InstallTransferAdapter(registry)
     sessions = {}
     scheduler = dispatch_scheduler(manager, registry, leases, sessions, slots)
     sent = asyncio.Event()
@@ -173,13 +173,14 @@ async def test_job_v1_push_waits_for_install_to_release_shared_budget(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_install_completion_does_not_release_job_v1_push_transfer(tmp_path):
+@pytest.mark.parametrize("reason,task", [("install_result", server.TASK_INSTALL), ("disconnect", None)])
+async def test_install_release_does_not_release_job_v1_push_transfer(tmp_path, reason, task):
     from push_test_helpers import claimed_job_context
 
     async with claimed_job_context(tmp_path) as (manager, capabilities, snapshot, assignment):
         server.MAX_CONCURRENT_TRANSFERS = 2
         slots = server.transfer_slots()
-        start_dispatch, push_sent, waiting, registry, _leases, key = (
+        start_dispatch, push_sent, waiting, registry, leases, key = (
             prepare_job_v1_dispatch(manager, capabilities, snapshot, assignment, slots)
         )
         install_ws = add_install_device("D1")
@@ -193,10 +194,14 @@ async def test_install_completion_does_not_release_job_v1_push_transfer(tmp_path
             assert push_transfer is not None and not push_transfer.done()
             assert ("D1", server.TASK_INSTALL) in server.pending_transfers
 
-            assert server.release_transfer_slot("D1", "install_result", task=server.TASK_INSTALL)
+            lease_token = leases.token(key)
+            assert lease_token is not None
+            assert server.release_transfer_slot("D1", reason, task=task)
             await asyncio.wait_for(install_task, 1)
+            assert not server.release_transfer_slot("D1", reason, task=task)
             assert not push_transfer.done()
             assert not push_task.done()
+            assert leases.token(key) == lease_token
 
             registry.release_exact(key, "download_complete")
             await asyncio.wait_for(push_task, 1)
