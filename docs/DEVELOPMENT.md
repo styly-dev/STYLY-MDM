@@ -564,6 +564,22 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `GET /artifacts/{artifact_id}?lease=...` | DB-resolved immutable job-v1 ZIP with identity encoding, `Accept-Ranges: bytes`, stable SHA-256 strong ETag, and an in-memory token scoped to the assignment's transfer slot. Supports full `200`, open-ended `Range: bytes=N-` as `206`, exact-ETag `If-Match` failure `412`, and `416` with `Content-Range: bytes */T` for an unsatisfiable range. The job client never sends a range from a complete local file, so it always rejects `416`. A missing or revoked job-v1 token returns `409` with `X-Push-Lease-Status: revoked`; server restart invalidates all such tokens. An expired tombstoned identity remains unavailable and is never reused. |
 | `POST /api/bundles` | Removed upload flow: returns HTTP 410; use the Push job API. `/bundles/` is no longer served. |
 
+`POST /api/apks` returns the URL used by **Install APK**. When the upload request
+uses a loopback address (`127.0.0.0/8`, `::1`, or `localhost`, case-insensitive and
+with an optional trailing dot), the server substitutes the sole IPv4 address
+returned by `get_local_ip_addresses()`, if there is exactly one. This prevents
+headsets from trying to download from their own loopback interface when an operator
+opens the console locally. The request scheme and port are preserved; explicit
+non-loopback IPs and hostnames are retained. Address lookup runs outside the event
+loop so hostname resolution cannot block WebSocket processing.
+
+With zero or multiple candidate addresses, the request host is retained rather
+than choosing an interface arbitrarily. Open the console using the server address
+reachable by the headsets in that case. The lookup is best-effort hostname
+resolution, not a reachability check. This fallback applies only to APK upload
+responses: **Update Client**, **Push Files**, and **Sync Folder** still require a
+device-reachable console address.
+
 ### Server → Admin
 
 | Message type | Description |
