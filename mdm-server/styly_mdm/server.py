@@ -43,6 +43,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("stylymdm")
+SERVER_INSTANCE_ID = str(uuid.uuid4())
 
 
 class _RedactPushLeaseFilter(logging.Filter):
@@ -227,12 +228,13 @@ class _ConfigurationRegistry:
     # Writers replace these maps in a detached candidate.
     groups: dict[str, _DeviceGroup] = field(default_factory=dict)
     packages: dict[str, dict] | None = field(default_factory=dict)
+    revision: int = 0
 
 
 _configuration = _ConfigurationRegistry()
 _registry_extras: dict = {}
 _registry_readable = True
-_CONFIGURATION_FIELDS = ("groups", "packages")
+_CONFIGURATION_FIELDS = ("groups", "packages", "configuration_revision")
 
 # Connected admin WebSocket sessions
 admin_connections: set[web.WebSocketResponse] = set()
@@ -407,6 +409,9 @@ def _serialized_groups(configuration: _ConfigurationRegistry) -> dict:
 
 
 def _read_configuration(raw: dict) -> _ConfigurationRegistry:
+    configuration_revision = raw.get("configuration_revision", 0)
+    if type(configuration_revision) is not int or configuration_revision < 0:
+        raise PackageError("Invalid saved configuration revision")
     raw_groups = raw.get("groups", {})
     if not isinstance(raw_groups, dict):
         raise PackageError("Invalid saved groups")
@@ -441,10 +446,10 @@ def _read_configuration(raw: dict) -> _ConfigurationRegistry:
                 groups[name] = _DeviceGroup(_coerce_group_members(members))
 
     _remove_duplicate_memberships(groups)
-    return _ConfigurationRegistry(groups, packages)
+    return _ConfigurationRegistry(groups, packages, configuration_revision)
 
 
-def _unavailable_configuration(raw_groups) -> _ConfigurationRegistry:
+def _unavailable_configuration(raw_groups, revision: int = 0) -> _ConfigurationRegistry:
     groups = {}
     if isinstance(raw_groups, dict):
         for raw_name, entry in raw_groups.items():
@@ -452,7 +457,7 @@ def _unavailable_configuration(raw_groups) -> _ConfigurationRegistry:
                 members = entry.get("members") if isinstance(entry, dict) else entry
                 groups[name] = _DeviceGroup(_coerce_group_members(members))
         _remove_duplicate_memberships(groups)
-    return _ConfigurationRegistry(groups, None)
+    return _ConfigurationRegistry(groups, None, revision)
 
 
 def _backup_registry() -> None:
@@ -473,24 +478,53 @@ def _backup_registry() -> None:
     log.warning("Registry format migration: saved the previous registry to %s", backup)
 
 
+def _has_group_map_shape(value) -> bool:
+    if not isinstance(value, dict) or not value:
+        return False
+    return any(
+        isinstance(entry, list)
+        or isinstance(entry, dict) and isinstance(entry.get("members"), list)
+        for entry in value.values()
+    )
+
+
+def _has_registry_wrapper_shape(raw: dict) -> bool:
+    groups = raw.get("groups")
+    packages = raw.get("packages")
+    revision = raw.get("configuration_revision")
+    return (
+        _has_group_map_shape(groups)
+        or isinstance(packages, dict) and ("version" in packages or "packages" in packages)
+        or type(revision) is int and revision >= 0
+    )
+
+
 def load_registry() -> None:
     """Load the registry and atomically migrate supported older configurations."""
     global _configuration, _registry_readable
     device_registry.clear()
     _registry_extras.clear()
     _registry_readable = True
+    raw = None
     try:
         raw = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("expected a JSON object")
-        if "packages" in raw and not isinstance(raw.get("devices"), dict):
+        has_wrapper_shape = _has_registry_wrapper_shape(raw)
+        if has_wrapper_shape and not isinstance(raw.get("devices"), dict):
             raise ValueError("configuration registry is missing its device map")
     except FileNotFoundError:
         _configuration = _ConfigurationRegistry()
         return
     except (ValueError, OSError, RecursionError) as exc:
         _registry_readable = False
-        _configuration = _ConfigurationRegistry(packages=None)
+        if isinstance(raw, dict):
+            revision = raw.get("configuration_revision", 0)
+            if type(revision) is not int or revision < 0:
+                revision = 0
+            _configuration = _unavailable_configuration(raw.get("groups"), revision)
+        else:
+            _configuration = _ConfigurationRegistry(packages=None)
         log.warning("Device registry unavailable at %s: %s; saved data retained", REGISTRY_PATH, exc)
         return
 
@@ -508,15 +542,15 @@ def load_registry() -> None:
         })
         try:
             candidate = _read_configuration(raw)
-            if ("packages" not in raw or raw["packages"]["version"] != configuration_packages.VERSION
-                    or raw_groups != _serialized_groups(candidate)):
+            if "packages" not in raw or raw_groups != _serialized_groups(candidate):
                 _backup_registry()
-                if not _commit_configuration(candidate):
+                if not _write_registry(candidate, device_registry):
                     raise PackageError("Configuration migration could not be saved")
-            else:
-                _configuration = candidate
+            _configuration = candidate
         except PackageError as exc:
-            _configuration = _unavailable_configuration(raw_groups)
+            raw_revision = raw.get("configuration_revision", 0)
+            revision = raw_revision if type(raw_revision) is int and raw_revision >= 0 else 0
+            _configuration = _unavailable_configuration(raw_groups, revision)
             _registry_extras.update({key: raw[key] for key in _CONFIGURATION_FIELDS if key in raw})
             log.warning("Configuration packages unavailable: %s; saved data retained", exc)
     else:
@@ -530,6 +564,8 @@ def _write_registry(configuration: _ConfigurationRegistry, records: dict[str, di
     if not _registry_readable:
         return False
     payload = {**_registry_extras, "devices": records}
+    if configuration.packages is not None or "configuration_revision" not in payload:
+        payload["configuration_revision"] = configuration.revision
     if configuration.packages is not None:
         payload["groups"] = _serialized_groups(configuration)
         payload["packages"] = {"version": configuration_packages.VERSION, "packages": configuration.packages}
@@ -571,23 +607,57 @@ class _Coalescer:
         self._work = work
         self._label = label
         self._task: asyncio.Task | None = None
-        # The event loop keeps only weak references to tasks; keep running ones alive.
-        self._running: set[asyncio.Task] = set()
+        self._wake_event: asyncio.Event | None = None
+        self._in_flight = False
+        self._pending = False
 
     def schedule(self) -> None:
         loop = asyncio.get_running_loop()
         task = self._task
         if task is not None and not task.done() and task.get_loop() is loop:
+            if self._in_flight:
+                self._pending = True
             return
+        self._wake_event = asyncio.Event()
         self._task = loop.create_task(self._run(), name=self._label)
-        self._running.add(self._task)
-        self._task.add_done_callback(self._running.discard)
+
+    async def _wait_before_run(self, delay: float) -> None:
+        event = self._wake_event
+        if event is None:
+            await asyncio.sleep(delay)
+            return
+        try:
+            await asyncio.wait_for(event.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            return
+        event.clear()
 
     async def _run(self) -> None:
-        await asyncio.sleep(self._delay)
-        # A request after this point needs a new run because this one may already have read state.
-        self._task = None
-        await self._invoke()
+        try:
+            await self._wait_before_run(self._delay)
+            while True:
+                self._pending = False
+                self._in_flight = True
+                loop = asyncio.get_running_loop()
+                started_at = loop.time()
+                try:
+                    await self._invoke()
+                finally:
+                    self._in_flight = False
+                if not self._pending:
+                    break
+                # Preserve the configured rate limit even when a request arrives
+                # during a very quick send.
+                remaining = self._delay - (loop.time() - started_at)
+                if remaining > 0:
+                    await self._wait_before_run(remaining)
+        finally:
+            current = asyncio.current_task()
+            if self._task is current:
+                self._task = None
+                self._wake_event = None
+            self._in_flight = False
+            self._pending = False
 
     async def _invoke(self) -> None:
         try:
@@ -600,14 +670,19 @@ class _Coalescer:
             log.exception("%s failed", self._label)
 
     async def flush(self, *, run: bool) -> None:
-        """Cancel a waiting run; ``run`` performs the pending work now instead."""
-        task, self._task = self._task, None
+        """Cancel and join pending work, or wake and join it when ``run`` is true."""
+        task = self._task
         if task is None or task.done():
             return
+        if run:
+            if not self._in_flight and self._wake_event is not None:
+                self._wake_event.set()
+            await asyncio.shield(task)
+            return
+
+        self._pending = False
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-        if run:
-            await self._invoke()
 
 
 # Telemetry (battery, Wi-Fi and configuration state) changes often across many headsets.
@@ -621,7 +696,12 @@ _device_list_broadcast = _Coalescer(
 
 def _record_telemetry() -> None:
     _telemetry_save.schedule()
-    _device_list_broadcast.schedule()
+    _schedule_device_list_broadcast()
+
+
+def _schedule_device_list_broadcast() -> None:
+    if admin_connections:
+        _device_list_broadcast.schedule()
 
 
 async def _flush_telemetry(app: web.Application) -> None:
@@ -634,12 +714,14 @@ def _commit_configuration(
 ) -> bool:
     """Expose a proposed change only after its registry replacement succeeds."""
     global _configuration
-    if not _write_registry(candidate, device_registry if records is None else records):
+    changed = candidate.groups != _configuration.groups or candidate.packages != _configuration.packages
+    committed = replace(candidate, revision=_configuration.revision + int(changed))
+    if not _write_registry(committed, device_registry if records is None else records):
         return False
     if records is not None:
         device_registry.clear()
         device_registry.update(records)
-    _configuration = candidate
+    _configuration = committed
     return True
 
 
@@ -745,10 +827,14 @@ def build_provisional_connection_list_msg() -> str:
 
 async def broadcast_device_list():
     """Send the current device list to every connected admin."""
+    if not admin_connections:
+        return
     await _broadcast_admin_message(build_device_list_msg())
 
 
 async def broadcast_provisional_connection_list() -> None:
+    if not admin_connections:
+        return
     await _broadcast_admin_message(build_provisional_connection_list_msg())
 
 
@@ -760,16 +846,22 @@ def _public_packages() -> list[dict]:
     ]
 
 
+def _published_group_profile(group: _DeviceGroup) -> dict | None:
+    profile = (_configuration.packages or {}).get(group.package_id)
+    if profile is not None and profile["published_revision"] is not None:
+        return profile
+    return None
+
+
 def build_group_list_msg() -> str:
     """Build group membership, package references and public deployment metadata."""
     group_entries = sorted(_configuration.groups.items())
     groups = {name: list(group.members) for name, group in group_entries}
-    packages = _configuration.packages or {}
     assignments = {name: group.package_id for name, group in group_entries if group.package_id is not None}
     deployments = {}
     for name, group in group_entries:
-        profile = packages.get(group.package_id)
-        if profile is None or profile["published_revision"] is None:
+        profile = _published_group_profile(group)
+        if profile is None:
             continue
         settings = configuration_packages.published_settings(profile)
         deployment = {
@@ -782,7 +874,9 @@ def build_group_list_msg() -> str:
     return json.dumps({"type": "GROUP_LIST", "groups": groups, "assignments": assignments,
                        "packages": _public_packages(), "deployments": deployments,
                        "registry_writable": _registry_readable,
-                       "configuration_available": _configuration.packages is not None})
+                       "configuration_available": _configuration.packages is not None,
+                       "revision": _configuration.revision,
+                       "server_instance_id": SERVER_INSTANCE_ID})
 
 
 async def broadcast_group_list():
@@ -794,40 +888,68 @@ async def _broadcast_admin_message(message: str) -> None:
     await _queue_admin_message(message)
 
 
+async def _send_admin_frames(ws: web.WebSocketResponse, frames: list[str]) -> None:
+    # Check membership before creating a lock. A fan-out already queued when this
+    # console disconnects must not recreate a stale lock after its handler removes it.
+    if ws not in admin_connections:
+        return
+    lock = _admin_send_locks.get(ws)
+    if lock is None:
+        lock = asyncio.Lock()
+        _admin_send_locks[ws] = lock
+
+    try:
+        async def send_locked() -> None:
+            async with lock:
+                if ws not in admin_connections:
+                    return
+                for frame in frames:
+                    await ws.send_str(frame)
+
+        # Bound the whole operation, including time spent queued behind another
+        # send to this console.
+        await asyncio.wait_for(send_locked(), ADMIN_SEND_TIMEOUT)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Several queued sends can hit their deadline at once. Only the first
+        # failure that still owns a connected socket should close it.
+        if ws not in admin_connections:
+            return
+        log.warning("Could not send message to admin WebSocket", exc_info=True)
+        admin_connections.discard(ws)
+        _admin_send_locks.pop(ws, None)
+        try:
+            await asyncio.wait_for(
+                ws.close(
+                    code=WSCloseCode.GOING_AWAY,
+                    message=b"admin send failed",
+                    drain=False,
+                ),
+                ADMIN_SEND_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (Exception, asyncio.TimeoutError):
+            log.warning("Could not close failed admin WebSocket", exc_info=True)
+
+
 def _queue_admin_message(
     message: str,
     *,
     acknowledgement: tuple[web.WebSocketResponse, str] | None = None,
+    acknowledgement_after: bool = False,
 ) -> Awaitable[None]:
-    """Schedule best-effort sends now, with an optional first frame for one console."""
+    """Schedule best-effort sends with an optional frame before or after the message."""
     async def send_one(ws: web.WebSocketResponse) -> None:
-        lock = _admin_send_locks.setdefault(ws, asyncio.Lock())
-        try:
-            async with lock:
-                if ws not in admin_connections:
-                    return
-                if acknowledgement is not None and ws is acknowledgement[0]:
-                    await asyncio.wait_for(ws.send_str(acknowledgement[1]), ADMIN_SEND_TIMEOUT)
-                await asyncio.wait_for(ws.send_str(message), ADMIN_SEND_TIMEOUT)
-        except asyncio.CancelledError:
-            raise
-        except (Exception, asyncio.TimeoutError):
-            log.warning("Could not send message to admin WebSocket", exc_info=True)
-            admin_connections.discard(ws)
-            _admin_send_locks.pop(ws, None)
-            try:
-                await asyncio.wait_for(
-                    ws.close(
-                        code=WSCloseCode.GOING_AWAY,
-                        message=b"admin send failed",
-                        drain=False,
-                    ),
-                    ADMIN_SEND_TIMEOUT,
-                )
-            except asyncio.CancelledError:
-                raise
-            except (Exception, asyncio.TimeoutError):
-                log.warning("Could not close failed admin WebSocket", exc_info=True)
+        frames = []
+        is_requester = acknowledgement is not None and ws is acknowledgement[0]
+        if is_requester and not acknowledgement_after:
+            frames.append(acknowledgement[1])
+        frames.append(message)
+        if is_requester and acknowledgement_after:
+            frames.append(acknowledgement[1])
+        await _send_admin_frames(ws, frames)
 
     fanout = asyncio.gather(*(send_one(ws) for ws in tuple(admin_connections)))
 
@@ -1657,18 +1779,16 @@ async def group_package_deploy_handler(request: web.Request) -> web.Response:
             impact, devices = _package_impact(package_id, profile)
             target = [profile["edit_revision"], impact["token"]]
         # Bind the preview to the current assignment, settings revision, and device set.
-        current_revision = None
-        if group.package_id is not None:
-            current_profile = (_configuration.packages or {}).get(group.package_id)
-            if current_profile is not None and current_profile["published_revision"] is not None:
-                current_revision = group.effective_revision(current_profile)
+        current_profile = _published_group_profile(group)
+        current_revision = group.effective_revision(current_profile) if current_profile is not None else None
         scope = [name, group.package_id, group.deployment_revision, current_revision,
                  package_id, package_name, use_current, target]
         token = hashlib.sha256(json.dumps(scope).encode()).hexdigest()
         if body is None:
             return web.json_response({
                 "name": package_name, "use_current": use_current, "clear": profile is None,
-                "wifi_mode": _group_wifi_mode(group),
+                "wifi_mode": (_wifi_mode(configuration_packages.published_settings(current_profile))
+                              if current_profile is not None else None),
                 "impact": {**impact, "token": token},
             })
         _check_deployment_impact(body, token)
@@ -1682,7 +1802,7 @@ async def group_package_deploy_handler(request: web.Request) -> web.Response:
         if not _commit_configuration(updated):
             raise PackageError("Group deployment could not be saved", 500)
         _schedule_configuration_publication(request.app, devices)
-        return web.json_response({"package_id": package_id})
+        return web.Response(text=build_group_list_msg(), content_type="application/json")
     except PackageError as exc:
         return web.json_response({"error": str(exc)}, status=exc.status)
 
@@ -1718,17 +1838,7 @@ def _wifi_mode(settings: dict) -> str | None:
     return "android_selection" if wifi.get("prioritize_networks") is False else "priority"
 
 
-def _group_wifi_mode(group: _DeviceGroup) -> str | None:
-    if group.package_id is None:
-        return None
-    profile = (_configuration.packages or {}).get(group.package_id)
-    if profile is None or profile["published_revision"] is None:
-        return None
-    return _wifi_mode(configuration_packages.published_settings(profile))
-
-
 def _desired_configuration(device_id: str, *, include_summary: bool = False, include_settings: bool = True) -> dict:
-    packages = _configuration.packages or {}
     group_name = None
     package_id = None
     revision = None
@@ -1736,12 +1846,10 @@ def _desired_configuration(device_id: str, *, include_summary: bool = False, inc
     for name, group in _configuration.groups.items():
         if device_id in group.members:
             group_name = name
-            if group.package_id is not None:
-                profile = packages[group.package_id]
-                if profile["published_revision"] is not None:
-                    package_id = group.package_id
-                    revision = group.effective_revision(profile)
-                    published = profile
+            published = _published_group_profile(group)
+            if published is not None:
+                package_id = group.package_id
+                revision = group.effective_revision(published)
             break
     policy = {
         "package_id": package_id,
@@ -2051,7 +2159,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     prev = device_registry.get(new_device_id, {})
                     # Promotion is one synchronous mutation: no task can observe this
                     # socket in both the provisional and canonical collections.
-                    provisional_connections.pop(ws, None)
+                    promoted_from_provisional = provisional_connections.pop(ws, None) is not None
                     device_id = new_device_id
                     socket_identity_kind = kind
                     push_state_status = parse_push_state_status(data.get("push_state"))
@@ -2117,9 +2225,9 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         log.info("Retired device re-registered, re-adopting: %s", device_id)
                     await _resolve_pending_retire(device_id)
                     await _resolve_pending_self_update(device_id, ws, version_code)
-                    if kind == "canonical":
+                    if promoted_from_provisional:
                         await broadcast_provisional_connection_list()
-                    await broadcast_device_list()
+                    _schedule_device_list_broadcast()
 
                 elif msg_type == "CONFIGURATION_STATE":
                     entry = devices[device_id]
@@ -2435,6 +2543,10 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
             # the row as "updating". A disconnect during the post-update verification
             # phase, however, means the answer will never arrive: close it out.
             pend = pending_self_updates.get(device_id)
+            transition_pending = (
+                (pend is not None and pend.get("phase") == "updating")
+                or device_id in pending_retires
+            )
             if pend is not None and pend.get("phase") == "verifying":
                 verify_timeout = pend.get("timeout_task")
                 if verify_timeout is not None:
@@ -2456,7 +2568,10 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                 rec["last_seen"] = time.time()
                 save_registry()
             log.info("Device disconnected: %s", device_id)
-            await broadcast_device_list()
+            if transition_pending:
+                await broadcast_device_list()
+            else:
+                _schedule_device_list_broadcast()
         if was_provisional:
             await broadcast_provisional_connection_list()
 
@@ -2625,12 +2740,12 @@ async def handle_set_device_label(admin_ws: web.WebSocketResponse, data: dict):
         return
     log.info("Device label set: %s -> %r", serial, label)
 
-    await admin_ws.send_str(json.dumps({
+    acknowledgement = json.dumps({
         "type": "DEVICE_LABEL_SET",
         "device_id": serial,
         "label": label,
-    }))
-    await broadcast_device_list()
+    })
+    await _queue_admin_message(build_device_list_msg(), acknowledgement=(admin_ws, acknowledgement))
 
 
 async def handle_forget_device(admin_ws: web.WebSocketResponse, data: dict):
@@ -2679,13 +2794,15 @@ async def handle_forget_device(admin_ws: web.WebSocketResponse, data: dict):
     if removed:
         log.info("Device forgotten: %s", serial)
 
-    await admin_ws.send_str(json.dumps({
+    acknowledgement = json.dumps({
         "type": "DEVICE_FORGOTTEN",
         "device_id": serial,
-    }))
-    await broadcast_device_list()
-    if changed_groups:
-        await broadcast_group_list()
+    })
+    try:
+        await _queue_admin_message(build_device_list_msg(), acknowledgement=(admin_ws, acknowledgement))
+    finally:
+        if changed_groups:
+            await broadcast_group_list()
 
 
 async def handle_create_group(admin_ws: web.WebSocketResponse, data: dict):
@@ -2714,11 +2831,10 @@ async def handle_create_group(admin_ws: web.WebSocketResponse, data: dict):
         return
     log.info("Group created: %r", name)
 
-    await admin_ws.send_str(json.dumps({
+    await _publish_group_change((), _notify_committed_group_change(admin_ws, {
         "type": "GROUP_CREATED",
         "name": name,
     }))
-    await broadcast_group_list()
 
 
 async def handle_rename_group(
@@ -2897,8 +3013,13 @@ async def handle_update_group_members(admin_ws: web.WebSocketResponse, data: dic
     })
     async def notify_admins() -> None:
         if changed:
-            await broadcast_group_list()
-        await admin_ws.send_str(result)
+            await _queue_admin_message(
+                build_group_list_msg(),
+                acknowledgement=(admin_ws, result),
+                acknowledgement_after=True,
+            )
+        else:
+            await admin_ws.send_str(result)
 
     if changed:
         await _publish_group_change(sorted(changed), notify_admins())

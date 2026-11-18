@@ -36,13 +36,6 @@ def _profile(name):
     }
 
 
-def _legacy_snapshot(settings, *, deployed_at_ms=None):
-    snapshot = {"revision": str(uuid.uuid4()), "settings": settings}
-    if deployed_at_ms is not None:
-        snapshot["deployed_at_ms"] = deployed_at_ms
-    return snapshot
-
-
 def _write_package_registry(tmp_path, groups, *, devices=None):
     """Write the package format; groups map a name to (members, package name or None)."""
     packages = {}
@@ -78,6 +71,7 @@ def test_released_groups_migrate_once_with_backup_and_one_group_per_device(tmp_p
         "Gamma": {"members": [], "package_id": None},
     }
     assert registry["packages"] == {"version": configuration_packages.VERSION, "packages": {}}
+    assert registry["configuration_revision"] == 0
     assert "kept 'Alpha', removed from 'Beta'" in caplog.text
     assert registry["another_section"] == {"preserve": True}
     assert registry["devices"]["device-a"]["other_field"] == {"preserve": True}
@@ -95,76 +89,32 @@ def test_released_groups_migrate_once_with_backup_and_one_group_per_device(tmp_p
     assert _backups(tmp_path) == [backup]
 
 
-def test_v2_catalog_migrates_edit_tokens_once_with_backup(tmp_path):
-    package_id = str(uuid.uuid4())
-    empty_id = str(uuid.uuid4())
-    group_revision = str(uuid.uuid4())
-    profile = _profile("Office")
-    profile["edit_revision"] = str(uuid.uuid4())
-    profile["deployed_at_ms"] = 1_795_000_000_000
-    profile["settings"]["wifi"] = {"managed": True, "value": {"auto_return": False, "networks": [{
-        "ssid": "Office", "security": "WPA2_WPA3", "password": "test-password", "hidden": False,
-    }]}}
-    v2_profile = {**profile, "draft_revision": profile["edit_revision"]}
-    del v2_profile["edit_revision"]
-    empty = {"name": "Empty", "settings": {}, "published_revision": None, "deployed_at_ms": None}
-    groups = {"Studio": {"members": ["device-a"], "package_id": package_id,
-                         "deployment_revision": group_revision}}
-    _write_registry(
-        tmp_path,
-        devices={"device-a": {"label": "Example", "configuration_state": {
-            "package_id": package_id, "revision": group_revision, "status": "already_attempted", "results": {},
-        }}},
-        groups=groups,
-        packages={"version": 2, "packages": {package_id: v2_profile, empty_id: {**empty, "draft_revision": None}}},
-    )
-    original = server.REGISTRY_PATH.read_bytes()
-
+def test_configuration_revision_is_durable_and_only_advances_for_configuration_changes(tmp_path):
+    _write_package_registry(tmp_path, {"Studio": ([], None)})
+    registry = json.loads(server.REGISTRY_PATH.read_text())
+    registry["operator_metadata"] = {"preserve": True}
+    server.REGISTRY_PATH.write_text(json.dumps(registry))
     server.load_registry()
 
-    saved = json.loads(server.REGISTRY_PATH.read_text())
-    assert saved["packages"] == {"version": 3, "packages": {package_id: profile, empty_id: {
-        **empty, "edit_revision": None,
-    }}}
-    assert saved["groups"] == groups
-    assert saved["devices"]["device-a"]["label"] == "Example"
-    assert saved["devices"]["device-a"]["configuration_state"] is None
-    assert server._desired_configuration("device-a")["revision"] == group_revision
-    [backup] = _backups(tmp_path)
-    assert backup.read_bytes() == original
+    before = json.loads(server.build_group_list_msg())
+    assert before["revision"] == 0
+    candidate = server.replace(server._configuration, groups={
+        **server._configuration.groups,
+        "Gallery": server._DeviceGroup(),
+    })
+    assert server._commit_configuration(candidate)
+    committed = json.loads(server.build_group_list_msg())
+    assert committed["revision"] == before["revision"] + 1
+    assert json.loads(server.REGISTRY_PATH.read_text())["configuration_revision"] == committed["revision"]
 
-    saved_bytes = server.REGISTRY_PATH.read_bytes()
-    server.load_registry()
-    assert server.REGISTRY_PATH.read_bytes() == saved_bytes
-    assert _backups(tmp_path) == [backup]
-
-
-def test_v1_package_catalog_is_unavailable_and_preserved(tmp_path):
-    package_id = str(uuid.uuid4())
-    profile = {
-        "name": "Office",
-        "draft": _legacy_snapshot({"brightness": {"managed": True, "value": 70}}),
-        "published": _legacy_snapshot({"brightness": 45}),
-    }
-    _write_registry(
-        tmp_path,
-        groups={"Studio": {"members": ["device-a"], "package_id": package_id}},
-        packages={"version": 1, "packages": {package_id: profile}},
-    )
-    original = server.REGISTRY_PATH.read_bytes()
-
-    server.load_registry()
-
-    assert server._configuration.packages is None
-    assert server.REGISTRY_PATH.read_bytes() == original
-    assert json.loads(server.REGISTRY_PATH.read_text())["packages"]["version"] == 1
-    assert _backups(tmp_path) == []
-    assert json.loads(server.build_group_list_msg())["groups"] == {"Studio": ["device-a"]}
-
-    server.device_registry["device-b"] = {"label": "Preserve old catalog"}
+    # Device telemetry persistence and idempotent config writes do not advance order.
     assert server.save_registry()
-    saved = json.loads(server.REGISTRY_PATH.read_text())
-    assert saved["packages"] == {"version": 1, "packages": {package_id: profile}}
+    assert server._commit_configuration(server._configuration)
+    server.load_registry()
+    reloaded = json.loads(server.build_group_list_msg())
+    assert reloaded["revision"] == committed["revision"]
+    persisted = json.loads(server.REGISTRY_PATH.read_text())
+    assert persisted["operator_metadata"] == {"preserve": True}
 
 
 def test_migration_is_not_written_when_the_backup_fails(tmp_path, monkeypatch):
@@ -262,19 +212,21 @@ def test_failed_writes_keep_committed_device_and_configuration_state(tmp_path, m
     asyncio.run(body())
 
 
-@pytest.mark.parametrize(("field", "opaque", "groups"), [
-    ("packages", {"version": 99, "packages": {}}, {"Alpha": {"members": ["same"], "package_id": None}}),
-    ("packages", {"version": 1, "packages": {}}, {"Alpha": {"members": ["same"], "package_id": "invalid"}}),
-])
-def test_unreadable_configuration_survives_unrelated_write(tmp_path, field, opaque, groups):
-    _write_registry(tmp_path, groups=groups, **{field: opaque})
+@pytest.mark.parametrize(("version", "package_id"), [(2, None), (99, "invalid")])
+def test_unsupported_catalog_survives_load_and_unrelated_write(tmp_path, version, package_id):
+    catalog = {"version": version, "packages": {}}
+    groups = {"Alpha": {"members": ["same"], "package_id": package_id}}
+    _write_registry(tmp_path, groups=groups, packages=catalog)
+    original = server.REGISTRY_PATH.read_bytes()
     server.load_registry()
     assert server._configuration.packages is None
+    assert server.REGISTRY_PATH.read_bytes() == original
+    assert _backups(tmp_path) == []
     assert json.loads(server.build_group_list_msg())["groups"] == {"Alpha": ["same"]}
     server.device_registry["another"] = {"label": "Example"}
     assert server.save_registry()
     saved = json.loads(server.REGISTRY_PATH.read_text())
-    assert saved[field] == opaque
+    assert saved["packages"] == catalog
     assert saved["groups"] == groups
 
 
@@ -315,12 +267,12 @@ def test_group_name_round_trip_and_upgrade_keep_membership_and_assignment(tmp_pa
         group = "a" * 63
         legacy_name = group + " "
         package_id = str(uuid.uuid4())
-        published = _legacy_snapshot({"brightness": 45})
+        revision = str(uuid.uuid4())
         profile = {
             "name": "Office",
             "settings": {"brightness": {"managed": True, "value": 45}},
-            "edit_revision": published["revision"],
-            "published_revision": published["revision"],
+            "edit_revision": revision,
+            "published_revision": revision,
             "deployed_at_ms": None,
         }
         _write_registry(
@@ -332,22 +284,96 @@ def test_group_name_round_trip_and_upgrade_keep_membership_and_assignment(tmp_pa
         saved = json.loads(server.REGISTRY_PATH.read_text())
         assert saved["groups"] == {group: {"members": ["device-a"], "package_id": package_id}}
         assert server._desired_configuration("device-a") == {
-            "package_id": package_id, "revision": published["revision"], "settings": {"brightness": 45},
+            "package_id": package_id, "revision": revision, "settings": {"brightness": 45},
         }
 
         admin = _AdminSocket()
+        server.admin_connections.add(admin)
         other = "b" * 63
         await server.handle_create_group(admin, {"name": other + " z"})
-        assert admin.messages[-1] == {"type": "GROUP_CREATED", "name": other}
+        assert admin.messages[0] == {"type": "GROUP_CREATED", "name": other}
+        assert admin.messages[1]["type"] == "GROUP_LIST"
         server.load_registry()
-        assert server._configuration.packages == {package_id: {
-            "name": "Office",
-            "settings": {"brightness": {"managed": True, "value": 45}},
-            "edit_revision": published["revision"],
-            "published_revision": published["revision"],
-            "deployed_at_ms": None,
-        }}
+        assert server._configuration.packages == {package_id: profile}
         assert json.loads(server.build_group_list_msg())["groups"] == {group: ["device-a"], other: []}
+
+    asyncio.run(body())
+
+
+def test_partial_configuration_registry_without_device_map_is_preserved(tmp_path):
+    server._apply_data_dir(str(tmp_path))
+    raw = {"groups": {"Studio": ["device-a"]}, "operator_metadata": {"keep": True}}
+    server.REGISTRY_PATH.write_text(json.dumps(raw))
+    before = server.REGISTRY_PATH.read_bytes()
+
+    server.load_registry()
+
+    assert server._registry_readable is False
+    assert server._configuration.packages is None
+    assert server._configuration.groups["Studio"].members == ("device-a",)
+    assert server.device_registry == {}
+    assert not server.save_registry()
+    assert server.REGISTRY_PATH.read_bytes() == before
+
+
+def test_reserved_legacy_device_id_with_string_label_is_not_a_registry_wrapper(tmp_path):
+    server._apply_data_dir(str(tmp_path))
+    server.REGISTRY_PATH.write_text(json.dumps({"groups": "lab"}))
+
+    server.load_registry()
+
+    assert server._registry_readable is True
+    assert server.device_registry["groups"]["label"] == "lab"
+
+
+def test_legacy_wrapped_device_map_without_configuration_metadata_is_migrated(tmp_path):
+    server._apply_data_dir(str(tmp_path))
+    server.REGISTRY_PATH.write_text(json.dumps({"devices": {"device-a": {"label": "Lab"}}}))
+
+    server.load_registry()
+
+    assert server._registry_readable is True
+    assert server.device_registry["device-a"]["label"] == "Lab"
+    assert "devices" not in server.device_registry
+
+
+@pytest.mark.parametrize("ack_type", ["GROUP_CREATED", "DEVICE_LABEL_SET", "DEVICE_FORGOTTEN"])
+def test_committed_change_broadcast_survives_requester_disconnect(tmp_path, monkeypatch, ack_type):
+    class RecordingAdmin(_AdminSocket):
+        async def close(self, **_kwargs):
+            self.closed = True
+
+    class DisconnectingAdmin(RecordingAdmin):
+        def __init__(self):
+            super().__init__()
+            self.closed = False
+
+        async def send_str(self, message):
+            parsed = json.loads(message)
+            if parsed["type"] == ack_type:
+                raise ConnectionResetError("requesting console disconnected")
+            await super().send_str(message)
+
+    async def body():
+        _write_registry(tmp_path, devices={"device-a": {"label": "Old"}}, groups={"Studio": ["device-a"]})
+        server.load_registry()
+        monkeypatch.setattr(server, "_admin_send_locks", {})
+        requester = DisconnectingAdmin()
+        peer = RecordingAdmin()
+        server.admin_connections.update((requester, peer))
+
+        if ack_type == "GROUP_CREATED":
+            await server.handle_create_group(requester, {"name": "Gallery"})
+            assert peer.messages[0]["groups"]["Gallery"] == []
+        elif ack_type == "DEVICE_LABEL_SET":
+            await server.handle_set_device_label(requester, {"device_id": "device-a", "label": "Lab"})
+            assert peer.messages[0]["devices"][0]["label"] == "Lab"
+        else:
+            await server.handle_forget_device(requester, {"device_id": "device-a"})
+            assert [message["type"] for message in peer.messages] == ["DEVICE_LIST", "GROUP_LIST"]
+            assert peer.messages[0]["devices"] == []
+            assert peer.messages[1]["groups"]["Studio"] == []
+        assert requester.closed
 
     asyncio.run(body())
 

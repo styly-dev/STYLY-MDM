@@ -307,6 +307,12 @@ test('a new package gets its first Wi-Fi network after Manage and reopens with d
 const pkg = { package_id: 'pkg', name: 'Studio', published_revision: 'r0' };
 const pkg2 = { package_id: 'pkg2', name: 'Night studio', published_revision: null };
 const d1 = { package_id: 'pkg', revision: 'r1', keys: ['brightness'] };
+
+function groupSnapshot(revision, { packages = [pkg, pkg2], assignments = {}, deployments = {}, groups = { 'The Lab': ['headset'] },
+  server_instance_id = 'server-a' } = {}) {
+  return { type: 'GROUP_LIST', revision, packages, assignments, deployments, groups,
+    registry_writable: true, configuration_available: true, server_instance_id };
+}
 const online = { device_id: 'headset', label: 'DEV-003', status: 'online', configuration_supported: true };
 const applied = { ...d1, status: 'complete', results: { brightness: { status: 'applied', value: 60 } } };
 const failed = { ...applied, results: { brightness: { status: 'failed', reason: 'WRITE_FAILED' } } };
@@ -356,6 +362,34 @@ test('priority and Android selection deployments use package support without a s
   }
 });
 
+test('failed package result definitions retry only when the group is reopened', async () => {
+  let attempts = 0;
+  const fixture = createHarness(request => {
+    if (request.url === '/api/packages/pkg') {
+      attempts++;
+      return response({}, 503);
+    }
+    assert.fail('unexpected request: ' + request.url);
+  });
+  fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
+
+  fixture.controller.renderGroup('The Lab');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(attempts, 1);
+
+  for (let index = 0; index < 4; index++) fixture.controller.renderGroup('The Lab');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(attempts, 1, 'repeated renders must not retry a failed request');
+
+  fixture.controller.renderGroup(null);
+  fixture.controller.renderGroup('The Lab');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(attempts, 2, 'reopening the group permits one retry');
+  for (let index = 0; index < 4; index++) fixture.controller.renderGroup('The Lab');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(attempts, 2);
+});
+
 test('Wi-Fi SAVED reports verified profiles and leaves connection selection to Android', () => {
   const deployment = { ...d1, keys: ['brightness', 'wifi'], wifi_mode: 'android_selection' };
   const report = { ...deployment, status: 'complete', results: {
@@ -403,16 +437,13 @@ test('Wi-Fi fallback is reported as applied with its reason', () => {
   assert.equal(deviceOutcome(devices[0], 'pkg', deployment)[1], 'Applied');
 });
 
-test('Wi-Fi failure keeps its result and exposes no rollback state', () => {
+test('Wi-Fi failure is rendered from the package application result', () => {
   const deployment = { ...d1, keys: ['brightness', 'wifi'] };
   const report = { ...deployment, status: 'complete', results: {
     brightness: { status: 'applied', value: 60 },
-    wifi: { status: 'failed', reason: 'UNREACHABLE', rolled_back: true },
+    wifi: { status: 'failed', reason: 'UNREACHABLE' },
   } };
-  const devices = [{ ...online, configuration_state: report, wifi_state: { last_result: {
-    operation_id: '22222222-2222-4222-8222-222222222222', revision: deployment.revision,
-    status: 'failed', reason: 'UNREACHABLE', rolled_back: true,
-  } } }];
+  const devices = [{ ...online, configuration_state: report }];
   const fixture = createHarness(() => assert.fail('rendering results should not call the API'), { devices });
   fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
   fixture.controller.renderGroup('The Lab');
@@ -421,7 +452,6 @@ test('Wi-Fi failure keeps its result and exposes no rollback state', () => {
   assert.match(results, /Partially applied/);
   assert.match(results, /Results at apply time/);
   assert.match(results, /wifi · Failed · unreachable/);
-  assert.doesNotMatch(results, /rolled back|restored|Latest Wi-Fi operation/i);
   assert.equal(deviceOutcome(devices[0], 'pkg', deployment)[1], 'Partially applied');
   assert.equal(retryEligible(devices[0], deployment), true);
 });
@@ -548,7 +578,7 @@ function profile({
     settings, sections: itemSections, impact };
 }
 
-function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'] }, confirm = () => true } = {}) {
+function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'] }, confirm = () => true, onSnapshot } = {}) {
   const createElement = overrides => ({
     innerHTML: '', textContent: '', value: '', hidden: false, disabled: false,
     classList: { toggle() {} },
@@ -611,6 +641,7 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
   const createForm = createElement({ querySelector: selector => createControls[selector] });
   const requests = [];
   const confirmations = [];
+  let lastSnapshotRevision = 0;
   let opened = 0;
   const controller = createController({
     groupPanel, packagePanel, packageList, createForm,
@@ -618,6 +649,7 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     getDevice: id => devices.find(device => device.device_id === id),
     openPackages: () => { opened++; },
     confirmAction: message => { confirmations.push(message); return confirm(message); },
+    onSnapshot,
     fetch: async (url, init) => {
       const request = { url, method: init.method, body: init.body && JSON.parse(init.body) };
       requests.push(request);
@@ -656,8 +688,12 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     control.value = id;
     groupPanel.handlers.get('change')({ target: control });
   };
-  const broadcast = ({ packages = [pkg, pkg2], assignments = {}, deployments = {} } = {}) => {
-    controller.updateSnapshot({ packages, assignments, deployments });
+  const broadcast = ({ revision, packages = [pkg, pkg2], assignments = {}, deployments = {}, groups: snapshotGroups,
+    server_instance_id } = {}) => {
+    const currentRevision = revision ?? lastSnapshotRevision + 1;
+    lastSnapshotRevision = Math.max(lastSnapshotRevision, currentRevision);
+    controller.updateSnapshot(groupSnapshot(currentRevision, { packages, assignments, deployments,
+      groups: snapshotGroups || groups, server_instance_id }), 'ws');
   };
   const create = async name => {
     createControls.input.value = name;
@@ -700,6 +736,31 @@ test('group cards use the committed assignment and count only reports for its de
   assert.deepEqual(summary('The Lab'), { name: 'Renamed', count: { text: 'Applied 0/4', state: 'pending' } });
   fixture.broadcast();
   assert.equal(summary('The Lab'), null);
+});
+
+test('an authoritative WS catalog clears a previous package-list failure', async () => {
+  const fixture = createHarness(() => response({ error: 'Unavailable' }, 503));
+  fixture.controller.showPackages();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(fixture.packageList.innerHTML, /data-refresh-packages/);
+
+  fixture.broadcast({ packages: [] });
+  assert.match(fixture.packageList.innerHTML, /No packages yet/);
+  assert.doesNotMatch(fixture.packageList.innerHTML, /data-refresh-packages|Reload packages/);
+});
+
+test('a late package-list failure cannot override a newer WS catalog', async () => {
+  let rejectCatalog;
+  const fixture = createHarness(() => new Promise((_, reject) => { rejectCatalog = reject; }));
+  fixture.controller.showPackages();
+  assert.equal(fixture.requests.length, 1);
+
+  fixture.broadcast({ packages: [] });
+  rejectCatalog(new Error('network unavailable'));
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.match(fixture.packageList.innerHTML, /No packages yet/);
+  assert.doesNotMatch(fixture.packageList.innerHTML, /data-refresh-packages|Reload packages/);
 });
 
 test('save and deploy sends the edited name and settings in one confirmed request', async () => {
@@ -906,7 +967,7 @@ test('package creation shows the HTTP status of a non-JSON failure', async () =>
   assert.equal(fixture.createControls.input.value, 'Studio');
 });
 
-test('group deployment uses the assigned package for status and preserves a staged selection across broadcasts', async () => {
+test('group deployment preserves a staged selection and ignores a delayed older group snapshot', async () => {
   let finishAssignment;
   const name = 'lab/+ Wi-Fi?&';
   const fixture = createHarness(({ method }) => method === 'GET' ? response(profile()) :
@@ -938,7 +999,10 @@ test('group deployment uses the assigned package for status and preserves a stag
   assert.match(results.innerHTML, /Waiting for deployment/);
   groupBroadcast('pkg', d1);
   fixture.controller.renderGroup(name);
-  finishAssignment(response({ package_id: 'pkg2' }));
+  finishAssignment(response(groupSnapshot(3, {
+    packages: [pkg, { ...pkg2, published_revision: 'r2' }],
+    assignments: { [name]: 'pkg2' }, deployments: { [name]: { package_id: 'pkg2', revision: 'r2', keys: ['brightness'] } },
+  })));
   await saving;
   assert.equal(selection.value, 'pkg');
   assert.match(results.innerHTML, /All managed settings were verified/);
@@ -946,13 +1010,16 @@ test('group deployment uses the assigned package for status and preserves a stag
   assert.equal(fixture.opened(), 1);
 });
 
-test('an assignment acknowledgment waits for the matching group snapshot before showing deployment status', async () => {
+test('group deploy applies its committed HTTP snapshot before a delayed older GROUP_LIST', async () => {
   const nextPackage = { ...pkg2, published_revision: 'r2' };
   const nextDeployment = { package_id: 'pkg2', revision: 'r2', keys: ['brightness'] };
+  const acceptedRevisions = [];
   const fixture = createHarness(({ method }) => method === 'POST'
-    ? response({ package_id: 'pkg2' })
+    ? response(groupSnapshot(3, { packages: [pkg, nextPackage], assignments: { [name]: 'pkg2' },
+      deployments: { [name]: nextDeployment } }))
     : response({ ...profile(), use_current: true, impact: { groups: 1, devices: 1, token: 'impact1' } }), {
     devices: [{ ...online, configuration_state: applied }],
+    onSnapshot: data => acceptedRevisions.push(data.revision),
   });
   const name = 'The Lab';
   const publication = fixture.groupControls['[data-group-publication]'];
@@ -964,22 +1031,76 @@ test('an assignment acknowledgment waits for the matching group snapshot before 
   assert.match(fixture.confirmations[0], /Deploy the current version.* to "The Lab" \(1 device\)/);
 
   assert.equal(fixture.groupControls['[data-group-package]'].value, 'pkg2');
-  assert.match(publication.textContent, /Waiting for the group update/);
-  assert.equal(fixture.groupButtons.deploy.disabled, true);
-  assert.match(fixture.groupControls['[data-deploy-hint]'].textContent, /Waiting for the group/);
-  assert.match(results.innerHTML, /Waiting for the group update/);
-  assert.doesNotMatch(results.innerHTML, /Waiting for deployment|All managed settings were verified/);
-
-  fixture.broadcast({ packages: [pkg, nextPackage], assignments: { [name]: 'pkg2' }, deployments: { [name]: nextDeployment } });
-  fixture.controller.renderGroup(name);
   assert.equal(publication.textContent, 'Deployed version r2');
   assert.match(results.innerHTML, /Waiting for the device to report this deployment/);
+
+  fixture.broadcast({ revision: 2, packages: [pkg, nextPackage], assignments: { [name]: 'pkg' }, deployments: { [name]: d1 } });
+  fixture.controller.renderGroup(name);
+  assert.deepEqual(acceptedRevisions, [1, 3]);
+  assert.equal(publication.textContent, 'Deployed version r2');
+  assert.match(results.innerHTML, /Waiting for the device to report this deployment/);
+});
+
+test('a newer GROUP_LIST received before the deploy response remains authoritative', async () => {
+  const name = 'The Lab';
+  const nextPackage = { ...pkg2, published_revision: 'r2' };
+  const latestDeployment = { package_id: 'pkg', revision: 'r3', keys: ['brightness'] };
+  let finishDeploy;
+  const fixture = createHarness(({ method }) => method === 'POST'
+    ? new Promise(resolve => { finishDeploy = resolve; })
+    : response({ ...profile(), use_current: true, impact: { groups: 1, devices: 1, token: 'impact1' } }));
+  fixture.broadcast({ revision: 10, packages: [pkg, nextPackage], assignments: { [name]: 'pkg' }, deployments: { [name]: d1 } });
+  fixture.controller.renderGroup(name);
+  fixture.select('pkg2');
+  const deploying = fixture.groupClick('deploy');
+  await new Promise(resolve => setImmediate(resolve));
+
+  fixture.broadcast({ revision: 12, packages: [pkg, nextPackage], assignments: { [name]: 'pkg' },
+    deployments: { [name]: latestDeployment } });
+  finishDeploy(response(groupSnapshot(11, { packages: [pkg, nextPackage], assignments: { [name]: 'pkg2' },
+    deployments: { [name]: { package_id: 'pkg2', revision: 'r2', keys: ['brightness'] } } })));
+  await deploying;
+
+  assert.equal(fixture.groupControls['[data-group-package]'].value, 'pkg');
+  assert.equal(fixture.groupControls['[data-group-publication]'].textContent, 'Deployed version r3');
+  assert.match(fixture.groupControls['[data-assignment-feedback]'].textContent, /newer group state/);
+});
+
+test('a new active server instance resets revision ordering and rejects an old in-flight HTTP response', async () => {
+  let finishDeploy;
+  const name = 'The Lab';
+  const nextPackage = { ...pkg2, published_revision: 'r2' };
+  const latestDeployment = { package_id: 'pkg', revision: 'r3', keys: ['brightness'] };
+  const accepted = [];
+  const fixture = createHarness(({ method }) => method === 'POST'
+    ? new Promise(resolve => { finishDeploy = resolve; })
+    : response({ ...profile(), use_current: true, impact: { groups: 1, devices: 1, token: 'impact1' } }), {
+    onSnapshot: data => accepted.push([data.server_instance_id, data.revision]),
+  });
+  fixture.broadcast({ revision: 50, server_instance_id: 'server-old', packages: [pkg, nextPackage],
+    assignments: { [name]: 'pkg' }, deployments: { [name]: d1 } });
+  fixture.controller.renderGroup(name);
+  fixture.select('pkg2');
+  const deploying = fixture.groupClick('deploy');
+  await new Promise(resolve => setImmediate(resolve));
+
+  fixture.broadcast({ revision: 0, server_instance_id: 'server-new', assignments: { [name]: 'pkg' },
+    deployments: { [name]: latestDeployment } });
+  finishDeploy(response(groupSnapshot(51, { packages: [pkg, nextPackage], assignments: { [name]: 'pkg2' },
+    deployments: { [name]: { package_id: 'pkg2', revision: 'r2', keys: ['brightness'] } },
+    server_instance_id: 'server-old' })));
+  await deploying;
+
+  assert.deepEqual(accepted, [['server-old', 50], ['server-new', 0]]);
+  assert.equal(fixture.groupControls['[data-group-package]'].value, 'pkg');
+  assert.equal(fixture.groupControls['[data-group-publication]'].textContent, 'Deployed version r3');
 });
 
 test('Group Settings redeploys the assigned package only after confirming the shared targets', async () => {
   let allowDeploy = false;
   const fixture = createHarness(({ method }) => method === 'POST'
-    ? response({ package_id: 'pkg' }) : response(profile()), { confirm: () => allowDeploy });
+    ? response(groupSnapshot(2, { assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': { ...d1, revision: 'r2' } } }))
+    : response(profile()), { confirm: () => allowDeploy });
   const name = 'The Lab';
   const hint = fixture.groupControls['[data-deploy-hint]'];
   const deployRequests = () => fixture.requests.filter(request => request.url.startsWith('/api/group-package/'));
@@ -1019,7 +1140,7 @@ test('Group Settings deploys No package through the same confirmation flow', asy
   const url = '/api/group-package/deploy?name=The+Lab&package_id=';
   const fixture = createHarness(request => {
     if (request.url === '/api/packages/pkg') return response(profile());
-    if (request.method === 'POST') return response({ package_id: null });
+    if (request.method === 'POST') return response(groupSnapshot(2));
     return response({ name: 'No package', clear: true, wifi_mode: 'priority',
       impact: { groups: 1, devices: 1, token: 'clear1' } });
   });
@@ -1036,8 +1157,7 @@ test('Group Settings deploys No package through the same confirmation flow', asy
     { url, method: 'GET', body: undefined },
     { url, method: 'POST', body: { expected_impact: 'clear1' } },
   ]);
-  assert.equal(fixture.groupButtons.deploy.disabled, true);
-  fixture.broadcast();
+  assert.equal(fixture.groupButtons.deploy.disabled, false);
   fixture.controller.renderGroup(name);
   assert.equal(fixture.groupControls['[data-group-package]'].value, '');
   assert.equal(fixture.groupControls['[data-deployment-count]'].hidden, true);
@@ -1049,7 +1169,7 @@ test('No package for Android selection explains retained Wi-Fi auto-connect sett
   const url = '/api/group-package/deploy?name=The+Lab&package_id=';
   const fixture = createHarness(request => {
     if (request.url === '/api/packages/pkg') return response(profile());
-    if (request.method === 'POST') return response({ package_id: null });
+    if (request.method === 'POST') return response(groupSnapshot(2));
     return response({ name: 'No package', clear: true, wifi_mode: 'android_selection',
       impact: { groups: 1, devices: 1, token: 'clear1' } });
   });
@@ -1065,7 +1185,7 @@ test('No package for Android selection explains retained Wi-Fi auto-connect sett
 
 test('No package for a scalar-only deployment has no Wi-Fi confirmation text', async () => {
   const fixture = createHarness(request => {
-    if (request.method === 'POST') return response({ package_id: null });
+    if (request.method === 'POST') return response(groupSnapshot(2));
     return response({ name: 'No package', clear: true, wifi_mode: null,
       impact: { groups: 1, devices: 1, token: 'clear1' } });
   });

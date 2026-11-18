@@ -57,6 +57,23 @@ internal fun settingOutcome(
     if (reason != null) put("reason", reason)
 }
 
+internal fun pollBluetoothState(
+    target: Boolean?,
+    nowElapsed: () -> Long = SystemClock::elapsedRealtime,
+    sleep: (Long) -> Unit = Thread::sleep,
+    readState: () -> Boolean?,
+): Boolean? {
+    val deadline = nowElapsed() + 2_000L
+    var actual: Boolean? = null
+    while (nowElapsed() < deadline) {
+        actual = readState()
+        if (actual != null && (target == null || actual == target)) return actual
+        val remaining = deadline - nowElapsed()
+        if (remaining > 0) sleep(minOf(remaining, 100L))
+    }
+    return actual
+}
+
 /** Applies persistent PUI settings off the main thread and reads them back after all writes. */
 internal class PicoDeviceSettings(private val context: Context, private val service: IToBServiceProxy) {
     companion object {
@@ -135,7 +152,7 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
     }
 
     private fun requested(key: String, values: JSONObject): Any = when (key) {
-        "brightness" -> values.getInt(key).also { require(it in 0..100) }
+        "brightness" -> values.getInt(key).also { require(it in 1..100) }
         "sleepDelay" -> values.getInt(key).also { require(it in sleepDelays) }
         "screenOff" -> values.getInt(key).also { require(it in screenOffDelays) }
         "shutdown" -> PicoShutdownSchedule.requested(values.getJSONObject(key))
@@ -150,7 +167,7 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
         "sleepDelay" -> readSleepDelay()
         "screenOff" -> readScreenOffDelay()
         "shutdown" -> synchronized(PowerCycleTimers) { PicoShutdownSchedule.read(service) }
-        "bluetooth" -> readBluetooth()
+        "bluetooth" -> awaitBluetooth()
         "developerMenu" -> {
             if (context.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) != PackageManager.PERMISSION_GRANTED) {
                 throw SettingFailure("PERMISSION_DENIED")
@@ -207,21 +224,23 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
     private fun readSleepDelay(): Int = service.pbsPropertyGetSleepDelay(0).index
     private fun readScreenOffDelay(): Int = service.pbsPropertyGetScreenOffDelay(0).index
 
-    private fun readBluetooth(): Boolean {
+    private fun awaitBluetooth(target: Boolean? = null): Boolean {
         val adapter = context.getSystemService(BluetoothManager::class.java)?.adapter
             ?: throw SettingFailure("UNSUPPORTED")
-        val deadline = SystemClock.elapsedRealtime() + 2_000L
-        do {
+        return pollBluetoothState(target) {
             when (adapter.state) {
-                BluetoothAdapter.STATE_OFF -> return false
-                BluetoothAdapter.STATE_ON -> return true
+                BluetoothAdapter.STATE_OFF -> false
+                BluetoothAdapter.STATE_ON -> true
+                else -> null
             }
-            Thread.sleep(100)
-        } while (SystemClock.elapsedRealtime() < deadline)
-        throw SettingFailure("READ_FAILED")
+        } ?: throw SettingFailure("READ_FAILED")
     }
 
     private fun awaitValue(key: String, target: Any) {
+        if (key == "bluetooth") {
+            awaitBluetooth(target as Boolean)
+            return
+        }
         val deadline = SystemClock.elapsedRealtime() + 2_000L
         while (!matches(key, read(key), target) && SystemClock.elapsedRealtime() < deadline) {
             Thread.sleep(100)

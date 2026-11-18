@@ -1,7 +1,6 @@
 package com.styly.mdmclient
 
 import android.content.Context
-import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.LinkProperties
@@ -10,6 +9,7 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiInfo
 import android.os.Build
+import android.os.SystemClock
 import androidx.annotation.RequiresApi
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -18,6 +18,7 @@ internal data class WifiLocalNetworkObservation(
     val ssid: String?,
     val hasUsableIp: Boolean,
     val sequence: Long,
+    val receivedElapsedMillis: Long,
     val security: String? = null,
 )
 
@@ -39,7 +40,7 @@ internal interface WifiLocalConnectivitySession : AutoCloseable {
 internal interface WifiLocalConnectivitySource {
     /** Fail before touching configured networks when SSID observation cannot be trusted. */
     fun preflight(): WifiReason?
-    fun observe(listener: (WifiLocalConnectivityEvent) -> Unit): WifiLocalConnectivitySession
+    fun observe(listener: (WifiLocalConnectivitySession, WifiLocalConnectivityEvent) -> Unit): WifiLocalConnectivitySession
 }
 
 /** Accessed only while the owning session lock is held. */
@@ -57,6 +58,39 @@ internal class WifiNetworkHandleTombstones {
     fun isLost(networkHandle: Long): Boolean = networkHandle in handles
 }
 
+/** A synchronous seed can fill fields whose callbacks have not arrived yet. */
+internal class WifiLocalObservationState {
+    var sequence: Long = 0
+    var receivedElapsedMillis: Long = 0
+    var ssid: String? = null
+        private set
+    var security: String? = null
+        private set
+    var hasUsableIp: Boolean = false
+        private set
+    private var hasCapabilitiesCallback = false
+    private var hasLinksCallback = false
+
+    fun updateCapabilities(ssid: String?, security: String?) {
+        this.ssid = ssid
+        this.security = security
+        hasCapabilitiesCallback = true
+    }
+
+    fun updateLinks(hasUsableIp: Boolean) {
+        this.hasUsableIp = hasUsableIp
+        hasLinksCallback = true
+    }
+
+    fun seed(ssid: String?, security: String?, hasUsableIp: Boolean) {
+        if (!hasCapabilitiesCallback) {
+            this.ssid = ssid
+            this.security = security
+        }
+        if (!hasLinksCallback) this.hasUsableIp = hasUsableIp
+    }
+}
+
 /** Tracks only Wi-Fi networks and derives SSID and addresses from each callback's arguments. */
 internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalConnectivitySource {
     private val appContext = context.applicationContext
@@ -64,17 +98,15 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
     private val locationManager = appContext.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
 
     override fun preflight(): WifiReason? {
-        if (appContext.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) !=
-            PackageManager.PERMISSION_GRANTED ||
-            appContext.checkSelfPermission(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION) !=
-            PackageManager.PERMISSION_GRANTED
-        ) return WifiReason.PERMISSION_DENIED
+        if (!hasManagedWifiLocationPermissions(appContext)) return WifiReason.PERMISSION_DENIED
         if (locationManager?.isLocationEnabled != true) return WifiReason.PERMISSION_DENIED
         if (connectivityManager == null) return WifiReason.UNSUPPORTED
         return null
     }
 
-    override fun observe(listener: (WifiLocalConnectivityEvent) -> Unit): WifiLocalConnectivitySession {
+    override fun observe(
+        listener: (WifiLocalConnectivitySession, WifiLocalConnectivityEvent) -> Unit,
+    ): WifiLocalConnectivitySession {
         if (!supportsManagedWifi()) throw IllegalStateException("Managed Wi-Fi is unsupported")
         val manager = connectivityManager ?: throw IllegalStateException("Connectivity service unavailable")
         val session = AndroidSession(manager, listener)
@@ -90,59 +122,56 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
     @RequiresApi(Build.VERSION_CODES.S)
     private class AndroidSession(
         private val manager: ConnectivityManager,
-        private val listener: (WifiLocalConnectivityEvent) -> Unit,
+        private val listener: (WifiLocalConnectivitySession, WifiLocalConnectivityEvent) -> Unit,
     ) : WifiLocalConnectivitySession {
-        private data class MutableObservation(
-            var ssid: String? = null,
-            var security: String? = null,
-            var hasUsableIp: Boolean = false,
-            var sequence: Long = 0,
-        )
-
         private val lock = Any()
         private val closed = AtomicBoolean(false)
-        private val observations = LinkedHashMap<Long, MutableObservation>()
-        // A seed read can race a callback delivered after registration. Retain lost handles
-        // so a stale allNetworks snapshot cannot recreate an observation after onLost.
-        private val lostNetworkHandles = WifiNetworkHandleTombstones()
+        private val observations = LinkedHashMap<Long, WifiLocalObservationState>()
+        // Seed reads race callbacks only during registration. Later callbacks update
+        // existing handles, so lost handles need no bookkeeping after the seed.
+        private var lostDuringSeed: WifiNetworkHandleTombstones? = WifiNetworkHandleTombstones()
         private var sequence = 0L
 
         private val callback = LocationAwareWifiCallback(this)
 
-        private fun onAvailable(network: Network) = emitUpdated(network)
+        private fun onAvailable(network: Network) = updateObservation(network, available = true)
 
-        private fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+        private fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) = updateObservation(network) {
             val info = networkCapabilities.transportInfo as? WifiInfo
-            val event = synchronized(lock) {
-                if (lostNetworkHandles.isLost(network.networkHandle)) return
-                val current = observations.getOrPut(network.networkHandle) { MutableObservation() }
-                current.ssid = info?.ssid?.normalizeSsid()
-                current.security = info?.currentNetworkSecurity()
-                current.sequence = ++sequence
-                WifiLocalConnectivityEvent.Updated(current.toObservation(network.networkHandle))
-            }
-            if (!closed.get()) listener(event)
+            updateCapabilities(info?.ssid?.normalizeSsid(), info?.currentNetworkSecurity())
         }
 
-        private fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-            val addresses = linkProperties.linkAddresses.map { it.address }.toSet()
+        private fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) = updateObservation(network) {
+            updateLinks(linkProperties.linkAddresses.any { it.address.isUsableLocalAddress() })
+        }
+
+        private fun updateObservation(
+            network: Network,
+            available: Boolean = false,
+            update: WifiLocalObservationState.() -> Unit = {},
+        ) {
+            val received = SystemClock.elapsedRealtime()
+            val handle = network.networkHandle
             val event = synchronized(lock) {
-                if (lostNetworkHandles.isLost(network.networkHandle)) return
-                val current = observations.getOrPut(network.networkHandle) { MutableObservation() }
-                current.hasUsableIp = addresses.any { it.isUsableLocalAddress() }
+                val current = if (available) {
+                    lostDuringSeed?.markAvailable(handle)
+                    observations.getOrPut(handle, ::WifiLocalObservationState)
+                } else observations[handle] ?: return
+                current.update()
                 current.sequence = ++sequence
-                WifiLocalConnectivityEvent.Updated(current.toObservation(network.networkHandle))
+                current.receivedElapsedMillis = received
+                WifiLocalConnectivityEvent.Updated(current.toObservation(handle))
             }
-            if (!closed.get()) listener(event)
+            if (!closed.get()) listener(this, event)
         }
 
         private fun onLost(network: Network) {
             val event = synchronized(lock) {
-                lostNetworkHandles.markLost(network.networkHandle)
+                lostDuringSeed?.markLost(network.networkHandle)
                 observations.remove(network.networkHandle)
                 WifiLocalConnectivityEvent.Lost(network.networkHandle, ++sequence)
             }
-            if (!closed.get()) listener(event)
+            if (!closed.get()) listener(this, event)
         }
 
         fun register() {
@@ -151,6 +180,7 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
                 .build()
             manager.registerNetworkCallback(request, callback)
             seedExistingWifiNetworks()
+            synchronized(lock) { lostDuringSeed = null }
         }
 
         private fun seedExistingWifiNetworks() {
@@ -158,6 +188,7 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
             // Seed every existing physical Wi-Fi handle so delayed callback delivery cannot
             // make a pre-change association look fresh after the reconnect call.
             for (network in manager.allNetworks) {
+                val received = SystemClock.elapsedRealtime()
                 val beforeRead = synchronized(lock) { observations[network.networkHandle]?.sequence }
                 val capabilities = manager.getNetworkCapabilities(network) ?: continue
                 if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
@@ -167,29 +198,22 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
                 val links = manager.getLinkProperties(network)
                 synchronized(lock) {
                     // Never overwrite newer callback data with a synchronous seed read.
-                    if (!lostNetworkHandles.isLost(network.networkHandle) &&
+                    if (lostDuringSeed?.isLost(network.networkHandle) != true &&
                         observations[network.networkHandle]?.sequence == beforeRead
                     ) {
-                        observations[network.networkHandle] = MutableObservation(
-                            ssid = info?.ssid?.normalizeSsid(),
-                            security = info?.currentNetworkSecurity(),
-                            hasUsableIp = links?.linkAddresses?.any { it.address.isUsableLocalAddress() } == true,
-                            sequence = ++sequence,
+                        val observation = observations.getOrPut(network.networkHandle, ::WifiLocalObservationState)
+                        observation.seed(
+                            info?.ssid?.normalizeSsid(),
+                            info?.currentNetworkSecurity(),
+                            links?.linkAddresses?.any { it.address.isUsableLocalAddress() } == true,
                         )
+                        if (beforeRead == null) {
+                            observation.sequence = ++sequence
+                            observation.receivedElapsedMillis = received
+                        }
                     }
                 }
             }
-        }
-
-        private fun emitUpdated(network: Network) {
-            val event = synchronized(lock) {
-                // A fresh availability notification permits a new observation for this handle.
-                lostNetworkHandles.markAvailable(network.networkHandle)
-                val current = observations.getOrPut(network.networkHandle) { MutableObservation() }
-                current.sequence = ++sequence
-                WifiLocalConnectivityEvent.Updated(current.toObservation(network.networkHandle))
-            }
-            if (!closed.get()) listener(event)
         }
 
         override fun snapshot(): List<WifiLocalNetworkObservation> = synchronized(lock) {
@@ -207,11 +231,12 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
             }
         }
 
-        private fun MutableObservation.toObservation(handle: Long) = WifiLocalNetworkObservation(
+        private fun WifiLocalObservationState.toObservation(handle: Long) = WifiLocalNetworkObservation(
             networkHandle = handle,
             ssid = ssid,
             hasUsableIp = hasUsableIp,
             sequence = sequence,
+            receivedElapsedMillis = receivedElapsedMillis,
             security = security,
         )
 

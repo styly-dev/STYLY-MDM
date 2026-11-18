@@ -8,10 +8,11 @@ import android.net.wifi.ScanResult
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.os.Build
-import android.os.Handler
-import android.os.HandlerThread
 import android.os.SystemClock
 import androidx.annotation.RequiresApi
+import java.util.concurrent.Executor
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 
 internal enum class WifiPriorityMonitorStatus(val wireValue: String) {
     OFF("off"),
@@ -29,8 +30,7 @@ internal data class WifiScanSample(
 
 internal data class WifiScanBroadcast(
     val resultsUpdated: Boolean,
-    val samples: List<WifiScanSample>,
-    val detail: String? = null,
+    val receivedElapsedMillis: Long,
 )
 
 internal data class WifiPriorityScanEvent(
@@ -43,14 +43,11 @@ internal interface WifiPriorityScanBackend {
     fun register(listener: (WifiScanBroadcast) -> Unit)
     fun unregister()
     fun startScan(): Boolean
-}
-
-internal interface WifiPriorityScanScheduler {
-    fun schedule(task: Runnable, delayMillis: Long)
-    fun cancel(task: Runnable)
+    fun readSamples(): List<WifiScanSample>
 }
 
 internal interface WifiPriorityScanSource {
+    /** Called on the Wi-Fi worker. The listener runs there as well. */
     fun start(networks: List<WifiNetworkProfile>, listener: (WifiPriorityScanEvent) -> Unit)
     fun stop()
 }
@@ -58,7 +55,8 @@ internal interface WifiPriorityScanSource {
 /** Rate-limited scan loop. Only fresh requested or passive results can trigger failback. */
 internal class WifiPriorityScanLoop(
     private val backend: WifiPriorityScanBackend,
-    private val scheduler: WifiPriorityScanScheduler,
+    private val worker: Executor,
+    private val schedule: (Runnable, Long) -> (() -> Unit),
     private val nowElapsed: () -> Long,
     private val requestIntervalMillis: Long = REQUEST_INTERVAL_MILLIS,
     private val broadcastTimeoutMillis: Long = BROADCAST_TIMEOUT_MILLIS,
@@ -66,205 +64,125 @@ internal class WifiPriorityScanLoop(
     /** Returns a delay in 0..bound. Spreads scans of headsets that start together. */
     private val jitter: (Long) -> Long = { 0L },
 ) : WifiPriorityScanSource {
-    private val lock = Any()
-    private var generation = 0L
-    private var active = false
-    private var targets: List<WifiNetworkProfile> = emptyList()
-    private var listener: ((WifiPriorityScanEvent) -> Unit)? = null
-    private var requestedAtElapsedMillis: Long? = null
-    private var failures = 0
-    private var nextRequest: Runnable? = null
-    private var broadcastTimeout: Runnable? = null
-    private var lastProcessedScanTimestampMillis = 0L
+    private var active: ScanSession? = null
 
     override fun start(networks: List<WifiNetworkProfile>, listener: (WifiPriorityScanEvent) -> Unit) {
         stop()
-        val token = synchronized(lock) {
-            generation++
-            active = true
-            targets = networks.toList()
-            this.listener = listener
-            failures = 0
-            lastProcessedScanTimestampMillis = 0L
-            generation
-        }
+        val session = ScanSession(networks.toList(), listener)
+        active = session
         try {
-            backend.register { broadcast -> onBroadcast(token, broadcast) }
-        } catch (failure: Exception) {
-            synchronized(lock) { if (generation == token) active = false }
-            runCatching { backend.unregister() }
-            emit(token, WifiPriorityScanEvent(WifiPriorityMonitorStatus.UNSUPPORTED, detail = "receiver_registration_failed"))
+            backend.register { broadcast ->
+                worker.execute { if (active === session) session.onBroadcast(broadcast) }
+            }
+        } catch (_: Exception) {
+            stop()
+            session.emit(WifiPriorityMonitorStatus.UNSUPPORTED, detail = "receiver_registration_failed")
             return
         }
-        emit(token, WifiPriorityScanEvent(WifiPriorityMonitorStatus.MONITORING, detail = "waiting_for_scan"))
-        scheduleRequest(token, jitter(INITIAL_JITTER_MILLIS))
+        session.scheduleRequest(jitter(INITIAL_JITTER_MILLIS))
+        session.emit(WifiPriorityMonitorStatus.MONITORING, detail = "waiting_for_scan")
     }
 
-    private fun nextIntervalMillis(): Long = requestIntervalMillis + jitter(requestIntervalMillis / 10)
-
     override fun stop() {
-        val tasks = synchronized(lock) {
-            if (!active && nextRequest == null && broadcastTimeout == null) return
-            active = false
-            generation++
-            requestedAtElapsedMillis = null
-            listener = null
-            val pending = listOfNotNull(nextRequest, broadcastTimeout)
-            nextRequest = null
-            broadcastTimeout = null
-            pending
-        }
-        tasks.forEach(scheduler::cancel)
+        val session = active ?: return
+        active = null
+        session.cancelTimer()
         runCatching { backend.unregister() }
     }
 
-    private fun scheduleRequest(token: Long, delayMillis: Long) {
-        val task = Runnable { requestScan(token) }
-        val old = synchronized(lock) {
-            if (!active || generation != token) return
-            nextRequest.also { nextRequest = task }
-        }
-        old?.let(scheduler::cancel)
-        scheduler.schedule(task, delayMillis)
-    }
+    private inner class ScanSession(
+        private val targets: List<WifiNetworkProfile>,
+        private val listener: (WifiPriorityScanEvent) -> Unit,
+    ) {
+        private var cancelScheduled: (() -> Unit)? = null
+        private var requestedAt: Long? = null
+        private var failures = 0
+        private var lastProcessedScanTimestampMillis = 0L
 
-    private fun requestScan(token: Long) {
-        synchronized(lock) {
-            if (!active || generation != token) return
-            nextRequest = null
-            requestedAtElapsedMillis = nowElapsed()
+        fun cancelTimer() {
+            cancelScheduled?.invoke()
+            cancelScheduled = null
         }
-        val accepted = try {
-            backend.startScan()
-        } catch (_: Exception) {
-            false
+
+        private fun scheduleAfter(delayMillis: Long, action: () -> Unit) {
+            cancelTimer()
+            cancelScheduled = schedule(Runnable {
+                if (active === this) {
+                    cancelScheduled = null
+                    action()
+                }
+            }, delayMillis.coerceAtLeast(0))
         }
-        if (!accepted) {
-            synchronized(lock) {
-                if (active && generation == token) requestedAtElapsedMillis = null
+
+        fun scheduleRequest(delayMillis: Long) = scheduleAfter(delayMillis, ::requestScan)
+
+        private fun requestScan() {
+            val startedAt = nowElapsed()
+            if (!runCatching { backend.startScan() }.getOrDefault(false)) {
+                failRequest("scan_request_rejected_or_throttled")
+                return
             }
-            val delay = failedRequest(token)
-            emit(token, WifiPriorityScanEvent(
-                WifiPriorityMonitorStatus.DEGRADED,
-                detail = "scan_request_rejected_or_throttled",
-            ))
-            scheduleRequest(token, delay)
-            return
+            requestedAt = startedAt
+            scheduleAfter(startedAt + broadcastTimeoutMillis - nowElapsed()) {
+                failRequest("scan_broadcast_timeout")
+            }
+            emit(WifiPriorityMonitorStatus.MONITORING, detail = "scan_requested")
         }
-        val timeout = Runnable { onBroadcastTimeout(token) }
-        synchronized(lock) {
-            if (!active || generation != token) return
-            broadcastTimeout = timeout
-        }
-        emit(token, WifiPriorityScanEvent(WifiPriorityMonitorStatus.MONITORING, detail = "scan_requested"))
-        scheduler.schedule(timeout, broadcastTimeoutMillis)
-    }
 
-    private fun onBroadcast(token: Long, broadcast: WifiScanBroadcast) {
-        val pending = synchronized(lock) {
-            if (!active || generation != token) return
-            requestedAtElapsedMillis
-        }
-        if (pending == null) {
-            if (!broadcast.resultsUpdated) return
+        fun onBroadcast(broadcast: WifiScanBroadcast) {
+            val receivedAt = broadcast.receivedElapsedMillis
+            val request = requestedAt?.takeIf { receivedAt - it in 0L until broadcastTimeoutMillis }
+            if (request != null) {
+                requestedAt = null
+                cancelTimer()
+            }
+            if (!broadcast.resultsUpdated) {
+                if (request != null) failRequest("broadcast_not_updated")
+                return
+            }
+
+            val samples = try {
+                backend.readSamples()
+            } catch (_: Exception) {
+                if (request != null) failRequest("scan_results_read_failed")
+                return
+            }
             val now = nowElapsed()
-            val fresh = broadcast.samples.filter { sample ->
-                sample.observedElapsedMillis <= now + FRESHNESS_TOLERANCE_MILLIS &&
-                    now - sample.observedElapsedMillis <= MAX_RESULT_AGE_MILLIS
+            val fresh = samples.filter { sample ->
+                sample.observedElapsedMillis <= receivedAt + FRESHNESS_TOLERANCE_MILLIS &&
+                    now - sample.observedElapsedMillis <= MAX_RESULT_AGE_MILLIS &&
+                    (request == null || sample.observedElapsedMillis >= request - FRESHNESS_TOLERANCE_MILLIS)
             }
-            if (fresh.isEmpty() || !claimFreshTimestamp(token, fresh)) return
-            val visible = visibleIdentities(token, fresh) ?: return
-            emit(token, WifiPriorityScanEvent(
-                WifiPriorityMonitorStatus.MONITORING,
-                visible,
-                "passive_fresh_scan_results",
-            ))
-            return
-        }
-        val requestAt = pending
-        val timeout = synchronized(lock) {
-            if (!active || generation != token || requestedAtElapsedMillis != requestAt) return
-            requestedAtElapsedMillis = null
-            broadcastTimeout.also { broadcastTimeout = null }
-        }
-        timeout?.let(scheduler::cancel)
-
-        if (!broadcast.resultsUpdated) {
-            val delay = failedRequest(token)
-            emit(token, WifiPriorityScanEvent(
-                WifiPriorityMonitorStatus.DEGRADED,
-                detail = broadcast.detail ?: "broadcast_not_updated",
-            ))
-            scheduleRequest(token, delay)
-            return
-        }
-        val now = nowElapsed()
-        val fresh = broadcast.samples.filter { sample ->
-            sample.observedElapsedMillis >= requestAt - FRESHNESS_TOLERANCE_MILLIS &&
-                sample.observedElapsedMillis <= now + FRESHNESS_TOLERANCE_MILLIS &&
-                now - sample.observedElapsedMillis <= MAX_RESULT_AGE_MILLIS
-        }
-        if (fresh.isEmpty()) {
-            val delay = failedRequest(token)
-            emit(token, WifiPriorityScanEvent(WifiPriorityMonitorStatus.DEGRADED, detail = "stale_scan_results"))
-            scheduleRequest(token, delay)
-            return
-        }
-        if (!claimFreshTimestamp(token, fresh)) {
-            scheduleRequest(token, nextIntervalMillis())
-            return
-        }
-        synchronized(lock) { if (active && generation == token) failures = 0 }
-        val visible = visibleIdentities(token, fresh) ?: return
-        emit(token, WifiPriorityScanEvent(WifiPriorityMonitorStatus.MONITORING, visible, "fresh_scan_results"))
-        scheduleRequest(token, nextIntervalMillis())
-    }
-
-    private fun claimFreshTimestamp(token: Long, fresh: List<WifiScanSample>): Boolean {
-        val newest = fresh.maxOfOrNull { it.observedElapsedMillis } ?: return false
-        return synchronized(lock) {
-            if (!active || generation != token || newest <= lastProcessedScanTimestampMillis) return@synchronized false
+            val newest = fresh.maxOfOrNull { it.observedElapsedMillis }
+            if (newest == null) {
+                if (request != null) failRequest("stale_scan_results")
+                return
+            }
+            if (request != null) {
+                if (newest > lastProcessedScanTimestampMillis) failures = 0
+                scheduleRequest(requestIntervalMillis + jitter(requestIntervalMillis / 10))
+            }
+            if (newest <= lastProcessedScanTimestampMillis) return
             lastProcessedScanTimestampMillis = newest
-            true
-        }
-    }
 
-    private fun visibleIdentities(token: Long, fresh: List<WifiScanSample>): Set<String>? {
-        val availableTargets = synchronized(lock) {
-            if (!active || generation != token) return null
-            targets
+            val visible = targets.filter { target ->
+                !target.hidden && fresh.any { wifiScanMatchesProfile(it, target) }
+            }.mapTo(mutableSetOf()) { it.identity }
+            val detail = if (request == null) "passive_fresh_scan_results" else "fresh_scan_results"
+            emit(WifiPriorityMonitorStatus.MONITORING, visible, detail)
         }
-        return buildSet {
-            for (target in availableTargets) {
-                if (!target.hidden && fresh.any { wifiScanMatchesProfile(it, target) }) add(target.identity)
-            }
+
+        private fun failRequest(detail: String) {
+            requestedAt = null
+            failures = (failures + 1).coerceAtMost(16)
+            val multiplier = 1L shl failures.coerceAtMost(10)
+            scheduleRequest((requestIntervalMillis * multiplier).coerceAtMost(maxBackoffMillis))
+            emit(WifiPriorityMonitorStatus.DEGRADED, detail = detail)
         }
-    }
 
-    private fun failedRequest(token: Long): Long = synchronized(lock) {
-        if (!active || generation != token) return@synchronized requestIntervalMillis
-        failures = (failures + 1).coerceAtMost(16)
-        val multiplier = 1L shl failures.coerceAtMost(10)
-        (requestIntervalMillis * multiplier).coerceAtMost(maxBackoffMillis)
-    }
-
-    private fun onBroadcastTimeout(token: Long) {
-        synchronized(lock) {
-            if (!active || generation != token || requestedAtElapsedMillis == null) return
-            requestedAtElapsedMillis = null
-            broadcastTimeout = null
+        fun emit(status: WifiPriorityMonitorStatus, visible: Set<String> = emptySet(), detail: String) {
+            runCatching { listener(WifiPriorityScanEvent(status, visible, detail)) }
         }
-        val delay = failedRequest(token)
-        emit(token, WifiPriorityScanEvent(WifiPriorityMonitorStatus.DEGRADED, detail = "scan_broadcast_timeout"))
-        scheduleRequest(token, delay)
-    }
-
-    private fun emit(token: Long, event: WifiPriorityScanEvent) {
-        val callback = synchronized(lock) {
-            if (generation != token) return
-            listener
-        } ?: return
-        runCatching { callback(event) }
     }
 
     companion object {
@@ -278,33 +196,24 @@ internal class WifiPriorityScanLoop(
 }
 
 @RequiresApi(Build.VERSION_CODES.TIRAMISU)
-internal class AndroidWifiPriorityScanBackend(
-    context: Context,
-    private val handler: Handler,
-) : WifiPriorityScanBackend {
+internal class AndroidWifiPriorityScanBackend(context: Context) : WifiPriorityScanBackend {
     private val appContext = context.applicationContext
     private val manager = appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
     private var receiver: BroadcastReceiver? = null
 
     override fun register(listener: (WifiScanBroadcast) -> Unit) {
-        val wifi = manager ?: throw IllegalStateException("Wi-Fi service unavailable")
+        checkNotNull(manager) { "Wi-Fi service unavailable" }
         check(receiver == null) { "Wi-Fi scan receiver already registered" }
         val nextReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
+                val receivedAt = SystemClock.elapsedRealtime()
                 val updated = intent.getBooleanExtra(WifiManager.EXTRA_RESULTS_UPDATED, false)
-                val samples = if (!updated) emptyList() else try {
-                    @Suppress("DEPRECATION")
-                    wifi.scanResults.mapNotNull { it.toWifiScanSample() }
-                } catch (failure: Exception) {
-                    listener(WifiScanBroadcast(false, emptyList(), "scan_results_read_failed"))
-                    return
-                }
-                listener(WifiScanBroadcast(updated, samples))
+                listener(WifiScanBroadcast(updated, receivedAt))
             }
         }
         val filter = IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
-        // PUI delivers this protected broadcast through the Wi-Fi system process.
-        appContext.registerReceiver(nextReceiver, filter, null, handler, Context.RECEIVER_EXPORTED)
+        // The Wi-Fi process sends this protected broadcast. Only the signal is read on the main thread.
+        appContext.registerReceiver(nextReceiver, filter, Context.RECEIVER_EXPORTED)
         receiver = nextReceiver
     }
 
@@ -316,6 +225,10 @@ internal class AndroidWifiPriorityScanBackend(
 
     override fun startScan(): Boolean = manager?.startScan() == true
 
+    @Suppress("DEPRECATION")
+    override fun readSamples(): List<WifiScanSample> =
+        checkNotNull(manager).scanResults.mapNotNull { it.toWifiScanSample() }
+
     private fun ScanResult.toWifiScanSample(): WifiScanSample? {
         if (SSID.isEmpty()) return null
         val observedSecurityTypes = wifiScanSecurityTypes(securityTypes.toSet())
@@ -324,26 +237,18 @@ internal class AndroidWifiPriorityScanBackend(
     }
 }
 
-internal class AndroidWifiPriorityScanScheduler(private val handler: Handler) : WifiPriorityScanScheduler {
-    override fun schedule(task: Runnable, delayMillis: Long) { handler.postDelayed(task, delayMillis) }
-    override fun cancel(task: Runnable) { handler.removeCallbacks(task) }
-}
-
-/**
- * Scan requests and scan-result reads are Binder calls, so they run on a dedicated thread
- * instead of the main thread. The controller is a process-wide singleton, so one thread suffices.
- */
 @RequiresApi(Build.VERSION_CODES.TIRAMISU)
-internal fun systemWifiPriorityScanSource(context: Context): WifiPriorityScanSource {
-    val thread = HandlerThread("wifi-priority-scan").apply { start() }
-    val handler = Handler(thread.looper)
-    return WifiPriorityScanLoop(
-        backend = AndroidWifiPriorityScanBackend(context.applicationContext, handler),
-        scheduler = AndroidWifiPriorityScanScheduler(handler),
+internal fun systemWifiPriorityScanSource(context: Context, worker: ScheduledExecutorService): WifiPriorityScanSource =
+    WifiPriorityScanLoop(
+        backend = AndroidWifiPriorityScanBackend(context.applicationContext),
+        worker = worker,
+        schedule = { task, delay ->
+            val future = worker.schedule(task, delay, TimeUnit.MILLISECONDS)
+            ({ future.cancel(false) })
+        },
         nowElapsed = SystemClock::elapsedRealtime,
         jitter = { bound -> kotlin.random.Random.nextLong(bound + 1) },
     )
-}
 
 /** Both the policy parser and saved profile decoder validate profiles before monitoring. */
 internal fun wifiScanMatchesProfile(sample: WifiScanSample, profile: WifiNetworkProfile): Boolean =

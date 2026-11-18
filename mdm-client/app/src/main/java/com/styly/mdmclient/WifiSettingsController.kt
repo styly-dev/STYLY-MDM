@@ -6,10 +6,9 @@ import android.provider.Settings
 import android.util.Log
 import org.json.JSONObject
 import java.io.File
-import java.util.UUID
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.Executor
-import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 internal data class WifiControllerDependencies(
@@ -30,7 +29,7 @@ internal data class WifiControllerDependencies(
 
 internal const val WIFI_PRIOR_CONNECTION_OBSERVATION_MS = 2_000L
 
-/** All policy, connection, and deadline events run on one scheduled worker. */
+/** One scheduled worker owns policy, connection selection and monitoring decisions. */
 internal class WifiSettingsController internal constructor(
     private val dependencies: WifiControllerDependencies,
     autoStart: Boolean = true,
@@ -39,7 +38,6 @@ internal class WifiSettingsController internal constructor(
     private enum class SelectionKind { RECONNECT, AUTO_RETURN, RESTORE }
 
     private class PolicyRequest(
-        val operationId: String,
         val revision: String,
         val settings: JSONObject,
         val reuseMatchingProfile: Boolean,
@@ -48,17 +46,17 @@ internal class WifiSettingsController internal constructor(
     )
 
     private class Attempt(
-        val id: String,
         val profile: WifiSavedProfile,
         var candidates: List<Int>,
         val request: PolicyRequest? = null,
         val priority: PriorityRuntime? = null,
         val selectionKind: SelectionKind? = null,
     ) {
-        var session: WifiLocalConnectivitySession? = null
         var phase = AttemptPhase.OBSERVING
+        var observationStartSequence: Long? = null
         var observationDeadline = 0L
         var deadlineElapsedMillis: Long? = null
+        var candidateDeadlineElapsedMillis: Long? = null
         var position = 0
         var reconnectSequence = 0L
         var applicationFailure: WifiReason? = null
@@ -71,8 +69,7 @@ internal class WifiSettingsController internal constructor(
     }
 
     private class PriorityRuntime {
-        var connection: WifiLocalConnectivitySession? = null
-        var scanToken: Any? = null
+        var scanning = false
         var disconnectCheck: Any? = null
         var reconnectFailures = 0
         var retryAllowedAt = 0L
@@ -82,18 +79,13 @@ internal class WifiSettingsController internal constructor(
     private class SavedConnectionWatch(
         val profile: WifiSavedProfile,
         val onVerified: (WifiReason) -> Unit,
-    ) {
-        var session: WifiLocalConnectivitySession? = null
-    }
+    )
 
     private data class View(
-        val managed: Boolean?,
-        val revision: String?,
         val busy: Boolean,
-        val canProcessPolicy: Boolean,
+        val canAcceptPolicy: Boolean,
         val unavailableReason: String?,
         val monitor: WifiPriorityMonitorStatus,
-        val result: WifiManualResult?,
     )
 
     companion object {
@@ -122,6 +114,7 @@ internal class WifiSettingsController internal constructor(
     private var pendingApply: PolicyRequest? = null
     private var priority: PriorityRuntime? = null
     private var savedConnectionWatch: SavedConnectionWatch? = null
+    private var connection: WifiLocalConnectivitySession? = null
     @Volatile private var view = currentView()
 
     init {
@@ -140,34 +133,30 @@ internal class WifiSettingsController internal constructor(
 
     fun addStateListener(listener: () -> Unit) { listeners.add(listener) }
     fun removeStateListener(listener: () -> Unit) { listeners.remove(listener) }
-    fun readyForPolicy(): Boolean = view.let { it.canProcessPolicy && it.unavailableReason != WifiReason.STORAGE_ERROR.wireValue }
+    fun canAcceptPolicy(): Boolean = view.canAcceptPolicy
 
-    fun canProcessPolicy(): Boolean = view.canProcessPolicy
+    // Automatic delivery can still apply the other settings and report a Wi-Fi storage failure.
+    fun canReapplyPolicy(): Boolean =
+        view.let { it.canAcceptPolicy && it.unavailableReason != WifiReason.STORAGE_ERROR.wireValue }
 
     /** Registration and socket callbacks read only the immutable, secret-free view. */
     fun stateSnapshot(): JSONObject {
         val snapshot = view
         return JSONObject().apply {
-            put("managed", snapshot.managed ?: JSONObject.NULL)
-            put("policy_revision", snapshot.revision ?: JSONObject.NULL)
             put("busy", snapshot.busy)
             put("available", snapshot.unavailableReason == null)
             put("unavailable_reason", snapshot.unavailableReason ?: JSONObject.NULL)
             put("priority_monitor", snapshot.monitor.wireValue)
-            put("last_result", snapshot.result?.let {
-                JSONObject()
-                    .put("operation_id", it.operationId)
-                    .put("revision", it.revision)
-                    .put("status", it.status)
-                    .put("reason", it.reason.wireValue)
-            } ?: JSONObject.NULL)
         }
     }
 
     fun refreshReadiness() {
         worker.execute {
             updateReadiness()
-            reconcileSavedConnection()
+            if (active == null && connection != null &&
+                !runCatching { connectivity.preflight() == null }.getOrDefault(false)
+            ) closeConnection()
+            reconcileMonitoring()
         }
     }
 
@@ -179,13 +168,10 @@ internal class WifiSettingsController internal constructor(
     }
 
     private fun currentView() = View(
-        state?.managedWifi,
-        state?.policyRevision,
         !initialized || active != null,
         initialized && active == null && pendingApply == null,
         if (storageHealthy) unavailableReason else WifiReason.STORAGE_ERROR.wireValue,
         monitor,
-        state?.latestResult,
     )
 
     private fun publishView() {
@@ -201,14 +187,11 @@ internal class WifiSettingsController internal constructor(
         reuseMatchingProfile: Boolean,
         isCurrent: () -> Boolean,
         onFinished: (WifiManualResult) -> Unit,
-        operationId: String = UUID.randomUUID().toString(),
     ) {
-        val request = PolicyRequest(operationId, revision, settings, reuseMatchingProfile, isCurrent, onFinished)
+        val request = PolicyRequest(revision, settings, reuseMatchingProfile, isCurrent, onFinished)
         worker.execute {
-            if (pendingApply != null) {
-                reportRequest(request, WifiReason.BUSY)
-                return@execute
-            }
+            // The package controller serializes policy applications.
+            check(pendingApply == null) { "A Wi-Fi policy is already queued" }
             pendingApply = request
             runIdleWork()
         }
@@ -216,25 +199,20 @@ internal class WifiSettingsController internal constructor(
 
     fun watchSavedConnection(profile: WifiSavedProfile?, onVerified: (WifiReason) -> Unit = {}) {
         worker.execute {
-            val previous = savedConnectionWatch
             savedConnectionWatch = profile?.let { SavedConnectionWatch(it, onVerified) }
-            runCatching { previous?.session?.close() }
-            reconcileSavedConnection()
+            reconcileMonitoring()
         }
     }
 
     /** Release management without changing the saved Android networks. */
-    fun stopManagingPolicy(revision: String? = null, onRecorded: (Boolean) -> Unit = {}) {
+    fun stopManagingPolicy(onRecorded: (Boolean) -> Unit) {
         worker.execute {
             val current = state
             if (current == null || !storageHealthy) {
                 onRecorded(false)
                 return@execute
             }
-            val releasedRevision = revision ?: current.policyRevision
-            val result = releasedRevision?.let { WifiManualResult(UUID.randomUUID().toString(), it, "success", WifiReason.NONE) }
-            val released = current.copy(managedWifi = false, policyRevision = releasedRevision,
-                latestResult = result ?: current.latestResult)
+            val released = current.copy(managedWifi = false)
             if (released != current && !save(released)) {
                 onRecorded(false)
                 return@execute
@@ -245,7 +223,7 @@ internal class WifiSettingsController internal constructor(
             queued?.let { reportRequest(it, WifiReason.UNKNOWN, publish = false) }
             onRecorded(true)
             val attempt = active
-            if (attempt != null) endAttempt(attempt, failure(attempt.id, attempt.profile.revision, WifiReason.UNKNOWN))
+            if (attempt != null) endAttempt(attempt, failure(attempt.profile.revision, WifiReason.UNKNOWN))
             else runIdleWork()
         }
     }
@@ -258,11 +236,29 @@ internal class WifiSettingsController internal constructor(
         val request = pendingApply
         pendingApply = null
         if (request != null) accept(request)
-        if (active == null) {
-            reconcileSavedConnection()
-            reconcilePriority()
-        }
+        reconcileMonitoring()
         publishView()
+    }
+
+    private fun observeConnection(): WifiLocalConnectivitySession {
+        connection?.let { return it }
+        connectivity.preflight()?.let { throw WifiAdapterFailure(it) }
+        return connectivity.observe { session, event ->
+            worker.execute {
+                if (connection !== session) return@execute
+                val attempt = active
+                if (attempt == null) reconcileMonitoring()
+                else if (attempt.observationStartSequence?.let { event.sequence > it } == true) {
+                    onConnectivity(attempt, event)
+                }
+            }
+        }.also { connection = it }
+    }
+
+    private fun closeConnection() {
+        val session = connection ?: return
+        connection = null
+        runCatching { session.close() }
     }
 
     private fun matchingProfile(current: WifiLocalState, requested: WifiSavedProfile): Boolean =
@@ -270,7 +266,7 @@ internal class WifiSettingsController internal constructor(
 
     private fun adoptProfile(current: WifiLocalState, requested: WifiSavedProfile): Boolean {
         val reset = !current.managedWifi || !matchingProfile(current, requested)
-        val next = current.copy(lastApplied = requested, policyRevision = requested.revision, managedWifi = true)
+        val next = current.copy(lastApplied = requested, managedWifi = true)
         if (next != state && !save(next)) return false
         if (reset) resetPriority()
         return true
@@ -299,11 +295,11 @@ internal class WifiSettingsController internal constructor(
             val current = checkNotNull(state)
             val applied = current.lastApplied
             if (request.reuseMatchingProfile && current.managedWifi &&
-                applied != null && current.policyRevision == applied.revision && applied.hasSameSettings(requested) &&
-                current.latestResult?.status == "success" && current.latestResult.revision == current.policyRevision
+                applied != null && applied.hasSameSettings(requested) &&
+                current.latestResult?.status == "success" && current.latestResult.revision == applied.revision
             ) {
-                val result = WifiManualResult(request.operationId, request.revision, "success", current.latestResult.reason)
-                val retained = requested.copy(unverifiedOnBoot = applied.unverifiedOnBoot)
+                val result = WifiManualResult(request.revision, "success", current.latestResult.reason)
+                val retained = requested.copy(unverifiedOnBoot = retainCurrentBootMarkers(applied))
                 if (adoptProfile(current.copy(latestResult = result), retained)) request.onFinished(result)
                 else reportRequest(request, WifiReason.STORAGE_ERROR, publish = false)
                 return
@@ -314,7 +310,7 @@ internal class WifiSettingsController internal constructor(
                     return
                 }
             }
-            startAttempt(Attempt(request.operationId, requested, requested.networks.indices.toList(), request))
+            startAttempt(Attempt(requested, requested.networks.indices.toList(), request))
         } catch (failure: WifiPolicyFailure) {
             reportRequest(request, failure.reason)
         } catch (failure: WifiAdapterFailure) {
@@ -340,22 +336,22 @@ internal class WifiSettingsController internal constructor(
     private fun prepareAttempt(attempt: Attempt) {
         if (active !== attempt) return
         if (attempt.selectionKind == SelectionKind.RESTORE && pendingApply != null) {
-            endAttempt(attempt, failure(attempt.id, attempt.profile.revision, WifiReason.UNKNOWN))
+            endAttempt(attempt, failure(attempt.profile.revision, WifiReason.UNKNOWN))
             return
         }
         if (attempt.request?.isCurrent?.invoke() == false) {
-            endAttempt(attempt, failure(attempt.id, attempt.profile.revision, WifiReason.UNKNOWN))
+            endAttempt(attempt, failure(attempt.profile.revision, WifiReason.UNKNOWN))
             return
         }
         if (!attempt.profile.prioritizeNetworks) {
             if (applyRequestedProfile(attempt, previous = null)) complete(attempt, WifiReason.SAVED)
             return
         }
-        attempt.session = try {
-            connectivity.observe { event ->
-                val observedAt = now()
-                worker.execute { onConnectivity(attempt, event, observedAt) }
-            }
+        val session = try {
+            observeConnection()
+        } catch (failure: WifiAdapterFailure) {
+            fail(attempt, failure.reason)
+            return
         } catch (_: SecurityException) {
             fail(attempt, WifiReason.PERMISSION_DENIED)
             return
@@ -363,6 +359,8 @@ internal class WifiSettingsController internal constructor(
             fail(attempt, WifiReason.UNSUPPORTED)
             return
         }
+        // Events queued for the previous attempt cannot drive this attempt.
+        attempt.observationStartSequence = session.lastSequence()
         attempt.observationDeadline = now() + WIFI_PRIOR_CONNECTION_OBSERVATION_MS
         resolvePriorConnection(attempt, expired = false)
         if (active === attempt && attempt.phase == AttemptPhase.OBSERVING) {
@@ -375,13 +373,13 @@ internal class WifiSettingsController internal constructor(
     }
 
     private fun resolvePriorConnection(attempt: Attempt, expired: Boolean) {
-        val session = checkNotNull(attempt.session)
+        val session = checkNotNull(connection)
         val usable = session.snapshot().filter { it.hasUsableIp }
         // Keep a connection that recovered while waiting to reconnect or restore.
         if ((attempt.selectionKind == SelectionKind.RECONNECT || attempt.selectionKind == SelectionKind.RESTORE) &&
             usable.isNotEmpty()
         ) {
-            endAttempt(attempt, failure(attempt.id, attempt.profile.revision, WifiReason.UNKNOWN))
+            endAttempt(attempt, failure(attempt.profile.revision, WifiReason.UNKNOWN))
             return
         }
         val previous = usable.maxByOrNull { it.sequence }
@@ -391,7 +389,7 @@ internal class WifiSettingsController internal constructor(
             val previousIndex = attempt.profile.networks.indexOfFirst { observationMatches(it, previous) }
             attempt.candidates = attempt.candidates.filter { it < previousIndex }
             if (attempt.candidates.isEmpty()) {
-                endAttempt(attempt, failure(attempt.id, attempt.profile.revision, WifiReason.UNKNOWN))
+                endAttempt(attempt, failure(attempt.profile.revision, WifiReason.UNKNOWN))
                 return
             }
             attempt.previousCandidateIndex = previousIndex
@@ -400,9 +398,14 @@ internal class WifiSettingsController internal constructor(
         if (attempt.request != null) {
             if (!applyRequestedProfile(attempt, previous)) return
             val candidate = attempt.candidate
-            // Use the link observed after saving the profiles.
+            val previousHandle = previous?.takeIf { observationMatches(candidate, it) }?.networkHandle
+            val deadline = attempt.deadlineElapsedMillis
+            // A link already in use can stay connected. A new link must arrive within the deadline.
             if (candidate.identity == attempt.profile.primaryIdentity &&
-                session.snapshot().any { it.hasUsableIp && observationMatches(candidate, it) }
+                session.snapshot().any {
+                    it.hasUsableIp && observationMatches(candidate, it) &&
+                        (it.networkHandle == previousHandle || deadline == null || it.receivedElapsedMillis < deadline)
+                }
             ) {
                 candidateConnected(attempt)
                 return
@@ -412,6 +415,10 @@ internal class WifiSettingsController internal constructor(
     }
 
     private fun applyRequestedProfile(attempt: Attempt, previous: WifiLocalNetworkObservation?): Boolean {
+        if (attempt.request?.isCurrent?.invoke() == false) {
+            endAttempt(attempt, failure(attempt.profile.revision, WifiReason.UNKNOWN))
+            return false
+        }
         val profile = attempt.profile
         var current = checkNotNull(state)
         if (!profile.prioritizeNetworks && current.managedWifi && current.lastApplied?.prioritizeNetworks == true) {
@@ -439,6 +446,16 @@ internal class WifiSettingsController internal constructor(
             } == true
         }
 
+        // Persist the uncertainty before any adapter mutation. A later failure can report no
+        // usable candidates even after an earlier candidate was already written.
+        if (profile.prioritizeNetworks && changedActive != null) {
+            if (!persistUnverifiedCredential(current, profile, changedActive)) {
+                fail(attempt, WifiReason.STORAGE_ERROR)
+                return false
+            }
+            current = checkNotNull(state)
+        }
+
         val application = try {
             adapter.applyProfile(profile.networks, profile.prioritizeNetworks) { beforeMutation(attempt) }
         } catch (failure: WifiAdapterFailure) {
@@ -452,15 +469,9 @@ internal class WifiSettingsController internal constructor(
             return false
         }
         val savedNetworks = attempt.candidates.map(profile.networks::get)
-        val unverifiedOnBoot = buildMap {
-            if (profile.prioritizeNetworks) {
-                for (network in savedNetworks) {
-                    val markedBoot = if (network.identity == changedActive?.identity) dependencies.bootCount
-                    else previousPrioritized?.unverifiedBoot(network, dependencies.bootCount)
-                    if (markedBoot != null) put(network.identity, markedBoot)
-                }
-            }
-        }
+        // Verification state is stored independently from adapter readback and was persisted
+        // before mutation, so it survives credentials omitted from this usable-candidate list.
+        val unverifiedOnBoot = retainCurrentBootMarkers(current.lastApplied)
         val savedProfile = profile.copy(networks = savedNetworks, unverifiedOnBoot = unverifiedOnBoot)
         if (adoptProfile(current, savedProfile)) return true
         fail(attempt, WifiReason.STORAGE_ERROR)
@@ -470,7 +481,7 @@ internal class WifiSettingsController internal constructor(
     private fun disconnectForCandidate(attempt: Attempt) {
         attempt.phase = AttemptPhase.DISCONNECTING
         attempt.waitingForLoss.clear()
-        val handles = checkNotNull(attempt.session).snapshot().map { it.networkHandle }
+        val handles = checkNotNull(connection).snapshot().map { it.networkHandle }
         attempt.oldHandles.addAll(handles)
         attempt.waitingForLoss.addAll(handles.filterNot { it in attempt.lostHandles })
         if (attempt.waitingForLoss.isEmpty()) selectCandidate(attempt)
@@ -484,11 +495,11 @@ internal class WifiSettingsController internal constructor(
 
     private fun selectCandidate(attempt: Attempt) {
         if (attempt.deadlineElapsedMillis?.let { now() >= it } == true) {
-            fail(attempt, WifiReason.UNREACHABLE)
+            fail(attempt, attempt.applicationFailure ?: WifiReason.UNREACHABLE)
             return
         }
         attempt.phase = AttemptPhase.CONNECTING
-        val session = checkNotNull(attempt.session)
+        val session = checkNotNull(connection)
         val reason = adapter.selectSavedCandidate(attempt.candidate) {
             beforeMutation(attempt).also {
                 if (it == null) attempt.reconnectSequence = session.lastSequence()
@@ -499,29 +510,25 @@ internal class WifiSettingsController internal constructor(
             return
         }
         val deadline = checkNotNull(attempt.deadlineElapsedMillis)
-        val observedAt = now()
-        if (observedAt >= deadline) {
-            fail(attempt, WifiReason.UNREACHABLE)
-            return
-        }
-        if (session.snapshot().any { isFreshCandidate(attempt, it, observedAt) }) {
-            candidateConnected(attempt)
-            return
-        }
+        val candidateDeadline = minOf(deadline, now() + CANDIDATE_TIMEOUT_MS)
+        attempt.candidateDeadlineElapsedMillis = candidateDeadline
+        if (confirmCandidate(attempt)) return
         val position = attempt.position
-        schedule(minOf(CANDIDATE_TIMEOUT_MS, deadline - observedAt)) {
-            if (active === attempt && attempt.phase == AttemptPhase.CONNECTING && attempt.position == position) {
+        schedule(candidateDeadline - now()) {
+            if (active === attempt && attempt.phase == AttemptPhase.CONNECTING && attempt.position == position &&
+                !confirmCandidate(attempt)
+            ) {
                 advance(attempt, WifiReason.UNREACHABLE)
             }
         }
     }
 
     private fun advance(attempt: Attempt, reason: WifiReason) {
-        if (attempt.deadlineElapsedMillis?.let { now() >= it } == true) {
-            fail(attempt, WifiReason.UNREACHABLE)
-        } else if (reason !in setOf(WifiReason.UPDATE_FAILED, WifiReason.VERIFY_FAILED, WifiReason.UNREACHABLE)) {
+        if (reason !in setOf(WifiReason.UPDATE_FAILED, WifiReason.VERIFY_FAILED, WifiReason.UNREACHABLE)) {
             fail(attempt, reason)
-        } else if (attempt.position == attempt.candidates.lastIndex) {
+        } else if (attempt.deadlineElapsedMillis?.let { now() >= it } == true ||
+            attempt.position == attempt.candidates.lastIndex
+        ) {
             fail(attempt, attempt.applicationFailure ?: reason)
         } else {
             attempt.position++
@@ -529,8 +536,7 @@ internal class WifiSettingsController internal constructor(
         }
     }
 
-    private fun onConnectivity(attempt: Attempt, event: WifiLocalConnectivityEvent, observedAt: Long) {
-        if (active !== attempt) return
+    private fun onConnectivity(attempt: Attempt, event: WifiLocalConnectivityEvent) {
         when (attempt.phase) {
             // Prior identity comes from the current snapshot, so use the worker's time here.
             AttemptPhase.OBSERVING -> resolvePriorConnection(attempt, expired = now() >= attempt.observationDeadline)
@@ -550,15 +556,23 @@ internal class WifiSettingsController internal constructor(
             }
             AttemptPhase.CONNECTING -> when (event) {
                 is WifiLocalConnectivityEvent.Updated ->
-                    if (isFreshCandidate(attempt, event.observation, observedAt)) candidateConnected(attempt)
+                    if (isFreshCandidate(attempt, event.observation)) candidateConnected(attempt)
                 is WifiLocalConnectivityEvent.Lost -> attempt.lostHandles.add(event.networkHandle)
             }
         }
     }
 
-    private fun isFreshCandidate(attempt: Attempt, observation: WifiLocalNetworkObservation, observedAt: Long): Boolean {
-        val deadline = attempt.deadlineElapsedMillis ?: return false
-        return observedAt < deadline && observation.sequence > attempt.reconnectSequence &&
+    private fun confirmCandidate(attempt: Attempt): Boolean {
+        if (attempt.phase != AttemptPhase.CONNECTING ||
+            connection?.snapshot()?.any { isFreshCandidate(attempt, it) } != true
+        ) return false
+        candidateConnected(attempt)
+        return true
+    }
+
+    private fun isFreshCandidate(attempt: Attempt, observation: WifiLocalNetworkObservation): Boolean {
+        val deadline = attempt.candidateDeadlineElapsedMillis ?: return false
+        return observation.receivedElapsedMillis < deadline && observation.sequence > attempt.reconnectSequence &&
             observation.networkHandle !in attempt.oldHandles && observation.hasUsableIp &&
             observationMatches(attempt.candidate, observation)
     }
@@ -566,20 +580,49 @@ internal class WifiSettingsController internal constructor(
     /** Keep the accepted operation bounded even when Wi-Fi takes a long time to disconnect. */
     private fun beforeMutation(attempt: Attempt): WifiReason? {
         if (!storageHealthy) return WifiReason.STORAGE_ERROR
+        if (attempt.request?.isCurrent?.invoke() == false) return WifiReason.UNKNOWN
         attempt.deadlineElapsedMillis?.let { deadline ->
             return if (now() < deadline) null else WifiReason.UNREACHABLE
         }
-        if (attempt.request?.isCurrent?.invoke() == false) return WifiReason.UNKNOWN
         val deadline = now() + WIFI_MANUAL_TIMEOUT_MS
         attempt.deadlineElapsedMillis = deadline
         schedule(deadline - now()) {
-            if (active === attempt && now() >= deadline) fail(attempt, WifiReason.UNREACHABLE)
+            if (active === attempt && now() >= deadline && !confirmCandidate(attempt)) {
+                fail(attempt, attempt.applicationFailure ?: WifiReason.UNREACHABLE)
+            }
         }
         return null
     }
 
     private fun isUnverified(candidate: WifiNetworkProfile): Boolean =
         state?.lastApplied?.unverifiedBoot(candidate, dependencies.bootCount) != null
+
+    private fun retainCurrentBootMarkers(profile: WifiSavedProfile?): Map<String, UnverifiedWifiCredential> =
+        profile?.unverifiedOnBoot.orEmpty().filterValues { marker ->
+            marker.bootCount < 0 || dependencies.bootCount < 0 || marker.bootCount == dependencies.bootCount
+        }
+
+    private fun persistUnverifiedCredential(
+        current: WifiLocalState,
+        requested: WifiSavedProfile,
+        network: WifiNetworkProfile,
+    ): Boolean {
+        val previous = current.lastApplied
+        val markerBase = previous ?: requested.copy(
+            networks = emptyList(),
+            autoReturn = false,
+            primaryIdentity = null,
+        )
+        val markers = retainCurrentBootMarkers(previous) + (
+            network.identity to UnverifiedWifiCredential(dependencies.bootCount, wifiPasswordHash(network.password))
+        )
+        val nextProfile = markerBase.copy(unverifiedOnBoot = markers)
+        val next = current.copy(
+            lastApplied = nextProfile,
+            managedWifi = previous != null && current.managedWifi,
+        )
+        return save(next)
+    }
 
     private fun candidateConnected(attempt: Attempt) {
         val reason = when {
@@ -592,13 +635,13 @@ internal class WifiSettingsController internal constructor(
 
     private fun complete(attempt: Attempt, reason: WifiReason, connectionSucceeded: Boolean = false) {
         val failureReason = attempt.applicationFailure ?: reason.takeIf { it == WifiReason.VERIFY_AFTER_REBOOT }
-        val result = failureReason?.let { failure(attempt.id, attempt.profile.revision, it) }
-            ?: WifiManualResult(attempt.id, attempt.profile.revision, "success", reason)
+        val result = failureReason?.let { failure(attempt.profile.revision, it) }
+            ?: WifiManualResult(attempt.profile.revision, "success", reason)
         recordResult(attempt, result, connectionSucceeded)
     }
 
     private fun fail(attempt: Attempt, reason: WifiReason) {
-        recordResult(attempt, failure(attempt.id, attempt.profile.revision, reason))
+        recordResult(attempt, failure(attempt.profile.revision, reason))
     }
 
     private fun recordResult(attempt: Attempt, result: WifiManualResult, connectionSucceeded: Boolean = false) {
@@ -623,7 +666,6 @@ internal class WifiSettingsController internal constructor(
 
     private fun endAttempt(attempt: Attempt, result: WifiManualResult, connectionSucceeded: Boolean = false) {
         active = null
-        runCatching { attempt.session?.close() }
         val runtime = attempt.priority
         if (runtime != null && attempt.selectionKind == SelectionKind.RECONNECT && !connectionSucceeded) {
             runtime.reconnectFailures = (runtime.reconnectFailures + 1).coerceAtMost(DISCONNECT_MAX_RETRY_EXPONENT)
@@ -637,7 +679,7 @@ internal class WifiSettingsController internal constructor(
                 priority === runtime && pendingApply == null
             ) {
                 // Give restoration its own deadline, including when the return attempt timed out.
-                startAttempt(Attempt(UUID.randomUUID().toString(), attempt.profile, listOf(previousIndex),
+                startAttempt(Attempt(attempt.profile, listOf(previousIndex),
                     priority = runtime, selectionKind = SelectionKind.RESTORE))
                 return
             }
@@ -652,20 +694,24 @@ internal class WifiSettingsController internal constructor(
     }
 
     private fun reportRequest(request: PolicyRequest, reason: WifiReason, publish: Boolean = true) {
-        val result = failure(request.operationId, request.revision, reason)
+        val result = failure(request.revision, reason)
         val reported = if (publish && storageHealthy && !save(checkNotNull(state).copy(latestResult = result))) {
             result.copy(status = "unknown", reason = WifiReason.STORAGE_ERROR)
         } else result
         request.onFinished(reported)
     }
 
-    private fun failure(id: String, revision: String, reason: WifiReason): WifiManualResult {
+    private fun failure(revision: String, reason: WifiReason): WifiManualResult {
         val interrupted = reason == WifiReason.UNKNOWN || reason == WifiReason.STORAGE_ERROR
-        return WifiManualResult(id, revision, if (interrupted) "unknown" else "failed", reason)
+        return WifiManualResult(revision, if (interrupted) "unknown" else "failed", reason)
     }
 
     private fun save(next: WifiLocalState): Boolean {
         if (!storageHealthy) return false
+        if (state == next) {
+            publishView()
+            return true
+        }
         try {
             dependencies.store.write(next)
             state = next
@@ -677,65 +723,67 @@ internal class WifiSettingsController internal constructor(
         return storageHealthy
     }
 
-    private fun reconcileSavedConnection() {
-        val watch = savedConnectionWatch ?: return
-        if (!initialized || active != null || !storageHealthy) return
-        val current = state?.takeIf { it.managedWifi && it.policyRevision == watch.profile.revision } ?: return
-        val applied = current.lastApplied?.takeIf { it.revision == watch.profile.revision && it.hasSameSettings(watch.profile) }
-            ?: return
-        val session = watch.session ?: try {
-            connectivity.observe {
-                worker.execute { if (savedConnectionWatch === watch) reconcileSavedConnection() }
-            }.also { watch.session = it }
-        } catch (_: Exception) {
-            return
+    private fun reconcileMonitoring() {
+        if (!initialized || active != null) return
+        val applied = managedProfile()
+        val watch = savedConnectionWatch?.takeIf {
+            applied != null && applied.revision == it.profile.revision && applied.hasSameSettings(it.profile)
         }
-        val connected = session.snapshot().filter { it.hasUsableIp }
+        val profile = activePriorityProfile()
+        val connected = if (watch == null && profile == null) {
+            closeConnection()
+            null
+        } else runCatching { observeConnection().snapshot().filter { it.hasUsableIp } }.getOrNull()
+        if (watch != null && applied != null && connected != null) {
+            reconcileSavedConnection(watch, applied, connected)
+        }
+        if (!storageHealthy) closeConnection()
+        reconcilePriority(profile.takeIf { storageHealthy }, connected)
+    }
+
+    private fun reconcileSavedConnection(
+        watch: SavedConnectionWatch,
+        applied: WifiSavedProfile,
+        connected: List<WifiLocalNetworkObservation>,
+    ) {
         val candidate = applied.networks.firstOrNull { network ->
             applied.unverifiedBoot(network, dependencies.bootCount) == null &&
                 connected.any { observationMatches(network, it) }
         } ?: return
         val reason = if (candidate.identity == applied.primaryIdentity) WifiReason.NONE else WifiReason.FALLBACK
+        val current = checkNotNull(state)
         val previous = current.latestResult
         if (previous == null || previous.revision != applied.revision || previous.status != "success" || previous.reason != reason) {
-            val result = WifiManualResult(UUID.randomUUID().toString(), applied.revision, "success", reason)
+            val result = WifiManualResult(applied.revision, "success", reason)
             if (!save(current.copy(latestResult = result))) return
         }
         watch.onVerified(reason)
     }
 
+    private fun managedProfile(): WifiSavedProfile? =
+        state?.takeIf { dependencies.platformSupported && storageHealthy && it.managedWifi }?.lastApplied
+
     private fun activePriorityProfile(): WifiSavedProfile? {
-        val current = state ?: return null
-        if (!dependencies.platformSupported || !storageHealthy || !current.managedWifi ||
-            active != null
-        ) return null
-        return current.lastApplied?.takeIf { profile ->
-            profile.prioritizeNetworks && profile.revision == current.policyRevision && profile.networks.isNotEmpty() &&
+        if (active != null) return null
+        return managedProfile()?.takeIf { profile ->
+            profile.prioritizeNetworks && profile.networks.isNotEmpty() &&
                 (profile.networks.size > 1 || profile.networks[0].identity != profile.primaryIdentity)
         }
     }
 
-    private fun reconcilePriority() {
-        val profile = activePriorityProfile()
+    private fun reconcilePriority(profile: WifiSavedProfile?, observations: List<WifiLocalNetworkObservation>?) {
         if (profile == null) {
             resetPriority()
             setMonitor(WifiPriorityMonitorStatus.OFF)
             return
         }
-        val runtime = priority ?: PriorityRuntime().also { priority = it }
-        if (runtime.connection == null) {
-            runtime.connection = try {
-                connectivity.observe {
-                    worker.execute {
-                        if (priority === runtime && active == null) reconcilePriority()
-                    }
-                }
-            } catch (_: Exception) {
-                setMonitor(if (profile.autoReturn) WifiPriorityMonitorStatus.UNSUPPORTED else WifiPriorityMonitorStatus.OFF)
-                return
-            }
+        if (observations == null) {
+            resetPriority()
+            setMonitor(if (profile.autoReturn) WifiPriorityMonitorStatus.UNSUPPORTED else WifiPriorityMonitorStatus.OFF)
+            return
         }
-        val connected = priorityConnection(runtime)
+        val runtime = priority ?: PriorityRuntime().also { priority = it }
+        val connected = observations.maxByOrNull { it.sequence }
         if (connected == null) {
             stopScanner(runtime)
             setMonitor(WifiPriorityMonitorStatus.OFF)
@@ -751,14 +799,9 @@ internal class WifiSettingsController internal constructor(
         }
         val scanner = dependencies.priorityScanSource
         if (scanner == null) setMonitor(WifiPriorityMonitorStatus.UNSUPPORTED)
-        else if (runtime.scanToken == null) {
-            val token = Any()
-            runtime.scanToken = token
-            scanner.start(profile.networks) { event ->
-                worker.execute {
-                    if (priority === runtime && runtime.scanToken === token) onScan(runtime, event)
-                }
-            }
+        else if (!runtime.scanning) {
+            runtime.scanning = true
+            scanner.start(profile.networks) { event -> onScan(runtime, event) }
         }
     }
 
@@ -771,12 +814,12 @@ internal class WifiSettingsController internal constructor(
             if (priority !== runtime || runtime.disconnectCheck !== token) return@schedule
             runtime.disconnectCheck = null
             val profile = activePriorityProfile() ?: return@schedule
-            if (priorityConnection(runtime) == null) {
+            if (priorityConnection() == null) {
                 if (!startSelection(runtime, profile, profile.networks.indices.toList(), SelectionKind.RECONNECT)) {
                     runtime.reconnectFailures = (runtime.reconnectFailures + 1).coerceAtMost(DISCONNECT_MAX_RETRY_EXPONENT)
                     scheduleDisconnectedSelection(runtime)
                 }
-            } else reconcilePriority()
+            } else reconcileMonitoring()
         }
     }
 
@@ -789,10 +832,10 @@ internal class WifiSettingsController internal constructor(
         if (event.status != WifiPriorityMonitorStatus.MONITORING || event.visibleIdentities.isEmpty() ||
             now() < runtime.retryAllowedAt
         ) return
-        val connected = priorityConnection(runtime)
+        val connected = priorityConnection()
         val currentIndex = connected?.let { observation -> profile.networks.indexOfFirst { observationMatches(it, observation) } } ?: -1
         if (currentIndex <= 0) {
-            reconcilePriority()
+            reconcileMonitoring()
             return
         }
         val candidates = (0 until currentIndex).filter { profile.networks[it].identity in event.visibleIdentities }
@@ -811,7 +854,7 @@ internal class WifiSettingsController internal constructor(
             return false
         }
         if (selectionKind == SelectionKind.AUTO_RETURN) setMonitor(WifiPriorityMonitorStatus.SWITCHING)
-        startAttempt(Attempt(UUID.randomUUID().toString(), profile, candidates,
+        startAttempt(Attempt(profile, candidates,
             priority = runtime, selectionKind = selectionKind))
         return true
     }
@@ -820,12 +863,11 @@ internal class WifiSettingsController internal constructor(
         val runtime = priority ?: return
         stopScanner(runtime)
         priority = null
-        runCatching { runtime.connection?.close() }
     }
 
     private fun stopScanner(runtime: PriorityRuntime) {
-        if (runtime.scanToken == null) return
-        runtime.scanToken = null
+        if (!runtime.scanning) return
+        runtime.scanning = false
         dependencies.priorityScanSource?.stop()
     }
 
@@ -834,8 +876,8 @@ internal class WifiSettingsController internal constructor(
         publishView()
     }
 
-    private fun priorityConnection(runtime: PriorityRuntime): WifiLocalNetworkObservation? =
-        runtime.connection?.snapshot()?.filter { it.hasUsableIp }?.maxByOrNull { it.sequence }
+    private fun priorityConnection(): WifiLocalNetworkObservation? =
+        connection?.snapshot()?.filter { it.hasUsableIp }?.maxByOrNull { it.sequence }
 
     private fun observationMatches(profile: WifiNetworkProfile, observation: WifiLocalNetworkObservation): Boolean =
         profile.ssid == observation.ssid && wifiSecurityViewMatchesProfile(profile, observation.security)
@@ -846,9 +888,9 @@ internal class WifiSettingsController internal constructor(
 }
 
 private fun productionDependencies(context: Context): WifiControllerDependencies {
-    val worker = Executors.newSingleThreadScheduledExecutor { task ->
+    val worker = ScheduledThreadPoolExecutor(1) { task ->
         Thread(task, "wifi-settings").apply { isDaemon = true }
-    }
+    }.apply { removeOnCancelPolicy = true }
     val adapter = WifiManagerAdapter(context)
     val connectivity = AndroidWifiLocalConnectivitySource(context)
     return WifiControllerDependencies(
@@ -857,7 +899,7 @@ private fun productionDependencies(context: Context): WifiControllerDependencies
         adapter = adapter,
         nowElapsed = SystemClock::elapsedRealtime,
         connectivity = connectivity,
-        priorityScanSource = if (supportsManagedWifi()) systemWifiPriorityScanSource(context) else null,
+        priorityScanSource = if (supportsManagedWifi()) systemWifiPriorityScanSource(context, worker) else null,
         logWarning = { Log.w("WifiSettings", it) },
         platformSupported = supportsManagedWifi(),
         bootCount = Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT, -1),

@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from styly_mdm.wifi_settings import (
     WiFiSettingsError,
     public_networks,
+    public_wifi_state,
     validate_profile_networks,
 )
 
@@ -74,56 +73,23 @@ def test_network_limit_empty_unmanaged_and_same_ssid_security_identity():
         ])
 
 
-def test_wifi_state_never_forwards_credentials_or_unvalidated_results():
-    from styly_mdm.wifi_settings import public_wifi_state
-    raw = {"managed": True, "policy_revision": "11111111-1111-4111-8111-111111111111",
-           "busy": False, "available": True, "unavailable_reason": None,
-           "password": "secret", "last_result": {
-               "operation_id": "22222222-2222-4222-8222-222222222222",
-               "revision": "11111111-1111-4111-8111-111111111111", "status": "failed",
-               "reason": "PERMISSION_DENIED", "rolled_back": True, "password": "secret"}}
-    state = public_wifi_state(raw)
-    assert "secret" not in json.dumps(state)
-    assert "rolled_back" not in state["last_result"]
-    for value in ([], {}, {**raw, "busy": "yes"}, {**raw, "last_result": {"status": "success"}},
-                  {**raw, "unavailable_reason": ["secret"]}, {**raw, "policy_revision": "invalid"}):
-        assert public_wifi_state(value) is None
-
-
-def test_wifi_state_accepts_fallback_and_rejects_retired_reasons():
-    from styly_mdm.wifi_settings import public_wifi_state
-
+def test_wifi_state_exposes_only_valid_readiness_and_monitor_state():
     base = {
-        "managed": True,
-        "policy_revision": "11111111-1111-4111-8111-111111111111",
-        "busy": False,
-        "available": True,
-        "unavailable_reason": None,
+        "busy": True, "available": False, "unavailable_reason": "INITIALIZING", "priority_monitor": "off",
     }
-    fallback = public_wifi_state({**base, "last_result": {
-        "operation_id": "22222222-2222-4222-8222-222222222222",
-        "revision": base["policy_revision"], "status": "success", "reason": "FALLBACK",
-    }})
-    assert fallback["last_result"]["reason"] == "FALLBACK"
-
-    deferred = public_wifi_state({**base, "last_result": {
-        "operation_id": "22222222-2222-4222-8222-222222222222",
-        "revision": base["policy_revision"], "status": "failed", "reason": "VERIFY_AFTER_REBOOT",
-    }})
-    assert deferred["last_result"]["reason"] == "VERIFY_AFTER_REBOOT"
-
-    saved = public_wifi_state({**base, "last_result": {
-        "operation_id": "22222222-2222-4222-8222-222222222222",
-        "revision": base["policy_revision"], "status": "success", "reason": "SAVED",
-    }})
-    assert saved["last_result"]["reason"] == "SAVED"
-
-    for reason in ("REBOOT_REQUIRED", "PREVIOUS_CREDENTIAL_REQUIRED", "RESTORE_FAILED", "TIMEOUT_ROLLED_BACK"):
-        rejected = public_wifi_state({**base, "last_result": {
-            "operation_id": "22222222-2222-4222-8222-222222222222",
-            "revision": base["policy_revision"], "status": "failed", "reason": reason,
-        }})
-        assert rejected is None
+    assert public_wifi_state({**base, "password": "secret"}) == base
+    for reason in ("INITIALIZING", "PERMISSION_DENIED", "STORAGE_ERROR", "UNKNOWN", "UNSUPPORTED"):
+        state = {**base, "unavailable_reason": reason}
+        assert public_wifi_state(state) == state
+    for monitor in ("off", "monitoring", "degraded", "switching", "unsupported"):
+        state = {**base, "available": True, "unavailable_reason": None, "priority_monitor": monitor}
+        assert public_wifi_state(state) == state
+    for raw in (
+        [], {}, {**base, "busy": "yes"}, {**base, "available": 1},
+        {**base, "unavailable_reason": ["secret"]}, {**base, "unavailable_reason": "secret"},
+        {**base, "priority_monitor": None}, {**base, "priority_monitor": "secret"},
+    ):
+        assert public_wifi_state(raw) is None
 
 
 def test_configuration_result_preserves_verify_after_reboot_reason():

@@ -483,6 +483,7 @@
     groupPanel, packagePanel, packageList, createForm, getGroups, getDevice, openPackages,
     deviceIdHtml = (_, id) => esc(id), fetch = root.fetch.bind(root),
     confirmAction = message => root.confirm(message),
+    onSnapshot = () => {},
   }) {
     const secretType = root.CSS?.supports?.('-webkit-text-security', 'disc') ? 'text' : 'password';
     const groupEdits = new Map();
@@ -495,14 +496,13 @@
     let catalogError = '';
     let catalogContent = '';
     let items = new Map();
-    let lastResultPackage = null;
+    const resultSectionsByPackage = new Map();
+    let retryFailedResultSectionsOnOpen = false;
     let creating = false;
     const packagePath = id => '/api/packages/' + encodeURIComponent(id);
     const packageById = id => catalog?.find(candidate => candidate.package_id === id);
     const assignment = name => Object.hasOwn(snapshot?.assignments || {}, name) ? snapshot.assignments[name] : null;
-    function assignedPackage(model) {
-      return model.assignmentAck === undefined ? assignment(model.name) : model.assignmentAck;
-    }
+    const assignedPackage = model => assignment(model.name);
     function selectedPackage(model) {
       return model.selection === undefined ? assignedPackage(model) : model.selection;
     }
@@ -511,7 +511,7 @@
       return deployment?.package_id === packageId ? deployment : null;
     }
     function currentDeployment(model) {
-      return model.assignmentAck === undefined ? deploymentFor(model.name, assignment(model.name)) : null;
+      return deploymentFor(model.name, assignment(model.name));
     }
 
     function groupOutcomes(name, packageId, deployment) {
@@ -559,21 +559,26 @@
       return response.json();
     }
 
-    function updateSnapshot(data) {
-      snapshot = { assignments: data.assignments || {}, deployments: data.deployments || {} };
+    function updateSnapshot(data, source = 'http') {
+      if (!Number.isSafeInteger(data?.revision) || data.revision < 0 ||
+          typeof data?.server_instance_id !== 'string' || !data.server_instance_id) return false;
+      const instanceChanged = snapshot && data.server_instance_id !== snapshot.server_instance_id;
+      if (instanceChanged && source !== 'ws') return false;
+      if (!instanceChanged && snapshot && data.revision < snapshot.revision) return false;
+      snapshot = { server_instance_id: data.server_instance_id, revision: data.revision,
+        assignments: data.assignments || {}, deployments: data.deployments || {} };
       catalog = data.packages || [];
+      catalogError = '';
+      const currentGroups = data.groups || getGroups();
       for (const [name, model] of groupEdits) {
-        if (!Object.hasOwn(getGroups(), name)) {
+        if (!Object.hasOwn(currentGroups, name)) {
           groupEdits.delete(name);
-        } else if (model.assignmentAck !== undefined) {
-          if (!model.busy && !model.error && model.selection === undefined && assignment(name) !== model.assignmentAck) {
-            model.message = 'Check the current group package.';
-          }
-          delete model.assignmentAck;
         }
       }
       renderCatalog();
       renderPublication();
+      onSnapshot(data);
+      return true;
     }
 
     function renderCatalog() {
@@ -608,9 +613,12 @@
       const before = snapshot;
       try {
         const data = await api('/api/packages');
-        if (snapshot === before) catalog = data.packages;
+        if (snapshot === before) {
+          catalog = data.packages;
+          catalogError = '';
+        }
       } catch (_) {
-        catalogError = 'Could not load configuration packages.';
+        if (snapshot === before) catalogError = 'Could not load configuration packages.';
       } finally {
         catalogLoading = false;
         renderCatalog();
@@ -727,13 +735,20 @@
       readSections(data.sections);
     }
 
-    async function readResultSections(id) {
-      if (!id || items.size || lastResultPackage === id) return;
-      lastResultPackage = id;
+    async function readResultSections(id, retryFailed = false) {
+      if (!id) return;
+      const previous = resultSectionsByPackage.get(id);
+      if (previous?.status === 'loading' || previous?.status === 'loaded' ||
+          (previous?.status === 'failed' && !retryFailed)) return;
+      const request = { status: 'loading' };
+      resultSectionsByPackage.set(id, request);
       try {
         const data = await api(packagePath(id));
+        if (resultSectionsByPackage.get(id) !== request) return;
+        request.status = 'loaded';
         readSections(data.sections);
       } catch (_) {
+        if (resultSectionsByPackage.get(id) === request) request.status = 'failed';
         // Report status is available independently of setting labels and formatters.
       }
     }
@@ -863,6 +878,7 @@
 
     function renderGroup(name) {
       if (name !== (group?.name ?? null)) {
+        retryFailedResultSectionsOnOpen = Boolean(name);
         group = name ? groupEdits.get(name) || { name } : null;
         groupPanel.innerHTML = group ? `<section class="settings-section">
           <header><h3>Configuration package</h3><p>Deploy a package to this group, or deploy No package to stop managing settings and keep current device values.</p></header>
@@ -910,7 +926,6 @@
       let deployReason = '';
       if (!snapshot) deployReason = 'Waiting for group details to load.';
       else if (group.busy) deployReason = group.busy;
-      else if (group.assignmentAck !== undefined) deployReason = 'Waiting for the group to show the package change.';
       else if (selected && !known) deployReason = 'This package is unavailable. Choose another package.';
       else if (known && !known.published_revision) {
         deployReason = 'Open Edit package and select Save & deploy to deploy it first.';
@@ -920,10 +935,8 @@
       feedback.textContent = group.message || '';
       feedback.classList.toggle('settings-error', Boolean(group.error));
       const deployment = currentDeployment(group);
-      groupPanel.querySelector('[data-group-publication]').textContent = group.assignmentAck !== undefined
-        ? 'Waiting for the group update.'
-        : deployment ? 'Deployed version ' + deployment.revision
-          : assigned ? 'Not deployed yet.' : 'No package set for this group.';
+      groupPanel.querySelector('[data-group-publication]').textContent = deployment ? 'Deployed version ' + deployment.revision
+        : assigned ? 'Not deployed yet.' : 'No package set for this group.';
       renderResults();
     }
 
@@ -935,15 +948,7 @@
       if (!group) return;
       const target = groupPanel.querySelector('[data-settings-results]');
       const count = groupPanel.querySelector('[data-deployment-count]');
-      count.hidden = group.assignmentAck !== undefined || !assignedPackage(group);
-      if (group.assignmentAck !== undefined) {
-        const content = '<p class="settings-meta">Waiting for the group update before showing device results.</p>';
-        if (target.resultContent !== content) {
-          target.resultContent = content;
-          target.innerHTML = content;
-        }
-        return;
-      }
+      count.hidden = !assignedPackage(group);
       const deployment = currentDeployment(group);
       const assigned = assignedPackage(group);
       const openResults = new Set(Array.from(target.querySelectorAll('[data-result-device][open]'), result => result.dataset.resultDevice));
@@ -983,22 +988,17 @@
         target.resultContent = content;
         target.innerHTML = content;
       }
-      if (deployment) readResultSections(assigned);
-    }
-
-    function recordGroupPackageChange(model, before, packageId) {
-      if (snapshot === before) {
-        // The HTTP acknowledgment contains no deployment or member status.
-        model.assignmentAck = packageId;
-      } else if (assignment(model.name) !== packageId) {
-        model.message = 'Check the current group package.';
+      if (deployment && assigned) {
+        const retryFailed = retryFailedResultSectionsOnOpen;
+        retryFailedResultSectionsOnOpen = false;
+        readResultSections(assigned, retryFailed);
       }
-      delete model.selection;
     }
 
     async function deployPackage(model) {
       const assigned = assignedPackage(model);
       const id = selectedPackage(model);
+      const submittedSelection = model.selection;
       const path = '/api/group-package/deploy?' + new URLSearchParams({ name: model.name, package_id: id ?? '' });
       groupEdits.set(model.name, model);
       model.busy = 'Checking deployment targets…';
@@ -1015,15 +1015,24 @@
           return;
         }
         if (!confirmDeployment(fresh, { groupName: model.name })) return;
-        const beforeDeploy = snapshot;
         writing = true;
         model.busy = 'Starting deployment…';
         refreshGroup();
         const data = await api(path, 'POST', { expected_impact: fresh.impact.token });
-        model.message = data.package_id === null
-          ? 'No package deployed. This group has no managed settings.'
-          : 'Deployment started. Check Device status for results.';
-        recordGroupPackageChange(model, beforeDeploy, data.package_id);
+        const applied = updateSnapshot(data, 'http');
+        if (!applied) {
+          if (model.selection === submittedSelection) delete model.selection;
+          model.message = 'A newer group state arrived while deployment was in progress.';
+        } else if (assignment(model.name) !== id) {
+          delete model.selection;
+          model.error = true;
+          model.message = 'The group changed again. Check the current package before deploying.';
+        } else {
+          delete model.selection;
+          model.message = id === null
+            ? 'No package deployed. This group has no managed settings.'
+            : 'Deployment started. Check Device status for results.';
+        }
       } catch (error) {
         model.error = true;
         model.message = writing && (!error.status || error.status >= 500)

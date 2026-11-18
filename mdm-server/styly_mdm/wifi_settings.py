@@ -10,6 +10,9 @@ MAX_SSID_BYTES = 32
 PRIORITY_MONITOR_STATES = frozenset({
     "off", "monitoring", "degraded", "switching", "unsupported",
 })
+WIFI_UNAVAILABLE_REASONS = frozenset({
+    "INITIALIZING", "PERMISSION_DENIED", "STORAGE_ERROR", "UNKNOWN", "UNSUPPORTED",
+})
 
 
 class WiFiSettingsError(ValueError):
@@ -29,43 +32,25 @@ def normalize_revision(value: Any) -> str | None:
 WIFI_REASONS = {
     "NONE", "PERMISSION_DENIED", "UNSUPPORTED", "CONFIG_READ_FAILED",
     "UPDATE_FAILED", "VERIFY_FAILED", "VERIFY_AFTER_REBOOT", "FALLBACK", "SAVED",
-    "BUSY", "UNREACHABLE", "UNKNOWN", "UNSUPPORTED_HIDDEN_NETWORK",
+    "UNREACHABLE", "UNKNOWN", "UNSUPPORTED_HIDDEN_NETWORK",
     "UNSUPPORTED_PRIORITY_NETWORK_LIMIT",
 }
 
 
 def public_wifi_state(raw: Any) -> dict | None:
     """Accept only secret-free device telemetry; never forward arbitrary fields."""
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or type(raw.get("busy")) is not bool or type(raw.get("available")) is not bool:
         return None
-    if (type(raw.get("busy")) is not bool or type(raw.get("available")) is not bool or
-        (raw.get("managed") is not None and type(raw["managed"]) is not bool)):
-        return None
-    revision = raw.get("policy_revision")
-    if revision is not None and normalize_revision(revision) is None:
-        return None
-    result = raw.get("last_result")
-    if result is not None:
-        if (not isinstance(result, dict) or
-            normalize_revision(result.get("operation_id")) is None or
-            normalize_revision(result.get("revision")) is None or
-            result.get("status") not in ("success", "failed", "unknown") or
-            result.get("reason") not in tuple(WIFI_REASONS)):
-            return None
-        result = {key: result[key] for key in (
-            "operation_id", "revision", "status", "reason",
-        )}
     reason = raw.get("unavailable_reason")
-    if reason is not None and reason not in tuple(WIFI_REASONS | {"INITIALIZING", "STORAGE_ERROR"}):
+    if reason is not None and (not isinstance(reason, str) or reason not in WIFI_UNAVAILABLE_REASONS):
         return None
-    state = {
-        "managed": raw.get("managed"), "policy_revision": revision, "last_result": result,
-        "busy": raw["busy"], "available": raw["available"], "unavailable_reason": reason,
-    }
     priority_monitor = raw.get("priority_monitor")
-    if isinstance(priority_monitor, str) and priority_monitor in PRIORITY_MONITOR_STATES:
-        state["priority_monitor"] = priority_monitor
-    return state
+    if not isinstance(priority_monitor, str) or priority_monitor not in PRIORITY_MONITOR_STATES:
+        return None
+    return {
+        "busy": raw["busy"], "available": raw["available"], "unavailable_reason": reason,
+        "priority_monitor": priority_monitor,
+    }
 
 
 def validate_profile_networks(

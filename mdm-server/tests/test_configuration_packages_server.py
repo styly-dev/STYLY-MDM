@@ -433,7 +433,10 @@ def test_group_deploy_assigns_atomically_redeploys_and_reuses_the_current_versio
                 await _assert_no_policy(studio)
                 await _assert_no_policy(gallery)
 
-                assert await _request(session, "POST", base, path("Studio"), request) == {"package_id": package_id}
+                assigned = await _request(session, "POST", base, path("Studio"), request)
+                assert assigned == json.loads(server.build_group_list_msg())
+                assert assigned["type"] == "GROUP_LIST"
+                assert assigned["assignments"]["Studio"] == package_id
                 scoped_policy = _policy(package, {"brightness": 40}, group="Studio")
                 assert scoped_policy["revision"] != package["published_revision"]
                 assert await _receive_type(studio, "CONFIGURATION_POLICY") == scoped_policy
@@ -487,7 +490,10 @@ def test_deploy_no_package_clears_management_for_only_the_selected_group(tmp_pat
                 assert preview["clear"] is True
                 assert (preview["impact"]["groups"], preview["impact"]["devices"]) == (1, 2)
                 request = {"expected_impact": preview["impact"]["token"]}
-                assert await _request(session, "POST", base, path, request) == {"package_id": None}
+                cleared = await _request(session, "POST", base, path, request)
+                assert cleared == json.loads(server.build_group_list_msg())
+                assert cleared["type"] == "GROUP_LIST"
+                assert "Studio" not in cleared["assignments"]
                 assert await _receive_type(studio, "CONFIGURATION_POLICY") == NO_POLICY
                 await _assert_no_policy(gallery)
                 snapshot = json.loads(server.build_group_list_msg())
@@ -549,7 +555,9 @@ def test_group_assignment_and_membership_release_and_referenced_delete(tmp_path)
             first = await _deploy(session, base, first, settings=_brightness(30))
             other = await _create(session, base, "Gallery")
             other = await _deploy(session, base, other, settings=_brightness(75))
-            assert await _assign(session, base, group, other) == {"package_id": other["package_id"]}
+            assigned = await _assign(session, base, group, other)
+            assert assigned == json.loads(server.build_group_list_msg())
+            assert assigned["assignments"][group] == other["package_id"]
             async with (session.ws_connect(base + "/ws/device", autoping=False) as ws,
                         session.ws_connect(base + "/ws/admin") as admin):
                 await _register(ws)
@@ -706,10 +714,295 @@ def test_telemetry_coalescer_runs_once_with_the_latest_state_and_flushes():
         await coalescer.flush(run=True)
         assert runs == [3, 4]
 
+        state["value"] = 5
+        coalescer.schedule()
+        state["value"] = 6
+        await coalescer.flush(run=True)
+        assert runs == [3, 4, 6]
+
         coalescer.schedule()
         await coalescer.flush(run=False)
         await asyncio.sleep(0.1)
-        assert runs == [3, 4]
+        assert runs == [3, 4, 6]
+
+    asyncio.run(body())
+
+
+def test_coalescer_serializes_work_and_runs_once_again_for_requests_during_work():
+    async def body():
+        state = {"value": 0}
+        started = asyncio.Event()
+        release_first = asyncio.Event()
+        second_finished = asyncio.Event()
+        snapshots = []
+        calls = 0
+        active = 0
+        max_active = 0
+
+        async def work():
+            nonlocal calls, active, max_active
+            calls += 1
+            active += 1
+            max_active = max(max_active, active)
+            snapshots.append(state["value"])
+            try:
+                if calls == 1:
+                    started.set()
+                    await release_first.wait()
+            finally:
+                active -= 1
+                if calls == 2:
+                    second_finished.set()
+
+        coalescer = server._Coalescer(0.01, work, "test")
+        coalescer.schedule()
+        await asyncio.wait_for(started.wait(), 1)
+        for value in (1, 2, 3):
+            state["value"] = value
+            coalescer.schedule()
+
+        await asyncio.sleep(0.04)
+        assert calls == 1
+        assert max_active == 1
+
+        state["value"] = 4
+        flush_task = asyncio.create_task(coalescer.flush(run=True))
+        await asyncio.sleep(0)
+        assert not flush_task.done()
+        release_first.set()
+        await asyncio.wait_for(flush_task, 1)
+        await asyncio.wait_for(second_finished.wait(), 1)
+        assert snapshots == [0, 4]
+        assert calls == 2
+        assert max_active == 1
+
+    asyncio.run(body())
+
+
+def test_coalescer_keeps_minimum_interval_between_pending_runs():
+    async def body():
+        started = asyncio.Event()
+        release_first = asyncio.Event()
+        second_started = asyncio.Event()
+        start_times = []
+        delay = 0.08
+
+        async def work():
+            start_times.append(asyncio.get_running_loop().time())
+            if len(start_times) == 1:
+                started.set()
+                await release_first.wait()
+            else:
+                second_started.set()
+
+        coalescer = server._Coalescer(delay, work, "test")
+        coalescer.schedule()
+        await asyncio.wait_for(started.wait(), 1)
+        coalescer.schedule()
+        release_first.set()
+        await asyncio.wait_for(second_started.wait(), 1)
+
+        assert start_times[1] - start_times[0] >= delay - 0.01
+        await coalescer.flush(run=False)
+
+    asyncio.run(body())
+
+
+def test_coalescer_flush_false_cancels_and_joins_in_flight_work():
+    async def body():
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def work():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        coalescer = server._Coalescer(0.01, work, "test")
+        coalescer.schedule()
+        await asyncio.wait_for(started.wait(), 1)
+        await asyncio.wait_for(coalescer.flush(run=False), 1)
+
+        assert cancelled.is_set()
+        assert coalescer._task is None
+
+    asyncio.run(body())
+
+
+def test_admin_send_timeout_includes_waiting_for_console_send_lock(monkeypatch):
+    class FakeAdminSocket:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+            self.close_calls = 0
+
+        async def send_str(self, message):
+            self.sent.append(message)
+
+        async def close(self, **kwargs):
+            self.closed = True
+            self.close_calls += 1
+
+    async def body():
+        ws = FakeAdminSocket()
+        lock = asyncio.Lock()
+        await lock.acquire()
+        monkeypatch.setattr(server, "admin_connections", {ws})
+        monkeypatch.setattr(server, "_admin_send_locks", {ws: lock})
+        monkeypatch.setattr(server, "ADMIN_SEND_TIMEOUT", 0.05)
+        started = asyncio.get_running_loop().time()
+
+        await asyncio.gather(
+            server._queue_admin_message("snapshot"),
+            server._queue_admin_message("snapshot"),
+        )
+
+        assert asyncio.get_running_loop().time() - started < 0.5
+        assert ws.sent == []
+        assert ws.closed
+        assert ws.close_calls == 1
+        assert ws not in server.admin_connections
+        assert lock.locked()
+        lock.release()
+
+    asyncio.run(body())
+
+
+def test_admin_fanout_does_not_reinsert_a_lock_after_disconnect():
+    class FakeAdminSocket:
+        async def send_str(self, _message):
+            raise AssertionError("disconnected admin should not receive a frame")
+
+    async def body():
+        ws = FakeAdminSocket()
+        server.admin_connections.add(ws)
+        server._admin_send_locks.clear()
+
+        pending_send = server._queue_admin_message("snapshot")
+        server.admin_connections.discard(ws)
+        server._admin_send_locks.pop(ws, None)
+        await pending_send
+
+        assert ws not in server._admin_send_locks
+
+    asyncio.run(body())
+
+
+def test_device_list_is_not_built_or_scheduled_without_admins(monkeypatch):
+    schedules = []
+
+    def fail_build():
+        raise AssertionError("device list should not be built with no admins")
+
+    monkeypatch.setattr(server, "admin_connections", set())
+    monkeypatch.setattr(server, "build_device_list_msg", fail_build)
+    monkeypatch.setattr(server._device_list_broadcast, "schedule", lambda: schedules.append(True))
+
+    async def body():
+        await server.broadcast_device_list()
+        server._schedule_device_list_broadcast()
+
+    asyncio.run(body())
+    assert schedules == []
+
+
+def test_register_and_disconnect_lists_are_coalesced_for_canonical_devices(tmp_path, monkeypatch):
+    async def body():
+        async with _running_server(tmp_path) as (session, base):
+            async with session.ws_connect(base + "/ws/admin") as admin:
+                for kind in (
+                    "SERVER_INFO", "CLIENT_APK_INFO", "DEVICE_LIST",
+                    "PROVISIONAL_CONNECTION_LIST", "GROUP_LIST",
+                ):
+                    await _receive_type(admin, kind)
+
+                build_device_list = server.build_device_list_msg
+                build_calls = []
+                provisional_calls = []
+
+                def counted_device_list():
+                    build_calls.append(True)
+                    return build_device_list()
+
+                async def count_provisional_list():
+                    provisional_calls.append(True)
+
+                monkeypatch.setattr(server, "build_device_list_msg", counted_device_list)
+                monkeypatch.setattr(server, "broadcast_provisional_connection_list", count_provisional_list)
+
+                async with (
+                    session.ws_connect(base + "/ws/device") as first,
+                    session.ws_connect(base + "/ws/device") as second,
+                ):
+                    await _register(first, {**REGISTRATION, "device_id": DEVICE_ID})
+                    await _register(second, {**REGISTRATION, "device_id": OTHER_ID})
+                    await _receive_type(first, "CONFIGURATION_POLICY")
+                    await _receive_type(second, "CONFIGURATION_POLICY")
+                    updated = await _receive_type(admin, "DEVICE_LIST")
+                    assert {entry["device_id"] for entry in updated["devices"]} == {DEVICE_ID, OTHER_ID}
+                    assert len(build_calls) == 1
+                    assert provisional_calls == []
+
+                    await asyncio.gather(first.close(), second.close())
+                    disconnected = await _receive_type(admin, "DEVICE_LIST")
+                    assert all(entry["status"] == "offline" for entry in disconnected["devices"])
+                    assert len(build_calls) == 2
+                    with pytest.raises(asyncio.TimeoutError):
+                        await asyncio.wait_for(admin.receive(), 0.2)
+
+    asyncio.run(body())
+
+
+def test_membership_snapshot_precedes_requester_ack_while_peer_send_stalls(tmp_path, monkeypatch):
+    class RecordingAdmin:
+        def __init__(self):
+            self.messages = []
+
+        async def send_str(self, raw):
+            self.messages.append(json.loads(raw))
+
+    class SlowPeer(RecordingAdmin):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def send_str(self, raw):
+            message = json.loads(raw)
+            if message["type"] == "GROUP_LIST":
+                self.started.set()
+                await self.release.wait()
+            await super().send_str(raw)
+
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        server.REGISTRY_PATH.write_text(json.dumps({
+            "devices": {},
+            "groups": {"Studio": []},
+        }))
+        server.load_registry()
+        monkeypatch.setattr(server, "_admin_send_locks", {})
+        requester = RecordingAdmin()
+        peer = SlowPeer()
+        server.admin_connections.update((requester, peer))
+        device_id = "44444444-4444-4444-8444-444444444444"
+
+        operation = asyncio.create_task(server.handle_update_group_members(
+            requester, {"name": "Studio", "add": {device_id: None}, "remove": []},
+        ))
+        try:
+            await asyncio.wait_for(peer.started.wait(), 1)
+            assert [message["type"] for message in requester.messages] == [
+                "GROUP_LIST", "GROUP_MEMBERS_SET",
+            ]
+            assert requester.messages[0]["groups"] == {"Studio": [device_id]}
+            assert not operation.done()
+        finally:
+            peer.release.set()
+        await asyncio.wait_for(operation, 1)
+        assert peer.messages[-1]["groups"] == {"Studio": [device_id]}
 
     asyncio.run(body())
 
@@ -845,7 +1138,9 @@ def test_deploy_response_and_admin_metadata_do_not_wait_for_device_delivery(tmp_
 
             monkeypatch.setattr(server, "_publish_configuration", hold_device_delivery)
             async with session.ws_connect(base + "/ws/admin") as other_console:
-                before = (await _receive_type(other_console, "GROUP_LIST"))["deployments"]
+                before_snapshot = await _receive_type(other_console, "GROUP_LIST")
+                before_revision = before_snapshot["revision"]
+                before = before_snapshot["deployments"]
                 assert before == ({} if deployment == "group" else {"Studio": {
                     "package_id": saved["package_id"], "revision": _group_revision("Studio"),
                     "keys": ["wifi"], "wifi_mode": "priority",
@@ -859,8 +1154,12 @@ def test_deploy_response_and_admin_metadata_do_not_wait_for_device_delivery(tmp_
                     assert not released.is_set()
                     # A second HTTP request is also usable while delivery is blocked.
                     published = await asyncio.wait_for(_request(session, "GET", base, _path(saved)), 1)
-                    assert result == (published if deployment == "package" else {"package_id": saved["package_id"]})
                     group_list = await _receive_type(other_console, "GROUP_LIST")
+                    if deployment == "package":
+                        assert result == published
+                    else:
+                        assert result == group_list
+                    assert group_list["revision"] > before_revision
                     assert group_list["groups"] == {"Studio": [DEVICE_ID]}
                     assert group_list["assignments"] == {"Studio": saved["package_id"]}
                     assert secret not in json.dumps(group_list)

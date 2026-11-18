@@ -3,9 +3,7 @@ package com.styly.mdmclient
 import java.io.File
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
-import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -15,7 +13,7 @@ class WifiSettingsStoreTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
-    fun `v4 round trip preserves ordered candidates and the latest result`() {
+    fun `v5 round trip preserves ordered candidates and the latest result`() {
         val file = File(temporaryFolder.newFolder("wifi-state"), "state.json")
         val store = WifiSettingsStore(file) {}
         val preferred = WifiNetworkProfile("office-a", "WPA2_WPA3", "first-password", hidden = false)
@@ -25,31 +23,50 @@ class WifiSettingsStoreTest {
                 "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", listOf(preferred, fallback), autoReturn = true,
             ),
             latestResult = WifiManualResult(
-                "11111111-1111-4111-8111-111111111111",
                 "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
                 "success",
                 WifiReason.FALLBACK,
             ),
             managedWifi = true,
-            policyRevision = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         )
 
         store.write(expected)
 
         assertEquals(expected, store.read())
         val encoded = JSONObject(file.readText())
-        assertEquals(4, encoded.getInt("version"))
+        assertEquals(5, encoded.getInt("version"))
         assertEquals(
-            setOf("version", "last_applied", "latest_result", "managed_wifi", "policy_revision"),
+            setOf("version", "last_applied", "latest_result", "managed_wifi"),
             encoded.keys().asSequence().toSet(),
         )
-        assertFalse(encoded.has("manual_operation"))
-        assertFalse(encoded.has("recovery_snapshot"))
         assertEquals("office-a", encoded.getJSONObject("last_applied").getJSONArray("networks")
             .getJSONObject(0).getString("ssid"))
         assertEquals("office-b", encoded.getJSONObject("last_applied").getJSONArray("networks")
             .getJSONObject(1).getString("ssid"))
-        assertEquals("FALLBACK", encoded.getJSONObject("latest_result").getString("reason"))
+        val result = encoded.getJSONObject("latest_result")
+        assertEquals(setOf("revision", "status", "reason"), result.keySet())
+        assertEquals("FALLBACK", result.getString("reason"))
+    }
+
+    @Test
+    fun `v4 boot markers migrate by fingerprinting their saved credential`() {
+        val network = WifiNetworkProfile("office-a", "WPA2_WPA3", "first-password", hidden = false)
+        val profile = WifiSavedProfile("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", listOf(network))
+        val legacy = JSONObject(WifiSettingsCodec.encode(WifiLocalState(lastApplied = profile)))
+            .put("version", 4)
+        legacy.getJSONObject("last_applied").put(
+            "unverified_on_boot", JSONObject().put(network.identity, 133),
+        )
+
+        val migrated = WifiSettingsCodec.decode(legacy.toString())
+        val marker = migrated.lastApplied!!.unverifiedOnBoot.getValue(network.identity)
+
+        assertEquals(133, marker.bootCount)
+        assertEquals(wifiPasswordHash(network.password), marker.passwordHash)
+        val upgraded = JSONObject(WifiSettingsCodec.encode(migrated))
+        assertEquals(5, upgraded.getInt("version"))
+        assertEquals(133, upgraded.getJSONObject("last_applied")
+            .getJSONObject("unverified_on_boot").getJSONObject(network.identity).getInt("boot_count"))
     }
 
     @Test
@@ -75,27 +92,10 @@ class WifiSettingsStoreTest {
     }
 
     @Test
-    fun `v4 records without primary identity default to their first saved network`() {
-        val primary = WifiNetworkProfile("office-a", "WPA2_WPA3", "first-password", hidden = false)
-        val fallback = WifiNetworkProfile("office-b", "WPA2_WPA3", "second-password", hidden = false)
-        val profile = WifiSavedProfile(
-            revision = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            networks = listOf(primary, fallback),
-            primaryIdentity = fallback.identity,
-        )
-        val legacyJson = JSONObject(WifiSettingsCodec.encode(WifiLocalState(lastApplied = profile)))
-        legacyJson.getJSONObject("last_applied").remove("primary_identity")
-
-        assertEquals(4, legacyJson.getInt("version"))
-        assertEquals(primary.identity, WifiSettingsCodec.decode(legacyJson.toString()).lastApplied!!.primaryIdentity)
-        assertTrue(WifiSettingsCodec.decode(legacyJson.toString()).lastApplied!!.prioritizeNetworks)
-    }
-
-    @Test
     fun `unsupported state versions are rejected and their files are preserved`() {
         val file = File(temporaryFolder.newFolder("wifi-state-unsupported"), "state.json")
         val store = WifiSettingsStore(file) {}
-        for (version in listOf(1, 2, 3, 5)) {
+        for (version in listOf(1, 2, 3, 6)) {
             val saved = JSONObject(WifiSettingsCodec.encode(WifiLocalState())).put("version", version).toString()
             file.writeText(saved)
 

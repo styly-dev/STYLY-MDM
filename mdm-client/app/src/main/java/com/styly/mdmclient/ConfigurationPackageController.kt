@@ -75,7 +75,7 @@ internal data class ConfigurationAttempt(
                 results = json.getJSONObject("results"),
                 retryIds = (0 until retryIds.length()).map(retryIds::getString).toSet(),
                 failedWifiFingerprint = json.opt("failed_wifi_fingerprint") as? String,
-                scalarTargets = json.optJSONObject("scalar_targets") ?: JSONObject(),
+                scalarTargets = json.getJSONObject("scalar_targets"),
                 wifiConnectionCheckRevision = (json.opt("wifi_connection_check_revision") as? String)
                     ?.takeIf(WifiSettingsProtocol::isValidUuid),
                 bootReapply = json.optBoolean("boot_reapply"),
@@ -186,6 +186,7 @@ internal class ConfigurationPackageController(
         val policy: Policy,
         val retryId: String?,
         val isCurrent: () -> Boolean,
+        val forceApply: Boolean,
         var ready: Boolean,
     )
 
@@ -262,6 +263,9 @@ internal class ConfigurationPackageController(
             }
             val token = assignment?.takeIf { it.policy.version == policy.version && it.policy.supportsApply == supportsApply }
                 ?.token ?: Any()
+            val resumesSupersededApply = pending?.takeIf { assignment?.token === token }?.forceApply == true ||
+                (applyingWifi && assignment?.policy?.version != policy.version &&
+                    policy.version?.let { journal?.find(it)?.status == "applying" } == true)
             val effectiveRetry = if (startingAssignment) null
                 else retryId ?: pending?.takeIf { assignment?.token === token }?.retryId
             // Try to cache the new assignment, including a removal, before the Wi-Fi worker acts on it.
@@ -274,20 +278,25 @@ internal class ConfigurationPackageController(
             assignment = selected
             pending = null
             // An authoritative removal still stops live management if writing its marker failed.
-            if (cached || (supportsApply && policy.version == null)) queue(selected, effectiveRetry)
-            else if (supportsApply && policy.version != null) publish(storageError(policy, journal?.find(policy.version)))
+            if (cached || (supportsApply && policy.version == null)) {
+                queue(selected, effectiveRetry, forceApply = resumesSupersededApply)
+            } else if (supportsApply && policy.version != null) {
+                publish(storageError(policy, journal?.find(policy.version)))
+            }
             reconcile()
         }
     }
 
-    private fun queue(selected: Assignment, retryId: String?) {
+    private fun queue(selected: Assignment, retryId: String?, forceApply: Boolean = false) {
         val policy = selected.policy
         val releasing = policy.version == null || policy.values.optJSONObject("wifi") == null
         // An accepted policy belongs to the assignment, even if the delivering socket is replaced.
-        val delivery = Delivery(policy, retryId, { assignment?.token === selected.token }, ready = !releasing)
+        val delivery = Delivery(
+            policy, retryId, { assignment?.token === selected.token }, forceApply, ready = !releasing,
+        )
         pending = delivery
         if (!releasing) return
-        wifi.stopManagingPolicy(policy.version?.revision) { recorded ->
+        wifi.stopManagingPolicy { recorded ->
             worker.execute releaseRecorded@{
                 if (pending !== delivery) return@releaseRecorded
                 // Clear the cached policy only after Wi-Fi has durably recorded the release.
@@ -325,7 +334,7 @@ internal class ConfigurationPackageController(
         policy.supportsApply && policy.version != null && assignment?.cached == true &&
             pending == null && !applyingWifi && journal != null && boot >= 0 && sdkReady &&
             journal?.find(policy.version)?.status != "applying" &&
-            (policy.values.optJSONObject("wifi") == null || wifi.readyForPolicy())
+            (policy.values.optJSONObject("wifi") == null || wifi.canReapplyPolicy())
 
     private fun publishScreenState() {
         val policy = latestPolicy ?: return
@@ -383,8 +392,12 @@ internal class ConfigurationPackageController(
         }
         val previous = current.find(version)
         val afterReboot = current.latest?.let { it.bootCount != boot } ?: (cachedVersionFromEarlierBoot != null)
-        val retryId = delivery.retryId?.takeIf { current.shouldApply(version, boot, it) }
-        val automatic = (delivery.retryId == null || afterReboot) && current.shouldApply(version, boot, null)
+        // An interrupted report can precede the first journal claim if caching the assignment failed.
+        val interruptedBeforeClaim = previous == null &&
+            reported?.takeIf { it.version == version }?.status == "interrupted"
+        val retryId = delivery.retryId?.takeIf { interruptedBeforeClaim || current.shouldApply(version, boot, it) }
+        val automatic = delivery.forceApply ||
+            ((delivery.retryId == null || afterReboot) && current.shouldApply(version, boot, null))
         if (retryId == null && !automatic) {
             pending = null
             if (previous != null) {
@@ -394,7 +407,7 @@ internal class ConfigurationPackageController(
         }
         if (boot < 0 || !sdkReady) return
         val applyScalars = dependencies.scalarWriter() ?: return
-        if (wifiPolicy != null && !wifi.canProcessPolicy()) return
+        if (wifiPolicy != null && !wifi.canAcceptPolicy()) return
 
         val baseline = current.latest?.takeIf {
             retryId == null && it.bootCount == boot
@@ -438,7 +451,6 @@ internal class ConfigurationPackageController(
             scalarTargets.put(key, value)
             val previousResult = baseline?.results?.optJSONObject(key)
             val previousValue = baseline?.scalarTargets?.opt(key)
-                ?: previousResult?.takeIf { it.optString("status") == "applied" }?.opt("value")
             if (previousResult != null && sameScalarTarget(key, previousValue, value)) {
                 results.put(key, previousResult)
             } else scalarValues.put(key, value)
@@ -484,7 +496,13 @@ internal class ConfigurationPackageController(
                 worker.execute {
                     applyingWifi = false
                     // A released or replaced assignment cannot restore its old deduplication history.
-                    if (isCurrent()) finishWifi(checkpoint, result, fingerprint, confirmWifiAfterTimeout)
+                    if (isCurrent()) {
+                        finishWifi(checkpoint, result, fingerprint, confirmWifiAfterTimeout)
+                    } else if (journal?.find(version) === checkpoint) {
+                        // Fence the stale operation while allowing a later reassignment of
+                        // this version to start a fresh attempt in the same boot.
+                        persist(checkpoint.copy(status = "interrupted"))
+                    }
                     reconcile()
                 }
             })

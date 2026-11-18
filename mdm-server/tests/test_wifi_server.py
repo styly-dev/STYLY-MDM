@@ -12,105 +12,7 @@ from styly_mdm import configuration_packages, server
 from server_test_helpers import reset_server_state
 
 
-DEVICE_V4 = "11111111-1111-4111-8111-111111111111"
-DEVICE_OLD = "22222222-2222-4222-8222-222222222222"
-
-
-def test_registration_advertises_new_wifi_capability_only():
-    kind, registered = server._parse_registration({
-        "identity_scheme": server.IDENTITY_SCHEME,
-        "device_id": DEVICE_V4,
-        "capabilities": ["wifi_settings_v4"],
-    }, "127.0.0.1")
-    assert kind == "canonical"
-    assert "wifi_settings_v4" in registered["capabilities"]
-
-    _, old = server._parse_registration({
-        "identity_scheme": server.IDENTITY_SCHEME,
-        "device_id": DEVICE_OLD,
-        "capabilities": ["wifi_settings_v3"],
-    }, "127.0.0.1")
-    assert "wifi_settings_v4" not in old["capabilities"]
-
-
-def test_priority_monitor_is_optional_allowlisted_and_unknown_values_are_ignored():
-    revision = "44444444-4444-4444-8444-444444444444"
-    base = {"managed": True, "policy_revision": revision, "last_result": None,
-            "busy": False, "available": True, "unavailable_reason": None}
-
-    legacy = server.public_wifi_state(base)
-    assert legacy is not None
-    assert "priority_monitor" not in legacy
-
-    for monitor in ("off", "monitoring", "degraded", "switching", "unsupported"):
-        accepted = server.public_wifi_state({**base, "priority_monitor": monitor})
-        assert accepted is not None
-        assert accepted["priority_monitor"] == monitor
-
-    for monitor in ("future_state", None, 1, {"status": "monitoring"}):
-        accepted = server.public_wifi_state({**base, "priority_monitor": monitor})
-        assert accepted is not None
-        assert "priority_monitor" not in accepted
-
-
-def test_priority_failure_reasons_survive_wifi_state_sanitization():
-    revision = "44444444-4444-4444-8444-444444444444"
-    for reason in (
-        "UNSUPPORTED_HIDDEN_NETWORK", "UNSUPPORTED_PRIORITY_NETWORK_LIMIT",
-    ):
-        raw = {
-            "managed": True,
-            "policy_revision": revision,
-            "last_result": {
-                "operation_id": DEVICE_OLD,
-                "revision": revision,
-                "status": "failed",
-                "reason": reason,
-                "password": "must-not-be-forwarded",
-            },
-            "busy": False,
-            "available": True,
-            "unavailable_reason": None,
-        }
-        state = server.public_wifi_state(raw)
-        assert state is not None
-        assert state["last_result"] == {
-            "operation_id": DEVICE_OLD,
-            "revision": revision,
-            "status": "failed",
-            "reason": reason,
-        }
-        assert "must-not-be-forwarded" not in json.dumps(state)
-
-    rejected = server.public_wifi_state({
-        "managed": True,
-        "policy_revision": revision,
-        "last_result": {
-            "operation_id": DEVICE_OLD,
-            "revision": revision,
-            "status": "failed",
-            "reason": "RESTORE_FAILED",
-        },
-        "busy": False,
-        "available": True,
-        "unavailable_reason": None,
-    })
-    assert rejected is None
-
-    fallback = server.public_wifi_state({
-        "managed": True,
-        "policy_revision": revision,
-        "last_result": {
-            "operation_id": DEVICE_OLD,
-            "revision": revision,
-            "status": "success",
-            "reason": "FALLBACK",
-        },
-        "busy": False,
-        "available": True,
-        "unavailable_reason": None,
-    })
-    assert fallback["last_result"]["reason"] == "FALLBACK"
+DEVICE_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def test_priority_unsupported_reasons_are_preserved_in_configuration_state():
@@ -164,15 +66,13 @@ def test_priority_monitor_broadcast_and_registration_survive_reconnect(tmp_path)
         server.devices.clear()
         server.admin_connections.clear()
         server.REGISTRY_PATH.write_text(json.dumps({"devices": {}, "groups": {}}))
-        revision = "44444444-4444-4444-8444-444444444444"
         base_state = {
-            "managed": True, "policy_revision": revision, "last_result": None,
             "busy": False, "available": True, "unavailable_reason": None,
             "priority_monitor": "monitoring",
         }
         registration = {
             "type": "REGISTER", "identity_scheme": server.IDENTITY_SCHEME,
-            "device_id": DEVICE_V4, "capabilities": ["wifi_settings_v4"],
+            "device_id": DEVICE_ID,
             "wifi_state": base_state,
         }
 
@@ -197,7 +97,7 @@ def test_priority_monitor_broadcast_and_registration_survive_reconnect(tmp_path)
         server.devices.clear()
         server.admin_connections.clear()
         server.load_registry()
-        assert server.device_registry[DEVICE_V4]["wifi_state"]["priority_monitor"] == "switching"
+        assert server.device_registry[DEVICE_ID]["wifi_state"]["priority_monitor"] == "switching"
 
         second_server = await run_server()
         base = str(second_server.make_url("/")).rstrip("/")
@@ -245,11 +145,9 @@ def test_device_wifi_reports_survive_reconnect_and_reject_stale_socket(tmp_path)
         test_server = TestServer(server.create_app())
         await test_server.start_server()
         base = str(test_server.make_url("/")).rstrip("/")
-        revision = "44444444-4444-4444-8444-444444444444"
-        state = {"managed": True, "policy_revision": revision, "last_result": None,
-                 "busy": False, "available": True, "unavailable_reason": None}
+        state = {"busy": False, "available": True, "unavailable_reason": None, "priority_monitor": "off"}
         registration = {"type": "REGISTER", "identity_scheme": server.IDENTITY_SCHEME,
-                        "device_id": DEVICE_V4, "capabilities": ["wifi_settings_v4"],
+                        "device_id": DEVICE_ID,
                         "wifi_state": state}
         async with aiohttp.ClientSession() as session:
             old = await session.ws_connect(base + "/ws/device", autoping=False)
@@ -262,25 +160,24 @@ def test_device_wifi_reports_survive_reconnect_and_reject_stale_socket(tmp_path)
             await live.send_json(registration)
             await receive_type(live, "REGISTERED")
             await receive_type(admin, "DEVICE_LIST")
-            failed = {**state, "last_result": {"operation_id": DEVICE_OLD, "revision": revision,
-                      "status": "failed", "reason": "PERMISSION_DENIED"}}
-            await old.send_json({"type": "WIFI_STATE", "wifi_state": {**state, "managed": False}})
+            unavailable = {**state, "available": False, "unavailable_reason": "PERMISSION_DENIED"}
+            await old.send_json({"type": "WIFI_STATE", "wifi_state": {**state, "busy": True}})
             # PONG proves the server read the preceding frame on this socket before
             # the live connection can overwrite an incorrectly accepted update.
             await old.ping(b"stale-processed")
             await asyncio.wait_for(receive_stale_barrier(old), 2)
-            assert server.devices[DEVICE_V4]["wifi_state"] == state
-            assert server.device_registry[DEVICE_V4]["wifi_state"] == state
-            await live.send_json({"type": "WIFI_STATE", "wifi_state": failed})
-            rows = await receive_device_list(admin, lambda row: row["wifi_state"] == failed)
-            assert rows[0]["wifi_state"] == failed
+            assert server.devices[DEVICE_ID]["wifi_state"] == state
+            assert server.device_registry[DEVICE_ID]["wifi_state"] == state
+            await live.send_json({"type": "WIFI_STATE", "wifi_state": unavailable})
+            rows = await receive_device_list(admin, lambda row: row["wifi_state"] == unavailable)
+            assert rows[0]["wifi_state"] == unavailable
             # A repeated or invalid report changes nothing, so the next list is the battery update.
-            await live.send_json({"type": "WIFI_STATE", "wifi_state": failed})
+            await live.send_json({"type": "WIFI_STATE", "wifi_state": unavailable})
             await live.send_json({"type": "WIFI_STATE", "wifi_state": {"password": "secret"}})
             await live.send_json({"type": "BATTERY_UPDATE", "level": 55, "charging": False})
             rows = (await receive_type(admin, "DEVICE_LIST"))["devices"]
             assert rows[0]["battery"]["level"] == 55
-            assert rows[0]["wifi_state"] == failed
+            assert rows[0]["wifi_state"] == unavailable
             assert "wifi_state_updated_at" not in rows[0]
             assert "secret" not in json.dumps(rows)
 
@@ -288,14 +185,14 @@ def test_device_wifi_reports_survive_reconnect_and_reject_stale_socket(tmp_path)
             await reconnected.send_json({key: value for key, value in registration.items() if key != "wifi_state"})
             await receive_type(reconnected, "REGISTERED")
             await receive_device_list(admin, lambda row: row["status"] == "online" and row["wifi_state"] is None)
-            assert server.device_registry[DEVICE_V4]["wifi_state"] == failed
+            assert server.device_registry[DEVICE_ID]["wifi_state"] == unavailable
             await reconnected.close()
             await old.close()
             await live.close()
             await admin.close()
         await test_server.close()
         server.load_registry()
-        assert server.device_registry[DEVICE_V4]["wifi_state"] == failed
-        assert "wifi_state_updated_at" not in server.device_registry[DEVICE_V4]
+        assert server.device_registry[DEVICE_ID]["wifi_state"] == unavailable
+        assert "wifi_state_updated_at" not in server.device_registry[DEVICE_ID]
 
     asyncio.run(body())

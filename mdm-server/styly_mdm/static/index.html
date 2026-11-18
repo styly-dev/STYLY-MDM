@@ -934,8 +934,32 @@
         getDevice: deviceById,
         getGroups: function () { return groups; },
         openPackages: function () { managePackages = true; render(); },
+        onSnapshot: applyGroupListSnapshot,
         deviceIdHtml,
       });
+
+      function applyGroupListSnapshot(msg) {
+        const previousMembers = groups[manageSelectedGroup] || [];
+        groups = msg.groups || {};
+        membershipSnapshotReady = true;
+        const registryUnreadable = msg.registry_writable === false;
+        document.getElementById('registryWarning').hidden = !registryUnreadable;
+        document.getElementById('configurationWarning').hidden = registryUnreadable || msg.configuration_available !== false;
+        groupsLoaded = true;
+        const selectedPendingGroup = applyPendingManageGroupSelection();
+        if (!selectedPendingGroup && manageSelectedGroup && !(manageSelectedGroup in groups)) { manageSelectedGroup = null; manageMembers = new Set(); }
+        else if (!selectedPendingGroup && manageSelectedGroup) {
+          // Keep staged adds/removals, and follow current membership for untouched devices.
+          manageMembers = window.MdmConfigurationPackages.syncMemberSelection(
+            previousMembers, groups[manageSelectedGroup] || [], manageMembers, manageEditedMembers);
+          window.MdmConfigurationPackages.clearMembershipEditsThatMatch(
+            manageMembers, groups[manageSelectedGroup] || [], manageEditedMembers, manageAddedOwners);
+        }
+        // Keep the active-group selection current: a group whose membership was
+        // just edited must not dispatch to the old member set (PR #29 P1).
+        syncActiveGroupSelection();
+        render();
+      }
 
       // ---------------- Helpers ----------------
       // textContent -> innerHTML escapes & < > but leaves quotes alone, and most callers
@@ -1162,17 +1186,26 @@
         if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
         membershipSnapshotReady = false;
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(proto + '//' + location.host + '/ws/admin');
-        ws.onopen = function () { setConnStatus('connected'); addLog('Connected to server', 'info'); if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; } };
-        ws.onclose = function () {
+        const socket = new WebSocket(proto + '//' + location.host + '/ws/admin');
+        ws = socket;
+        socket.onopen = function () {
+          if (ws !== socket) return;
+          setConnStatus('connected'); addLog('Connected to server', 'info'); if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+        };
+        socket.onclose = function () {
+          if (ws !== socket) return;
           membershipSnapshotReady = false;
           if (membershipSave?.state === 'saving') {
             showMembershipFeedback(membershipSave.name, 'Connection lost. Review the current group before saving again.', 'error');
+            if (applyPendingManageGroupSelection()) render();
           }
           setConnStatus('reconnecting'); addLog('Disconnected from server', 'fail'); scheduleReconnect();
         };
-        ws.onerror = function () { };
-        ws.onmessage = function (e) { try { handleMessage(JSON.parse(e.data)); } catch (err) { addLog('Failed to parse message: ' + err.message, 'fail'); } };
+        socket.onerror = function () { };
+        socket.onmessage = function (e) {
+          if (ws !== socket) return;
+          try { handleMessage(JSON.parse(e.data)); } catch (err) { addLog('Failed to parse message: ' + err.message, 'fail'); }
+        };
       }
       function scheduleReconnect() {
         if (reconnectTimer) return;
@@ -1238,27 +1271,7 @@
             break;
           }
           case 'GROUP_LIST': {
-            const previousMembers = groups[manageSelectedGroup] || [];
-            groups = msg.groups || {};
-            membershipSnapshotReady = true;
-            const registryUnreadable = msg.registry_writable === false;
-            document.getElementById('registryWarning').hidden = !registryUnreadable;
-            document.getElementById('configurationWarning').hidden = registryUnreadable || msg.configuration_available !== false;
-            configurationController.updateSnapshot(msg);
-            groupsLoaded = true;
-            if (pendingSelectGroup && (pendingSelectGroup in groups)) { selectManageGroup(pendingSelectGroup); pendingSelectGroup = null; }
-            else if (manageSelectedGroup && !(manageSelectedGroup in groups)) { manageSelectedGroup = null; manageMembers = new Set(); }
-            else if (manageSelectedGroup) {
-              // Keep staged adds/removals, and follow current membership for untouched devices.
-              manageMembers = window.MdmConfigurationPackages.syncMemberSelection(
-                previousMembers, groups[manageSelectedGroup] || [], manageMembers, manageEditedMembers);
-              window.MdmConfigurationPackages.clearMembershipEditsThatMatch(
-                manageMembers, groups[manageSelectedGroup] || [], manageEditedMembers, manageAddedOwners);
-            }
-            // Keep the active-group selection current: a group whose membership was
-            // just edited must not dispatch to the old member set (PR #29 P1).
-            syncActiveGroupSelection();
-            render();
+            configurationController.updateSnapshot(msg, 'ws');
             break;
           }
           case 'LAUNCH_RESULT': {
@@ -1305,12 +1318,24 @@
             break;
           case 'DEVICE_LABEL_SET': addLog('Label set: ' + (msg.device_id || '-') + ' -> ' + (msg.label || '(cleared)'), 'success'); break;
           case 'DEVICE_FORGOTTEN': addLog('Device forgotten: ' + (msg.device_id || '-'), 'success'); break;
-          case 'GROUP_CREATED': addLog('Group created: ' + (msg.name || '-'), 'success'); if (view === 'manage') pendingSelectGroup = msg.name; break;
-          case 'GROUP_RENAMED':
-            addLog('Group renamed: ' + (msg.name || '-') + ' -> ' + (msg.new_name || '-'), 'success');
-            if (manageSelectedGroup === msg.name) pendingSelectGroup = msg.new_name;
-            if (activeGroup === msg.name) activeGroup = msg.new_name;
+          case 'GROUP_CREATED':
+            addLog('Group created: ' + (msg.name || '-'), 'success');
+            if (view === 'manage') {
+              pendingSelectGroup = msg.name;
+              if (applyPendingManageGroupSelection()) render();
+            }
             break;
+          case 'GROUP_RENAMED': {
+            addLog('Group renamed: ' + (msg.name || '-') + ' -> ' + (msg.new_name || '-'), 'success');
+            let selectedRenamedGroup = false;
+            if (manageSelectedGroup === msg.name) {
+              pendingSelectGroup = msg.new_name;
+              selectedRenamedGroup = applyPendingManageGroupSelection();
+            }
+            if (activeGroup === msg.name) activeGroup = msg.new_name;
+            if (selectedRenamedGroup) render();
+            break;
+          }
           case 'GROUP_DELETED': addLog('Group deleted: ' + (msg.name || '-'), 'success'); if (activeGroup === msg.name) activeGroup = null; break;
           case 'GROUP_MEMBERS_SET':
             if (msg.operation === 'UPDATE_GROUP_MEMBERS' && membershipSave?.name === msg.name && membershipSave.state === 'saving') {
@@ -1319,6 +1344,7 @@
               manageMembers = new Set(groups[msg.name] || []);
               showMembershipFeedback(msg.name, 'Members saved.', 'saved');
             }
+            if (applyPendingManageGroupSelection()) render();
             addLog('Group "' + (msg.name || '-') + '" saved: ' + ((msg.members && msg.members.length) || 0) + ' device(s)', 'success');
             break;
           case 'SET_STARTUP_APP_SENT': addLog('Startup app set: ' + msg.package_name + ' (' + msg.sent_count + '/' + msg.target_count + ' devices)', 'success'); break;
@@ -1367,6 +1393,7 @@
           case 'ERROR':
             if (msg.operation === 'UPDATE_GROUP_MEMBERS' && membershipSave?.name === msg.name) {
               showMembershipFeedback(msg.name, msg.message || 'Could not save members. Review the current group and try again.', 'error');
+              if (applyPendingManageGroupSelection()) render();
             }
             addLog('[ERROR] ' + (msg.message || 'Unknown error'), 'fail');
             break;
@@ -2535,7 +2562,13 @@
       function openManage(group) {
         view = 'manage';
         managePackages = false;
-        if (group && (group in groups)) selectManageGroup(group);
+        if (group && (group in groups)) {
+          if (membershipSave?.state === 'saving') pendingSelectGroup = group;
+          else {
+            pendingSelectGroup = null;
+            selectManageGroup(group);
+          }
+        }
         render();
       }
       function backToConsole() {
@@ -2555,6 +2588,13 @@
         renameGroupDraft = '';
         renameGroupCaret = null;
         renameGroupRefocus = false;
+      }
+
+      function applyPendingManageGroupSelection() {
+        if (!pendingSelectGroup || !(pendingSelectGroup in groups) || membershipSave?.state === 'saving') return false;
+        selectManageGroup(pendingSelectGroup);
+        pendingSelectGroup = null;
+        return true;
       }
 
       function renderManageSidebar() {
@@ -2588,18 +2628,21 @@
           : '<div><div class="mg-title">' + esc(name) + '</div><div class="mg-sub">' + onCount + ' online, ' + offCount + ' offline</div></div>' +
             '<div class="mg-head-actions"><button class="btn-outline" data-act="renameGroup">Rename</button>' +
             '<button class="btn btn-danger-outline" data-act="deleteGroup" data-group="' + esc(name) + '">Delete</button></div>';
+        const memberEditor = manageTab === 'devices'
+          ? '<div><div class="mg-search"><input class="mg-search-input" data-mg-search placeholder="⌕ Search devices to add…" value="' + esc(manageSearch) + '">' +
+            '<button class="mg-sort-btn" data-act="sortManage" title="Sort by name">Name<span class="sort-arrow">' + (manageSort === 'label-desc' ? '▼' : '▲') + '</span></button></div>' +
+            '<div class="mg-dev-list" id="mgDevList">' + renderMgDevListHtml() + '</div>' +
+            '<div class="mg-footer"><span class="mg-foot-count">' + manageMembers.size + ' selected</span>' +
+            '<div class="spacer"></div>' +
+            '<button class="btn-text" data-act="cancelMembers">Cancel</button>' +
+            '<button class="btn btn-primary" data-act="saveMembers">Save</button></div>' +
+            '<div class="settings-feedback mg-member-feedback" data-members-feedback role="status" aria-live="polite"></div></div>'
+          : '';
         mgDetail.innerHTML =
           '<div class="mg-detail-head">' + head + '</div>' +
           '<div class="subtabs mg-tabs"><button class="subtab' + (manageTab === 'devices' ? ' active' : '') + '" data-act="manageTab" data-manage-tab="devices" aria-pressed="' + (manageTab === 'devices') + '">Devices</button>' +
           '<button class="subtab' + (manageTab === 'settings' ? ' active' : '') + '" data-act="manageTab" data-manage-tab="settings" aria-pressed="' + (manageTab === 'settings') + '">Settings</button><div class="subtabs-fill"></div></div>' +
-          '<div' + (manageTab === 'settings' ? ' hidden' : '') + '><div class="mg-search"><input class="mg-search-input" data-mg-search placeholder="⌕ Search devices to add…" value="' + esc(manageSearch) + '">' +
-          '<button class="mg-sort-btn" data-act="sortManage" title="Sort by name">Name<span class="sort-arrow">' + (manageSort === 'label-desc' ? '▼' : '▲') + '</span></button></div>' +
-          '<div class="mg-dev-list" id="mgDevList">' + renderMgDevListHtml() + '</div>' +
-          '<div class="mg-footer"><span class="mg-foot-count">' + manageMembers.size + ' selected</span>' +
-          '<div class="spacer"></div>' +
-          '<button class="btn-text" data-act="cancelMembers">Cancel</button>' +
-          '<button class="btn btn-primary" data-act="saveMembers">Save</button></div>' +
-          '<div class="settings-feedback mg-member-feedback" data-members-feedback role="status" aria-live="polite"></div></div>';
+          memberEditor;
         renderMembershipFeedback();
         groupSettingsPanel.hidden = manageTab !== 'settings';
         restoreRenameGroupFocus(hadRenameFocus);

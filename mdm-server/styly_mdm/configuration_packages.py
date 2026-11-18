@@ -217,19 +217,18 @@ def check_expected_revision(body, current_revision):
 
 def load_packages(raw):
     if (not isinstance(raw, dict) or type(raw.get("version")) is not int
-            or raw["version"] not in (2, VERSION) or not isinstance(raw.get("packages"), dict)):
+            or raw["version"] != VERSION or not isinstance(raw.get("packages"), dict)):
         raise PackageError("Unsupported configuration format")
-    revision_key = "draft_revision" if raw["version"] == 2 else "edit_revision"
-    packages = {}
 
-    for package_id, profile in raw["packages"].items():
+    packages = raw["packages"]
+    for package_id, profile in packages.items():
         if normalize_revision(package_id) is None or not isinstance(profile, dict):
             raise PackageError("Invalid saved package")
-        if (set(profile) != {"name", "settings", revision_key, "published_revision", "deployed_at_ms"}
+        if (set(profile) != {"name", "settings", "edit_revision", "published_revision", "deployed_at_ms"}
                 or validate_name(profile.get("name")) != profile["name"]
                 or not isinstance(profile["settings"], dict)):
             raise PackageError("Invalid saved package")
-        edit_revision = profile[revision_key]
+        edit_revision = profile["edit_revision"]
         published_revision = profile["published_revision"]
         deployed_at_ms = profile["deployed_at_ms"]
         if (edit_revision is not None and normalize_revision(edit_revision) is None
@@ -239,10 +238,6 @@ def load_packages(raw):
                 or (edit_revision is None and (profile["settings"] or published_revision is not None))):
             raise PackageError("Invalid saved package revisions")
         validate_settings(profile["settings"])
-        if raw["version"] == 2:
-            profile = profile.copy()
-            profile["edit_revision"] = profile.pop(revision_key)
-        packages[package_id] = profile
     return packages
 
 

@@ -35,6 +35,8 @@ internal data class WifiProfileApplication(
     val autoJoinFailure: WifiReason? = null,
 )
 
+private val WIFI_SECURITY_VIEW_PREFERENCE = listOf("OPEN", "WPA_PSK", "SAE")
+
 /** Whether a saved or observed security type satisfies a validated [profile]. */
 internal fun wifiSecurityViewMatchesProfile(profile: WifiNetworkProfile, security: String?): Boolean = when {
     profile.security == "OPEN" -> security == "OPEN"
@@ -44,24 +46,13 @@ internal fun wifiSecurityViewMatchesProfile(profile: WifiNetworkProfile, securit
 }
 
 internal fun desiredWifiSecurityView(profile: WifiNetworkProfile, savedSecurity: String? = null): String? =
-    savedSecurity?.takeIf { wifiSecurityViewMatchesProfile(profile, it) } ?: when {
-        profile.security == "OPEN" -> "OPEN"
-        profile.security == "WPA2_WPA3" && profile.requiresSaeOnly -> "SAE"
-        profile.security == "WPA2_WPA3" -> "WPA_PSK"
-        else -> null
-    }
+    savedSecurity?.takeIf { wifiSecurityViewMatchesProfile(profile, it) } ?: preferredWifiSecurityView(profile)
 
-internal fun preferredWifiSecurityView(
+private fun preferredWifiSecurityView(
     profile: WifiNetworkProfile,
-    securities: Collection<String?>,
-): String? {
-    val available = securities.filterNotNull().toSet()
-    return when {
-        profile.security == "OPEN" -> "OPEN".takeIf { it in available }
-        profile.requiresSaeOnly -> "SAE".takeIf { it in available }
-        profile.security == "WPA2_WPA3" -> listOf("WPA_PSK", "SAE").firstOrNull { it in available }
-        else -> null
-    }
+    securities: Collection<String?> = WIFI_SECURITY_VIEW_PREFERENCE,
+): String? = WIFI_SECURITY_VIEW_PREFERENCE.firstOrNull {
+    it in securities && wifiSecurityViewMatchesProfile(profile, it)
 }
 
 /** Return null for an absent candidate; reject an identity shared by distinct saved networks. */
@@ -194,6 +185,10 @@ internal fun supportsManagedWifi(): Boolean =
     Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && supportsPico4UltraEnterpriseSettings()
 
 internal class WifiAdapterFailure(val reason: WifiReason) : Exception()
+
+internal fun hasManagedWifiLocationPermissions(context: Context): Boolean =
+    context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED &&
+        context.checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED
 
 internal fun hasManagedWifiReadAccess(context: Context): Boolean = Settings.canDrawOverlays(context)
 
@@ -398,11 +393,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
     private fun requireAuthority() {
         // PUI exposes A94U0 to application processes and A9210 through ADB on this device.
         if (!supportsManagedWifi()) throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
-        if (appContext.checkSelfPermission("android.permission.ACCESS_FINE_LOCATION") != PackageManager.PERMISSION_GRANTED ||
-            appContext.checkSelfPermission("android.permission.ACCESS_BACKGROUND_LOCATION") != PackageManager.PERMISSION_GRANTED
-        ) {
-            throw WifiAdapterFailure(WifiReason.PERMISSION_DENIED)
-        }
+        if (!hasManagedWifiLocationPermissions(appContext)) throw WifiAdapterFailure(WifiReason.PERMISSION_DENIED)
         if (!hasManagedWifiReadAccess(appContext)) throw WifiAdapterFailure(WifiReason.PERMISSION_DENIED)
     }
 
