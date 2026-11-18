@@ -399,7 +399,11 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun requestWifiPermission() {
-        if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) {
+        val fineLocationMissing = !hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+        val permissions = getPreferences(MODE_PRIVATE)
+        if (fineLocationMissing && (!permissions.getBoolean("requested_fine_location", false) ||
+                shouldShowRequestPermissionRationale(Manifest.permission.ACCESS_FINE_LOCATION))) {
+            permissions.edit().putBoolean("requested_fine_location", true).apply()
             requestPermissions(
                 arrayOf(
                     Manifest.permission.ACCESS_FINE_LOCATION,
@@ -412,7 +416,7 @@ class SettingsActivity : AppCompatActivity() {
 
         val packageUri = Uri.fromParts("package", packageName, null)
         val intent = when {
-            !hasPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) ->
+            fineLocationMissing || !hasPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) ->
                 Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri)
             !hasManagedWifiReadAccess(this) -> Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, packageUri)
             !locationServicesEnabled() -> Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)

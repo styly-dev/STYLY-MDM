@@ -122,8 +122,7 @@ class ConfigurationPackageControllerTest {
         }
         wifi.adapter.application = WifiProfileApplication(
             usableIndexes = listOf(1),
-            failure = WifiReason.UPDATE_FAILED,
-            autoJoinFailure = WifiReason.VERIFY_FAILED,
+            failure = WifiReason.VERIFY_FAILED,
         )
         val packages = PackageHarness(wifi)
         packages.receive(packagePayload(listOf(preferred, fallback)))
@@ -455,7 +454,7 @@ class ConfigurationPackageControllerTest {
         val networks = listOf(primary, fallback)
         val failures = listOf(
             WifiProfileApplication(listOf(0), failure = WifiReason.UPDATE_FAILED),
-            WifiProfileApplication(listOf(0, 1), autoJoinFailure = WifiReason.VERIFY_FAILED),
+            WifiProfileApplication(listOf(0, 1), failure = WifiReason.VERIFY_FAILED),
         )
         for (application in failures) {
             val previous = WifiSavedProfile(OLD_REVISION, networks)
@@ -484,7 +483,7 @@ class ConfigurationPackageControllerTest {
         val applications = listOf(
             null to "NONE",
             WifiProfileApplication(listOf(0), failure = WifiReason.UPDATE_FAILED) to "UPDATE_FAILED",
-            WifiProfileApplication(listOf(0, 1), autoJoinFailure = WifiReason.VERIFY_FAILED) to "VERIFY_FAILED",
+            WifiProfileApplication(listOf(0, 1), failure = WifiReason.VERIFY_FAILED) to "VERIFY_FAILED",
         )
         for ((application, reason) in applications) {
             val initialWifi = Harness(

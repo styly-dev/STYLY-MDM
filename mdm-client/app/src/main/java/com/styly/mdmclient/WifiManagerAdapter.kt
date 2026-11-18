@@ -32,7 +32,6 @@ internal data class WifiConfiguredView(
 internal data class WifiProfileApplication(
     val usableIndexes: List<Int>,
     val failure: WifiReason? = null,
-    val autoJoinFailure: WifiReason? = null,
 )
 
 private val WIFI_SECURITY_VIEW_PREFERENCE = listOf("OPEN", "WPA_PSK", "SAE")
@@ -338,7 +337,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             autoJoinFailure = WifiReason.VERIFY_FAILED
             logOperationFailure("AUTO_JOIN", WifiReason.VERIFY_FAILED)
         }
-        WifiProfileApplication(usableIndexes, firstFailure, autoJoinFailure)
+        WifiProfileApplication(usableIndexes, autoJoinFailure ?: firstFailure)
     }
 
     override fun selectSavedCandidate(

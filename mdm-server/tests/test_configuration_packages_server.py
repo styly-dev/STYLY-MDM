@@ -1353,6 +1353,140 @@ def test_unreadable_configuration_does_not_release_connected_device(tmp_path):
     asyncio.run(body())
 
 
+def test_group_deployment_waits_for_writable_socket_and_sends_latest_policy(tmp_path):
+    async def body():
+        async with _running_server(tmp_path, {"Studio": [DEVICE_ID, OFFLINE_ID]}) as (session, base):
+            url = base + "/ws/device"
+            original = await _create(session, base, "Office")
+            original = await _deploy_to(session, base, original, _brightness(20), "Studio")
+            latest = await _create(session, base, "New Office")
+            latest = await _deploy(session, base, latest, settings=_brightness(90))
+            offline_registration = {**REGISTRATION, "device_id": OFFLINE_ID}
+            async with session.ws_connect(url) as offline:
+                await _register(offline, offline_registration)
+                assert await _receive_type(offline, "CONFIGURATION_POLICY") == _policy(
+                    original, {"brightness": 20}, group="Studio",
+                )
+
+            async with session.ws_connect(url, autoping=False) as online:
+                await _register(online)
+                assert await _receive_type(online, "CONFIGURATION_POLICY") == _policy(
+                    original, {"brightness": 20}, group="Studio",
+                )
+                assert OFFLINE_ID not in server.devices
+                transport = server.devices[DEVICE_ID]["ws"]
+                async with transport._push_send_lock:
+                    await _deploy(session, base, original, settings=_brightness(40))
+                    pending = server._configuration_deliveries[transport]
+                    await _assign(session, base, "Studio", latest)
+                    await asyncio.sleep(0.05)
+                    assert not pending.task.done()
+                    assert server._configuration_deliveries[transport] is pending
+
+                desired = _policy(latest, {"brightness": 90}, group="Studio")
+                assert await _receive_type(online, "CONFIGURATION_POLICY") == desired
+                await asyncio.wait_for(pending.task, 2)
+                await _assert_no_policy(online)
+                assert server.devices[DEVICE_ID]["ws"] is transport
+                assert transport not in server._configuration_deliveries
+
+                async with session.ws_connect(url, autoping=False) as reconnected:
+                    await _register(reconnected, offline_registration)
+                    assert await _receive_type(reconnected, "CONFIGURATION_POLICY") == desired
+                    await _assert_no_policy(reconnected)
+
+    asyncio.run(body())
+
+
+def test_registration_delivery_preserves_deployment_during_an_in_flight_write(tmp_path, monkeypatch):
+    async def body():
+        async with _running_server(tmp_path, {"Studio": [DEVICE_ID]}) as (session, base):
+            profile = await _create(session, base, "Office")
+            profile = await _deploy_to(session, base, profile, _brightness(20), "Studio")
+            original = _policy(profile, {"brightness": 20}, group="Studio")
+            started = asyncio.Event()
+            release = asyncio.Event()
+            queued = asyncio.Event()
+            send_str = server.web.WebSocketResponse.send_str
+            queue_configuration = server._queue_configuration
+
+            async def hold_first_policy_write(ws, data, compress=None):
+                if json.loads(data)["type"] == "CONFIGURATION_POLICY" and not started.is_set():
+                    started.set()
+                    await release.wait()
+                await send_str(ws, data, compress=compress)
+
+            def observe_publication(device_id, entry):
+                queue_configuration(device_id, entry)
+                if started.is_set():
+                    queued.set()
+
+            monkeypatch.setattr(server.web.WebSocketResponse, "send_str", hold_first_policy_write)
+            monkeypatch.setattr(server, "_queue_configuration", observe_publication)
+            async with session.ws_connect(base + "/ws/device", autoping=False) as device:
+                await _register(device)
+                await asyncio.wait_for(started.wait(), 2)
+                transport = server.devices[DEVICE_ID]["ws"]
+                pending = server._configuration_deliveries[transport]
+                try:
+                    latest = await _deploy(session, base, profile, settings=_brightness(75))
+                    await asyncio.wait_for(queued.wait(), 2)
+                finally:
+                    release.set()
+                assert await _receive_type(device, "CONFIGURATION_POLICY") == original
+                assert await _receive_type(device, "CONFIGURATION_POLICY") == _policy(latest, {"brightness": 75})
+                await asyncio.wait_for(pending.task, 2)
+                await _assert_no_policy(device)
+
+    asyncio.run(body())
+
+
+@pytest.mark.parametrize("stop", ["replacement", "disconnect", "shutdown"])
+def test_configuration_delivery_cancels_with_connection_lifecycle(tmp_path, monkeypatch, stop):
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        server.devices.clear()
+        test_server = TestServer(server.create_app())
+        await test_server.start_server(shutdown_timeout=0.05)
+        first_write = asyncio.Event()
+        send_str = server.web.WebSocketResponse.send_str
+
+        async def block_first_policy_write(ws, data, compress=None):
+            if json.loads(data)["type"] == "CONFIGURATION_POLICY" and not first_write.is_set():
+                first_write.set()
+                await asyncio.Future()
+            await send_str(ws, data, compress=compress)
+
+        monkeypatch.setattr(server.web.WebSocketResponse, "send_str", block_first_policy_write)
+        async with test_server, aiohttp.ClientSession() as session:
+            url = test_server.make_url("/ws/device")
+            async with session.ws_connect(url) as device:
+                await _register(device)
+                await asyncio.wait_for(first_write.wait(), 2)
+                transport = server.devices[DEVICE_ID]["ws"]
+                pending = server._configuration_deliveries[transport]
+
+                async def assert_cancelled():
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(asyncio.shield(pending.task), 2)
+                    assert pending.task.cancelled()
+                    assert transport not in server._configuration_deliveries
+
+                if stop == "replacement":
+                    async with session.ws_connect(url) as replacement:
+                        await _register(replacement)
+                        assert await _receive_type(replacement, "CONFIGURATION_POLICY") == NO_POLICY
+                        await assert_cancelled()
+                else:
+                    if stop == "disconnect":
+                        await device.close()
+                    else:
+                        await asyncio.wait_for(test_server.close(), 2)
+                    await assert_cancelled()
+
+    asyncio.run(body())
+
+
 def test_transport_send_gate_rechecks_retry_revision_and_socket_owner(tmp_path, monkeypatch):
     async def body():
         async with _running_server(tmp_path, {"Studio": [DEVICE_ID]}) as (session, base):
@@ -1405,6 +1539,30 @@ def test_transport_send_gate_rechecks_retry_revision_and_socket_owner(tmp_path, 
                 assert retried == _policy(latest, {"brightness": 95})
                 assert await server._send_configuration(DEVICE_ID, entry)
                 assert await _receive_type(device, "CONFIGURATION_POLICY") == retried
+    asyncio.run(body())
+
+
+def test_explicit_retry_times_out_while_waiting_for_the_send_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "CONFIGURATION_SEND_TIMEOUT", 0.025)
+
+    async def body():
+        async with _running_server(tmp_path, {"Studio": [DEVICE_ID]}) as (session, base):
+            profile = await _create(session, base, "Office")
+            profile = await _deploy_to(session, base, profile, _brightness(20), "Studio")
+            async with session.ws_connect(base + "/ws/device", autoping=False) as device:
+                await _register(device)
+                policy = await _receive_type(device, "CONFIGURATION_POLICY")
+                retry = {"device_id": DEVICE_ID, "package_id": policy["package_id"],
+                         "revision": policy["revision"]}
+                transport = server.devices[DEVICE_ID]["ws"]
+                async with transport._push_send_lock:
+                    response = await asyncio.wait_for(
+                        _request(session, "POST", base, "/api/package-retry", retry, status=409),
+                        1,
+                    )
+                assert response["error"] == "The device or published package is no longer available for retry"
+                await _assert_no_policy(device)
+
     asyncio.run(body())
 
 

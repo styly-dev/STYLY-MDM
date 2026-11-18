@@ -43,21 +43,6 @@ internal interface WifiLocalConnectivitySource {
     fun observe(listener: (WifiLocalConnectivitySession, WifiLocalConnectivityEvent) -> Unit): WifiLocalConnectivitySession
 }
 
-/** Accessed only while the owning session lock is held. */
-internal class WifiNetworkHandleTombstones {
-    private val handles = HashSet<Long>()
-
-    fun markLost(networkHandle: Long) {
-        handles.add(networkHandle)
-    }
-
-    fun markAvailable(networkHandle: Long) {
-        handles.remove(networkHandle)
-    }
-
-    fun isLost(networkHandle: Long): Boolean = networkHandle in handles
-}
-
 /** A synchronous seed can fill fields whose callbacks have not arrived yet. */
 internal class WifiLocalObservationState {
     var sequence: Long = 0
@@ -129,7 +114,7 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
         private val observations = LinkedHashMap<Long, WifiLocalObservationState>()
         // Seed reads race callbacks only during registration. Later callbacks update
         // existing handles, so lost handles need no bookkeeping after the seed.
-        private var lostDuringSeed: WifiNetworkHandleTombstones? = WifiNetworkHandleTombstones()
+        private var lostDuringSeed: MutableSet<Long>? = mutableSetOf()
         private var sequence = 0L
 
         private val callback = LocationAwareWifiCallback(this)
@@ -154,7 +139,7 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
             val handle = network.networkHandle
             val event = synchronized(lock) {
                 val current = if (available) {
-                    lostDuringSeed?.markAvailable(handle)
+                    lostDuringSeed?.remove(handle)
                     observations.getOrPut(handle, ::WifiLocalObservationState)
                 } else observations[handle] ?: return
                 current.update()
@@ -167,7 +152,7 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
 
         private fun onLost(network: Network) {
             val event = synchronized(lock) {
-                lostDuringSeed?.markLost(network.networkHandle)
+                lostDuringSeed?.add(network.networkHandle)
                 observations.remove(network.networkHandle)
                 WifiLocalConnectivityEvent.Lost(network.networkHandle, ++sequence)
             }
@@ -198,7 +183,7 @@ internal class AndroidWifiLocalConnectivitySource(context: Context) : WifiLocalC
                 val links = manager.getLinkProperties(network)
                 synchronized(lock) {
                     // Never overwrite newer callback data with a synchronous seed read.
-                    if (lostDuringSeed?.isLost(network.networkHandle) != true &&
+                    if (lostDuringSeed?.contains(network.networkHandle) != true &&
                         observations[network.networkHandle]?.sequence == beforeRead
                     ) {
                         val observation = observations.getOrPut(network.networkHandle, ::WifiLocalObservationState)

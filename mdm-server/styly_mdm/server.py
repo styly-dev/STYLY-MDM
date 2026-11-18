@@ -218,6 +218,7 @@ class _DeviceGroup:
     members: tuple[str, ...] = ()
     package_id: str | None = None
     deployment_revision: str | None = None
+    deployment_at_ms: int | None = None
 
     def effective_revision(self, profile: dict) -> str:
         return self.deployment_revision or profile["published_revision"]
@@ -404,6 +405,8 @@ def _serialized_groups(configuration: _ConfigurationRegistry) -> dict:
         entry = {"members": list(group.members), "package_id": group.package_id}
         if group.deployment_revision is not None:
             entry["deployment_revision"] = group.deployment_revision
+        if group.deployment_at_ms is not None:
+            entry["deployment_at_ms"] = group.deployment_at_ms
         groups[name] = entry
     return groups
 
@@ -423,7 +426,7 @@ def _read_configuration(raw: dict) -> _ConfigurationRegistry:
             name = _group_name(raw_name)
             if (not name or name in groups or len(raw_name) > MAX_GROUP_NAME_LEN
                     or not isinstance(entry, dict)
-                    or set(entry) - {"deployment_revision"} != {"members", "package_id"}
+                    or set(entry) - {"deployment_revision", "deployment_at_ms"} != {"members", "package_id"}
                     or not isinstance(entry["members"], list)
                     or any(not isinstance(member, str) or not member for member in entry["members"])):
                 raise PackageError("Invalid saved group")
@@ -434,7 +437,11 @@ def _read_configuration(raw: dict) -> _ConfigurationRegistry:
             if revision is not None and (normalize_revision(revision) is None or package_id is None
                                         or packages[package_id]["published_revision"] is None):
                 raise PackageError("Invalid saved group deployment revision")
-            groups[name] = _DeviceGroup(_coerce_group_members(entry["members"]), package_id, revision)
+            deployed_at = entry.get("deployment_at_ms")
+            if deployed_at is not None and (type(deployed_at) is not int or not 1 <= deployed_at <= 253402300799999
+                                            or revision is None):
+                raise PackageError("Invalid saved group deployment time")
+            groups[name] = _DeviceGroup(_coerce_group_members(entry["members"]), package_id, revision, deployed_at)
     else:
         # Released servers saved {name: [device_id]} and allowed several groups per device.
         packages = {}
@@ -1087,19 +1094,13 @@ def release_transfer_slot(device_id: str, reason: str, task: str | None = None) 
     tell a real transfer→apply transition from a late message for a device whose
     transfer already timed out or finished.
     """
-    if task is not None:
-        fut = pending_transfers.get((device_id, task))
-        if fut is not None and not fut.done():
-            fut.set_result(reason)
-            return True
+    if task not in (None, TASK_INSTALL):
         return False
-
-    released = False
-    for (did, _task), fut in list(pending_transfers.items()):
-        if did == device_id and not fut.done():
-            fut.set_result(reason)
-            released = True
-    return released
+    fut = pending_transfers.get((device_id, TASK_INSTALL))
+    if fut is None or fut.done():
+        return False
+    fut.set_result(reason)
+    return True
 
 
 async def broadcast_install_state(
@@ -1585,6 +1586,15 @@ CONFIGURATION_SEND_TIMEOUT = 5.0
 _CONFIGURATION_PUBLICATIONS = web.AppKey("configuration_publications", set)
 
 
+@dataclass
+class _ConfigurationDelivery:
+    pending: bool = True
+    task: asyncio.Task[None] = field(init=False)
+
+
+_configuration_deliveries: dict[web.WebSocketResponse, _ConfigurationDelivery] = {}
+
+
 def _require_package_origin(request: web.Request) -> None:
     origin = request.headers.get("Origin")
     if origin is None:
@@ -1672,7 +1682,7 @@ def _published_configuration(package_id: str, profile: dict) -> _ConfigurationRe
         "deployed_at_ms": time.time_ns() // 1_000_000,
     }
     groups = {
-        name: replace(group, deployment_revision=None) if group.package_id == package_id else group
+        name: replace(group, deployment_revision=None, deployment_at_ms=None) if group.package_id == package_id else group
         for name, group in _configuration.groups.items()
     }
     return replace(_configuration, groups=groups, packages={**_require_packages(), package_id: published})
@@ -1797,7 +1807,8 @@ async def group_package_deploy_handler(request: web.Request) -> web.Response:
         else:
             # A scoped deployment uses the published settings with a fresh revision for this group.
             revision = str(uuid.uuid4()) if use_current else None
-            assignment = replace(group, package_id=package_id, deployment_revision=revision)
+            deployed_at = time.time_ns() // 1_000_000 if use_current else None
+            assignment = replace(group, package_id=package_id, deployment_revision=revision, deployment_at_ms=deployed_at)
             updated = replace(_configuration, groups={**_configuration.groups, name: assignment})
         if not _commit_configuration(updated):
             raise PackageError("Group deployment could not be saved", 500)
@@ -1843,6 +1854,7 @@ def _desired_configuration(device_id: str, *, include_summary: bool = False, inc
     package_id = None
     revision = None
     published = None
+    deployed_at = None
     for name, group in _configuration.groups.items():
         if device_id in group.members:
             group_name = name
@@ -1850,6 +1862,8 @@ def _desired_configuration(device_id: str, *, include_summary: bool = False, inc
             if published is not None:
                 package_id = group.package_id
                 revision = group.effective_revision(published)
+                deployed_at = (group.deployment_at_ms if group.deployment_revision is not None
+                               else published.get("deployed_at_ms"))
             break
     policy = {
         "package_id": package_id,
@@ -1859,36 +1873,86 @@ def _desired_configuration(device_id: str, *, include_summary: bool = False, inc
     }
     if include_summary:
         policy["group_name"] = group_name
-        policy["deployed_at_ms"] = published.get("deployed_at_ms") if published is not None else None
+        policy["deployed_at_ms"] = deployed_at
     return policy
+
+
+def _configuration_connection_ready(device_id: str, entry: dict) -> bool:
+    return (_configuration.packages is not None and devices.get(device_id) is entry
+            and entry.get("status") == "online" and entry.get("registration_ready") is True
+            and not entry["ws"].closed)
 
 
 async def _send_configuration(
     device_id: str, entry: dict, *, retry: tuple[str, str] | None = None,
+    delivery: _ConfigurationDelivery | None = None,
 ) -> bool:
+    """Send one current policy. A timeout bounds explicit HTTP Retry requests."""
+    if not _configuration_connection_ready(device_id, entry):
+        return False
     ws = entry["ws"]
+    include_settings = _supports_configuration(entry)
+    include_summary = (entry.get("identity_kind") == "canonical"
+                       and configuration_packages.SUMMARY_CAPABILITY in entry.get("capabilities", ()))
+    if not include_settings and (not include_summary or retry is not None):
+        return False
 
     def resolve() -> str | None:
-        if (_configuration.packages is None or devices.get(device_id) is not entry or ws.closed
-                or entry.get("status") != "online" or entry.get("registration_ready") is not True):
-            return None
-        include_settings = _supports_configuration(entry)
-        include_summary = (entry.get("identity_kind") == "canonical"
-                           and configuration_packages.SUMMARY_CAPABILITY in entry.get("capabilities", ()))
-        if not include_settings and (not include_summary or retry is not None):
+        if not _configuration_connection_ready(device_id, entry):
             return None
         policy = _desired_configuration(device_id, include_summary=include_summary, include_settings=include_settings)
         if retry is not None:
             if retry != (policy["package_id"], policy["revision"]):
                 return None
             policy["retry_id"] = str(uuid.uuid4())
+        if delivery is not None:
+            # All requests received before the write are covered by this policy.
+            delivery.pending = False
         return json.dumps({"type": "CONFIGURATION_POLICY", **policy}, ensure_ascii=False)
 
     try:
-        return await asyncio.wait_for(ws.send_current_text(resolve), timeout=CONFIGURATION_SEND_TIMEOUT)
-    except (ConnectionError, RuntimeError, asyncio.TimeoutError):
+        send = ws.send_current_text(resolve)
+        if retry is not None:
+            return await asyncio.wait_for(send, timeout=CONFIGURATION_SEND_TIMEOUT)
+        return await send
+    except (asyncio.TimeoutError, ConnectionError, RuntimeError):
         log.info("Configuration delivery could not be confirmed for %s", device_id)
         return False
+
+
+async def _deliver_configuration(device_id: str, entry: dict, delivery: _ConfigurationDelivery) -> None:
+    while delivery.pending:
+        if not await _send_configuration(device_id, entry, delivery=delivery):
+            return
+
+
+def _queue_configuration(device_id: str, entry: dict) -> None:
+    if not _configuration_connection_ready(device_id, entry):
+        return
+    ws = entry["ws"]
+    current = _configuration_deliveries.get(ws)
+    if current is not None and not current.task.done():
+        current.pending = True
+        return
+
+    delivery = _ConfigurationDelivery()
+    delivery.task = asyncio.create_task(_deliver_configuration(device_id, entry, delivery),
+                                        name="configuration-delivery")
+    _configuration_deliveries[ws] = delivery
+
+    def finish(task: asyncio.Task[None]) -> None:
+        if _configuration_deliveries.get(ws) is delivery:
+            del _configuration_deliveries[ws]
+        if not task.cancelled() and (error := task.exception()) is not None:
+            log.error("Could not deliver configuration for %s", device_id, exc_info=error)
+
+    delivery.task.add_done_callback(finish)
+
+
+def _cancel_configuration_delivery(ws: web.WebSocketResponse) -> None:
+    delivery = _configuration_deliveries.get(ws)
+    if delivery is not None:
+        delivery.task.cancel()
 
 
 async def _publish_group_change(device_ids, admin_update=None) -> None:
@@ -1927,17 +1991,17 @@ def _schedule_configuration_publication(app: web.Application, device_ids: list[s
 
 
 async def _stop_configuration_publications(app: web.Application) -> None:
-    tasks = tuple(app[_CONFIGURATION_PUBLICATIONS])
+    tasks = (*app[_CONFIGURATION_PUBLICATIONS], *(delivery.task for delivery in _configuration_deliveries.values()))
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _publish_configuration(device_ids) -> None:
-    await asyncio.gather(*(
-        _send_configuration(device_id, devices[device_id])
-        for device_id in device_ids if device_id in devices
-    ))
+    for device_id in device_ids:
+        entry = devices.get(device_id)
+        if entry is not None:
+            _queue_configuration(device_id, entry)
 
 
 # ---------------------------------------------------------------------------
@@ -2114,7 +2178,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                             idempotent=True,
                         )
                         if _owns_device(device_id, ws):
-                            await _send_configuration(device_id, devices[device_id])
+                            _queue_configuration(device_id, devices[device_id])
                         continue
                     if kind == "provisional":
                         now = time.time()
@@ -2171,6 +2235,8 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         if supports_configuration
                         else None
                     )
+                    if device_id in devices:
+                        _cancel_configuration_delivery(devices[device_id]["ws"])
                     devices[device_id] = {
                         "ws": ws,
                         "device_id": device_id,
@@ -2218,9 +2284,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     if not _owns_device(device_id, ws):
                         continue
                     devices[device_id]["status"] = "online"
-                    await _send_configuration(device_id, devices[device_id])
-                    if not _owns_device(device_id, ws):
-                        continue
+                    _queue_configuration(device_id, devices[device_id])
                     if prev.get("retired"):
                         log.info("Retired device re-registered, re-adopting: %s", device_id)
                     await _resolve_pending_retire(device_id)
@@ -2508,6 +2572,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
             elif raw_msg.type == web.WSMsgType.ERROR:
                 log.error("Device WS error: %s", ws.exception())
     finally:
+        _cancel_configuration_delivery(ws)
         # Abrupt TCP loss can end iteration without calling WebSocket.close().
         # Notify the Push adapter while this socket's registration is still present.
         notify_disconnect = getattr(ws, "notify_canonical_disconnect", None)

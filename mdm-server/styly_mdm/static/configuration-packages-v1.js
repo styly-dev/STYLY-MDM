@@ -496,8 +496,7 @@
     let catalogError = '';
     let catalogContent = '';
     let items = new Map();
-    const resultSectionsByPackage = new Map();
-    let retryFailedResultSectionsOnOpen = false;
+    let resultSections = { status: 'idle' };
     let creating = false;
     const packagePath = id => '/api/packages/' + encodeURIComponent(id);
     const packageById = id => catalog?.find(candidate => candidate.package_id === id);
@@ -562,9 +561,14 @@
     function updateSnapshot(data, source = 'http') {
       if (!Number.isSafeInteger(data?.revision) || data.revision < 0 ||
           typeof data?.server_instance_id !== 'string' || !data.server_instance_id) return false;
-      const instanceChanged = snapshot && data.server_instance_id !== snapshot.server_instance_id;
-      if (instanceChanged && source !== 'ws') return false;
+      const previousInstanceId = snapshot?.server_instance_id ?? null;
+      const instanceChanged = data.server_instance_id !== previousInstanceId;
+      if (snapshot && instanceChanged && source !== 'ws') return false;
       if (!instanceChanged && snapshot && data.revision < snapshot.revision) return false;
+      if (instanceChanged) {
+        resultSections = { status: 'idle' };
+        items = new Map();
+      }
       snapshot = { server_instance_id: data.server_instance_id, revision: data.revision,
         assignments: data.assignments || {}, deployments: data.deployments || {} };
       catalog = data.packages || [];
@@ -710,12 +714,14 @@
       updateActions();
     }
 
-    function readSections(sections) {
+    function readSections(sections, expectedInstanceId = snapshot?.server_instance_id ?? null) {
+      if ((snapshot?.server_instance_id ?? null) !== expectedInstanceId) return;
+      resultSections = { status: 'loaded' };
       items = new Map(sections.flatMap(section => section.items.map(item => [item.id, item])));
       renderResults();
     }
 
-    function readProfile(model, data, preserveEdits = false) {
+    function readProfile(model, data, preserveEdits = false, expectedInstanceId = snapshot?.server_instance_id ?? null) {
       const saved = loadDraft(data.sections, data.settings);
       const draft = structuredClone(saved);
       let name = data.name;
@@ -732,23 +738,20 @@
       Object.assign(model, { sections: data.sections, editRevision: data.edit_revision,
         publishedRevision: data.published_revision,
         savedName: data.name, saved, name, draft });
-      readSections(data.sections);
+      readSections(data.sections, expectedInstanceId);
     }
 
-    async function readResultSections(id, retryFailed = false) {
+    async function readResultSections(id) {
       if (!id) return;
-      const previous = resultSectionsByPackage.get(id);
-      if (previous?.status === 'loading' || previous?.status === 'loaded' ||
-          (previous?.status === 'failed' && !retryFailed)) return;
+      if (resultSections.status !== 'idle') return;
       const request = { status: 'loading' };
-      resultSectionsByPackage.set(id, request);
+      resultSections = request;
       try {
         const data = await api(packagePath(id));
-        if (resultSectionsByPackage.get(id) !== request) return;
-        request.status = 'loaded';
+        if (resultSections !== request) return;
         readSections(data.sections);
       } catch (_) {
-        if (resultSectionsByPackage.get(id) === request) request.status = 'failed';
+        if (resultSections === request) resultSections = { status: 'failed' };
         // Report status is available independently of setting labels and formatters.
       }
     }
@@ -787,6 +790,7 @@
       else renderEditor();
       const path = packagePath(model.id);
       const before = snapshot;
+      const beforeInstanceId = before?.server_instance_id ?? null;
       let writing = false;
       try {
         let data;
@@ -804,13 +808,20 @@
           writing = true;
           data = await api(path, 'DELETE');
         }
+        if ((snapshot?.server_instance_id ?? null) !== beforeInstanceId) {
+          model.message = writing
+            ? 'Could not confirm the request after the server restarted. Reload the package to check its current state.'
+            : 'The server restarted while the package was loading. Reload to get the current version.';
+          model.error = true;
+          return;
+        }
         if (action === 'delete') {
           current = null;
           updateSummary(before, null, model.id);
           renderCatalog();
           return;
         }
-        readProfile(model, data, action === 'reload');
+        readProfile(model, data, action === 'reload', beforeInstanceId);
         updateSummary(before, data, model.id);
         model.conflict = false;
         model.message = { deploy: 'Package saved. Deployment started.',
@@ -839,12 +850,12 @@
       return !current.saved || !hasChanges(current) || confirmAction('Discard the unsaved changes in "' + current.savedName + '"?');
     }
 
-    function selectPackage(id, profile) {
+    function selectPackage(id, profile, expectedInstanceId = snapshot?.server_instance_id ?? null) {
       if (current?.id === id) return;
       current = { id, expanded: new Set(['basic']) };
       renderCatalog();
-      if (!profile) return request(current, 'reload');
-      readProfile(current, profile);
+      if (!profile || expectedInstanceId !== (snapshot?.server_instance_id ?? null)) return request(current, 'reload');
+      readProfile(current, profile, false, expectedInstanceId);
       renderEditor();
     }
 
@@ -859,12 +870,13 @@
       button.disabled = input.disabled = true;
       feedback.textContent = 'Creating package…';
       const before = snapshot;
+      const beforeInstanceId = before?.server_instance_id ?? null;
       const editorBefore = current;
       try {
         const profile = await api('/api/packages', 'POST', { name });
         updateSummary(before, profile, profile.package_id);
         if (current === editorBefore && canSwitchPackage(profile.package_id)) {
-          selectPackage(profile.package_id, profile);
+          selectPackage(profile.package_id, profile, beforeInstanceId);
         }
         input.value = '';
         feedback.textContent = 'Package created.';
@@ -878,7 +890,7 @@
 
     function renderGroup(name) {
       if (name !== (group?.name ?? null)) {
-        retryFailedResultSectionsOnOpen = Boolean(name);
+        if (name && resultSections.status === 'failed') resultSections = { status: 'idle' };
         group = name ? groupEdits.get(name) || { name } : null;
         groupPanel.innerHTML = group ? `<section class="settings-section">
           <header><h3>Configuration package</h3><p>Deploy a package to this group, or deploy No package to stop managing settings and keep current device values.</p></header>
@@ -989,9 +1001,7 @@
         target.innerHTML = content;
       }
       if (deployment && assigned) {
-        const retryFailed = retryFailedResultSectionsOnOpen;
-        retryFailedResultSectionsOnOpen = false;
-        readResultSections(assigned, retryFailed);
+        readResultSections(assigned);
       }
     }
 

@@ -99,7 +99,7 @@ the managed settings sent to devices from the saved values.
 - **Save & deploy** in the editor saves the edits and publishes a new revision
   for every group using the package, in one commit.
 - **Deploy** in group **Settings** assigns a published package to the group with
-  a new group deployment revision. A new package must be deployed once from the
+  a new group deployment revision and assignment time. A new package must be deployed once from the
   editor first. Deploying the package already selected for the group publishes
   a new shared revision.
 - **No package** releases every managed setting for the group and leaves device
@@ -134,8 +134,12 @@ a restart. HTTP responses from the previous instance are ignored.
 The server sends the effective snapshot on registration, publication,
 assignment changes, group renames and deletions, and membership changes.
 Headset delivery and admin notifications run concurrently after the save, so a
-slow console cannot hold back device policy. There is no device delivery queue.
-Offline devices receive the latest snapshot when they connect.
+slow console cannot hold back device policy. Each connected device has at most
+one coalescing delivery task. Its serialized WebSocket write waits until the
+current policy can be sent, and lifecycle cleanup cancels it on disconnect,
+replacement, or server shutdown. HTTP Retry requests have a bounded send time.
+There is no persisted device delivery queue: offline devices receive the latest
+snapshot when they register again.
 
 Retry sends one token for the device's current package and revision. The server
 validates it after taking the device's WebSocket send lock and returns a
@@ -254,7 +258,7 @@ The **Permissions** section shows file access, each Wi-Fi grant, and the
 Location switch, and refreshes when the operator returns from Android settings.
 When both location grants are present, the running service adds its `location`
 foreground service type. **Device configuration** shows the assigned group and
-the deployment time of the published revision in local time.
+the deployment time of its active group revision in local time.
 
 #### Package API and device reports
 
@@ -274,9 +278,10 @@ the deployment time of the published revision in local time.
 #### Registry storage
 
 The private `device_registry.json` stores the `configuration_revision` with
-`packages` and each group's `members`,
-`package_id`, and optional `deployment_revision`. Republishing a package
-replaces group deployment revisions with its new `published_revision`. Wi-Fi
+`packages` and each group's `members`, `package_id`, and optional
+`deployment_revision` and `deployment_at_ms`. The group time is written together
+with its scoped revision. Shared publication replaces scoped revisions and times
+with the package's new `published_revision` and `deployed_at_ms`. Wi-Fi
 passwords are plaintext in the registry and its backups.
 
 - The released `{"groups": {name: [device_id]}}` format is migrated to the

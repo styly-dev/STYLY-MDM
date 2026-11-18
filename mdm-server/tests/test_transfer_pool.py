@@ -203,6 +203,9 @@ async def test_install_release_does_not_release_job_v1_push_transfer(tmp_path, r
             assert not push_task.done()
             assert leases.token(key) == lease_token
 
+            assert not server.release_transfer_slot("D1", reason, task="unknown")
+            assert not push_transfer.done()
+
             registry.release_exact(key, "download_complete")
             await asyncio.wait_for(push_task, 1)
             assert server.pending_transfers == {}

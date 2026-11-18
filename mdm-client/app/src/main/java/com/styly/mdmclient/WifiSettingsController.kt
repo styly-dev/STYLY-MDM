@@ -463,7 +463,7 @@ internal class WifiSettingsController internal constructor(
             return false
         }
         attempt.candidates = application.usableIndexes
-        attempt.applicationFailure = application.autoJoinFailure ?: application.failure
+        attempt.applicationFailure = application.failure
         if (attempt.candidates.isEmpty()) {
             fail(attempt, attempt.applicationFailure ?: WifiReason.UPDATE_FAILED)
             return false

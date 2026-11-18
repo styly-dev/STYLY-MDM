@@ -1264,3 +1264,79 @@ test('deletion displays a server reference conflict and removes the package afte
   assert.doesNotMatch(fixture.packageList.innerHTML, /data-package-id="pkg"/);
   assert.match(fixture.packagePanel.innerHTML, /Select a configuration package/);
 });
+
+test('editor sections are shared with group results for other packages', async () => {
+  const fixture = createHarness(({ url }) => {
+    if (url === '/api/packages') return response({ packages: [pkg, pkg2] });
+    if (url === '/api/packages/pkg') {
+      return response(profile({ itemSections: [{ ...sections[0], items: [
+        { ...sections[0].items[0], label: 'Editor brightness' },
+      ] }] }));
+    }
+    assert.fail('group results should reuse the editor sections');
+  }, { groups: { 'The Lab': ['headset'] }, devices: [{ ...online, configuration_state: {
+    package_id: 'pkg2', revision: 'r2', status: 'complete', results: { brightness: { status: 'applied', value: 60 } },
+  } }] });
+
+  fixture.broadcast({ assignments: { 'The Lab': 'pkg2' }, deployments: { 'The Lab': {
+    package_id: 'pkg2', revision: 'r2', keys: ['brightness'],
+  } } });
+  await fixture.controller.showPackages('pkg');
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  fixture.controller.renderGroup('The Lab');
+
+  assert.match(fixture.groupControls['[data-settings-results]'].innerHTML, /Editor brightness/);
+  assert.equal(fixture.requests.filter(request => request.url.startsWith('/api/packages/')).length, 1);
+});
+
+test('failed result sections are retried after reopening the group', async () => {
+  let packageReads = 0;
+  const fixture = createHarness(({ url }) => {
+    if (url.startsWith('/api/packages/')) {
+      packageReads++;
+      if (packageReads === 1) throw new Error('temporary read failure');
+      return response(profile());
+    }
+    assert.fail('unexpected package request');
+  }, { devices: [{ ...online, configuration_state: applied }] });
+  fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
+  fixture.controller.renderGroup('The Lab');
+  await new Promise(resolve => setImmediate(resolve));
+
+  fixture.controller.renderGroup(null);
+  fixture.controller.renderGroup('The Lab');
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(packageReads, 2);
+  assert.match(fixture.groupControls['[data-settings-results]'].innerHTML, /All managed settings were verified/);
+});
+
+test('old section responses cannot replace schema after a server instance change', async () => {
+  const pending = [];
+  const fixture = createHarness(({ url }) => {
+    if (!url.startsWith('/api/packages/')) assert.fail('unexpected package request');
+    return new Promise(resolve => pending.push(resolve));
+  }, { devices: [{ ...online, configuration_state: applied }] });
+  fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
+  fixture.controller.renderGroup('The Lab');
+  await new Promise(resolve => setImmediate(resolve));
+
+  fixture.broadcast({ revision: 1, server_instance_id: 'server-b',
+    assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
+  fixture.controller.renderGroup('The Lab');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(pending.length, 2);
+
+  const namedSections = label => [{ ...sections[0], items: [
+    { ...sections[0].items[0], label },
+  ] }];
+  pending[0](response(profile({ itemSections: namedSections('Old server brightness') })));
+  await new Promise(resolve => setImmediate(resolve));
+  pending[1](response(profile({ itemSections: namedSections('Current server brightness') })));
+  await new Promise(resolve => setImmediate(resolve));
+
+  const rendered = fixture.groupControls['[data-settings-results]'].innerHTML;
+  assert.match(rendered, /Current server brightness/);
+  assert.doesNotMatch(rendered, /Old server brightness/);
+});
