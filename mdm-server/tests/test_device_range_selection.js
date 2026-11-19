@@ -47,11 +47,12 @@ function makeHarness({ order = [], selected = [], devices = null } = {}) {
   });
   // Keep this accessor live when DEVICE_LIST replaces the module's device array.
   context.deviceById = (id) => context.devices.find((d) => d.device_id === id);
+  context.getOnlineIds = () => context.devices.filter(d => d.status === 'online').map(d => d.device_id);
   context.knownIds = () => new Set(context.devices.map((d) => d.device_id));
   vm.runInContext(listHelpers, context);
   vm.runInContext(functionSource('toggleRangeSelection'), context);
   for (const name of ['toggleDevice', 'toggleSelectAll', 'clearSelection', 'selectGroupAsTarget',
-    'syncActiveGroupSelection', 'switchTargetTab']) {
+    'syncActiveGroupSelection', 'switchTargetTab', 'sameSet', 'powerDeviceTargets']) {
     vm.runInContext(functionSource(name), context);
   }
   return context;
@@ -141,6 +142,27 @@ test('DEVICE_LIST refresh keeps an existing anchor ID and prunes one whose devic
   assert.equal(context.deviceSelectionAnchorId, 'b');
   context.applyDeviceList({ devices: [{ device_id: 'a', label: 'A', status: 'online' }] });
   assert.equal(context.deviceSelectionAnchorId, null);
+});
+
+test('active group member or eligible online target changes invalidate power confirmation', () => {
+  const context = makeHarness({ order: ['a', 'b'], selected: ['a', 'b'] });
+  context.activeGroup = 'Room A';
+  context.groups = { 'Room A': ['a', 'b'] };
+  context.powerConfirm.checked = true;
+  context.groups['Room A'] = ['b'];
+  context.syncActiveGroupSelection();
+  assert.deepEqual(selected(context), ['b']);
+  assert.equal(context.powerConfirm.checked, false, 'a membership change invalidates the confirmation');
+
+  context.powerConfirm.checked = true;
+  context.devices = [{ device_id: 'b', label: 'B', status: 'online' }];
+  const block = source.match(/case 'DEVICE_LIST': \{([\s\S]*?)\n          \}  \n          case 'PROVISIONAL_CONNECTION_LIST'/) ||
+    source.match(/case 'DEVICE_LIST': \{([\s\S]*?)\n          \}\n          case 'PROVISIONAL_CONNECTION_LIST'/);
+  assert.ok(block, 'actual DEVICE_LIST handler exists');
+  const body = block[1].replace(/\n\s*break;\s*$/, '');
+  vm.runInContext('function applyDeviceList(msg) {' + body + '\n}', context);
+  context.applyDeviceList({ devices: [{ device_id: 'b', label: 'B', status: 'offline' }] });
+  assert.equal(context.powerConfirm.checked, false, 'online command targets changing invalidates the confirmation');
 });
 
 test('select-all, clear, group selection/sync, and tab transitions reset the anchor', () => {

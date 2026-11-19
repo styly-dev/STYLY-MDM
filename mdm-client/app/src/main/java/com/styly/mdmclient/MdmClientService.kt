@@ -101,6 +101,7 @@ class MdmClientService : Service() {
     }
 
     private val startupHandler = Handler(android.os.Looper.getMainLooper())
+    private var startupLaunchScheduled = false
     @Volatile private var notificationStatus = "Initializing..."
     private lateinit var webSocketManager: WebSocketManager
 
@@ -163,8 +164,6 @@ class MdmClientService : Service() {
         )
         webSocketManager.connect()
 
-        launchStartupAppIfConfigured()
-
         guardEnsureThread = HandlerThread("guard-ensure").apply { start() }
         guardEnsure = Handler(guardEnsureThread.looper)
         guardEnsure.postDelayed(::guardEnsureTick, GUARD_ENSURE_INTERVAL_MS)
@@ -180,6 +179,10 @@ class MdmClientService : Service() {
             intent == null -> REASON_SYSTEM
             intent.action == "com.pvr.tobservice.SERVICE_AUTO_BOOT" -> "tob_auto_boot"
             else -> intent.getStringExtra(EXTRA_START_REASON) ?: REASON_SYSTEM
+        }
+        if (reason != REASON_SETTINGS && !startupLaunchScheduled) {
+            startupLaunchScheduled = true
+            launchStartupAppIfConfigured()
         }
         Log.i(TAG, "MdmClientService started (reason=$reason)")
         UpdateJournal.record(
@@ -956,12 +959,12 @@ class MdmClientService : Service() {
                     }
                 }
             )
-        } catch (e: Exception) {
+        } catch (failure: Throwable) {
             apkFile.delete()
             if (isSelfUpdate && UpdateJournal.powerCycleTimersSet(this)) {
                 PowerCycleTimers.disarm(this, "install_failed")
             }
-            throw e
+            throw failure
         }
     }
 

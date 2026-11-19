@@ -1,9 +1,11 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
-  createController, loadDraft, buildPayload, deviceOutcome, retryEligible, syncMemberSelection,
-  clearMembershipEditsThatMatch, expectedMembershipOwner, buildMembershipEdit,
+  createController, loadDraft, buildPayload, deviceOutcome, retryEligible,
 } = require('../styly_mdm/static/configuration-packages-v1.js');
+const {
+  membershipGroups, selectedMembers, toggleMember, reconcileMembers, buildMembershipEdit,
+} = require('../styly_mdm/static/group-membership.js');
 
 const sections = [
   { id: 'basic', title: 'Basic settings', description: 'Display and power', items: [
@@ -136,6 +138,75 @@ test('Wi-Fi accepts short WPA3-only ASCII passwords and rejects invalid values',
   assert.throws(() => buildPayload(sections, draft, saved), /1 to 63 ASCII characters/);
   draft.wifi.value.networks[0].password = '';
   assert.throws(() => buildPayload(sections, draft, saved), /Enter a 1 to 63 character ASCII password/);
+});
+
+test('unmanaging Wi-Fi discards an incomplete draft row and retains saved metadata and credentials', () => {
+  const saved = loadDraft(sections, { wifi: { managed: true, value: {
+    prioritize_networks: false,
+    auto_return: false,
+    networks: [{ ssid: '日本語', security: 'WPA2_WPA3', hidden: false, password_present: true }],
+  } } });
+  const draft = structuredClone(saved);
+  draft.wifi.value.networks.push({ ssid: '', security: 'OPEN', hidden: false, password: '' });
+  draft.wifi.managed = false;
+
+  const payload = buildPayload(sections, draft, saved).wifi;
+  assert.deepEqual(payload, { managed: false, value: {
+    networks: [{ ssid: '日本語', security: 'WPA2_WPA3', hidden: false }],
+    auto_return: false, prioritize_networks: false,
+  } });
+  assert.equal(Object.hasOwn(payload.value.networks[0], 'password'), false);
+});
+
+test('Wi-Fi edits stop counting as dirty after unmanaging an already unmanaged setting', async () => {
+  const settings = { wifi: { managed: false, value: {
+    auto_return: false,
+    prioritize_networks: true,
+    networks: [{ ssid: 'Office', security: 'OPEN', hidden: false }],
+  } } };
+  let latest = profile({ settings });
+  let submitted;
+  const fixture = createHarness(({ url, method, body }) => {
+    if (url === '/api/packages') return response({ packages: [latest] });
+    if (method === 'GET') return response(latest);
+    submitted = body;
+    latest = { ...latest, settings: body.settings, edit_revision: 'edit2', published_revision: 'r1' };
+    return response(latest);
+  });
+  fixture.broadcast({ packages: [latest] });
+  await fixture.controller.showPackages('pkg');
+
+  fixture.edit({ dataset: { manage: 'wifi' }, checked: true });
+  fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'ssid' }, value: 'Temporary', type: 'text' });
+  fixture.edit({ dataset: { manage: 'wifi' }, checked: false });
+
+  assert.match(fixture.packagePanel.innerHTML, /value="Office"/);
+  assert.doesNotMatch(fixture.packagePanel.innerHTML, /value="Temporary"/);
+  assert.equal(fixture.footerStatus.textContent, '');
+  assert.equal(fixture.editorButtons.discard.disabled, true);
+  assert.equal(fixture.editorButtons.deploy.disabled, false,
+    'manual redeploy stays available even when there are no saved changes');
+  await fixture.editClick('deploy');
+  assert.equal(submitted.settings.wifi.managed, false);
+  assert.equal(submitted.settings.wifi.value.networks[0].ssid, 'Office');
+});
+
+test('Wi-Fi SSIDs follow the server UTF-8 byte and character rules', () => {
+  const saved = loadDraft(sections, { wifi: { managed: true, value: {
+    auto_return: false,
+    networks: [{ ssid: '日本語', security: 'OPEN', hidden: false }],
+  } } });
+  const draft = structuredClone(saved);
+  assert.doesNotThrow(() => buildPayload(sections, draft, saved), '3 Japanese characters fit within 32 UTF-8 bytes');
+
+  draft.wifi.value.networks[0].ssid = '界'.repeat(10) + 'ab';
+  assert.doesNotThrow(() => buildPayload(sections, draft, saved), '32 UTF-8 bytes are accepted');
+  draft.wifi.value.networks[0].ssid = '界'.repeat(11);
+  assert.throws(() => buildPayload(sections, draft, saved), /1 to 32 UTF-8 bytes/);
+  for (const ssid of ['bad"ssid', 'bad\\ssid', 'line\nfeed', '\u0085control', '\ud800']) {
+    draft.wifi.value.networks[0].ssid = ssid;
+    assert.throws(() => buildPayload(sections, draft, saved), /SSID/);
+  }
 });
 
 test('auto-return is stored inside the Wi-Fi setting and hidden networks are rejected', async () => {
@@ -309,9 +380,9 @@ const pkg2 = { package_id: 'pkg2', name: 'Night studio', published_revision: nul
 const d1 = { package_id: 'pkg', revision: 'r1', keys: ['brightness'] };
 
 function groupSnapshot(revision, { packages = [pkg, pkg2], assignments = {}, deployments = {}, groups = { 'The Lab': ['headset'] },
-  server_instance_id = 'server-a' } = {}) {
+  server_instance_id = 'server-a', configuration_available = true } = {}) {
   return { type: 'GROUP_LIST', revision, packages, assignments, deployments, groups,
-    registry_writable: true, configuration_available: true, server_instance_id };
+    registry_writable: true, configuration_available, server_instance_id };
 }
 const online = { device_id: 'headset', label: 'DEV-003', status: 'online', configuration_supported: true };
 const applied = { ...d1, status: 'complete', results: { brightness: { status: 'applied', value: 60 } } };
@@ -331,7 +402,7 @@ test('device status uses deployment keys and requires both IDs for current resul
   assert.equal(status({ ...applied, status: 'applying' }), 'Applying');
   assert.equal(status(applied, null), 'Waiting for deployment');
   assert.equal(status(unsupported), 'Unsupported');
-  assert.equal(deviceOutcome(online, null, null)[1], 'No package');
+  assert.equal(deviceOutcome(online, null, null)[1], 'No managed settings');
   for (const report of [failed, unsupported, { ...applied, status: 'interrupted' }]) {
     assert.equal(retryEligible(device(report), d1), true);
     assert.equal(retryEligible(device({ ...report, package_id: 'other' }), d1), false);
@@ -509,59 +580,117 @@ test('Group Settings reports live auto-return monitor status separately from app
   assert.doesNotMatch(fixture.groupControls['[data-settings-results]'].innerHTML, /Wi-Fi auto-return monitor:/);
 });
 
-test('a broadcast does not reselect an untouched device moved to another group', () => {
-  assert.deepEqual(syncMemberSelection(['moved', 'remove'], ['remove', 'remote-add'], new Set(['moved', 'local-add'])),
-    new Set(['remote-add', 'local-add']));
-});
-
-test('membership edits include only local changes and preserve untouched remote moves', () => {
-  const previous = ['moved', 'kept'];
-  const selected = new Set(['moved', 'kept', 'local-add']);
-  const edited = new Set(['local-add']);
+test('membership edits derive the roster from the latest snapshot and one edit map', () => {
+  const edits = new Map();
   const currentGroups = { Studio: ['kept'], Gallery: ['moved'] };
-  const current = new Set(currentGroups.Studio);
-  const selection = syncMemberSelection(previous, currentGroups.Studio, selected, edited);
-  const stagedOwners = new Map([
-    ['local-add', expectedMembershipOwner('local-add', 'Studio', currentGroups)],
-  ]);
-  const payload = buildMembershipEdit('Studio', current, selection, currentGroups, stagedOwners);
-  assert.deepEqual(payload, {
+  edits.set('local-add', { kind: 'add', expectedOwner: null });
+
+  assert.deepEqual(selectedMembers(currentGroups.Studio, edits), new Set(['kept', 'local-add']));
+  assert.deepEqual(buildMembershipEdit('Studio', currentGroups, edits), {
     type: 'UPDATE_GROUP_MEMBERS', name: 'Studio', add: { 'local-add': null }, remove: [],
   });
-  assert.deepEqual(selection, new Set(['kept', 'local-add']));
+  assert.deepEqual(membershipGroups('moved', currentGroups), ['Gallery']);
 });
 
-test('membership additions reject a changed source group until reviewed again', () => {
-  const original = { Studio: [], LabA: ['headset'] };
-  const expectedOwners = new Map([['headset', expectedMembershipOwner('headset', 'Studio', original)]]);
-  const changed = { Studio: [], LabB: ['headset'] };
-  assert.throws(() => buildMembershipEdit('Studio', [], ['headset'], changed, expectedOwners),
-    /Group membership changed/);
-  assert.throws(() => expectedMembershipOwner('headset', 'Studio', {
-    Studio: [], LabA: ['headset'], LabB: ['headset'],
-  }), /conflicting group memberships/);
-  assert.deepEqual(buildMembershipEdit('Studio', [], ['headset'], changed,
-    new Map([['headset', 'LabB']])), {
+test('membership toggles add, remove, and clear an edit when reverted', () => {
+  const groups = { Studio: ['kept'], Gallery: ['headset'] };
+  const edits = new Map();
+
+  assert.equal(toggleMember('Studio', groups, edits, 'headset'), true);
+  assert.deepEqual(edits.get('headset'), { kind: 'add', expectedOwner: 'Gallery' });
+  assert.equal(toggleMember('Studio', groups, edits, 'headset'), false);
+  assert.equal(edits.has('headset'), false);
+
+  assert.equal(toggleMember('Studio', groups, edits, 'kept'), false);
+  assert.deepEqual(edits.get('kept'), { kind: 'remove' });
+  assert.equal(toggleMember('Studio', groups, edits, 'kept'), true);
+  assert.equal(edits.has('kept'), false);
+});
+
+test('a broadcast follows untouched moves while preserving staged additions and removals', () => {
+  const edits = new Map([
+    ['remove', { kind: 'remove' }],
+    ['local-add', { kind: 'add', expectedOwner: null }],
+  ]);
+  const currentGroups = { Studio: ['remove', 'kept'], Gallery: ['moved'] };
+  assert.deepEqual(selectedMembers(currentGroups.Studio, edits), new Set(['kept', 'local-add']));
+  assert.deepEqual(buildMembershipEdit('Studio', currentGroups, edits), {
+    type: 'UPDATE_GROUP_MEMBERS', name: 'Studio', add: { 'local-add': null }, remove: ['remove'],
+  });
+
+  const latestGroups = { Studio: ['kept', 'remote-add'], Gallery: ['moved'] };
+  assert.deepEqual(selectedMembers(latestGroups.Studio, edits),
+    new Set(['kept', 'remote-add', 'local-add']));
+  assert.deepEqual(buildMembershipEdit('Studio', latestGroups, edits), {
+    type: 'UPDATE_GROUP_MEMBERS', name: 'Studio', add: { 'local-add': null }, remove: [],
+  });
+});
+
+test('membership edits already applied by another console are pruned from the map', () => {
+  const edits = new Map([
+    ['added', { kind: 'add', expectedOwner: null }],
+    ['removed', { kind: 'remove' }],
+    ['still-pending-add', { kind: 'add', expectedOwner: 'Gallery' }],
+    ['still-pending-remove', { kind: 'remove' }],
+  ]);
+
+  reconcileMembers(['added', 'still-pending-remove'], edits);
+  assert.deepEqual(edits, new Map([
+    ['still-pending-add', { kind: 'add', expectedOwner: 'Gallery' }],
+    ['still-pending-remove', { kind: 'remove' }],
+  ]));
+
+  const laterGroups = { Studio: [], Gallery: [] };
+  assert.deepEqual(selectedMembers(laterGroups.Studio, edits), new Set(['still-pending-add']));
+});
+
+test('membership payload skips edits already satisfied by the latest group snapshot', () => {
+  const groups = { Studio: ['already-added'] };
+  const edits = new Map([
+    ['already-added', { kind: 'add', expectedOwner: 'Gallery' }],
+    ['already-removed', { kind: 'remove' }],
+  ]);
+
+  assert.deepEqual(buildMembershipEdit('Studio', groups, edits), {
+    type: 'UPDATE_GROUP_MEMBERS', name: 'Studio', add: {}, remove: [],
+  });
+});
+
+test('membership payload safely preserves device IDs that are object property names', () => {
+  const payload = buildMembershipEdit('Studio', { Studio: [] }, new Map([
+    ['__proto__', { kind: 'add', expectedOwner: null }],
+  ]));
+
+  assert.equal(Object.hasOwn(payload.add, '__proto__'), true);
+  assert.equal(payload.add.__proto__, null);
+});
+
+test('membership additions reject changed or conflicting owners without changing the draft', () => {
+  const edits = new Map();
+  const initialGroups = { Studio: [], LabA: ['headset'] };
+  toggleMember('Studio', initialGroups, edits, 'headset');
+
+  const changedGroups = { Studio: [], LabB: ['headset'] };
+  assert.throws(() => buildMembershipEdit('Studio', changedGroups, edits), /Group membership changed/);
+  assert.deepEqual(edits.get('headset'), { kind: 'add', expectedOwner: 'LabA' });
+
+  assert.throws(() => toggleMember('Studio', {
+    Studio: [], LabA: ['other'], LabB: ['other'],
+  }, edits, 'other'), /conflicting group memberships/);
+  assert.equal(edits.has('other'), false);
+
+  const reviewedEdits = new Map([['headset', { kind: 'add', expectedOwner: 'LabB' }]]);
+  assert.deepEqual(buildMembershipEdit('Studio', changedGroups, reviewedEdits), {
     type: 'UPDATE_GROUP_MEMBERS', name: 'Studio', add: { headset: 'LabB' }, remove: [],
   });
 });
 
-test('group selection follows fresh unedited members and keeps staged removals deselected', () => {
-  const selection = syncMemberSelection(
-    ['remove', 'untouched'], ['remove', 'remote-add'], new Set(['untouched']), new Set(['remove']));
-  assert.deepEqual(selection, new Set(['remote-add']));
-});
-
-test('a reverted local toggle is cleared before a later remote add', () => {
-  const selected = new Set();
-  const edited = new Set(['headset']);
-  const owners = new Map([['headset', null]]);
-  clearMembershipEditsThatMatch(selected, [], edited, owners);
-  assert.deepEqual(edited, new Set());
-  assert.deepEqual(owners, new Map());
-
-  const next = syncMemberSelection([], ['headset'], selected, edited);
-  assert.deepEqual(next, new Set(['headset']));
+test('membership payload rejects duplicate IDs and stale removals', () => {
+  assert.throws(() => buildMembershipEdit('Studio', { Studio: ['headset', 'headset'] }, new Map()),
+    /duplicate device IDs/);
+  assert.throws(() => buildMembershipEdit('Studio', {
+    Studio: ['headset'], Gallery: ['headset'],
+  }, new Map([['headset', { kind: 'remove' }]])), /membership changed/);
 });
 
 function response(data, status = 200) {
@@ -578,7 +707,8 @@ function profile({
     settings, sections: itemSections, impact };
 }
 
-function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'] }, confirm = () => true, onSnapshot } = {}) {
+function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'] }, confirm = () => true,
+  onSnapshot, requestGroupSnapshot = () => false } = {}) {
   const createElement = overrides => ({
     innerHTML: '', textContent: '', value: '', hidden: false, disabled: false,
     classList: { toggle() {} },
@@ -650,6 +780,7 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     openPackages: () => { opened++; },
     confirmAction: message => { confirmations.push(message); return confirm(message); },
     onSnapshot,
+    requestGroupSnapshot,
     fetch: async (url, init) => {
       const request = { url, method: init.method, body: init.body && JSON.parse(init.body) };
       requests.push(request);
@@ -689,18 +820,18 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     groupPanel.handlers.get('change')({ target: control });
   };
   const broadcast = ({ revision, packages = [pkg, pkg2], assignments = {}, deployments = {}, groups: snapshotGroups,
-    server_instance_id } = {}) => {
+    server_instance_id, configuration_available } = {}) => {
     const currentRevision = revision ?? lastSnapshotRevision + 1;
     lastSnapshotRevision = Math.max(lastSnapshotRevision, currentRevision);
     controller.updateSnapshot(groupSnapshot(currentRevision, { packages, assignments, deployments,
-      groups: snapshotGroups || groups, server_instance_id }), 'ws');
+      groups: snapshotGroups || groups, server_instance_id, configuration_available }), 'ws');
   };
   const create = async name => {
     createControls.input.value = name;
     await createForm.handlers.get('submit')({ preventDefault() {} });
   };
   return {
-    controller, packagePanel, packageList, edit, editClick, policyClick, editorButtons, editorControls, groupControls,
+    controller, packagePanel, packageList, groupPanel, edit, editClick, policyClick, editorButtons, editorControls, groupControls,
     groupClick, groupButtons, select, broadcast, create, createControls, requests, confirmations,
     passwordInputs: () => passwordInputs,
     valueField, moveButtons, wifiLimitWarning, wifiHiddenWarning, addNetworkButton, footerStatus,
@@ -747,6 +878,121 @@ test('an authoritative WS catalog clears a previous package-list failure', async
   fixture.broadcast({ packages: [] });
   assert.match(fixture.packageList.innerHTML, /No packages yet/);
   assert.doesNotMatch(fixture.packageList.innerHTML, /data-refresh-packages|Reload packages/);
+});
+
+test('an unavailable configuration snapshot keeps known packages visible but disables configuration actions', () => {
+  const fixture = createHarness(() => assert.fail('unavailable configuration must not start a write'));
+  fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
+  fixture.broadcast({ packages: [], configuration_available: false,
+    assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
+  fixture.controller.renderGroup('The Lab');
+
+  assert.match(fixture.packageList.innerHTML, /Waiting for the server connection/);
+  assert.match(fixture.packageList.innerHTML, /data-package-id="pkg"[^>]*disabled/);
+  assert.equal(fixture.groupControls['[data-group-package]'].disabled, true);
+  assert.equal(fixture.groupButtons.edit.disabled, true);
+  assert.equal(fixture.groupButtons.deploy.disabled, true);
+  assert.deepEqual(fixture.controller.groupPackageSummary('The Lab'), { name: null, count: null });
+  assert.equal(fixture.controller.groupPackageSummary('Empty')?.name, null);
+});
+
+test('package Reload waits for a fresh group snapshot and retries after reconnect', async () => {
+  const snapshotRequests = [];
+  let socketConnected = false;
+  const fixture = createHarness(({ url }) => url === '/api/packages'
+    ? response({ packages: [pkg] })
+    : response(profile()), { requestGroupSnapshot: () => {
+      snapshotRequests.push('requested');
+      return socketConnected;
+    } });
+  fixture.broadcast({ packages: [pkg], configuration_available: true,
+    assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
+  fixture.controller.renderGroup('The Lab');
+  assert.equal(fixture.createControls.input.disabled, false);
+
+  fixture.broadcast({ packages: [], configuration_available: false,
+    assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
+  fixture.controller.renderGroup('The Lab');
+  assert.equal(fixture.createControls.input.disabled, true);
+  assert.equal(fixture.createControls.button.disabled, true);
+
+  const reload = { dataset: {} };
+  const requestsBeforeReload = fixture.requests.length;
+  await fixture.packageList.handlers.get('click')({ target: { closest: () => reload } });
+  assert.equal(snapshotRequests.length, 1);
+  assert.equal(fixture.requests.length, requestsBeforeReload,
+    'an unavailable server snapshot does not start a catalog GET while disconnected');
+  assert.match(fixture.packageList.innerHTML, /Waiting for the server connection/);
+  assert.equal(fixture.createControls.input.disabled, true,
+    'catalog contents do not determine configuration availability');
+  assert.equal(fixture.groupControls['[data-group-package]'].disabled, true);
+
+  socketConnected = true;
+  fixture.controller.setGroupSnapshotConnected(true);
+  assert.equal(snapshotRequests.length, 2, 'reconnection requests a fresh authoritative snapshot');
+  assert.match(fixture.packageList.innerHTML, /Checking configuration status with the server/);
+
+  fixture.broadcast({ packages: [pkg], configuration_available: true,
+    assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
+  assert.equal(fixture.createControls.input.disabled, false,
+    'a later authoritative GROUP_LIST restores package actions');
+});
+
+test('opening the package catalog waits for configuration availability on the group snapshot', async () => {
+  const fixture = createHarness(() => assert.fail('opening the catalog must wait for the group snapshot'));
+  fixture.broadcast({ packages: [], configuration_available: false });
+
+  await fixture.controller.showPackages();
+
+  assert.equal(fixture.requests.length, 0);
+  assert.match(fixture.packageList.innerHTML, /Waiting for the server connection/);
+  assert.equal(fixture.createControls.input.disabled, true);
+});
+
+test('a delayed successful catalog GET cannot replace a newer GROUP_LIST catalog', async () => {
+  const oldPackage = { ...pkg, name: 'Stale package' };
+  const currentPackage = { ...pkg2, name: 'Current package' };
+  let resolveCatalog;
+  const fixture = createHarness(({ url }) => url === '/api/packages'
+    ? new Promise(resolve => { resolveCatalog = resolve; })
+    : response(profile()));
+  fixture.broadcast({ packages: [oldPackage], configuration_available: true });
+  fixture.controller.renderGroup('The Lab');
+
+  const reload = fixture.packageList.handlers.get('click')({ target: { closest: () => ({ dataset: {} }) } });
+  assert.equal(fixture.requests.at(-1).url, '/api/packages');
+  fixture.broadcast({ packages: [currentPackage], configuration_available: true });
+  assert.match(fixture.packageList.innerHTML, /Current package/);
+
+  resolveCatalog(response({ packages: [oldPackage] }));
+  await reload;
+  assert.match(fixture.packageList.innerHTML, /Current package/);
+  assert.doesNotMatch(fixture.packageList.innerHTML, /Stale package/);
+  assert.equal(fixture.createControls.button.disabled, false);
+});
+
+test('package creation finally keeps controls disabled after availability becomes false', async () => {
+  let rejectCreate;
+  const fixture = createHarness(({ url, method }) => {
+    if (url === '/api/packages' && method === 'POST') {
+      return new Promise((_, reject) => { rejectCreate = reject; });
+    }
+    return response({ packages: [] });
+  });
+  fixture.broadcast({ packages: [], configuration_available: true });
+
+  const pendingCreate = fixture.create('New package');
+  assert.equal(fixture.createControls.button.disabled, true);
+  fixture.broadcast({ packages: [], configuration_available: false });
+  rejectCreate(Object.assign(new Error('Configuration packages are unavailable'), { status: 503 }));
+  await pendingCreate;
+
+  assert.equal(fixture.createControls.input.disabled, true);
+  assert.equal(fixture.createControls.button.disabled, true);
+  const requestCount = fixture.requests.length;
+  await fixture.create('Blocked package');
+  assert.equal(fixture.requests.length, requestCount,
+    'a re-enabled submit must not reach the API while the snapshot is unavailable');
 });
 
 test('a late package-list failure cannot override a newer WS catalog', async () => {
@@ -918,6 +1164,30 @@ test('a lost publish response requires reloading the package before publishing a
   assert.equal(fixture.editorButtons.deploy.disabled, false);
 });
 
+test('a publish response after a server restart exposes reload before another deploy', async () => {
+  let finishPublish;
+  const fixture = createHarness(({ method }) => {
+    if (method === 'GET') return response(profile());
+    return new Promise(resolve => { finishPublish = resolve; });
+  });
+  fixture.broadcast();
+  await fixture.controller.showPackages('pkg');
+
+  const deploying = fixture.editClick('deploy');
+  await new Promise(resolve => setImmediate(resolve));
+  fixture.broadcast({ server_instance_id: 'server-b' });
+  finishPublish(response(profile({ publishedRevision: 'r1' })));
+  await deploying;
+
+  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /server restarted/);
+  assert.equal(fixture.editorButtons.reload.hidden, false);
+  assert.equal(fixture.editorButtons.deploy.disabled, true);
+
+  await fixture.editClick('reload');
+  assert.equal(fixture.editorButtons.reload.hidden, true);
+  assert.equal(fixture.editorButtons.deploy.disabled, false);
+});
+
 test('WS catalog updates do not repaint draft inputs or yield to an older HTTP save response', async () => {
   let finishSave;
   const fixture = createHarness(({ method }) => method === 'GET' ? response(profile()) :
@@ -1013,13 +1283,13 @@ test('group deployment preserves a staged selection and ignores a delayed older 
 test('group deploy applies its committed HTTP snapshot before a delayed older GROUP_LIST', async () => {
   const nextPackage = { ...pkg2, published_revision: 'r2' };
   const nextDeployment = { package_id: 'pkg2', revision: 'r2', keys: ['brightness'] };
-  const acceptedRevisions = [];
+  const acceptedSnapshots = [];
   const fixture = createHarness(({ method }) => method === 'POST'
     ? response(groupSnapshot(3, { packages: [pkg, nextPackage], assignments: { [name]: 'pkg2' },
       deployments: { [name]: nextDeployment } }))
     : response({ ...profile(), use_current: true, impact: { groups: 1, devices: 1, token: 'impact1' } }), {
     devices: [{ ...online, configuration_state: applied }],
-    onSnapshot: data => acceptedRevisions.push(data.revision),
+    onSnapshot: (data, source) => acceptedSnapshots.push([data.revision, source]),
   });
   const name = 'The Lab';
   const publication = fixture.groupControls['[data-group-publication]'];
@@ -1036,7 +1306,7 @@ test('group deploy applies its committed HTTP snapshot before a delayed older GR
 
   fixture.broadcast({ revision: 2, packages: [pkg, nextPackage], assignments: { [name]: 'pkg' }, deployments: { [name]: d1 } });
   fixture.controller.renderGroup(name);
-  assert.deepEqual(acceptedRevisions, [1, 3]);
+  assert.deepEqual(acceptedSnapshots, [[1, 'ws'], [3, 'http']]);
   assert.equal(publication.textContent, 'Deployed version r2');
   assert.match(results.innerHTML, /Waiting for the device to report this deployment/);
 });
@@ -1136,12 +1406,12 @@ test('Group Settings redeploys the assigned package only after confirming the sh
   assert.match(fixture.groupControls['[data-assignment-feedback]'].textContent, /Deployment started/);
 });
 
-test('Group Settings deploys No package through the same confirmation flow', async () => {
+test('Group Settings stops managing settings through the same confirmation flow', async () => {
   const url = '/api/group-package/deploy?name=The+Lab&package_id=';
   const fixture = createHarness(request => {
     if (request.url === '/api/packages/pkg') return response(profile());
     if (request.method === 'POST') return response(groupSnapshot(2));
-    return response({ name: 'No package', clear: true, wifi_mode: 'priority',
+    return response({ name: 'No managed settings', clear: true, wifi_mode: 'priority',
       impact: { groups: 1, devices: 1, token: 'clear1' } });
   });
   const name = 'The Lab';
@@ -1152,7 +1422,7 @@ test('Group Settings deploys No package through the same confirmation flow', asy
   assert.equal(fixture.groupButtons.deploy.disabled, false);
   const requestCount = fixture.requests.length;
   await fixture.groupClick('deploy');
-  assert.match(fixture.confirmations[0], /Deploy No package to "The Lab" \(1 device\)\?[\s\S]*leaves current device values in place[\s\S]*Wi-Fi auto-connect settings still apply after release[\s\S]*enable auto-connect for it on the headset/);
+  assert.match(fixture.confirmations[0], /Stop managing settings for "The Lab" \(1 device\)\?[\s\S]*leaves current device values in place[\s\S]*Wi-Fi auto-connect settings still apply after release[\s\S]*enable auto-connect for it on the headset/);
   assert.deepEqual(fixture.requests.slice(requestCount), [
     { url, method: 'GET', body: undefined },
     { url, method: 'POST', body: { expected_impact: 'clear1' } },
@@ -1162,15 +1432,15 @@ test('Group Settings deploys No package through the same confirmation flow', asy
   assert.equal(fixture.groupControls['[data-group-package]'].value, '');
   assert.equal(fixture.groupControls['[data-deployment-count]'].hidden, true);
   assert.equal(fixture.groupButtons.deploy.disabled, false);
-  assert.match(fixture.groupControls['[data-assignment-feedback]'].textContent, /No package deployed/);
+  assert.equal(fixture.groupControls['[data-assignment-feedback]'].textContent, 'Stopped managing settings for this group.');
 });
 
-test('No package for Android selection explains retained Wi-Fi auto-connect settings', async () => {
+test('No managed settings for Android selection explains retained Wi-Fi auto-connect settings', async () => {
   const url = '/api/group-package/deploy?name=The+Lab&package_id=';
   const fixture = createHarness(request => {
     if (request.url === '/api/packages/pkg') return response(profile());
     if (request.method === 'POST') return response(groupSnapshot(2));
-    return response({ name: 'No package', clear: true, wifi_mode: 'android_selection',
+    return response({ name: 'No managed settings', clear: true, wifi_mode: 'android_selection',
       impact: { groups: 1, devices: 1, token: 'clear1' } });
   });
   const name = 'The Lab';
@@ -1183,10 +1453,10 @@ test('No package for Android selection explains retained Wi-Fi auto-connect sett
   assert.match(fixture.confirmations[0], /enable auto-connect for it on the headset/);
 });
 
-test('No package for a scalar-only deployment has no Wi-Fi confirmation text', async () => {
+test('No managed settings for a scalar-only deployment has no Wi-Fi confirmation text', async () => {
   const fixture = createHarness(request => {
     if (request.method === 'POST') return response(groupSnapshot(2));
-    return response({ name: 'No package', clear: true, wifi_mode: null,
+    return response({ name: 'No managed settings', clear: true, wifi_mode: null,
       impact: { groups: 1, devices: 1, token: 'clear1' } });
   });
   const name = 'The Lab';
@@ -1249,20 +1519,106 @@ test('Retry sends exactly the current device, package and revision and ignores r
   assert.doesNotMatch(results.innerHTML, /WRITE_FAILED|write failed|data-group-action="retry"/);
 });
 
-test('deletion displays a server reference conflict and removes the package after successful deletion', async () => {
+test('Retry keeps focus on the pending result action when its row updates', async () => {
+  const devices = [{ ...online, configuration_state: failed }];
+  let finishRetry;
+  const fixture = createHarness(request => request.url === '/api/packages/pkg'
+    ? response(profile()) : new Promise(resolve => { finishRetry = resolve; }), { devices });
+  fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
+  fixture.controller.renderGroup('The Lab');
+  const results = fixture.groupControls['[data-settings-results]'];
+  let html = '';
+  let activeElement = null;
+  let focusedAfterReplace = false;
+  Object.defineProperty(results, 'innerHTML', {
+    get() { return html; },
+    set(value) { html = value; activeElement = null; },
+  });
+  results.querySelectorAll = selector => {
+    if (selector === '[data-result-device][open]') return [];
+    if (selector === '[data-group-action="retry"]' && /data-group-action="retry"/.test(html)) {
+      return [{ dataset: { deviceId: 'headset' }, focus(options) {
+        activeElement = this;
+        focusedAfterReplace = options.preventScroll === true;
+      } }];
+    }
+    return [];
+  };
+  const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    value: { get activeElement() { return activeElement; } },
+  });
+  try {
+    activeElement = {
+      dataset: { deviceId: 'headset' },
+      matches(selector) { return selector === '[data-group-action="retry"]'; },
+    };
+    const handler = fixture.groupPanel.handlers.get('click');
+    const retry = handler({ target: { closest: () => ({
+      dataset: { groupAction: 'retry', deviceId: 'headset' }, disabled: false,
+    }) } });
+
+    assert.equal(focusedAfterReplace, true);
+    assert.ok(activeElement);
+    assert.match(results.innerHTML, /aria-disabled="true"/);
+    devices[0].configuration_state = { ...failed, status: 'applying' };
+    fixture.controller.renderGroup('The Lab');
+    finishRetry(response({ sent: true }));
+    await retry;
+  } finally {
+    if (originalDocument) Object.defineProperty(globalThis, 'document', originalDocument);
+    else delete globalThis.document;
+  }
+});
+
+test('deletion sends the loaded revision and displays a server reference conflict', async () => {
   let referenced = true;
   const fixture = createHarness(({ method }) => method === 'GET' ? response(profile()) :
-    referenced ? response({ error: 'Unassign this package before deleting it.' }, 409) : response({ deleted: true }));
+    referenced ? response({ error: 'Configuration package is assigned to a group', code: 'package_assigned' }, 409) :
+      response({ deleted: true }));
   fixture.broadcast();
   await fixture.controller.showPackages('pkg');
   await fixture.editClick('delete');
-  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /Unassign this package/);
+  assert.deepEqual(fixture.requests.at(-1).body, { expected_revision: 'edit1' });
+  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /assigned to a group/);
   assert.equal(fixture.editorButtons.reload.hidden, true);
   referenced = false;
   await fixture.editClick('delete');
   assert.equal(fixture.requests.at(-1).method, 'DELETE');
   assert.doesNotMatch(fixture.packageList.innerHTML, /data-package-id="pkg"/);
   assert.match(fixture.packagePanel.innerHTML, /Select a configuration package/);
+});
+
+test('a stale delete revision requires reload before the latest package can be deleted', async () => {
+  let latest = profile();
+  const fixture = createHarness(({ method, body }) => {
+    if (method === 'GET') return response(latest);
+    if (body.expected_revision !== latest.edit_revision) {
+      latest = profile({ editRevision: 'remote' });
+      return response({ error: 'The package changed. Reload the package.' }, 409);
+    }
+    return response({ deleted: true });
+  });
+  fixture.broadcast();
+  await fixture.controller.showPackages('pkg');
+
+  latest = profile({ editRevision: 'remote' });
+  await fixture.editClick('delete');
+  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /The package changed/);
+  assert.equal(fixture.editorButtons.reload.hidden, false);
+  assert.equal(fixture.editorButtons.deploy.disabled, true);
+  assert.deepEqual(fixture.requests.filter(({ method }) => method === 'DELETE').map(({ body }) => body), [
+    { expected_revision: 'edit1' },
+  ]);
+
+  await fixture.editClick('reload');
+  assert.equal(fixture.editorButtons.deploy.disabled, false);
+  await fixture.editClick('delete');
+  assert.deepEqual(fixture.requests.filter(({ method }) => method === 'DELETE').map(({ body }) => body), [
+    { expected_revision: 'edit1' }, { expected_revision: 'remote' },
+  ]);
+  assert.doesNotMatch(fixture.packageList.innerHTML, /data-package-id="pkg"/);
 });
 
 test('editor sections are shared with group results for other packages', async () => {

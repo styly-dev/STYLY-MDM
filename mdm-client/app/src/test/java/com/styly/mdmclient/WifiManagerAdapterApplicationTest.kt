@@ -211,6 +211,14 @@ class WifiManagerAdapterApplicationTest {
         assertTrue(wifiStoredMacSettings(sequenceOf(begin, savedHeader, setting.replace('3', '9'), end), original).isEmpty())
     }
 
+    @Test
+    fun `configured SSID normalization skips null and empty entries independently`() {
+        val configuredSsids = listOf(null, "\"office\"", "\"\"", "   ")
+            .mapNotNull(::normalizeConfiguredWifiSsid)
+
+        assertEquals(listOf("office", "   "), configuredSsids)
+    }
+
     private fun entry(
         id: Int,
         ssid: String,

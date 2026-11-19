@@ -294,7 +294,8 @@ def test_shared_publish_and_offline_reconnect_use_latest_published_snapshot(tmp_
 
 def test_mutations_enforce_origin_draft_cas_impact_and_validation(tmp_path):
     async def body():
-        async with _running_server(tmp_path, {"Studio": [DEVICE_ID], "Gallery": [OTHER_ID]}) as (session, base):
+        async with _running_server(tmp_path, {"Studio": [DEVICE_ID], "Gallery": [OTHER_ID]},
+                                   devices={OFFLINE_ID: {"label": "Offline"}}) as (session, base):
             await _create(session, base, "Forbidden", origin="http://attacker.invalid", status=403)
             initial = await _create(session, base, " Studio ")
             assert initial["name"] == "Studio"
@@ -470,7 +471,7 @@ def test_group_deploy_assigns_atomically_redeploys_and_reuses_the_current_versio
     asyncio.run(body())
 
 
-def test_deploy_no_package_clears_management_for_only_the_selected_group(tmp_path):
+def test_deploy_no_managed_settings_clears_management_for_only_the_selected_group(tmp_path):
     async def body():
         groups = {"Studio": [DEVICE_ID, OFFLINE_ID], "Gallery": [OTHER_ID]}
         async with _running_server(tmp_path, groups) as (session, base):
@@ -512,7 +513,7 @@ def test_deploy_no_package_clears_management_for_only_the_selected_group(tmp_pat
     asyncio.run(body())
 
 
-def test_reassigning_after_no_package_issues_a_fresh_revision_for_an_offline_device(tmp_path):
+def test_reassigning_after_releasing_management_issues_a_fresh_revision_for_an_offline_device(tmp_path):
     async def body():
         groups = {"Studio": [DEVICE_ID], "Gallery": [OTHER_ID]}
         async with _running_server(tmp_path, groups) as (session, base):
@@ -565,7 +566,9 @@ def test_group_assignment_and_membership_release_and_referenced_delete(tmp_path)
                 await _assign(session, base, "Studio", first)
                 studio_policy = _policy(first, {"brightness": 30}, group="Studio")
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == studio_policy
-                await _request(session, "DELETE", base, _path(first), status=409)
+                assigned = await _request(session, "DELETE", base, _path(first),
+                                          {"expected_revision": first["edit_revision"]}, status=409)
+                assert assigned["code"] == "package_assigned"
                 # A move must name the current owner, so a device never lands in two groups.
                 await admin.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": group,
                                        "add": {DEVICE_ID: None}, "remove": []})
@@ -595,9 +598,38 @@ def test_group_assignment_and_membership_release_and_referenced_delete(tmp_path)
                                        "add": {}, "remove": [DEVICE_ID]})
                 await _receive_type(admin, "GROUP_MEMBERS_SET")
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == NO_POLICY
-                await _request(session, "DELETE", base, _path(first), status=409)
-                assert await _request(session, "DELETE", base, _path(other)) == {"deleted": True}
+                await _request(session, "DELETE", base, _path(first),
+                               {"expected_revision": first["edit_revision"]}, status=409)
+                assert await _request(session, "DELETE", base, _path(other),
+                                      {"expected_revision": other["edit_revision"]}) == {"deleted": True}
                 await _request(session, "GET", base, _path(other), status=404)
+    asyncio.run(body())
+
+
+def test_package_delete_requires_current_edit_revision(tmp_path):
+    async def body():
+        async with _running_server(tmp_path) as (session, base):
+            package = await _create(session, base, "Office")
+            saved = await _deploy(session, base, package, settings=_brightness(45))
+
+            await _request(session, "DELETE", base, _path(saved),
+                           {"expected_revision": package["edit_revision"]}, status=409)
+            current = await _request(session, "GET", base, _path(saved))
+            assert current["edit_revision"] == saved["edit_revision"]
+            assert current["published_revision"] == saved["published_revision"]
+
+            assert await _request(session, "DELETE", base, _path(current),
+                                  {"expected_revision": current["edit_revision"]}) == {"deleted": True}
+            await _request(session, "GET", base, _path(saved), status=404)
+
+            unpublished = await _create(session, base, "Draft")
+            assert unpublished["edit_revision"] is None
+            assert await _request(session, "DELETE", base, _path(unpublished),
+                                  {"expected_revision": None}) == {"deleted": True}
+
+            missing = await _create(session, base, "Missing revision")
+            await _request(session, "DELETE", base, _path(missing), {}, status=400)
+
     asyncio.run(body())
 
 
@@ -890,6 +922,36 @@ def test_admin_fanout_does_not_reinsert_a_lock_after_disconnect():
     asyncio.run(body())
 
 
+def test_get_device_list_request_uses_the_bounded_admin_send_path(tmp_path, monkeypatch):
+    async def body():
+        async with _running_server(tmp_path) as (session, base):
+            async with session.ws_connect(base + "/ws/admin") as admin:
+                for kind in (
+                    "SERVER_INFO", "CLIENT_APK_INFO", "DEVICE_LIST",
+                    "PROVISIONAL_CONNECTION_LIST", "GROUP_LIST",
+                ):
+                    await _receive_type(admin, kind)
+
+                original_send = server._send_admin_frames
+                calls = []
+
+                async def record_send(ws, frames):
+                    calls.append((ws, frames))
+                    await original_send(ws, frames)
+
+                monkeypatch.setattr(server, "_send_admin_frames", record_send)
+                await admin.send_json({"type": "GET_DEVICE_LIST"})
+                response = await _receive_type(admin, "DEVICE_LIST")
+
+                assert response["type"] == "DEVICE_LIST"
+                assert len(calls) == 1
+                assert calls[0][0] in server.admin_connections
+                assert len(calls[0][1]) == 1
+                assert json.loads(calls[0][1][0])["type"] == "DEVICE_LIST"
+
+    asyncio.run(body())
+
+
 def test_device_list_is_not_built_or_scheduled_without_admins(monkeypatch):
     schedules = []
 
@@ -955,6 +1017,58 @@ def test_register_and_disconnect_lists_are_coalesced_for_canonical_devices(tmp_p
     asyncio.run(body())
 
 
+def test_reconnect_registry_writes_are_coalesced_after_the_first_registration(tmp_path, monkeypatch):
+    async def body():
+        async with _running_server(tmp_path) as (session, base):
+            original_write = server._write_registry
+            writes = []
+
+            def count_write(configuration, records):
+                writes.append(records[DEVICE_ID]["last_seen"])
+                return original_write(configuration, records)
+
+            monkeypatch.setattr(server, "_write_registry", count_write)
+            monkeypatch.setattr(server._telemetry_save, "_delay", 60)
+            for _ in range(3):
+                async with session.ws_connect(base + "/ws/device") as device:
+                    await _register(device)
+                    await _receive_type(device, "CONFIGURATION_POLICY")
+                    assert len(writes) == 1
+
+            assert DEVICE_ID not in server.devices
+            final_last_seen = server.device_registry[DEVICE_ID]["last_seen"]
+            await server._telemetry_save.flush(run=True)
+            assert len(writes) == 2
+            assert writes[-1] == final_last_seen
+            saved = json.loads(server.REGISTRY_PATH.read_text())
+            assert saved["devices"][DEVICE_ID]["last_seen"] == final_last_seen
+
+    asyncio.run(body())
+
+
+def test_timed_out_console_initialization_drops_the_socket_and_send_lock(tmp_path, monkeypatch):
+    async def body():
+        started = asyncio.Event()
+        send_str = server.web.WebSocketResponse.send_str
+
+        async def hold_first_frame(ws, message, compress=None):
+            if json.loads(message)["type"] == "SERVER_INFO":
+                started.set()
+                await asyncio.Future()
+            await send_str(ws, message, compress=compress)
+
+        async with _running_server(tmp_path) as (session, base):
+            monkeypatch.setattr(server, "ADMIN_SEND_TIMEOUT", 0.05)
+            monkeypatch.setattr(server.web.WebSocketResponse, "send_str", hold_first_frame)
+            async with session.ws_connect(base + "/ws/admin") as admin:
+                await asyncio.wait_for(started.wait(), 2)
+                assert (await asyncio.wait_for(admin.receive(), 2)).type == aiohttp.WSMsgType.CLOSE
+                assert not server.admin_connections
+                assert not server._admin_send_locks
+
+    asyncio.run(body())
+
+
 def test_membership_snapshot_precedes_requester_ack_while_peer_send_stalls(tmp_path, monkeypatch):
     class RecordingAdmin:
         def __init__(self):
@@ -977,9 +1091,10 @@ def test_membership_snapshot_precedes_requester_ack_while_peer_send_stalls(tmp_p
             await super().send_str(raw)
 
     async def body():
+        device_id = "44444444-4444-4444-8444-444444444444"
         server._apply_data_dir(str(tmp_path))
         server.REGISTRY_PATH.write_text(json.dumps({
-            "devices": {},
+            "devices": {device_id: {"label": "Offline"}},
             "groups": {"Studio": []},
         }))
         server.load_registry()
@@ -987,7 +1102,6 @@ def test_membership_snapshot_precedes_requester_ack_while_peer_send_stalls(tmp_p
         requester = RecordingAdmin()
         peer = SlowPeer()
         server.admin_connections.update((requester, peer))
-        device_id = "44444444-4444-4444-8444-444444444444"
 
         operation = asyncio.create_task(server.handle_update_group_members(
             requester, {"name": "Studio", "add": {device_id: None}, "remove": []},
@@ -1017,7 +1131,9 @@ def test_update_group_members_uses_expected_owners_from_each_console_snapshot(tm
             policy_targets.put_nowait(sorted(device_ids))
 
         monkeypatch.setattr(server, "_publish_configuration", capture_policy_targets)
-        async with _running_server(tmp_path, {"A": [DEVICE_ID, OTHER_ID, legacy_id], "B": []}) as (session, base):
+        records = {device_id: {"label": "Offline"} for device_id in (DEVICE_ID, OTHER_ID, legacy_id, added_offline_id)}
+        async with _running_server(tmp_path, {"A": [DEVICE_ID, OTHER_ID, legacy_id], "B": []},
+                                   devices=records) as (session, base):
             async with (session.ws_connect(base + "/ws/admin") as first,
                         session.ws_connect(base + "/ws/admin") as stale):
                 first_snapshot = await _receive_type(first, "GROUP_LIST")
@@ -1056,8 +1172,7 @@ def test_update_group_members_uses_expected_owners_from_each_console_snapshot(tm
                 assert (await _receive_type(stale, "GROUP_LIST"))["groups"] == current
                 assert policy_targets.empty()
 
-                # The current owner is accepted, and the legacy full-list edit
-                # remains compatible with offline or unregistered identifiers.
+                # An owner match is sufficient for a known offline device.
                 await stale.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": "B",
                                       "add": {DEVICE_ID: "A", OTHER_ID: "B"}, "remove": []})
                 assert (await _receive_type(first, "GROUP_LIST"))["groups"] == {
@@ -1070,8 +1185,7 @@ def test_update_group_members_uses_expected_owners_from_each_console_snapshot(tm
                 assert accepted["operation"] == "UPDATE_GROUP_MEMBERS"
                 assert await asyncio.wait_for(policy_targets.get(), 2) == [DEVICE_ID]
 
-                # An expected null owner is valid for a device not yet in the
-                # registry, matching the existing group membership contract.
+                # An offline device in the registry may join its first group.
                 await first.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": "A",
                                        "add": {added_offline_id: None}, "remove": []})
                 assert (await _receive_type(stale, "GROUP_LIST"))["groups"]["A"] == [legacy_id, added_offline_id]
@@ -1109,6 +1223,46 @@ def test_update_group_members_uses_expected_owners_from_each_console_snapshot(tm
                 for console in (first, stale):
                     with pytest.raises(asyncio.TimeoutError):
                         await asyncio.wait_for(console.receive(), 0.05)
+
+    asyncio.run(body())
+
+
+def test_stale_console_cannot_add_a_forgotten_device_and_can_remove_an_orphan(tmp_path):
+    async def body():
+        async with _running_server(tmp_path, {"Studio": [OTHER_ID]},
+                                   devices={DEVICE_ID: {"label": "Ready to add"}}) as (session, base):
+            async with (session.ws_connect(base + "/ws/admin") as first,
+                        session.ws_connect(base + "/ws/admin") as stale):
+                device_list = await _receive_type(stale, "DEVICE_LIST")
+                assert {row["device_id"] for row in device_list["devices"]} == {DEVICE_ID}
+                await _receive_type(stale, "GROUP_LIST")
+                await first.send_json({"type": "FORGET_DEVICE", "device_id": DEVICE_ID})
+                await _receive_type(first, "DEVICE_FORGOTTEN")
+                await stale.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": "Studio",
+                                       "add": {DEVICE_ID: None}, "remove": [OTHER_ID]})
+                error = await _receive_type(stale, "ERROR")
+                assert error["operation"] == "UPDATE_GROUP_MEMBERS"
+                assert "no longer exists" in error["message"]
+                assert (await _receive_type(stale, "GROUP_LIST"))["groups"] == {"Studio": [OTHER_ID]}
+                await stale.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": "Studio",
+                                       "add": {}, "remove": [OTHER_ID]})
+                assert (await _receive_type(stale, "GROUP_MEMBERS_SET"))["members"] == []
+
+    asyncio.run(body())
+
+
+def test_group_create_error_identifies_the_failed_operation_and_normalized_name(tmp_path):
+    async def body():
+        async with _running_server(tmp_path, {"Studio": []}) as (session, base):
+            async with session.ws_connect(base + "/ws/admin") as admin:
+                await _receive_type(admin, "GROUP_LIST")
+                await admin.send_json({"type": "CREATE_GROUP", "name": "  Studio  "})
+                error = await _receive_type(admin, "ERROR")
+                assert error["operation"] == "CREATE_GROUP"
+                assert error["name"] == "Studio"
+                await admin.send_json({"type": "CREATE_GROUP", "name": "Gallery"})
+                assert (await _receive_type(admin, "GROUP_CREATED"))["name"] == "Gallery"
+                assert (await _receive_type(admin, "GROUP_LIST"))["groups"] == {"Studio": [], "Gallery": []}
 
     asyncio.run(body())
 
@@ -1303,6 +1457,53 @@ def test_configuration_state_is_sanitized_and_has_no_effect_on_delivery(tmp_path
     asyncio.run(body())
 
 
+def test_device_reports_refresh_on_reregistration_and_can_be_cleared(tmp_path):
+    async def body():
+        result = {"package_id": OTHER_ID, "revision": OFFLINE_ID, "status": "complete", "results": {}}
+        changed = {**result, "status": "interrupted"}
+        wifi = {"available": True, "busy": False, "unavailable_reason": None, "priority_monitor": "off"}
+        busy_wifi = {**wifi, "busy": True}
+        async with _running_server(tmp_path) as (session, base):
+            async with session.ws_connect(base + "/ws/device") as device:
+                await _register(device, {**REGISTRATION, "configuration_state": result, "wifi_state": wifi})
+                await _receive_type(device, "CONFIGURATION_POLICY")
+                assert server.devices[DEVICE_ID]["configuration_state"] == result
+                assert server.devices[DEVICE_ID]["wifi_state"] == wifi
+
+                await _register(device, {**REGISTRATION, "configuration_state": changed, "wifi_state": busy_wifi})
+                await _receive_type(device, "CONFIGURATION_POLICY")
+                for entry in (server.devices[DEVICE_ID], server.device_registry[DEVICE_ID]):
+                    assert entry["configuration_state"] == changed
+                    assert entry["wifi_state"] == busy_wifi
+
+                await device.send_json({"type": "CONFIGURATION_STATE"})
+                await _register(device, REGISTRATION)
+                await _receive_type(device, "CONFIGURATION_POLICY")
+                assert server.devices[DEVICE_ID]["configuration_state"] == changed
+                assert server.device_registry[DEVICE_ID]["configuration_state"] == changed
+
+                await device.send_json({"type": "CONFIGURATION_STATE", "configuration_state": None})
+                await _register(device, {**REGISTRATION, "configuration_state": "malformed"})
+                await _receive_type(device, "CONFIGURATION_POLICY")
+                assert server.device_registry[DEVICE_ID]["configuration_state"] is None
+                assert server.device_registry[DEVICE_ID]["wifi_state"] == busy_wifi
+
+                await _register(device, {**REGISTRATION, "configuration_state": result})
+                await _receive_type(device, "CONFIGURATION_POLICY")
+
+            async with session.ws_connect(base + "/ws/device") as reconnected:
+                await _register(reconnected, {**REGISTRATION, "configuration_state": None, "wifi_state": None})
+                await _receive_type(reconnected, "CONFIGURATION_POLICY")
+                assert server.devices[DEVICE_ID]["configuration_state"] is None
+                assert server.devices[DEVICE_ID]["wifi_state"] is None
+
+        stored = json.loads(server.REGISTRY_PATH.read_text())["devices"][DEVICE_ID]
+        assert stored["configuration_state"] is None
+        assert stored["wifi_state"] is None
+
+    asyncio.run(body())
+
+
 def test_retry_sends_fresh_id_only_to_current_online_matching_device(tmp_path):
     async def body():
         device_id = "11111111-1111-7111-8111-111111111111"
@@ -1335,6 +1536,24 @@ def test_retry_sends_fresh_id_only_to_current_online_matching_device(tmp_path):
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == NO_POLICY
                 await _request(session, "POST", base, "/api/package-retry", retry, status=409)
                 await _assert_no_policy(ws)
+    asyncio.run(body())
+
+
+@pytest.mark.parametrize("configuration_available", [True, False])
+def test_admin_can_reload_the_current_group_snapshot(tmp_path, configuration_available):
+    async def body():
+        fields = {}
+        if not configuration_available:
+            fields["packages"] = {"version": configuration_packages.VERSION, "packages": []}
+        async with _running_server(tmp_path, {"Studio": [DEVICE_ID]}, **fields) as (session, base):
+            async with session.ws_connect(base + "/ws/admin") as admin:
+                initial = await _receive_type(admin, "GROUP_LIST")
+                await admin.send_json({"type": "GET_GROUP_LIST"})
+                reloaded = await _receive_type(admin, "GROUP_LIST")
+                assert reloaded == initial
+                assert reloaded["groups"] == {"Studio": [DEVICE_ID]}
+                assert reloaded["configuration_available"] is configuration_available
+
     asyncio.run(body())
 
 
@@ -1641,7 +1860,7 @@ def test_unified_wifi_policy_publishes_networks_and_auto_return_together(tmp_pat
     asyncio.run(body())
 
 
-def test_android_wifi_selection_delivers_all_settings_and_reports_mode_for_no_package(tmp_path):
+def test_android_wifi_selection_delivers_all_settings_and_reports_mode_on_release(tmp_path):
     async def body():
         async with _running_server(tmp_path, {"Studio": [DEVICE_ID]}) as (session, base):
             profile = await _create(session, base, "Office")
@@ -1672,7 +1891,7 @@ def test_android_wifi_selection_delivers_all_settings_and_reports_mode_for_no_pa
                 preview = await _request(session, "GET", base, path)
                 assert preview["wifi_mode"] == "android_selection"
 
-                # Republish the shared package in another mode after previewing No package.
+                # Republish the shared package in another mode after previewing No managed settings.
                 # The old confirmation must become stale along with its Wi-Fi warning.
                 priority_wifi_value = _wifi_value(auto_return=False)
                 updated = await _deploy(session, base, published, settings={
@@ -1864,5 +2083,185 @@ def test_group_edits_order_requester_ack_and_publish_to_other_connections(tmp_pa
                 assert unreachable not in server._admin_send_locks
                 assert peer.messages[-1]["groups"] == {}
                 assert "Gallery" not in server._configuration.groups
+
+    asyncio.run(body())
+
+
+def test_startup_app_persistence_errors_precede_sent_acknowledgements(tmp_path, monkeypatch):
+    async def body():
+        async with _running_server(tmp_path) as (_session, _base):
+            class RecordingAdmin:
+                def __init__(self):
+                    self.messages = []
+
+                async def send_str(self, raw):
+                    self.messages.append(json.loads(raw))
+
+            class RecordingDevice:
+                async def send_str(self, _raw):
+                    return None
+
+            admin = RecordingAdmin()
+            device_ws = RecordingDevice()
+            server.admin_connections.add(admin)
+            server.devices[DEVICE_ID] = {
+                "ws": device_ws, "registration_ready": True,
+                "capabilities": set(), "startup_app": None,
+            }
+            monkeypatch.setattr(server, "resolve_target_ids", lambda *_args, **_kwargs: [DEVICE_ID])
+            monkeypatch.setattr(server, "save_registry", lambda: False)
+            monkeypatch.setattr(server, "broadcast_device_list", lambda: asyncio.sleep(0))
+
+            await server.handle_set_startup_app(
+                admin, {"target_devices": [DEVICE_ID], "package_name": "com.example.app"},
+            )
+            assert [message["type"] for message in admin.messages] == ["ERROR", "SET_STARTUP_APP_SENT"]
+
+            admin.messages.clear()
+            await server.handle_clear_startup_app(admin, {"target_devices": [DEVICE_ID]})
+            assert [message["type"] for message in admin.messages] == ["ERROR", "CLEAR_STARTUP_APP_SENT"]
+
+    asyncio.run(body())
+
+
+@pytest.mark.parametrize("case", [
+    "label_persist",
+    "label_missing_device_id",
+    "label_duplicate",
+    "forget_persist",
+    "forget_missing_device_id",
+    "forget_online",
+    "create_persist",
+    "rename_persist",
+    "rename_invalid",
+    "rename_missing_group",
+    "rename_duplicate",
+    "delete_persist",
+    "delete_missing_name",
+    "members_persist",
+    "create_duplicate",
+    "members_reject",
+    "members_noop",
+    "startup_set_missing_package",
+    "startup_set_no_target",
+    "startup_set_persist",
+    "startup_clear_no_target",
+    "startup_clear_persist",
+])
+def test_group_management_replies_close_admin_when_bounded_send_times_out(tmp_path, monkeypatch, case):
+    async def body():
+        groups = {"Studio": []}
+        devices = {DEVICE_ID: {"label": "Spare"}}
+
+        class StallingAdmin:
+            closed = False
+
+            async def send_str(self, _message):
+                await asyncio.Future()
+
+            async def close(self, **_kwargs):
+                self.closed = True
+
+        async with _running_server(tmp_path, groups, devices=devices):
+            admin = StallingAdmin()
+            server.admin_connections.add(admin)
+            monkeypatch.setattr(server, "ADMIN_SEND_TIMEOUT", 0.01)
+
+            if case == "label_persist":
+                monkeypatch.setattr(server, "_commit_configuration", lambda *_args, **_kwargs: False)
+                operation = server.handle_set_device_label(admin, {"device_id": DEVICE_ID, "label": "New label"})
+            elif case == "label_missing_device_id":
+                operation = server.handle_set_device_label(admin, {"label": "Spare"})
+            elif case == "label_duplicate":
+                server.device_registry[OTHER_ID] = {"label": "Spare"}
+                operation = server.handle_set_device_label(admin, {"device_id": DEVICE_ID, "label": "Spare"})
+            elif case == "forget_persist":
+                monkeypatch.setattr(server, "_commit_configuration", lambda *_args, **_kwargs: False)
+                operation = server.handle_forget_device(admin, {"device_id": DEVICE_ID})
+            elif case == "forget_missing_device_id":
+                operation = server.handle_forget_device(admin, {})
+            elif case == "forget_online":
+                server.devices[DEVICE_ID] = {"ws": object()}
+                operation = server.handle_forget_device(admin, {"device_id": DEVICE_ID})
+            elif case == "create_persist":
+                monkeypatch.setattr(server, "_save_groups", lambda *_args, **_kwargs: False)
+                operation = server.handle_create_group(admin, {"name": "Gallery"})
+            elif case == "rename_persist":
+                monkeypatch.setattr(server, "_save_groups", lambda *_args, **_kwargs: False)
+                operation = server.handle_rename_group(admin, {"name": "Studio", "new_name": "Gallery"})
+            elif case == "rename_invalid":
+                operation = server.handle_rename_group(admin, {"name": "", "new_name": "Gallery"})
+            elif case == "rename_missing_group":
+                operation = server.handle_rename_group(admin, {"name": "Missing", "new_name": "Gallery"})
+            elif case == "rename_duplicate":
+                server._configuration.groups["Gallery"] = server._DeviceGroup()
+                operation = server.handle_rename_group(admin, {"name": "Studio", "new_name": "Gallery"})
+            elif case == "delete_persist":
+                monkeypatch.setattr(server, "_save_groups", lambda *_args, **_kwargs: False)
+                operation = server.handle_delete_group(admin, {"name": "Studio"})
+            elif case == "delete_missing_name":
+                operation = server.handle_delete_group(admin, {})
+            elif case == "members_persist":
+                monkeypatch.setattr(server, "_save_groups", lambda *_args, **_kwargs: False)
+                operation = server.handle_update_group_members(
+                    admin, {"name": "Studio", "add": {DEVICE_ID: None}, "remove": []},
+                )
+            elif case == "create_duplicate":
+                operation = server.handle_create_group(admin, {"name": "Studio"})
+            elif case == "members_reject":
+                operation = server.handle_update_group_members(
+                    admin, {"name": "Studio", "add": [], "remove": []},
+                )
+            elif case == "members_noop":
+                operation = server.handle_update_group_members(
+                    admin, {"name": "Studio", "add": {}, "remove": []},
+                )
+            elif case in {"startup_set_missing_package", "startup_set_no_target"}:
+                if case == "startup_set_no_target":
+                    monkeypatch.setattr(server, "resolve_target_ids", lambda *_args, **_kwargs: [])
+                operation = server.handle_set_startup_app(
+                    admin, {"target_devices": [DEVICE_ID], "package_name": "com.example.app"}
+                    if case == "startup_set_no_target" else {"target_devices": [DEVICE_ID]},
+                )
+            elif case == "startup_set_persist":
+                monkeypatch.setattr(server, "resolve_target_ids", lambda *_args, **_kwargs: [DEVICE_ID])
+                monkeypatch.setattr(server, "save_registry", lambda: False)
+                monkeypatch.setattr(server, "broadcast_device_list", lambda: asyncio.sleep(0))
+
+                class DeviceSocket:
+                    async def send_str(self, _message):
+                        return None
+
+                device_ws = DeviceSocket()
+                server.devices[DEVICE_ID] = {
+                    "ws": device_ws, "registration_ready": True,
+                    "capabilities": set(), "startup_app": None,
+                }
+                operation = server.handle_set_startup_app(
+                    admin, {"target_devices": [DEVICE_ID], "package_name": "com.example.app"},
+                )
+            elif case == "startup_clear_no_target":
+                monkeypatch.setattr(server, "resolve_target_ids", lambda *_args, **_kwargs: [])
+                operation = server.handle_clear_startup_app(admin, {"target_devices": [DEVICE_ID]})
+            else:
+                monkeypatch.setattr(server, "resolve_target_ids", lambda *_args, **_kwargs: [DEVICE_ID])
+                monkeypatch.setattr(server, "save_registry", lambda: False)
+                monkeypatch.setattr(server, "broadcast_device_list", lambda: asyncio.sleep(0))
+
+                class DeviceSocket:
+                    async def send_str(self, _message):
+                        return None
+
+                device_ws = DeviceSocket()
+                server.devices[DEVICE_ID] = {
+                    "ws": device_ws, "registration_ready": True,
+                    "capabilities": set(), "startup_app": {"package_name": "com.example.app"},
+                }
+                operation = server.handle_clear_startup_app(admin, {"target_devices": [DEVICE_ID]})
+
+            await asyncio.wait_for(operation, 1)
+            assert admin.closed
+            assert admin not in server.admin_connections
+            assert admin not in server._admin_send_locks
 
     asyncio.run(body())

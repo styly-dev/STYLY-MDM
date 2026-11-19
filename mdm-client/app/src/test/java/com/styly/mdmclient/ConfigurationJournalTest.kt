@@ -25,14 +25,14 @@ class ConfigurationJournalTest {
         assertTrue(restored.shouldApply(updated, 133, null))
     }
 
-    @Test fun `failed revision can apply once after reboot and waits for Retry during the same boot`() {
+    @Test fun `failed revision reapplies after another package attempt and after reboot`() {
         val results = JSONObject().put("brightness", settingOutcome("applied", 60))
             .put("wifi", settingOutcome("failed", reason = "UNREACHABLE"))
         val failed = ConfigurationAttempt(first, 133, "complete", results)
         val journal = ConfigurationJournal().withAttempt(failed)
             .withAttempt(ConfigurationAttempt(second, 133, "complete"))
         val restored = ConfigurationJournal.restore(journal.encode())
-        assertFalse(restored.shouldApply(first, 133, null))
+        assertTrue(restored.shouldApply(first, 133, null))
         assertTrue(restored.shouldApply(first, 134, null))
         val secondAppliedAfterReboot = restored.withAttempt(ConfigurationAttempt(second, 134, "complete"))
         assertTrue(secondAppliedAfterReboot.shouldApply(first, 134, null))

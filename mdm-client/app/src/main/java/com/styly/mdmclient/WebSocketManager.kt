@@ -249,6 +249,7 @@ class WebSocketManager internal constructor(
 
     // Main thread only. Internal journal writes notify often; send only public changes.
     private var lastWifiState: Pair<WebSocket, String>? = null
+    private var lastConfigurationState: Pair<WebSocket, String>? = null
 
     private fun publishWifiState() {
         val socket = webSocket ?: return
@@ -264,11 +265,14 @@ class WebSocketManager internal constructor(
 
     private fun publishConfigurationState() {
         val socket = webSocket ?: return
-        if (!isRunning || !registration.isCanonicalAcknowledged(socket)) return
-        val state = configurationPackages.snapshot() ?: return
-        socket.send(JSONObject()
+        if (!isRunning || !registration.isCanonicalAcknowledged(socket) || !supportsPico4UltraEnterpriseSettings()) return
+        val state = configurationPackages.reportValue() ?: return
+        val encoded = state.toString()
+        if (lastConfigurationState?.let { it.first === socket && it.second == encoded } == true) return
+        val sent = socket.send(JSONObject()
             .put("type", "CONFIGURATION_STATE")
             .put("configuration_state", state).toString())
+        if (sent) lastConfigurationState = socket to encoded
     }
 
     private val scheduler = ConnectionScheduler {
@@ -356,6 +360,7 @@ class WebSocketManager internal constructor(
         registration.clear()
         connectedServerAddress = null
         lastWifiState = null
+        lastConfigurationState = null
     }
 
     fun sendMessage(json: JSONObject) {
@@ -662,7 +667,7 @@ class WebSocketManager internal constructor(
                 capabilities.put(CONFIGURATION_SUMMARY_CAPABILITY)
                 if (supportsPico4UltraEnterpriseSettings()) {
                     capabilities.put(CONFIGURATION_PACKAGES_CAPABILITY)
-                    configurationPackages.snapshot()?.let { put("configuration_state", it) }
+                    put("configuration_state", configurationPackages.reportValue())
                 }
                 put("capabilities", capabilities)
                 put("push_state", pushFields.getJSONObject("push_state"))
@@ -689,7 +694,11 @@ class WebSocketManager internal constructor(
         Log.d(TAG, "Sending: ${messageTypeForLog(payload)}")
         val canonical = identity is DeviceIdentityState.Ready
         if (canonical) registration.markSent(socket)
-        if (!socket.send(text) && canonical) registration.clearSent(socket)
+        if (!socket.send(text)) {
+            if (canonical) registration.clearSent(socket)
+        } else {
+            payload.opt("configuration_state")?.let { lastConfigurationState = socket to it.toString() }
+        }
     }
 
     private fun commandContext(socket: WebSocket): CommandContext? {

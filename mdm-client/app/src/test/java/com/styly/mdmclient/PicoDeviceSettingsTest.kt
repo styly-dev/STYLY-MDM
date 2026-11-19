@@ -6,6 +6,14 @@ import org.junit.Test
 
 class PicoDeviceSettingsTest {
     @Test
+    fun `SDK linkage errors use the existing failed setting reason`() {
+        val outcome = settingsFailureOutcome(NoSuchMethodError("missing SDK method"), "WRITE_FAILED")
+
+        assertEquals("failed", outcome.getString("status"))
+        assertEquals("WRITE_FAILED", outcome.getString("reason"))
+    }
+
+    @Test
     fun `Bluetooth transition near the deadline does not start another wait`() {
         var now = 0L
         var lastRead = 0L

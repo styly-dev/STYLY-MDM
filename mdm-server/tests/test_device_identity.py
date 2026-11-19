@@ -513,6 +513,8 @@ def test_admin_label_and_group_survive_reload_without_mode(tmp_path, monkeypatch
             await recv_type(admin, "GROUP_LIST")
             await admin.send_json({"type": "SET_DEVICE_LABEL", "device_id": GUID, "label": "Reserved"})
             await recv_type(admin, "DEVICE_LABEL_SET")
+            await admin.send_json({"type": "SET_DEVICE_LABEL", "device_id": "SERIAL-1", "label": "Legacy"})
+            await recv_type(admin, "DEVICE_LABEL_SET")
             await admin.send_json({"type": "CREATE_GROUP", "name": "Old"})
             await recv_type(admin, "GROUP_CREATED")
             await admin.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": "Old",

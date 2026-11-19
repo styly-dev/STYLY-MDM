@@ -197,6 +197,7 @@ class SettingsActivity : AppCompatActivity() {
         }
         val status = state?.applyStatus
         val statusText = when {
+            status == ConfigurationApplyStatus.RELEASE_UNSAVED -> R.string.configuration_release_unsaved
             version == null -> 0
             status == null -> R.string.configuration_unsupported
             status == ConfigurationApplyStatus.APPLYING -> R.string.configuration_applying
@@ -206,7 +207,7 @@ class SettingsActivity : AppCompatActivity() {
         }
         configurationApplyStatus.visibility = if (statusText != 0) View.VISIBLE else View.GONE
         if (statusText != 0) configurationApplyStatus.setText(statusText)
-        reapplyButton.visibility = if (status != null) View.VISIBLE else View.GONE
+        reapplyButton.visibility = if (version != null && status != null) View.VISIBLE else View.GONE
         reapplyButton.isEnabled = state?.canReapply == true && !reapplyPending
         reapplyButton.setOnClickListener {
             if (version != null && !reapplyPending) reapplyConfiguration(version)

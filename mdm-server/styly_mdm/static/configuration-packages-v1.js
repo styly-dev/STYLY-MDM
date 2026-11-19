@@ -3,72 +3,6 @@
 
   const CREATE_PACKAGE_OPTION = 'create-package';
 
-  function membershipGroups(deviceId, groups) {
-    return Object.keys(groups || {}).filter(function (name) {
-      return (groups[name] || []).includes(deviceId);
-    }).sort();
-  }
-
-  function syncMemberSelection(previous, next, selected, edited) {
-    const previousMembers = new Set(previous);
-    const editedMembers = edited || new Set();
-    const selection = new Set(next.filter(id => editedMembers.has(id)
-      ? selected.has(id) : !previousMembers.has(id) || selected.has(id)));
-    for (const id of selected) {
-      if (!previousMembers.has(id) || editedMembers.has(id)) selection.add(id);
-    }
-    return selection;
-  }
-
-  function clearMembershipEditsThatMatch(selected, current, edited, expectedOwners) {
-    const members = new Set(current);
-    for (const deviceId of edited) {
-      if (selected.has(deviceId) === members.has(deviceId)) {
-        edited.delete(deviceId);
-        expectedOwners.delete(deviceId);
-      }
-    }
-  }
-
-  function expectedMembershipOwner(deviceId, name, groups) {
-    const owners = membershipGroups(deviceId, groups);
-    if (owners.length > 1) throw new Error('Resolve this device’s conflicting group memberships before editing it.');
-    return owners[0] ?? null;
-  }
-
-  function buildMembershipEdit(name, currentMembers, selectedMembers, groups, expectedOwners) {
-    const current = new Set();
-    for (const deviceId of currentMembers) {
-      if (current.has(deviceId)) throw new Error('Resolve duplicate device IDs in this group before editing it.');
-      current.add(deviceId);
-    }
-    const selected = new Set(selectedMembers);
-    const add = new Map();
-    const remove = [];
-
-    for (const deviceId of selected) {
-      if (current.has(deviceId)) continue;
-      if (!expectedOwners.has(deviceId)) throw new Error('Choose the source group for each device again before saving.');
-      const owners = membershipGroups(deviceId, groups);
-      if (owners.includes(name) || owners.filter(group => group !== name).length > 1 ||
-          expectedMembershipOwner(deviceId, name, groups) !== expectedOwners.get(deviceId)) {
-        throw new Error('Group membership changed. Remove and add the device again after reviewing its current group.');
-      }
-      add.set(deviceId, expectedOwners.get(deviceId));
-    }
-
-    for (const deviceId of current) {
-      if (selected.has(deviceId)) continue;
-      const owners = membershipGroups(deviceId, groups);
-      if (!owners.includes(name) || owners.length !== 1) {
-        throw new Error('Group membership changed. Review the current members before saving again.');
-      }
-      remove.push(deviceId);
-    }
-
-    return { type: 'UPDATE_GROUP_MEMBERS', name, add: Object.fromEntries(add), remove };
-  }
-
   const MAX_WIFI_NETWORKS = 4;
   const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   const WIFI_ORDER_HELP = 'Earlier networks in this list have higher priority.';
@@ -125,6 +59,23 @@
     return Number.isInteger(value) && value > 0 && value <= 127;
   }
 
+  function validWifiSsid(ssid) {
+    if (typeof ssid !== 'string' || !ssid.length) return 'Enter an SSID';
+    let byteLength = 0;
+    let unsupported = false;
+    for (const character of ssid) {
+      const code = character.codePointAt(0);
+      if (code >= 0xd800 && code <= 0xdfff) return 'SSID must contain valid UTF-8 text';
+      byteLength += code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
+      if (code < 0x20 || (code >= 0x7f && code <= 0x9f) || character === '"' || character === '\\') {
+        unsupported = true;
+      }
+    }
+    if (byteLength > 32) return 'SSID must contain 1 to 32 UTF-8 bytes';
+    if (unsupported) return 'SSID contains unsupported characters';
+    return '';
+  }
+
   function schedulePayload(item, value, savedValue, active) {
     const schedule = { ...value };
     if (active) {
@@ -154,7 +105,8 @@
     const identities = new Set();
     const payloadNetworks = networks.map(function (network, index) {
       const { ssid, security, hidden, password } = network;
-      if (!ssid) throw new Error('Enter an SSID for Wi-Fi ' + (index + 1) + '.');
+      const ssidError = validWifiSsid(ssid);
+      if (ssidError) throw new Error(ssidError + ' for Wi-Fi ' + (index + 1) + '.');
       if (!['OPEN', 'WPA2_WPA3'].includes(security)) {
         throw new Error('Choose Open or WPA2/WPA3 security for Wi-Fi ' + (index + 1) + '.');
       }
@@ -235,7 +187,8 @@
       const entry = draft[item.id];
       if (!entry) continue;
       const managed = entry.managed;
-      const { value } = entry;
+      const value = item.kind === 'wifi' && !entry.managed
+        ? saved[item.id].value : entry.value;
       let payloadValue = value;
       if (item.kind === 'schedule') {
         payloadValue = schedulePayload(item, value, saved[item.id]?.value, managed && value.enabled === true);
@@ -245,7 +198,8 @@
       settings[item.id] = {
         managed,
         value: item.kind === 'wifi'
-          ? wifiPayload(value, saved[item.id].value.networks, managed)
+          ? wifiPayload(value,
+            saved[item.id].value.networks, managed)
           : payloadValue,
       };
     }
@@ -279,7 +233,7 @@
   function deviceOutcome(device, packageId, deployment) {
     const online = device?.status === 'online';
     const connection = online ? '' : ' · Offline';
-    if (!packageId) return ['', 'No package' + connection, 'This group has no managed settings.'];
+    if (!packageId) return ['', 'No managed settings' + connection, 'This group has no managed settings.'];
     if (!deployment) return ['pending', 'Waiting for deployment' + connection, 'Deploy the group package to send its settings to devices.'];
     if (online && device.configuration_supported !== true) {
       return ['unavailable', 'Client update needed', 'This client does not report support for configuration packages.'];
@@ -484,6 +438,7 @@
     deviceIdHtml = (_, id) => esc(id), fetch = root.fetch.bind(root),
     confirmAction = message => root.confirm(message),
     onSnapshot = () => {},
+    requestGroupSnapshot = () => false,
   }) {
     const secretType = root.CSS?.supports?.('-webkit-text-security', 'disc') ? 'text' : 'password';
     const groupEdits = new Map();
@@ -492,6 +447,9 @@
     let current = null;
     let snapshot = null;
     let catalog = null;
+    let configurationAvailable = null;
+    let snapshotConnectionReady = false;
+    let catalogRefreshState = null;
     let catalogLoading = false;
     let catalogError = '';
     let catalogContent = '';
@@ -538,6 +496,7 @@
     }
 
     function groupPackageSummary(name) {
+      if (configurationAvailable === false) return { name: null, count: null };
       const packageId = assignment(name);
       if (!packageId) return null;
       const deployment = deploymentFor(name, packageId);
@@ -553,7 +512,9 @@
       const response = await fetch(path, { method, headers, body: JSON.stringify(body) });
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
-        throw Object.assign(new Error(data?.error || `Request failed (HTTP ${response.status}).`), { status: response.status });
+        throw Object.assign(new Error(data?.error || `Request failed (HTTP ${response.status}).`), {
+          status: response.status, code: data?.code,
+        });
       }
       return response.json();
     }
@@ -568,10 +529,15 @@
       if (instanceChanged) {
         resultSections = { status: 'idle' };
         items = new Map();
+        catalog = null;
       }
       snapshot = { server_instance_id: data.server_instance_id, revision: data.revision,
         assignments: data.assignments || {}, deployments: data.deployments || {} };
-      catalog = data.packages || [];
+      configurationAvailable = data.configuration_available !== false;
+      catalogRefreshState = null;
+      updateCreateControls();
+      if (configurationAvailable) catalog = Array.isArray(data.packages) ? data.packages : [];
+      else if (Array.isArray(data.packages) && data.packages.length) catalog = data.packages;
       catalogError = '';
       const currentGroups = data.groups || getGroups();
       for (const [name, model] of groupEdits) {
@@ -581,21 +547,36 @@
       }
       renderCatalog();
       renderPublication();
-      onSnapshot(data);
+      if (current) updateActions();
+      onSnapshot(data, source);
       return true;
     }
 
     function renderCatalog() {
-      const content = catalog?.map(pkg =>
-        `<button type="button" class="mg-item settings-package-item${current?.id === pkg.package_id ? ' active' : ''}" data-package-id="${esc(pkg.package_id)}" aria-pressed="${current?.id === pkg.package_id}">
+      const unavailable = configurationAvailable === false;
+      const notice = unavailable
+        ? '<p class="settings-error" role="status">' + esc(catalogRefreshState === 'waiting-snapshot'
+          ? 'Checking configuration status with the server…'
+          : catalogRefreshState === 'waiting-connection' || !snapshotConnectionReady
+            ? 'Waiting for the server connection to check configuration status.'
+            : 'Configuration packages are unavailable. Reload after the server recovers.') + '</p>'
+        : '';
+      const entries = catalog?.map(pkg =>
+        `<button type="button" class="mg-item settings-package-item${current?.id === pkg.package_id ? ' active' : ''}" data-package-id="${esc(pkg.package_id)}" aria-pressed="${current?.id === pkg.package_id}" ${unavailable ? 'disabled' : ''}>
           <span class="mg-item-name">${esc(pkg.name)}</span>
           <span class="mg-item-count">${pkg.published_revision ? 'Deployed' : 'New'}</span>
-        </button>`).join('') || `<p class="empty small">${esc(catalog ? 'No packages yet.' : catalogError || 'Loading packages…')}</p>
-        ${catalogError ? '<button type="button" class="btn-outline" data-refresh-packages>Reload packages</button>' : ''}`;
+        </button>`).join('');
+      const empty = entries || catalog?.length
+        ? ''
+        : `<p class="empty small">${esc(unavailable ? 'Package catalog unavailable.' : catalog ? 'No packages yet.' : catalogError || 'Loading packages…')}</p>`;
+      const reload = unavailable || catalogError
+        ? '<button type="button" class="btn-outline" data-refresh-packages>Reload packages</button>' : '';
+      const content = notice + (entries || '') + empty + reload;
       if (catalogContent !== content) {
         catalogContent = content;
         packageList.innerHTML = content;
       }
+      updateCreateControls();
     }
 
     function renderPublication() {
@@ -609,8 +590,8 @@
         (snapshot ? ' · Used by ' + refs + ' ' + (refs === 1 ? 'group' : 'groups') : '');
     }
 
-    async function loadCatalog() {
-      if (catalog || catalogLoading) return;
+    async function loadCatalog(force = false) {
+      if (configurationAvailable === false || (!force && catalog) || catalogLoading) return;
       catalogLoading = true;
       catalogError = '';
       renderCatalog();
@@ -651,24 +632,34 @@
       hint.textContent = reason;
     }
 
+    function updateCreateControls() {
+      const disabled = creating || configurationAvailable === false;
+      const input = createForm.querySelector('input');
+      const button = createForm.querySelector('button');
+      if (input) input.disabled = disabled;
+      if (button) button.disabled = disabled;
+    }
+
     function updateActions() {
       const model = current;
       const footer = packagePanel.querySelector('.settings-actions');
       if (!model || !footer) return;
       const changed = hasChanges(model);
-      const locked = model.busy || model.conflict;
+      const locked = model.busy || model.conflict || configurationAvailable === false;
       packagePanel.querySelector('.settings-editor').disabled = locked;
       packagePanel.querySelector('[data-package-name]').disabled = locked;
       footer.querySelector('[data-policy-action="discard"]').disabled = locked || !changed;
       let deployReason = '';
       if (model.busy) deployReason = 'Wait for the current package operation to finish.';
       else if (model.conflict) deployReason = 'Select Reload package and review the latest version before deploying.';
+      else if (configurationAvailable === false) deployReason = 'Configuration packages are unavailable. Wait for the server to recover.';
       else if (!model.name.trim()) deployReason = 'Enter a package name before deploying.';
       updateDeployAction(footer.querySelector('[data-policy-action="deploy"]'), packagePanel.querySelector('[data-deploy-hint]'), deployReason);
       packagePanel.querySelector('[data-policy-action="delete"]').disabled = locked;
       footer.querySelector('.settings-meta').textContent = changed ? 'Unsaved changes' : '';
       const feedback = packagePanel.querySelector('[data-settings-feedback]');
-      feedback.textContent = model.message;
+      feedback.textContent = model.message || (configurationAvailable === false
+        ? 'Configuration packages are unavailable. Wait for the server to recover.' : '');
       feedback.classList.toggle('settings-error', model.error);
       packagePanel.querySelector('[data-policy-action="reload"]').hidden = !model.conflict;
     }
@@ -735,6 +726,9 @@
           if (JSON.stringify(edited.value) !== JSON.stringify(previous.value)) draft[key].value = edited.value;
         }
       }
+      if (draft.wifi?.managed === false && saved.wifi) {
+        draft.wifi.value = structuredClone(saved.wifi.value);
+      }
       Object.assign(model, { sections: data.sections, editRevision: data.edit_revision,
         publishedRevision: data.published_revision,
         savedName: data.name, saved, name, draft });
@@ -764,7 +758,7 @@
         ? 'The count includes offline devices, which receive the deployed version when they connect.'
         : 'Devices will receive this version once a group uses this package.';
       if (profile.clear) {
-        return confirmAction('Deploy No package to "' + groupName + '" (' + deviceCount + ')?\n\n' +
+        return confirmAction('Stop managing settings for "' + groupName + '" (' + deviceCount + ')?\n\n' +
           'This stops managing all settings for this group and leaves current device values in place. ' +
           (profile.wifi_mode === 'priority' || profile.wifi_mode === 'android_selection'
             ? 'Wi-Fi auto-connect settings still apply after release. To let a network reconnect automatically, enable auto-connect for it on the headset. '
@@ -804,11 +798,14 @@
           if (!confirmDeployment(fresh, { editorName: model.name.trim() })) return;
           writing = true;
           data = await api(path + '/save-and-deploy', 'POST', { ...body, expected_impact: fresh.impact.token });
-        } else {
+        } else if (action === 'delete') {
           writing = true;
-          data = await api(path, 'DELETE');
+          data = await api(path, 'DELETE', body);
+        } else {
+          throw new Error('Unknown package action.');
         }
         if ((snapshot?.server_instance_id ?? null) !== beforeInstanceId) {
+          model.conflict = true;
           model.message = writing
             ? 'Could not confirm the request after the server restarted. Reload the package to check its current state.'
             : 'The server restarted while the package was loading. Reload to get the current version.';
@@ -831,7 +828,7 @@
         if (writing && (!error.status || error.status >= 500)) {
           model.conflict = true;
           model.message = 'Could not confirm the request. Reload to check the latest package.';
-        } else if (error.status === 409 && action !== 'delete') {
+        } else if (error.status === 409 && error.code !== 'package_assigned') {
           model.conflict = true;
           model.message = action === 'deploy' && writing ?
             'The package or deployment targets changed. Reload and review before deploying again.' : error.message;
@@ -865,9 +862,12 @@
       const feedback = createForm.querySelector('[role="status"]');
       const name = input.value.trim();
       if (creating || !name) return;
+      if (configurationAvailable === false) {
+        feedback.textContent = 'Configuration packages are unavailable. Wait for the server to recover.';
+        return;
+      }
       creating = true;
-      const button = createForm.querySelector('button');
-      button.disabled = input.disabled = true;
+      updateCreateControls();
       feedback.textContent = 'Creating package…';
       const before = snapshot;
       const beforeInstanceId = before?.server_instance_id ?? null;
@@ -884,7 +884,7 @@
         feedback.textContent = error.status ? error.message : 'Could not create the package.';
       } finally {
         creating = false;
-        button.disabled = input.disabled = false;
+        updateCreateControls();
       }
     }
 
@@ -893,7 +893,7 @@
         if (name && resultSections.status === 'failed') resultSections = { status: 'idle' };
         group = name ? groupEdits.get(name) || { name } : null;
         groupPanel.innerHTML = group ? `<section class="settings-section">
-          <header><h3>Configuration package</h3><p>Deploy a package to this group, or deploy No package to stop managing settings and keep current device values.</p></header>
+          <header><h3>Configuration package</h3><p>Deploy a package to this group, or choose No managed settings to stop managing settings and keep current device values.</p></header>
           <div class="settings-assignment">
             <label class="settings-name">Package for this group<select class="field" data-group-package></select></label>
             <div class="settings-buttons">
@@ -922,7 +922,7 @@
       const selected = selectedPackage(group);
       const select = groupPanel.querySelector('[data-group-package]');
       const known = packageById(selected);
-      const options = '<option value="">No package</option>' +
+      const options = '<option value="">No managed settings</option>' +
         (catalog || []).map(pkg => `<option value="${esc(pkg.package_id)}">${esc(pkg.name)}</option>`).join('') +
         (selected && !known ? `<option value="${esc(selected)}" disabled>Package unavailable</option>` : '') +
         `<option value="${CREATE_PACKAGE_OPTION}">Create package…</option>`;
@@ -931,13 +931,14 @@
         select.innerHTML = options;
       }
       if (select.value !== (selected || '')) select.value = selected || '';
-      select.disabled = !snapshot || Boolean(group.busy);
+      select.disabled = !snapshot || Boolean(group.busy) || configurationAvailable === false;
       const edit = groupPanel.querySelector('[data-group-action="edit"]');
       edit.hidden = !known;
-      edit.disabled = Boolean(group.busy);
+      edit.disabled = Boolean(group.busy) || configurationAvailable === false;
       let deployReason = '';
       if (!snapshot) deployReason = 'Waiting for group details to load.';
       else if (group.busy) deployReason = group.busy;
+      else if (configurationAvailable === false) deployReason = 'Configuration packages are unavailable. Wait for the server to recover.';
       else if (selected && !known) deployReason = 'This package is unavailable. Choose another package.';
       else if (known && !known.published_revision) {
         deployReason = 'Open Edit package and select Save & deploy to deploy it first.';
@@ -947,8 +948,10 @@
       feedback.textContent = group.message || '';
       feedback.classList.toggle('settings-error', Boolean(group.error));
       const deployment = currentDeployment(group);
-      groupPanel.querySelector('[data-group-publication]').textContent = deployment ? 'Deployed version ' + deployment.revision
-        : assigned ? 'Not deployed yet.' : 'No package set for this group.';
+      groupPanel.querySelector('[data-group-publication]').textContent = configurationAvailable === false
+        ? 'Configuration packages unavailable.'
+        : deployment ? 'Deployed version ' + deployment.revision
+          : assigned ? 'Not deployed yet.' : 'This group has no managed settings.';
       renderResults();
     }
 
@@ -963,6 +966,8 @@
       count.hidden = !assignedPackage(group);
       const deployment = currentDeployment(group);
       const assigned = assignedPackage(group);
+      const focusedRetryDevice = root.document?.activeElement?.matches?.('[data-group-action="retry"]')
+        ? root.document.activeElement.dataset.deviceId : null;
       const openResults = new Set(Array.from(target.querySelectorAll('[data-result-device][open]'), result => result.dataset.resultDevice));
       const outcomes = groupOutcomes(group.name, assigned, deployment);
       const rows = [];
@@ -977,9 +982,9 @@
             pending.reportChanged = true;
             if (!pending.sending) retrying.delete(key);
           }
-          if (retryEligible(device, deployment)) {
+          if (configurationAvailable !== false && retryEligible(device, deployment)) {
             const waiting = retrying.has(key);
-            button = `<button type="button" class="btn-outline" data-group-action="retry" data-device-id="${esc(id)}" ${waiting ? 'disabled' : ''}>${waiting ? 'Retry requested' : 'Retry'}</button>`;
+            button = `<button type="button" class="btn-outline${waiting ? ' retry-pending' : ''}" data-group-action="retry" data-device-id="${esc(id)}" ${waiting ? 'aria-disabled="true"' : ''}>${waiting ? 'Retry requested' : 'Retry'}</button>`;
           }
         }
         rows.push(`<article class="settings-device-result ${state}">
@@ -999,6 +1004,10 @@
       if (target.resultContent !== content) {
         target.resultContent = content;
         target.innerHTML = content;
+        if (focusedRetryDevice) {
+          Array.from(target.querySelectorAll('[data-group-action="retry"]'))
+            .find(button => button.dataset.deviceId === focusedRetryDevice)?.focus({ preventScroll: true });
+        }
       }
       if (deployment && assigned) {
         readResultSections(assigned);
@@ -1006,6 +1015,12 @@
     }
 
     async function deployPackage(model) {
+      if (configurationAvailable === false) {
+        model.error = true;
+        model.message = 'Configuration packages are unavailable. Wait for the server to recover.';
+        refreshGroup();
+        return;
+      }
       const assigned = assignedPackage(model);
       const id = selectedPackage(model);
       const submittedSelection = model.selection;
@@ -1040,7 +1055,7 @@
         } else {
           delete model.selection;
           model.message = id === null
-            ? 'No package deployed. This group has no managed settings.'
+            ? 'Stopped managing settings for this group.'
             : 'Deployment started. Check Device status for results.';
         }
       } catch (error) {
@@ -1056,6 +1071,7 @@
     }
 
     async function retryDevice(model, deviceId) {
+      if (configurationAvailable === false) return;
       const deployment = currentDeployment(model);
       const device = getDevice(deviceId);
       if (device?.device_id !== deviceId || !retryEligible(device, deployment) ||
@@ -1100,6 +1116,14 @@
       } else if (manage) {
         model.draft[manage].managed = target.checked;
         if (manage === 'wifi') {
+          if (!target.checked) {
+            model.draft.wifi.value = structuredClone(model.saved.wifi.value);
+            model.error = false;
+            model.message = '';
+            renderEditor();
+            packagePanel.querySelector('[data-manage="wifi"]')?.focus({ preventScroll: true });
+            return;
+          }
           const valuePanel = target.closest('.settings-row').querySelector('.settings-value');
           updateWifiMoveButtons(valuePanel, model.draft);
           updateWifiWarnings(valuePanel, model.draft);
@@ -1162,6 +1186,7 @@
       if (!button || button.disabled || !model || model.busy) return;
       const action = button.dataset.policyAction;
       if (action === 'reload') return request(model, 'reload');
+      if (configurationAvailable === false) return;
       if (!model.saved || model.conflict) return;
       if (action === 'discard') {
         model.name = model.savedName;
@@ -1184,7 +1209,9 @@
         return request(model, 'deploy', { expected_revision: model.editRevision, settings,
           ...(name !== model.savedName ? { name } : {}) });
       } else if (action === 'delete') {
-        if (confirmAction('Delete configuration package "' + model.savedName + '"?')) return request(model, 'delete');
+        if (confirmAction('Delete configuration package "' + model.savedName + '"?')) {
+          return request(model, 'delete', { expected_revision: model.editRevision });
+        }
       } else if (action === 'add-network' || action === 'remove-network' || action === 'move-network') {
         const { setting, network } = button.dataset;
         const entry = model.draft[setting];
@@ -1204,7 +1231,7 @@
     }
 
     groupPanel.addEventListener('change', event => {
-      if (!group || group.busy || !event.target.matches('[data-group-package]')) return;
+      if (!group || group.busy || configurationAvailable === false || !event.target.matches('[data-group-package]')) return;
       const selected = event.target.value || null;
       if (selected === CREATE_PACKAGE_OPTION) {
         refreshGroup();
@@ -1229,9 +1256,18 @@
     });
     packageList.addEventListener('click', event => {
       const button = event.target.closest('[data-package-id], [data-refresh-packages]');
-      if (!button) return;
+      if (!button || button.disabled) return;
       const id = button.dataset.packageId;
-      if (!id) return loadCatalog();
+      if (!id) {
+        if (configurationAvailable === false) {
+          const requested = requestGroupSnapshot();
+          catalogRefreshState = requested ? 'waiting-snapshot' : 'waiting-connection';
+          renderCatalog();
+          refreshGroup();
+          return;
+        }
+        return loadCatalog(true);
+      }
       if (canSwitchPackage(id)) return selectPackage(id);
     });
     createForm.addEventListener('submit', createPackage);
@@ -1252,12 +1288,21 @@
     }
 
     renderEditor();
-    return { renderGroup, updateSnapshot, showPackages, groupPackageSummary };
+    function setGroupSnapshotConnected(connected) {
+      snapshotConnectionReady = connected;
+      if (configurationAvailable !== false) return;
+      if (!connected && catalogRefreshState === 'waiting-snapshot') {
+        catalogRefreshState = 'waiting-connection';
+      } else if (connected && catalogRefreshState === 'waiting-connection') {
+        catalogRefreshState = requestGroupSnapshot() ? 'waiting-snapshot' : 'waiting-connection';
+      }
+      renderCatalog();
+    }
+
+    return { renderGroup, updateSnapshot, showPackages, groupPackageSummary, setGroupSnapshotConnected };
   }
 
-  const api = { createController, membershipGroups, syncMemberSelection, clearMembershipEditsThatMatch,
-    expectedMembershipOwner,
-    buildMembershipEdit, loadDraft, buildPayload, deviceOutcome, retryEligible };
+  const api = { createController, loadDraft, buildPayload, deviceOutcome, retryEligible };
   root.MdmConfigurationPackages = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);

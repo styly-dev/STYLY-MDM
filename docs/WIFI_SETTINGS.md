@@ -13,6 +13,9 @@ for the same SSID and security. Choose **Save & deploy**. The confirmation
 includes all assigned groups and members. Offline devices receive the latest
 revision when they connect. Group **Settings** shows Wi-Fi readiness and the
 last package result.
+Turning off **Manage** keeps the previously saved list and keys. Draft network
+rows are ignored while deploying Wi-Fi as unmanaged. Returning **Manage** to
+its saved off state leaves no Wi-Fi change to save.
 
 ## Modes
 
@@ -21,7 +24,9 @@ last package result.
 - **Priority mode**: only the first listed network has Android auto-join on.
   Other saved networks have it off. When the headset needs a connection, the
   client tries the listed networks in order. A headset already connected to the
-  first listed network keeps that connection.
+  first listed network keeps that connection. Each candidate gets up to 12
+  seconds, including time to disconnect and obtain an IP address, within the
+  overall connection attempt of up to one minute.
 - **Android selection** (priority off): every listed network has auto-join on
   and other saved networks have it off. Android chooses and reconnects.
   Automatic return is not available.
@@ -64,25 +69,30 @@ These apply to priority mode.
 - After a disconnection, Android reconnects to the first listed network. With
   more than one listed network, the client waits about 10 seconds and then
   tries the networks in order. It keeps retrying with a growing delay of up to
-  about a minute.
+  about a minute. While Wi-Fi is off, it waits for the radio to become available.
 - With automatic return on, a headset on a lower network checks Wi-Fi scans for
   a higher one, first within about 30 seconds and then about every five
   minutes. Any visible higher network triggers a switch, regardless of signal
   strength. A switch briefly interrupts communication. If it fails, the client
   reconnects to the previous network. After each attempt the client waits five
-  minutes, doubling up to 30 minutes after consecutive failures.
+  minutes, doubling up to 30 minutes after consecutive failures. Scanning pauses
+  during this wait.
 - Detection depends on Android scan results. Sleep, throttling, and radio
   conditions can delay it. The console shows the monitor state separately from
-  the package result.
+  the package result. If the client cannot register to receive scan results, it
+  tries again on the next Wi-Fi readiness or connectivity check.
 - Automatic return does not support hidden SSIDs. Turn it off to use hidden
   networks.
 
 ## Reapply and release
 
 A same-boot deployment whose Wi-Fi setting matches a successful result reuses
-it. To write Wi-Fi again, use **Reapply settings** on the headset or reboot it.
+it. To write managed Wi-Fi again, use **Reapply settings** on the headset or reboot it.
 
-**No package**, or turning off **Manage** for Wi-Fi, stops Wi-Fi management.
+**No managed settings**, or turning off **Manage** for Wi-Fi, stops Wi-Fi management.
+Once the headset saves the release or the updated assignment, it also honors
+the change when it reboots offline. Headset Settings shows an error if the
+client cannot save the release.
 Saved profiles and their auto-join flags stay as they are. To let a network
 with auto-join off reconnect automatically, turn auto-connect on for it on the
 headset.

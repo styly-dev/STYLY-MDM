@@ -20,7 +20,7 @@ class WifiPriorityScanMonitorTest {
         val source = WifiPriorityScanLoop(backend, scheduler, scheduler::schedule, { scheduler.now })
         val events = mutableListOf<WifiPriorityScanEvent>()
         val profile = network("preferred")
-        source.start(listOf(profile), events::add)
+        source.ensureStarted(listOf(profile), events::add)
         scheduler.runNext()
 
         assertEquals(WifiPriorityMonitorStatus.DEGRADED, events.last().status)
@@ -38,20 +38,26 @@ class WifiPriorityScanMonitorTest {
     }
 
     @Test
-    fun `accepted request distinguishes unchanged broadcast and applies interval backoff`() {
+    fun `an unrelated failed broadcast does not settle an accepted request`() {
         val backend = FakeBackend().apply { accepted = true }
         val scheduler = FakeScheduler(now = 100_000L)
         val source = WifiPriorityScanLoop(backend, scheduler, scheduler::schedule, { scheduler.now })
         val events = mutableListOf<WifiPriorityScanEvent>()
         val profile = network("preferred")
-        source.start(listOf(profile), events::add)
+        source.ensureStarted(listOf(profile), events::add)
         scheduler.runNext()
         backend.emit(scheduler.now, resultsUpdated = false)
         scheduler.runCallbacks()
 
-        assertEquals(WifiPriorityMonitorStatus.DEGRADED, events.last().status)
-        assertEquals("broadcast_not_updated", events.last().detail)
-        assertEquals(10 * 60_000L, scheduler.pending.single().delayMillis)
+        assertEquals("scan_requested", events.last().detail)
+        assertEquals(WifiPriorityScanLoop.BROADCAST_TIMEOUT_MILLIS, scheduler.pending.single().delayMillis)
+
+        backend.emit(scheduler.now, samples = listOf(sample(profile, scheduler.now)))
+        scheduler.runCallbacks()
+
+        assertEquals("fresh_scan_results", events.last().detail)
+        assertEquals(setOf(profile.identity), events.last().visibleIdentities)
+        assertEquals(WifiPriorityScanLoop.REQUEST_INTERVAL_MILLIS, scheduler.pending.single().delayMillis)
     }
 
     @Test
@@ -61,7 +67,7 @@ class WifiPriorityScanMonitorTest {
         val source = WifiPriorityScanLoop(backend, scheduler, scheduler::schedule, { scheduler.now })
         val events = mutableListOf<WifiPriorityScanEvent>()
         val profile = network("preferred")
-        source.start(listOf(profile), events::add)
+        source.ensureStarted(listOf(profile), events::add)
         scheduler.runNext()
         backend.emit(scheduler.now, samples = listOf(sample(profile, 90_000L)))
         scheduler.runCallbacks()
@@ -116,7 +122,7 @@ class WifiPriorityScanMonitorTest {
             bound
         })
         val profile = network("preferred")
-        source.start(listOf(profile)) {}
+        source.ensureStarted(listOf(profile)) {}
 
         assertEquals(WifiPriorityScanLoop.INITIAL_JITTER_MILLIS, scheduler.pending.single().delayMillis)
         scheduler.runNext()
@@ -152,7 +158,7 @@ class WifiPriorityScanMonitorTest {
         val settled = CompletableFuture<WifiPriorityScanEvent>()
         try {
             worker.execute {
-                source.start(listOf(profile)) { event ->
+                source.ensureStarted(listOf(profile)) { event ->
                     if (event.detail == "fresh_scan_results" || event.status == WifiPriorityMonitorStatus.DEGRADED) {
                         settled.complete(event)
                     }
@@ -180,15 +186,54 @@ class WifiPriorityScanMonitorTest {
         val scheduler = FakeScheduler(now = 100_000L)
         val source = WifiPriorityScanLoop(backend, scheduler, scheduler::schedule, { scheduler.now })
         val profile = network("preferred")
-        source.start(listOf(profile)) {}
+        source.ensureStarted(listOf(profile)) {}
         backend.emit(scheduler.now, samples = listOf(sample(profile, scheduler.now)))
 
         val replacement = mutableListOf<WifiPriorityScanEvent>()
-        source.start(listOf(profile), replacement::add)
+        source.stop()
+        source.ensureStarted(listOf(profile), replacement::add)
         scheduler.runCallbacks()
 
         assertEquals(listOf("waiting_for_scan"), replacement.map { it.detail })
         assertEquals(0, backend.sampleReads)
+        assertEquals(1, scheduler.pending.size)
+    }
+
+    @Test
+    fun `priority monitoring recovers on the same fallback after registration fails`() {
+        val preferred = network("preferred")
+        val fallback = network("fallback")
+        val networks = listOf(preferred, fallback)
+        val profile = WifiSavedProfile(REVISION, networks, autoReturn = true)
+        val backend = FakeBackend().apply { failNextRegistration = true }
+        val scheduler = FakeScheduler(now = 100_000L)
+        val source = WifiPriorityScanLoop(backend, scheduler, scheduler::schedule, { scheduler.now })
+        val controller = WifiSettingsController(
+            WifiControllerDependencies(
+                store = MemoryStore(WifiLocalState(lastApplied = profile), failRead = false),
+                adapter = FakeAdapter(networks),
+                connectivity = FakeConnectivity(listOf(observation(10, fallback.ssid))) { scheduler.now },
+                nowElapsed = { scheduler.now },
+                worker = scheduler,
+                schedule = { task, delay -> scheduler.schedule(task, delay) },
+                priorityScanSource = source,
+            ),
+        )
+        scheduler.runCallbacks()
+
+        assertEquals("unsupported", controller.stateSnapshot().getString("priority_monitor"))
+        assertTrue(scheduler.pending.isEmpty())
+
+        controller.refreshReadiness()
+        scheduler.runCallbacks()
+
+        assertEquals("monitoring", controller.stateSnapshot().getString("priority_monitor"))
+        assertEquals(2, backend.registrationAttempts)
+
+        controller.refreshReadiness()
+        scheduler.runCallbacks()
+
+        assertEquals(2, backend.registrationAttempts)
         assertEquals(1, scheduler.pending.size)
     }
 
@@ -200,11 +245,19 @@ class WifiPriorityScanMonitorTest {
     private class FakeBackend : WifiPriorityScanBackend {
         var accepted = true
         var beforeStart: () -> Unit = {}
+        var failNextRegistration = false
+        var registrationAttempts = 0
+            private set
         private var listener: ((WifiScanBroadcast) -> Unit)? = null
         private var samples = emptyList<WifiScanSample>()
         var sampleReads = 0
             private set
         override fun register(listener: (WifiScanBroadcast) -> Unit) {
+            registrationAttempts++
+            if (failNextRegistration) {
+                failNextRegistration = false
+                throw IllegalStateException("Temporary receiver registration failure")
+            }
             this.listener = listener
         }
         override fun unregister() {

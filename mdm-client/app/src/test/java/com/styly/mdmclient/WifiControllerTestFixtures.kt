@@ -62,6 +62,8 @@ internal class Harness(
 
     init { worker.runAll() }
 
+    fun scheduledDelayCount(delayMillis: Long): Int = timers.count { it.delayMillis == delayMillis }
+
     fun apply(
         networks: List<WifiNetworkProfile>,
         autoReturn: Boolean = false,
@@ -79,11 +81,24 @@ internal class Harness(
     }
 
     fun expireNext(delayMillis: Long) {
-        val timer = timers.firstOrNull { !it.fired && it.delayMillis == delayMillis }
+        val matching = timers.filter { !it.fired && it.delayMillis == delayMillis }
+        val timer = matching.filter { it.dueAt >= clock.value }.minByOrNull { it.dueAt }
+            ?: matching.maxByOrNull { it.dueAt }
             ?: error("no pending timer with delay $delayMillis")
         clock.value = maxOf(clock.value, timer.dueAt)
         timer.run()
         worker.runAll()
+    }
+
+    fun advanceBy(millis: Long) {
+        val end = clock.value + millis
+        while (true) {
+            val timer = timers.filter { !it.fired && it.dueAt <= end }.minByOrNull { it.dueAt } ?: break
+            clock.value = maxOf(clock.value, timer.dueAt)
+            timer.run()
+            worker.runAll()
+        }
+        clock.value = maxOf(clock.value, end)
     }
 
     fun replayTimer(delayMillis: Long, index: Int) {
@@ -106,10 +121,20 @@ internal class FakeAdapter(initialNetworks: List<WifiNetworkProfile>) : WifiSett
     var disconnectCalls = 0
         private set
     var application: WifiProfileApplication? = null
+    var wifiEnabled = true
+    var disconnectResult = WifiReason.NONE
+    var disconnectFailure: Throwable? = null
+    var selectionFailure: Throwable? = null
     var afterApply: (() -> Unit)? = null
     var afterDisconnect: (() -> Unit)? = null
     var onDisconnect: (() -> Unit)? = null
     var afterSelect: ((WifiNetworkProfile) -> Unit)? = null
+    var onCheckWifiEnabled: (() -> Unit)? = null
+
+    override fun isWifiEnabled(): Boolean {
+        onCheckWifiEnabled?.invoke()
+        return wifiEnabled
+    }
 
     override fun applyProfile(
         target: List<WifiNetworkProfile>,
@@ -141,6 +166,10 @@ internal class FakeAdapter(initialNetworks: List<WifiNetworkProfile>) : WifiSett
     ): WifiReason {
         selectCalls += candidate
         beforeMutation()?.let { return it }
+        selectionFailure?.let { failure ->
+            selectionFailure = null
+            throw failure
+        }
         afterSelect?.invoke(candidate)
         return WifiReason.NONE
     }
@@ -148,9 +177,13 @@ internal class FakeAdapter(initialNetworks: List<WifiNetworkProfile>) : WifiSett
     override fun disconnectCurrent(beforeMutation: () -> WifiReason?): WifiReason {
         disconnectCalls++
         beforeMutation()?.let { return it }
+        disconnectFailure?.let { failure ->
+            disconnectFailure = null
+            throw failure
+        }
         onDisconnect?.invoke()
         afterDisconnect?.invoke()
-        return WifiReason.NONE
+        return disconnectResult
     }
 }
 
@@ -178,16 +211,31 @@ internal class FakeConnectivity(
         return FakeSession(current.values.toList(), sequence, listener).also { sessions += it }
     }
 
-    fun update(handle: Long, ssid: String, hasUsableIp: Boolean = true, security: String = "WPA_PSK") {
-        val observation = WifiLocalNetworkObservation(handle, ssid, hasUsableIp, ++sequence, now(), security)
+    fun update(handle: Long, ssid: String?, hasUsableIp: Boolean = true, security: String? = "WPA_PSK") {
+        val previous = current[handle]
+        val nextSequence = ++sequence
+        val observation = WifiLocalNetworkObservation(
+            handle,
+            ssid,
+            hasUsableIp,
+            nextSequence,
+            now(),
+            security,
+            associationSequence = previous?.associationSequence ?: nextSequence,
+            usableIpReceivedElapsedMillis = when {
+                !hasUsableIp -> null
+                previous?.hasUsableIp == true -> previous.usableIpReceivedElapsedMillis
+                else -> now()
+            },
+        )
         current[handle] = observation
-        sessions.toList().forEach { it.update(observation) }
+        sessions.toList().forEach { it.update(current.values.toList(), sequence) }
     }
 
     fun lose(handle: Long) {
         current.remove(handle)
-        val event = WifiLocalConnectivityEvent.Lost(handle, ++sequence)
-        sessions.toList().forEach { it.lose(event) }
+        val event = WifiLocalConnectivityEvent(++sequence)
+        sessions.toList().forEach { it.update(current.values.toList(), event.sequence) }
     }
 
     fun loseAll() { current.keys.toList().forEach(::lose) }
@@ -203,19 +251,15 @@ internal class FakeConnectivity(
         var closed = false
             private set
 
-        override fun snapshot(): List<WifiLocalNetworkObservation> = observations.values.toList()
-        override fun lastSequence(): Long = sequence
-        fun update(observation: WifiLocalNetworkObservation) {
+        override fun snapshot(): WifiLocalConnectivitySnapshot =
+            WifiLocalConnectivitySnapshot(observations.values.toList(), sequence)
+
+        fun update(current: List<WifiLocalNetworkObservation>, currentSequence: Long) {
             if (closed) return
-            observations[observation.networkHandle] = observation
-            sequence = observation.sequence
-            listener(this, WifiLocalConnectivityEvent.Updated(observation))
-        }
-        fun lose(event: WifiLocalConnectivityEvent.Lost) {
-            if (closed) return
-            observations.remove(event.networkHandle)
-            sequence = event.sequence
-            listener(this, event)
+            observations.clear()
+            observations.putAll(current.associateBy { it.networkHandle })
+            sequence = currentSequence
+            listener(this, WifiLocalConnectivityEvent(currentSequence))
         }
         override fun close() { closed = true }
     }
@@ -224,14 +268,18 @@ internal class FakeConnectivity(
 internal class FakePriorityScanSource(private val worker: Executor) : WifiPriorityScanSource {
     private var listener: ((WifiPriorityScanEvent) -> Unit)? = null
     var startCalls = 0
+    var stopCalls = 0
 
-    override fun start(networks: List<WifiNetworkProfile>, listener: (WifiPriorityScanEvent) -> Unit) {
+    override fun ensureStarted(networks: List<WifiNetworkProfile>, listener: (WifiPriorityScanEvent) -> Unit) {
+        if (this.listener != null) return
         startCalls++
         this.listener = listener
         listener(WifiPriorityScanEvent(WifiPriorityMonitorStatus.MONITORING, detail = "test_started"))
     }
 
     override fun stop() {
+        if (listener == null) return
+        stopCalls++
         listener = null
     }
 
@@ -241,15 +289,22 @@ internal class FakePriorityScanSource(private val worker: Executor) : WifiPriori
     }
 }
 
-internal class MemoryStore(initial: WifiLocalState, private val failRead: Boolean) : WifiLocalStore {
+internal class MemoryStore(initial: WifiLocalState, var failRead: Boolean) : WifiLocalStore {
     var state = initial
         private set
+    var writeFailuresRemaining = 0
 
     override fun read(): WifiLocalState {
         check(!failRead) { "Wi-Fi state could not be read" }
         return state
     }
-    override fun write(state: WifiLocalState) { this.state = state }
+    override fun write(state: WifiLocalState) {
+        if (writeFailuresRemaining > 0) {
+            writeFailuresRemaining--
+            error("Wi-Fi state could not be written")
+        }
+        this.state = state
+    }
 }
 
 internal class MutableClock(var value: Long = 0L)

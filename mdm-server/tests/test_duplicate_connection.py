@@ -251,6 +251,44 @@ def test_e2e_battery_update_on_a_superseded_socket_is_ignored(tmp_path):
     asyncio.run(body())
 
 
+def test_reconnect_while_disconnect_verification_notification_is_pending(tmp_path, monkeypatch):
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        notifying = asyncio.get_running_loop().create_future()
+        resume = asyncio.Event()
+        forward = server.forward_to_admins
+
+        async def delay_verification_notification(payload):
+            if payload["type"] == "SELF_UPDATE_VERIFIED":
+                notifying.set_result(asyncio.current_task())
+                await resume.wait()
+            await forward(payload)
+
+        monkeypatch.setattr(server, "forward_to_admins", delay_verification_notification)
+        device_id = "64b19041-0b8c-4ef4-82fd-000000000000"
+        async with TestServer(server.create_app()) as ts, aiohttp.ClientSession() as session:
+            # Match the production runner: finish disconnect notifications after TCP closes.
+            ts.handler.handler_cancellation = False
+            base = str(ts.make_url("/")).rstrip("/")
+            old = await _register(session, base, device_id)
+            server.pending_self_updates[device_id] = {"phase": "verifying", "correlation_id": "old"}
+            closing = asyncio.create_task(old.close())
+            try:
+                old_handler = await asyncio.wait_for(notifying, 2)
+                live = await _register(session, base, device_id)
+                resume.set()
+                await asyncio.wait_for(asyncio.shield(old_handler), 2)
+                async with session.ws_connect(base + "/ws/admin") as admin:
+                    await live.send_json({"type": "BATTERY_UPDATE", "level": 66, "charging": True})
+                    assert await _recv_device_list(admin, device_id, status="online", battery={"level": 66})
+                await live.close()
+            finally:
+                resume.set()
+                await closing
+
+    asyncio.run(body())
+
+
 def test_e2e_single_connection_disconnect_still_goes_offline(tmp_path):
     """The guard must not keep a genuinely gone device pinned online."""
     async def body():

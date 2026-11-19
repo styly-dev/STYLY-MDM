@@ -22,26 +22,29 @@ internal class WifiSettingsStore(
 
     @Synchronized
     override fun write(state: WifiLocalState) {
-        val parent = file.parentFile ?: throw IllegalStateException("Wi-Fi state directory is unavailable")
-        if (!parent.exists() && !parent.mkdirs()) {
-            throw IllegalStateException("Wi-Fi state directory could not be created")
+        writeAtomicStateFile(file, WifiSettingsCodec.encode(state), syncDirectory)
+    }
+}
+
+internal fun writeAtomicStateFile(file: File, state: String, syncDirectory: (File) -> Unit) {
+    val parent = file.parentFile ?: throw IllegalStateException("State directory is unavailable")
+    if (!parent.exists() && !parent.mkdirs()) {
+        throw IllegalStateException("State directory could not be created")
+    }
+    val temporary = File(parent, "${file.name}.tmp")
+    try {
+        FileOutputStream(temporary, false).use { output ->
+            output.write(state.toByteArray(Charsets.UTF_8))
+            output.fd.sync()
         }
-        val temporary = File(parent, "${file.name}.tmp")
-        val bytes = WifiSettingsCodec.encode(state).toByteArray(Charsets.UTF_8)
-        try {
-            FileOutputStream(temporary, false).use { output ->
-                output.write(bytes)
-                output.fd.sync()
-            }
-            Files.move(
-                temporary.toPath(),
-                file.toPath(),
-                StandardCopyOption.ATOMIC_MOVE,
-                StandardCopyOption.REPLACE_EXISTING,
-            )
-            syncDirectory(parent)
-        } finally {
-            temporary.delete()
-        }
+        Files.move(
+            temporary.toPath(),
+            file.toPath(),
+            StandardCopyOption.ATOMIC_MOVE,
+            StandardCopyOption.REPLACE_EXISTING,
+        )
+        syncDirectory(parent)
+    } finally {
+        temporary.delete()
     }
 }

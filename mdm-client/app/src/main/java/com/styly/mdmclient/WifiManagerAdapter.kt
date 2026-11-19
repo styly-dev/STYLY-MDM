@@ -195,6 +195,7 @@ internal fun hasManagedWifiDiagnosticsAccess(context: Context): Boolean =
     context.checkSelfPermission(Manifest.permission.DUMP) == PackageManager.PERMISSION_GRANTED
 
 internal interface WifiSettingsAdapter {
+    fun isWifiEnabled(): Boolean
     fun applyProfile(
         target: List<WifiNetworkProfile>,
         prioritizeNetworks: Boolean,
@@ -211,6 +212,8 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
     private val autoJoinField by lazy { WifiConfiguration::class.java.getField("allowAutojoin") }
     private val ownedMacSettings by lazy { appContext.getSharedPreferences("wifi-owned-mac-settings", Context.MODE_PRIVATE) }
 
+    override fun isWifiEnabled(): Boolean = runCatching { manager?.isWifiEnabled == true }.getOrDefault(false)
+
     private fun readCurrent(): List<WifiConfiguredEntry> = configuredNetworkViews().map { it.entry }
 
     private fun resolveView(profile: WifiNetworkProfile, views: List<WifiConfiguredView> = configuredNetworkViews()): WifiConfiguredView? =
@@ -221,8 +224,9 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         return try {
             @Suppress("DEPRECATION")
             val configs = manager?.configuredNetworks ?: throw WifiAdapterFailure(WifiReason.CONFIG_READ_FAILED)
-            configs.map { config ->
-                val entry = WifiConfiguredEntry(config.networkId, config.SSID.removeSurrounding("\""), config.securityView(),
+            configs.mapNotNull { config ->
+                val ssid = normalizeConfiguredWifiSsid(config.SSID) ?: return@mapNotNull null
+                val entry = WifiConfiguredEntry(config.networkId, ssid, config.securityView(),
                     config.hiddenSSID, autoJoinField.getBoolean(config))
                 WifiConfiguredView(entry, config)
             }
@@ -308,6 +312,8 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                 if (service.allowWifiAutoJoin(null, id, allowed) == 0) WifiReason.NONE else WifiReason.UPDATE_FAILED
             } catch (_: SecurityException) {
                 WifiReason.PERMISSION_DENIED
+            } catch (_: LinkageError) {
+                WifiReason.UNSUPPORTED
             } catch (_: Exception) {
                 WifiReason.UPDATE_FAILED
             }
@@ -345,10 +351,12 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         beforeMutation: () -> WifiReason?,
     ): WifiReason = guarded {
         val wifi = manager ?: return@guarded WifiReason.UNSUPPORTED
+        if (!isWifiEnabled()) return@guarded WifiReason.UNREACHABLE
         val current = readCurrent()
         val entry = resolveWifiProfileViewIndex(candidate, current)?.let(current::get)
             ?: return@guarded WifiReason.VERIFY_FAILED
         beforeMutation()?.let { return@guarded it }
+        if (!isWifiEnabled()) return@guarded WifiReason.UNREACHABLE
         val reason = try {
             @Suppress("DEPRECATION")
             if (wifi.enableNetwork(entry.networkId, true)) WifiReason.NONE else WifiReason.UPDATE_FAILED
@@ -363,7 +371,9 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
 
     override fun disconnectCurrent(beforeMutation: () -> WifiReason?): WifiReason = guarded {
         val wifi = manager ?: return@guarded WifiReason.UNSUPPORTED
+        if (!isWifiEnabled()) return@guarded WifiReason.UNREACHABLE
         beforeMutation()?.let { return@guarded it }
+        if (!isWifiEnabled()) return@guarded WifiReason.UNREACHABLE
         @Suppress("DEPRECATION")
         if (wifi.disconnect()) WifiReason.NONE else WifiReason.UNREACHABLE
     }
@@ -402,6 +412,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             action()
         } catch (failure: WifiAdapterFailure) { failure.reason
         } catch (_: SecurityException) { WifiReason.PERMISSION_DENIED
+        } catch (_: LinkageError) { WifiReason.UNSUPPORTED
         } catch (_: Exception) { WifiReason.CONFIG_READ_FAILED }
         if (reason != WifiReason.NONE) android.util.Log.w("WifiSettings", "Wi-Fi adapter failed: ${reason.wireValue}")
         return reason
@@ -415,6 +426,8 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             WifiProfileApplication(emptyList(), failure.reason)
         } catch (_: SecurityException) {
             WifiProfileApplication(emptyList(), WifiReason.PERMISSION_DENIED)
+        } catch (_: LinkageError) {
+            WifiProfileApplication(emptyList(), WifiReason.UNSUPPORTED)
         } catch (_: Exception) {
             WifiProfileApplication(emptyList(), WifiReason.CONFIG_READ_FAILED)
         }
@@ -573,6 +586,9 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         android.util.Log.w("WifiSettings", "Wi-Fi operation $operation failed: ${reason.wireValue}")
     }
 }
+
+internal fun normalizeConfiguredWifiSsid(ssid: String?): String? =
+    ssid?.removeSurrounding("\"")?.takeIf { it.isNotEmpty() }
 
 private fun WifiConfiguration.securityView(): String = when {
     allowedKeyManagement.get(WifiConfiguration.KeyMgmt.SAE) -> "SAE"

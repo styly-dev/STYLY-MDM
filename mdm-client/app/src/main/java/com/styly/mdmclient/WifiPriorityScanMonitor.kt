@@ -47,8 +47,8 @@ internal interface WifiPriorityScanBackend {
 }
 
 internal interface WifiPriorityScanSource {
-    /** Called on the Wi-Fi worker. The listener runs there as well. */
-    fun start(networks: List<WifiNetworkProfile>, listener: (WifiPriorityScanEvent) -> Unit)
+    /** Starts a session if none is active. Call on the Wi-Fi worker, where the listener also runs. */
+    fun ensureStarted(networks: List<WifiNetworkProfile>, listener: (WifiPriorityScanEvent) -> Unit)
     fun stop()
 }
 
@@ -66,8 +66,8 @@ internal class WifiPriorityScanLoop(
 ) : WifiPriorityScanSource {
     private var active: ScanSession? = null
 
-    override fun start(networks: List<WifiNetworkProfile>, listener: (WifiPriorityScanEvent) -> Unit) {
-        stop()
+    override fun ensureStarted(networks: List<WifiNetworkProfile>, listener: (WifiPriorityScanEvent) -> Unit) {
+        if (active != null) return
         val session = ScanSession(networks.toList(), listener)
         active = session
         try {
@@ -130,15 +130,14 @@ internal class WifiPriorityScanLoop(
         }
 
         fun onBroadcast(broadcast: WifiScanBroadcast) {
+            // Android delivers this broadcast for scans started by the platform and other
+            // apps too. A failed unrelated scan cannot settle our outstanding request.
+            if (!broadcast.resultsUpdated) return
             val receivedAt = broadcast.receivedElapsedMillis
             val request = requestedAt?.takeIf { receivedAt - it in 0L until broadcastTimeoutMillis }
             if (request != null) {
                 requestedAt = null
                 cancelTimer()
-            }
-            if (!broadcast.resultsUpdated) {
-                if (request != null) failRequest("broadcast_not_updated")
-                return
             }
 
             val samples = try {
@@ -223,7 +222,7 @@ internal class AndroidWifiPriorityScanBackend(context: Context) : WifiPrioritySc
         appContext.unregisterReceiver(current)
     }
 
-    override fun startScan(): Boolean = manager?.startScan() == true
+    override fun startScan(): Boolean = manager?.let { it.isWifiEnabled && it.startScan() } == true
 
     @Suppress("DEPRECATION")
     override fun readSamples(): List<WifiScanSample> =

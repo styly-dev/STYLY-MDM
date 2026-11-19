@@ -7,6 +7,7 @@ import com.pvr.tobservice.ToBServiceHelper
 import com.pvr.tobservice.interfaces.IToBServiceProxy
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.security.MessageDigest
 import java.util.Base64
 import java.util.concurrent.CopyOnWriteArraySet
@@ -102,7 +103,7 @@ internal class ConfigurationJournal(private val attempts: List<ConfigurationAtte
         }
         if (!sameBoot) return true
         // A different attempt may have changed the saved settings since the previous result.
-        return !isLatest && (!previous.needsRetry || previous.wifiAwaitingReboot != null)
+        return !isLatest
     }
 
     fun encode(): String = JSONArray(attempts.map(ConfigurationAttempt::saved)).toString()
@@ -123,13 +124,14 @@ internal data class ConfigurationPackageDependencies(
     val readJournal: () -> String?,
     val writeJournal: (String) -> Boolean,
     val readLastPolicy: () -> String?,
-    val writeLastPolicy: (String?) -> Boolean,
+    val writeLastPolicy: (String) -> Boolean,
+    val writeInitialAssignment: (journal: String, lastPolicy: String) -> Boolean,
     val scalarWriter: () -> ((JSONObject, Boolean) -> JSONObject)?,
     val logJournalError: (String) -> Unit = {},
     val onApplied: (bootReapply: Boolean, isCurrent: () -> Boolean) -> Unit = { _, _ -> },
 )
 
-internal enum class ConfigurationApplyStatus { WAITING, APPLYING, APPLIED, INCOMPLETE }
+internal enum class ConfigurationApplyStatus { WAITING, APPLYING, APPLIED, INCOMPLETE, RELEASE_UNSAVED }
 
 internal data class ConfigurationScreenState(
     val groupKnown: Boolean,
@@ -158,7 +160,7 @@ internal class ConfigurationPackageController(
     ) {
         fun encode(boot: Int): String = (version?.toJson()
             ?: JSONObject().put("package_id", JSONObject.NULL).put("revision", JSONObject.NULL))
-            .put("settings", values)
+            .put("settings", if (version == null) JSONObject() else values)
             .put("group_name", if (groupKnown) groupName ?: JSONObject.NULL else null)
             .put("deployed_at_ms", deployedAtMillis)
             .put("boot_count", boot)
@@ -182,6 +184,12 @@ internal class ConfigurationPackageController(
 
     private class Assignment(val policy: Policy, val token: Any = Any(), val cached: Boolean = true)
 
+    private sealed interface Report {
+        data object Unknown : Report
+        data object Cleared : Report
+        data class Available(val attempt: ConfigurationAttempt) : Report
+    }
+
     private class Delivery(
         val policy: Policy,
         val retryId: String?,
@@ -194,18 +202,16 @@ internal class ConfigurationPackageController(
     private val boot = dependencies.bootCount
     private val listeners = CopyOnWriteArraySet<() -> Unit>()
     private val screenListeners = CopyOnWriteArraySet<() -> Unit>()
-    private var journal = runCatching {
-        dependencies.readJournal()?.let(ConfigurationJournal::restore) ?: ConfigurationJournal()
-    }.onFailure {
-        dependencies.logJournalError("Could not read package application journal")
-    }.getOrNull()
-    @Volatile private var reported: ConfigurationAttempt? = null
+    private var journal = loadJournal()
+    @Volatile private var report: Report = Report.Unknown
+    private val reported get() = (report as? Report.Available)?.attempt
     @Volatile private var screenState: ConfigurationScreenState? = null
     @Volatile private var assignment: Assignment?
     private val latestPolicy get() = assignment?.policy
     private var pending: Delivery? = null
     private var sdkReady = false
-    private var applyingWifi = false
+    private var wifiAttempt: ConfigurationAttempt? = null
+    private val applyingWifi get() = wifiAttempt != null
     private var watchedWifiAttempt: ConfigurationAttempt? = null
     private val cachedVersionFromEarlierBoot: ConfigurationVersion?
 
@@ -235,11 +241,18 @@ internal class ConfigurationPackageController(
         if (cached != null) worker.execute(::reconcile)
     }
 
-    fun snapshot(): JSONObject? = reported?.report()
+    // Kotlin null omits the field. JSON null explicitly clears the server's report.
+    fun reportValue(): Any? = when (val current = report) {
+        Report.Unknown -> null
+        Report.Cleared -> JSONObject.NULL
+        is Report.Available -> current.attempt.report()
+    }
 
-    fun onSdkReady() {
+    fun onSdkReady(ready: Boolean, isCurrent: () -> Boolean = { true }) {
         worker.execute {
-            sdkReady = true
+            if (!isCurrent()) return@execute
+            sdkReady = ready
+            if (ready) reloadJournal()
             reconcile()
         }
     }
@@ -252,14 +265,22 @@ internal class ConfigurationPackageController(
         ) return
         worker.execute {
             if (!isCurrent()) return@execute
+            reloadJournal()
             val startingAssignment = supportsApply && policy.version != null && latestPolicy?.version == null
             if (startingAssignment) {
-                // A new assignment must not inherit attempts from before management was released.
-                if (journal?.latest != null && !saveJournal(ConfigurationJournal())) {
-                    publish(storageError(policy, policy.version?.let { journal?.find(it) }))
+                // Commit the reset and the first cached assignment together. If the journal
+                // was unreadable, preserve it until a later read succeeds.
+                if (journal == null) {
+                    publish(storageError(policy, previous = null))
                     return@execute
                 }
-                reported = null
+                val firstJournal = ConfigurationJournal()
+                if (!saveInitialAssignment(firstJournal, policy.encode(boot))) {
+                    publish(storageError(policy, null))
+                    return@execute
+                }
+                journal = firstJournal
+                setReport(Report.Cleared)
             }
             val token = assignment?.takeIf { it.policy.version == policy.version && it.policy.supportsApply == supportsApply }
                 ?.token ?: Any()
@@ -268,12 +289,8 @@ internal class ConfigurationPackageController(
                     policy.version?.let { journal?.find(it)?.status == "applying" } == true)
             val effectiveRetry = if (startingAssignment) null
                 else retryId ?: pending?.takeIf { assignment?.token === token }?.retryId
-            // Try to cache the new assignment, including a removal, before the Wi-Fi worker acts on it.
-            val cached = supportsApply && saveLastPolicy(policy.encode(boot))
-            if (startingAssignment && !cached) {
-                publish(storageError(policy, previous = null))
-                return@execute
-            }
+            // The same record supplies the assignment or release on the next boot.
+            val cached = supportsApply && (startingAssignment || saveLastPolicy(policy.encode(boot)))
             val selected = Assignment(policy, token, cached)
             assignment = selected
             pending = null
@@ -296,29 +313,42 @@ internal class ConfigurationPackageController(
         )
         pending = delivery
         if (!releasing) return
-        wifi.stopManagingPolicy { recorded ->
+        // The saved assignment governs the next boot. Wait here for the local Wi-Fi stop attempt.
+        wifi.stopManagingPolicy {
             worker.execute releaseRecorded@{
                 if (pending !== delivery) return@releaseRecorded
-                // Clear the cached policy only after Wi-Fi has durably recorded the release.
-                if (recorded && policy.version == null) saveLastPolicy(null)
                 delivery.ready = true
                 reconcile()
             }
         }
     }
 
-    private fun saveLastPolicy(encoded: String?): Boolean {
+    private fun saveLastPolicy(encoded: String): Boolean {
         if (runCatching { dependencies.writeLastPolicy(encoded) }.getOrDefault(false)) return true
         dependencies.logJournalError("Could not save the last configuration package")
         return false
     }
 
+    private fun saveInitialAssignment(journal: ConfigurationJournal, lastPolicy: String): Boolean {
+        val saved = try {
+            dependencies.writeInitialAssignment(journal.encode(), lastPolicy)
+        } catch (_: Exception) {
+            false
+        }
+        if (!saved) {
+            dependencies.logJournalError("Could not atomically save the initial configuration package")
+            return false
+        }
+        return true
+    }
+
     fun reapply(expected: ConfigurationVersion, onFinished: (Boolean) -> Unit) {
         worker.execute {
+            val journalLoaded = reloadJournal()
             val selected = assignment
             val policy = selected?.policy
-            val started = if (selected != null && policy?.version == expected && canReapply(policy)) {
-                val applyScalars = dependencies.scalarWriter()
+            val started = if (journalLoaded && selected != null && policy?.version == expected && canReapply(policy)) {
+                val applyScalars = scalarWriter()
                 applyScalars != null &&
                     startAttempt(policy, journal?.find(expected), null, applyScalars, overwriteScalars = true) {
                         assignment?.token === selected.token
@@ -332,29 +362,52 @@ internal class ConfigurationPackageController(
 
     private fun canReapply(policy: Policy): Boolean =
         policy.supportsApply && policy.version != null && assignment?.cached == true &&
-            pending == null && !applyingWifi && journal != null && boot >= 0 && sdkReady &&
+            pending == null && !applyingWifi && boot >= 0 && sdkReady &&
             journal?.find(policy.version)?.status != "applying" &&
-            (policy.values.optJSONObject("wifi") == null || wifi.canReapplyPolicy())
+            (policy.values.optJSONObject("wifi") == null || wifi.canAcceptPolicy())
+
+    private fun reloadJournal(): Boolean {
+        if (journal != null) return true
+        journal = loadJournal()
+        return journal != null
+    }
+
+    private fun loadJournal(): ConfigurationJournal? = try {
+        dependencies.readJournal()?.let(ConfigurationJournal::restore) ?: ConfigurationJournal()
+    } catch (_: Exception) {
+        dependencies.logJournalError("Could not read package application journal")
+        null
+    }
+
+    private fun scalarWriter(): ((JSONObject, Boolean) -> JSONObject)? = try {
+        dependencies.scalarWriter()
+    } catch (_: LinkageError) {
+        { values, _ -> JSONObject().apply {
+            for (key in values.keys()) put(key, settingOutcome("failed", reason = "READ_FAILED"))
+        } }
+    }
 
     private fun publishScreenState() {
         val policy = latestPolicy ?: return
         val attempt = policy.version?.let { version ->
             reported?.takeIf { it.version == version } ?: journal?.find(version)
         }
-        val applyStatus = if (policy.supportsApply && policy.version != null) when {
+        val applyStatus = when {
+            !policy.supportsApply -> null
+            policy.version == null -> ConfigurationApplyStatus.RELEASE_UNSAVED.takeIf { assignment?.cached == false }
             attempt?.status == "applying" -> ConfigurationApplyStatus.APPLYING
             pending?.policy === policy && pending?.isCurrent() == true -> ConfigurationApplyStatus.WAITING
             attempt == null -> ConfigurationApplyStatus.WAITING
             attempt.needsRetry -> ConfigurationApplyStatus.INCOMPLETE
             else -> ConfigurationApplyStatus.APPLIED
-        } else null
+        }
         val next = ConfigurationScreenState(
             policy.groupKnown, policy.groupName, policy.version, policy.deployedAtMillis, applyStatus,
             canReapply(policy),
         )
         if (screenState == next) return
         screenState = next
-        screenListeners.forEach { it() }
+        notifyListeners(screenListeners)
     }
 
     private fun reconcile() {
@@ -379,7 +432,7 @@ internal class ConfigurationPackageController(
         val version = policy.version
         if (version == null) {
             pending = null
-            reported = null
+            if (assignment?.cached == true) setReport(Report.Cleared)
             return
         }
 
@@ -406,7 +459,7 @@ internal class ConfigurationPackageController(
             return
         }
         if (boot < 0 || !sdkReady) return
-        val applyScalars = dependencies.scalarWriter() ?: return
+        val applyScalars = scalarWriter() ?: return
         if (wifiPolicy != null && !wifi.canAcceptPolicy()) return
 
         val baseline = current.latest?.takeIf {
@@ -444,14 +497,16 @@ internal class ConfigurationPackageController(
         }?.results?.optJSONObject("wifi")
         val scalarTargets = JSONObject()
         val scalarValues = JSONObject()
-        val results = JSONObject()
+        val results = JSONObject().apply { retainedWifiFailure?.let { put("wifi", it) } }
         for (key in policy.values.keys()) {
             if (key == "wifi") continue
             val value = policy.values.get(key)
             scalarTargets.put(key, value)
             val previousResult = baseline?.results?.optJSONObject(key)
             val previousValue = baseline?.scalarTargets?.opt(key)
-            if (previousResult != null && sameScalarTarget(key, previousValue, value)) {
+            if (previousResult != null && previousResult.optString("status") != "failed" &&
+                sameScalarTarget(key, previousValue, value)
+            ) {
                 results.put(key, previousResult)
             } else scalarValues.put(key, value)
         }
@@ -466,23 +521,31 @@ internal class ConfigurationPackageController(
             // A later Wi-Fi confirmation can complete the original boot reapply.
             bootReapply = bootReapply || (retainedWifiFailure != null && previousWifi?.bootReapply == true),
         )
-        if (!persist(attempt)) {
-            updateAttempt(storageError(policy, attempt))
-            return false
-        }
-        publishScreenState()
-
-        if (scalarValues.length() > 0) {
-            val scalarResults = applyScalars(scalarValues, overwriteScalars)
-            for (key in scalarValues.keys()) {
-                results.put(key, scalarResults.optJSONObject(key) ?: settingOutcome("unsupported", reason = "UNSUPPORTED"))
+        try {
+            if (!persist(attempt)) {
+                updateAttempt(storageError(policy, attempt))
+                return false
             }
-        }
+            publishScreenState()
 
-        if (retainedWifiFailure != null) results.put("wifi", retainedWifiFailure)
-        if (wifiPolicy == null || retainedWifiFailure != null) {
-            finish(attempt.copy(status = "complete", results = results))
-        } else {
+            if (scalarValues.length() > 0) {
+                val scalarResults = try {
+                    applyScalars(scalarValues, overwriteScalars)
+                } catch (failure: LinkageError) {
+                    JSONObject().apply {
+                        for (key in scalarValues.keys()) put(key, settingOutcome("failed", reason = "WRITE_FAILED"))
+                    }
+                }
+                for (key in scalarValues.keys()) {
+                    results.put(key, scalarResults.optJSONObject(key) ?: settingOutcome("unsupported", reason = "UNSUPPORTED"))
+                }
+            }
+
+            if (wifiPolicy == null || retainedWifiFailure != null) {
+                finish(attempt.copy(status = "complete", results = results))
+                return true
+            }
+
             val checkpoint = attempt.copy(results = results)
             if (!persist(checkpoint)) {
                 // The durable claim still fences this attempt. Wi-Fi has not been queued.
@@ -490,24 +553,39 @@ internal class ConfigurationPackageController(
                 updateAttempt(attempt.copy(status = "interrupted", results = results))
                 return true
             }
-            applyingWifi = true
+            wifiAttempt = checkpoint
             val reuseMatchingWifi = baseline?.results?.optJSONObject("wifi")?.optString("status") == "applied"
             wifi.applyManagedPolicy(version.revision, wifiPolicy, reuseMatchingWifi, isCurrent, onFinished = { result ->
                 worker.execute {
-                    applyingWifi = false
-                    // A released or replaced assignment cannot restore its old deduplication history.
-                    if (isCurrent()) {
-                        finishWifi(checkpoint, result, fingerprint, confirmWifiAfterTimeout)
-                    } else if (journal?.find(version) === checkpoint) {
-                        // Fence the stale operation while allowing a later reassignment of
-                        // this version to start a fresh attempt in the same boot.
-                        persist(checkpoint.copy(status = "interrupted"))
+                    if (wifiAttempt !== checkpoint) return@execute
+                    wifiAttempt = null
+                    try {
+                        // A released or replaced assignment cannot restore its old deduplication history.
+                        if (isCurrent()) {
+                            finishWifi(checkpoint, result, fingerprint, confirmWifiAfterTimeout)
+                        } else if (journal?.find(version) === checkpoint) {
+                            // Fence the stale operation while allowing a later reassignment of
+                            // this version to start a fresh attempt in the same boot.
+                            finish(checkpoint.copy(status = "interrupted"))
+                        }
+                    } catch (failure: Exception) {
+                        interruptApplyingAttempt(version, results, failure)
+                    } finally {
+                        reconcile()
                     }
-                    reconcile()
                 }
             })
+        } catch (failure: Exception) {
+            wifiAttempt = null
+            interruptApplyingAttempt(version, results, failure)
         }
         return true
+    }
+
+    private fun interruptApplyingAttempt(version: ConfigurationVersion, results: JSONObject, failure: Exception) {
+        dependencies.logJournalError("Package application interrupted (${failure.javaClass.simpleName})")
+        val claimed = journal?.find(version)?.takeIf { it.status == "applying" } ?: return
+        finish(claimed.copy(status = "interrupted", results = results))
     }
 
     private fun storageError(policy: Policy, previous: ConfigurationAttempt?): ConfigurationAttempt {
@@ -601,7 +679,11 @@ internal class ConfigurationPackageController(
         publish(next)
         val token = assignment?.token
         if (token != null && next.status == "complete" && !next.needsRetry) {
-            dependencies.onApplied(next.bootReapply) { assignment?.token === token && reported === next }
+            try {
+                dependencies.onApplied(next.bootReapply) { assignment?.token === token && reported === next }
+            } catch (_: Exception) {
+                dependencies.logJournalError("Could not show package application notice")
+            }
         }
         return true
     }
@@ -616,10 +698,22 @@ internal class ConfigurationPackageController(
         publish(next)
     }
 
-    private fun publish(next: ConfigurationAttempt) {
-        if (reported == next) return
-        reported = next
-        listeners.forEach { it() }
+    private fun publish(next: ConfigurationAttempt) = setReport(Report.Available(next))
+
+    private fun setReport(next: Report) {
+        if (report == next) return
+        report = next
+        notifyListeners(listeners)
+    }
+
+    private fun notifyListeners(listeners: Set<() -> Unit>) {
+        for (listener in listeners) {
+            try {
+                listener()
+            } catch (_: Exception) {
+                dependencies.logJournalError("Configuration package listener failed")
+            }
+        }
     }
 }
 
@@ -645,16 +739,43 @@ private fun wifiFingerprint(revision: String, settings: JSONObject): String? {
 
 private fun productionDependencies(context: Context): ConfigurationPackageDependencies {
     val preferences = context.getSharedPreferences("configuration-packages", Context.MODE_PRIVATE)
+    val store = ConfigurationPackageStore(
+        File(context.noBackupFilesDir, "configuration-packages.json"),
+        syncDirectory = ::syncDirectory,
+        readLegacy = {
+            ConfigurationPackageState(
+                lastPolicy = preferences.getString("last_policy", null),
+                journal = preferences.getString("journal", null),
+            )
+        },
+        clearLegacy = {
+            if (preferences.contains("last_policy") || preferences.contains("journal")) {
+                if (!preferences.edit().remove("last_policy").remove("journal").commit()) {
+                    Log.w("ConfigurationPackages", "Could not remove the legacy configuration cache")
+                }
+            }
+        },
+    )
     val appliedNotice = PicoPackageAppliedNotice(context.applicationContext)
     return ConfigurationPackageDependencies(
         worker = Executors.newSingleThreadExecutor(),
         bootCount = Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT, -1),
-        readJournal = { preferences.getString("journal", null) },
-        writeJournal = { preferences.edit().putString("journal", it).commit() },
-        readLastPolicy = {
-            if (supportsPico4UltraEnterpriseSettings()) preferences.getString("last_policy", null) else null
+        readJournal = { store.read().journal },
+        writeJournal = {
+            store.save(store.read().copy(journal = it))
+            true
         },
-        writeLastPolicy = { preferences.edit().putString("last_policy", it).commit() },
+        readLastPolicy = {
+            if (supportsPico4UltraEnterpriseSettings()) store.read().lastPolicy else null
+        },
+        writeLastPolicy = {
+            store.save(store.read().copy(lastPolicy = it))
+            true
+        },
+        writeInitialAssignment = { journal, lastPolicy ->
+            store.save(ConfigurationPackageState(lastPolicy = lastPolicy, journal = journal))
+            true
+        },
         scalarWriter = {
             (ToBServiceHelper.getInstance().serviceBinder as? IToBServiceProxy)
                 ?.let { PicoDeviceSettings(context, it)::apply }

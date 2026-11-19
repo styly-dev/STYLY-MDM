@@ -71,7 +71,7 @@ def test_released_groups_migrate_once_with_backup_and_one_group_per_device(tmp_p
         "Gamma": {"members": [], "package_id": None},
     }
     assert registry["packages"] == {"version": configuration_packages.VERSION, "packages": {}}
-    assert registry["configuration_revision"] == 0
+    assert "configuration_revision" not in registry
     assert "kept 'Alpha', removed from 'Beta'" in caplog.text
     assert registry["another_section"] == {"preserve": True}
     assert registry["devices"]["device-a"]["other_field"] == {"preserve": True}
@@ -89,10 +89,22 @@ def test_released_groups_migrate_once_with_backup_and_one_group_per_device(tmp_p
     assert _backups(tmp_path) == [backup]
 
 
-def test_configuration_revision_is_durable_and_only_advances_for_configuration_changes(tmp_path):
+def test_registry_loads_other_devices_when_an_identity_kind_is_malformed(tmp_path):
+    _write_package_registry(tmp_path, {}, devices={
+        "bad": {"identity_kind": [], "label": "Keep this device"},
+        "good": {"identity_kind": "canonical"},
+    })
+    server.load_registry()
+    assert server.device_registry["bad"]["identity_kind"] == "legacy"
+    assert server.device_registry["bad"]["label"] == "Keep this device"
+    assert server.device_registry["good"]["identity_kind"] == "canonical"
+
+
+def test_configuration_revision_orders_one_snapshot_stream_and_ignores_saved_counters(tmp_path):
     _write_package_registry(tmp_path, {"Studio": ([], None)})
     registry = json.loads(server.REGISTRY_PATH.read_text())
     registry["operator_metadata"] = {"preserve": True}
+    registry["configuration_revision"] = 23
     server.REGISTRY_PATH.write_text(json.dumps(registry))
     server.load_registry()
 
@@ -105,16 +117,46 @@ def test_configuration_revision_is_durable_and_only_advances_for_configuration_c
     assert server._commit_configuration(candidate)
     committed = json.loads(server.build_group_list_msg())
     assert committed["revision"] == before["revision"] + 1
-    assert json.loads(server.REGISTRY_PATH.read_text())["configuration_revision"] == committed["revision"]
+    assert committed["server_instance_id"] == before["server_instance_id"]
+    assert "configuration_revision" not in json.loads(server.REGISTRY_PATH.read_text())
 
     # Device telemetry persistence and idempotent config writes do not advance order.
     assert server.save_registry()
     assert server._commit_configuration(server._configuration)
+    assert json.loads(server.build_group_list_msg()) == committed
     server.load_registry()
     reloaded = json.loads(server.build_group_list_msg())
-    assert reloaded["revision"] == committed["revision"]
+    assert reloaded["revision"] == 0
+    assert reloaded["server_instance_id"] != committed["server_instance_id"]
+    assert reloaded["groups"] == committed["groups"]
     persisted = json.loads(server.REGISTRY_PATH.read_text())
     assert persisted["operator_metadata"] == {"preserve": True}
+
+
+def test_registry_sync_failure_preserves_the_previous_configuration(tmp_path, monkeypatch):
+    _write_package_registry(tmp_path, {"Studio": ([], None)})
+    server.load_registry()
+    before = server.REGISTRY_PATH.read_bytes()
+    committed = server._configuration
+
+    def fail_sync(_fd):
+        raise OSError("test sync failure")
+
+    monkeypatch.setattr(server.os, "fsync", fail_sync)
+    assert not server._save_groups({"Gallery": server._DeviceGroup()})
+    assert server._configuration is committed
+    assert server.REGISTRY_PATH.read_bytes() == before
+
+
+def test_migration_backups_are_distinct_in_the_same_second(tmp_path, monkeypatch):
+    _write_registry(tmp_path, devices={"one": {"label": "First"}})
+    before = server.REGISTRY_PATH.read_bytes()
+    monkeypatch.setattr(server.time, "strftime", lambda *_args: "20261118-120000")
+    server._backup_registry()
+    server.REGISTRY_PATH.write_text(json.dumps({"devices": {"two": {"label": "Second"}}}))
+    after = server.REGISTRY_PATH.read_bytes()
+    server._backup_registry()
+    assert {backup.read_bytes() for backup in _backups(tmp_path)} == {before, after}
 
 
 def test_migration_is_not_written_when_the_backup_fails(tmp_path, monkeypatch):
@@ -194,6 +236,8 @@ def test_failed_writes_keep_committed_device_and_configuration_state(tmp_path, m
         before_bytes = server.REGISTRY_PATH.read_bytes()
         monkeypatch.setattr(server, "_write_registry", lambda *_: False)
         admin = _AdminSocket()
+        monkeypatch.setattr(server, "admin_connections", {admin})
+        monkeypatch.setattr(server, "_admin_send_locks", {})
 
         with pytest.raises(configuration_packages.PackageError):
             server._save_package(package_id, {"name": "Replacement"})

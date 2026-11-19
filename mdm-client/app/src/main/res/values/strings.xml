@@ -17,6 +17,7 @@
     <string name="configuration_applied">Settings applied</string>
     <string name="configuration_applied_notice">STYLY-MDM Package Applied!</string>
     <string name="configuration_incomplete">Some settings could not be applied</string>
+    <string name="configuration_release_unsaved">Could not save the release. Settings may be reapplied after restart.</string>
     <string name="configuration_unsupported">Applying settings is unavailable on this headset</string>
     <string name="configuration_reapply">Reapply settings</string>
     <string name="configuration_reapply_unavailable">Could not start reapplying settings. Check the current configuration and try again.</string>

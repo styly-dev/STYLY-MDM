@@ -9,6 +9,54 @@ import org.junit.Test
 
 class WifiSettingsControllerTest {
     @Test
+    fun `Wi-Fi release retries a state read that initially failed`() {
+        val profile = WifiSavedProfile(REVISION, listOf(network("office-a")))
+        val harness = Harness(
+            initialState = WifiLocalState(managedWifi = true, lastApplied = profile),
+            failStoreRead = true,
+        )
+        var firstRelease: Boolean? = null
+        harness.controller.stopManagingPolicy { firstRelease = it }
+        harness.worker.runAll()
+
+        assertEquals(false, firstRelease)
+
+        harness.store.failRead = false
+        var retryRelease: Boolean? = null
+        harness.controller.stopManagingPolicy { retryRelease = it }
+        harness.worker.runAll()
+
+        assertEquals(true, retryRelease)
+        assertFalse(harness.store.state.managedWifi)
+    }
+
+    @Test
+    fun `a later deployment retries a Wi-Fi state read that initially failed`() {
+        val harness = Harness(failStoreRead = true)
+        val requested = network("office-a")
+        var firstResult: WifiManualResult? = null
+        harness.controller.applyManagedPolicy(
+            REVISION, settings(listOf(requested), prioritizeNetworks = false),
+            reuseMatchingProfile = false, isCurrent = { true }, onFinished = { firstResult = it },
+        )
+        harness.worker.runAll()
+
+        assertEquals(WifiReason.STORAGE_ERROR, firstResult?.reason)
+        assertTrue(harness.controller.canAcceptPolicy())
+
+        harness.store.failRead = false
+        var retryResult: WifiManualResult? = null
+        harness.controller.applyManagedPolicy(
+            OLD_REVISION, settings(listOf(requested), prioritizeNetworks = false),
+            reuseMatchingProfile = false, isCurrent = { true }, onFinished = { retryResult = it },
+        )
+        harness.worker.runAll()
+
+        assertEquals("success", retryResult?.status)
+        assertEquals(OLD_REVISION, harness.store.state.lastApplied?.revision)
+    }
+
+    @Test
     fun `startup keeps the saved Wi-Fi profile without rewriting configured networks`() {
         val preferred = network("office-a")
         val fallback = network("office-b")
@@ -49,19 +97,19 @@ class WifiSettingsControllerTest {
     }
 
     @Test
-    fun `selection accepts only connections received before the deadline while the worker is blocked`() {
+    fun `selection accepts only connections received before its deadline while the worker is blocked`() {
         val preferred = network("office-a")
         for (offset in listOf(-1L, 0L, 1L)) {
             val harness = Harness()
             harness.adapter.afterSelect = { selected ->
-                harness.clock.value += WIFI_MANUAL_TIMEOUT_MS + offset
+                harness.clock.value += 12_000L + offset
                 harness.connectivity.update(21, selected.ssid)
                 harness.clock.value += 2
             }
 
             harness.apply(listOf(preferred))
             harness.expireNext(WIFI_PRIOR_CONNECTION_OBSERVATION_MS)
-            if (offset >= 0) harness.expireNext(WIFI_MANUAL_TIMEOUT_MS)
+            harness.expireNext(12_000L)
 
             val result = requireNotNull(harness.store.state.latestResult)
             assertEquals(if (offset < 0) WifiReason.NONE else WifiReason.UNREACHABLE, result.reason)
@@ -94,6 +142,30 @@ class WifiSettingsControllerTest {
                 harness.clock.value += WIFI_MANUAL_TIMEOUT_MS + offset
                 harness.connectivity.lose(10)
                 harness.connectivity.update(21, preferred.ssid)
+                harness.clock.value += 2
+            }
+
+            harness.apply(listOf(preferred))
+
+            val result = requireNotNull(harness.store.state.latestResult)
+            assertEquals(if (offset < 0) WifiReason.NONE else WifiReason.UNREACHABLE, result.reason)
+        }
+    }
+
+    @Test
+    fun `a same-handle reassociation during a slow save does not inherit the old connection exception`() {
+        val preferred = network("office-a")
+        val oldProfile = WifiSavedProfile(OLD_REVISION, listOf(preferred))
+        for (offset in listOf(-1L, 0L)) {
+            val harness = Harness(
+                initialState = WifiLocalState(managedWifi = true, lastApplied = oldProfile),
+                initialNetworks = listOf(preferred),
+                initialWifi = listOf(observation(10, preferred.ssid)),
+            )
+            harness.adapter.afterApply = {
+                harness.clock.value += WIFI_MANUAL_TIMEOUT_MS + offset
+                harness.connectivity.lose(10)
+                harness.connectivity.update(10, preferred.ssid)
                 harness.clock.value += 2
             }
 
@@ -636,6 +708,538 @@ class WifiSettingsControllerTest {
     }
 
     @Test
+    fun `a failed disconnect after the old association is gone keeps the current candidate`() {
+        val old = network("old-office")
+        val preferred = network("office-a")
+        val fallback = network("office-b")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old))),
+            initialWifi = listOf(observation(10, old.ssid)),
+        )
+        harness.adapter.disconnectResult = WifiReason.UNREACHABLE
+        harness.adapter.onDisconnect = { harness.connectivity.loseAll() }
+        harness.adapter.afterSelect = { if (it == preferred) harness.connectivity.update(11, preferred.ssid) }
+
+        harness.apply(listOf(preferred, fallback))
+
+        assertEquals(listOf(preferred), harness.adapter.selectCalls)
+        assertEquals("success", harness.store.state.latestResult?.status)
+        assertEquals(preferred.ssid, harness.connectivity.currentUsableSsid())
+    }
+
+    @Test
+    fun `a new association arriving during disconnect is also cleared before selection`() {
+        val old = network("old-office")
+        val preferred = network("office-a")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old))),
+            initialWifi = listOf(observation(10, old.ssid)),
+        )
+        harness.adapter.onDisconnect = {
+            if (harness.adapter.disconnectCalls == 1) harness.connectivity.update(11, "unrelated-office")
+        }
+
+        harness.apply(listOf(preferred))
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+
+        harness.connectivity.lose(10)
+        harness.worker.runAll()
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+
+        harness.adapter.afterSelect = { harness.connectivity.update(12, preferred.ssid) }
+        harness.connectivity.lose(11)
+        harness.worker.runAll()
+
+        assertEquals(listOf(preferred), harness.adapter.selectCalls)
+        assertEquals("success", harness.store.state.latestResult?.status)
+    }
+
+    @Test
+    fun `each unrelated association that appears during disconnect is cleared before selection`() {
+        val old = network("old-office")
+        val preferred = network("office-a")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old))),
+            initialWifi = listOf(observation(10, old.ssid)),
+        )
+        harness.adapter.onDisconnect = {
+            when (harness.adapter.disconnectCalls) {
+                1 -> {
+                    harness.connectivity.update(11, "unrelated-one")
+                    harness.connectivity.lose(10)
+                }
+                2 -> {
+                    harness.connectivity.lose(11)
+                    harness.connectivity.update(12, "unrelated-two")
+                }
+                3 -> harness.connectivity.lose(12)
+            }
+        }
+        harness.adapter.afterSelect = { selected ->
+            if (selected == preferred) harness.connectivity.update(13, selected.ssid)
+        }
+
+        harness.apply(listOf(preferred))
+
+        assertEquals(3, harness.adapter.disconnectCalls)
+        assertEquals(listOf(preferred), harness.adapter.selectCalls)
+        assertEquals("success", harness.store.state.latestResult?.status)
+        assertEquals(preferred.ssid, harness.connectivity.currentUsableSsid())
+    }
+
+    @Test
+    fun `an unrelated association after candidate selection queues disconnect reconciliation`() {
+        val old = network("old-office")
+        val preferred = network("office-a")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old))),
+            initialWifi = listOf(observation(10, old.ssid)),
+        )
+        harness.adapter.onDisconnect = { harness.connectivity.loseAll() }
+        harness.adapter.afterSelect = { selected ->
+            if (harness.adapter.selectCalls.size == 1) {
+                harness.connectivity.update(11, selected.ssid)
+                harness.connectivity.update(12, "unrelated-office")
+            } else {
+                harness.connectivity.update(13, selected.ssid)
+            }
+        }
+        harness.controller.applyManagedPolicy(
+            REVISION,
+            settings(listOf(preferred)),
+            reuseMatchingProfile = false,
+            isCurrent = { true },
+            onFinished = {},
+        )
+
+        harness.worker.runNext() // Accept the policy and queue attempt preparation.
+        harness.worker.runNext() // The first selection observes a candidate and an unrelated AP.
+
+        assertEquals(listOf(preferred), harness.adapter.selectCalls)
+        assertEquals(1, harness.adapter.disconnectCalls)
+        harness.worker.runAll()
+
+        assertEquals(listOf(preferred, preferred), harness.adapter.selectCalls)
+        assertEquals(2, harness.adapter.disconnectCalls)
+        assertEquals("success", harness.store.state.latestResult?.status)
+    }
+
+    @Test
+    fun `a matching association awaiting disconnect cannot be confirmed later`() {
+        val old = network("old-office")
+        val preferred = network("office-a")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old))),
+            initialWifi = listOf(observation(10, old.ssid)),
+        )
+        var result: WifiManualResult? = null
+        harness.adapter.onDisconnect = {
+            when (harness.adapter.disconnectCalls) {
+                1 -> harness.connectivity.loseAll()
+                2 -> harness.connectivity.lose(12) // Keep the candidate association marked for disconnect.
+            }
+        }
+        harness.adapter.afterSelect = { selected ->
+            if (harness.adapter.selectCalls.size == 1) {
+                harness.connectivity.update(11, selected.ssid)
+                harness.connectivity.update(12, "unrelated-office")
+            }
+        }
+        harness.controller.applyManagedPolicy(
+            REVISION,
+            settings(listOf(preferred)),
+            reuseMatchingProfile = false,
+            isCurrent = { true },
+            onFinished = { result = it },
+        )
+        harness.worker.runAll()
+
+        assertNull(result)
+        assertEquals(2, harness.adapter.disconnectCalls)
+        harness.expireNext(12_000L)
+
+        assertEquals("failed", result?.status)
+        assertFalse(result?.canConfirmConnectionLater ?: true)
+    }
+
+    @Test
+    fun `a stale update queued during the disconnect snapshot cannot trigger another disconnect`() {
+        val old = network("old-office")
+        val preferred = network("office-a")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old))),
+            initialWifi = listOf(observation(10, old.ssid)),
+        )
+        harness.adapter.afterApply = {
+            harness.connectivity.update(11, "unrelated-office")
+            harness.connectivity.lose(11)
+        }
+
+        harness.apply(listOf(preferred))
+
+        assertEquals(1, harness.adapter.disconnectCalls)
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+    }
+
+    @Test
+    fun `a preferred connection reobserved on the same handle during disconnect is adopted`() {
+        val old = network("old-office")
+        val preferred = network("office-a")
+        val fallback = network("office-b")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old))),
+            initialWifi = listOf(observation(10, old.ssid)),
+        )
+        harness.adapter.onDisconnect = {
+            harness.connectivity.lose(10)
+            harness.connectivity.update(10, preferred.ssid)
+        }
+
+        harness.apply(listOf(preferred, fallback))
+
+        assertEquals("success", harness.store.state.latestResult?.status)
+        assertEquals(WifiReason.NONE, harness.store.state.latestResult?.reason)
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+        assertEquals(1, harness.adapter.disconnectCalls)
+    }
+
+    @Test
+    fun `a rejected disconnect with its old link still present is bounded by the candidate window`() {
+        val old = network("old-office")
+        val preferred = network("office-a")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old))),
+            initialWifi = listOf(observation(10, old.ssid)),
+        )
+        harness.adapter.disconnectResult = WifiReason.UNREACHABLE
+
+        harness.apply(listOf(preferred))
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+
+        harness.expireNext(12_000L)
+
+        assertEquals("failed", harness.store.state.latestResult?.status)
+        assertEquals(WifiReason.UNREACHABLE, harness.store.state.latestResult?.reason)
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+    }
+
+    @Test
+    fun `an associated candidate without an IP advances to fallback at its candidate deadline`() {
+        val old = network("old-office")
+        val preferred = network("office-a")
+        val fallback = network("office-b")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old))),
+            initialWifi = listOf(observation(10, old.ssid)),
+        )
+        harness.adapter.onDisconnect = {
+            when (harness.adapter.disconnectCalls) {
+                1 -> {
+                    harness.connectivity.update(11, preferred.ssid, hasUsableIp = false)
+                    harness.connectivity.lose(10)
+                }
+                2 -> harness.connectivity.lose(11)
+            }
+        }
+        harness.adapter.afterSelect = { selected ->
+            if (selected == fallback) harness.connectivity.update(12, fallback.ssid)
+        }
+
+        harness.apply(listOf(preferred, fallback))
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+
+        harness.expireNext(12_000L)
+
+        assertEquals(listOf(fallback), harness.adapter.selectCalls)
+        assertEquals("success", harness.store.state.latestResult?.status)
+        assertEquals(WifiReason.FALLBACK, harness.store.state.latestResult?.reason)
+    }
+
+    @Test
+    fun `candidate IP received before its deadline is accepted after worker delay`() {
+        val old = network("old-office")
+        val preferred = network("office-a")
+        val fallback = network("office-b")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old))),
+            initialWifi = listOf(observation(10, old.ssid)),
+        )
+        harness.adapter.onDisconnect = {
+            harness.connectivity.update(11, preferred.ssid, hasUsableIp = false)
+            harness.connectivity.lose(10)
+        }
+
+        harness.apply(listOf(preferred, fallback))
+        assertNull(harness.store.state.latestResult)
+
+        harness.clock.value = 11_999L
+        harness.connectivity.update(11, preferred.ssid, hasUsableIp = true)
+        harness.clock.value = 12_000L
+        harness.worker.runAll()
+
+        assertEquals("success", harness.store.state.latestResult?.status)
+        assertEquals(WifiReason.NONE, harness.store.state.latestResult?.reason)
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+    }
+
+    @Test
+    fun `an IP observed in time is accepted when the disconnect worker resumes after the overall deadline`() {
+        val old = network("old-office")
+        val preferred = network("office-a")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old))),
+            initialWifi = listOf(observation(10, old.ssid)),
+        )
+        harness.adapter.onDisconnect = {
+            harness.clock.value = 11_999L
+            harness.connectivity.update(11, preferred.ssid)
+            harness.connectivity.lose(10)
+            harness.clock.value = WIFI_MANUAL_TIMEOUT_MS
+        }
+
+        harness.apply(listOf(preferred))
+
+        assertEquals("success", harness.store.state.latestResult?.status)
+        assertEquals(WifiReason.NONE, harness.store.state.latestResult?.reason)
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+    }
+
+    @Test
+    fun `an IP observed at the overall deadline is rejected when the disconnect worker resumes`() {
+        val old = network("old-office")
+        val preferred = network("office-a")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old))),
+            initialWifi = listOf(observation(10, old.ssid)),
+        )
+        harness.adapter.onDisconnect = {
+            harness.connectivity.update(11, preferred.ssid, hasUsableIp = false)
+            harness.connectivity.lose(10)
+            harness.clock.value = WIFI_MANUAL_TIMEOUT_MS
+            harness.connectivity.update(11, preferred.ssid)
+        }
+
+        harness.apply(listOf(preferred))
+
+        assertEquals("failed", harness.store.state.latestResult?.status)
+        assertEquals(WifiReason.UNREACHABLE, harness.store.state.latestResult?.reason)
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+    }
+
+    @Test
+    fun `a linkage error during candidate selection completes once and a later policy can run`() {
+        val preferred = network("office-a")
+        val fallback = network("office-b")
+        val harness = Harness()
+        harness.adapter.selectionFailure = NoSuchMethodError("SDK method unavailable")
+        var completions = 0
+        var firstResult: WifiManualResult? = null
+        harness.controller.applyManagedPolicy(
+            REVISION,
+            settings(listOf(preferred)),
+            reuseMatchingProfile = false,
+            isCurrent = { true },
+            onFinished = { completions++; firstResult = it },
+        )
+        harness.worker.runAll()
+        harness.expireNext(WIFI_PRIOR_CONNECTION_OBSERVATION_MS)
+
+        assertEquals(1, completions)
+        assertEquals(WifiReason.UNSUPPORTED, firstResult?.reason)
+        assertEquals("failed", firstResult?.status)
+        assertTrue(harness.controller.canAcceptPolicy())
+
+        harness.adapter.afterSelect = { selected ->
+            if (selected == fallback) harness.connectivity.update(22, fallback.ssid)
+        }
+        harness.apply(listOf(fallback))
+        harness.expireNext(WIFI_PRIOR_CONNECTION_OBSERVATION_MS)
+        assertEquals("reason=${harness.store.state.latestResult?.reason}, selections=${harness.adapter.selectCalls}",
+            "success", harness.store.state.latestResult?.status)
+        assertEquals(fallback.ssid, harness.connectivity.currentUsableSsid())
+    }
+
+    @Test
+    fun `a monitoring failure after completion keeps the saved result and releases the worker`() {
+        val harness = Harness()
+        val preferred = network("office-a")
+        val fallback = network("office-b")
+        harness.adapter.afterSelect = { harness.connectivity.update(70, it.ssid) }
+        val results = mutableListOf<WifiManualResult>()
+        harness.controller.applyManagedPolicy(REVISION, settings(listOf(preferred, fallback)), false, { true }) {
+            results += it
+            harness.adapter.onCheckWifiEnabled = {
+                harness.adapter.onCheckWifiEnabled = null
+                throw IllegalStateException("Monitoring failed after the attempt finished")
+            }
+        }
+        harness.worker.runAll()
+        harness.expireNext(WIFI_PRIOR_CONNECTION_OBSERVATION_MS)
+
+        assertNull(harness.adapter.onCheckWifiEnabled)
+        assertEquals("success", results.single().status)
+        assertEquals("success", harness.store.state.latestResult?.status)
+        assertTrue(harness.controller.canAcceptPolicy())
+    }
+
+    @Test
+    fun `a disconnect exception completes once and does not block the next policy`() {
+        val old = network("old-office")
+        val preferred = network("office-a")
+        val fallback = network("office-b")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old))),
+            initialWifi = listOf(observation(10, old.ssid)),
+        )
+        harness.adapter.disconnectFailure = IllegalStateException("disconnect failed")
+        var completions = 0
+        var firstResult: WifiManualResult? = null
+        harness.controller.applyManagedPolicy(
+            REVISION,
+            settings(listOf(preferred)),
+            reuseMatchingProfile = false,
+            isCurrent = { true },
+            onFinished = { completions++; firstResult = it },
+        )
+        harness.worker.runAll()
+
+        assertEquals(1, completions)
+        assertEquals(WifiReason.CONFIG_READ_FAILED, firstResult?.reason)
+        assertTrue(harness.controller.canAcceptPolicy())
+
+        harness.adapter.onDisconnect = { harness.connectivity.loseAll() }
+        harness.adapter.afterSelect = { selected ->
+            if (selected == fallback) harness.connectivity.update(22, fallback.ssid)
+        }
+        harness.apply(listOf(fallback))
+        assertEquals("success", harness.store.state.latestResult?.status)
+        assertEquals(fallback.ssid, harness.connectivity.currentUsableSsid())
+    }
+
+    @Test
+    fun `Wi-Fi disabled before candidate selection does not schedule an empty candidate window`() {
+        val preferred = network("office-a")
+        val harness = Harness()
+        harness.adapter.wifiEnabled = false
+
+        harness.apply(listOf(preferred))
+        val scheduledCandidateTimers = harness.scheduledDelayCount(12_000L)
+        harness.expireNext(WIFI_PRIOR_CONNECTION_OBSERVATION_MS)
+
+        assertEquals(scheduledCandidateTimers, harness.scheduledDelayCount(12_000L))
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+        assertEquals(WifiReason.UNREACHABLE, harness.store.state.latestResult?.reason)
+    }
+
+    @Test
+    fun `a rejected disconnect still allows a delayed loss to start the first candidate`() {
+        val old = network("previous")
+        val preferred = network("office-a")
+        val fallback = network("office-b")
+        val harness = Harness(initialWifi = listOf(observation(10, old.ssid)))
+        harness.adapter.disconnectResult = WifiReason.UNREACHABLE
+        harness.adapter.afterSelect = { if (it == preferred) harness.connectivity.update(11, preferred.ssid) }
+
+        harness.apply(listOf(preferred, fallback))
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+        harness.connectivity.lose(10)
+        harness.worker.runAll()
+
+        assertEquals(listOf(preferred), harness.adapter.selectCalls)
+        assertEquals("success", harness.store.state.latestResult?.status)
+    }
+
+    @Test
+    fun `an automatic connection to the current candidate during disconnect is accepted`() {
+        val preferred = network("office-a")
+        val fallback = network("office-b")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(fallback))),
+            initialWifi = listOf(observation(10, fallback.ssid)),
+        )
+
+        harness.apply(listOf(preferred, fallback))
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+        assertEquals(1, harness.adapter.disconnectCalls)
+
+        harness.connectivity.update(11, null, hasUsableIp = true, security = null)
+        harness.worker.runAll()
+        assertNull(harness.store.state.latestResult)
+        assertEquals(1, harness.adapter.disconnectCalls)
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+
+        harness.connectivity.update(11, preferred.ssid, hasUsableIp = false)
+        harness.worker.runAll()
+        assertEquals(1, harness.adapter.disconnectCalls)
+        assertNull(harness.store.state.latestResult)
+
+        harness.connectivity.lose(10)
+        harness.worker.runAll()
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+
+        harness.connectivity.update(11, preferred.ssid)
+        harness.worker.runAll()
+
+        assertEquals("success", harness.store.state.latestResult?.status)
+        assertEquals(WifiReason.NONE, harness.store.state.latestResult?.reason)
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+        assertEquals(1, harness.adapter.disconnectCalls)
+    }
+
+    @Test
+    fun `a candidate connection arriving after its request expires is not adopted`() {
+        val preferred = network("office-a")
+        val fallback = network("office-b")
+        var isCurrent = true
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(fallback))),
+            initialWifi = listOf(observation(10, fallback.ssid)),
+        )
+        var disconnectMutations = 0
+        harness.adapter.onDisconnect = { disconnectMutations++ }
+        harness.controller.applyManagedPolicy(
+            REVISION,
+            settings(listOf(preferred, fallback)),
+            reuseMatchingProfile = false,
+            isCurrent = { isCurrent },
+            onFinished = {},
+        )
+        harness.worker.runAll()
+        assertEquals(1, harness.adapter.disconnectCalls)
+
+        isCurrent = false
+        harness.connectivity.update(11, preferred.ssid)
+        harness.worker.runAll()
+
+        assertEquals("unknown", harness.store.state.latestResult?.status)
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+        assertEquals(1, harness.adapter.disconnectCalls)
+        assertEquals(1, disconnectMutations)
+    }
+
+    @Test
+    fun `a candidate update queued before the deadline is not adopted after it expires`() {
+        val preferred = network("office-a")
+        val fallback = network("office-b")
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(fallback))),
+            initialWifi = listOf(observation(10, fallback.ssid)),
+        )
+        var disconnectMutations = 0
+        harness.adapter.onDisconnect = { disconnectMutations++ }
+        harness.apply(listOf(preferred, fallback))
+
+        harness.connectivity.update(11, preferred.ssid)
+        harness.clock.value = WIFI_MANUAL_TIMEOUT_MS
+        harness.worker.runAll()
+
+        assertEquals("failed", harness.store.state.latestResult?.status)
+        assertEquals(WifiReason.UNREACHABLE, harness.store.state.latestResult?.reason)
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+        assertEquals(1, disconnectMutations)
+    }
+
+    @Test
     fun `candidate timeout advances to the next index and an old timeout cannot advance it again`() {
         val preferred = network("office-a")
         val middle = network("office-b")
@@ -732,6 +1336,53 @@ class WifiSettingsControllerTest {
         assertEquals(listOf(primary, fallback, primary), wifi.adapter.selectCalls)
         assertEquals(primary.ssid, wifi.connectivity.currentUsableSsid())
         assertEquals(pending, wifi.store.state.latestResult)
+    }
+
+    @Test
+    fun `Wi-Fi off delays reconnect without selecting until Wi-Fi returns`() {
+        val preferred = network("office-a")
+        val fallback = network("office-b")
+        val profile = WifiSavedProfile(REVISION, listOf(preferred, fallback))
+        val adapter = FakeAdapter(listOf(preferred, fallback)).apply { wifiEnabled = false }
+        val wifi = Harness(
+            initialState = WifiLocalState(managedWifi = true, lastApplied = profile),
+            sharedAdapter = adapter,
+        )
+
+        wifi.expireNext(8_000L)
+        assertTrue(adapter.selectCalls.isEmpty())
+        assertEquals(0, adapter.disconnectCalls)
+
+        adapter.wifiEnabled = true
+        wifi.expireNext(8_000L)
+        wifi.expireNext(WIFI_PRIOR_CONNECTION_OBSERVATION_MS)
+
+        assertEquals(listOf(preferred), adapter.selectCalls)
+    }
+
+    @Test
+    fun `Wi-Fi off stops priority scanning and monitoring resumes after Wi-Fi returns`() {
+        val preferred = network("office-a")
+        val fallback = network("office-b")
+        val profile = WifiSavedProfile(REVISION, listOf(preferred, fallback), autoReturn = true)
+        val adapter = FakeAdapter(listOf(preferred, fallback)).apply { wifiEnabled = false }
+        val wifi = Harness(
+            initialState = WifiLocalState(managedWifi = true, lastApplied = profile),
+            initialWifi = listOf(observation(10, fallback.ssid)),
+            sharedAdapter = adapter,
+        )
+        assertEquals(0, wifi.priorityScanSource.startCalls)
+
+        wifi.expireNext(8_000L)
+        assertEquals(0, wifi.priorityScanSource.startCalls)
+        assertTrue(adapter.selectCalls.isEmpty())
+        assertEquals(0, adapter.disconnectCalls)
+
+        adapter.wifiEnabled = true
+        wifi.expireNext(8_000L)
+
+        assertEquals(1, wifi.priorityScanSource.startCalls)
+        assertTrue(adapter.selectCalls.isEmpty())
     }
 
     @Test
@@ -853,6 +1504,7 @@ class WifiSettingsControllerTest {
         assertEquals(success, wifi.store.state.latestResult)
         assertEquals(listOf(preferred, fallback), wifi.adapter.selectCalls)
         assertEquals(fallback.ssid, wifi.connectivity.currentUsableSsid())
+        assertEquals(1, wifi.priorityScanSource.stopCalls)
 
         wifi.clock.value += 5 * 60_000L - WIFI_PRIOR_CONNECTION_OBSERVATION_MS - 1
         wifi.priorityScanSource.emit(preferredVisible)
@@ -860,6 +1512,8 @@ class WifiSettingsControllerTest {
         assertEquals(2, wifi.adapter.selectCalls.size)
 
         wifi.clock.value++
+        wifi.expireNext(5 * 60_000L - WIFI_PRIOR_CONNECTION_OBSERVATION_MS)
+        assertEquals(2, wifi.priorityScanSource.startCalls)
         wifi.priorityScanSource.emit(preferredVisible)
         wifi.worker.runAll()
         assertEquals(3, wifi.adapter.selectCalls.size)
@@ -876,6 +1530,8 @@ class WifiSettingsControllerTest {
 
         wifi.adapter.afterSelect = { selected -> wifi.connectivity.update(++handle, selected.ssid) }
         wifi.clock.value++
+        wifi.expireNext(10 * 60_000L - WIFI_PRIOR_CONNECTION_OBSERVATION_MS)
+        assertEquals(3, wifi.priorityScanSource.startCalls)
         wifi.priorityScanSource.emit(preferredVisible)
         wifi.worker.runAll()
 

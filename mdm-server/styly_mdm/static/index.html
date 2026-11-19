@@ -419,6 +419,8 @@
     .mg-dev-list { max-height: 320px; overflow-y: auto; padding: 2px 12px 10px; }
     .mg-dev { display: flex; align-items: center; gap: 12px; padding: 9px 10px; border-radius: 7px; cursor: pointer; }
     .mg-dev:hover { background: var(--bg-bar); }
+    .mg-dev-ghost { border: 1px solid var(--border-soft); }
+    .mg-dev-ghost .mg-dev-status, .settings-device-result .retry-pending { opacity: .55; cursor: not-allowed; }
     .mg-dev-main { flex: 1; min-width: 0; }
     .mg-dev-status { font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
     .mg-footer { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-top: 1px solid var(--border); background: #161a24; }
@@ -561,6 +563,7 @@
   </style>
   <script src="/static/push-jobs-v1.js"></script>
   <script src="/static/configuration-packages-v1.js"></script>
+  <script src="/static/group-membership.js"></script>
 </head>
 
 <body>
@@ -779,6 +782,7 @@
           <div class="mg-list" id="mgList"></div>
         </div>
         <div class="mg-main">
+          <div class="settings-feedback" id="membershipNotice" role="status"></div>
           <div id="mgDetail"></div>
           <div id="groupSettingsPanel" hidden></div>
         </div>
@@ -851,22 +855,25 @@
       let deviceStatusFilter = 'any';  // 'any' | 'online' | 'offline'
       // Manage view
       let manageSelectedGroup = null;
+      const pendingGroupCreates = new Set();
+      // A create waits for its own acknowledgement, then a WS group list. A
+      // confirmed target and a manual choice can both be held by a member save.
+      let pendingSelection = null; // { name, phase: 'ack' | 'snapshot' | 'ready', intent: 'automatic' | 'manual', renamedFrom? }
       let manageTab = 'devices';
       let managePackages = false;
-      let manageMembers = new Set();
-      let manageEditedMembers = new Set();
-      let manageAddedOwners = new Map();
+      const membership = window.MdmGroupMembership;
+      const memberEdits = new Map();
       let membershipSnapshotReady = false;
       let membershipSave = null;
       let manageSearch = '';
       let manageSort = 'label-asc';
+      let manageRenderedLayout;
+      let renderedMemberList;
+      let renderedMemberListContent;
       let renamingManageGroup = false;
-      // Same story as editingLabelDraft: renderManageDetail() runs on every DEVICE_LIST /
-      // GROUP_LIST, so the group-rename input needs its text kept outside the DOM too.
+      // The rename draft survives layout changes and server snapshots while its input is
+      // otherwise updated in place with the selected group detail.
       let renameGroupDraft = '';
-      let renameGroupCaret = null;     // null = select the whole draft (editor just opened)
-      let renameGroupRefocus = false;  // one-shot: focus the editor on the next render
-      let pendingSelectGroup = null;   // select this group in manage once GROUP_LIST confirms it
 
       // ---------------- DOM refs ----------------
       const consoleView = document.getElementById('consoleView');
@@ -920,6 +927,7 @@
       const btnClearLog = document.getElementById('btnClearLog');
       const mgSidebar = document.getElementById('mgSidebar');
       const mgDetail = document.getElementById('mgDetail');
+      const membershipNotice = document.getElementById('membershipNotice');
       const groupSettingsPanel = document.getElementById('groupSettingsPanel');
       const manageGroupsGrid = document.getElementById('manageGroupsGrid');
       const packagesGrid = document.getElementById('configurationPackagesGrid');
@@ -935,29 +943,41 @@
         getGroups: function () { return groups; },
         openPackages: function () { managePackages = true; render(); },
         onSnapshot: applyGroupListSnapshot,
+        requestGroupSnapshot: function () { return wsSend({ type: 'GET_GROUP_LIST' }, 'refresh group details'); },
         deviceIdHtml,
       });
 
-      function applyGroupListSnapshot(msg) {
-        const previousMembers = groups[manageSelectedGroup] || [];
+      function applyGroupListSnapshot(msg, source = 'ws') {
+        const previousPowerTargets = selectedIds.size ? powerDeviceTargets(Array.from(selectedIds)) : null;
         groups = msg.groups || {};
-        membershipSnapshotReady = true;
+        if (source === 'ws') membershipSnapshotReady = true;
         const registryUnreadable = msg.registry_writable === false;
         document.getElementById('registryWarning').hidden = !registryUnreadable;
         document.getElementById('configurationWarning').hidden = registryUnreadable || msg.configuration_available !== false;
         groupsLoaded = true;
-        const selectedPendingGroup = applyPendingManageGroupSelection();
-        if (!selectedPendingGroup && manageSelectedGroup && !(manageSelectedGroup in groups)) { manageSelectedGroup = null; manageMembers = new Set(); }
-        else if (!selectedPendingGroup && manageSelectedGroup) {
-          // Keep staged adds/removals, and follow current membership for untouched devices.
-          manageMembers = window.MdmConfigurationPackages.syncMemberSelection(
-            previousMembers, groups[manageSelectedGroup] || [], manageMembers, manageEditedMembers);
-          window.MdmConfigurationPackages.clearMembershipEditsThatMatch(
-            manageMembers, groups[manageSelectedGroup] || [], manageEditedMembers, manageAddedOwners);
+        // Only the requester's acknowledgement identifies a rename. HTTP can see
+        // the new roster before that acknowledgement, so wait for its WS group list.
+        if (source === 'ws' && manageSelectedGroup && pendingSelection?.renamedFrom === manageSelectedGroup &&
+            Object.hasOwn(groups, pendingSelection.name)) {
+          manageSelectedGroup = pendingSelection.name;
+          pendingSelection = null;
+          membershipSave = null;
         }
+        if (manageSelectedGroup && Object.hasOwn(groups, manageSelectedGroup)) {
+          membership.reconcileMembers(groups[manageSelectedGroup], memberEdits);
+        } else if (manageSelectedGroup && source === 'ws') {
+          if (memberEdits.size) {
+            membershipNotice.textContent = 'Group "' + manageSelectedGroup + '" is no longer listed. Your unsaved membership changes were discarded.';
+          }
+          manageSelectedGroup = null;
+          memberEdits.clear();
+          membershipSave = null;
+        }
+        applyPendingManageGroupSelection(source === 'ws');
         // Keep the active-group selection current: a group whose membership was
         // just edited must not dispatch to the old member set (PR #29 P1).
         syncActiveGroupSelection();
+        if (previousPowerTargets && !sameSet(previousPowerTargets, powerDeviceTargets(Array.from(selectedIds)))) powerConfirm.checked = false;
         render();
       }
 
@@ -1089,6 +1109,13 @@
       // Command targets need a live WebSocket, which "updating" (mid self-update,
       // device rebooting) does not have — only strictly-online devices qualify.
       function getOnlineIds() { return devices.filter(function (d) { return d.status === 'online'; }).map(getDeviceId).filter(Boolean); }
+      function sameSet(a, b) { return a.size === b.size && Array.from(a).every(function (id) { return b.has(id); }); }
+      function powerDeviceTargets(ids) {
+        const online = new Set(getOnlineIds());
+        return new Set(ids.filter(function (id) {
+          return online.has(id) && (deviceById(id) || {}).identity_kind !== 'legacy';
+        }));
+      }
       // The device retries its durable Push state by itself for about five minutes,
       // then waits for the next app start; the operator frees storage and reboots.
       function pushStateUnavailable(d) {
@@ -1144,7 +1171,7 @@
       // selectAllState()/toggleSelectAll() correct rather than only correct-looking: with no
       // hidden selections, "all visible are selected" and "all selected" cannot disagree.
       // Deliberately not folded into filterSortDevices(): the Manage Groups picker tracks a
-      // different set (manageMembers) and must keep filtering strictly by query.
+      // separate membership draft and must keep filtering strictly by query.
       function visibleDevices() {
         const q = deviceSearch.trim().toLowerCase();
         return sortDevices(devices.filter(function (d) {
@@ -1180,6 +1207,7 @@
         if (state === 'connected') { connDot.classList.add('connected'); connText.textContent = 'Connected'; }
         else if (state === 'reconnecting') { connDot.classList.add('reconnecting'); connText.textContent = 'Reconnecting...'; }
         else { connText.textContent = 'Disconnected'; }
+        configurationController.setGroupSnapshotConnected(state === 'connected');
       }
 
       function connect() {
@@ -1195,6 +1223,9 @@
         socket.onclose = function () {
           if (ws !== socket) return;
           membershipSnapshotReady = false;
+          pendingGroupCreates.clear();
+          // Keep an explicit user choice. Automatic moves belong to the old connection.
+          if (pendingSelection?.intent !== 'manual') pendingSelection = null;
           if (membershipSave?.state === 'saving') {
             showMembershipFeedback(membershipSave.name, 'Connection lost. Review the current group before saving again.', 'error');
             if (applyPendingManageGroupSelection()) render();
@@ -1237,6 +1268,7 @@
             break;
           }
           case 'DEVICE_LIST': {
+            const previousPowerTargets = selectedIds.size ? powerDeviceTargets(Array.from(selectedIds)) : null;
             devices = msg.devices || [];
             const selectedBefore = selectedIds.size;
             const cur = knownIds();
@@ -1253,6 +1285,7 @@
               }
             });
             syncActiveGroupSelection();
+            if (previousPowerTargets && !sameSet(previousPowerTargets, powerDeviceTargets(Array.from(selectedIds)))) powerConfirm.checked = false;
             if (window.__stylyPushJobsV1Actions) window.__stylyPushJobsV1Actions.refreshConnectivity();
             render();
             break;
@@ -1320,28 +1353,30 @@
           case 'DEVICE_FORGOTTEN': addLog('Device forgotten: ' + (msg.device_id || '-'), 'success'); break;
           case 'GROUP_CREATED':
             addLog('Group created: ' + (msg.name || '-'), 'success');
-            if (view === 'manage') {
-              pendingSelectGroup = msg.name;
-              if (applyPendingManageGroupSelection()) render();
+            if (pendingGroupCreates.delete(msg.name) && pendingSelection?.phase === 'ack' &&
+                pendingSelection.name === msg.name) {
+              pendingSelection.phase = 'snapshot';
             }
             break;
           case 'GROUP_RENAMED': {
             addLog('Group renamed: ' + (msg.name || '-') + ' -> ' + (msg.new_name || '-'), 'success');
-            let selectedRenamedGroup = false;
-            if (manageSelectedGroup === msg.name) {
-              pendingSelectGroup = msg.new_name;
-              selectedRenamedGroup = applyPendingManageGroupSelection();
+            const target = pendingSelection?.name ?? manageSelectedGroup;
+            if (view === 'manage' && target === msg.name && pendingSelection?.phase !== 'ack') {
+              pendingSelection = {
+                ...pendingSelection,
+                name: msg.new_name,
+                phase: 'snapshot',
+                intent: pendingSelection?.intent ?? 'automatic',
+                renamedFrom: manageSelectedGroup === msg.name ? msg.name : pendingSelection?.renamedFrom,
+              };
             }
             if (activeGroup === msg.name) activeGroup = msg.new_name;
-            if (selectedRenamedGroup) render();
             break;
           }
           case 'GROUP_DELETED': addLog('Group deleted: ' + (msg.name || '-'), 'success'); if (activeGroup === msg.name) activeGroup = null; break;
           case 'GROUP_MEMBERS_SET':
             if (msg.operation === 'UPDATE_GROUP_MEMBERS' && membershipSave?.name === msg.name && membershipSave.state === 'saving') {
-              manageEditedMembers.clear();
-              manageAddedOwners.clear();
-              manageMembers = new Set(groups[msg.name] || []);
+              memberEdits.clear();
               showMembershipFeedback(msg.name, 'Members saved.', 'saved');
             }
             if (applyPendingManageGroupSelection()) render();
@@ -1391,6 +1426,12 @@
             break;
           }
           case 'ERROR':
+            if (msg.operation === 'CREATE_GROUP' && typeof msg.name === 'string') {
+              pendingGroupCreates.delete(msg.name);
+              if (pendingSelection?.phase === 'ack' && pendingSelection.name === msg.name) {
+                pendingSelection = null;
+              }
+            }
             if (msg.operation === 'UPDATE_GROUP_MEMBERS' && membershipSave?.name === msg.name) {
               showMembershipFeedback(msg.name, msg.message || 'Could not save members. Review the current group and try again.', 'error');
               if (applyPendingManageGroupSelection()) render();
@@ -1453,9 +1494,10 @@
         if (showToolbar && devSearchInput.value !== deviceSearch) devSearchInput.value = deviceSearch;
         if (showToolbar) syncStatusFilterButtons();
         const hadFocus = labelInputFocused();
-        targetsBody.innerHTML = targetTab === 'groups'
+        const content = targetTab === 'groups'
           ? renderGroupsHtml()
           : (targetTab === 'devices' ? renderDevicesHtml() : renderAttentionHtml());
+        if (targetsBody.innerHTML !== content) targetsBody.innerHTML = content;
         if (targetTab === 'devices') restoreLabelEditFocus(hadFocus);
         if (targetTab === 'attention') syncPushAttentionCheckboxes();
       }
@@ -1566,7 +1608,7 @@
       function renderGroupPackageHtml(name) {
         const summary = configurationController.groupPackageSummary(name);
         if (!summary?.name) {
-          const label = summary ? 'Package unavailable' : 'No package';
+          const label = summary ? 'Package unavailable' : 'No managed settings';
           return '<div class="group-package group-package-empty" title="' + label + '">' + label + '</div>';
         }
         const packageName = esc(summary.name);
@@ -2036,7 +2078,11 @@
         connectionSelectionAnchorId = null;
         selectedConnectionIds.clear();
         const known = knownIds();
-        selectedIds = new Set((groups[name] || []).filter(function (s) { return known.has(s); }));
+        const next = new Set((groups[name] || []).filter(function (s) { return known.has(s); }));
+        if (selectedIds.size !== next.size || Array.from(selectedIds).some(function (id) { return !next.has(id); })) {
+          powerConfirm.checked = false;
+        }
+        selectedIds = next;
         activeGroup = name;
         addLog('Selected group "' + name + '": ' + selectedIds.size + ' device(s) selected', 'info');
         render();
@@ -2047,9 +2093,18 @@
       // pointing at a stale member set. If the group is gone, clear the selection.
       function syncActiveGroupSelection() {
         if (!activeGroup) return;
-        if (!(activeGroup in groups)) { activeGroup = null; selectedIds.clear(); return; }
+        if (!(activeGroup in groups)) {
+          activeGroup = null;
+          if (selectedIds.size) powerConfirm.checked = false;
+          selectedIds.clear();
+          return;
+        }
         const known = knownIds();
-        selectedIds = new Set((groups[activeGroup] || []).filter(function (s) { return known.has(s); }));
+        const next = new Set((groups[activeGroup] || []).filter(function (s) { return known.has(s); }));
+        if (selectedIds.size !== next.size || Array.from(selectedIds).some(function (id) { return !next.has(id); })) {
+          powerConfirm.checked = false;
+        }
+        selectedIds = next;
       }
       function toggleDevice(id, shiftKey) {
         const device = deviceById(id);
@@ -2508,7 +2563,13 @@
       }
 
       // ---------------- Group senders ----------------
-      function sendCreateGroup(name) { wsSend({ type: 'CREATE_GROUP', name: name }, 'create group'); }
+      function sendCreateGroup(name) {
+        if (pendingGroupCreates.has(name)) return false;
+        if (!wsSend({ type: 'CREATE_GROUP', name: name }, 'create group')) return false;
+        pendingGroupCreates.add(name);
+        pendingSelection = { name, phase: 'ack', intent: 'automatic' };
+        return true;
+      }
       function sendRenameGroup(name, nn) { wsSend({ type: 'RENAME_GROUP', name: name, new_name: nn }, 'rename group'); }
       function sendDeleteGroup(name) { wsSend({ type: 'DELETE_GROUP', name: name }, 'delete group'); }
 
@@ -2519,15 +2580,18 @@
 
       function renderMembershipFeedback() {
         const feedback = mgDetail.querySelector('[data-members-feedback]');
-        if (!feedback) return;
         const current = membershipSave?.name === manageSelectedGroup ? membershipSave : null;
-        feedback.textContent = current?.message || '';
-        feedback.classList.toggle('settings-error', current?.state === 'error');
+        if (feedback) {
+          feedback.textContent = current?.message || '';
+          feedback.classList.toggle('settings-error', current?.state === 'error');
+        }
         const saving = membershipSave?.name === manageSelectedGroup && membershipSave.state === 'saving';
         const save = mgDetail.querySelector('[data-act="saveMembers"]');
         const cancel = mgDetail.querySelector('[data-act="cancelMembers"]');
+        const remove = mgDetail.querySelector('[data-act="deleteGroup"]');
         if (save) save.disabled = saving;
         if (cancel) cancel.disabled = saving;
+        if (remove) remove.disabled = saving;
       }
 
       function saveGroupMembers() {
@@ -2539,15 +2603,13 @@
         }
         let edit;
         try {
-          edit = window.MdmConfigurationPackages.buildMembershipEdit(
-            name, groups[name] || [], manageMembers, groups, manageAddedOwners);
+          edit = membership.buildMembershipEdit(name, groups, memberEdits);
         } catch (error) {
           showMembershipFeedback(name, error.message, 'error');
           return;
         }
         if (!Object.keys(edit.add).length && !edit.remove.length) {
-          manageEditedMembers.clear();
-          manageAddedOwners.clear();
+          memberEdits.clear();
           showMembershipFeedback(name, 'No membership changes.', 'saved');
           return;
         }
@@ -2562,39 +2624,52 @@
       function openManage(group) {
         view = 'manage';
         managePackages = false;
-        if (group && (group in groups)) {
-          if (membershipSave?.state === 'saving') pendingSelectGroup = group;
-          else {
-            pendingSelectGroup = null;
-            selectManageGroup(group);
-          }
+        if (group && Object.hasOwn(groups, group)) {
+          selectManageGroup(group);
         }
         render();
       }
       function backToConsole() {
+        pendingSelection = null;
         configurationController.renderGroup(null);
-        view = 'console'; renamingManageGroup = false; renameGroupDraft = '';
-        renameGroupCaret = null; renameGroupRefocus = false; render();
+        view = 'console'; renamingManageGroup = false; renameGroupDraft = ''; render();
       }
       function selectManageGroup(name) {
-        if (membershipSave?.state === 'saving') return;
-        manageSelectedGroup = name;
-        manageMembers = new Set(groups[name] || []);
-        manageEditedMembers = new Set();
-        manageAddedOwners = new Map();
-        membershipSave = null;
-        manageSearch = '';
-        renamingManageGroup = false;
-        renameGroupDraft = '';
-        renameGroupCaret = null;
-        renameGroupRefocus = false;
+        membershipNotice.textContent = '';
+        if (name === manageSelectedGroup) {
+          if (pendingSelection?.renamedFrom !== name) pendingSelection = null;
+          return false;
+        }
+        pendingSelection = { name, phase: 'ready', intent: 'manual' };
+        return applyPendingManageGroupSelection();
       }
 
-      function applyPendingManageGroupSelection() {
-        if (!pendingSelectGroup || !(pendingSelectGroup in groups) || membershipSave?.state === 'saving') return false;
-        selectManageGroup(pendingSelectGroup);
-        pendingSelectGroup = null;
+      function applyPendingManageGroupSelection(fromSnapshot = false) {
+        if (!pendingSelection || pendingSelection.phase === 'ack') return false;
+        if (pendingSelection.phase === 'snapshot') {
+          if (!fromSnapshot) return false;
+          pendingSelection.phase = 'ready';
+        }
+        const name = pendingSelection.name;
+        if (!Object.hasOwn(groups, name)) {
+          pendingSelection = null;
+          return false;
+        }
+        if (membershipSave?.state === 'saving') return false;
+        pendingSelection = null;
+        manageSelectedGroup = name;
+        memberEdits.clear();
+        membershipSave = null;
+        manageSearch = '';
+        const searchInput = mgDetail.querySelector('[data-mg-search]');
+        if (searchInput) searchInput.value = '';
+        renamingManageGroup = false;
+        renameGroupDraft = '';
         return true;
+      }
+
+      function selectedManageMembers() {
+        return membership.selectedMembers(groups[manageSelectedGroup] || [], memberEdits);
       }
 
       function renderManageSidebar() {
@@ -2610,29 +2685,33 @@
       }
 
       function renderManageDetail() {
-        const hadRenameFocus = renameInputFocused();
-        if (!manageSelectedGroup || !(manageSelectedGroup in groups)) {
-          mgDetail.innerHTML = '<div class="mg-detail-empty">Select a group, or create one.</div>';
+        if (!manageSelectedGroup || !Object.hasOwn(groups, manageSelectedGroup)) {
+          if (manageRenderedLayout !== 'empty') {
+            mgDetail.innerHTML = '<div class="mg-detail-empty">Select a group, or create one.</div>';
+            manageRenderedLayout = 'empty';
+          }
           groupSettingsPanel.hidden = true;
           configurationController.renderGroup(null);
           return;
         }
         const name = manageSelectedGroup;
-        const memArr = manageTab === 'settings' ? (groups[name] || []) : Array.from(manageMembers);
-        const offCount = memArr.filter(function (s) { const d = deviceById(s); return !d || !isOnline(d); }).length;
-        const onCount = memArr.length - offCount;
+        const layout = JSON.stringify([name, manageTab, renamingManageGroup]);
+        if (manageRenderedLayout === layout) {
+          refreshManageDetailContents();
+          return;
+        }
         const head = renamingManageGroup
           ? '<div class="dev-edit"><input class="label-input" data-mg-rename maxlength="64" value="' + esc(renameGroupDraft) + '">' +
             '<button class="btn-mini btn-save" data-act="saveRename">Save</button>' +
             '<button class="btn-mini btn-cancel" data-act="cancelRename">Cancel</button></div>'
-          : '<div><div class="mg-title">' + esc(name) + '</div><div class="mg-sub">' + onCount + ' online, ' + offCount + ' offline</div></div>' +
+          : '<div><div class="mg-title">' + esc(name) + '</div><div class="mg-sub"></div></div>' +
             '<div class="mg-head-actions"><button class="btn-outline" data-act="renameGroup">Rename</button>' +
             '<button class="btn btn-danger-outline" data-act="deleteGroup" data-group="' + esc(name) + '">Delete</button></div>';
         const memberEditor = manageTab === 'devices'
           ? '<div><div class="mg-search"><input class="mg-search-input" data-mg-search placeholder="⌕ Search devices to add…" value="' + esc(manageSearch) + '">' +
             '<button class="mg-sort-btn" data-act="sortManage" title="Sort by name">Name<span class="sort-arrow">' + (manageSort === 'label-desc' ? '▼' : '▲') + '</span></button></div>' +
-            '<div class="mg-dev-list" id="mgDevList">' + renderMgDevListHtml() + '</div>' +
-            '<div class="mg-footer"><span class="mg-foot-count">' + manageMembers.size + ' selected</span>' +
+            '<div class="mg-dev-list" id="mgDevList"></div>' +
+            '<div class="mg-footer"><span class="mg-foot-count"></span>' +
             '<div class="spacer"></div>' +
             '<button class="btn-text" data-act="cancelMembers">Cancel</button>' +
             '<button class="btn btn-primary" data-act="saveMembers">Save</button></div>' +
@@ -2643,44 +2722,38 @@
           '<div class="subtabs mg-tabs"><button class="subtab' + (manageTab === 'devices' ? ' active' : '') + '" data-act="manageTab" data-manage-tab="devices" aria-pressed="' + (manageTab === 'devices') + '">Devices</button>' +
           '<button class="subtab' + (manageTab === 'settings' ? ' active' : '') + '" data-act="manageTab" data-manage-tab="settings" aria-pressed="' + (manageTab === 'settings') + '">Settings</button><div class="subtabs-fill"></div></div>' +
           memberEditor;
+        manageRenderedLayout = layout;
+        refreshManageDetailContents();
+      }
+
+      function refreshManageDetailContents() {
+        const name = manageSelectedGroup;
+        if (!name || !Object.hasOwn(groups, name)) return;
+        if (manageTab === 'devices') {
+          const members = selectedManageMembers();
+          refreshMgDevList(members);
+          updateMgCounts(members);
+        } else {
+          updateMgCounts(groups[name]);
+        }
         renderMembershipFeedback();
         groupSettingsPanel.hidden = manageTab !== 'settings';
-        restoreRenameGroupFocus(hadRenameFocus);
         configurationController.renderGroup(manageTab === 'settings' ? name : null);
-      }
-
-      function renameInputFocused() {
-        const a = document.activeElement;
-        return !!(a && a.matches && a.matches('[data-mg-rename]'));
-      }
-
-      // Counterpart of restoreLabelEditFocus() for the group-rename input, with the same
-      // "only if it already had focus" rule so the manage-view search box keeps the caret.
-      function restoreRenameGroupFocus(hadFocus) {
-        if (!renamingManageGroup) return;
-        if (!hadFocus && !renameGroupRefocus) return;
-        renameGroupRefocus = false;
-        const r = mgDetail.querySelector('[data-mg-rename]');
-        if (!r) return;
-        setTimeout(function () {
-          r.focus();
-          if (renameGroupCaret === null) r.select();
-          else r.setSelectionRange(renameGroupCaret, renameGroupCaret);
-        }, 0);
       }
 
       function openRenameGroupEditor() {
         renamingManageGroup = true;
         renameGroupDraft = manageSelectedGroup || '';
-        renameGroupCaret = null;
-        renameGroupRefocus = true;
         renderManageDetail();
+        const input = mgDetail.querySelector('[data-mg-rename]');
+        if (input) {
+          input.focus();
+          input.select();
+        }
       }
       function closeRenameGroupEditor() {
         renamingManageGroup = false;
         renameGroupDraft = '';
-        renameGroupCaret = null;
-        renameGroupRefocus = false;
         renderManageDetail();
       }
       // Commit the group rename from the live input, falling back to the draft if a
@@ -2694,14 +2767,18 @@
         if (nn && nn !== from) sendRenameGroup(from, nn);
       }
 
-      function renderMgDevListHtml() {
-        if (!devices.length) return '<div class="empty small">No devices yet</div>';
+      function renderMgDevListHtml(members = selectedManageMembers()) {
+        const query = manageSearch.trim().toLowerCase();
+        const ghosts = Array.from(members).filter(function (id) {
+          return !deviceById(id) && (!query || String(id).toLowerCase().includes(query));
+        });
+        if (!devices.length && !ghosts.length) return '<div class="empty small">No devices yet</div>';
         // Filter (by device name/label) and sort via the shared helper (issue #57).
         const list = filterSortDevices(manageSearch, manageSort);
-        if (!list.length) return '<div class="empty small">No matching devices</div>';
-        return list.map(function (d) {
-          const id = getDeviceId(d); const mem = manageMembers.has(id); const off = !isOnline(d);
-          const otherGroups = window.MdmConfigurationPackages.membershipGroups(id, groups).filter(function (name) { return name !== manageSelectedGroup; });
+        if (!list.length && !ghosts.length) return '<div class="empty small">No matching devices</div>';
+        const rows = list.map(function (d) {
+          const id = getDeviceId(d); const mem = members.has(id); const off = !isOnline(d);
+          const otherGroups = membership.membershipGroups(id, groups).filter(function (name) { return name !== manageSelectedGroup; });
           return '<div class="mg-dev" data-act="toggleMember" data-id="' + esc(id) + '">' +
             '<div class="selbox ' + (mem ? 'on' : '') + '">' + (mem ? '✓' : '') + '</div>' +
             '<div class="mg-dev-main">' +
@@ -2710,22 +2787,40 @@
             (otherGroups.length ? '<div class="mg-dev-overlap" data-member-move="' + esc(otherGroups.join(', ')) + '">' + (mem ? 'Moves from ' : 'Adding moves from ') + esc(otherGroups.join(', ')) + '</div>' : '') + '</div></div>' +
             '<div class="mg-dev-status"><span class="dot ' + (off ? 'off' : '') + '"></span>' + (off ? 'Offline' : 'Online') + '</div>' +
             '</div>';
-        }).join('');
+        });
+        ghosts.forEach(function (id) {
+          const otherGroups = membership.membershipGroups(id, groups)
+            .filter(function (name) { return name !== manageSelectedGroup; });
+          rows.push('<div class="mg-dev mg-dev-ghost" data-act="toggleMember" data-id="' + esc(id) + '">' +
+            '<div class="selbox on">✓</div>' +
+            '<div class="mg-dev-main"><div><span class="dev-label">Unknown device</span></div>' +
+            '<div class="dev-sub">' + deviceIdHtml({}, id) + ' · Stored member not in the device list' +
+            (otherGroups.length ? '<div class="mg-dev-overlap" data-member-move="' + esc(otherGroups.join(', ')) + '">Also in ' + esc(otherGroups.join(', ')) + '</div>' : '') +
+            '</div></div><div class="mg-dev-status"><span class="dot off"></span>Unknown · select to remove</div></div>');
+        });
+        return rows.join('');
       }
 
-      function refreshMgDevList() {
+      function refreshMgDevList(members) {
         const el = document.getElementById('mgDevList');
-        if (el) el.innerHTML = renderMgDevListHtml();
+        if (!el) return;
+        const content = renderMgDevListHtml(members);
+        if (renderedMemberList === el && renderedMemberListContent === content) return;
+        const scrollTop = el.scrollTop;
+        el.innerHTML = content;
+        el.scrollTop = scrollTop;
+        renderedMemberList = el;
+        renderedMemberListContent = content;
       }
 
       // Update the member count in the header/footer in place, without rebuilding
       // the device list (which would reset its scroll position on every toggle).
-      function updateMgCounts() {
+      function updateMgCounts(members = selectedManageMembers()) {
+        const memArr = Array.from(members);
         const foot = mgDetail.querySelector('.mg-foot-count');
-        if (foot) foot.textContent = manageMembers.size + ' selected';
+        if (foot) foot.textContent = memArr.length + ' selected';
         const sub = mgDetail.querySelector('.mg-sub');
         if (sub) {
-          const memArr = Array.from(manageMembers);
           const offCount = memArr.filter(function (s) { const d = deviceById(s); return !d || !isOnline(d); }).length;
           sub.textContent = (memArr.length - offCount) + ' online, ' + offCount + ' offline';
         }
@@ -3447,69 +3542,57 @@
         else if (act === 'selectManageGroup') { selectManageGroup(t.dataset.group); renderManageSidebar(); renderManageDetail(); }
         else if (act === 'addGroup') {
           const inp = mgSidebar.querySelector('[data-mg-new]'); const name = inp ? inp.value.trim() : '';
-          if (name) { sendCreateGroup(name); pendingSelectGroup = name; if (inp) inp.value = ''; }
+          if (name && sendCreateGroup(name) && inp) inp.value = '';
         }
         else if (act === 'toggleMember') {
           if (membershipSave?.state === 'saving' && membershipSave.name === manageSelectedGroup) return;
           const id = t.dataset.id;
-          const nowMember = !manageMembers.has(id);
-          if (nowMember) manageMembers.add(id);
-          else manageMembers.delete(id);
-
-          const committed = window.MdmConfigurationPackages.membershipGroups(
-            id, groups).includes(manageSelectedGroup);
-          if (nowMember === committed) {
-            manageEditedMembers.delete(id);
-            manageAddedOwners.delete(id);
-          } else {
-            manageEditedMembers.add(id);
-            if (nowMember) {
-              let owner;
-              try {
-                owner = window.MdmConfigurationPackages.expectedMembershipOwner(
-                  id, manageSelectedGroup, groups);
-              } catch (error) {
-                manageMembers.delete(id);
-                manageEditedMembers.delete(id);
-                showMembershipFeedback(manageSelectedGroup, error.message, 'error');
-                return;
-              }
-              manageAddedOwners.set(id, owner);
-            } else {
-              manageAddedOwners.delete(id);
-            }
+          let nowMember;
+          try {
+            nowMember = membership.toggleMember(manageSelectedGroup, groups, memberEdits, id);
+          } catch (error) {
+            showMembershipFeedback(manageSelectedGroup, error.message, 'error');
+            return;
           }
-          // Update only the clicked row + counts so the list keeps its scroll position.
-          const box = t.querySelector('.selbox');
-          if (box) { box.classList.toggle('on', nowMember); box.textContent = nowMember ? '✓' : ''; }
-          const move = t.querySelector('[data-member-move]');
-          if (move) move.textContent = (nowMember ? 'Moves from ' : 'Adding moves from ') + move.dataset.memberMove;
-          updateMgCounts();
+          const members = selectedManageMembers();
+          if (!deviceById(id)) {
+            refreshMgDevList(members);
+          } else {
+            // Keep the existing row and its controls while updating the render cache.
+            const box = t.querySelector('.selbox');
+            if (box) { box.classList.toggle('on', nowMember); box.textContent = nowMember ? '✓' : ''; }
+            const move = t.querySelector('[data-member-move]');
+            if (move) move.textContent = (nowMember ? 'Moves from ' : 'Adding moves from ') + move.dataset.memberMove;
+            renderedMemberListContent = renderMgDevListHtml(members);
+          }
+          updateMgCounts(members);
         }
         else if (act === 'saveMembers') saveGroupMembers();
         else if (act === 'cancelMembers') {
           if (membershipSave?.state === 'saving' && membershipSave.name === manageSelectedGroup) return;
-          manageMembers = new Set(groups[manageSelectedGroup] || []);
-          manageEditedMembers.clear();
-          manageAddedOwners.clear();
+          memberEdits.clear();
           membershipSave = null;
           renderManageDetail();
         }
         else if (act === 'renameGroup') openRenameGroupEditor();
         else if (act === 'saveRename') commitRenameGroup();
         else if (act === 'cancelRename') closeRenameGroupEditor();
-        else if (act === 'deleteGroup') { const name = t.dataset.group; if (confirm('Delete group "' + name + '"?\nThis removes the group and its package assignment. Existing values on devices stay in place.')) sendDeleteGroup(name); }
+        else if (act === 'deleteGroup') {
+          const name = t.dataset.group;
+          if (membershipSave?.state === 'saving' && membershipSave.name === name) return;
+          if (confirm('Delete group "' + name + '"?\nThis removes the group and its package assignment. Existing values on devices stay in place.')) sendDeleteGroup(name);
+        }
       });
       // Manage search + keyboard
       manageView.addEventListener('input', function (e) {
         if (e.target.matches('[data-mg-search]')) { manageSearch = e.target.value; refreshMgDevList(); }
-        else if (e.target.matches('[data-mg-rename]')) { renameGroupDraft = e.target.value; renameGroupCaret = e.target.selectionStart; }
+        else if (e.target.matches('[data-mg-rename]')) renameGroupDraft = e.target.value;
       });
       manageView.addEventListener('keydown', function (e) {
         if (e.isComposing || e.keyCode === 229) return; // ignore IME composition-confirming keys
         if (e.target.matches('[data-mg-new]') && e.key === 'Enter') {
           e.preventDefault();
-          const name = e.target.value.trim(); if (name) { sendCreateGroup(name); pendingSelectGroup = name; e.target.value = ''; }
+          const name = e.target.value.trim(); if (name && sendCreateGroup(name)) e.target.value = '';
         } else if (e.target.matches('[data-mg-rename]')) {
           if (e.key === 'Enter') { e.preventDefault(); commitRenameGroup(); }
           else if (e.key === 'Escape') { e.preventDefault(); closeRenameGroupEditor(); }

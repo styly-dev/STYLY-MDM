@@ -9,6 +9,7 @@ import android.os.Environment
 import android.util.Log
 import com.pvr.tobservice.ToBServiceHelper
 import java.io.File
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Application class that initializes PICO Enterprise SDK (TobService) and owns
@@ -42,6 +43,8 @@ class MdmClientApplication : Application() {
 
         internal fun configurationPackageController(): ConfigurationPackageController = configurationPackages
     }
+
+    private val bindingGeneration = AtomicLong()
 
     override fun onCreate() {
         super.onCreate()
@@ -85,6 +88,7 @@ class MdmClientApplication : Application() {
     private fun bindTobService() {
         try {
             ToBServiceHelper.getInstance().bindTobService(this) { status ->
+                val generation = bindingGeneration.incrementAndGet()
                 Log.i(TAG, "TobService bind status: $status")
                 wifiController?.refreshReadiness()
                 if (status) {
@@ -101,8 +105,8 @@ class MdmClientApplication : Application() {
                         )
                     }
                     recoverFromSelfUpdate()
-                    configurationPackages.onSdkReady()
                 }
+                configurationPackages.onSdkReady(status) { bindingGeneration.get() == generation }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to bind TobService", e)

@@ -57,6 +57,17 @@ internal fun settingOutcome(
     if (reason != null) put("reason", reason)
 }
 
+internal fun settingsFailureOutcome(failure: Throwable, fallback: String): JSONObject {
+    val reason = when (failure) {
+        is PicoDeviceSettings.SettingFailure -> failure.reason
+        is SecurityException -> "PERMISSION_DENIED"
+        is TimeoutException -> "CALLBACK_TIMEOUT"
+        is IllegalArgumentException -> "INVALID_VALUE"
+        else -> fallback
+    }
+    return settingOutcome(if (reason == "UNSUPPORTED") "unsupported" else "failed", reason = reason)
+}
+
 internal fun pollBluetoothState(
     target: Boolean?,
     nowElapsed: () -> Long = SystemClock::elapsedRealtime,
@@ -99,8 +110,6 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
         private const val DEVELOPER_MENU_VISIBLE = "tab_key_developerextra_item_visible"
     }
 
-    private class SettingFailure(val reason: String) : Exception()
-
     fun apply(values: JSONObject, overwrite: Boolean): JSONObject {
         val results = JSONObject()
         val written = linkedMapOf<String, Any>()
@@ -119,8 +128,10 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
                     awaitValue(key, target)
                 }
                 written[key] = target
+            } catch (failure: LinkageError) {
+                results.put(key, settingsFailureOutcome(failure, error))
             } catch (failure: Exception) {
-                results.put(key, failureOutcome(failure, error))
+                results.put(key, settingsFailureOutcome(failure, error))
             }
         }
 
@@ -144,8 +155,10 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
                 val value = if (actual is PicoShutdownSchedule) actual.toJson() else actual
                 if (matches(key, actual, target)) settingOutcome("applied", value)
                 else settingOutcome("failed", value, "READBACK_MISMATCH")
+            } catch (failure: LinkageError) {
+                settingsFailureOutcome(failure, "READ_FAILED")
             } catch (failure: Exception) {
-                failureOutcome(failure, "READ_FAILED")
+                settingsFailureOutcome(failure, "READ_FAILED")
             })
         }
         return results
@@ -265,14 +278,5 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
         if (code != 0) throw SettingFailure(if (code == -2) "UNSUPPORTED" else "WRITE_FAILED")
     }
 
-    private fun failureOutcome(failure: Exception, fallback: String): JSONObject {
-        val reason = when (failure) {
-            is SettingFailure -> failure.reason
-            is SecurityException -> "PERMISSION_DENIED"
-            is TimeoutException -> "CALLBACK_TIMEOUT"
-            is IllegalArgumentException -> "INVALID_VALUE"
-            else -> fallback
-        }
-        return settingOutcome(if (reason == "UNSUPPORTED") "unsupported" else "failed", reason = reason)
-    }
+    internal class SettingFailure(val reason: String) : Exception()
 }
