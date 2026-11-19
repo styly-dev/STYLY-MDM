@@ -315,6 +315,12 @@ class MdmClientService : Service() {
     ) {
         Log.i(TAG, "Handling command: $type")
         when (type) {
+            "EXECUTE_RECORDING_CONTROL" -> {
+                val command = commandContext ?: return
+                NativeRecordingControl(applicationContext).execute(payload, command::isActive) { result ->
+                    webSocketManager.sendMessageForCommand(command, result)
+                }
+            }
             "EXECUTE_LAUNCH" -> executeLaunch(payload)
             "EXECUTE_UNINSTALL" -> executeUninstall(payload)
             "EXECUTE_INSTALL" -> executeInstall(payload)
