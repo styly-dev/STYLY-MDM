@@ -129,5 +129,4 @@ Personal prefers WPA3 and allows WPA2 fallback. Passwords contain 1–63
 printable ASCII characters; use at least eight to allow WPA2.
 
 The server stores Wi-Fi passwords in plaintext in its registry and backups.
-Editor responses, device reports, and console logs omit them. Device test
-results are in the [PICO Wi-Fi field notes](PICO_WIFI_FIELD_NOTES.md).
+Editor responses, device reports, and console logs omit them.

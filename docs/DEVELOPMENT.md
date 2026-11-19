@@ -85,8 +85,7 @@ compatibility, and message sequences.
 
 ### Configuration packages
 
-Operator-facing Wi-Fi behavior is in [Wi-Fi settings](WIFI_SETTINGS.md). Device
-findings are in the [PICO Wi-Fi field notes](PICO_WIFI_FIELD_NOTES.md).
+Operator-facing Wi-Fi behavior is in [Wi-Fi settings](WIFI_SETTINGS.md).
 
 #### Groups and deployment
 
