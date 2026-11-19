@@ -615,7 +615,9 @@ class WebSocketManager internal constructor(
             if (identity is DeviceIdentityState.Ready) {
                 put("device_id", identity.deviceId)
                 put("process_instance_id", pushFields!!.getString("process_instance_id"))
-                put("capabilities", pushFields.getJSONArray("capabilities"))
+                put("capabilities", JSONArray(pushFields.getJSONArray("capabilities").toString()).apply {
+                    put(OPEN_URL_CAPABILITY)
+                })
                 put("push_state", pushFields.getJSONObject("push_state"))
                 put("push_runtime", pushFields.getJSONObject("push_runtime"))
                 val startupConfig = getStartupAppConfig()

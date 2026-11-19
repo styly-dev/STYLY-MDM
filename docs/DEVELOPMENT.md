@@ -20,6 +20,9 @@ For end-user setup and usage, see the [README](../README.md).
 
 ### Durable Push / Sync jobs
 
+See also [headset browser controls](#headset-browser-controls) for URL navigation
+over the existing command connection.
+
 **Push Files** and **Sync Folder** use server-owned UUID jobs, a SQLite-backed
 lifecycle, immutable artifacts, and an Application-scoped client coordinator.
 APK installation keeps its existing command path and shares the server-wide
@@ -82,6 +85,61 @@ payloads and parser exception details that could contain artifact lease tokens.
 [`PUSH_JOBS.md`](PUSH_JOBS.md) is the canonical specification for protocol fields,
 state transitions, Resume/Cancel/Retry eligibility, retention, recovery, deployment
 compatibility, and message sequences.
+
+### Headset browser controls
+
+Select exactly one online headset and use **Open URL** with a complete HTTP(S)
+address. The address opens in the headset and may interrupt its current experience.
+LAN addresses are supported; `localhost` refers to the headset. The result confirms
+a browser launch request, not successful page loading or a first-run browser prompt.
+
+Update the server and client APK together. This uses the existing WebSocket
+connection, with no ADB, separate helper, or new permission. Only ready canonical
+clients advertising `open_url_v1` are eligible; live device lists expose
+`open_url_supported`. Older clients, legacy identities, and provisional connections
+are ineligible. Capabilities refresh on same-socket registration and are never
+inferred from version numbers.
+
+| Direction | Message | Fields / behavior |
+|---|---|---|
+| Admin → Server | `OPEN_URL` | UUID `request_id`, one-element `target_devices`, `url` |
+| Server → Client | `EXECUTE_OPEN_URL` | Same request ID and original URL |
+| Server → Admin | `OPEN_URL_SENT` | Request ID and device ID; dispatch only |
+| Client → Server | `OPEN_URL_RESULT` | Request ID and fixed result `code` |
+| Server → Requesting admin | `OPEN_URL_RESULT` | Request ID, authoritative device ID, `status=requested/fail`, fixed code/message |
+
+`BrowserControl` validates before dispatch, permits one in-flight request per
+headset, and accepts results only from the original, current registered socket.
+Unconfirmed requests expire after 18 seconds and are never retried automatically.
+Only static result messages reach the console; URLs and exception details are not
+logged, persisted, or included in results. URL transport uses the existing trusted
+LAN connection, which is not encrypted by default.
+
+Android validates again. `BrowserLaunchRequests` creates a random one-shot token
+and calls PICO `pbsStartActivity` to open `BrowserLaunchActivity`. Only the token is
+passed in vendor extras; the URL and original connection remain in private memory
+with a 12-second expiry. The exported activity rejects unsolicited, expired, and
+consumed tokens. Process loss, service destruction, and socket replacement
+invalidate pending navigation. Delayed timeout callbacks cannot clear newer work.
+
+The activity waits for `onResume` before opening the browser, avoiding Android's
+background activity restrictions on direct service launches. It resolves
+`ACTION_MAIN` / `CATEGORY_APP_BROWSER` without a URL, then launches `ACTION_VIEW` /
+`CATEGORY_BROWSABLE` restricted to that package. This preserves the PICO fix from
+[IMMENSIVA-MDM PR #2](https://github.com/krispatl/IMMENSIVA-MDM/pull/2): a browser's
+launcher and URL entry point need not be the same activity. Only the URI scheme is
+lowercased for Android matching; path, query, and fragment are preserved. Missing
+browsers, chooser resolution, vendor failures, and missing callbacks report
+explicit failures. The handoff activity closes after dispatch.
+
+Host tests cover URL validation, actual WebSocket registration/dispatch/results,
+capability refresh, stale sockets, timeout, busy requests, one-shot token expiry,
+and console feedback. Physical PICO testing remains necessary for vendor activity
+launch from background, browser chooser/first-run prompts, and actual page loading.
+
+References: [PICO Enterprise API](https://business.picoxr.com/us/doc/EnterpriseAPI-Intro),
+[Android web intents](https://developer.android.com/guide/components/intents-common#Browser),
+[Android background activity restrictions](https://developer.android.com/guide/components/activities/background-starts).
 
 ## Building the MDM Client
 

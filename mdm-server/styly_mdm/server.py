@@ -30,6 +30,7 @@ from .device_policy import (
 )
 from .integrity import apk_cd_digest, file_sha256, is_os_metadata
 from .push_jobs import parse_capabilities
+from .browser_control import BrowserControl, CAPABILITY as BROWSER_CAPABILITY
 
 logging.basicConfig(
     level=logging.INFO,
@@ -195,6 +196,7 @@ MAX_IDENTITY_DIAGNOSTIC_LEN = 256
 
 # Connected devices: device_id -> {ws, device_id, model, ip, status, startup_app, battery}
 devices: dict[str, dict] = {}
+browser_control = BrowserControl(devices, command_allowed)
 
 # One entry per live, not-yet-identified socket. This collection is intentionally
 # absent from every persistence path; its connection_id is live-connection scoped
@@ -459,6 +461,7 @@ def build_device_list_msg() -> str:
             "version_name": d.get("version_name", ""),
             # Live-only: whether the connected client can currently accept Push.
             "push_state_status": d.get("push_state_status"),
+            "open_url_supported": BROWSER_CAPABILITY in d.get("capabilities", []) and command_allowed(d),
         }
         for d in devices.values()
     ]
@@ -1318,7 +1321,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                 try:
                     data = json.loads(raw_msg.data)
                 except json.JSONDecodeError:
-                    log.warning("Device sent invalid JSON: %s", raw_msg.data[:200])
+                    log.warning("Device sent invalid JSON")
                     continue
                 if not isinstance(data, dict):
                     await _close_protocol_error(ws, "Device messages must be JSON objects")
@@ -1373,6 +1376,9 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                             data,
                             idempotent=True,
                         )
+                        if _owns_device(device_id, ws):
+                            devices[device_id]["capabilities"] = registration["capabilities"]
+                            await broadcast_device_list()
                         continue
                     if kind == "provisional":
                         now = time.time()
@@ -1425,6 +1431,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "ws": ws,
                         "device_id": device_id,
                         "identity_kind": kind,
+                        "capabilities": registration["capabilities"],
                         "registration_ready": False,
                         "model": model,
                         "ip": ip,
@@ -1652,6 +1659,9 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "detail": detail,
                     })
 
+                elif msg_type == "OPEN_URL_RESULT":
+                    await browser_control.receive(ws, device_id, data)
+
                 elif msg_type in {
                     "LAUNCH_RESULT",
                     "REBOOT_RESULT",
@@ -1829,7 +1839,7 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
                 try:
                     data = json.loads(raw_msg.data)
                 except json.JSONDecodeError:
-                    log.warning("Admin sent invalid JSON: %s", raw_msg.data[:200])
+                    log.warning("Admin sent invalid JSON")
                     continue
 
                 msg_type = data.get("type")
@@ -1846,6 +1856,9 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 if msg_type == "LAUNCH_APP":
                     await handle_launch_app(ws, data)
+
+                elif msg_type == "OPEN_URL":
+                    await browser_control.start(ws, data)
 
                 elif msg_type == "DELETE_APP":
                     await handle_delete_app(ws, data)
@@ -3127,6 +3140,7 @@ def create_app() -> web.Application:
     load_registry()
     app = web.Application(
         client_max_size=max(MAX_APK_SIZE, MAX_BUNDLE_SIZE) + 10 * 1024 * 1024)
+    app.on_cleanup.append(browser_control.close)
 
     # WebSocket endpoints
     app.router.add_get("/ws/device", device_ws_handler)

@@ -585,6 +585,16 @@
               </div>
             </div>
             <div class="cmd-divider"></div>
+            <div class="cmd-section collapsed" data-cmd="browser">
+              <div class="cmd-head" data-act="toggleCmd"><span>Open URL</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <div class="push-note">Open an HTTP(S) address in one selected headset's browser. This can interrupt its current experience. Update the MDM client if this control is unavailable.</div>
+                <input type="url" class="field" id="browserUrl" maxlength="4096" placeholder="https://example.com/" aria-label="Headset browser URL" autocomplete="off" spellcheck="false">
+                <button class="btn btn-primary" id="btnOpenUrl" disabled>Open URL on Headset</button>
+                <div class="push-note" id="browserStatus" role="status" aria-live="polite">Select exactly one online headset with browser support.</div>
+              </div>
+            </div>
+            <div class="cmd-divider"></div>
             <div class="cmd-section collapsed" data-cmd="power">
               <div class="cmd-head" data-act="toggleCmd"><span>Power Control</span><span class="cmd-chevron">▾</span></div>
               <div class="cmd-body">
@@ -640,6 +650,7 @@
     (function () {
       // ---------------- State ----------------
       let ws = null;
+      let browserPending = null;
       let devices = [];
       let provisionalConnections = [];
       let serverVersion = null;        // STYLY-MDM server version, from SERVER_INFO
@@ -723,6 +734,9 @@
       const launchPkg = document.getElementById('launchPkg');
       const launchExtra = document.getElementById('launchExtra');
       const btnLaunch = document.getElementById('btnLaunch');
+      const browserUrl = document.getElementById('browserUrl');
+      const btnOpenUrl = document.getElementById('btnOpenUrl');
+      const browserStatus = document.getElementById('browserStatus');
       const uninstallPkg = document.getElementById('uninstallPkg');
       const uninstallConfirm = document.getElementById('uninstallConfirm');
       const btnUninstall = document.getElementById('btnUninstall');
@@ -976,8 +990,8 @@
         if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
         ws = new WebSocket(proto + '//' + location.host + '/ws/admin');
-        ws.onopen = function () { setConnStatus('connected'); addLog('Connected to server', 'info'); if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; } };
-        ws.onclose = function () { setConnStatus('reconnecting'); addLog('Disconnected from server', 'fail'); scheduleReconnect(); };
+        ws.onopen = function () { setConnStatus('connected'); updateButtons(); addLog('Connected to server', 'info'); if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; } };
+        ws.onclose = function () { setConnStatus('reconnecting'); finishBrowserRequest(null, 'Connection lost. Check the headset before trying again.', false); addLog('Disconnected from server', 'fail'); updateButtons(); scheduleReconnect(); };
         ws.onerror = function () { };
         ws.onmessage = function (e) { try { handleMessage(JSON.parse(e.data)); } catch (err) { addLog('Failed to parse message: ' + err.message, 'fail'); } };
       }
@@ -1061,6 +1075,12 @@
             break;
           }
           case 'LAUNCH_SENT': addLog('Launch command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
+          case 'OPEN_URL_SENT':
+            if (browserPending && browserPending.requestId === msg.request_id) browserStatus.textContent = 'Waiting for the headset browser...';
+            break;
+          case 'OPEN_URL_RESULT':
+            finishBrowserRequest(msg.request_id, msg.message, msg.status === 'requested');
+            break;
           case 'DELETE_APP_SENT': addLog('Uninstall command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
           case 'DELETE_APP_RESULT': {
             const ok = msg.status === 'success';
@@ -1637,6 +1657,11 @@
         const hasInstall = !attentionMode && Array.from(selectedIds).some(function (id) { return isOnline(deviceById(id)); });
         btnInstall.disabled = uploadInProgress || apkFile.files.length === 0 || !hasInstall;
         btnLaunch.disabled = launchPkg.value.trim() === '' || !has;
+        btnOpenUrl.disabled = !!browserPending || !selectedBrowserDevice() || !browserUrl.value || !ws || ws.readyState !== WebSocket.OPEN;
+        if (!browserPending && !browserStatus.dataset.result) {
+          browserStatus.textContent = selectedBrowserDevice() ? 'Enter an HTTP(S) URL to open in the selected headset.' :
+            'Select exactly one online headset with browser support. Update its MDM client if needed.';
+        }
         btnUninstall.disabled = !uninstallConfirm.checked || uninstallPkg.value.trim() === '' || !has;
         btnStartupSet.disabled = startupPkg.value.trim() === '' || !has;
         btnStartupClear.disabled = !has;
@@ -1858,6 +1883,50 @@
       }
 
       // ---------------- Commands ----------------
+      function selectedBrowserDevice() {
+        if (targetTab === 'attention' || selectedIds.size !== 1) return null;
+        const device = deviceById(Array.from(selectedIds)[0]);
+        return device && device.status === 'online' && device.open_url_supported === true ? device : null;
+      }
+
+      function finishBrowserRequest(requestId, message, ok) {
+        if (!browserPending || (requestId !== null && requestId !== browserPending.requestId)) return;
+        clearTimeout(browserPending.timer);
+        const deviceId = browserPending.deviceId;
+        browserPending = null;
+        browserStatus.textContent = message;
+        browserStatus.dataset.result = 'true';
+        addLog('Open URL on ' + labelFor(deviceId) + ': ' + message, ok ? 'success' : 'fail');
+        updateButtons();
+      }
+
+      function sendOpenUrl() {
+        const device = selectedBrowserDevice();
+        if (!device || browserPending) return;
+        delete browserStatus.dataset.result;
+        const url = browserUrl.value;
+        try {
+          const parsed = new URL(url);
+          if (url.length > 4096 || /[\\\s\u0000-\u001f\u007f]/.test(url) || !/^https?:\/\//i.test(url) ||
+              !['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password ||
+              url.slice(url.indexOf('//') + 2).split(/[/?#]/)[0].includes('@')) throw new Error();
+        } catch (_) {
+          browserStatus.textContent = 'Enter a complete HTTP(S) URL without credentials or whitespace.';
+          return;
+        }
+        const bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+        bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
+        const hex = Array.from(bytes, function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+        const requestId = [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join('-');
+        if (!wsSend({ type: 'OPEN_URL', request_id: requestId, target_devices: [device.device_id], url: url }, 'open URL')) return;
+        browserPending = { requestId: requestId, deviceId: device.device_id, timer: setTimeout(function () {
+          finishBrowserRequest(requestId, 'Browser launch was not confirmed. Check the headset before trying again.', false);
+        }, 20000) };
+        browserStatus.textContent = 'Waiting for the headset browser...';
+        updateButtons();
+      }
+
       function sendLaunch() {
         const pkg = launchPkg.value.trim();
         if (!pkg) return;
@@ -3041,6 +3110,8 @@
       btnInstall.addEventListener('click', sendInstall);
       btnUpdateClients.addEventListener('click', sendClientUpdateBulk);
       btnLaunch.addEventListener('click', sendLaunch);
+      browserUrl.addEventListener('input', function () { delete browserStatus.dataset.result; updateButtons(); });
+      btnOpenUrl.addEventListener('click', sendOpenUrl);
       btnUninstall.addEventListener('click', sendUninstall);
       btnStartupSet.addEventListener('click', sendSetStartup);
       btnStartupClear.addEventListener('click', sendClearStartup);
