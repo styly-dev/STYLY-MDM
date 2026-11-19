@@ -290,9 +290,11 @@ the session stopped so the next readiness or connectivity check can retry it.
   connection Android has restored, or selects candidates in order. Failed
   rounds double the wait up to about one minute. When Wi-Fi is off, the client
   waits for it to become available before selecting candidates.
-- Automatic return requests scans while the headset is on a lower candidate:
-  first within 30 seconds, then every five minutes plus up to 10% jitter, and
-  up to 30 minutes after failed requests. Any visible higher candidate triggers
+- Automatic return requests its first scan within 30 seconds of starting to
+  monitor a lower candidate. Five follow-up scans use one-minute intervals,
+  then scans use five-minute intervals. Each interval adds up to 10% jitter.
+  Failed scan requests end the one-minute checks for that session and retry
+  after 10, 20, then 30 minutes. Any visible higher candidate triggers
   a switch. If it fails, the client reselects the previous candidate. Attempts
   wait five minutes, doubling up to 30 minutes after failures. Scans pause
   during that wait, which is kept in memory.

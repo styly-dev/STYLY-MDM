@@ -70,13 +70,14 @@ These apply to priority mode.
   more than one listed network, the client waits about 10 seconds and then
   tries the networks in order. It keeps retrying with a growing delay of up to
   about a minute. While Wi-Fi is off, it waits for the radio to become available.
-- With automatic return on, a headset on a lower network checks Wi-Fi scans for
-  a higher one, first within about 30 seconds and then about every five
-  minutes. Any visible higher network triggers a switch, regardless of signal
-  strength. A switch briefly interrupts communication. If it fails, the client
-  reconnects to the previous network. After each attempt the client waits five
-  minutes, doubling up to 30 minutes after consecutive failures. Scanning pauses
-  during this wait.
+- With automatic return on, a headset on a lower network requests its first
+  scan within 30 seconds. It requests five more scans about one minute apart,
+  then scans about every five minutes. A failed scan ends the one-minute checks
+  for that monitoring session. Any visible higher network triggers a switch,
+  regardless of signal strength. A switch briefly interrupts communication.
+  If it fails, the client reconnects to the previous network. After each
+  attempt the client waits five minutes, doubling up to 30 minutes after
+  consecutive failures. Scanning pauses during this wait.
 - Detection depends on Android scan results. Sleep, throttling, and radio
   conditions can delay it. The console shows the monitor state separately from
   the package result. If the client cannot register to receive scan results, it

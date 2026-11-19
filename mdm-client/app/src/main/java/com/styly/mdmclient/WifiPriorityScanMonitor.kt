@@ -99,6 +99,7 @@ internal class WifiPriorityScanLoop(
         private var cancelScheduled: (() -> Unit)? = null
         private var requestedAt: Long? = null
         private var failures = 0
+        private var fastScansRemaining = FAST_FOLLOW_UP_SCANS
         private var lastProcessedScanTimestampMillis = 0L
 
         fun cancelTimer() {
@@ -161,7 +162,13 @@ internal class WifiPriorityScanLoop(
             }
             if (request != null) {
                 if (newest > lastProcessedScanTimestampMillis) failures = 0
-                scheduleRequest(requestIntervalMillis + jitter(requestIntervalMillis / 10))
+                val interval = if (fastScansRemaining > 0) {
+                    fastScansRemaining--
+                    FAST_REQUEST_INTERVAL_MILLIS
+                } else {
+                    requestIntervalMillis
+                }
+                scheduleRequest(interval + jitter(interval / 10))
             }
             if (newest <= lastProcessedScanTimestampMillis) return
             lastProcessedScanTimestampMillis = newest
@@ -175,6 +182,7 @@ internal class WifiPriorityScanLoop(
 
         private fun failRequest(detail: String) {
             requestedAt = null
+            fastScansRemaining = 0
             failures = (failures + 1).coerceAtMost(16)
             val multiplier = 1L shl failures.coerceAtMost(10)
             scheduleRequest((requestIntervalMillis * multiplier).coerceAtMost(maxBackoffMillis))
@@ -187,6 +195,8 @@ internal class WifiPriorityScanLoop(
     }
 
     companion object {
+        private const val FAST_REQUEST_INTERVAL_MILLIS = 60_000L
+        private const val FAST_FOLLOW_UP_SCANS = 5
         const val REQUEST_INTERVAL_MILLIS = 5 * 60_000L
         const val BROADCAST_TIMEOUT_MILLIS = 20_000L
         const val MAX_BACKOFF_MILLIS = 30 * 60_000L

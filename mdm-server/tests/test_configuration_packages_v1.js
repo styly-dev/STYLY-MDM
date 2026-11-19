@@ -226,7 +226,7 @@ test('auto-return is stored inside the Wi-Fi setting and hidden networks are rej
   assert.match(fixture.packagePanel.innerHTML, /data-setting="wifi" data-field="auto_return"/);
   assert.match(fixture.packagePanel.innerHTML, /data-field="prioritize_networks" checked/);
   assert.match(fixture.packagePanel.innerHTML,
-    /about every 5 minutes while connected below the first choice, including after manual selection or fallback/);
+    /within 30 seconds, then about once a minute for 5 checks, then about every 5 minutes/);
   assert.match(fixture.packagePanel.innerHTML, /tries the previous network again/);
   assert.match(fixture.packagePanel.innerHTML, /Only the first listed Wi-Fi network is enabled for Android auto-connect/);
 

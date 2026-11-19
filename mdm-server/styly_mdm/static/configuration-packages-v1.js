@@ -306,7 +306,7 @@
     const conflicts = wifiConflicts({ managed, value });
     const strategyControls = value.prioritize_networks ? `<small class="wifi-order-note" data-wifi-order-note>${WIFI_ORDER_HELP}</small>
       <label><input type="checkbox" data-setting="${esc(item.id)}" data-field="auto_return" ${value.auto_return ? 'checked' : ''}> Automatically return to a higher-priority network when it becomes available</label>
-      <small>Checks for higher-priority networks about every 5 minutes while connected below the first choice, including after manual selection or fallback. If a move fails and the headset is still disconnected, it tries the previous network again. Android may delay detection.</small>` : '';
+      <small>After manual selection or fallback to a lower-priority network, the headset checks within 30 seconds, then about once a minute for 5 checks, then about every 5 minutes. If a move fails and the headset is still disconnected, it tries the previous network again. Android may delay detection.</small>` : '';
     const priorityControls = `<div class="wifi-options">
       <label><input type="checkbox" data-setting="${esc(item.id)}" data-field="prioritize_networks" ${value.prioritize_networks ? 'checked' : ''}> Prioritize package Wi-Fi networks</label>
       ${strategyControls}

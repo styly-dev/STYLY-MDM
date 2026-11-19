@@ -35,6 +35,13 @@ class WifiPriorityScanMonitorTest {
         assertEquals(WifiPriorityMonitorStatus.MONITORING, events.last().status)
         assertEquals("passive_fresh_scan_results", events.last().detail)
         assertEquals(setOf(profile.identity), events.last().visibleIdentities)
+        assertEquals(10 * 60_000L, scheduler.pending.single().delayMillis)
+
+        backend.accepted = true
+        scheduler.runNext()
+        backend.emit(scheduler.now, samples = listOf(sample(profile, scheduler.now)))
+        scheduler.runCallbacks()
+        assertEquals(5 * 60_000L, scheduler.pending.single().delayMillis)
     }
 
     @Test
@@ -57,7 +64,7 @@ class WifiPriorityScanMonitorTest {
 
         assertEquals("fresh_scan_results", events.last().detail)
         assertEquals(setOf(profile.identity), events.last().visibleIdentities)
-        assertEquals(WifiPriorityScanLoop.REQUEST_INTERVAL_MILLIS, scheduler.pending.single().delayMillis)
+        assertEquals(60_000L, scheduler.pending.single().delayMillis)
     }
 
     @Test
@@ -113,25 +120,29 @@ class WifiPriorityScanMonitorTest {
     }
 
     @Test
-    fun `jitter spreads the first request and the regular interval`() {
+    fun `each session requests five fast follow-up scans then stays at the regular interval`() {
         val backend = FakeBackend().apply { accepted = true }
         val scheduler = FakeScheduler(now = 100_000L)
-        val bounds = mutableListOf<Long>()
-        val source = WifiPriorityScanLoop(backend, scheduler, scheduler::schedule, { scheduler.now }, jitter = { bound ->
-            bounds += bound
-            bound
-        })
+        val source = WifiPriorityScanLoop(backend, scheduler, scheduler::schedule, { scheduler.now }, jitter = { it })
         val profile = network("preferred")
-        source.ensureStarted(listOf(profile)) {}
+        repeat(2) {
+            source.ensureStarted(listOf(profile)) {}
+            assertEquals(30_000L, scheduler.pending.single().delayMillis)
+            val intervals = List(5) { 66_000L } + List(2) { 330_000L }
+            for (interval in intervals) {
+                scheduler.runNext()
+                backend.emit(scheduler.now, samples = listOf(sample(profile, scheduler.now)))
+                scheduler.runCallbacks()
+                assertEquals(interval, scheduler.pending.single().delayMillis)
 
-        assertEquals(WifiPriorityScanLoop.INITIAL_JITTER_MILLIS, scheduler.pending.single().delayMillis)
-        scheduler.runNext()
-        backend.emit(scheduler.now, samples = listOf(sample(profile, scheduler.now)))
-        scheduler.runCallbacks()
-
-        val interval = WifiPriorityScanLoop.REQUEST_INTERVAL_MILLIS
-        assertEquals(interval + interval / 10, scheduler.pending.single().delayMillis)
-        assertEquals(listOf(WifiPriorityScanLoop.INITIAL_JITTER_MILLIS, interval / 10), bounds)
+                // A passive scan and a readiness refresh must not advance or restart the schedule.
+                backend.emit(scheduler.now + 1, samples = listOf(sample(profile, scheduler.now + 1)))
+                scheduler.runCallbacks()
+                source.ensureStarted(listOf(profile)) {}
+                assertEquals(interval, scheduler.pending.single().delayMillis)
+            }
+            source.stop()
+        }
     }
 
     @Test
