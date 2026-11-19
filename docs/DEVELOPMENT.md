@@ -208,10 +208,13 @@ replacement for the same assignment.
   Scalar results are saved before Wi-Fi starts. A recoverable exception during
   application or a process stop before results are saved leaves an interrupted
   attempt. The same package remains eligible for Retry or **Reapply settings**.
-  An unreadable journal blocks writes and is reported as `STORAGE_ERROR`. A subsequent
-  delivery or headset reapply reads it again. If saving the
-  assignment fails before the first attempt is recorded, Retry can start that
-  attempt once storage recovers. A Wi-Fi state file error applies to the
+  A temporary journal read error blocks application and is retried on delivery
+  or headset reapply. If the saved record or journal is malformed, the next
+  authoritative assignment or release replaces it atomically. The client uses
+  its loaded journal when available and starts a fresh one when its contents
+  are corrupt. If saving the assignment fails before the first attempt is
+  recorded, Retry can start that attempt once storage recovers.
+  A Wi-Fi state file error applies to the
   current attempt. The next deployment, Retry, or headset reapply can use the
   saved Wi-Fi state once the file is readable and writable again.
   A release that cannot be saved stops the current Wi-Fi work and leaves the

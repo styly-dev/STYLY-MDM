@@ -12,6 +12,7 @@ import android.os.Process
 import android.os.SystemClock
 import android.provider.Settings
 import androidx.annotation.ChecksSdkIntAtLeast
+import androidx.annotation.RequiresApi
 import com.pvr.tobservice.ToBServiceHelper
 import com.pvr.tobservice.interfaces.IToBService
 import com.pvr.tobservice.interfaces.IToBServiceProxy
@@ -418,6 +419,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         return reason
     }
 
+    @ChecksSdkIntAtLeast(api = Build.VERSION_CODES.TIRAMISU, lambda = 0)
     private inline fun guardedApplication(action: () -> WifiProfileApplication): WifiProfileApplication {
         val result = try {
             requireAuthority()
@@ -466,6 +468,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
 
     private fun ownedMacSettingKey(entry: WifiConfiguredEntry) = "${Process.myUid()}:${entry.security}:${entry.ssid}"
 
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     @Suppress("DEPRECATION")
     private fun addSavedNetwork(
         wifi: WifiManager,

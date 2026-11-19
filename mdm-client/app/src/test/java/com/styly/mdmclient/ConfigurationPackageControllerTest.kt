@@ -8,9 +8,14 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import java.io.File
 
 class ConfigurationPackageControllerTest {
+    @get:Rule val temporary = TemporaryFolder()
+
     @Test
     fun `a scalar writer exception ends the claim and permits Retry on the same boot`() {
         val packages = PackageHarness()
@@ -311,6 +316,66 @@ class ConfigurationPackageControllerTest {
         assertEquals(true, started)
         assertEquals(1, reapplying.scalarWrites.count)
         assertEquals("complete", reapplying.attempt()?.status)
+    }
+
+    @Test
+    fun `a delivery recovers a malformed file and a loaded journal prevents duplicate application`() {
+        val file = temporary.newFile()
+        val store = newPackageStore(file, "{")
+        val packages = PackageHarness(packageStore = store)
+        val policy = scalarPackagePayload()
+        packages.policyWritesToFail = 1
+
+        packages.receiveAndRunWorkers(policy)
+        assertEquals("{", file.readText())
+        assertEquals(0, packages.scalarWrites.count)
+
+        packages.receiveAndRunWorkers(policy)
+        assertEquals("complete", packages.attempt()?.status)
+        assertEquals(1, packages.scalarWrites.count)
+
+        file.writeText("{")
+        packages.receiveAndRunWorkers(policy)
+        val recovered = store.read()
+        assertEquals(REVISION, JSONObject(requireNotNull(recovered.lastPolicy)).getString("revision"))
+        assertEquals("complete", ConfigurationJournal.restore(requireNotNull(recovered.journal)).latest?.status)
+        assertEquals(1, packages.scalarWrites.count)
+    }
+
+    @Test
+    fun `a release replaces corrupt storage and survives an offline restart`() {
+        val store = newPackageStore(temporary.newFile(), "{")
+        val packages = PackageHarness(packageStore = store)
+
+        packages.receiveAndRunWorkers(noPackagePayload())
+        val release = store.read()
+        assertTrue(JSONObject(requireNotNull(release.lastPolicy)).isNull("package_id"))
+        assertEquals("[]", release.journal)
+
+        val restarted = packages.restart()
+        restarted.wifi.worker.runAll()
+        restarted.worker.runAll()
+        assertSame(JSONObject.NULL, restarted.controller.reportValue())
+        assertEquals(0, restarted.scalarWrites.count)
+    }
+
+    @Test
+    fun `a Retry with a corrupt inner journal applies the delivered policy once`() {
+        val policy = scalarPackagePayload().put("boot_count", 133)
+        val damaged = JSONObject().put("last_policy", policy.toString()).put("journal", "invalid").toString()
+        val store = newPackageStore(temporary.newFile(), damaged)
+        val packages = PackageHarness(packageStore = store, failedScalars = setOf("brightness"))
+        packages.wifi.worker.runAll()
+        packages.worker.runAll()
+        assertEquals(0, packages.scalarWrites.count)
+
+        packages.receiveAndRunWorkers(policy.put("retry_id", RETRY_ID))
+        packages.receiveAndRunWorkers(policy)
+        assertEquals(1, packages.scalarWrites.count)
+        val result = requireNotNull(ConfigurationJournal.restore(requireNotNull(store.read().journal)).latest)
+        assertEquals("complete", result.status)
+        assertEquals(setOf(RETRY_ID), result.retryIds)
+        assertTrue(result.needsRetry)
     }
 
     @Test
@@ -1317,6 +1382,16 @@ class ConfigurationPackageControllerTest {
 
     private fun ConfigurationPackageController.resultSnapshot(): JSONObject? = reportValue() as? JSONObject
 
+    private fun newPackageStore(file: File, encoded: String): ConfigurationPackageStore {
+        file.writeText(encoded)
+        return ConfigurationPackageStore(
+            file,
+            syncDirectory = {},
+            readLegacy = { ConfigurationPackageState() },
+            clearLegacy = {},
+        )
+    }
+
     private class PackageHarness(
         val wifi: Harness = Harness(),
         var encodedJournal: String? = null,
@@ -1325,6 +1400,7 @@ class ConfigurationPackageControllerTest {
         deferSdk: Boolean = false,
         failedScalars: Set<String> = emptySet(),
         var journalReadFailuresRemaining: Int = 0,
+        private val packageStore: ConfigurationPackageStore? = null,
     ) {
         val worker = QueueExecutor()
         val scalarWrites = ScalarWrites(failedScalars)
@@ -1344,39 +1420,37 @@ class ConfigurationPackageControllerTest {
                         journalReadFailuresRemaining--
                         throw IllegalStateException("temporary journal read failure")
                     }
-                    encodedJournal
+                    if (packageStore == null) encodedJournal else packageStore.read().journal
                 },
                 writeJournal = {
                     journalWriteCalls++
                     if (journalWriteCalls == journalWriteToFail) {
                         false
                     } else {
+                        packageStore?.save(packageStore.read().copy(journal = it))
                         encodedJournal = it
                         true
                     }
                 },
-                readLastPolicy = { persistedPolicy },
-                writeLastPolicy = {
-                    if (policyWritesToFail > 0) {
-                        policyWritesToFail--
-                        false
-                    } else {
-                        persistedPolicy = it
-                        true
-                    }
+                readLastPolicy = {
+                    if (packageStore == null) persistedPolicy else packageStore.read().lastPolicy
                 },
-                writeInitialAssignment = { journal, lastPolicy ->
-                    journalWriteCalls++
-                    val journalSaved = journalWriteCalls != journalWriteToFail
+                writePolicy = { lastPolicy, journal ->
+                    val journalChanged = journal != null && journal != encodedJournal
+                    if (journalChanged) journalWriteCalls++
+                    val journalSaved = !journalChanged || journalWriteCalls != journalWriteToFail
                     val policySaved = if (policyWritesToFail > 0) {
                         policyWritesToFail--
                         false
                     } else true
                     if (journalSaved && policySaved) {
-                        encodedJournal = journal
+                        packageStore?.savePolicy(lastPolicy, journal)
                         persistedPolicy = lastPolicy
+                        if (journal != null) encodedJournal = journal
                         true
-                    } else false
+                    } else {
+                        false
+                    }
                 },
                 scalarWriter = { { values, overwrite -> scalarWrites.apply(values, overwrite) } },
                 onApplied = { bootReapply, isCurrent -> appliedNotices += AppliedNotice(bootReapply, isCurrent) },
@@ -1390,6 +1464,12 @@ class ConfigurationPackageControllerTest {
 
         fun receive(payload: JSONObject) {
             controller.receive(payload, supportsApply = true, isCurrent = { true })
+            worker.runAll()
+        }
+
+        fun receiveAndRunWorkers(payload: JSONObject) {
+            receive(payload)
+            wifi.worker.runAll()
             worker.runAll()
         }
 
@@ -1413,6 +1493,7 @@ class ConfigurationPackageControllerTest {
                 bootCount = bootCount,
                 deferSdk = deferSdk,
                 failedScalars = scalarWrites.failedKeys,
+                packageStore = packageStore,
             )
         }
 

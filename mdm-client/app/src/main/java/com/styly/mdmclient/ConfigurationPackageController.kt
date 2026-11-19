@@ -6,6 +6,7 @@ import android.util.Log
 import com.pvr.tobservice.ToBServiceHelper
 import com.pvr.tobservice.interfaces.IToBServiceProxy
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
@@ -70,7 +71,7 @@ internal data class ConfigurationAttempt(
             val status = json.getString("status")
             val retryIds = json.getJSONArray("retry_ids")
             return ConfigurationAttempt(
-                version = requireNotNull(ConfigurationVersion.parse(json)),
+                version = ConfigurationVersion.parse(json) ?: throw JSONException("Invalid saved package version"),
                 bootCount = json.getInt("boot_count"),
                 status = if (status == "applying") "interrupted" else status,
                 results = json.getJSONObject("results"),
@@ -124,8 +125,7 @@ internal data class ConfigurationPackageDependencies(
     val readJournal: () -> String?,
     val writeJournal: (String) -> Boolean,
     val readLastPolicy: () -> String?,
-    val writeLastPolicy: (String) -> Boolean,
-    val writeInitialAssignment: (journal: String, lastPolicy: String) -> Boolean,
+    val writePolicy: (lastPolicy: String, journal: String?) -> Boolean,
     val scalarWriter: () -> ((JSONObject, Boolean) -> JSONObject)?,
     val logJournalError: (String) -> Unit = {},
     val onApplied: (bootReapply: Boolean, isCurrent: () -> Boolean) -> Unit = { _, _ -> },
@@ -202,6 +202,7 @@ internal class ConfigurationPackageController(
     private val boot = dependencies.bootCount
     private val listeners = CopyOnWriteArraySet<() -> Unit>()
     private val screenListeners = CopyOnWriteArraySet<() -> Unit>()
+    private var journalCorrupt = false
     private var journal = loadJournal()
     @Volatile private var report: Report = Report.Unknown
     private val reported get() = (report as? Report.Available)?.attempt
@@ -267,36 +268,25 @@ internal class ConfigurationPackageController(
             if (!isCurrent()) return@execute
             reloadJournal()
             val startingAssignment = supportsApply && policy.version != null && latestPolicy?.version == null
-            if (startingAssignment) {
-                // Commit the reset and the first cached assignment together. If the journal
-                // was unreadable, preserve it until a later read succeeds.
-                if (journal == null) {
-                    publish(storageError(policy, previous = null))
-                    return@execute
-                }
-                val firstJournal = ConfigurationJournal()
-                if (!saveInitialAssignment(firstJournal, policy.encode(boot))) {
-                    publish(storageError(policy, null))
-                    return@execute
-                }
-                journal = firstJournal
-                setReport(Report.Cleared)
+            val resetJournal = startingAssignment || journalCorrupt
+            val cached = supportsApply && savePolicy(policy, resetJournal)
+            if (startingAssignment && !cached) {
+                publish(storageError(policy, previous = null))
+                return@execute
             }
+            if (cached && resetJournal && policy.version != null) setReport(Report.Cleared)
             val token = assignment?.takeIf { it.policy.version == policy.version && it.policy.supportsApply == supportsApply }
                 ?.token ?: Any()
             val resumesSupersededApply = pending?.takeIf { assignment?.token === token }?.forceApply == true ||
                 (applyingWifi && assignment?.policy?.version != policy.version &&
                     policy.version?.let { journal?.find(it)?.status == "applying" } == true)
-            val effectiveRetry = if (startingAssignment) null
-                else retryId ?: pending?.takeIf { assignment?.token === token }?.retryId
-            // The same record supplies the assignment or release on the next boot.
-            val cached = supportsApply && (startingAssignment || saveLastPolicy(policy.encode(boot)))
+            val effectiveRetry = retryId ?: pending?.takeIf { assignment?.token === token }?.retryId
             val selected = Assignment(policy, token, cached)
             assignment = selected
             pending = null
             // An authoritative removal still stops live management if writing its marker failed.
             if (cached || (supportsApply && policy.version == null)) {
-                queue(selected, effectiveRetry, forceApply = resumesSupersededApply)
+                queue(selected, effectiveRetry, forceApply = resumesSupersededApply || (resetJournal && retryId != null))
             } else if (supportsApply && policy.version != null) {
                 publish(storageError(policy, journal?.find(policy.version)))
             }
@@ -323,23 +313,22 @@ internal class ConfigurationPackageController(
         }
     }
 
-    private fun saveLastPolicy(encoded: String): Boolean {
-        if (runCatching { dependencies.writeLastPolicy(encoded) }.getOrDefault(false)) return true
-        dependencies.logJournalError("Could not save the last configuration package")
-        return false
-    }
-
-    private fun saveInitialAssignment(journal: ConfigurationJournal, lastPolicy: String): Boolean {
+    private fun savePolicy(policy: Policy, resetJournal: Boolean): Boolean {
+        // A read error can be temporary. Only replace an unreadable journal after a format error.
+        if (resetJournal && journal == null && !journalCorrupt) return false
+        val nextJournal = if (resetJournal) ConfigurationJournal() else journal
         val saved = try {
-            dependencies.writeInitialAssignment(journal.encode(), lastPolicy)
+            dependencies.writePolicy(policy.encode(boot), nextJournal?.encode())
         } catch (_: Exception) {
             false
         }
         if (!saved) {
-            dependencies.logJournalError("Could not atomically save the initial configuration package")
-            return false
+            dependencies.logJournalError("Could not save the configuration package")
+        } else if (resetJournal) {
+            journal = nextJournal
+            journalCorrupt = false
         }
-        return true
+        return saved
     }
 
     fun reapply(expected: ConfigurationVersion, onFinished: (Boolean) -> Unit) {
@@ -372,11 +361,18 @@ internal class ConfigurationPackageController(
         return journal != null
     }
 
-    private fun loadJournal(): ConfigurationJournal? = try {
-        dependencies.readJournal()?.let(ConfigurationJournal::restore) ?: ConfigurationJournal()
-    } catch (_: Exception) {
-        dependencies.logJournalError("Could not read package application journal")
-        null
+    private fun loadJournal(): ConfigurationJournal? {
+        journalCorrupt = false
+        return try {
+            dependencies.readJournal()?.let(ConfigurationJournal::restore) ?: ConfigurationJournal()
+        } catch (_: JSONException) {
+            journalCorrupt = true
+            dependencies.logJournalError("Invalid configuration package state; waiting for a policy delivery")
+            null
+        } catch (_: Exception) {
+            dependencies.logJournalError("Could not read package application journal")
+            null
+        }
     }
 
     private fun scalarWriter(): ((JSONObject, Boolean) -> JSONObject)? = try {
@@ -445,10 +441,10 @@ internal class ConfigurationPackageController(
         }
         val previous = current.find(version)
         val afterReboot = current.latest?.let { it.bootCount != boot } ?: (cachedVersionFromEarlierBoot != null)
-        // An interrupted report can precede the first journal claim if caching the assignment failed.
-        val interruptedBeforeClaim = previous == null &&
-            reported?.takeIf { it.version == version }?.status == "interrupted"
-        val retryId = delivery.retryId?.takeIf { interruptedBeforeClaim || current.shouldApply(version, boot, it) }
+        // A Retry can be the first claim after a journal reset or a failed assignment write.
+        val firstClaim = previous == null && (delivery.forceApply ||
+            reported?.takeIf { it.version == version }?.status == "interrupted")
+        val retryId = delivery.retryId?.takeIf { firstClaim || current.shouldApply(version, boot, it) }
         val automatic = delivery.forceApply ||
             ((delivery.retryId == null || afterReboot) && current.shouldApply(version, boot, null))
         if (retryId == null && !automatic) {
@@ -768,12 +764,8 @@ private fun productionDependencies(context: Context): ConfigurationPackageDepend
         readLastPolicy = {
             if (supportsPico4UltraEnterpriseSettings()) store.read().lastPolicy else null
         },
-        writeLastPolicy = {
-            store.save(store.read().copy(lastPolicy = it))
-            true
-        },
-        writeInitialAssignment = { journal, lastPolicy ->
-            store.save(ConfigurationPackageState(lastPolicy = lastPolicy, journal = journal))
+        writePolicy = { lastPolicy, journal ->
+            store.savePolicy(lastPolicy, journal)
             true
         },
         scalarWriter = {

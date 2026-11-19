@@ -1,5 +1,6 @@
 package com.styly.mdmclient
 
+import org.json.JSONException
 import org.json.JSONObject
 import java.io.File
 import java.nio.file.Files
@@ -22,9 +23,20 @@ internal class ConfigurationPackageStore(
         }
         val data = JSONObject(encoded)
         return ConfigurationPackageState(
-            lastPolicy = data.get("last_policy").takeUnless { it === JSONObject.NULL } as String?,
-            journal = data.get("journal").takeUnless { it === JSONObject.NULL } as String?,
+            lastPolicy = data.savedString("last_policy"),
+            journal = data.savedString("journal"),
         )
+    }
+
+    private fun JSONObject.savedString(key: String): String? = when (val value = get(key)) {
+        JSONObject.NULL -> null
+        is String -> value
+        else -> throw JSONException("Invalid type for $key in configuration package state")
+    }
+
+    fun savePolicy(lastPolicy: String, journal: String?) {
+        // If the journal could not be loaded, preserve the on-disk value or fail the write.
+        save(ConfigurationPackageState(lastPolicy, journal ?: read().journal))
     }
 
     fun save(state: ConfigurationPackageState) {

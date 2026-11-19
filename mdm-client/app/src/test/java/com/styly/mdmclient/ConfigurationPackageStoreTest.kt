@@ -2,6 +2,7 @@ package com.styly.mdmclient
 
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -41,5 +42,34 @@ class ConfigurationPackageStoreTest {
         assertEquals(legacy.journal, restored.journal)
         assertEquals(2, failedCleanups)
         assertEquals(1, legacyReads)
+    }
+
+    @Test
+    fun `a policy write preserves the journal when it was not loaded`() {
+        val file = File(temporary.root, "configuration-packages.json")
+        val original = ConfigurationPackageState("old policy", "saved journal")
+        val store = ConfigurationPackageStore(file, syncDirectory = {}, readLegacy = { original }, clearLegacy = {})
+        store.save(original)
+
+        store.savePolicy("new policy", journal = null)
+
+        assertEquals(ConfigurationPackageState("new policy", "saved journal"), store.read())
+    }
+
+    @Test
+    fun `a filesystem read failure does not replace the saved package state`() {
+        val directoryAtFilePath = File(temporary.root, "configuration-packages.json")
+        assertTrue(directoryAtFilePath.mkdir())
+        val store = ConfigurationPackageStore(
+            directoryAtFilePath,
+            syncDirectory = {},
+            readLegacy = { ConfigurationPackageState("legacy policy", "legacy journal") },
+            clearLegacy = {},
+        )
+
+        assertThrows(IOException::class.java) {
+            store.savePolicy("new policy", journal = null)
+        }
+        assertTrue(directoryAtFilePath.isDirectory)
     }
 }

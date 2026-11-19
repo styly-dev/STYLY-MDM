@@ -1,9 +1,11 @@
 package com.styly.mdmclient
 
+import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.net.wifi.ScanResult
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
@@ -225,8 +227,14 @@ internal class AndroidWifiPriorityScanBackend(context: Context) : WifiPrioritySc
     override fun startScan(): Boolean = manager?.let { it.isWifiEnabled && it.startScan() } == true
 
     @Suppress("DEPRECATION")
-    override fun readSamples(): List<WifiScanSample> =
-        checkNotNull(manager).scanResults.mapNotNull { it.toWifiScanSample() }
+    override fun readSamples(): List<WifiScanSample> {
+        if (appContext.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            throw SecurityException("Wi-Fi scan results require location permission")
+        }
+        return checkNotNull(manager).scanResults.mapNotNull { it.toWifiScanSample() }
+    }
 
     private fun ScanResult.toWifiScanSample(): WifiScanSample? {
         if (SSID.isEmpty()) return null

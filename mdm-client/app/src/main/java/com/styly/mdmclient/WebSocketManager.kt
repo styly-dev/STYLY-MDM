@@ -248,31 +248,20 @@ class WebSocketManager internal constructor(
     }
 
     // Main thread only. Internal journal writes notify often; send only public changes.
-    private var lastWifiState: Pair<WebSocket, String>? = null
-    private var lastConfigurationState: Pair<WebSocket, String>? = null
+    private val wifiReport = SocketStateReport<WebSocket>("wifi_state", "WIFI_STATE")
+    private val configurationReport = SocketStateReport<WebSocket>("configuration_state", "CONFIGURATION_STATE")
 
     private fun publishWifiState() {
         val socket = webSocket ?: return
         if (!isRunning || !registration.isCanonicalAcknowledged(socket)) return
-        val state = wifiController.stateSnapshot().toString()
-        if (lastWifiState?.let { it.first === socket && it.second == state } == true) return
-        lastWifiState = socket to state
-        socket.send(JSONObject().apply {
-            put("type", "WIFI_STATE")
-            put("wifi_state", JSONObject(state))
-        }.toString())
+        wifiReport.publish(socket, wifiController.stateSnapshot(), socket::send)
     }
 
     private fun publishConfigurationState() {
         val socket = webSocket ?: return
         if (!isRunning || !registration.isCanonicalAcknowledged(socket) || !supportsPico4UltraEnterpriseSettings()) return
         val state = configurationPackages.reportValue() ?: return
-        val encoded = state.toString()
-        if (lastConfigurationState?.let { it.first === socket && it.second == encoded } == true) return
-        val sent = socket.send(JSONObject()
-            .put("type", "CONFIGURATION_STATE")
-            .put("configuration_state", state).toString())
-        if (sent) lastConfigurationState = socket to encoded
+        configurationReport.publish(socket, state, socket::send)
     }
 
     private val scheduler = ConnectionScheduler {
@@ -359,8 +348,8 @@ class WebSocketManager internal constructor(
         socketOpen = false
         registration.clear()
         connectedServerAddress = null
-        lastWifiState = null
-        lastConfigurationState = null
+        wifiReport.clear()
+        configurationReport.clear()
     }
 
     fun sendMessage(json: JSONObject) {
@@ -697,7 +686,8 @@ class WebSocketManager internal constructor(
         if (!socket.send(text)) {
             if (canonical) registration.clearSent(socket)
         } else {
-            payload.opt("configuration_state")?.let { lastConfigurationState = socket to it.toString() }
+            wifiReport.recordRegistration(socket, payload)
+            configurationReport.recordRegistration(socket, payload)
         }
     }
 
@@ -814,4 +804,21 @@ class WebSocketManager internal constructor(
         val level: Int,
         val charging: Boolean
     )
+}
+
+internal class SocketStateReport<T : Any>(private val field: String, private val type: String) {
+    private var lastSent: Pair<T, String>? = null
+
+    fun recordRegistration(socket: T, payload: JSONObject) {
+        payload.opt(field)?.let { lastSent = socket to it.toString() }
+    }
+
+    fun publish(socket: T, state: Any, send: (String) -> Boolean) {
+        val encoded = state.toString()
+        if (lastSent?.let { it.first === socket && it.second == encoded } == true) return
+        val message = JSONObject().put("type", type).put(field, state)
+        if (send(message.toString())) lastSent = socket to encoded
+    }
+
+    fun clear() { lastSent = null }
 }
