@@ -10,6 +10,12 @@ STYLY-MDM currently supports PICO devices (PICO OS with Business Mode). Support 
 
 ## Features
 
+- **Headset browsers:** select headsets or a group and use **Open URL** to open an
+  HTTP(S) address, or **Close All Tabs** to close browser tabs while retaining browser data,
+  with individual results. Open URL requires the updated MDM client; closing tabs requires
+  authorized network ADB from the server. See
+  [browser setup and behavior](docs/DEVELOPMENT.md#headset-browser-controls).
+
 - **Multi-device launch** — select devices with the checkboxes (use the header checkbox to select all) and send an app launch command to them at once; offline devices are skipped automatically
 - **Persistent device list** — once an HMD has connected it stays in the list with an `online`/`offline` status instead of vanishing on disconnect; offline devices keep their last-known details, can be pre-labeled, and can be forgotten when decommissioned
 - **Battery monitoring** — connected clients report battery percentage and charging state, and the console highlights low-battery devices

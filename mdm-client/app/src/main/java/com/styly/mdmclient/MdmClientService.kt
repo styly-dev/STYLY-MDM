@@ -183,6 +183,7 @@ class MdmClientService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        BrowserLaunchRequests.clear()
         Log.i(TAG, "MdmClientService destroyed")
         UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_DESTROYED)
         guardEnsureThread.quitSafely()
@@ -315,6 +316,7 @@ class MdmClientService : Service() {
     ) {
         Log.i(TAG, "Handling command: $type")
         when (type) {
+            "EXECUTE_OPEN_URL" -> BrowserLaunchRequests.open(this, payload, commandContext)
             "EXECUTE_LAUNCH" -> executeLaunch(payload)
             "EXECUTE_UNINSTALL" -> executeUninstall(payload)
             "EXECUTE_INSTALL" -> executeInstall(payload)

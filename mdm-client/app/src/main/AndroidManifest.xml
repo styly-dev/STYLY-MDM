@@ -43,6 +43,15 @@
             </intent-filter>
         </activity>
 
+        <!-- TobService launches this foreground handoff. Only a live, one-shot token
+             created by the service can navigate; unsolicited launches immediately close. -->
+        <activity
+            android:name=".BrowserLaunchActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+
         <service
             android:name=".MdmClientService"
             android:exported="true"

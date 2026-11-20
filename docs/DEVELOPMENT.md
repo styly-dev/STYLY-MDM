@@ -20,6 +20,9 @@ For end-user setup and usage, see the [README](../README.md).
 
 ### Durable Push / Sync jobs
 
+See also [headset browser controls](#headset-browser-controls) for URL navigation
+over the existing command connection.
+
 **Push Files** and **Sync Folder** use server-owned UUID jobs, a SQLite-backed
 lifecycle, immutable artifacts, and an Application-scoped client coordinator.
 APK installation keeps its existing command path and shares the server-wide
@@ -82,6 +85,138 @@ payloads and parser exception details that could contain artifact lease tokens.
 [`PUSH_JOBS.md`](PUSH_JOBS.md) is the canonical specification for protocol fields,
 state transitions, Resume/Cancel/Retry eligibility, retention, recovery, deployment
 compatibility, and message sequences.
+
+### Headset browser controls
+
+Select headsets or a group and use **Open URL** with a complete HTTP(S) address.
+The address opens in each eligible headset and may interrupt its current experience.
+Each selected headset reports its own result; offline, unsupported, busy, and failed
+devices do not block dispatch to the others. LAN addresses are supported;
+`localhost` refers to each headset. A result confirms
+a browser launch request, not successful page loading or a first-run browser prompt.
+
+Update the server and client APK together. This uses the existing WebSocket
+connection, with no ADB, separate helper, or new permission. Only ready canonical
+clients advertising `open_url_v1` are eligible; live device lists expose
+`open_url_supported`. Older clients, legacy identities, and provisional connections
+are ineligible. Capabilities refresh on same-socket registration and are never
+inferred from version numbers.
+
+| Direction | Message | Fields / behavior |
+|---|---|---|
+| Admin → Server | `OPEN_URL` | UUID `request_id`, nonempty explicit `target_devices` list, `url`; duplicate IDs are dispatched once |
+| Server → Client | `EXECUTE_OPEN_URL` | Same request ID and original URL |
+| Server → Admin | `OPEN_URL_SENT` | Request ID and device ID for each dispatched headset; dispatch only |
+| Client → Server | `OPEN_URL_RESULT` | Request ID and fixed result `code` |
+| Server → Requesting admin | `OPEN_URL_RESULT` | Request ID, authoritative device ID, `status=requested/fail`, fixed code/message |
+
+`BrowserControl` validates before dispatch, fans out concurrently, permits one
+in-flight request per headset, and accepts each result only from that headset's
+original, current registered socket. Single-target requests retain the same wire
+format. Wildcards and an empty target list are rejected. An invalid URL or target
+list fails the request without dispatch; eligibility and transport failures are
+reported per device. A stalled socket send is bounded to five seconds independently
+of peers. Pending slots are reserved synchronously; owned background send tasks keep
+the admin connection responsive to subsequent commands and are cancelled on shutdown.
+Unconfirmed requests expire after 18 seconds and are never retried automatically.
+Only static result messages reach the console; URLs and exception details are not
+logged, persisted, or included in results. URL transport uses the existing trusted
+LAN connection, which is not encrypted by default.
+
+The console snapshots selected device IDs and labels for each request, including
+offline and unsupported peers so their outcomes are visible. At least one capable
+online device is required to submit. Selection/group changes during execution do
+not alter pending targets. Results are matched by request ID and device ID; duplicate,
+late, and unrelated replies cannot settle other rows. The panel shows aggregate
+completion and per-headset messages. Timeout or connection loss fails only unfinished
+rows and retains already completed results. A retry requires a new explicit action.
+
+Android validates again. `BrowserLaunchRequests` creates a random one-shot token
+and calls PICO `pbsStartActivity` to open `BrowserLaunchActivity`. Only the token is
+passed in vendor extras; the URL and original connection remain in private memory
+with a 12-second expiry. The exported activity rejects unsolicited, expired, and
+consumed tokens. Process loss, service destruction, and socket replacement
+invalidate pending navigation. Delayed timeout callbacks cannot clear newer work.
+
+The activity waits for `onResume` before opening the browser, avoiding Android's
+background activity restrictions on direct service launches. It resolves
+`ACTION_MAIN` / `CATEGORY_APP_BROWSER` without a URL, then launches `ACTION_VIEW` /
+`CATEGORY_BROWSABLE` restricted to that package. This preserves the PICO fix from
+[IMMENSIVA-MDM PR #2](https://github.com/krispatl/IMMENSIVA-MDM/pull/2): a browser's
+launcher and URL entry point need not be the same activity. Only the URI scheme is
+lowercased for Android matching; path, query, and fragment are preserved. Missing
+browsers, chooser resolution, vendor failures, and missing callbacks report
+explicit failures. The handoff activity closes after dispatch.
+
+Host tests cover URL validation, single- and multi-device WebSocket dispatch/results,
+capability refresh, mixed eligibility/transport failures, duplicate IDs, stale sockets,
+timeout, busy requests, one-shot token expiry, and out-of-order console feedback.
+Physical PICO testing remains necessary for vendor activity
+launch from background, browser chooser/first-run prompts, and actual page loading.
+
+References: [PICO Enterprise API](https://business.picoxr.com/us/doc/EnterpriseAPI-Intro),
+[Android web intents](https://developer.android.com/guide/components/intents-common#Browser),
+[Android background activity restrictions](https://developer.android.com/guide/components/activities/background-starts).
+
+### Close all browser tabs
+
+The Browser panel also offers **Close All Tabs on Selected**, independently of the
+URL field. It follows [IMMENSIVA-MDM PR #4](https://github.com/krispatl/IMMENSIVA-MDM/pull/4).
+Each selected canonical, online HMD runs independently. The operation shares the
+same per-headset busy slot as Open URL, including across admin connections.
+Offline, unsupported, or failed peers do not prevent other headsets from finishing.
+
+This operation uses **authorized host ADB**, because [Chromium restricts Android
+DevTools socket access](https://chromium.googlesource.com/chromium/src/+/main/content/browser/android/devtools_auth.cc)
+to shell/root or the browser's own UID. Install Android
+platform-tools on the server and expose `adb` on its `PATH`, or set `STYLY_MDM_ADB`
+to its executable path before starting the server. This supports macOS, Windows,
+and Linux. Enable network debugging on each HMD at port 5555 and authorize the
+server beforehand; the server does not grant debugging permissions automatically.
+Without ADB, Close All Tabs is disabled. No additional client APK update is needed
+for this operation on an existing canonical-ID client; Open URL retains its client
+capability requirement. A discovered ADB executable is a prerequisite, not proof
+of network authorization or browser support.
+
+`BrowserTabs` validates the registered IP address, connects to ADB, then reads the
+published Device-ID-Provider MediaStore namespace (`Pictures/Device-ID-Provider/`,
+including subdirectories, excluding pending images). It requires exactly one valid
+lowercase `GUID.png` entry matching the selected canonical ID. Missing, ambiguous,
+inaccessible, or mismatched identities fail before touching the browser. Hardware
+serials are never substituted for GUIDs. Multiple valid Provider images are rejected
+conservatively, even if the Provider itself would choose the oldest; the images
+are never changed or deleted by this feature.
+
+After identity verification, the server resolves MAIN/APP_BROWSER without a URL
+and selects only `weblayer_devtools_remote_<pid>` belonging to that browser's main
+process. If necessary it opens the browser to restore saved tabs; a blocked launch
+or missing socket produces an explicit failure. It creates one temporary loopback
+ADB forward, snapshots `/json/list`, and sends one `/json/close/<id>` request per
+original page target. Workers and newly opened tabs are not targeted. A lost close
+response is verified by listing tabs again, never by retrying the close.
+
+The result is `confirmed` if no tabs remain, or only one newly created empty tab
+remains; otherwise it is `partial` with closed/remaining counts. This can interrupt
+an experience and discard unsaved page state, but does not clear cookies, login
+sessions, bookmarks, history, downloads, or other browser storage. No `pm clear`
+or force-stop fallback is used. HTTP redirects are rejected, responses are capped
+at 1 MiB, and page titles/URLs are never returned, logged, or persisted. Each request
+removes only its own temporary forward, including on failure/cancellation.
+
+| Direction | Message | Fields / behavior |
+|---|---|---|
+| Admin → Server | `CLOSE_BROWSER_TABS` | UUID `request_id`, explicit nonempty `target_devices`; duplicates dispatch once; no URL required |
+| Server → Requesting admin | `CLOSE_BROWSER_TABS_SENT` | Request ID and device ID; operation started, not confirmation |
+| Server → Requesting admin | `CLOSE_BROWSER_TABS_RESULT` | Request ID, device ID, `status=confirmed/partial/fail`, code/message; successful verification includes `closed_tabs` and `remaining_tabs` |
+| Server → Admin | `DEVICE_LIST` | `close_browser_tabs_supported` reflects server ADB availability and canonical online readiness, independently of `open_url_supported` |
+
+The server bounds close operations to 90 seconds; the console waits 95 seconds.
+Cleanup can extend cancellation briefly. Per-device results retain the original
+selection snapshot, and failure/timeout never causes automatic retries. A timeout
+does not imply that no tabs closed; check the HMD before explicitly trying again.
+Host tests cover transport, identity checks, tab snapshots and verification, cleanup,
+multi-device dispatch, and console results. Physical PICO socket availability,
+authorization, browser lifecycle, and retained browser data still require HMD testing.
 
 ## Building the MDM Client
 
