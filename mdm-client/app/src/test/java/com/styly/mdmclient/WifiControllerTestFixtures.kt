@@ -111,20 +111,19 @@ internal class Harness(
 }
 
 internal class FakeAdapter(initialNetworks: List<WifiNetworkProfile>) : WifiSettingsAdapter {
-    private data class Saved(var profile: WifiNetworkProfile, var autoJoin: Boolean = true)
+    private data class Saved(var profile: WifiNetworkProfile, val networkId: Int, var autoJoin: Boolean = true)
 
-    private val saved = initialNetworks.map(::Saved).toMutableList()
+    private var nextNetworkId = 0
+    private val saved = initialNetworks.map { Saved(it, nextNetworkId++) }.toMutableList()
     val currentProfiles: List<WifiNetworkProfile> get() = saved.map { it.profile }
     val currentAutoJoin: List<Boolean> get() = saved.map { it.autoJoin }
     val applyCalls = mutableListOf<List<WifiNetworkProfile>>()
-    val trustedNetworkCalls = mutableListOf<List<WifiNetworkProfile>>()
+    val trustedNetworkCalls = mutableListOf<Map<WifiNetworkProfile, Int>?>()
     val rewrittenNetworkCalls = mutableListOf<Set<Int>>()
-    val recreationFallbacks = mutableListOf<WifiNetworkProfile?>()
     val selectCalls = mutableListOf<WifiNetworkProfile>()
     var disconnectCalls = 0
         private set
     var application: WifiProfileApplication? = null
-    var recreatesOwnedPrimary = false
     var wifiEnabled = true
     var disconnectResult = WifiReason.NONE
     var disconnectFailure: Throwable? = null
@@ -134,6 +133,13 @@ internal class FakeAdapter(initialNetworks: List<WifiNetworkProfile>) : WifiSett
     var onDisconnect: (() -> Unit)? = null
     var afterSelect: ((WifiNetworkProfile) -> Unit)? = null
     var onCheckWifiEnabled: (() -> Unit)? = null
+
+    fun savedNetworkId(profile: WifiNetworkProfile): Int = saved.first { it.profile.identity == profile.identity }.networkId
+
+    fun replaceSavedNetwork(profile: WifiNetworkProfile) {
+        val index = saved.indexOfFirst { it.profile.identity == profile.identity }
+        saved[index] = Saved(profile, nextNetworkId++)
+    }
 
     fun setAutoJoin(profile: WifiNetworkProfile, enabled: Boolean) {
         val entry = saved.firstOrNull { it.profile.identity == profile.identity }
@@ -149,13 +155,11 @@ internal class FakeAdapter(initialNetworks: List<WifiNetworkProfile>) : WifiSett
     override fun applyProfile(
         target: List<WifiNetworkProfile>,
         prioritizeNetworks: Boolean,
-        primaryRecreation: WifiPrimaryRecreation?,
-        trustedSavedNetworks: List<WifiNetworkProfile>,
+        trustedNetworkIds: Map<WifiNetworkProfile, Int>?,
         beforeMutation: () -> WifiReason?,
     ): WifiProfileApplication {
         applyCalls += target.toList()
-        trustedNetworkCalls += trustedSavedNetworks.toList()
-        recreationFallbacks += primaryRecreation?.fallback
+        trustedNetworkCalls += trustedNetworkIds
         val reason = beforeMutation()
         if (reason != null) {
             rewrittenNetworkCalls.add(emptySet())
@@ -173,17 +177,15 @@ internal class FakeAdapter(initialNetworks: List<WifiNetworkProfile>) : WifiSett
             if (index !in result.usableIndexes) continue
             val existing = saved.firstOrNull { it.profile.identity == profile.identity }
             if (existing == null) {
-                saved += Saved(profile)
+                saved += Saved(profile, nextNetworkId++)
                 newlyAdded += index
                 rewritten += index
-            } else if (profile !in trustedSavedNetworks ||
-                existing.profile.ssid != profile.ssid || existing.profile.security != profile.security ||
-                existing.profile.hidden != profile.hidden
-            ) {
-                existing.profile = profile
-                rewritten += index
-                if (index == 0 && recreatesOwnedPrimary && primaryRecreation?.isFallbackStillConnected?.invoke() == true) {
-                    newlyAdded += index
+            } else {
+                val entry = WifiConfiguredEntry(existing.networkId, existing.profile.ssid,
+                    desiredWifiSecurityView(existing.profile), existing.profile.hidden, existing.autoJoin)
+                if (!canReuseConfiguredWifi(entry, profile, trustedNetworkIds)) {
+                    existing.profile = profile
+                    rewritten += index
                 }
             }
         }
@@ -193,7 +195,11 @@ internal class FakeAdapter(initialNetworks: List<WifiNetworkProfile>) : WifiSett
         }
         afterApply?.invoke()
         rewrittenNetworkCalls += rewritten.toSet()
-        return result.copy(newlyAddedIndexes = newlyAdded, rewrittenIndexes = rewritten)
+        return result.copy(
+            newlyAddedIndexes = newlyAdded,
+            rewrittenIndexes = rewritten,
+            networkIds = result.usableIndexes.associateWith { savedNetworkId(target[it]) },
+        )
     }
 
     override fun selectSavedCandidate(

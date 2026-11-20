@@ -11,7 +11,7 @@ class WifiSettingsControllerTest {
     @Test
     fun `fresh deployment reads an unchanged saved policy and leaves selection untouched`() {
         val primary = network("office-a")
-        val profile = WifiSavedProfile(OLD_REVISION, listOf(primary))
+        val profile = WifiSavedProfile(OLD_REVISION, listOf(primary), networkIds = mapOf(primary.identity to 0))
         val harness = Harness(
             initialState = WifiLocalState(managedWifi = true, lastApplied = profile),
             initialNetworks = listOf(primary),
@@ -20,7 +20,7 @@ class WifiSettingsControllerTest {
         harness.apply(listOf(primary), reuseMatchingProfile = true)
 
         assertEquals(listOf(listOf(primary)), harness.adapter.applyCalls)
-        assertEquals(listOf(listOf(primary)), harness.adapter.trustedNetworkCalls)
+        assertEquals(listOf(mapOf(primary to 0)), harness.adapter.trustedNetworkCalls)
         assertEquals(listOf(emptySet<Int>()), harness.adapter.rewrittenNetworkCalls)
         assertTrue(harness.adapter.selectCalls.isEmpty())
         assertEquals(0, harness.adapter.disconnectCalls)
@@ -31,7 +31,7 @@ class WifiSettingsControllerTest {
     @Test
     fun `fresh deployment repairs auto join drift without rewriting or reconnecting`() {
         val primary = network("office-a")
-        val profile = WifiSavedProfile(OLD_REVISION, listOf(primary))
+        val profile = WifiSavedProfile(OLD_REVISION, listOf(primary), networkIds = mapOf(primary.identity to 0))
         val harness = Harness(
             initialState = WifiLocalState(managedWifi = true, lastApplied = profile),
             initialNetworks = listOf(primary),
@@ -53,7 +53,8 @@ class WifiSettingsControllerTest {
         val primary = network("office-a")
         val fallback = network("office-b")
         val backup = network("office-c")
-        val previous = WifiSavedProfile(OLD_REVISION, listOf(primary, fallback, backup))
+        val previous = WifiSavedProfile(OLD_REVISION, listOf(primary, fallback, backup),
+            networkIds = mapOf(primary.identity to 0, fallback.identity to 1, backup.identity to 2))
         val updatedBackup = backup.copy(password = "new-backup-password")
         val harness = Harness(
             initialState = WifiLocalState(managedWifi = true, lastApplied = previous),
@@ -71,9 +72,49 @@ class WifiSettingsControllerTest {
     }
 
     @Test
+    fun `fresh deployment restores the credential of a replaced saved network`() {
+        val preferred = network("office-a")
+        val harness = Harness(initialNetworks = listOf(preferred))
+        harness.apply(listOf(preferred), prioritizeNetworks = false)
+        val savedId = harness.adapter.savedNetworkId(preferred)
+        assertEquals(savedId, harness.store.state.lastApplied?.networkIds?.get(preferred.identity))
+
+        harness.adapter.replaceSavedNetwork(preferred.copy(password = "other-password"))
+        val replacementId = harness.adapter.savedNetworkId(preferred)
+        assertTrue(replacementId != savedId)
+        harness.apply(listOf(preferred), reuseMatchingProfile = true, prioritizeNetworks = false)
+
+        assertEquals(listOf(preferred), harness.adapter.currentProfiles)
+        assertEquals(replacementId, harness.store.state.lastApplied?.networkIds?.get(preferred.identity))
+        assertEquals(WifiReason.SAVED, harness.store.state.latestResult?.reason)
+        assertEquals(0, harness.adapter.disconnectCalls)
+    }
+
+    @Test
+    fun `an interrupted credential change invalidates the previous password evidence`() {
+        val original = network("office-a", password = "original-password")
+        val changed = original.copy(password = "changed-password")
+        val harness = Harness(initialNetworks = listOf(original))
+        harness.apply(listOf(original), prioritizeNetworks = false)
+
+        harness.adapter.afterApply = {
+            harness.store.writeFailuresRemaining = 1
+            harness.adapter.afterApply = null
+        }
+        harness.apply(listOf(changed), reuseMatchingProfile = true, prioritizeNetworks = false)
+        assertEquals(listOf(changed), harness.adapter.currentProfiles)
+        assertTrue(requireNotNull(harness.store.state.lastApplied).networkIds.isEmpty())
+
+        harness.apply(listOf(original), reuseMatchingProfile = true, prioritizeNetworks = false)
+        assertEquals(listOf(original), harness.adapter.currentProfiles)
+        assertEquals(WifiReason.SAVED, harness.store.state.latestResult?.reason)
+    }
+
+    @Test
     fun `released Wi-Fi policy does not authorize trusted credential reuse on redeploy`() {
         val primary = network("office-a")
-        val previous = WifiSavedProfile(OLD_REVISION, listOf(primary), prioritizeNetworks = false)
+        val previous = WifiSavedProfile(OLD_REVISION, listOf(primary), prioritizeNetworks = false,
+            networkIds = mapOf(primary.identity to 0))
         val harness = Harness(
             initialState = WifiLocalState(managedWifi = false, lastApplied = previous),
             initialNetworks = listOf(primary),
@@ -81,7 +122,7 @@ class WifiSettingsControllerTest {
 
         harness.apply(listOf(primary), reuseMatchingProfile = true, prioritizeNetworks = false)
 
-        assertEquals(listOf(emptyList<WifiNetworkProfile>()), harness.adapter.trustedNetworkCalls)
+        assertEquals(listOf(emptyMap<WifiNetworkProfile, Int>()), harness.adapter.trustedNetworkCalls)
         assertEquals(listOf(setOf(0)), harness.adapter.rewrittenNetworkCalls)
         assertEquals(WifiReason.SAVED, harness.store.state.latestResult?.reason)
     }
@@ -93,7 +134,6 @@ class WifiSettingsControllerTest {
 
         harness.apply(listOf(open), reuseMatchingProfile = true, prioritizeNetworks = false)
 
-        assertEquals(listOf(listOf(open)), harness.adapter.trustedNetworkCalls)
         assertEquals(listOf(emptySet<Int>()), harness.adapter.rewrittenNetworkCalls)
         assertEquals(WifiReason.SAVED, harness.store.state.latestResult?.reason)
     }
@@ -564,33 +604,29 @@ class WifiSettingsControllerTest {
     }
 
     @Test
-    fun `changed inactive password stays pending unless the saved profile is recreated`() {
+    fun `changing an inactive password keeps the saved network ID and its verification pending`() {
         val old = network("first-choice", password = "old-password")
         val changed = old.copy(password = "new-password")
         val fallback = network("backup")
-        for (recreated in listOf(false, true)) {
-            val harness = Harness(
-                initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old, fallback))),
-                initialNetworks = listOf(old, fallback),
-                initialWifi = listOf(observation(10, fallback.ssid)),
-            )
-            harness.adapter.recreatesOwnedPrimary = recreated
-            harness.adapter.afterDisconnect = { harness.connectivity.loseAll() }
-            harness.adapter.afterSelect = { harness.connectivity.update(11, it.ssid) }
+        val harness = Harness(
+            initialState = WifiLocalState(lastApplied = WifiSavedProfile(OLD_REVISION, listOf(old, fallback))),
+            initialNetworks = listOf(old, fallback),
+            initialWifi = listOf(observation(10, fallback.ssid)),
+        )
+        val savedId = harness.adapter.savedNetworkId(old)
+        harness.adapter.afterDisconnect = { harness.connectivity.loseAll() }
+        harness.adapter.afterSelect = { harness.connectivity.update(11, it.ssid) }
 
-            harness.apply(listOf(changed, fallback))
+        harness.apply(listOf(changed, fallback))
 
-            assertEquals(listOf(fallback), harness.adapter.recreationFallbacks)
-            assertEquals(changed.ssid, harness.connectivity.currentUsableSsid())
-            assertEquals(
-                if (recreated) WifiReason.NONE else WifiReason.VERIFY_AFTER_REBOOT,
-                harness.store.state.latestResult?.reason,
-            )
-        }
+        assertEquals(listOf(changed, fallback), harness.adapter.currentProfiles)
+        assertEquals(savedId, harness.adapter.savedNetworkId(changed))
+        assertEquals(changed.ssid, harness.connectivity.currentUsableSsid())
+        assertEquals(WifiReason.VERIFY_AFTER_REBOOT, harness.store.state.latestResult?.reason)
     }
 
     @Test
-    fun `reapply can recreate a pending primary from a verified fallback`() {
+    fun `reapplying a pending primary retains its saved ID and verification marker`() {
         val primary = network("first-choice")
         val fallback = network("backup")
         val profile = WifiSavedProfile(OLD_REVISION, listOf(primary, fallback), unverifiedOnBoot = mapOf(
@@ -601,15 +637,15 @@ class WifiSettingsControllerTest {
             initialNetworks = profile.networks,
             initialWifi = listOf(observation(10, fallback.ssid)),
         )
-        harness.adapter.recreatesOwnedPrimary = true
+        val savedId = harness.adapter.savedNetworkId(primary)
         harness.adapter.afterDisconnect = { harness.connectivity.loseAll() }
         harness.adapter.afterSelect = { harness.connectivity.update(11, it.ssid) }
 
         harness.apply(profile.networks)
 
-        assertEquals(listOf(fallback), harness.adapter.recreationFallbacks)
-        assertEquals(WifiReason.NONE, harness.store.state.latestResult?.reason)
-        assertNull(harness.store.state.lastApplied?.unverifiedBoot(primary, 133))
+        assertEquals(savedId, harness.adapter.savedNetworkId(primary))
+        assertEquals(WifiReason.VERIFY_AFTER_REBOOT, harness.store.state.latestResult?.reason)
+        assertEquals(133, harness.store.state.lastApplied?.unverifiedBoot(primary, 133))
     }
 
     @Test
@@ -628,29 +664,6 @@ class WifiSettingsControllerTest {
     }
 
     @Test
-    fun `an unverified fallback cannot authorize recreating the primary`() {
-        val old = network("first-choice", password = "old-password")
-        val primary = old.copy(password = "new-password")
-        val fallback = network("backup")
-        val profile = WifiSavedProfile(OLD_REVISION, listOf(old, fallback), unverifiedOnBoot = mapOf(
-            fallback.identity to UnverifiedWifiCredential(133, wifiPasswordHash(fallback.password)),
-        ))
-        val harness = Harness(
-            initialState = WifiLocalState(lastApplied = profile),
-            initialNetworks = profile.networks,
-            initialWifi = listOf(observation(10, fallback.ssid)),
-        )
-        harness.adapter.recreatesOwnedPrimary = true
-        harness.adapter.afterDisconnect = { harness.connectivity.loseAll() }
-        harness.adapter.afterSelect = { harness.connectivity.update(11, it.ssid) }
-
-        harness.apply(listOf(primary, fallback))
-
-        assertEquals(listOf<WifiNetworkProfile?>(null), harness.adapter.recreationFallbacks)
-        assertEquals(WifiReason.VERIFY_AFTER_REBOOT, harness.store.state.latestResult?.reason)
-    }
-
-    @Test
     fun `a failed save preserves the currently usable fallback connection`() {
         val old = network("first-choice", password = "old-password")
         val primary = old.copy(password = "new-password")
@@ -660,11 +673,13 @@ class WifiSettingsControllerTest {
             initialNetworks = listOf(old, fallback),
             initialWifi = listOf(observation(10, fallback.ssid)),
         )
+        val savedId = harness.adapter.savedNetworkId(old)
         harness.adapter.application = WifiProfileApplication(listOf(1), WifiReason.UPDATE_FAILED)
 
         harness.apply(listOf(primary, fallback))
 
-        assertEquals(listOf(fallback), harness.adapter.recreationFallbacks)
+        assertEquals(listOf(old, fallback), harness.adapter.currentProfiles)
+        assertEquals(savedId, harness.adapter.savedNetworkId(old))
         assertEquals(WifiReason.UPDATE_FAILED, harness.store.state.latestResult?.reason)
         assertEquals(fallback.ssid, harness.connectivity.currentUsableSsid())
         assertEquals(0, harness.adapter.disconnectCalls)

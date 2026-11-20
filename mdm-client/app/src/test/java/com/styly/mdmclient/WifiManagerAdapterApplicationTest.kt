@@ -57,14 +57,19 @@ class WifiManagerAdapterApplicationTest {
     }
 
     @Test
-    fun `saved profile reuse requires SSID security and hidden readback to match`() {
+    fun `secured profile reuse requires the saved ID and matching readback`() {
         val profile = WifiNetworkProfile("office", "WPA2_WPA3", "trusted-password", hidden = true)
+        val trusted = mapOf(profile to 7)
+        val actual = entry(7, "office", "WPA_PSK", hidden = true)
 
-        assertTrue(wifiConfiguredEntryMatchesProfile(entry(7, "office", "WPA_PSK", hidden = true), profile))
-        assertTrue(wifiConfiguredEntryMatchesProfile(entry(7, "office", "SAE", hidden = true), profile))
-        assertFalse(wifiConfiguredEntryMatchesProfile(entry(7, "other", "WPA_PSK", hidden = true), profile))
-        assertFalse(wifiConfiguredEntryMatchesProfile(entry(7, "office", "OPEN", hidden = true), profile))
-        assertFalse(wifiConfiguredEntryMatchesProfile(entry(7, "office", "WPA_PSK", hidden = false), profile))
+        assertTrue(canReuseConfiguredWifi(actual, profile, trusted))
+        assertTrue(canReuseConfiguredWifi(actual.copy(security = "SAE"), profile, trusted))
+        assertFalse(canReuseConfiguredWifi(actual.copy(networkId = 8), profile, trusted))
+        assertFalse(canReuseConfiguredWifi(actual.copy(ssid = "other"), profile, trusted))
+        assertFalse(canReuseConfiguredWifi(actual.copy(security = "OPEN"), profile, trusted))
+        assertFalse(canReuseConfiguredWifi(actual.copy(hidden = false), profile, trusted))
+        assertFalse(canReuseConfiguredWifi(actual, profile.copy(password = "changed-password"), trusted))
+        assertFalse(canReuseConfiguredWifi(actual, profile, emptyMap()))
     }
 
     @Test
@@ -198,7 +203,7 @@ class WifiManagerAdapterApplicationTest {
     }
 
     @Test
-    fun `stored MAC policy and creator match full or PUI masked SSIDs by network ID`() {
+    fun `stored MAC policy matches full or PUI masked SSIDs by network ID`() {
         val dump = """
             * ID: 7 SSID: "office" PROVIDER-NAME: null
              macRandomizationSetting: 1
@@ -219,11 +224,11 @@ class WifiManagerAdapterApplicationTest {
 
         assertEquals(
             mapOf(
-                7 to WifiStoredNetworkSettings(WifiConfiguration.RANDOMIZATION_AUTO, 10231),
-                9 to WifiStoredNetworkSettings(WifiConfiguration.RANDOMIZATION_NONE, 1000),
-                10 to WifiStoredNetworkSettings(WifiConfiguration.RANDOMIZATION_NON_PERSISTENT, null),
+                7 to WifiConfiguration.RANDOMIZATION_AUTO,
+                9 to WifiConfiguration.RANDOMIZATION_NONE,
+                10 to WifiConfiguration.RANDOMIZATION_NON_PERSISTENT,
             ),
-            wifiStoredNetworkSettings(dump.lineSequence(), mapOf(7 to "\"office\"", 9 to "\"VR-Maintenance\"", 10 to "\"old network\"")),
+            wifiStoredMacSettings(dump.lineSequence(), mapOf(7 to "\"office\"", 9 to "\"VR-Maintenance\"", 10 to "\"old network\"")),
         )
     }
 
@@ -235,9 +240,9 @@ class WifiManagerAdapterApplicationTest {
         val setting = " macRandomizationSetting: 3"
         val original = mapOf(7 to "\"office\"")
 
-        assertTrue(wifiStoredNetworkSettings(sequenceOf(begin, savedHeader, setting), original).isEmpty())
-        assertTrue(wifiStoredNetworkSettings(sequenceOf(begin, savedHeader, setting, savedHeader, end), original).isEmpty())
-        assertTrue(wifiStoredNetworkSettings(sequenceOf(begin, savedHeader, setting.replace('3', '9'), end), original).isEmpty())
+        assertTrue(wifiStoredMacSettings(sequenceOf(begin, savedHeader, setting), original).isEmpty())
+        assertTrue(wifiStoredMacSettings(sequenceOf(begin, savedHeader, setting, savedHeader, end), original).isEmpty())
+        assertTrue(wifiStoredMacSettings(sequenceOf(begin, savedHeader, setting.replace('3', '9'), end), original).isEmpty())
     }
 
     @Test

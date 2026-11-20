@@ -1256,6 +1256,40 @@ class ConfigurationPackageControllerTest {
     }
 
     @Test
+    fun `Retry reapplies a returning assignment after its cache write failed`() {
+        val packages = PackageHarness()
+        val first = scalarPackagePayload()
+        val second = JSONObject()
+            .put("package_id", PACKAGE_ID_2)
+            .put("revision", REVISION_2)
+            .put("settings", JSONObject().put("brightness", 35))
+        packages.scalarWrites.failNext = true
+        packages.receiveAndRunWorkers(first)
+        val oldRetryId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+        val oldRetry = JSONObject(first.toString()).put("retry_id", oldRetryId)
+        packages.receiveAndRunWorkers(oldRetry)
+        assertEquals(60, packages.scalarWrites.currentValues["brightness"])
+        packages.receiveAndRunWorkers(second)
+        assertEquals(35, packages.scalarWrites.currentValues["brightness"])
+
+        packages.policyWritesToFail = 1
+        packages.receiveAndRunWorkers(first)
+        assertEquals("interrupted", packages.controller.resultSnapshot()?.getString("status"))
+        packages.receiveAndRunWorkers(oldRetry)
+        assertEquals("interrupted", packages.controller.resultSnapshot()?.getString("status"))
+        assertEquals(35, packages.scalarWrites.currentValues["brightness"])
+
+        val retry = JSONObject(first.toString()).put("retry_id", RETRY_ID)
+        packages.receiveAndRunWorkers(retry)
+        assertEquals(60, packages.scalarWrites.currentValues["brightness"])
+        assertEquals(ConfigurationVersion(PACKAGE_ID, REVISION), packages.attempt()?.version)
+        assertEquals(setOf(oldRetryId, RETRY_ID), packages.attempt()?.retryIds)
+
+        packages.receiveAndRunWorkers(retry)
+        assertEquals(4, packages.scalarWrites.count)
+    }
+
+    @Test
     fun `returning to a saved package reuses it when the intervening policy never applied`() {
         val networkA = network("office-a")
         val networkB = network("office-b")

@@ -426,15 +426,19 @@ internal class ConfigurationPackageController(
         }
         val previous = current.find(version)
         val afterReboot = current.latest?.let { it.bootCount != boot } ?: (cachedVersionFromEarlierBoot != null)
-        // A Retry can be the first claim after a journal reset or a failed assignment write.
-        val firstClaim = previous == null && (delivery.forceApply ||
+        // A Retry can claim an assignment whose first write failed, even if this
+        // version was applied before a different package changed the device.
+        val needsFreshAttempt = current.shouldApply(version, boot, null)
+        val firstClaim = needsFreshAttempt && (delivery.forceApply ||
             reported?.takeIf { it.version == version }?.status == "interrupted")
-        val retryId = delivery.retryId?.takeIf { firstClaim || current.shouldApply(version, boot, it) }
+        val retryId = delivery.retryId?.takeIf {
+            (firstClaim && it !in previous?.retryIds.orEmpty()) || current.shouldApply(version, boot, it)
+        }
         val automatic = delivery.forceApply ||
-            ((delivery.retryId == null || afterReboot) && current.shouldApply(version, boot, null))
+            ((delivery.retryId == null || afterReboot) && needsFreshAttempt)
         if (retryId == null && !automatic) {
             pending = null
-            if (previous != null) {
+            if (previous != null && !needsFreshAttempt) {
                 publish(previous)
             }
             return

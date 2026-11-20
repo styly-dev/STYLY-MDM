@@ -432,6 +432,14 @@ test('device status uses deployment keys and requires both IDs for current resul
   assert.equal(retryEligible(device({ ...failed, status: 'applying' }), d1), false);
 });
 
+test('release stays pending for a device that still reports a previous deployment', () => {
+  const device = { ...online, configuration_state: applied };
+  assert.equal(deviceOutcome(device, null, null)[1], 'Release pending');
+  assert.equal(deviceOutcome({ ...device, status: 'offline' }, null, null)[1], 'Release pending · Offline');
+  assert.equal(deviceOutcome({ ...device, configuration_supported: false }, null, null)[1], 'Client update needed');
+  assert.equal(deviceOutcome({ ...device, configuration_state: null }, null, null)[1], 'No managed settings');
+});
+
 test('Wi-Fi deployment does not use the removed Wi-Fi priority client gate', () => {
   const wifiDeployment = { ...d1, keys: ['wifi'] };
   const wifiApplied = { ...wifiDeployment, status: 'complete', results: { wifi: { status: 'applied' } } };
@@ -1479,7 +1487,7 @@ test('Group Settings stops managing settings through the same confirmation flow'
   assert.equal(fixture.groupControls['[data-group-package]'].value, '');
   assert.equal(fixture.groupControls['[data-deployment-count]'].hidden, true);
   assert.equal(fixture.groupButtons.deploy.disabled, false);
-  assert.equal(fixture.groupControls['[data-assignment-feedback]'].textContent, 'Stopped managing settings for this group.');
+  assert.equal(fixture.groupControls['[data-assignment-feedback]'].textContent, 'Release saved. Offline devices receive it when they reconnect.');
 });
 
 test('No managed settings for Android selection explains retained Wi-Fi auto-connect settings', async () => {

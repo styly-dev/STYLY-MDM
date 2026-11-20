@@ -243,12 +243,20 @@
   function deviceOutcome(device, packageId, deployment) {
     const online = device?.status === 'online';
     const connection = online ? '' : ' · Offline';
-    if (!packageId) return ['', 'No managed settings' + connection, 'This group has no managed settings.'];
+    const report = device?.configuration_state;
+    if (!packageId) {
+      if (report) {
+        if (online && device.configuration_supported !== true) {
+          return ['unavailable', 'Client update needed', 'Update the client so it can report the release.'];
+        }
+        return ['pending', 'Release pending' + connection, 'Waiting for the device to report that it saved the release.'];
+      }
+      return ['', 'No managed settings' + connection, 'This group has no managed settings.'];
+    }
     if (!deployment) return ['pending', 'Waiting for deployment' + connection, 'Deploy the group package to send its settings to devices.'];
     if (online && device.configuration_supported !== true) {
       return ['unavailable', 'Client update needed', 'This client does not report support for configuration packages.'];
     }
-    const report = device?.configuration_state;
     if (!matchesDeployment(report, deployment) || (!online && report.status === 'applying')) {
       return ['pending', 'Pending' + connection, 'Waiting for the device to report this deployment.'];
     }
@@ -1086,7 +1094,7 @@
         } else {
           delete model.selection;
           model.message = id === null
-            ? 'Stopped managing settings for this group.'
+            ? 'Release saved. Offline devices receive it when they reconnect.'
             : 'Deployment started. Check Device status for results.';
         }
       } catch (error) {

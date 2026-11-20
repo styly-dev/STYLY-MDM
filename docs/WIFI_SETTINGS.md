@@ -85,8 +85,11 @@ or switching to a higher-priority network.
 
 ## Reapply and release
 
-A same-boot deployment whose Wi-Fi setting matches a successful result reuses
-it. To write managed Wi-Fi again, use **Reapply settings** on the headset or reboot it.
+Redelivery of the same revision during the same boot reuses its result. A new
+deployment checks the saved profiles and auto-join flags again. The client
+reuses a secured profile only when the requested profile and its Android network
+ID match the saved evidence. Existing profiles are updated in place. Use
+**Reapply settings** on the headset or reboot it to write managed Wi-Fi again.
 
 **No managed settings**, or turning off **Manage** for Wi-Fi, stops Wi-Fi management.
 Once the headset saves the release or the updated assignment, it also honors

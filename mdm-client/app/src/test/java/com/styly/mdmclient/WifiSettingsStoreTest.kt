@@ -21,6 +21,7 @@ class WifiSettingsStoreTest {
         val expected = WifiLocalState(
             lastApplied = WifiSavedProfile(
                 "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", listOf(preferred, fallback), autoReturn = true,
+                networkIds = mapOf(preferred.identity to 0, fallback.identity to 7),
             ),
             latestResult = WifiManualResult(
                 "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -64,6 +65,7 @@ class WifiSettingsStoreTest {
         assertEquals(133, marker.bootCount)
         assertEquals(wifiPasswordHash(network.password), marker.passwordHash)
         val upgraded = JSONObject(WifiSettingsCodec.encode(migrated))
+        assertEquals(emptyMap<String, Int>(), migrated.lastApplied.networkIds)
         assertEquals(5, upgraded.getInt("version"))
         assertEquals(133, upgraded.getJSONObject("last_applied")
             .getJSONObject("unverified_on_boot").getJSONObject(network.identity).getInt("boot_count"))

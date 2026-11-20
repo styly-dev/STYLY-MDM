@@ -57,10 +57,16 @@ internal data class WifiSavedProfile(
     /** Original first candidate, even if its settings could not be saved. */
     val primaryIdentity: String? = networks.firstOrNull()?.identity,
     val prioritizeNetworks: Boolean = true,
+    /** Android network IDs read back for the credentials in this profile. */
+    val networkIds: Map<String, Int> = emptyMap(),
 ) {
     fun hasSameSettings(other: WifiSavedProfile): Boolean =
         networks == other.networks && autoReturn == other.autoReturn &&
             primaryIdentity == other.primaryIdentity && prioritizeNetworks == other.prioritizeNetworks
+
+    fun networkIdsByProfile(): Map<WifiNetworkProfile, Int> = networks.mapNotNull { network ->
+        networkIds[network.identity]?.let { network to it }
+    }.toMap()
 
     fun unverifiedBoot(network: WifiNetworkProfile, bootCount: Int): Int? {
         val marker = unverifiedOnBoot[network.identity] ?: return null
@@ -191,6 +197,7 @@ internal object WifiSettingsCodec {
         put("networks", encodeNetworks(profile.networks))
         put("auto_return", profile.autoReturn)
         if (!profile.prioritizeNetworks) put("prioritize_networks", false)
+        if (profile.networkIds.isNotEmpty()) put("network_ids", JSONObject(profile.networkIds))
         if (profile.unverifiedOnBoot.isNotEmpty()) {
             put("unverified_on_boot", JSONObject().apply {
                 profile.unverifiedOnBoot.forEach { (identity, marker) ->
@@ -208,6 +215,7 @@ internal object WifiSettingsCodec {
 
     private fun decodeSavedProfile(json: JSONObject): WifiSavedProfile {
         val networks = decodeNetworks(json.getJSONArray("networks"))
+        val ids = json.optJSONObject("network_ids")
         return WifiSavedProfile(
             revision = json.getString("revision"),
             networks = networks,
@@ -234,6 +242,10 @@ internal object WifiSettingsCodec {
             primaryIdentity = if (json.has("primary_identity")) optionalString(json, "primary_identity")
                 else networks.firstOrNull()?.identity,
             prioritizeNetworks = !json.has("prioritize_networks") || requiredBoolean(json, "prioritize_networks"),
+            networkIds = networks.mapNotNull { network ->
+                val id = ids?.opt(network.identity) as? Int
+                id?.takeIf { it >= 0 }?.let { network.identity to it }
+            }.toMap(),
         )
     }
 

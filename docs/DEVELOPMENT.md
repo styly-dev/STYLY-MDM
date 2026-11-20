@@ -108,7 +108,9 @@ the managed settings sent to devices from the saved values.
   editor first. Deploying the package already selected for the group publishes
   a new shared revision.
 - **No managed settings** releases every managed setting for the group and leaves device
-  values in place. For a Wi-Fi package, the confirmation notes that auto-connect
+  values in place when each device receives the release. A device still reporting
+  an earlier deployment shows **Release pending**. Offline devices receive the release
+  when they reconnect. For a Wi-Fi package, the confirmation notes that auto-connect
   flags stay on the headset.
 - Turning off **Manage** for Wi-Fi keeps the saved network values and credentials.
   Incomplete unsaved rows do not block deployment of the other settings.
@@ -195,8 +197,10 @@ replacement for the same assignment.
 - **New deployment:** the client reads every managed setting and records fresh
   results for the new revision. It writes and reads back settings that differ.
   Wi-Fi checks the saved profiles and auto-join flags on the headset. When
-  those settings match and the client has saved evidence for the requested
-  credentials, it retains the existing connection. A changed assignment
+  those settings match and the saved evidence for the requested credentials
+  matches the live Android network ID, it retains the existing connection.
+  Older device caches without network IDs are still readable. A new deployment
+  writes those credentials before trusting their saved IDs. A changed assignment
   rechecks settings even when it returns to an earlier revision.
 - **Redelivery in the same boot:** the current revision reuses its recorded
   attempt, including after an app restart. A new assignment after a release
@@ -292,10 +296,10 @@ the session stopped so the next readiness or connectivity check can retry it.
   and the client durably stores the applied profile. Connection selection
   and fallback can continue after that result. Save and readback failures
   are reported even when a candidate connects.
-- While a usable fallback with unchanged credentials is connected, the client
-  may recreate the MDM-owned first choice. It tracks changed or unknown
-  credentials by boot count and password fingerprint to decide whether it can
-  rely on the fallback during recreation.
+- The client updates existing profiles by ID and retains them on update failure.
+  Android can reuse authentication from earlier in the same boot after a
+  password change. The client tracks uncertain credentials by boot count and
+  password fingerprint, independently of whether the password was saved.
 - After a disconnection with more than one candidate, or with a cached fallback
   profile, the client waits 8 seconds plus up to 3 seconds of jitter. It keeps a
   connection Android has restored, or selects candidates in order. Failed
