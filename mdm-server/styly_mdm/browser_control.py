@@ -1,4 +1,4 @@
-"""Validated, single-headset browser requests over the existing client socket."""
+"""Validated browser requests with independent per-headset dispatch and results."""
 
 import asyncio
 import json
@@ -62,17 +62,22 @@ class BrowserControl:
             await self._reply(admin, None, None, "invalid_request", "A UUID request_id is required.")
             return
         targets = data.get("target_devices")
-        if (not isinstance(targets, list) or len(targets) != 1
-                or not isinstance(targets[0], str) or targets[0] == "*"
+        if (not isinstance(targets, list) or not targets
+                or any(not isinstance(target, str) or not target or target == "*" for target in targets)
                 or "target_connections" in data):
-            await self._reply(admin, request_id, None, "invalid_target", "Select exactly one online headset.")
+            await self._reply(admin, request_id, None, "invalid_target", "Select one or more headsets using explicit device IDs.")
             return
-        device_id = targets[0]
+        targets = list(dict.fromkeys(targets))
         try:
             url = validate_browser_url(data.get("url"))
         except ValueError:
-            await self._reply(admin, request_id, device_id, "invalid_url")
+            await self._reply(admin, request_id, targets[0] if len(targets) == 1 else None, "invalid_url")
             return
+        # Each target owns its eligibility check, pending slot, timeout, and result.
+        # A slow or failed socket must not delay dispatch to another headset.
+        await asyncio.gather(*(self._start_one(admin, request_id, device_id, url) for device_id in targets))
+
+    async def _start_one(self, admin, request_id, device_id, url):
         entry = self.devices.get(device_id)
         if not self.command_allowed(entry, "EXECUTE_OPEN_URL") or entry.get("status", "online") != "online":
             await self._reply(admin, request_id, device_id, "invalid_target", "Select a ready online headset with a canonical identity.")
@@ -85,17 +90,17 @@ class BrowserControl:
             return
         pending = {"request_id": request_id, "socket": entry["ws"], "admin": admin, "timer": None}
         self.pending[device_id] = pending
+        pending["timer"] = asyncio.create_task(self._expire(device_id, pending))
         try:
-            await entry["ws"].send_str(json.dumps({
+            await asyncio.wait_for(entry["ws"].send_str(json.dumps({
                 "type": "EXECUTE_OPEN_URL", "request_id": request_id, "url": url,
-            }))
-        except ConnectionError:
-            self.pending.pop(device_id, None)
-            await self._reply(admin, request_id, device_id, "unavailable")
+            })), timeout=min(self.timeout, 5))
+        except (OSError, RuntimeError, asyncio.TimeoutError):
+            if self.pending.get(device_id) is pending:
+                self.pending.pop(device_id)
+                pending["timer"].cancel()
+                await self._reply(admin, request_id, device_id, "unavailable")
             return
-        # A fast result can settle while send_str is suspended.
-        if self.pending.get(device_id) is pending:
-            pending["timer"] = asyncio.create_task(self._expire(device_id, pending))
         try:
             await admin.send_str(json.dumps({
                 "type": "OPEN_URL_SENT", "request_id": request_id, "device_id": device_id,

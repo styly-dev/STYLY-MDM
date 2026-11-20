@@ -588,10 +588,11 @@
             <div class="cmd-section collapsed" data-cmd="browser">
               <div class="cmd-head" data-act="toggleCmd"><span>Open URL</span><span class="cmd-chevron">▾</span></div>
               <div class="cmd-body">
-                <div class="push-note">Open an HTTP(S) address in one selected headset's browser. This can interrupt its current experience. Update the MDM client if this control is unavailable.</div>
+                <div class="push-note">Open an HTTP(S) address in the selected headsets' browsers. This can interrupt their current experiences. Each headset reports its own result; unavailable devices do not block the others.</div>
                 <input type="url" class="field" id="browserUrl" maxlength="4096" placeholder="https://example.com/" aria-label="Headset browser URL" autocomplete="off" spellcheck="false">
-                <button class="btn btn-primary" id="btnOpenUrl" disabled>Open URL on Headset</button>
-                <div class="push-note" id="browserStatus" role="status" aria-live="polite">Select exactly one online headset with browser support.</div>
+                <button class="btn btn-primary" id="btnOpenUrl" disabled>Open URL on Selected</button>
+                <div class="push-note" id="browserStatus" role="status" aria-live="polite">Select headsets or a group with at least one online headset supporting browser control.</div>
+                <div class="push-note" id="browserResults" aria-label="Browser results by headset"></div>
               </div>
             </div>
             <div class="cmd-divider"></div>
@@ -737,6 +738,7 @@
       const browserUrl = document.getElementById('browserUrl');
       const btnOpenUrl = document.getElementById('btnOpenUrl');
       const browserStatus = document.getElementById('browserStatus');
+      const browserResults = document.getElementById('browserResults');
       const uninstallPkg = document.getElementById('uninstallPkg');
       const uninstallConfirm = document.getElementById('uninstallConfirm');
       const btnUninstall = document.getElementById('btnUninstall');
@@ -991,7 +993,7 @@
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
         ws = new WebSocket(proto + '//' + location.host + '/ws/admin');
         ws.onopen = function () { setConnStatus('connected'); updateButtons(); addLog('Connected to server', 'info'); if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; } };
-        ws.onclose = function () { setConnStatus('reconnecting'); finishBrowserRequest(null, 'Connection lost. Check the headset before trying again.', false); addLog('Disconnected from server', 'fail'); updateButtons(); scheduleReconnect(); };
+        ws.onclose = function () { setConnStatus('reconnecting'); failPendingBrowserRequests('Connection lost. Check the headset before trying again.'); addLog('Disconnected from server', 'fail'); updateButtons(); scheduleReconnect(); };
         ws.onerror = function () { };
         ws.onmessage = function (e) { try { handleMessage(JSON.parse(e.data)); } catch (err) { addLog('Failed to parse message: ' + err.message, 'fail'); } };
       }
@@ -1076,10 +1078,10 @@
           }
           case 'LAUNCH_SENT': addLog('Launch command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
           case 'OPEN_URL_SENT':
-            if (browserPending && browserPending.requestId === msg.request_id) browserStatus.textContent = 'Waiting for the headset browser...';
+            browserRequestSent(msg);
             break;
           case 'OPEN_URL_RESULT':
-            finishBrowserRequest(msg.request_id, msg.message, msg.status === 'requested');
+            finishBrowserRequest(msg.request_id, msg.device_id, msg.message, msg.status === 'requested');
             break;
           case 'DELETE_APP_SENT': addLog('Uninstall command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
           case 'DELETE_APP_RESULT': {
@@ -1657,10 +1659,12 @@
         const hasInstall = !attentionMode && Array.from(selectedIds).some(function (id) { return isOnline(deviceById(id)); });
         btnInstall.disabled = uploadInProgress || apkFile.files.length === 0 || !hasInstall;
         btnLaunch.disabled = launchPkg.value.trim() === '' || !has;
-        btnOpenUrl.disabled = !!browserPending || !selectedBrowserDevice() || !browserUrl.value || !ws || ws.readyState !== WebSocket.OPEN;
+        const browserTargets = selectedBrowserTargets();
+        const browserReady = browserTargets.filter(function (id) { const d = deviceById(id); return d && d.status === 'online' && d.open_url_supported === true; }).length;
+        btnOpenUrl.disabled = !!browserPending || !browserReady || !browserUrl.value || !ws || ws.readyState !== WebSocket.OPEN;
         if (!browserPending && !browserStatus.dataset.result) {
-          browserStatus.textContent = selectedBrowserDevice() ? 'Enter an HTTP(S) URL to open in the selected headset.' :
-            'Select exactly one online headset with browser support. Update its MDM client if needed.';
+          browserStatus.textContent = browserReady ? browserReady + ' of ' + browserTargets.length + ' selected headset(s) ready. Each selected headset will report its own result.' :
+            'Select headsets or a group with browser support. Update the MDM client if needed.';
         }
         btnUninstall.disabled = !uninstallConfirm.checked || uninstallPkg.value.trim() === '' || !has;
         btnStartupSet.disabled = startupPkg.value.trim() === '' || !has;
@@ -1883,26 +1887,57 @@
       }
 
       // ---------------- Commands ----------------
-      function selectedBrowserDevice() {
-        if (targetTab === 'attention' || selectedIds.size !== 1) return null;
-        const device = deviceById(Array.from(selectedIds)[0]);
-        return device && device.status === 'online' && device.open_url_supported === true ? device : null;
+      function selectedBrowserTargets() {
+        return targetTab === 'attention' ? [] : Array.from(selectedIds);
       }
 
-      function finishBrowserRequest(requestId, message, ok) {
-        if (!browserPending || (requestId !== null && requestId !== browserPending.requestId)) return;
-        clearTimeout(browserPending.timer);
-        const deviceId = browserPending.deviceId;
-        browserPending = null;
-        browserStatus.textContent = message;
+      function renderBrowserProgress() {
+        if (!browserPending) return;
+        const results = Array.from(browserPending.targets.values());
+        const pending = results.filter(function (r) { return r.status === 'pending'; }).length;
+        const requested = results.filter(function (r) { return r.status === 'requested'; }).length;
+        const failed = results.length - pending - requested;
+        browserStatus.textContent = (pending ? 'Opening browsers: ' : 'Browser requests complete: ') +
+          (results.length - pending) + '/' + results.length + ' completed · ' + requested + ' requested · ' + failed + ' failed' +
+          (pending ? ' · ' + pending + ' pending' : '');
+        browserResults.innerHTML = results.map(function (r) {
+          return '<div><strong>' + esc(r.label) + '</strong>: ' + esc(r.message) + '</div>';
+        }).join('');
         browserStatus.dataset.result = 'true';
-        addLog('Open URL on ' + labelFor(deviceId) + ': ' + message, ok ? 'success' : 'fail');
+        if (!pending) {
+          clearTimeout(browserPending.timer);
+          browserPending = null;
+        }
         updateButtons();
       }
 
+      function browserRequestSent(msg) {
+        if (!browserPending || msg.request_id !== browserPending.requestId) return;
+        const target = browserPending.targets.get(msg.device_id);
+        if (!target || target.status !== 'pending') return;
+        target.message = 'Waiting for the headset browser...';
+        renderBrowserProgress();
+      }
+
+      function finishBrowserRequest(requestId, deviceId, message, ok) {
+        if (!browserPending || requestId !== browserPending.requestId) return;
+        const targets = deviceId === null ? Array.from(browserPending.targets.values()) : [browserPending.targets.get(deviceId)];
+        targets.forEach(function (target) {
+          if (!target || target.status !== 'pending') return;
+          target.status = ok ? 'requested' : 'fail';
+          target.message = message || 'Browser launch was not confirmed. Check the headset.';
+          addLog('Open URL on ' + target.label + ': ' + target.message, ok ? 'success' : 'fail');
+        });
+        renderBrowserProgress();
+      }
+
+      function failPendingBrowserRequests(message) {
+        if (browserPending) finishBrowserRequest(browserPending.requestId, null, message, false);
+      }
+
       function sendOpenUrl() {
-        const device = selectedBrowserDevice();
-        if (!device || browserPending) return;
+        const targets = selectedBrowserTargets();
+        if (browserPending || !targets.some(function (id) { const d = deviceById(id); return d && d.status === 'online' && d.open_url_supported === true; })) return;
         delete browserStatus.dataset.result;
         const url = browserUrl.value;
         try {
@@ -1919,12 +1954,19 @@
         bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
         const hex = Array.from(bytes, function (b) { return b.toString(16).padStart(2, '0'); }).join('');
         const requestId = [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join('-');
-        if (!wsSend({ type: 'OPEN_URL', request_id: requestId, target_devices: [device.device_id], url: url }, 'open URL')) return;
-        browserPending = { requestId: requestId, deviceId: device.device_id, timer: setTimeout(function () {
-          finishBrowserRequest(requestId, 'Browser launch was not confirmed. Check the headset before trying again.', false);
-        }, 20000) };
-        browserStatus.textContent = 'Waiting for the headset browser...';
-        updateButtons();
+        // Snapshot IDs and labels before dispatch; later selection/group edits cannot
+        // change which result rows belong to this request.
+        browserPending = { requestId: requestId, targets: new Map(targets.map(function (id) {
+          return [id, { label: labelFor(id), status: 'pending', message: 'Sending browser request...' }];
+        })), timer: null };
+        if (!wsSend({ type: 'OPEN_URL', request_id: requestId, target_devices: targets, url: url }, 'open URL')) {
+          failPendingBrowserRequests('Not connected. Browser request was not sent.');
+          return;
+        }
+        browserPending.timer = setTimeout(function () {
+          finishBrowserRequest(requestId, null, 'Browser launch was not confirmed. Check the headset before trying again.', false);
+        }, 20000);
+        renderBrowserProgress();
       }
 
       function sendLaunch() {

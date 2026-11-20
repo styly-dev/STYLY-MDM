@@ -88,9 +88,11 @@ compatibility, and message sequences.
 
 ### Headset browser controls
 
-Select exactly one online headset and use **Open URL** with a complete HTTP(S)
-address. The address opens in the headset and may interrupt its current experience.
-LAN addresses are supported; `localhost` refers to the headset. The result confirms
+Select headsets or a group and use **Open URL** with a complete HTTP(S) address.
+The address opens in each eligible headset and may interrupt its current experience.
+Each selected headset reports its own result; offline, unsupported, busy, and failed
+devices do not block dispatch to the others. LAN addresses are supported;
+`localhost` refers to each headset. A result confirms
 a browser launch request, not successful page loading or a first-run browser prompt.
 
 Update the server and client APK together. This uses the existing WebSocket
@@ -102,18 +104,30 @@ inferred from version numbers.
 
 | Direction | Message | Fields / behavior |
 |---|---|---|
-| Admin → Server | `OPEN_URL` | UUID `request_id`, one-element `target_devices`, `url` |
+| Admin → Server | `OPEN_URL` | UUID `request_id`, nonempty explicit `target_devices` list, `url`; duplicate IDs are dispatched once |
 | Server → Client | `EXECUTE_OPEN_URL` | Same request ID and original URL |
-| Server → Admin | `OPEN_URL_SENT` | Request ID and device ID; dispatch only |
+| Server → Admin | `OPEN_URL_SENT` | Request ID and device ID for each dispatched headset; dispatch only |
 | Client → Server | `OPEN_URL_RESULT` | Request ID and fixed result `code` |
 | Server → Requesting admin | `OPEN_URL_RESULT` | Request ID, authoritative device ID, `status=requested/fail`, fixed code/message |
 
-`BrowserControl` validates before dispatch, permits one in-flight request per
-headset, and accepts results only from the original, current registered socket.
-Unconfirmed requests expire after 18 seconds and are never retried automatically.
+`BrowserControl` validates before dispatch, fans out concurrently, permits one
+in-flight request per headset, and accepts each result only from that headset's
+original, current registered socket. Single-target requests retain the same wire
+format. Wildcards and an empty target list are rejected. An invalid URL or target
+list fails the request without dispatch; eligibility and transport failures are
+reported per device. A stalled socket send is bounded to five seconds independently
+of peers. Unconfirmed requests expire after 18 seconds and are never retried automatically.
 Only static result messages reach the console; URLs and exception details are not
 logged, persisted, or included in results. URL transport uses the existing trusted
 LAN connection, which is not encrypted by default.
+
+The console snapshots selected device IDs and labels for each request, including
+offline and unsupported peers so their outcomes are visible. At least one capable
+online device is required to submit. Selection/group changes during execution do
+not alter pending targets. Results are matched by request ID and device ID; duplicate,
+late, and unrelated replies cannot settle other rows. The panel shows aggregate
+completion and per-headset messages. Timeout or connection loss fails only unfinished
+rows and retains already completed results. A retry requires a new explicit action.
 
 Android validates again. `BrowserLaunchRequests` creates a random one-shot token
 and calls PICO `pbsStartActivity` to open `BrowserLaunchActivity`. Only the token is
@@ -132,9 +146,10 @@ lowercased for Android matching; path, query, and fragment are preserved. Missin
 browsers, chooser resolution, vendor failures, and missing callbacks report
 explicit failures. The handoff activity closes after dispatch.
 
-Host tests cover URL validation, actual WebSocket registration/dispatch/results,
-capability refresh, stale sockets, timeout, busy requests, one-shot token expiry,
-and console feedback. Physical PICO testing remains necessary for vendor activity
+Host tests cover URL validation, single- and multi-device WebSocket dispatch/results,
+capability refresh, mixed eligibility/transport failures, duplicate IDs, stale sockets,
+timeout, busy requests, one-shot token expiry, and out-of-order console feedback.
+Physical PICO testing remains necessary for vendor activity
 launch from background, browser chooser/first-run prompts, and actual page loading.
 
 References: [PICO Enterprise API](https://business.picoxr.com/us/doc/EnterpriseAPI-Intro),

@@ -74,7 +74,7 @@ async def test_dispatch_preserves_url_and_result_hides_diagnostics():
 
 @pytest.mark.parametrize("changes", [
     {"target_devices": []}, {"target_devices": ["*"]}, {"target_devices": "device"},
-    {"target_devices": ["device", "device"]}, {"target_devices": [{}]},
+    {"target_devices": ["device", "*"]}, {"target_devices": [""]}, {"target_devices": [{}]},
     {"request_id": []}, {"request_id": "bad"}, {"target_connections": []}, {"url": "file:///x"},
 ])
 @pytest.mark.asyncio
@@ -141,6 +141,100 @@ async def test_dispatch_failure_and_invalid_result_never_claim_success():
 
 
 @pytest.mark.asyncio
+async def test_multi_target_dispatch_deduplicates_and_keeps_failures_independent():
+    control, device, admin = setup_control()
+    healthy = Socket()
+    broken = Socket()
+    broken.failure = True
+    control.devices.update({
+        "healthy": {**control.devices["device"], "ws": healthy},
+        "unsupported": {**control.devices["device"], "ws": Socket(), "capabilities": []},
+        "offline": {**control.devices["device"], "ws": Socket(), "status": "offline"},
+        "broken": {**control.devices["device"], "ws": broken},
+    })
+    await control.start(admin, request(target_devices=[
+        "unsupported", "device", "device", "offline", "missing", "broken", "healthy",
+    ]))
+    assert len(device.sent) == len(healthy.sent) == 1
+    assert device.sent[0] == healthy.sent[0]
+    assert set(control.pending) == {"device", "healthy"}
+    failures = {m["device_id"]: m["code"] for m in admin.sent if m["type"] == "OPEN_URL_RESULT"}
+    assert failures == {"unsupported": "unsupported", "offline": "invalid_target",
+                        "missing": "invalid_target", "broken": "unavailable"}
+    await control.receive(healthy, "healthy", {"request_id": REQUEST, "code": "requested"})
+    assert set(control.pending) == {"device"}
+    await control.receive(device, "device", {"request_id": REQUEST, "code": "no_browser"})
+    assert not control.pending
+    assert [(m["device_id"], m["status"]) for m in admin.sent[-2:]] == [
+        ("healthy", "requested"), ("device", "fail")]
+
+
+@pytest.mark.asyncio
+async def test_busy_headset_does_not_block_new_peer_request():
+    control, device, admin = setup_control()
+    healthy = Socket()
+    control.devices["healthy"] = {**control.devices["device"], "ws": healthy}
+    await control.start(admin, request())
+    other_id = "22222222-2222-4222-8222-222222222222"
+    await control.start(admin, request(request_id=other_id, target_devices=["device", "healthy"]))
+    assert len(device.sent) == 1
+    assert healthy.sent[0]["request_id"] == other_id
+    assert any(m.get("code") == "busy" and m["device_id"] == "device"
+               and m["request_id"] == other_id for m in admin.sent)
+    assert control.pending["device"]["request_id"] == REQUEST
+    await control.close()
+
+
+@pytest.mark.asyncio
+async def test_timeout_only_fails_unfinished_peers_and_does_not_resend():
+    control, device, admin = setup_control(timeout=0.01)
+    healthy = Socket()
+    control.devices["healthy"] = {**control.devices["device"], "ws": healthy}
+    await control.start(admin, request(target_devices=["device", "healthy"]))
+    await control.receive(healthy, "healthy", {"request_id": REQUEST, "code": "requested"})
+    await asyncio.sleep(0.03)
+    results = [m for m in admin.sent if m["type"] == "OPEN_URL_RESULT"]
+    assert [(m["device_id"], m["code"]) for m in results] == [
+        ("healthy", "requested"), ("device", "timeout")]
+    assert len(device.sent) == len(healthy.sent) == 1
+    await control.receive(device, "device", {"request_id": REQUEST, "code": "requested"})
+    assert len([m for m in admin.sent if m["type"] == "OPEN_URL_RESULT"]) == 2
+    assert not control.pending
+
+
+@pytest.mark.asyncio
+async def test_slow_socket_does_not_delay_dispatch_to_another_headset():
+    control, device, admin = setup_control()
+    release = asyncio.Event()
+    sent = asyncio.Event()
+
+    class SlowSocket(Socket):
+        async def send_str(self, message):
+            await release.wait()
+            raise RuntimeError("Transport closed")
+
+    class HealthySocket(Socket):
+        async def send_str(self, message):
+            await super().send_str(message)
+            sent.set()
+
+    healthy = HealthySocket()
+    control.devices["device"]["ws"] = SlowSocket()
+    control.devices["healthy"] = {**control.devices["device"], "ws": healthy}
+    dispatch = asyncio.create_task(control.start(admin, request(target_devices=["device", "healthy"])))
+    try:
+        await asyncio.wait_for(sent.wait(), 1)
+        assert not dispatch.done()
+        await control.receive(healthy, "healthy", {"request_id": REQUEST, "code": "requested"})
+        assert any(m.get("status") == "requested" and m["device_id"] == "healthy" for m in admin.sent)
+    finally:
+        release.set()
+        await dispatch
+        await control.close()
+    assert any(m.get("code") == "unavailable" and m["device_id"] == "device" for m in admin.sent)
+
+
+@pytest.mark.asyncio
 async def test_real_websocket_registration_dispatch_result_and_capability_refresh(tmp_path, caplog):
     device_id = "64b19041-0b8c-4ef4-82fd-000000000000"
     server.devices.clear()
@@ -184,6 +278,58 @@ async def test_real_websocket_registration_dispatch_result_and_capability_refres
             result = await receive_type(admin, "OPEN_URL_RESULT")
             assert result["code"] == "unsupported"
             await device.close()
+            await admin.close()
+    finally:
+        await app.close()
+        server.devices.clear()
+        server.device_registry.clear()
+        server.admin_connections.clear()
+
+
+@pytest.mark.asyncio
+async def test_real_websockets_open_multiple_headsets_with_mixed_outcomes(tmp_path):
+    ids = [f"64b19041-0b8c-4ef4-82fd-{i:012d}" for i in range(4)]
+    server.devices.clear()
+    server.device_registry.clear()
+    server.admin_connections.clear()
+    server._apply_data_dir(str(tmp_path))
+    app = TestServer(server.create_app())
+    await app.start_server()
+    try:
+        async with aiohttp.ClientSession() as session:
+            admin = await session.ws_connect(app.make_url("/ws/admin"))
+            peers = []
+            for index, device_id in enumerate(ids[:3]):
+                peer = await session.ws_connect(app.make_url("/ws/device"))
+                peers.append(peer)
+                await peer.send_json({
+                    "type": "REGISTER", "identity_scheme": "styly_device_id_v1",
+                    "device_id": device_id, "model": "PICO", "ip": "127.0.0.1",
+                    "capabilities": ["open_url_v1"] if index < 2 else [],
+                    "push_runtime": {"active": None},
+                })
+                assert await receive_type(peer, "REGISTERED")
+            assert await receive_type(admin, "DEVICE_LIST", predicate=lambda m:
+                                      len(m["devices"]) == 3 and all(d["status"] == "online" for d in m["devices"]))
+            await admin.send_json({"type": "OPEN_URL", **request(target_devices=ids + [ids[0]])})
+            commands = await asyncio.gather(*(receive_type(peer, "EXECUTE_OPEN_URL") for peer in peers[:2]))
+            assert commands[0] == commands[1]
+            assert commands[0]["url"] == request()["url"]
+            dispatch_frames = [await asyncio.wait_for(admin.receive_json(), 2) for _ in range(4)]
+            assert {m["device_id"] for m in dispatch_frames if m["type"] == "OPEN_URL_SENT"} == set(ids[:2])
+            assert {m["device_id"]: m["code"] for m in dispatch_frames if m["type"] == "OPEN_URL_RESULT"} == {
+                ids[2]: "unsupported", ids[3]: "invalid_target",
+            }
+            await peers[1].send_json({"type": "OPEN_URL_RESULT", "request_id": REQUEST, "code": "requested"})
+            result = await receive_type(admin, "OPEN_URL_RESULT")
+            assert result["device_id"] == ids[1] and result["status"] == "requested"
+            assert ids[0] in server.browser_control.pending
+            await peers[0].send_json({"type": "OPEN_URL_RESULT", "request_id": REQUEST, "code": "no_browser"})
+            result = await receive_type(admin, "OPEN_URL_RESULT")
+            assert result["device_id"] == ids[0] and result["status"] == "fail"
+            assert not server.browser_control.pending
+            for peer in peers:
+                await peer.close()
             await admin.close()
     finally:
         await app.close()
