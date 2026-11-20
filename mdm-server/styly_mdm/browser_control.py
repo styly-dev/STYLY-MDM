@@ -45,6 +45,7 @@ class BrowserControl:
         self.command_allowed = command_allowed
         self.timeout = timeout
         self.pending = {}
+        self.send_tasks = set()
 
     async def _reply(self, admin, request_id, device_id, code, message=None):
         try:
@@ -75,24 +76,28 @@ class BrowserControl:
             return
         # Each target owns its eligibility check, pending slot, timeout, and result.
         # A slow or failed socket must not delay dispatch to another headset.
-        await asyncio.gather(*(self._start_one(admin, request_id, device_id, url) for device_id in targets))
+        for device_id in targets:
+            task = asyncio.create_task(self._admit(admin, request_id, device_id, url))
+            self.send_tasks.add(task)
+            task.add_done_callback(self.send_tasks.discard)
 
-    async def _start_one(self, admin, request_id, device_id, url):
+    def _admit(self, admin, request_id, device_id, url):
         entry = self.devices.get(device_id)
         if not self.command_allowed(entry, "EXECUTE_OPEN_URL") or entry.get("status", "online") != "online":
-            await self._reply(admin, request_id, device_id, "invalid_target", "Select a ready online headset with a canonical identity.")
-            return
+            return self._reply(admin, request_id, device_id, "invalid_target", "Select a ready online headset with a canonical identity.")
         if CAPABILITY not in entry.get("capabilities", []):
-            await self._reply(admin, request_id, device_id, "unsupported", "Update the headset's MDM client to use Open URL.")
-            return
+            return self._reply(admin, request_id, device_id, "unsupported", "Update the headset's MDM client to use Open URL.")
         if device_id in self.pending:
-            await self._reply(admin, request_id, device_id, "busy")
-            return
+            return self._reply(admin, request_id, device_id, "busy")
         pending = {"request_id": request_id, "socket": entry["ws"], "admin": admin, "timer": None}
         self.pending[device_id] = pending
         pending["timer"] = asyncio.create_task(self._expire(device_id, pending))
+        return self._send(device_id, pending, url)
+
+    async def _send(self, device_id, pending, url):
+        admin, request_id = pending["admin"], pending["request_id"]
         try:
-            await asyncio.wait_for(entry["ws"].send_str(json.dumps({
+            await asyncio.wait_for(pending["socket"].send_str(json.dumps({
                 "type": "EXECUTE_OPEN_URL", "request_id": request_id, "url": url,
             })), timeout=min(self.timeout, 5))
         except (OSError, RuntimeError, asyncio.TimeoutError):
@@ -134,6 +139,8 @@ class BrowserControl:
     async def close(self, app=None):
         timers = [p["timer"] for p in self.pending.values() if p["timer"] is not None]
         self.pending.clear()
-        for timer in timers:
-            timer.cancel()
-        await asyncio.gather(*timers, return_exceptions=True)
+        tasks = list(self.send_tasks) + timers
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.send_tasks.clear()

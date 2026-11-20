@@ -116,7 +116,9 @@ original, current registered socket. Single-target requests retain the same wire
 format. Wildcards and an empty target list are rejected. An invalid URL or target
 list fails the request without dispatch; eligibility and transport failures are
 reported per device. A stalled socket send is bounded to five seconds independently
-of peers. Unconfirmed requests expire after 18 seconds and are never retried automatically.
+of peers. Pending slots are reserved synchronously; owned background send tasks keep
+the admin connection responsive to subsequent commands and are cancelled on shutdown.
+Unconfirmed requests expire after 18 seconds and are never retried automatically.
 Only static result messages reach the console; URLs and exception details are not
 logged, persisted, or included in results. URL transport uses the existing trusted
 LAN connection, which is not encrypted by default.
