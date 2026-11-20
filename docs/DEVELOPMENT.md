@@ -158,6 +158,66 @@ References: [PICO Enterprise API](https://business.picoxr.com/us/doc/EnterpriseA
 [Android web intents](https://developer.android.com/guide/components/intents-common#Browser),
 [Android background activity restrictions](https://developer.android.com/guide/components/activities/background-starts).
 
+### Close all browser tabs
+
+The Browser panel also offers **Close All Tabs on Selected**, independently of the
+URL field. It follows [IMMENSIVA-MDM PR #4](https://github.com/krispatl/IMMENSIVA-MDM/pull/4).
+Each selected canonical, online HMD runs independently. The operation shares the
+same per-headset busy slot as Open URL, including across admin connections.
+Offline, unsupported, or failed peers do not prevent other headsets from finishing.
+
+This operation uses **authorized host ADB**, because [Chromium restricts Android
+DevTools socket access](https://chromium.googlesource.com/chromium/src/+/main/content/browser/android/devtools_auth.cc)
+to shell/root or the browser's own UID. Install Android
+platform-tools on the server and expose `adb` on its `PATH`, or set `STYLY_MDM_ADB`
+to its executable path before starting the server. This supports macOS, Windows,
+and Linux. Enable network debugging on each HMD at port 5555 and authorize the
+server beforehand; the server does not grant debugging permissions automatically.
+Without ADB, Close All Tabs is disabled. No additional client APK update is needed
+for this operation on an existing canonical-ID client; Open URL retains its client
+capability requirement. A discovered ADB executable is a prerequisite, not proof
+of network authorization or browser support.
+
+`BrowserTabs` validates the registered IP address, connects to ADB, then reads the
+published Device-ID-Provider MediaStore namespace (`Pictures/Device-ID-Provider/`,
+including subdirectories, excluding pending images). It requires exactly one valid
+lowercase `GUID.png` entry matching the selected canonical ID. Missing, ambiguous,
+inaccessible, or mismatched identities fail before touching the browser. Hardware
+serials are never substituted for GUIDs. Multiple valid Provider images are rejected
+conservatively, even if the Provider itself would choose the oldest; the images
+are never changed or deleted by this feature.
+
+After identity verification, the server resolves MAIN/APP_BROWSER without a URL
+and selects only `weblayer_devtools_remote_<pid>` belonging to that browser's main
+process. If necessary it opens the browser to restore saved tabs; a blocked launch
+or missing socket produces an explicit failure. It creates one temporary loopback
+ADB forward, snapshots `/json/list`, and sends one `/json/close/<id>` request per
+original page target. Workers and newly opened tabs are not targeted. A lost close
+response is verified by listing tabs again, never by retrying the close.
+
+The result is `confirmed` if no tabs remain, or only one newly created empty tab
+remains; otherwise it is `partial` with closed/remaining counts. This can interrupt
+an experience and discard unsaved page state, but does not clear cookies, login
+sessions, bookmarks, history, downloads, or other browser storage. No `pm clear`
+or force-stop fallback is used. HTTP redirects are rejected, responses are capped
+at 1 MiB, and page titles/URLs are never returned, logged, or persisted. Each request
+removes only its own temporary forward, including on failure/cancellation.
+
+| Direction | Message | Fields / behavior |
+|---|---|---|
+| Admin → Server | `CLOSE_BROWSER_TABS` | UUID `request_id`, explicit nonempty `target_devices`; duplicates dispatch once; no URL required |
+| Server → Requesting admin | `CLOSE_BROWSER_TABS_SENT` | Request ID and device ID; operation started, not confirmation |
+| Server → Requesting admin | `CLOSE_BROWSER_TABS_RESULT` | Request ID, device ID, `status=confirmed/partial/fail`, code/message; successful verification includes `closed_tabs` and `remaining_tabs` |
+| Server → Admin | `DEVICE_LIST` | `close_browser_tabs_supported` reflects server ADB availability and canonical online readiness, independently of `open_url_supported` |
+
+The server bounds close operations to 90 seconds; the console waits 95 seconds.
+Cleanup can extend cancellation briefly. Per-device results retain the original
+selection snapshot, and failure/timeout never causes automatic retries. A timeout
+does not imply that no tabs closed; check the HMD before explicitly trying again.
+Host tests cover transport, identity checks, tab snapshots and verification, cleanup,
+multi-device dispatch, and console results. Physical PICO socket availability,
+authorization, browser lifecycle, and retained browser data still require HMD testing.
+
 ## Building the MDM Client
 
 ### Build from CLI

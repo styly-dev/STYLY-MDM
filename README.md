@@ -11,7 +11,9 @@ STYLY-MDM currently supports PICO devices (PICO OS with Business Mode). Support 
 ## Features
 
 - **Headset browsers:** select headsets or a group and use **Open URL** to open an
-  HTTP(S) address in their browsers, with individual results. Requires the updated MDM client; see
+  HTTP(S) address, or **Close All Tabs** to close browser tabs while retaining browser data,
+  with individual results. Open URL requires the updated MDM client; closing tabs requires
+  authorized network ADB from the server. See
   [browser setup and behavior](docs/DEVELOPMENT.md#headset-browser-controls).
 
 - **Multi-device launch** — select devices with the checkboxes (use the header checkbox to select all) and send an app launch command to them at once; offline devices are skipped automatically
