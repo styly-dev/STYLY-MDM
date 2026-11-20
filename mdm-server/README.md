@@ -7,6 +7,9 @@ many headsets at once over the LAN.
 
 > STYLY-MDM is designed for use within a local area network (LAN). It has no
 > authentication. **Do not expose the server to the public internet.**
+> Restrict server access to trusted devices and operators when deploying Wi-Fi
+> settings. A client that can reach the server can claim an assigned Device ID
+> and receive its Wi-Fi credentials.
 
 ## Install & run
 
@@ -43,6 +46,11 @@ artifacts (`<data-dir>/push-artifacts/`) and upload work (`<data-dir>/push-work/
 registry (`<data-dir>/device_registry.json`). It defaults to the directory the
 server is started from, so `uvx styly-mdm` in a fresh directory comes up with no
 devices or groups.
+
+Configuration packages and group references share this registry. Wi-Fi
+passwords are plaintext. Protect the file and its backups. A registry from an
+earlier release keeps its groups and starts with no packages.
+See [the package contract](../docs/DEVELOPMENT.md#configuration-packages).
 
 Transfer throttling bounds how many devices download at once — one server-wide
 pool shared by every install and push/sync job; the rest queue until a slot

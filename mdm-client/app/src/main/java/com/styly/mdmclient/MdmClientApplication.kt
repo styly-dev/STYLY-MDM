@@ -9,6 +9,7 @@ import android.os.Environment
 import android.util.Log
 import com.pvr.tobservice.ToBServiceHelper
 import java.io.File
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Application class that initializes PICO Enterprise SDK (TobService) and owns
@@ -25,12 +26,25 @@ class MdmClientApplication : Application() {
         @Volatile
         private var identityResolver: DeviceIdentityResolver? = null
 
+        @Volatile
+        private var wifiController: WifiSettingsController? = null
+
+        @Volatile
+        private lateinit var configurationPackages: ConfigurationPackageController
+
         fun pushJobCoordinator(): PushJobCoordinator =
             coordinator ?: throw IllegalStateException("PushJobCoordinator is not initialized")
 
         fun deviceIdentityResolver(): DeviceIdentityResolver =
             identityResolver ?: throw IllegalStateException("DeviceIdentityResolver is not initialized")
+
+        internal fun wifiSettingsController(): WifiSettingsController =
+            wifiController ?: throw IllegalStateException("WifiSettingsController is not initialized")
+
+        internal fun configurationPackageController(): ConfigurationPackageController = configurationPackages
     }
+
+    private val bindingGeneration = AtomicLong()
 
     override fun onCreate() {
         super.onCreate()
@@ -46,6 +60,8 @@ class MdmClientApplication : Application() {
                 }
             }
         }, IntentFilter(Intent.ACTION_SHUTDOWN))
+        wifiController = WifiSettingsController(this)
+        configurationPackages = ConfigurationPackageController(this, wifiSettingsController())
         identityResolver = DeviceIdentityResolver.create(this).also {
             it.startInitialLookup()
         }
@@ -72,7 +88,9 @@ class MdmClientApplication : Application() {
     private fun bindTobService() {
         try {
             ToBServiceHelper.getInstance().bindTobService(this) { status ->
+                val generation = bindingGeneration.incrementAndGet()
                 Log.i(TAG, "TobService bind status: $status")
+                wifiController?.refreshReadiness()
                 if (status) {
                     try {
                         ToBServiceHelper.getInstance().serviceBinder?.pbsAppKeepAlive(packageName, true, 0)
@@ -88,6 +106,7 @@ class MdmClientApplication : Application() {
                     }
                     recoverFromSelfUpdate()
                 }
+                configurationPackages.onSdkReady(status) { bindingGeneration.get() == generation }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to bind TobService", e)

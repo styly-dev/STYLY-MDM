@@ -88,6 +88,7 @@ class WebSocketManager internal constructor(
         // Kept separate from PREF_SERVER_URL, which is only a discovery cache.
         private const val PREF_MANUAL_SERVER_URL = "manual_server_url_value"
         private const val MANUAL_SERVER_PATH = "/ws/device"
+        private const val PRODUCTION_WS_PORT = 7070
         // Last-resort fallback used only when discovery fails and no URL is saved.
         // The port is flavor-aware (BuildConfig.DEFAULT_WS_PORT) so the dev build
         // never falls back to the production port and accidentally connects to a
@@ -159,12 +160,12 @@ class WebSocketManager internal constructor(
         private fun preferences(context: Context) =
             context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
 
-        private fun isValidWsUrl(url: String): Boolean {
+        internal fun isValidWsUrl(url: String): Boolean {
             if (!url.startsWith("ws://") && !url.startsWith("wss://")) return false
             return try {
                 // OkHttp accepts WebSocket URLs here by normalizing ws/wss to http/https.
-                Request.Builder().url(url).build()
-                true
+                val port = Request.Builder().url(url).build().url.port
+                isAllowedServerPort(port)
             } catch (_: IllegalArgumentException) {
                 false
             }
@@ -195,8 +196,11 @@ class WebSocketManager internal constructor(
 
             if (!isAsciiDigits(parts[1])) return false
             val port = parts[1].toIntOrNull() ?: return false
-            return port in 1..65535
+            return isAllowedServerPort(port)
         }
+
+        private fun isAllowedServerPort(port: Int): Boolean =
+            port in 1..65535 && (BuildConfig.FLAVOR != "dev" || port != PRODUCTION_WS_PORT)
 
         private fun isValidServerHost(host: String): Boolean {
             if (host.isEmpty()) return false
@@ -232,12 +236,37 @@ class WebSocketManager internal constructor(
         .build()
 
     private val pushCoordinator = MdmClientApplication.pushJobCoordinator()
+    private val wifiController = MdmClientApplication.wifiSettingsController()
+    private val configurationPackages = MdmClientApplication.configurationPackageController()
     @Volatile
     private var webSocket: WebSocket? = null
     private var isRunning = false
     private val reconnectHandler = Handler(Looper.getMainLooper())
     private val reconnectToken = Object()
     private val batteryTelemetryToken = Object()
+    private val wifiStateListener: () -> Unit = {
+        reconnectHandler.post { publishWifiState() }
+    }
+    private val configurationListener: () -> Unit = {
+        reconnectHandler.post { publishConfigurationState() }
+    }
+
+    // Main thread only. Internal journal writes notify often; send only public changes.
+    private val wifiReport = SocketStateReport<WebSocket>("wifi_state", "WIFI_STATE")
+    private val configurationReport = SocketStateReport<WebSocket>("configuration_state", "CONFIGURATION_STATE")
+
+    private fun publishWifiState() {
+        val socket = webSocket ?: return
+        if (!isRunning || !registration.isCanonicalAcknowledged(socket)) return
+        wifiReport.publish(socket, wifiController.stateSnapshot(), socket::send)
+    }
+
+    private fun publishConfigurationState() {
+        val socket = webSocket ?: return
+        if (!isRunning || !registration.isCanonicalAcknowledged(socket) || !supportsPico4UltraEnterpriseSettings()) return
+        val state = configurationPackages.reportValue() ?: return
+        configurationReport.publish(socket, state, socket::send)
+    }
 
     private val scheduler = ConnectionScheduler {
         ClientConfig.load(File(Environment.getExternalStorageDirectory(), ClientConfig.CONFIG_RELATIVE_PATH))
@@ -290,6 +319,8 @@ class WebSocketManager internal constructor(
     fun connect() {
         isRunning = true
         identityResolver.addListener(identityListener)
+        wifiController.addStateListener(wifiStateListener)
+        configurationPackages.addStateListener(configurationListener)
         onStatusChanged(false, "Waiting for network...")
         // The connection window is anchored on network availability, not on
         // service start: the callback fires immediately when a network is
@@ -302,6 +333,8 @@ class WebSocketManager internal constructor(
     fun disconnect() {
         isRunning = false
         identityResolver.removeListener(identityListener)
+        wifiController.removeStateListener(wifiStateListener)
+        configurationPackages.removeStateListener(configurationListener)
         if (networkCallbackRegistered) {
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             cm.unregisterNetworkCallback(networkCallback)
@@ -319,6 +352,8 @@ class WebSocketManager internal constructor(
         socketOpen = false
         registration.clear()
         connectedServerAddress = null
+        wifiReport.clear()
+        configurationReport.clear()
     }
 
     fun sendMessage(json: JSONObject) {
@@ -476,6 +511,9 @@ class WebSocketManager internal constructor(
                                 registration.isCanonicalAcknowledged(webSocket)
                             ) {
                                 startBatteryTelemetry()
+                                publishWifiState()
+                                publishConfigurationState()
+                                wifiController.refreshReadiness()
                                 publishConnectedStatus(identityResolver.snapshot())
                             }
                         }
@@ -500,6 +538,9 @@ class WebSocketManager internal constructor(
                         json.optString("connection_id", "") != registration.provisionalConnectionId(webSocket)
                     ) {
                         Log.w(TAG, "Ignoring $logType for a different provisional connection")
+                    } else if (type == "CONFIGURATION_POLICY") {
+                        val owner = commandContext(webSocket) ?: return
+                        configurationPackages.receive(json, supportsPico4UltraEnterpriseSettings(), owner::isActive)
                     } else if (type.isNotEmpty() && !pushCoordinator.handleServerMessage(type, json)) {
                         onCommand(type, json, commandContext(webSocket))
                     }
@@ -615,8 +656,15 @@ class WebSocketManager internal constructor(
             if (identity is DeviceIdentityState.Ready) {
                 put("device_id", identity.deviceId)
                 put("process_instance_id", pushFields!!.getString("process_instance_id"))
-                put("capabilities", pushFields.getJSONArray("capabilities"))
+                val capabilities = JSONArray(pushFields.getJSONArray("capabilities").toString())
+                capabilities.put(CONFIGURATION_SUMMARY_CAPABILITY)
+                if (supportsPico4UltraEnterpriseSettings()) {
+                    capabilities.put(CONFIGURATION_PACKAGES_CAPABILITY)
+                    put("configuration_state", configurationPackages.reportValue())
+                }
+                put("capabilities", capabilities)
                 put("push_state", pushFields.getJSONObject("push_state"))
+                put("wifi_state", wifiController.stateSnapshot())
                 put("push_runtime", pushFields.getJSONObject("push_runtime"))
                 val startupConfig = getStartupAppConfig()
                 if (startupConfig != null) {
@@ -639,7 +687,12 @@ class WebSocketManager internal constructor(
         Log.d(TAG, "Sending: ${messageTypeForLog(payload)}")
         val canonical = identity is DeviceIdentityState.Ready
         if (canonical) registration.markSent(socket)
-        if (!socket.send(text) && canonical) registration.clearSent(socket)
+        if (!socket.send(text)) {
+            if (canonical) registration.clearSent(socket)
+        } else {
+            wifiReport.recordRegistration(socket, payload)
+            configurationReport.recordRegistration(socket, payload)
+        }
     }
 
     private fun commandContext(socket: WebSocket): CommandContext? {
@@ -755,4 +808,21 @@ class WebSocketManager internal constructor(
         val level: Int,
         val charging: Boolean
     )
+}
+
+internal class SocketStateReport<T : Any>(private val field: String, private val type: String) {
+    private var lastSent: Pair<T, String>? = null
+
+    fun recordRegistration(socket: T, payload: JSONObject) {
+        payload.opt(field)?.let { lastSent = socket to it.toString() }
+    }
+
+    fun publish(socket: T, state: Any, send: (String) -> Boolean) {
+        val encoded = state.toString()
+        if (lastSent?.let { it.first === socket && it.second == encoded } == true) return
+        val message = JSONObject().put("type", type).put(field, state)
+        if (send(message.toString())) lastSent = socket to encoded
+    }
+
+    fun clear() { lastSent = null }
 }

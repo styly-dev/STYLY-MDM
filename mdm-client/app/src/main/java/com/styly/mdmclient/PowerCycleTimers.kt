@@ -36,8 +36,12 @@ object PowerCycleTimers {
     private const val MAX_ARM_CLOSE_ATTEMPTS = 4
     private const val ARM_CLOSE_BACKOFF_MS = 150L
 
-    /** Outcome of [arm]. A refusal is safe only once no shutdown timer can remain armed alone. */
-    enum class ArmOutcome { ARMED, REFUSED_SAFE, REFUSED_UNSAFE }
+    /**
+     * Outcome of [arm]. A refusal is safe only once no shutdown timer can remain armed alone.
+     * REFUSED_SHUTDOWN_SCHEDULE means nothing was armed because the device's recurring
+     * shutdown schedule is set or unreadable and shares the timer this fallback needs.
+     */
+    enum class ArmOutcome { ARMED, REFUSED_SAFE, REFUSED_UNSAFE, REFUSED_SHUTDOWN_SCHEDULE }
 
     /** Whether a single close pass confirmed each timer closed (returned 0, no throw). */
     data class CloseResult(val shutdownClosed: Boolean, val startupClosed: Boolean)
@@ -53,7 +57,18 @@ object PowerCycleTimers {
      * strings are journalled so a wrong wall-clock schedule (time zone, 1-based
      * month) is diagnosable from the headset after the fact.
      */
+    @Synchronized
     fun arm(context: Context, proxy: IToBServiceProxy): ArmOutcome {
+        if (supportsPico4UltraEnterpriseSettings()) {
+            // The recurring policy and this fallback share the PICO close API.
+            // Do not replace an operator's schedule or close it during recovery.
+            val recurring = runCatching { PicoShutdownSchedule.read(proxy) }
+                .getOrNull()?.let { it.enabled && it.repeat > 0 }
+            if (recurring != false) {
+                Log.w(TAG, "Power-cycle fallback requires an available shutdown timer")
+                return ArmOutcome.REFUSED_SHUTDOWN_SCHEDULE
+            }
+        }
         val plan = PowerCycleSchedule.compute(Calendar.getInstance())
         // These SDK calls are guarded with catch(Throwable), not catch(Exception): the
         // timing APIs resolve com.google.gson.JsonObject internally, and a missing Gson
@@ -211,6 +226,7 @@ object PowerCycleTimers {
      * retired anyway so a past-due timer that can no longer be closed does not
      * loop the recovery on every boot.
      */
+    @Synchronized
     fun disarm(context: Context, reason: String) {
         val proxy = ToBServiceHelper.getInstance().serviceBinder as? IToBServiceProxy
         if (proxy == null) {

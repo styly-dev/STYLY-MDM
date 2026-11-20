@@ -34,6 +34,11 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Pin version from the release tag
         if: github.event_name == 'release'
         env:
@@ -46,7 +51,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e '.[dev]' build
 
-      - name: Run tests
+      - name: Run Python and Node tests
         working-directory: mdm-server
         run: python -m pytest -q
 

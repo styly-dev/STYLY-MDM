@@ -25,6 +25,7 @@ venv/
 mdm-client/.gradle/
 mdm-client/build/
 mdm-client/app/build/
+mdm-client/app/.cxx/
 mdm-client/local.properties
 *.apk
 *.aab
@@ -37,6 +38,7 @@ mdm-client/local.properties
 # === Server runtime data ===
 mdm-server/device_registry.json
 mdm-server/device_registry.json.tmp
+mdm-server/device_registry.json.*.bak
 mdm-server/push_jobs.sqlite3*
 mdm-server/bundles/
 mdm-server/push-artifacts/
@@ -49,3 +51,6 @@ mdm-server/push-artifacts/
 # === Misc ===
 nanobanana-output/*.png
 .claude/settings.local.json
+
+# The uv lockfile is generated locally and not committed
+mdm-server/uv.lock

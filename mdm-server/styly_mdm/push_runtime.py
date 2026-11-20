@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import uuid
-from collections.abc import Iterator, MutableMapping
+from collections.abc import Callable, Iterator, MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -96,57 +96,46 @@ def _operator_action_context(payload: dict[str, Any]) -> dict[str, Any]:
     return context
 
 
-class _LegacyTransferAdapter(MutableMapping[tuple[str, str], asyncio.Future[str]]):
-    """Compatibility facade backed by the typed transfer registry.
+class _InstallTransferAdapter(MutableMapping[tuple[str, str], asyncio.Future[str]]):
+    """Install-only tuple view of the shared transfer registry.
 
-    The established install path uses tuple syntax. Job-v1 Push accesses the typed
-    registry directly, so its waiter ownership is independent of this facade.
+    The registry owns every waiter; this view keeps no second key inventory and
+    cannot expose or release a Push transfer when an install disconnects.
     """
 
     def __init__(self, registry: TransferRegistry) -> None:
         self.registry = registry
-        self._keys: dict[tuple[str, str], TransferKey] = {}
 
     def _key(self, key: tuple[str, str]) -> TransferKey:
         device_id, task = key
-        if task == "install":
-            return TransferKey("install", device_id)
-        existing = self._keys.get(key)
-        if existing is not None:
-            return existing
-        return TransferKey("push", device_id, f"legacy-{uuid.uuid4()}", 1)
+        if task != "install":
+            raise KeyError(key)
+        return TransferKey("install", device_id)
 
     def __getitem__(self, key: tuple[str, str]) -> asyncio.Future[str]:
-        typed = self._keys[key]
-        future = self.registry.get(typed)
+        future = self.registry.get(self._key(key))
         if future is None:
-            self._keys.pop(key, None)
             raise KeyError(key)
         return future
 
     def __setitem__(self, key: tuple[str, str], value: asyncio.Future[str]) -> None:
-        previous = self._keys.get(key)
-        if previous is not None:
-            current = self.registry.get(previous)
-            if current is not None:
-                self.registry.remove_if_same(previous, current)
         typed = self._key(key)
+        current = self.registry.get(typed)
+        if current is not None:
+            self.registry.remove_if_same(typed, current)
         self.registry.register(typed, value)
-        self._keys[key] = typed
 
     def __delitem__(self, key: tuple[str, str]) -> None:
-        typed = self._keys.pop(key)
+        typed = self._key(key)
         future = self.registry.get(typed)
-        if future is not None:
-            self.registry.remove_if_same(typed, future)
+        if future is None:
+            raise KeyError(key)
+        self.registry.remove_if_same(typed, future)
 
     def __iter__(self) -> Iterator[tuple[str, str]]:
-        for key in tuple(self._keys):
-            typed = self._keys[key]
-            if self.registry.get(typed) is None:
-                self._keys.pop(key, None)
-            else:
-                yield key
+        for key in self.registry:
+            if key.kind == "install":
+                yield key.device_id, "install"
 
     def __len__(self) -> int:
         return sum(1 for _ in self)
@@ -167,7 +156,14 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
         self._push_admin_snapshot_sent = False
 
     async def send_str(self, data: str, compress: int | None = None) -> None:
+        await self.send_current_text(lambda: data, compress=compress)
+
+    async def send_current_text(self, resolve: Callable[[], str | None], *, compress: int | None = None) -> bool:
+        """Resolve and authorize the message at the serialized socket write."""
         async with self._push_send_lock:
+            data = resolve()
+            if data is None:
+                return False
             if self._push_path == "/ws/device" and self._push_runtime is not None:
                 payload = json.loads(data)
                 message_type = payload.get("type", "")
@@ -201,6 +197,7 @@ class RuntimeWebSocketResponse(aiohttp_web.WebSocketResponse):
                             "Device is not ready or command is not allowed"
                         )
             await super().send_str(data, compress=compress)
+            return True
 
     async def prepare(self, request: aiohttp_web.Request) -> Any:
         result = await super().prepare(request)
@@ -313,7 +310,7 @@ class PushRuntime:
         self.artifacts = ArtifactStore(data_dir)
         self.leases = PushTransferLeases()
         self.transfers = TransferRegistry(self.leases.revoke_now)
-        self.legacy_transfers = _LegacyTransferAdapter(self.transfers)
+        self.install_transfers = _InstallTransferAdapter(self.transfers)
         self.sessions: dict[str, LiveSession] = {}
         self.device_locks: dict[str, asyncio.Lock] = {}
         self.registration_candidates: dict[str, RuntimeWebSocketResponse] = {}
@@ -2409,32 +2406,8 @@ def runtime_for_current_server() -> PushRuntime:
     if runtime is None:
         runtime = PushRuntime(server, data_dir)
         _RUNTIME_BY_DATA_DIR[data_dir] = runtime
-        server.pending_transfers = runtime.legacy_transfers
+        server.pending_transfers = runtime.install_transfers
     return runtime
-
-
-def _release_transfer_slot(
-    device_id: str, reason: str, task: str | None = None
-) -> bool:
-    from . import server as legacy_server
-
-    mapping = legacy_server.pending_transfers
-    if task in {"install", "push"}:
-        future = mapping.get((device_id, task))
-        if future is None or future.done():
-            return False
-        future.set_result(reason)
-        return True
-
-    released = False
-    for key in tuple(mapping):
-        if key[0] != device_id:
-            continue
-        future = mapping.get(key)
-        if future is not None and not future.done():
-            future.set_result(reason)
-            released = True
-    return released
 
 
 def install(server: Any) -> None:
@@ -2444,7 +2417,6 @@ def install(server: Any) -> None:
     _INSTALLED = True
     _ORIGINAL_CREATE_APP = server.create_app
     server._websocket_response_factory = RuntimeWebSocketResponse
-    server.release_transfer_slot = _release_transfer_slot
 
     def create_app() -> aiohttp_web.Application:
         runtime = runtime_for_current_server()
