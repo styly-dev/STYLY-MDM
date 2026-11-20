@@ -31,6 +31,7 @@ from .device_policy import (
 from .integrity import apk_cd_digest, file_sha256, is_os_metadata
 from .push_jobs import parse_capabilities
 from .browser_control import BrowserControl, CAPABILITY as BROWSER_CAPABILITY
+from .browser_tabs import BrowserTabs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -196,7 +197,7 @@ MAX_IDENTITY_DIAGNOSTIC_LEN = 256
 
 # Connected devices: device_id -> {ws, device_id, model, ip, status, startup_app, battery}
 devices: dict[str, dict] = {}
-browser_control = BrowserControl(devices, command_allowed)
+browser_control = BrowserControl(devices, command_allowed, browser_tabs=BrowserTabs())
 
 # One entry per live, not-yet-identified socket. This collection is intentionally
 # absent from every persistence path; its connection_id is live-connection scoped
@@ -462,6 +463,7 @@ def build_device_list_msg() -> str:
             # Live-only: whether the connected client can currently accept Push.
             "push_state_status": d.get("push_state_status"),
             "open_url_supported": BROWSER_CAPABILITY in d.get("capabilities", []) and command_allowed(d),
+            "close_browser_tabs_supported": browser_control.tabs_supported(d),
         }
         for d in devices.values()
     ]
@@ -1859,6 +1861,9 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 elif msg_type == "OPEN_URL":
                     await browser_control.start(ws, data)
+
+                elif msg_type == "CLOSE_BROWSER_TABS":
+                    await browser_control.start(ws, data, operation="CLOSE_BROWSER_TABS")
 
                 elif msg_type == "DELETE_APP":
                     await handle_delete_app(ws, data)

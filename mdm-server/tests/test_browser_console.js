@@ -22,16 +22,16 @@ function harness() {
     devices: [{ device_id: 'device', label: 'Headset A', status: 'online', open_url_supported: true }],
     browserUrl: { value: 'https://example.com/a?q=one%26two&token=secret#part' },
     browserStatus: { textContent: '', dataset: {} }, browserResults: { innerHTML: '' },
-    messages: [], logs: [], timers: [], updateButtons() {}, clearTimeout() {},
+    messages: [], logs: [], timers: [], delays: [], updateButtons() {}, clearTimeout() {},
     esc(text) { return String(text).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;'); },
   });
   context.deviceById = (id) => context.devices.find(d => d.device_id === id);
   context.labelFor = (id) => (context.deviceById(id) || {}).label || id;
   context.wsSend = (message) => { context.messages.push(message); return true; };
   context.addLog = (text) => context.logs.push(text);
-  context.setTimeout = (callback) => { context.timers.push(callback); return context.timers.length; };
+  context.setTimeout = (callback, delay) => { context.timers.push(callback); context.delays.push(delay); return context.timers.length; };
   for (const name of ['selectedBrowserTargets', 'renderBrowserProgress', 'browserRequestSent',
-    'sendOpenUrl', 'finishBrowserRequest', 'failPendingBrowserRequests']) {
+    'sendOpenUrl', 'sendCloseBrowserTabs', 'sendBrowserOperation', 'finishBrowserRequest', 'failPendingBrowserRequests']) {
     vm.runInContext(functionSource(name), context);
   }
   return context;
@@ -148,4 +148,48 @@ test('request-wide validation errors settle every pending target and failed send
   assert.equal(c.browserPending, null);
   assert.match(c.browserResults.innerHTML, /not sent/);
   assert.equal(c.timers.length, 1);
+});
+
+test('Close All Tabs supports multiple old clients without a URL and shows partial outcomes', () => {
+  const c = harness();
+  c.devices[0].open_url_supported = false;
+  c.devices[0].close_browser_tabs_supported = true;
+  addDevice(c, 'second', { open_url_supported: false, close_browser_tabs_supported: true });
+  c.browserUrl.value = '';
+  c.sendCloseBrowserTabs();
+  assert.equal(c.messages[0].type, 'CLOSE_BROWSER_TABS');
+  assert.equal('url' in c.messages[0], false);
+  assert.deepEqual([...c.messages[0].target_devices], ['device', 'second']);
+  assert.equal(c.delays[0], 95000);
+  const requestId = c.messages[0].request_id;
+  c.finishBrowserRequest(requestId, 'second', 'Closed 2 tabs; 1 remains.', 'partial');
+  assert.match(c.browserStatus.textContent, /0 confirmed.*1 partial.*0 failed/);
+  c.finishBrowserRequest(requestId, 'device', 'Closed 3 tabs; 0 remain.', 'confirmed');
+  assert.equal(c.browserPending, null);
+  assert.match(c.browserStatus.textContent, /1 confirmed.*1 partial.*0 failed/);
+  assert.match(c.browserResults.innerHTML, /Closed 2 tabs; 1 remains/);
+  assert.ok(c.logs.every(line => line.startsWith('Close All Tabs on')));
+});
+
+test('Close All Tabs and Open URL cannot overlap in the console', () => {
+  const c = harness(); c.devices[0].close_browser_tabs_supported = true;
+  c.sendOpenUrl(); c.sendCloseBrowserTabs(); assert.equal(c.messages.length, 1);
+  finish(c, 'device'); c.sendCloseBrowserTabs(); c.sendOpenUrl();
+  assert.equal(c.messages.length, 2);
+  c.browserRequestSent({ type: 'OPEN_URL_SENT', request_id: c.messages[1].request_id, device_id: 'device' });
+  assert.equal(c.browserPending.targets.get('device').message, 'Sending browser request...');
+  c.timers[1](); assert.equal(c.browserPending, null);
+  assert.match(c.browserResults.innerHTML, /Some tabs may already be closed/);
+});
+
+test('Close All Tabs requires its own availability and preserves completed rows on disconnect', () => {
+  const c = harness(); c.sendCloseBrowserTabs(); assert.equal(c.messages.length, 0);
+  c.devices[0].close_browser_tabs_supported = true;
+  addDevice(c, 'second', { close_browser_tabs_supported: true });
+  c.sendCloseBrowserTabs();
+  c.finishBrowserRequest(c.messages[0].request_id, 'device', 'No tabs remain.', 'confirmed');
+  c.failPendingBrowserRequests('Connection lost. Check the headset.');
+  assert.match(c.browserStatus.textContent, /1 confirmed.*0 partial.*1 failed/);
+  assert.match(c.browserResults.innerHTML, /No tabs remain/);
+  assert.equal(c.messages.length, 1);
 });

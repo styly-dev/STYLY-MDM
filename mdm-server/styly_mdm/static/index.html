@@ -586,11 +586,13 @@
             </div>
             <div class="cmd-divider"></div>
             <div class="cmd-section collapsed" data-cmd="browser">
-              <div class="cmd-head" data-act="toggleCmd"><span>Open URL</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-head" data-act="toggleCmd"><span>Browser Controls</span><span class="cmd-chevron">▾</span></div>
               <div class="cmd-body">
                 <div class="push-note">Open an HTTP(S) address in the selected headsets' browsers. This can interrupt their current experiences. Each headset reports its own result; unavailable devices do not block the others.</div>
                 <input type="url" class="field" id="browserUrl" maxlength="4096" placeholder="https://example.com/" aria-label="Headset browser URL" autocomplete="off" spellcheck="false">
                 <button class="btn btn-primary" id="btnOpenUrl" disabled>Open URL on Selected</button>
+                <div class="push-note">Close All Tabs closes browser tabs on selected headsets. It requires authorized wireless ADB and may bring the browser to the foreground.</div>
+                <button class="btn btn-danger-outline" id="btnCloseBrowserTabs" disabled>Close All Tabs on Selected</button>
                 <div class="push-note" id="browserStatus" role="status" aria-live="polite">Select headsets or a group with at least one online headset supporting browser control.</div>
                 <div class="push-note" id="browserResults" aria-label="Browser results by headset"></div>
               </div>
@@ -737,6 +739,7 @@
       const btnLaunch = document.getElementById('btnLaunch');
       const browserUrl = document.getElementById('browserUrl');
       const btnOpenUrl = document.getElementById('btnOpenUrl');
+      const btnCloseBrowserTabs = document.getElementById('btnCloseBrowserTabs');
       const browserStatus = document.getElementById('browserStatus');
       const browserResults = document.getElementById('browserResults');
       const uninstallPkg = document.getElementById('uninstallPkg');
@@ -1081,7 +1084,13 @@
             browserRequestSent(msg);
             break;
           case 'OPEN_URL_RESULT':
-            finishBrowserRequest(msg.request_id, msg.device_id, msg.message, msg.status === 'requested');
+            if (browserPending && browserPending.operation === 'OPEN_URL') finishBrowserRequest(msg.request_id, msg.device_id, msg.message, msg.status);
+            break;
+          case 'CLOSE_BROWSER_TABS_SENT':
+            browserRequestSent(msg);
+            break;
+          case 'CLOSE_BROWSER_TABS_RESULT':
+            if (browserPending && browserPending.operation === 'CLOSE_BROWSER_TABS') finishBrowserRequest(msg.request_id, msg.device_id, msg.message, msg.status);
             break;
           case 'DELETE_APP_SENT': addLog('Uninstall command sent to ' + msg.sent_count + '/' + msg.target_count + ' device(s)', 'info'); break;
           case 'DELETE_APP_RESULT': {
@@ -1662,9 +1671,11 @@
         const browserTargets = selectedBrowserTargets();
         const browserReady = browserTargets.filter(function (id) { const d = deviceById(id); return d && d.status === 'online' && d.open_url_supported === true; }).length;
         btnOpenUrl.disabled = !!browserPending || !browserReady || !browserUrl.value || !ws || ws.readyState !== WebSocket.OPEN;
+        const tabsReady = browserTargets.filter(function (id) { const d = deviceById(id); return d && d.status === 'online' && d.close_browser_tabs_supported === true; }).length;
+        btnCloseBrowserTabs.disabled = !!browserPending || !tabsReady || !ws || ws.readyState !== WebSocket.OPEN;
         if (!browserPending && !browserStatus.dataset.result) {
-          browserStatus.textContent = browserReady ? browserReady + ' of ' + browserTargets.length + ' selected headset(s) ready. Each selected headset will report its own result.' :
-            'Select headsets or a group with browser support. Update the MDM client if needed.';
+          browserStatus.textContent = browserReady || tabsReady ? browserTargets.length + ' selected · Open URL ready: ' + browserReady + ' · Close All Tabs ready: ' + tabsReady + '. Each headset reports its own result.' :
+            'Select headsets or a group. Open URL requires the updated MDM client; Close All Tabs requires ADB tools on the server.';
         }
         btnUninstall.disabled = !uninstallConfirm.checked || uninstallPkg.value.trim() === '' || !has;
         btnStartupSet.disabled = startupPkg.value.trim() === '' || !has;
@@ -1896,10 +1907,15 @@
         const results = Array.from(browserPending.targets.values());
         const pending = results.filter(function (r) { return r.status === 'pending'; }).length;
         const requested = results.filter(function (r) { return r.status === 'requested'; }).length;
-        const failed = results.length - pending - requested;
-        browserStatus.textContent = (pending ? 'Opening browsers: ' : 'Browser requests complete: ') +
-          (results.length - pending) + '/' + results.length + ' completed · ' + requested + ' requested · ' + failed + ' failed' +
-          (pending ? ' · ' + pending + ' pending' : '');
+        const confirmed = results.filter(function (r) { return r.status === 'confirmed'; }).length;
+        const partial = results.filter(function (r) { return r.status === 'partial'; }).length;
+        const failed = results.length - pending - requested - confirmed - partial;
+        const closing = browserPending.operation === 'CLOSE_BROWSER_TABS';
+        browserStatus.textContent = (closing ? (pending ? 'Closing browser tabs: ' : 'Close All Tabs complete: ') :
+          (pending ? 'Opening browsers: ' : 'Browser requests complete: ')) +
+          (results.length - pending) + '/' + results.length + ' completed · ' +
+          (closing ? confirmed + ' confirmed · ' + partial + ' partial' : requested + ' requested') +
+          ' · ' + failed + ' failed' + (pending ? ' · ' + pending + ' pending' : '');
         browserResults.innerHTML = results.map(function (r) {
           return '<div><strong>' + esc(r.label) + '</strong>: ' + esc(r.message) + '</div>';
         }).join('');
@@ -1912,21 +1928,25 @@
       }
 
       function browserRequestSent(msg) {
-        if (!browserPending || msg.request_id !== browserPending.requestId) return;
+        if (!browserPending || msg.request_id !== browserPending.requestId || (msg.type && msg.type !== browserPending.operation + '_SENT')) return;
         const target = browserPending.targets.get(msg.device_id);
         if (!target || target.status !== 'pending') return;
-        target.message = 'Waiting for the headset browser...';
+        target.message = browserPending.operation === 'CLOSE_BROWSER_TABS' ? 'Closing tabs and checking the remaining count...' : 'Waiting for the headset browser...';
         renderBrowserProgress();
       }
 
-      function finishBrowserRequest(requestId, deviceId, message, ok) {
+      function finishBrowserRequest(requestId, deviceId, message, outcome) {
         if (!browserPending || requestId !== browserPending.requestId) return;
+        const status = typeof outcome === 'boolean' ? (outcome ? 'requested' : 'fail') :
+          (['requested', 'confirmed', 'partial'].includes(outcome) ? outcome : 'fail');
+        const operationLabel = browserPending.operation === 'CLOSE_BROWSER_TABS' ? 'Close All Tabs' : 'Open URL';
         const targets = deviceId === null ? Array.from(browserPending.targets.values()) : [browserPending.targets.get(deviceId)];
         targets.forEach(function (target) {
           if (!target || target.status !== 'pending') return;
-          target.status = ok ? 'requested' : 'fail';
-          target.message = message || 'Browser launch was not confirmed. Check the headset.';
-          addLog('Open URL on ' + target.label + ': ' + target.message, ok ? 'success' : 'fail');
+          target.status = status;
+          target.message = message || 'Browser operation was not confirmed. Check the headset.';
+          addLog(operationLabel + ' on ' + target.label + ': ' + target.message,
+            status === 'partial' ? 'warn' : (status === 'fail' ? 'fail' : 'success'));
         });
         renderBrowserProgress();
       }
@@ -1949,6 +1969,17 @@
           browserStatus.textContent = 'Enter a complete HTTP(S) URL without credentials or whitespace.';
           return;
         }
+        sendBrowserOperation('OPEN_URL', targets, url);
+      }
+
+      function sendCloseBrowserTabs() {
+        const targets = selectedBrowserTargets();
+        if (browserPending || !targets.some(function (id) { const d = deviceById(id); return d && d.status === 'online' && d.close_browser_tabs_supported === true; })) return;
+        delete browserStatus.dataset.result;
+        sendBrowserOperation('CLOSE_BROWSER_TABS', targets);
+      }
+
+      function sendBrowserOperation(operation, targets, url) {
         const bytes = new Uint8Array(16);
         window.crypto.getRandomValues(bytes);
         bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
@@ -1956,16 +1987,19 @@
         const requestId = [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join('-');
         // Snapshot IDs and labels before dispatch; later selection/group edits cannot
         // change which result rows belong to this request.
-        browserPending = { requestId: requestId, targets: new Map(targets.map(function (id) {
+        browserPending = { requestId: requestId, operation: operation, targets: new Map(targets.map(function (id) {
           return [id, { label: labelFor(id), status: 'pending', message: 'Sending browser request...' }];
         })), timer: null };
-        if (!wsSend({ type: 'OPEN_URL', request_id: requestId, target_devices: targets, url: url }, 'open URL')) {
+        const payload = { type: operation, request_id: requestId, target_devices: targets };
+        if (operation === 'OPEN_URL') payload.url = url;
+        if (!wsSend(payload, operation === 'OPEN_URL' ? 'open URL' : 'close browser tabs')) {
           failPendingBrowserRequests('Not connected. Browser request was not sent.');
           return;
         }
         browserPending.timer = setTimeout(function () {
-          finishBrowserRequest(requestId, null, 'Browser launch was not confirmed. Check the headset before trying again.', false);
-        }, 20000);
+          finishBrowserRequest(requestId, null, operation === 'OPEN_URL' ? 'Browser launch was not confirmed. Check the headset before trying again.' :
+            'Closing tabs was not confirmed. Some tabs may already be closed; check the headset before trying again.', false);
+        }, operation === 'OPEN_URL' ? 20000 : 95000);
         renderBrowserProgress();
       }
 
@@ -3154,6 +3188,7 @@
       btnLaunch.addEventListener('click', sendLaunch);
       browserUrl.addEventListener('input', function () { delete browserStatus.dataset.result; updateButtons(); });
       btnOpenUrl.addEventListener('click', sendOpenUrl);
+      btnCloseBrowserTabs.addEventListener('click', sendCloseBrowserTabs);
       btnUninstall.addEventListener('click', sendUninstall);
       btnStartupSet.addEventListener('click', sendSetStartup);
       btnStartupClear.addEventListener('click', sendClearStartup);
