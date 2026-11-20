@@ -231,6 +231,13 @@ uses local device time and a weekday mask, and an enabled schedule blocks the
 self-update power-cycle fallback. See the
 [PICO Enterprise SDK reference](https://business.picoxr.com/us/doc/EnterpriseAPI-Intro).
 
+**Power on when USB is connected** under **USB & advanced** manages the PICO
+`SFS_USB_BOOT` switch. When enabled, connecting USB power starts a powered-off
+headset. The client reads the switch back after applying it. Existing packages
+can omit `usbBoot`. Older package-capable clients report it as unsupported if
+deployed. A server downgrade requires removing packages containing the new key
+or restoring a registry backup from before those packages were saved.
+
 **Developer options menu** under **USB & advanced** sets the PUI Developer tab
 visibility flag (0 or 1), which PUI reads when its Settings screen opens. It
 needs `WRITE_SECURE_SETTINGS`, granted over ADB with

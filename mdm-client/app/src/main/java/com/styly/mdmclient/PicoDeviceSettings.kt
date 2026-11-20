@@ -100,6 +100,7 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
             "securityZone" to SFS_SECURITY_ZONE_PERMANENTLY,
             "proximity" to SFS_PSENSOR,
             "seeThrough" to SFS_QUICK_SEETHROUGH_MODE,
+            "usbBoot" to SFS_USB_BOOT,
             "usb" to SFS_USB,
             "wirelessAdb" to SFS_WIRELESS_USB_ADB,
             "usbCopy" to SFS_AUTO_COPY_FILES_FROM_USB_DEVICE,
@@ -194,7 +195,7 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
         else -> when (awaitCallback { service.pbsGetSwitchSystemFunctionStatus(switches.getValue(key), it, 0) }) {
             0 -> false
             1 -> true
-            -2 -> throw SettingFailure("UNSUPPORTED")
+            2, -2 -> throw SettingFailure("UNSUPPORTED")
             else -> throw SettingFailure("READ_FAILED")
         }
     }

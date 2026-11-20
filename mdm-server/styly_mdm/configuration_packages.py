@@ -72,6 +72,8 @@ SECTIONS = [
         _item("seeThrough", "Quick see-through mode", "Enable quick see-through mode.", "bool", False),
     ]},
     {"id": "advanced", "title": "USB & advanced", "description": "USB, file copying and developer options", "items": [
+        _item("usbBoot", "Power on when USB is connected",
+              "Automatically start a powered-off headset when USB power is connected.", "bool", False),
         _item("usb", "USB debugging", "Enable USB debugging.", "bool", False),
         _item("usbCopy", "Auto-copy from USB", "Automatically import files from a connected USB device.",
               "bool", False),

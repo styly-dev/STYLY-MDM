@@ -247,16 +247,18 @@ def test_shared_publish_and_offline_reconnect_use_latest_published_snapshot(tmp_
                 assert await _receive_type(gallery, "CONFIGURATION_POLICY") == NO_POLICY
                 first = await _deploy_to(session, base, empty, {
                     **_brightness(10),
+                    "usbBoot": {"managed": True, "value": True},
                     "usbCopy": {"managed": True, "value": True},
                     "developerMenu": {"managed": True, "value": False},
                 }, "Studio", "Gallery")
                 assert first["impact"]["groups"] == 2 and first["impact"]["devices"] == 3
-                first_settings = {"brightness": 10, "usbCopy": True, "developerMenu": False}
+                first_settings = {"brightness": 10, "usbBoot": True, "usbCopy": True, "developerMenu": False}
                 assert await _receive_type(studio, "CONFIGURATION_POLICY") == _policy(first, first_settings, group="Studio")
                 assert await _receive_type(gallery, "CONFIGURATION_POLICY") == _policy(first, first_settings, group="Gallery")
 
                 latest = await _deploy(session, base, first, settings={
                     **_brightness(25),
+                    "usbBoot": {"managed": True, "value": False},
                     "usbCopy": {"managed": True, "value": False},
                     "developerMenu": {"managed": True, "value": True},
                     "wifi": {"managed": True, "value": _wifi_value(networks=[network])},
@@ -265,7 +267,7 @@ def test_shared_publish_and_offline_reconnect_use_latest_published_snapshot(tmp_
                 assert set(latest) == {"package_id", "name", "edit_revision", "published_revision",
                                        "settings", "sections", "impact"}
                 wanted = _policy(latest, {
-                    "brightness": 25, "usbCopy": False, "developerMenu": True,
+                    "brightness": 25, "usbBoot": False, "usbCopy": False, "developerMenu": True,
                     "wifi": _wifi_value(networks=[network]),
                 })
                 assert await _receive_type(studio, "CONFIGURATION_POLICY") == wanted
@@ -281,6 +283,7 @@ def test_shared_publish_and_offline_reconnect_use_latest_published_snapshot(tmp_
                 cleared = await _deploy(session, base, latest, settings={
                     **_brightness(90, managed=False),
                     "usbCopy": {"managed": False, "value": False},
+                    "usbBoot": {"managed": False, "value": True},
                     "developerMenu": {"managed": False, "value": False},
                     "wifi": {"managed": False, "value": _wifi_value(
                         networks=[{k: v for k, v in network.items() if k != "password"}],
@@ -301,6 +304,9 @@ def test_mutations_enforce_origin_draft_cas_impact_and_validation(tmp_path):
             assert initial["name"] == "Studio"
             assert initial["settings"] == {} and initial["edit_revision"] is None
             assert [section["id"] for section in initial["sections"]] == ["basic", "network", "input", "safety", "advanced"]
+            advanced = next(section for section in initial["sections"] if section["id"] == "advanced")
+            usb_boot = next(item for item in advanced["items"] if item["id"] == "usbBoot")
+            assert usb_boot["kind"] == "bool" and usb_boot["default"] is False
             first = await _deploy(session, base, initial, settings=_brightness(40))
             await _assign(session, base, "Studio", first, origin="http://attacker.invalid", status=403)
             await _assign(session, base, "Studio", first)
