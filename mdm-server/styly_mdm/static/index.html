@@ -424,6 +424,7 @@
     }
   </style>
   <script src="/static/push-jobs-v1.js"></script>
+  <script src="/static/recording-control.js"></script>
 </head>
 
 <body>
@@ -529,6 +530,19 @@
                 <input type="text" class="field" id="launchPkg" placeholder="com.example.app">
                 <input type="text" class="field" id="launchExtra" placeholder='{"scene":"main"} (optional)'>
                 <button class="btn btn-primary" id="btnLaunch" disabled>Launch to Selected</button>
+              </div>
+            </div>
+            <div class="cmd-divider"></div>
+            <div class="cmd-section collapsed" data-cmd="recording">
+              <div class="cmd-head" data-act="toggleCmd"><span>Screen recording</span><span class="cmd-chevron">▾</span></div>
+              <div class="cmd-body">
+                <div class="push-note">Select one or more headsets. Start/Stop applies to selected headsets with a fresh, known recording state; unavailable headsets are skipped individually. Videos stay on each headset. Recording state includes the startup countdown.</div>
+                <div class="push-note" id="recordingState" role="status" style="white-space:pre-line">Select headsets to control recording.</div>
+                <div class="btn-row">
+                  <button class="btn btn-success" id="btnRecordingStart" disabled>Start recording</button>
+                  <button class="btn btn-danger-outline" id="btnRecordingStop" disabled>Stop recording</button>
+                </div>
+                <button class="btn btn-primary" id="btnRecordingRefresh" disabled>Refresh recording state</button>
               </div>
             </div>
             <div class="cmd-divider"></div>
@@ -673,6 +687,7 @@
       let verifyApkRef = null;         // { size, cd_sha256, filename }
       let verifyApkAutoPkg = '';       // last package name auto-filled from an APK (vs typed)
       let verifyDirRef = null;         // { tree_hash, file_count, total_size, manifest?, source }
+      let recordingControls = null;
       let reconnectTimer = null;
       const RECONNECT_DELAY = 3000;
       const LOW_BATTERY_THRESHOLD = 20;
@@ -977,7 +992,7 @@
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
         ws = new WebSocket(proto + '//' + location.host + '/ws/admin');
         ws.onopen = function () { setConnStatus('connected'); addLog('Connected to server', 'info'); if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; } };
-        ws.onclose = function () { setConnStatus('reconnecting'); addLog('Disconnected from server', 'fail'); scheduleReconnect(); };
+        ws.onclose = function () { if (recordingControls) recordingControls.disconnected(); setConnStatus('reconnecting'); addLog('Disconnected from server', 'fail'); scheduleReconnect(); };
         ws.onerror = function () { };
         ws.onmessage = function (e) { try { handleMessage(JSON.parse(e.data)); } catch (err) { addLog('Failed to parse message: ' + err.message, 'fail'); } };
       }
@@ -1054,6 +1069,7 @@
             render();
             break;
           }
+          case 'RECORDING_RESULT': if (recordingControls) recordingControls.receive(msg); break;
           case 'LAUNCH_RESULT': {
             const st = msg.status === 'success' ? 'success' : 'fail';
             const detail = msg.error || msg.message || '';
@@ -1629,6 +1645,7 @@
 
 
       function updateButtons() {
+        if (recordingControls) recordingControls.refresh();
         const attentionMode = targetTab === 'attention';
         const hasAttentionPower = attentionMode && Array.from(selectedConnectionIds).some(function (id) {
           return attentionPowerSupported(connectionById(id));
@@ -3040,6 +3057,21 @@
       startupPkg.addEventListener('input', updateButtons);
       btnInstall.addEventListener('click', sendInstall);
       btnUpdateClients.addEventListener('click', sendClientUpdateBulk);
+      recordingControls = window.createRecordingControls({
+        document: document,
+        selection: function () {
+          if (targetTab === 'attention') return [];
+          return Array.from(selectedIds).map(deviceById).filter(Boolean);
+        },
+        connected: function () { return ws && ws.readyState === WebSocket.OPEN; },
+        visible: function () { return view === 'console' && !document.hidden && !document.querySelector('[data-cmd="recording"]').classList.contains('collapsed'); },
+        now: Date.now,
+        requestId: function () { return Array.from(crypto.getRandomValues(new Uint8Array(16))).map(function (b) { return b.toString(16).padStart(2, '0'); }).join(''); },
+        send: function (message) { return wsSend(message, 'control recording'); },
+        label: labelFor,
+        log: addLog,
+        setInterval: window.setInterval.bind(window)
+      });
       btnLaunch.addEventListener('click', sendLaunch);
       btnUninstall.addEventListener('click', sendUninstall);
       btnStartupSet.addEventListener('click', sendSetStartup);

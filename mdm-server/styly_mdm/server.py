@@ -30,6 +30,9 @@ from .device_policy import (
 )
 from .integrity import apk_cd_digest, file_sha256, is_os_metadata
 from .push_jobs import parse_capabilities
+from .recording_control import RecordingRequests
+
+recording_controls = RecordingRequests()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -459,6 +462,7 @@ def build_device_list_msg() -> str:
             "version_name": d.get("version_name", ""),
             # Live-only: whether the connected client can currently accept Push.
             "push_state_status": d.get("push_state_status"),
+            "recording_control_supported": recording_controls.supported(d),
         }
         for d in devices.values()
     ]
@@ -492,6 +496,7 @@ def build_device_list_msg() -> str:
             "version_name": rec.get("version_name", ""),
             "identity_kind": rec.get("identity_kind", "legacy"),
             "push_state_status": None,
+            "recording_control_supported": False,
         })
     device_list.sort(
         key=lambda e: (e["label"] == "", (e["label"] or e["device_id"]).lower())
@@ -1373,6 +1378,9 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                             data,
                             idempotent=True,
                         )
+                        if _owns_device(device_id, ws):
+                            devices[device_id]["capabilities"] = registration["capabilities"]
+                            await broadcast_device_list()
                         continue
                     if kind == "provisional":
                         now = time.time()
@@ -1425,6 +1433,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "ws": ws,
                         "device_id": device_id,
                         "identity_kind": kind,
+                        "capabilities": registration["capabilities"],
                         "registration_ready": False,
                         "model": model,
                         "ip": ip,
@@ -1652,6 +1661,9 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "detail": detail,
                     })
 
+                elif msg_type == "RECORDING_RESULT":
+                    await recording_controls.consume(ws, device_id, data, devices)
+
                 elif msg_type in {
                     "LAUNCH_RESULT",
                     "REBOOT_RESULT",
@@ -1741,6 +1753,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
         # transfer slots, settle its pending state, or delete its registration —
         # that last one left a connected device stuck on "offline" until the next
         # BATTERY_UPDATE crashed the survivor (#70). See _owns_device.
+        await recording_controls.disconnected(ws)
         is_current = _owns_device(device_id, ws)
         if device_id and not is_current:
             log.info("Superseded device connection closed, ignoring: %s", device_id)
@@ -1844,7 +1857,10 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     }))
                     continue
 
-                if msg_type == "LAUNCH_APP":
+                if msg_type == "RECORDING_CONTROL":
+                    await recording_controls.dispatch(ws, data, devices)
+
+                elif msg_type == "LAUNCH_APP":
                     await handle_launch_app(ws, data)
 
                 elif msg_type == "DELETE_APP":
@@ -3127,6 +3143,7 @@ def create_app() -> web.Application:
     load_registry()
     app = web.Application(
         client_max_size=max(MAX_APK_SIZE, MAX_BUNDLE_SIZE) + 10 * 1024 * 1024)
+    app.cleanup_ctx.append(recording_controls.lifecycle)
 
     # WebSocket endpoints
     app.router.add_get("/ws/device", device_ws_handler)
