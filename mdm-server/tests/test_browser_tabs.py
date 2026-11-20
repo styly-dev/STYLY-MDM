@@ -94,11 +94,12 @@ async def tab_browser():
         "tabs": [{"id": "one", "type": "page", "url": "https://private.invalid/?token=secret"},
                  {"id": "two", "type": "page", "url": "https://example.com/"},
                  {"id": "worker", "type": "service_worker"}],
-        "requests": [], "mode": "normal", "running": True,
+        "requests": [], "list_requests": 0, "mode": "normal", "running": True,
         "started": asyncio.Event(), "release": asyncio.Event(),
     }
 
     async def listing(request):
+        state["list_requests"] += 1
         if state["mode"] == "wait":
             state["started"].set()
             await state["release"].wait()
@@ -271,6 +272,39 @@ async def test_cancellation_removes_only_its_dynamic_forward(tab_browser):
         await operation
     state["release"].set()
     assert_forward_removed(browser, state)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_forward_allocation_waits_for_port_and_removes_it(tab_browser):
+    browser, state = tab_browser
+    allocated = asyncio.Event()
+    release = asyncio.Event()
+    original = browser.command.side_effect
+
+    async def delayed_forward(*args, **kwargs):
+        if args[2:] == ("forward", "tcp:0", "localabstract:weblayer_devtools_remote_123"):
+            # ADB has created the forward, but its assigned port is not returned yet.
+            allocated.set()
+            await release.wait()
+        return await original(*args, **kwargs)
+
+    browser.command.side_effect = delayed_forward
+    operation = asyncio.create_task(browser.close_all_tabs(DEVICE))
+    try:
+        await asyncio.wait_for(allocated.wait(), 3)
+        operation.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(operation, 3)
+        assert_forward_removed(browser, state)
+        assert state["list_requests"] == 0
+        assert not state["requests"]
+    finally:
+        release.set()
+        if not operation.done():
+            operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
 
 
 @pytest.mark.parametrize("pids", ["123 456", "unexpected"])
