@@ -536,8 +536,8 @@
             <div class="cmd-section collapsed" data-cmd="recording">
               <div class="cmd-head" data-act="toggleCmd"><span>Screen recording</span><span class="cmd-chevron">▾</span></div>
               <div class="cmd-body">
-                <div class="push-note">Select one online headset. Videos stay on the headset. Recording state includes the startup countdown; check saved videos in the headset.</div>
-                <div class="push-note" id="recordingState" role="status">Select one online headset with an updated recording-capable client.</div>
+                <div class="push-note">Select one or more headsets. Start/Stop applies to selected headsets with a fresh, known recording state; unavailable headsets are skipped individually. Videos stay on each headset. Recording state includes the startup countdown.</div>
+                <div class="push-note" id="recordingState" role="status" style="white-space:pre-line">Select headsets to control recording.</div>
                 <div class="btn-row">
                   <button class="btn btn-success" id="btnRecordingStart" disabled>Start recording</button>
                   <button class="btn btn-danger-outline" id="btnRecordingStop" disabled>Stop recording</button>
@@ -3060,8 +3060,8 @@
       recordingControls = window.createRecordingControls({
         document: document,
         selection: function () {
-          if (targetTab === 'attention' || selectedIds.size !== 1) return null;
-          return deviceById(Array.from(selectedIds)[0]);
+          if (targetTab === 'attention') return [];
+          return Array.from(selectedIds).map(deviceById).filter(Boolean);
         },
         connected: function () { return ws && ws.readyState === WebSocket.OPEN; },
         visible: function () { return view === 'console' && !document.hidden && !document.querySelector('[data-cmd="recording"]').classList.contains('collapsed'); },

@@ -332,29 +332,48 @@ STYLY-MDM/
 
 ## Native screen recording
 
-Select **one online headset** and expand **Screen recording**. The console reads
-native state every five seconds while the panel is visible. **Start recording**
-is enabled only for a fresh stopped state; **Stop recording** only for a fresh
-recording state. **Refresh recording state** can recover from an unknown state.
-Videos stay on the headset. State confirmation includes the native startup
-countdown and does not prove video-file integrity or playback.
+Select **one or more headsets** (or a group) and expand **Screen recording**.
+The panel displays each selected headset's native recording state and refreshes
+eligible devices every five seconds while visible, measured from each response
+so delayed replies still leave time to act on a fresh observation. **Start recording** is enabled
+when at least one selected headset has a fresh stopped state; **Stop recording**
+when at least one has a fresh recording state. Both actions are available for a
+mixed selection. **Refresh recording state** requests new observations without
+changing recording.
+
+Start/Stop sends the explicit desired state to each selected, eligible headset
+with a fresh known state. A headset already in that state returns a no-op.
+Offline, unsupported, busy, unknown, or stale devices are skipped and reported
+individually; they do not block other selected headsets. Each request snapshots
+the target IDs, and each headset keeps independent pending work, freshness,
+results, and timeout handling even if selection changes or replies arrive out
+of order. Videos stay on each headset. State confirmation includes the native
+startup countdown and does not prove video-file integrity or playback.
 
 Deploy both the updated server and client APK. The client advertises
-`recording_control_v1` on canonical registration; older clients, legacy identities,
-provisional connections, offline devices, wildcard targets, and multiple selected
-headsets are rejected. No separate recording helper or wireless ADB is required.
+`recording_control_v1` on canonical registration. Older clients, legacy identities,
+provisional connections, and offline devices receive per-device failures if
+addressed directly. No separate recording helper or wireless ADB is required.
 Existing PICO Enterprise provisioning and authorization remain required.
 
 The console sends `RECORDING_CONTROL` with a 32-character lowercase hexadecimal
-`request_id`, exactly one `target_devices` entry, and `action` equal to `status`,
-`start`, or `stop`. The server forwards `EXECUTE_RECORDING_CONTROL` with the same
-request ID and action. `RECORDING_RESULT` contains `status` (`success` or `fail`),
-`state` (`recording`, `stopped`, or `unknown`), `changed`, and `detail`. The server
-adds the canonical device ID and routes the response only to its requesting
-console. It matches request, action, device, and original socket, rejects stale
-results, serializes per headset, and reports a bounded timeout. No command is
-retried automatically; disconnects and timeouts require refreshing native state.
-The server rejects reuse of mutating request IDs within a console connection.
+`request_id`, a nonempty list of explicit `target_devices`, and `action` equal to
+`status`, `start`, or `stop`. Wildcard and provisional-connection targets are not
+accepted. The server deduplicates the supplied IDs and independently forwards
+`EXECUTE_RECORDING_CONTROL` with the same batch request ID and action to each
+eligible headset. Per-device dispatch errors, busy state, disconnects and timeouts
+do not prevent other targets from proceeding. Bounded send tasks run outside the
+admin receive loop, so a slow peer does not delay a subsequent action for a healthy
+headset. A single-target list remains valid.
+
+Each `RECORDING_RESULT` contains `status` (`success` or `fail`), `state`
+(`recording`, `stopped`, or `unknown`), `changed`, and `detail`. The server adds the
+canonical device ID and routes each result only to its requesting console.
+Pending operations are keyed by `(request_id, device_id)`. Responses must also
+match the action and original device socket. Stale results are discarded and
+commands are serialized independently on each headset. The server rejects reuse
+of a mutating `(request_id, device_id)` within a console connection. No command
+is retried automatically; disconnects and timeouts require refreshing native state.
 
 The client reads `/system/bin/getprop` with a two-second timeout on a worker
 thread. `pvr.screen.action=record` means recording; a present empty property means
@@ -380,7 +399,8 @@ queue; consoles generate a new ID for each deliberate action and never replay
 historical commands after reconnecting.
 
 Avoid simultaneous native headset and MDM recording inputs: the state read and
-vendor toggle are separate operations. Unknown state disables both action buttons.
+vendor toggle are separate operations. Unknown state excludes only that headset
+from Start/Stop; other selected headsets with known state remain actionable.
 Host tests and APK builds do not replace checking Start, repeated Start, Stop,
 initial idle, reconnect, and saved playback on the target firmware.
 
