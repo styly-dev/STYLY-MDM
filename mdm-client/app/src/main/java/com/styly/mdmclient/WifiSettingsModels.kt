@@ -74,11 +74,11 @@ internal data class WifiManualResult(
     val revision: String,
     val status: String,
     val reason: WifiReason,
-    val canConfirmConnectionLater: Boolean = false,
 )
 
 internal data class WifiLocalState(
     val lastApplied: WifiSavedProfile? = null,
+    /** Latest local Wi-Fi operation, including connection selection. */
     val latestResult: WifiManualResult? = null,
     val managedWifi: Boolean = true,
 )

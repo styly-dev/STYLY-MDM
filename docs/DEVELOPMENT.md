@@ -85,7 +85,13 @@ compatibility, and message sequences.
 
 ### Configuration packages
 
+The client advertises configuration package support when the app process sees
+`Build.MANUFACTURER` equal to `Pico` (case-insensitive) and `Build.PRODUCT`
+equal to `PICO 4 Ultra Enterprise`. On DEV-005, the ADB shell reports
+`ro.product.name` as `sparrow`, while the app reports the enterprise product name.
 Operator-facing Wi-Fi behavior is in [Wi-Fi settings](WIFI_SETTINGS.md).
+Device cards in Group Settings start collapsed. Opening a card shows each
+setting's reported result for the current deployment.
 
 #### Groups and deployment
 
@@ -186,13 +192,15 @@ Failed or interrupted attempts wait for Retry when the same active deployment
 is delivered again in the same OS boot. An explicit Retry token is used once and survives a socket
 replacement for the same assignment.
 
-- **Same boot:** an automatic deployment carries forward results for unchanged
-  scalar settings other than failures, and a matching verified Wi-Fi setting
-  keeps its connection. A changed assignment reapplies its settings even when
-  it returns to an earlier revision.
-  Duplicate deliveries of the current revision reuse the recorded attempt,
-  including after an app restart. A new assignment after a release clears the
-  old attempts in the same write that caches the assignment.
+- **New deployment:** the client reads every managed setting and records fresh
+  results for the new revision. It writes and reads back settings that differ.
+  Wi-Fi checks the saved profiles and auto-join flags on the headset. When
+  those settings match and the client has saved evidence for the requested
+  credentials, it retains the existing connection. A changed assignment
+  rechecks settings even when it returns to an earlier revision.
+- **Redelivery in the same boot:** the current revision reuses its recorded
+  attempt, including after an app restart. A new assignment after a release
+  clears the old attempts in the same write that caches the assignment.
 - On **OS boot**, the client reapplies every setting in the saved assignment, even
   without the server. A saved release disables offline reapplication and Wi-Fi
   management. **Reapply settings** on the headset applies the saved assignment
@@ -203,8 +211,7 @@ replacement for the same assignment.
   the previous preferences until its first successful file write. A legacy
   cache left on disk cannot override the committed file. Clients downgraded
   after migration need the server to deliver their assignment again.
-  The attempt journal stores per-setting results, scalar
-  targets, and a Wi-Fi fingerprint used to keep an unchanged failure for Retry.
+  The attempt journal records per-setting results and used Retry tokens.
   Scalar results are saved before Wi-Fi starts. A recoverable exception during
   application or a process stop before results are saved leaves an interrupted
   attempt. The same package remains eligible for Retry or **Reapply settings**.
@@ -264,7 +271,7 @@ TobService `allowWifiAutoJoin(null, networkId, allowed)`. It confirms the flags
 by reading `WifiConfiguration.allowAutojoin` through reflection.
 
 **Priority mode.** One scheduled worker owns policy operations, adapter writes,
-scan requests and decisions. Application, late verification and ongoing
+scan requests and decisions. Application and ongoing
 priority monitoring share one Wi-Fi network callback while observation is
 needed. Callback delivery prompts the worker to read the current connection
 snapshot. Android stamps observations on receipt so a synchronous adapter call
@@ -281,17 +288,14 @@ the session stopped so the next readiness or connectivity check can retry it.
   timestamp and gates new adapter mutations by the current time. A fresh usable
   connection to the candidate can finish selection during disconnect once the
   earlier and unrelated associations have cleared.
-- A connected protected network whose password changed or is unknown to MDM is
-  unverified until the next OS boot. A usable connection to it reports
-  `VERIFY_AFTER_REBOOT`. The local journal keeps this credential check across
-  candidate removal, partial saves, and client restarts in the same boot.
-  The v5 Wi-Fi journal stores the boot count and a password fingerprint for
-  each such network. It reads v4 boot counts using the matching saved
-  credentials; a v4 client cannot read a journal once v5 has written it.
-  A lower candidate reports `FALLBACK`. Save and flag
-  failures are reported even when a candidate connects.
-- If a boot attempt saved everything but timed out, the client watches for a
-  later connection during that boot and then marks Wi-Fi applied.
+- The package result is `SAVED` once profile and auto-join readback succeeds
+  and the client durably stores the applied profile. Connection selection
+  and fallback can continue after that result. Save and readback failures
+  are reported even when a candidate connects.
+- While a usable fallback with unchanged credentials is connected, the client
+  may recreate the MDM-owned first choice. It tracks changed or unknown
+  credentials by boot count and password fingerprint to decide whether it can
+  rely on the fallback during recreation.
 - After a disconnection with more than one candidate, or with a cached fallback
   profile, the client waits 8 seconds plus up to 3 seconds of jitter. It keeps a
   connection Android has restored, or selects candidates in order. Failed
@@ -315,7 +319,8 @@ auto-join flags unchanged. The Wi-Fi policy state is stored in
 
 #### Headset Settings screen
 
-The **Permissions** section shows file access, each Wi-Fi grant, and the
+The **Permissions** section summarizes file access and Wi-Fi readiness.
+**Permission details** lists each Wi-Fi grant and the
 Location switch, and refreshes when the operator returns from Android settings.
 When both location grants are present, the running service adds its `location`
 foreground service type. **Device configuration** shows the assigned group and
@@ -328,7 +333,7 @@ launches when the service starts for a boot or system reason.
 | Surface | Contract |
 |---|---|
 | `GET /api/packages`, `POST /api/packages` | List packages or create one by name. |
-| `GET /api/packages/{id}` | Returns package identity and name, `edit_revision`, `published_revision`, the saved editor `settings`, including unchecked settings, the editor `sections`, and `impact` with group and device counts and a token. A saved Wi-Fi password is represented by `password_present`. |
+| `GET /api/packages/{id}` | Returns package identity and name, `edit_revision`, `published_revision`, the saved editor `settings`, including unchecked settings and Wi-Fi passwords, the editor `sections`, and `impact` with group and device counts and a token. |
 | `POST /api/packages/{id}/save-and-deploy` | Atomically saves `settings` as `{id: {managed, value}}` and deploys a new revision. Supply `expected_revision` equal to the loaded edit token `edit_revision` (null for a new package), and `expected_impact` from the preview. An optional `name` renames the package. |
 | `DELETE /api/packages/{id}` | Deletes an unassigned package. Send a JSON body with `expected_revision` equal to the loaded `edit_revision` (null for a new package). A stale edit revision or a current group assignment returns 409, with `code: "package_assigned"` for the assignment conflict. |
 | `GET`, `POST /api/group-package/deploy?name=...&package_id=...` | GET previews the deployment scope and whether it uses the current deployed version. An empty `package_id=` previews clearing management for the group and sets `clear` to true. The preview includes the current deployment's `wifi_mode`. POST accepts `expected_impact` from the preview, commits the group reference and any new deployment revision together, and returns the committed `GROUP_LIST` snapshot. A package that has never been deployed returns 409. |
@@ -446,10 +451,11 @@ adb install app/build/outputs/apk/dev/debug/app-dev-debug.apk
 
 The dev APK keeps the production applicationId `com.styly.mdmclient` and only changes
 its label to **STYLY-MDM Dev**, so installing it replaces the production build on a
-device (they share a package name and cannot coexist). It only broadcasts/listens on
-the dev discovery port (7081), so it never discovers the production server. Its
-fallback URL also targets the dev WebSocket port (7080), so even if discovery times
-out it cannot accidentally connect to a production server.
+device (they share a package name and cannot coexist). It broadcasts on the dev
+discovery port (7081) and uses 7080 as its fallback WebSocket port. The dev client
+ignores port 7070 in saved manual addresses, cached URLs and discovery replies.
+An ignored manual address triggers auto-discovery, and the dev client can still
+use other ports for a custom development server.
 
 The ports come from `BuildConfig` fields defined per flavor in
 `mdm-client/app/build.gradle` (`DISCOVERY_PORT`, `DEFAULT_WS_PORT`).

@@ -40,6 +40,7 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var saveButton: Button
     private lateinit var autoDiscoveryButton: Button
     private lateinit var storagePermissionStatus: TextView
+    private lateinit var storagePermissionAction: View
     private lateinit var grantStorageButton: Button
     private lateinit var deviceIdentityStatus: TextView
     private lateinit var journalText: TextView
@@ -47,9 +48,14 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var journalClearButton: Button
     private lateinit var wifiPermissionHint: TextView
     private lateinit var wifiPermissionButton: Button
+    private lateinit var wifiPermissionSummary: TextView
+    private lateinit var wifiDiagnosticsHint: View
+    private lateinit var permissionDetails: View
+    private lateinit var permissionDetailsToggle: Button
     private var hadWifiLocationPermissions = false
     private lateinit var configurationGroup: TextView
     private lateinit var configurationDeployment: TextView
+    private lateinit var configurationDeploymentRow: View
     private lateinit var configurationApplyStatus: TextView
     private lateinit var reapplyButton: Button
 
@@ -106,6 +112,7 @@ class SettingsActivity : AppCompatActivity() {
         saveButton = findViewById(R.id.save_button)
         autoDiscoveryButton = findViewById(R.id.use_auto_discovery_button)
         storagePermissionStatus = findViewById(R.id.storage_permission_status)
+        storagePermissionAction = findViewById(R.id.storage_permission_action)
         grantStorageButton = findViewById(R.id.grant_storage_button)
         deviceIdentityStatus = findViewById(R.id.device_identity_status)
         journalText = findViewById(R.id.journal_text)
@@ -113,8 +120,13 @@ class SettingsActivity : AppCompatActivity() {
         journalClearButton = findViewById(R.id.journal_clear_button)
         wifiPermissionHint = findViewById(R.id.wifi_permission_hint)
         wifiPermissionButton = findViewById(R.id.wifi_location_permission_button)
+        wifiPermissionSummary = findViewById(R.id.wifi_permission_summary)
+        wifiDiagnosticsHint = findViewById(R.id.wifi_diagnostics_hint)
+        permissionDetails = findViewById(R.id.permission_details)
+        permissionDetailsToggle = findViewById(R.id.permission_details_toggle)
         configurationGroup = findViewById(R.id.configuration_group)
         configurationDeployment = findViewById(R.id.configuration_deployment)
+        configurationDeploymentRow = findViewById(R.id.configuration_deployment_row)
         configurationApplyStatus = findViewById(R.id.configuration_apply_status)
         reapplyButton = findViewById(R.id.configuration_reapply)
 
@@ -142,10 +154,24 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         wifiPermissionButton.setOnClickListener { requestWifiPermission() }
+        showPermissionDetails(savedInstanceState?.getBoolean(KEY_PERMISSION_DETAILS_OPEN) == true)
+        permissionDetailsToggle.setOnClickListener {
+            showPermissionDetails(permissionDetails.visibility != View.VISIBLE)
+        }
 
         hadWifiLocationPermissions = hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) &&
             hasPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
         startMdmService()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(KEY_PERMISSION_DETAILS_OPEN, permissionDetails.visibility == View.VISIBLE)
+    }
+
+    private fun showPermissionDetails(expanded: Boolean) {
+        permissionDetails.visibility = if (expanded) View.VISIBLE else View.GONE
+        permissionDetailsToggle.setText(if (expanded) R.string.permission_details_hide else R.string.permission_details_show)
     }
 
     override fun onResume() {
@@ -180,24 +206,20 @@ class SettingsActivity : AppCompatActivity() {
         val state = configurationController.screenSnapshot()
         val version = state?.version
         configurationGroup.text = when {
-            state?.groupName != null -> getString(R.string.configuration_group, state.groupName)
+            state?.groupName != null -> state.groupName
             state?.groupKnown == true -> getString(R.string.configuration_group_none)
             else -> getString(R.string.configuration_group_unknown)
         }
-        configurationDeployment.visibility =
-            if (version != null || state?.groupName != null) View.VISIBLE else View.GONE
-        configurationDeployment.text = when {
-            version == null -> getString(R.string.configuration_not_deployed)
-            state.deployedAtMillis == null -> getString(R.string.configuration_deployment_unknown)
-            else -> getString(
-                R.string.configuration_deployment,
-                DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
-                    .format(Date(state.deployedAtMillis)),
-            )
+        configurationDeploymentRow.visibility = if (version != null) View.VISIBLE else View.GONE
+        if (version != null) {
+            configurationDeployment.text = state.deployedAtMillis?.let {
+                DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(it))
+            } ?: getString(R.string.configuration_deployment_unknown)
         }
         val status = state?.applyStatus
         val statusText = when {
             status == ConfigurationApplyStatus.RELEASE_UNSAVED -> R.string.configuration_release_unsaved
+            version == null && state?.groupKnown == true -> R.string.configuration_not_deployed
             version == null -> 0
             status == null -> R.string.configuration_unsupported
             status == ConfigurationApplyStatus.APPLYING -> R.string.configuration_applying
@@ -244,7 +266,7 @@ class SettingsActivity : AppCompatActivity() {
         if (!WebSocketManager.saveManualServerUrl(this, url)) {
             Toast.makeText(
                 this,
-                "Enter a valid server address such as 192.168.1.100:7070",
+                getString(R.string.invalid_server_address, getString(R.string.server_url_hint)),
                 Toast.LENGTH_SHORT,
             ).show()
             return
@@ -285,11 +307,11 @@ class SettingsActivity : AppCompatActivity() {
         if (hasAllFilesAccess()) {
             storagePermissionStatus.setText(R.string.storage_permission_granted)
             storagePermissionStatus.setTextColor(getColor(R.color.permission_status_granted))
-            grantStorageButton.visibility = View.GONE
+            storagePermissionAction.visibility = View.GONE
         } else {
             storagePermissionStatus.setText(R.string.storage_permission_not_granted)
-            storagePermissionStatus.setTextColor(0xFFFF5722.toInt())
-            grantStorageButton.visibility = View.VISIBLE
+            storagePermissionStatus.setTextColor(getColor(R.color.permission_status_action))
+            storagePermissionAction.visibility = View.VISIBLE
         }
     }
 
@@ -358,17 +380,29 @@ class SettingsActivity : AppCompatActivity() {
             getText(if (locationEnabled) R.string.wifi_location_services_on else R.string.wifi_location_services_off),
         )
 
-        val settingsHint = when {
-            !preciseLocation -> R.string.wifi_precise_location_permission_missing
-            !backgroundLocation -> R.string.wifi_background_location_permission_missing
-            !overlay -> R.string.wifi_overlay_permission_missing
-            !locationEnabled -> R.string.wifi_location_services_disabled
+        val settingsAction = when {
+            !preciseLocation -> R.string.wifi_precise_location_permission_missing to R.string.wifi_allow_precise_location
+            !backgroundLocation -> R.string.wifi_background_location_permission_missing to R.string.wifi_open_app_permissions
+            !overlay -> R.string.wifi_overlay_permission_missing to R.string.wifi_open_overlay_settings
+            !locationEnabled -> R.string.wifi_location_services_disabled to R.string.wifi_open_location_settings
             else -> null
         }
-        val hint = settingsHint ?: if (diagnostics) null else R.string.wifi_diagnostics_permission_missing
-        wifiPermissionHint.visibility = if (hint == null) View.GONE else View.VISIBLE
-        if (hint != null) wifiPermissionHint.setText(hint)
-        wifiPermissionButton.visibility = if (settingsHint == null) View.GONE else View.VISIBLE
+        val actionVisibility = if (settingsAction == null) View.GONE else View.VISIBLE
+        wifiPermissionHint.visibility = actionVisibility
+        wifiPermissionButton.visibility = actionVisibility
+        wifiDiagnosticsHint.visibility = if (diagnostics) View.GONE else View.VISIBLE
+        if (settingsAction == null) {
+            wifiPermissionSummary.setText(R.string.wifi_permissions_ready)
+        } else {
+            val (hint, button) = settingsAction
+            wifiPermissionHint.setText(hint)
+            wifiPermissionButton.setText(button)
+            wifiPermissionSummary.text = buildSpannedString {
+                color(getColor(R.color.permission_status_action)) {
+                    append(getText(R.string.wifi_permissions_action_needed))
+                }
+            }
+        }
 
         val hasLocationPermissions = preciseLocation && backgroundLocation
         val locationPermissionsAcquired = hasLocationPermissions && !hadWifiLocationPermissions
@@ -447,6 +481,7 @@ class SettingsActivity : AppCompatActivity() {
 
     companion object {
         private const val REQUEST_WIFI_LOCATION_PERMISSION = 8702
+        private const val KEY_PERMISSION_DETAILS_OPEN = "permission_details_open"
     }
 
     private fun updateStatusDisplay(connected: Boolean, message: String) {

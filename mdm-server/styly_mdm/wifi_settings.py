@@ -125,12 +125,13 @@ def validate_profile_networks(
     return result
 
 
-def public_networks(networks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Build the non-secret network shape returned by profile APIs."""
+def editor_networks(networks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the saved networks for the package editor."""
     return [
         {
             "ssid": network["ssid"],
             "security": network["security"],
+            "password": network["password"],
             "password_present": network["security"] == "WPA2_WPA3" and bool(network.get("password")),
             "hidden": network["hidden"],
         }

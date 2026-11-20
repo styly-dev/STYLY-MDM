@@ -620,7 +620,7 @@ def test_registry_recovers_after_retired_wifi_entries_are_removed_without_losing
         "settings": {"brightness": 45},
     }
 
-def test_wifi_public_draft_redacts_password_and_keeps_nested_policy():
+def test_wifi_editor_returns_saved_password_and_keeps_nested_policy():
     settings = configuration_packages.validate_settings({
         "wifi": {"managed": True, "value": {
             "networks": [
@@ -634,22 +634,21 @@ def test_wifi_public_draft_redacts_password_and_keeps_nested_policy():
         "edit_revision": str(uuid.uuid4()), "published_revision": None, "deployed_at_ms": None,
     }
 
-    public = configuration_packages.public_profile(
+    editor = configuration_packages.editor_profile(
         str(uuid.uuid4()), profile, {},
     )
-    assert public["settings"]["wifi"]["value"] == {
+    assert editor["settings"]["wifi"]["value"] == {
         "networks": [{
-            "ssid": "Hidden Office", "security": "WPA2_WPA3", "password_present": True, "hidden": True,
+            "ssid": "Hidden Office", "security": "WPA2_WPA3", "password": "test-password",
+            "password_present": True, "hidden": True,
         }],
         "auto_return": False,
     }
-    assert "test-password" not in json.dumps(public)
-
     settings["wifi"]["value"]["prioritize_networks"] = False
-    public = configuration_packages.public_profile(str(uuid.uuid4()), {
+    editor = configuration_packages.editor_profile(str(uuid.uuid4()), {
         **profile, "settings": settings,
     }, {})
-    assert public["settings"]["wifi"]["value"]["prioritize_networks"] is False
+    assert editor["settings"]["wifi"]["value"]["prioritize_networks"] is False
 
 
 def test_wifi_caps_networks_at_four_in_managed_drafts_and_snapshots():

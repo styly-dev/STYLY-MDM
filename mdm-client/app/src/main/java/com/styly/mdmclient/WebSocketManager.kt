@@ -88,6 +88,7 @@ class WebSocketManager internal constructor(
         // Kept separate from PREF_SERVER_URL, which is only a discovery cache.
         private const val PREF_MANUAL_SERVER_URL = "manual_server_url_value"
         private const val MANUAL_SERVER_PATH = "/ws/device"
+        private const val PRODUCTION_WS_PORT = 7070
         // Last-resort fallback used only when discovery fails and no URL is saved.
         // The port is flavor-aware (BuildConfig.DEFAULT_WS_PORT) so the dev build
         // never falls back to the production port and accidentally connects to a
@@ -159,12 +160,12 @@ class WebSocketManager internal constructor(
         private fun preferences(context: Context) =
             context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
 
-        private fun isValidWsUrl(url: String): Boolean {
+        internal fun isValidWsUrl(url: String): Boolean {
             if (!url.startsWith("ws://") && !url.startsWith("wss://")) return false
             return try {
                 // OkHttp accepts WebSocket URLs here by normalizing ws/wss to http/https.
-                Request.Builder().url(url).build()
-                true
+                val port = Request.Builder().url(url).build().url.port
+                isAllowedServerPort(port)
             } catch (_: IllegalArgumentException) {
                 false
             }
@@ -195,8 +196,11 @@ class WebSocketManager internal constructor(
 
             if (!isAsciiDigits(parts[1])) return false
             val port = parts[1].toIntOrNull() ?: return false
-            return port in 1..65535
+            return isAllowedServerPort(port)
         }
+
+        private fun isAllowedServerPort(port: Int): Boolean =
+            port in 1..65535 && (BuildConfig.FLAVOR != "dev" || port != PRODUCTION_WS_PORT)
 
         private fun isValidServerHost(host: String): Boolean {
             if (host.isEmpty()) return false

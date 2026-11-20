@@ -8,8 +8,9 @@ managed LAN. Package deployment and the client implementation are described in
 
 Open **Manage Groups → Configuration Packages**, choose a package, then expand
 **Network & connectivity**. Select **Manage** on **Wi-Fi networks** and add
-Open or WPA2/WPA3 Personal networks. A blank password field keeps the saved key
-for the same SSID and security. Choose **Save & deploy**. The confirmation
+Open or WPA2/WPA3 Personal networks. The editor fills in the saved password.
+Enter a new password to replace it. An empty field keeps the saved key for the
+same SSID and security. Choose **Save & deploy**. The confirmation
 includes all assigned groups and members. Offline devices receive the latest
 revision when they connect. Group **Settings** shows Wi-Fi readiness and the
 last package result.
@@ -19,7 +20,7 @@ its saved off state leaves no Wi-Fi change to save.
 
 ## Modes
 
-**Prioritize package Wi-Fi networks** is on by default.
+**Prioritize Wi-Fi by list order** is on by default.
 
 - **Priority mode**: only the first listed network has Android auto-join on.
   Other saved networks have it off. When the headset needs a connection, the
@@ -40,31 +41,28 @@ network's password or deploying uncertain credentials.
 
 ## Results
 
-The Wi-Fi line under **Results at apply time** shows one of these outcomes.
+Select the device card in **Device status** to see the Wi-Fi result and the
+other verified settings. An applied setting shows a green check. A failed or
+unverified setting shows a red cross next to its name and the reason, when reported.
 
 | Console | Meaning | Action |
 |---|---|---|
-| Applied | Connected to the first listed network. | None. |
-| Applied · fallback | Connected to a lower listed network after earlier ones failed. | Check the earlier networks. |
+| Saved | The headset saved the listed profiles and read them back with their auto-join flags. | None. |
 | Saved. Android selects the network. | Android selection: profiles and auto-join flags were read back. | None. |
-| Saved. Verify after reboot. | A new or previously unknown password was saved for the connected network. | Restart the headset to confirm it. |
-| Failed · unreachable | No listed network connected within about a minute. | Reconnect the headset if needed, then Retry or deploy corrected settings. |
-| Failed · update failed, verify failed | A profile or auto-join flag could not be written or read back. Shown even if another network connected. | Check provisioning, then Retry. |
-| Failed · permission denied | A required grant is missing. | See [Provisioning](#provisioning). |
+| Update failed or Verify failed | A profile or auto-join flag could not be written or read back. Shown even if another network connected. | Check provisioning, then Retry. |
+| Permission denied | A required grant is missing. | See [Provisioning](#provisioning). |
 
-Android does not let MDM read a saved password, and a reconnection during the
-same boot can reuse earlier authentication. A changed password is therefore
-confirmed only after the next reboot. Removing and re-adding that network,
-retrying a partial save from a fallback network, or restarting the MDM client
-does not confirm the password.
-
-After a reboot, the headset reapplies the package. If the access point comes up
-later than the headset and all networks were saved, an `unreachable` result
-changes to applied once the headset connects to a listed network.
+Android masks saved passwords. The readback checks network profiles and
+auto-join flags. A successful readback completes the Wi-Fi setting. The
+headset handles association and fallback independently and reapplies the saved
+package after a reboot.
 
 ## Reconnection and automatic return
 
 These apply to priority mode.
+
+The device card shows a live notice when auto-return is degraded, unavailable,
+or switching to a higher-priority network.
 
 - After a disconnection, Android reconnects to the first listed network. With
   more than one listed network, the client waits about 10 seconds and then
@@ -130,4 +128,6 @@ Personal prefers WPA3 and allows WPA2 fallback. Passwords contain 1–63
 printable ASCII characters; use at least eight to allow WPA2.
 
 The server stores Wi-Fi passwords in plaintext in its registry and backups.
-Editor responses, device reports, and console logs omit them.
+The package editor receives saved passwords to fill in the form. Restrict
+server access to trusted devices and operators. Device status reports and
+console logs omit passwords.

@@ -70,16 +70,19 @@ class ConfigurationJournalTest {
         assertFalse(journal.shouldApply(updated, 134, "retry-one"))
     }
 
-    @Test fun `deferred Wi-Fi verification is refreshed when a different package was applied`() {
-        val results = JSONObject().put("wifi", settingOutcome("failed", reason = "VERIFY_AFTER_REBOOT"))
-        val deferred = ConfigurationAttempt(first, 133, "complete", results)
-        val journal = ConfigurationJournal().withAttempt(deferred)
-        assertTrue(deferred.needsRetry)
-        assertFalse(journal.shouldApply(first, 133, null))
-        assertFalse(journal.shouldApply(first, 133, "retry-one"))
-        assertTrue(journal.shouldApply(first, 134, null))
+    @Test fun `old connection only failures restore as saved while write failures remain retryable`() {
+        for ((reason, checkRevision) in listOf("VERIFY_AFTER_REBOOT" to null, "UNREACHABLE" to first.revision)) {
+            val results = JSONObject().put("wifi", settingOutcome("failed", reason = reason))
+            val legacy = ConfigurationAttempt(first, 133, "complete", results).saved()
+                .put("failed_wifi_fingerprint", "old").put("wifi_connection_check_revision", checkRevision)
+            val restored = ConfigurationAttempt.restore(legacy)
+            assertEquals("SAVED", restored.results.getJSONObject("wifi").getString("reason"))
+            assertFalse(restored.needsRetry)
+            assertFalse(restored.saved().has("failed_wifi_fingerprint"))
+        }
 
-        val replaced = journal.withAttempt(ConfigurationAttempt(second, 133, "complete"))
-        assertTrue(replaced.shouldApply(first, 133, null))
+        val failure = ConfigurationAttempt(first, 133, "complete",
+            JSONObject().put("wifi", settingOutcome("failed", reason = "VERIFY_FAILED")))
+        assertTrue(ConfigurationAttempt.restore(failure.saved()).needsRetry)
     }
 }

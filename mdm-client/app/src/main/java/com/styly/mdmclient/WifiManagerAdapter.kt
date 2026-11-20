@@ -33,6 +33,14 @@ internal data class WifiConfiguredView(
 internal data class WifiProfileApplication(
     val usableIndexes: List<Int>,
     val failure: WifiReason? = null,
+    val newlyAddedIndexes: Set<Int> = emptySet(),
+    /** Profiles whose saved SSID/security/hidden configuration was added or rewritten. */
+    val rewrittenIndexes: Set<Int> = emptySet(),
+)
+
+internal data class WifiPrimaryRecreation(
+    val fallback: WifiNetworkProfile,
+    val isFallbackStillConnected: () -> Boolean,
 )
 
 private val WIFI_SECURITY_VIEW_PREFERENCE = listOf("OPEN", "WPA_PSK", "SAE")
@@ -72,6 +80,10 @@ internal fun resolveWifiProfileViewIndex(
 
 private fun WifiConfiguredEntry.matches(profile: WifiNetworkProfile): Boolean =
     ssid == profile.ssid && wifiSecurityViewMatchesProfile(profile, security)
+
+/** Fields that can be read back through WifiManager and must match before reusing a saved profile. */
+internal fun wifiConfiguredEntryMatchesProfile(entry: WifiConfiguredEntry, profile: WifiNetworkProfile): Boolean =
+    entry.matches(profile) && entry.hidden == profile.hidden
 
 /** Restrict auto-join to the requested network IDs after at least one confirmed save. */
 internal fun wifiAutoJoinChanges(
@@ -140,18 +152,26 @@ private val WIFI_MAC_RANDOMIZATION_SETTINGS = setOf(
 )
 private val savedWifiHeader = Regex("(?:\\* |- DSBLE )?ID: (\\d+) SSID: (.*)")
 
-/** Read the MAC policy of requested IDs from the configured-networks section. */
-internal fun wifiStoredMacSettings(lines: Sequence<String>, ssidsById: Map<Int, String>): Map<Int, Int> {
+internal data class WifiStoredNetworkSettings(val macRandomization: Int, val creatorUid: Int?)
+
+/** Read the saved MAC policy and creator of requested IDs from PUI's configured-networks section. */
+internal fun wifiStoredNetworkSettings(
+    lines: Sequence<String>,
+    ssidsById: Map<Int, String>,
+): Map<Int, WifiStoredNetworkSettings> {
     var inSavedNetworks = false
     var requestedId: Int? = null
     val seen = mutableSetOf<Int>()
     val settings = mutableMapOf<Int, Int>()
+    val creators = mutableMapOf<Int, Int>()
     for (line in lines) {
         if (!inSavedNetworks) {
             inSavedNetworks = line == SAVED_WIFI_DUMP_BEGIN
             continue
         }
-        if (line == SAVED_WIFI_DUMP_END) return settings
+        if (line == SAVED_WIFI_DUMP_END) {
+            return settings.mapValues { (id, mac) -> WifiStoredNetworkSettings(mac, creators[id]) }
+        }
         if (line == SAVED_WIFI_DUMP_BEGIN) return emptyMap()
         val header = savedWifiHeader.matchEntire(line)
         if (header != null) {
@@ -169,6 +189,11 @@ internal fun wifiStoredMacSettings(lines: Sequence<String>, ssidsById: Map<Int, 
             continue
         }
         val id = requestedId ?: continue
+        val field = line.trimStart()
+        if (field.startsWith("cuid=")) {
+            val uid = field.removePrefix("cuid=").substringBefore(' ').toIntOrNull()
+            if (uid != null && creators.put(id, uid) != null) return emptyMap()
+        }
         if (!line.startsWith(SAVED_WIFI_MAC_PREFIX)) continue
         val setting = line.removePrefix(SAVED_WIFI_MAC_PREFIX).toIntOrNull()
         if (setting == null || setting !in WIFI_MAC_RANDOMIZATION_SETTINGS || id in settings) return emptyMap()
@@ -177,8 +202,12 @@ internal fun wifiStoredMacSettings(lines: Sequence<String>, ssidsById: Map<Int, 
     return emptyMap()
 }
 
-internal fun supportsPico4UltraEnterpriseSettings(): Boolean =
-    Build.MODEL == "A94U0" && Build.MANUFACTURER.equals("Pico", ignoreCase = true)
+// PUI can expose different product names to apps and to the ADB shell.
+internal fun supportsPico4UltraEnterpriseSettings(
+    product: String = Build.PRODUCT,
+    manufacturer: String = Build.MANUFACTURER,
+): Boolean = manufacturer.equals("Pico", ignoreCase = true) &&
+    product == "PICO 4 Ultra Enterprise"
 
 @ChecksSdkIntAtLeast(api = Build.VERSION_CODES.TIRAMISU)
 internal fun supportsManagedWifi(): Boolean =
@@ -200,6 +229,8 @@ internal interface WifiSettingsAdapter {
     fun applyProfile(
         target: List<WifiNetworkProfile>,
         prioritizeNetworks: Boolean,
+        primaryRecreation: WifiPrimaryRecreation?,
+        trustedSavedNetworks: List<WifiNetworkProfile> = emptyList(),
         beforeMutation: () -> WifiReason?,
     ): WifiProfileApplication
     fun selectSavedCandidate(candidate: WifiNetworkProfile, beforeMutation: () -> WifiReason?): WifiReason
@@ -240,6 +271,8 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
     override fun applyProfile(
         target: List<WifiNetworkProfile>,
         prioritizeNetworks: Boolean,
+        primaryRecreation: WifiPrimaryRecreation?,
+        trustedSavedNetworks: List<WifiNetworkProfile>,
         beforeMutation: () -> WifiReason?,
     ): WifiProfileApplication = guardedApplication {
         val wifi = manager ?: return@guardedApplication WifiProfileApplication(emptyList(), WifiReason.UNSUPPORTED)
@@ -259,6 +292,8 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         var firstFailure: WifiReason? = null
         var commonFailure: WifiReason? = null
         val writtenNetworks = linkedMapOf<Int, Pair<Int, String>>()
+        val newlyAdded = mutableSetOf<Int>()
+        val rewritten = mutableSetOf<Int>()
         fun checkMutationAllowed(): Boolean {
             val reason = try {
                 beforeMutation()
@@ -278,12 +313,27 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             val result = try {
                 val views = configuredNetworkViews()
                 val existing = resolveView(network, views)
-                writtenNetworks[index] = if (existing == null) {
+                val reusable = existing?.takeIf { view ->
+                    network in trustedSavedNetworks &&
+                        views.filter { it.entry.networkId == view.entry.networkId }
+                            .all { wifiConfiguredEntryMatchesProfile(it.entry, network) }
+                }
+                val written = if (reusable != null) {
+                    // Passwords are not readable from WifiManager. Reuse only when the exact
+                    // profile, including its credential, was previously accepted locally.
+                    reusable.entry.networkId to checkNotNull(reusable.entry.security)
+                } else if (existing == null) {
                     operation = "ADD"
                     addSavedNetwork(wifi, network, views, beforeWrite)
+                } else if (prioritizeNetworks && index == 0 && primaryRecreation != null) {
+                    recreateOwnedNetwork(wifi, network, existing, primaryRecreation, beforeWrite)
+                        ?: updateSavedNetwork(wifi, service, network, existing, beforeWrite)
                 } else {
                     updateSavedNetwork(wifi, service, network, existing, beforeWrite)
                 }
+                writtenNetworks[index] = written
+                if (reusable == null) rewritten += index
+                if (views.none { it.entry.networkId == written.first }) newlyAdded += index
                 null
             } catch (_: SecurityException) {
                 commonFailure = WifiReason.PERMISSION_DENIED
@@ -344,7 +394,12 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             autoJoinFailure = WifiReason.VERIFY_FAILED
             logOperationFailure("AUTO_JOIN", WifiReason.VERIFY_FAILED)
         }
-        WifiProfileApplication(usableIndexes, autoJoinFailure ?: firstFailure)
+        WifiProfileApplication(
+            usableIndexes,
+            autoJoinFailure ?: firstFailure,
+            newlyAdded.intersect(usableIndexes.toSet()),
+            rewritten.intersect(usableIndexes.toSet()),
+        )
     }
 
     override fun selectSavedCandidate(
@@ -401,7 +456,6 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
     }
 
     private fun requireAuthority() {
-        // PUI exposes A94U0 to application processes and A9210 through ADB on this device.
         if (!supportsManagedWifi()) throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
         if (!hasManagedWifiLocationPermissions(appContext)) throw WifiAdapterFailure(WifiReason.PERMISSION_DENIED)
         if (!hasManagedWifiReadAccess(appContext)) throw WifiAdapterFailure(WifiReason.PERMISSION_DENIED)
@@ -475,8 +529,8 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         profile: WifiNetworkProfile,
         before: List<WifiConfiguredView>,
         beforeMutation: () -> WifiReason?,
+        config: WifiConfiguration = configuration(profile),
     ): Pair<Int, String> {
-        val config = configuration(profile)
         beforeMutation()?.let { throw WifiAdapterFailure(it) }
         val id = wifi.addNetwork(config)
         if (id < 0) throw WifiAdapterFailure(WifiReason.UPDATE_FAILED)
@@ -495,7 +549,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         return id to security
     }
 
-    private fun readStoredMacSetting(view: WifiConfiguredView): Int {
+    private fun readStoredSettings(view: WifiConfiguredView): WifiStoredNetworkSettings {
         if (!hasManagedWifiDiagnosticsAccess(appContext)) {
             throw WifiAdapterFailure(WifiReason.PERMISSION_DENIED)
         }
@@ -506,7 +560,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         try {
             val dump = ProcessBuilder("/system/bin/dumpsys", "-t", "2", "wifi").redirectErrorStream(true).start()
             try {
-                val settings = dump.inputStream.bufferedReader().use { wifiStoredMacSettings(it.lineSequence(), ssidsById) }
+                val settings = dump.inputStream.bufferedReader().use { wifiStoredNetworkSettings(it.lineSequence(), ssidsById) }
                 return settings[id] ?: throw WifiAdapterFailure(WifiReason.CONFIG_READ_FAILED)
             } finally {
                 dump.destroy()
@@ -516,6 +570,38 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         } catch (_: Exception) {
             throw WifiAdapterFailure(WifiReason.CONFIG_READ_FAILED)
         }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+    @Suppress("DEPRECATION")
+    private fun recreateOwnedNetwork(
+        wifi: WifiManager,
+        profile: WifiNetworkProfile,
+        existing: WifiConfiguredView,
+        recreation: WifiPrimaryRecreation,
+        beforeMutation: () -> WifiReason?,
+    ): Pair<Int, String>? {
+        val stored = runCatching { readStoredSettings(existing) }.getOrNull() ?: return null
+        if (stored.creatorUid != Process.myUid()) return null
+
+        val views = configuredNetworkViews()
+        val target = resolveView(profile, views)?.takeIf { it.entry == existing.entry } ?: return null
+        val fallback = recreation.fallback
+        val fallbackId = runCatching { resolveView(fallback, views)?.entry?.networkId }.getOrNull() ?: return null
+        val targetId = target.entry.networkId
+        val replacement = configuration(profile, target.original).apply {
+            networkId = -1
+            macRandomizationSetting = stored.macRandomization
+        }
+        beforeMutation()?.let { throw WifiAdapterFailure(it) }
+        val active = wifi.connectionInfo
+        if (targetId == fallbackId || active?.networkId != fallbackId ||
+            normalizeConfiguredWifiSsid(active.ssid) != fallback.ssid || !recreation.isFallbackStillConnected()
+        ) return null
+        val removed = try { wifi.removeNetwork(targetId) } catch (_: SecurityException) { false }
+        if (!removed) return null
+        if (resolveView(profile) != null) throw WifiAdapterFailure(WifiReason.VERIFY_FAILED)
+        return addSavedNetwork(wifi, profile, views, beforeMutation, replacement)
     }
 
     @TargetApi(Build.VERSION_CODES.TIRAMISU)
@@ -543,7 +629,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
 
         val external = if (knownMac == null) existing else resolveView(profile)
             ?: throw WifiAdapterFailure(WifiReason.VERIFY_FAILED)
-        val storedMacSetting = readStoredMacSetting(external)
+        val storedMacSetting = readStoredSettings(external).macRandomization
         val current = resolveView(profile)
         if (current == null || current.entry != external.entry) throw WifiAdapterFailure(WifiReason.VERIFY_FAILED)
         val original = current.entry

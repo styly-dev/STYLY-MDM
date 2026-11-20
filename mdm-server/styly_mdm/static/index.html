@@ -397,6 +397,7 @@
     .mg-tabs { padding-top: 0; }
     .mg-sidebar { background: var(--bg-actions); border-right: 1px solid var(--border); padding: 14px 12px; }
     .mg-create { display: flex; gap: 8px; margin-bottom: 12px; }
+    .mg-create :disabled { opacity: .5; cursor: not-allowed; }
     .mg-new { flex: 1; padding: 9px 11px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; color: var(--text-primary); font-size: 13px; font-family: inherit; min-width: 0; }
     .mg-new:focus { outline: none; border-color: var(--accent); }
     .mg-list { display: flex; flex-direction: column; gap: 3px; }
@@ -480,9 +481,11 @@
     .wifi-network { padding: 12px; background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 8px; }
     .wifi-network-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
     .wifi-network-head strong { font-size: 12px; color: var(--text-secondary); }
-    .wifi-network-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
-    .wifi-network-actions .btn-outline { width: auto; margin: 0; padding: 4px 8px; font-size: 10px; }
+    .wifi-network-actions { display: flex; justify-content: flex-end; gap: 5px; margin-left: auto; }
+    .wifi-network-actions .btn-outline { display: grid; place-items: center; width: 28px; height: 28px; margin: 0; padding: 0; }
+    .wifi-network-actions svg { width: 16px; height: 16px; }
     .wifi-network-actions .btn-outline:disabled { opacity: .4; cursor: not-allowed; }
+    .wifi-network-actions .wifi-remove:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
     .wifi-network label { min-width: 0; display: block; color: var(--text-secondary); font-size: 11px; }
     .wifi-network label .field { display: block; margin-top: 4px; }
     .wifi-secret[type="text"] { -webkit-text-security: disc; }
@@ -495,7 +498,6 @@
     .wifi-options label input { flex: none; margin: 1px 0 0; }
     .wifi-options small { color: var(--text-muted); font-size: 10px; }
     .wifi-options .wifi-warning { color: var(--danger); font-weight: 600; }
-    .wifi-order-note { color: var(--text-muted); font-size: 10px; }
     .settings-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
     .settings-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
     .settings-buttons .btn, .settings-buttons .btn-outline { width: auto; margin: 0; padding: 9px 14px; font-size: 13px; font-weight: 600; line-height: 18px; }
@@ -509,6 +511,11 @@
     .settings-actions + .settings-deploy-hint, .settings-assignment + .settings-deploy-hint { margin-top: 6px; text-align: right; }
     .settings-error { color: var(--danger); font-size: 12px; margin-bottom: 8px; }
     .registry-warning { margin: 10px 16px 0; color: var(--danger); border-color: var(--danger); }
+    .group-configuration-note { margin: 8px 12px; color: var(--warning); }
+    .package-catalog-notice { margin: 18px 20px; max-width: 980px; padding: 14px 16px; }
+    .package-catalog-notice strong { color: var(--warning); font-size: 13px; }
+    .package-catalog-notice p { margin: 4px 0 10px; }
+    .package-catalog-notice:not([hidden]) + #configurationPackagePanel > .mg-detail-empty { display: none; }
     .settings-results { margin-top: 16px; }
     .settings-results-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 4px; }
     .settings-results h4 { font-size: 13px; }
@@ -517,17 +524,25 @@
     .settings-deployment-count[data-state="pending"] { color: var(--warning); }
     .settings-deployment-count[data-state="failed"] { color: var(--danger); }
     .settings-device-results { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
-    .settings-device-result { display: flex; align-items: center; gap: 12px; padding: 8px 10px; background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 6px; }
-    .settings-result-body { min-width: 0; flex: 1; overflow-wrap: anywhere; }
-    .settings-device-result > .btn-outline { flex-shrink: 0; }
-    .settings-result-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 3px; font-size: 12px; }
-    .settings-result-head > span { font-weight: 700; color: var(--text-secondary); }
-    .settings-device-result.success .settings-result-head > span { color: var(--success); }
-    .settings-device-result.failed .settings-result-head > span, .settings-device-result.unavailable .settings-result-head > span { color: var(--danger); }
-    .settings-device-result.pending .settings-result-head > span { color: var(--warning); }
-    .settings-readback { color: var(--text-secondary); font-size: 11px; margin-top: 4px; }
-    .settings-readback summary { cursor: pointer; }
-    .settings-readback ul { padding-left: 18px; }
+    .settings-device-result { overflow-wrap: anywhere; padding: 8px 10px; background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 6px; }
+    .settings-result-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 3px; font-size: 12px; }
+    .settings-result-head > strong { min-width: 0; }
+    .settings-result-actions { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 4px 10px; text-align: right; }
+    .settings-result-actions .btn-outline { padding: 3px 9px; white-space: nowrap; }
+    .settings-result-actions > span { font-weight: 700; color: var(--text-secondary); }
+    .settings-device-result.success .settings-result-actions > span { color: var(--success); }
+    .settings-device-result.failed .settings-result-actions > span, .settings-device-result.unavailable .settings-result-actions > span { color: var(--danger); }
+    .settings-device-result.pending .settings-result-actions > span { color: var(--warning); }
+    .settings-device-result[data-result-device] { cursor: pointer; }
+    .settings-result-toggle { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 0; border: 0; background: none; color: inherit; font: inherit; font-weight: 700; text-align: left; overflow-wrap: anywhere; cursor: pointer; }
+    .settings-result-toggle::before { content: ""; flex: none; border-block: 4px solid transparent; border-left: 5px solid var(--text-secondary); }
+    .settings-result-toggle[aria-expanded="true"]::before { transform: rotate(90deg); }
+    .settings-readback { margin: 7px 0 0; padding: 5px 0 0; border-top: 1px solid var(--border-soft); list-style: none; font-size: 11px; }
+    .settings-readback li { display: grid; grid-template-columns: 12px minmax(0, 1fr) fit-content(55%); gap: 6px; align-items: baseline; padding: 2px 0; }
+    .settings-readback-icon { font-size: 13px; font-weight: 700; line-height: 1; }
+    .settings-readback-value { color: var(--text-secondary); text-align: right; }
+    .settings-readback .applied .settings-readback-icon { color: var(--success); }
+    .settings-readback .unverified, .settings-readback .unverified .settings-readback-value { color: var(--danger); }
     .mg-dev-overlap { color: var(--warning); font-size: 11px; overflow-wrap: anywhere; }
 
     @container (max-width: 600px) {
@@ -569,7 +584,6 @@
 <body>
   <div class="shell">
     <div class="push-note registry-warning" id="registryWarning" role="alert" hidden>The server could not read its device registry, so changes to devices and groups are not saved. The file is kept unchanged. Fix or restore the registry, then restart the server.</div>
-    <div class="push-note registry-warning" id="configurationWarning" role="alert" hidden>The server could not read its saved configuration packages. Repair or restore the registry and restart the server to manage groups and packages.</div>
     <!-- ===================== CONSOLE VIEW ===================== -->
     <div id="consoleView" class="card">
       <div class="topbar">
@@ -798,7 +812,14 @@
           </form>
           <div class="mg-list" id="configurationPackagesList"></div>
         </div>
-        <div class="mg-main" id="configurationPackagePanel"></div>
+        <div class="mg-main">
+          <div class="push-note package-catalog-notice" id="packageCatalogNotice" hidden>
+            <strong>Configuration packages unavailable</strong>
+            <p role="status"></p>
+            <button type="button" class="btn-outline" data-refresh-packages>Reload packages</button>
+          </div>
+          <div id="configurationPackagePanel"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -813,6 +834,7 @@
       let clientApk = null;            // newest styly-mdm-client APK on the server, from CLIENT_APK_INFO ({filename,url,version} or null)
       let groups = {};                 // name -> [serials]
       let groupsLoaded = false;
+      let groupConfigurationUnavailable = false;
       let selectedIds = new Set();
       let deviceSelectionAnchorId = null;
       let selectedConnectionIds = new Set();
@@ -938,6 +960,7 @@
         groupPanel: groupSettingsPanel,
         packagePanel: document.getElementById('configurationPackagePanel'),
         packageList: document.getElementById('configurationPackagesList'),
+        catalogNotice: document.getElementById('packageCatalogNotice'),
         createForm: document.getElementById('createConfigurationPackage'),
         getDevice: deviceById,
         getGroups: function () { return groups; },
@@ -953,7 +976,7 @@
         if (source === 'ws') membershipSnapshotReady = true;
         const registryUnreadable = msg.registry_writable === false;
         document.getElementById('registryWarning').hidden = !registryUnreadable;
-        document.getElementById('configurationWarning').hidden = registryUnreadable || msg.configuration_available !== false;
+        groupConfigurationUnavailable = !registryUnreadable && msg.configuration_available === false;
         groupsLoaded = true;
         // Only the requester's acknowledgement identifies a rename. HTTP can see
         // the new roster before that acknowledgement, so wait for its WS group list.
@@ -1576,8 +1599,11 @@
 
       function renderGroupsHtml() {
         const names = groupNames();
-        if (!names.length) return '<div class="empty">No groups yet — use "Manage Groups" (top right) to create one.</div>';
-        return '<div class="group-list">' + names.map(function (name) {
+        const notice = groupConfigurationUnavailable
+          ? '<p class="push-note group-configuration-note" role="status">Configuration packages unavailable. Group settings cannot be deployed.</p>'
+          : '';
+        if (!names.length) return notice + '<div class="empty">No groups yet — use "Manage Groups" (top right) to create one.</div>';
+        return notice + '<div class="group-list">' + names.map(function (name) {
           const members = groups[name] || [];
           const count = members.length;
           const off = offlineMembers(name);
@@ -1597,7 +1623,7 @@
             '<button class="group-expand" data-act="toggleExpand" data-group="' + esc(name) + '" title="' + (expanded ? 'Collapse' : 'Show devices') + '">' + (expanded ? '▾' : '▸') + '</button>' +
             (off ? '<span class="badge-offline" title="' + off + ' offline">' + off + ' offline</span>' : '') +
             '</div>' + preview + '</div>' +
-            renderGroupPackageHtml(name) +
+            (groupConfigurationUnavailable ? '' : renderGroupPackageHtml(name)) +
             '<button class="btn-edit" data-act="editGroup" data-group="' + esc(name) + '">✏ Edit</button>' +
             '</div>';
           const body = expanded ? '<div class="group-devs">' + renderGroupDevsHtml(members) + '</div>' : '';

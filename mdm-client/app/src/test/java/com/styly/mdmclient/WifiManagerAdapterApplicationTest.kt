@@ -10,6 +10,18 @@ import org.junit.Test
 
 class WifiManagerAdapterApplicationTest {
     @Test
+    fun `configuration settings require the PICO 4 Ultra Enterprise app product`() {
+        val product = "PICO 4 Ultra Enterprise"
+        assertTrue(supportsPico4UltraEnterpriseSettings(product, "Pico"))
+        assertTrue(supportsPico4UltraEnterpriseSettings(product, "PICO"))
+        assertFalse(supportsPico4UltraEnterpriseSettings("PICO 4 Ultra", "Pico"))
+        assertFalse(supportsPico4UltraEnterpriseSettings("sparrow", "Pico"))
+        assertFalse(supportsPico4UltraEnterpriseSettings("A94U0", "Pico"))
+        assertFalse(supportsPico4UltraEnterpriseSettings("A98U0", "Pico"))
+        assertFalse(supportsPico4UltraEnterpriseSettings(product, "other"))
+    }
+
+    @Test
     fun `profile update resolves the matching security view when PICO exposes duplicate ID views`() {
         val profile = WifiNetworkProfile("transition", "WPA2_WPA3", "test-password", false)
         val entries = listOf(
@@ -42,6 +54,17 @@ class WifiManagerAdapterApplicationTest {
         val failure = assertThrows(WifiAdapterFailure::class.java) { resolveWifiProfileViewIndex(profile, entries) }
 
         assertEquals(WifiReason.VERIFY_FAILED, failure.reason)
+    }
+
+    @Test
+    fun `saved profile reuse requires SSID security and hidden readback to match`() {
+        val profile = WifiNetworkProfile("office", "WPA2_WPA3", "trusted-password", hidden = true)
+
+        assertTrue(wifiConfiguredEntryMatchesProfile(entry(7, "office", "WPA_PSK", hidden = true), profile))
+        assertTrue(wifiConfiguredEntryMatchesProfile(entry(7, "office", "SAE", hidden = true), profile))
+        assertFalse(wifiConfiguredEntryMatchesProfile(entry(7, "other", "WPA_PSK", hidden = true), profile))
+        assertFalse(wifiConfiguredEntryMatchesProfile(entry(7, "office", "OPEN", hidden = true), profile))
+        assertFalse(wifiConfiguredEntryMatchesProfile(entry(7, "office", "WPA_PSK", hidden = false), profile))
     }
 
     @Test
@@ -175,7 +198,7 @@ class WifiManagerAdapterApplicationTest {
     }
 
     @Test
-    fun `stored MAC policy matches full or PUI masked SSIDs by network ID`() {
+    fun `stored MAC policy and creator match full or PUI masked SSIDs by network ID`() {
         val dump = """
             * ID: 7 SSID: "office" PROVIDER-NAME: null
              macRandomizationSetting: 1
@@ -183,18 +206,24 @@ class WifiManagerAdapterApplicationTest {
             * ID: 7 SSID: "office" PROVIDER-NAME: null
              NetworkSelectionStatus NETWORK_SELECTION_ENABLED
              macRandomizationSetting: 3
+            cuid=10231 cname=com.styly.mdmclient luid=10231
             - DSBLE ID: 9 SSID: *****aintenance" PROVIDER-NAME: null
              NetworkSelectionStatus NETWORK_SELECTION_TEMPORARY_DISABLED
              macRandomizationSetting: 0
-            ID: 10 SSID: **** profile" PROVIDER-NAME: null
+            cuid=1000 cname=android.uid.system:1000 luid=1000
+            ID: 10 SSID: **** network" PROVIDER-NAME: null
              NetworkSelectionStatus NETWORK_SELECTION_ENABLED
              macRandomizationSetting: 2
             WifiConfigManager - Configured networks End ----
         """.trimIndent()
 
         assertEquals(
-            mapOf(7 to WifiConfiguration.RANDOMIZATION_AUTO, 9 to WifiConfiguration.RANDOMIZATION_NONE),
-            wifiStoredMacSettings(dump.lineSequence(), mapOf(7 to "\"office\"", 9 to "\"VR-Maintenance\"", 10 to "\"old network\"")),
+            mapOf(
+                7 to WifiStoredNetworkSettings(WifiConfiguration.RANDOMIZATION_AUTO, 10231),
+                9 to WifiStoredNetworkSettings(WifiConfiguration.RANDOMIZATION_NONE, 1000),
+                10 to WifiStoredNetworkSettings(WifiConfiguration.RANDOMIZATION_NON_PERSISTENT, null),
+            ),
+            wifiStoredNetworkSettings(dump.lineSequence(), mapOf(7 to "\"office\"", 9 to "\"VR-Maintenance\"", 10 to "\"old network\"")),
         )
     }
 
@@ -206,9 +235,9 @@ class WifiManagerAdapterApplicationTest {
         val setting = " macRandomizationSetting: 3"
         val original = mapOf(7 to "\"office\"")
 
-        assertTrue(wifiStoredMacSettings(sequenceOf(begin, savedHeader, setting), original).isEmpty())
-        assertTrue(wifiStoredMacSettings(sequenceOf(begin, savedHeader, setting, savedHeader, end), original).isEmpty())
-        assertTrue(wifiStoredMacSettings(sequenceOf(begin, savedHeader, setting.replace('3', '9'), end), original).isEmpty())
+        assertTrue(wifiStoredNetworkSettings(sequenceOf(begin, savedHeader, setting), original).isEmpty())
+        assertTrue(wifiStoredNetworkSettings(sequenceOf(begin, savedHeader, setting, savedHeader, end), original).isEmpty())
+        assertTrue(wifiStoredNetworkSettings(sequenceOf(begin, savedHeader, setting.replace('3', '9'), end), original).isEmpty())
     }
 
     @Test

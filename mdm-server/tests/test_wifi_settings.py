@@ -6,7 +6,7 @@ import pytest
 
 from styly_mdm.wifi_settings import (
     WiFiSettingsError,
-    public_networks,
+    editor_networks,
     public_wifi_state,
     validate_profile_networks,
 )
@@ -25,8 +25,9 @@ def test_profile_validation_preserves_saved_password_and_accepts_overwrite():
     previous = validate_profile_networks(_networks())
     retained = validate_profile_networks(_networks(None), previous)
     assert retained[0]["password"] == "correct-horse"
-    assert public_networks(retained) == [{
-        "ssid": "Studio Wi-Fi", "security": "WPA2_WPA3", "password_present": True, "hidden": False,
+    assert editor_networks(retained) == [{
+        "ssid": "Studio Wi-Fi", "security": "WPA2_WPA3", "password": "correct-horse",
+        "password_present": True, "hidden": False,
     }]
     assert validate_profile_networks(_networks("new-password"), previous)[0]["password"] == "new-password"
 

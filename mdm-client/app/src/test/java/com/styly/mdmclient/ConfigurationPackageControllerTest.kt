@@ -152,10 +152,11 @@ class ConfigurationPackageControllerTest {
     @Test
     fun `all writes failing preserves the applied profile and the next Retry can verify the same credential`() {
         val primary = network("office-a")
-        val priorProfile = WifiSavedProfile(OLD_REVISION, listOf(primary))
+        val previouslySaved = primary.copy(hidden = true)
+        val priorProfile = WifiSavedProfile(OLD_REVISION, listOf(previouslySaved))
         val wifi = Harness(
             initialState = WifiLocalState(lastApplied = priorProfile),
-            initialNetworks = listOf(primary),
+            initialNetworks = listOf(previouslySaved),
             initialWifi = listOf(observation(10, primary.ssid)),
         )
         wifi.adapter.application = WifiProfileApplication(emptyList(), WifiReason.UPDATE_FAILED)
@@ -451,7 +452,7 @@ class ConfigurationPackageControllerTest {
     }
 
     @Test
-    fun `brightness-only package revision reuses the same-boot Wi-Fi connection`() {
+    fun `new revision rechecks all scalar settings and keeps matching Wi-Fi connected`() {
         val preferred = network("office-a")
         val fallback = network("office-b")
         val wifi = Harness()
@@ -459,7 +460,9 @@ class ConfigurationPackageControllerTest {
             if (selected == preferred) wifi.connectivity.update(40, selected.ssid)
         }
         val packages = PackageHarness(wifi)
-        val initial = packagePayload(listOf(preferred, fallback))
+        val initial = packagePayload(listOf(preferred, fallback)).also {
+            it.getJSONObject("settings").put("autoSleep", true).put("usbBoot", true)
+        }
         packages.receive(initial)
         wifi.worker.runAll()
         wifi.expireNext(2_000L)
@@ -468,20 +471,58 @@ class ConfigurationPackageControllerTest {
         val selectCalls = wifi.adapter.selectCalls.size
         val disconnectCalls = wifi.adapter.disconnectCalls
 
-        val changed = packagePayload(listOf(preferred, fallback), revision = REVISION_2)
+        packages.scalarWrites.currentValues["autoSleep"] = false
+        val changed = JSONObject(initial.toString()).put("revision", REVISION_2)
             .also { it.getJSONObject("settings").put("brightness", 65) }
         packages.receive(changed)
         wifi.worker.runAll()
         packages.worker.runAll()
 
-        assertEquals(applyCalls, wifi.adapter.applyCalls.size)
+        assertEquals(applyCalls + 1, wifi.adapter.applyCalls.size)
+        assertTrue(wifi.adapter.rewrittenNetworkCalls.last().isEmpty())
         assertEquals(selectCalls, wifi.adapter.selectCalls.size)
         assertEquals(disconnectCalls, wifi.adapter.disconnectCalls)
         assertEquals(preferred.ssid, wifi.connectivity.currentUsableSsid())
-        assertEquals(setOf("brightness"), packages.scalarWrites.calls.last())
+        assertEquals(setOf("brightness", "autoSleep", "usbBoot"), packages.scalarWrites.calls.last())
+        assertEquals(setOf("brightness", "autoSleep"), packages.scalarWrites.mutations.last())
         assertEquals(2, packages.scalarWrites.count)
+        assertTrue(packages.attempt()?.results?.getJSONObject("autoSleep")?.getBoolean("value") == true)
+        assertTrue(packages.attempt()?.results?.getJSONObject("usbBoot")?.getBoolean("value") == true)
         assertEquals(REVISION_2, wifi.store.state.lastApplied?.revision)
         assertEquals("complete", packages.controller.resultSnapshot()?.getString("status"))
+    }
+
+    @Test
+    fun `new Deploy retries unchanged Wi-Fi after permission recovery and its redelivery does not run again`() {
+        val preferred = network("office-a")
+        val wifi = Harness(initialWifi = listOf(observation(40, preferred.ssid)))
+        val packages = PackageHarness(wifi)
+        val initial = packagePayload(listOf(preferred))
+        wifi.adapter.application = WifiProfileApplication(emptyList(), WifiReason.PERMISSION_DENIED)
+        packages.receive(initial)
+        wifi.worker.runAll()
+        packages.worker.runAll()
+        assertEquals("PERMISSION_DENIED", packages.attempt()?.results?.getJSONObject("wifi")?.getString("reason"))
+
+        wifi.adapter.application = null
+        val newDeployment = JSONObject(initial.toString()).put("revision", REVISION_2)
+        packages.receive(newDeployment)
+        wifi.worker.runAll()
+        packages.worker.runAll()
+        assertEquals(REVISION_2, packages.attempt()?.version?.revision)
+        assertEquals("SAVED", packages.attempt()?.results?.getJSONObject("wifi")?.getString("reason"))
+        assertEquals(2, wifi.adapter.applyCalls.size)
+        assertEquals(2, packages.scalarWrites.count)
+        assertEquals(emptySet<String>(), packages.scalarWrites.mutations.last())
+        assertEquals(0, wifi.adapter.disconnectCalls)
+
+        val journalWrites = packages.journalWriteCalls
+        packages.receive(newDeployment)
+        wifi.worker.runAll()
+        packages.worker.runAll()
+        assertEquals(2, wifi.adapter.applyCalls.size)
+        assertEquals(2, packages.scalarWrites.count)
+        assertEquals(journalWrites, packages.journalWriteCalls)
     }
 
     @Test
@@ -527,7 +568,8 @@ class ConfigurationPackageControllerTest {
         val results = requireNotNull(packages.controller.resultSnapshot()).getJSONObject("results")
         assertEquals(65, results.getJSONObject("brightness").getInt("value"))
         assertEquals("applied", results.getJSONObject("wifi").getString("status"))
-        assertEquals(applyCalls, wifi.adapter.applyCalls.size)
+        assertEquals(applyCalls + 1, wifi.adapter.applyCalls.size)
+        assertTrue(wifi.adapter.rewrittenNetworkCalls.last().isEmpty())
         assertEquals(disconnectCalls, wifi.adapter.disconnectCalls)
         assertEquals(initialResult, resultAfterSelection)
     }
@@ -612,6 +654,7 @@ class ConfigurationPackageControllerTest {
         boot.worker.runAll()
 
         assertEquals(REVISION_2, boot.attempt()?.version?.revision)
+        assertEquals(listOf(false), boot.scalarWrites.overwriteModes)
         assertFalse(boot.appliedNotices.single().bootReapply)
     }
 
@@ -661,190 +704,57 @@ class ConfigurationPackageControllerTest {
     }
 
     @Test
-    fun `late Android connection clears a single network boot timeout across a process restart`() {
+    fun `boot reports Wi-Fi saved before association and does not change it on timeout or late connection`() {
         val primary = network("office-a")
-        val policy = packagePayload(listOf(primary))
-        val boot = bootWithCachedPackage(policy)
+        val boot = bootWithCachedPackage(packagePayload(listOf(primary)))
+        val wifi = boot.wifi
         boot.enableSdk()
-        boot.wifi.worker.runAll()
-        boot.wifi.expireNext(WIFI_PRIOR_CONNECTION_OBSERVATION_MS)
-        boot.wifi.expireNext(12_000L)
+        wifi.worker.runAll()
+        wifi.expireNext(WIFI_PRIOR_CONNECTION_OBSERVATION_MS)
         boot.worker.runAll()
-        assertEquals("UNREACHABLE", boot.attempt()?.results?.getJSONObject("wifi")?.getString("reason"))
-        assertEquals(REVISION, boot.attempt()?.wifiConnectionCheckRevision)
-        assertTrue(boot.appliedNotices.isEmpty())
+
+        val saved = requireNotNull(boot.attempt())
+        assertEquals("applied", saved.results.getJSONObject("wifi").getString("status"))
+        assertEquals("SAVED", saved.results.getJSONObject("wifi").getString("reason"))
+        assertFalse(wifi.controller.canAcceptPolicy())
+        assertTrue(boot.appliedNotices.single().bootReapply)
+
+        wifi.expireNext(12_000L)
+        wifi.connectivity.update(21, primary.ssid)
+        wifi.worker.runAll()
+        boot.worker.runAll()
+        assertEquals(saved.report().toString(), boot.attempt()?.report().toString())
+        assertEquals(1, boot.appliedNotices.size)
 
         val restarted = boot.restart(bootCount = 134)
-        val wifi = restarted.wifi
-        wifi.worker.runAll()
-        wifi.connectivity.update(20, "other")
-        wifi.connectivity.update(21, primary.ssid, hasUsableIp = false)
-        wifi.connectivity.update(22, primary.ssid, security = "OPEN")
-        wifi.worker.runAll()
+        restarted.wifi.worker.runAll()
         restarted.worker.runAll()
-        assertEquals("failed", restarted.attempt()?.results?.getJSONObject("wifi")?.getString("status"))
-
-        restarted.journalWriteToFail = restarted.journalWriteCalls + 1
-        wifi.connectivity.update(21, primary.ssid)
-        wifi.worker.runAll()
-        restarted.worker.runAll()
-        assertEquals("failed", restarted.controller.resultSnapshot()?.getJSONObject("results")?.getJSONObject("wifi")
-            ?.getString("status"))
-        assertTrue(restarted.appliedNotices.isEmpty())
-
-        wifi.connectivity.update(21, primary.ssid)
-        wifi.worker.runAll()
-        restarted.worker.runAll()
-        wifi.worker.runAll()
-        assertEquals("applied", restarted.controller.resultSnapshot()?.getJSONObject("results")?.getJSONObject("wifi")
-            ?.getString("status"))
-        assertNull(restarted.attempt()?.wifiConnectionCheckRevision)
-        assertEquals(ConfigurationApplyStatus.APPLIED, restarted.controller.screenSnapshot()?.applyStatus)
-        val notice = restarted.appliedNotices.single()
-        assertTrue(notice.bootReapply)
-        assertTrue(notice.isCurrent())
-        assertEquals(1, wifi.adapter.applyCalls.size)
-        assertEquals(listOf(primary), wifi.adapter.selectCalls)
-        assertEquals(0, wifi.adapter.disconnectCalls)
-        assertEquals(0, wifi.connectivity.openSessionCount)
-
-        val scalarDelta = packagePayload(listOf(primary), revision = REVISION_2)
-        scalarDelta.getJSONObject("settings").put("brightness", 65)
-        restarted.receive(scalarDelta)
-        wifi.worker.runAll()
-        restarted.worker.runAll()
-        assertEquals(1, wifi.adapter.applyCalls.size)
-        assertEquals(65, restarted.attempt()?.results?.getJSONObject("brightness")?.getInt("value"))
-        assertFalse(notice.isCurrent())
+        assertEquals("applied", restarted.attempt()?.results?.getJSONObject("wifi")?.getString("status"))
+        assertEquals(1, restarted.wifi.adapter.applyCalls.size)
     }
 
     @Test
-    fun `a boot timeout is corrected when Android auto join receives IP after the timeout runs`() {
-        verifyLateAutomaticBootConnection(ipArrivesBeforeTimeoutRuns = false)
-    }
-
-    @Test
-    fun `a boot timeout is corrected when late IP arrives before the timeout runs`() {
-        verifyLateAutomaticBootConnection(ipArrivesBeforeTimeoutRuns = true)
-    }
-
-    private fun verifyLateAutomaticBootConnection(ipArrivesBeforeTimeoutRuns: Boolean) {
-        val primary = network("office-a")
-        val boot = startBootWithAutomaticWifi(primary, observedSsid = primary.ssid)
-        val wifi = boot.wifi
-
-        if (ipArrivesBeforeTimeoutRuns) {
-            wifi.clock.value += 12_001L
-            wifi.connectivity.update(91, primary.ssid)
-            wifi.worker.runAll()
-        } else {
-            wifi.advanceBy(12_000L)
-        }
-        boot.worker.runAll()
-
-        val timedOut = requireNotNull(boot.attempt())
-        assertEquals("UNREACHABLE", timedOut.results.getJSONObject("wifi").getString("reason"))
-        assertEquals(REVISION, timedOut.wifiConnectionCheckRevision)
-        assertTrue(boot.appliedNotices.isEmpty())
-
-        if (!ipArrivesBeforeTimeoutRuns) {
-            wifi.advanceBy(2_000L)
-            wifi.connectivity.update(91, primary.ssid)
-        }
+    fun `a scalar-only deployment rechecks saved Wi-Fi after selection times out`() {
+        val networks = listOf(network("office-a"), network("office-b"))
+        val packages = PackageHarness(Harness())
+        val wifi = packages.wifi
+        packages.receive(packagePayload(networks))
         wifi.worker.runAll()
-        boot.worker.runAll()
-
-        assertEquals("applied", boot.attempt()?.results?.getJSONObject("wifi")?.getString("status"))
-        assertNull(boot.attempt()?.wifiConnectionCheckRevision)
-        assertTrue(boot.appliedNotices.single().bootReapply)
-        assertTrue(wifi.adapter.selectCalls.isEmpty())
-    }
-
-    @Test
-    fun `a boot disconnect timeout cannot verify an unidentified association`() {
-        val primary = network("office-a")
-        val boot = startBootWithAutomaticWifi(primary, observedSsid = null)
-        boot.wifi.advanceBy(12_000L)
-        boot.worker.runAll()
-
-        val timedOut = requireNotNull(boot.attempt())
-        assertEquals("UNREACHABLE", timedOut.results.getJSONObject("wifi").getString("reason"))
-        assertNull(timedOut.wifiConnectionCheckRevision)
-    }
-
-    @Test
-    fun `a boot disconnect timeout cannot verify an automatic join while the old association remains`() {
-        val primary = network("office-a")
-        val boot = startBootWithAutomaticWifi(primary, observedSsid = primary.ssid, oldAssociationLost = false)
-        val wifi = boot.wifi
-        wifi.advanceBy(12_000L)
-        boot.worker.runAll()
-
-        val timedOut = requireNotNull(boot.attempt())
-        assertEquals("UNREACHABLE", timedOut.results.getJSONObject("wifi").getString("reason"))
-        assertNull(timedOut.wifiConnectionCheckRevision)
-        wifi.connectivity.update(91, primary.ssid)
-        wifi.worker.runAll()
-        boot.worker.runAll()
-        assertEquals("failed", boot.attempt()?.results?.getJSONObject("wifi")?.getString("status"))
-    }
-
-    private fun startBootWithAutomaticWifi(
-        primary: WifiNetworkProfile,
-        observedSsid: String?,
-        oldAssociationLost: Boolean = true,
-    ): PackageHarness {
-        val initialWifi = Harness(initialWifi = listOf(observation(10, "previous-office")))
-        val boot = bootWithCachedPackage(packagePayload(listOf(primary)), initialWifi)
-        val wifi = boot.wifi
-        wifi.adapter.afterDisconnect = {
-            if (oldAssociationLost) wifi.connectivity.loseAll()
-            wifi.connectivity.update(91, observedSsid, hasUsableIp = false)
-        }
-        boot.enableSdk()
-        wifi.worker.runAll()
-        assertEquals(1, wifi.adapter.disconnectCalls)
-        assertTrue(wifi.adapter.selectCalls.isEmpty())
-        return boot
-    }
-
-    @Test
-    fun `a late verified fallback clears only Wi-Fi in the current revision`() {
-        val primary = network("office-a")
-        val fallback = network("office-b")
-        val networks = listOf(primary, fallback)
-        val initialWifi = Harness(initialNetworks = listOf(primary), initialWifi = listOf(observation(10, primary.ssid)))
-        val boot = bootWithCachedPackage(packagePayload(networks), initialWifi, failedScalars = setOf("brightness"))
-        val wifi = boot.wifi
-        wifi.adapter.afterApply = { wifi.connectivity.loseAll() }
-        boot.enableSdk()
-        wifi.worker.runAll()
+        wifi.expireNext(WIFI_PRIOR_CONNECTION_OBSERVATION_MS)
         repeat(2) { wifi.expireNext(12_000L) }
-        boot.worker.runAll()
-        wifi.worker.runAll()
+        packages.worker.runAll()
+        assertEquals("SAVED", packages.attempt()?.results?.getJSONObject("wifi")?.getString("reason"))
 
-        val updated = packagePayload(networks, revision = REVISION_2)
-        updated.getJSONObject("settings").put("brightness", 65)
-        boot.receive(updated)
+        val update = packagePayload(networks, revision = REVISION_2)
+        update.getJSONObject("settings").put("brightness", 65)
+        packages.receive(update)
         wifi.worker.runAll()
-        assertEquals(REVISION, boot.attempt()?.wifiConnectionCheckRevision)
-
-        // The active credential changed or was unknown before the boot write.
-        wifi.connectivity.update(91, primary.ssid)
-        wifi.worker.runAll()
-        boot.worker.runAll()
-        assertEquals("failed", boot.attempt()?.results?.getJSONObject("wifi")?.getString("status"))
-
-        wifi.connectivity.lose(91)
-        wifi.connectivity.update(92, fallback.ssid)
-        wifi.worker.runAll()
-        boot.worker.runAll()
-        val current = requireNotNull(boot.attempt())
-        assertEquals(REVISION_2, current.version.revision)
-        assertEquals("FALLBACK", current.results.getJSONObject("wifi").getString("reason"))
-        assertEquals("applied", current.results.getJSONObject("wifi").getString("status"))
-        assertEquals("failed", current.results.getJSONObject("brightness").getString("status"))
-        assertEquals(1, wifi.adapter.applyCalls.size)
+        packages.worker.runAll()
+        assertEquals(REVISION_2, packages.attempt()?.version?.revision)
+        assertEquals("SAVED", packages.attempt()?.results?.getJSONObject("wifi")?.getString("reason"))
+        assertEquals(65, packages.attempt()?.results?.getJSONObject("brightness")?.getInt("value"))
+        assertEquals(2, wifi.adapter.applyCalls.size)
+        assertTrue(wifi.adapter.rewrittenNetworkCalls.last().isEmpty())
         assertEquals(networks, wifi.adapter.selectCalls)
     }
 
@@ -868,7 +778,6 @@ class ConfigurationPackageControllerTest {
             wifi.expireNext(WIFI_PRIOR_CONNECTION_OBSERVATION_MS)
             wifi.expireNext(WIFI_MANUAL_TIMEOUT_MS)
             boot.worker.runAll()
-            assertNull(boot.attempt()?.wifiConnectionCheckRevision)
 
             wifi.connectivity.update(94, primary.ssid)
             wifi.worker.runAll()
@@ -882,7 +791,7 @@ class ConfigurationPackageControllerTest {
         val primary = network("office-a")
         val networks = listOf(primary, network("office-b"))
         val applications = listOf(
-            null to "NONE",
+            null to "SAVED",
             WifiProfileApplication(listOf(0), failure = WifiReason.UPDATE_FAILED) to "UPDATE_FAILED",
             WifiProfileApplication(listOf(0, 1), failure = WifiReason.VERIFY_FAILED) to "VERIFY_FAILED",
         )
@@ -906,13 +815,12 @@ class ConfigurationPackageControllerTest {
             assertTrue(wifi.adapter.selectCalls.isEmpty())
             val result = boot.attempt()?.results?.getJSONObject("wifi")
             assertEquals(if (application == null) "applied" else "failed", result?.getString("status"))
-            assertEquals(reason, wifi.store.state.latestResult?.reason?.name)
-            if (application != null) assertEquals(reason, result?.getString("reason"))
+            assertEquals(reason, result?.getString("reason"))
         }
     }
 
     @Test
-    fun `a late verification callback cannot apply after No managed settings`() {
+    fun `a late association cannot restore the report after No managed settings`() {
         val primary = network("office-a")
         val boot = bootWithCachedPackage(packagePayload(listOf(primary)))
         val wifi = boot.wifi
@@ -934,7 +842,7 @@ class ConfigurationPackageControllerTest {
         boot.worker.runAll()
         assertNull(boot.controller.resultSnapshot())
         assertEquals(listOf<JSONObject?>(null), reported)
-        assertEquals("failed", boot.attempt()?.results?.getJSONObject("wifi")?.getString("status"))
+        assertEquals("applied", boot.attempt()?.results?.getJSONObject("wifi")?.getString("status"))
         assertEquals(0, wifi.connectivity.openSessionCount)
     }
 
@@ -1064,7 +972,7 @@ class ConfigurationPackageControllerTest {
     }
 
     @Test
-    fun `a package awaiting verification skips same boot Retry and verifies at the next OS boot`() {
+    fun `saved Wi-Fi skips same boot Retry and is written again on the next OS boot`() {
         val primary = network("office-a")
         val wifi = Harness(initialNetworks = listOf(primary), initialWifi = listOf(observation(10, primary.ssid)))
         wifi.adapter.afterDisconnect = { wifi.connectivity.loseAll() }
@@ -1074,7 +982,7 @@ class ConfigurationPackageControllerTest {
         packages.receive(payload)
         wifi.worker.runAll()
         packages.worker.runAll()
-        assertEquals("VERIFY_AFTER_REBOOT", packages.attempt()?.results?.getJSONObject("wifi")?.getString("reason"))
+        assertEquals("SAVED", packages.attempt()?.results?.getJSONObject("wifi")?.getString("reason"))
 
         val sameBoot = packages.restart(bootCount = 133)
         sameBoot.receive(JSONObject(payload.toString()).put("retry_id", RETRY_ID))
@@ -1083,7 +991,7 @@ class ConfigurationPackageControllerTest {
         assertEquals(0, sameBoot.scalarWrites.count)
         assertEquals(1, wifi.adapter.applyCalls.size)
         assertEquals(0, wifi.adapter.disconnectCalls)
-        assertEquals("VERIFY_AFTER_REBOOT", sameBoot.attempt()?.results?.getJSONObject("wifi")?.getString("reason"))
+        assertEquals("SAVED", sameBoot.attempt()?.results?.getJSONObject("wifi")?.getString("reason"))
 
         val nextBoot = sameBoot.restart(bootCount = 134)
         nextBoot.wifi.adapter.afterDisconnect = { nextBoot.wifi.connectivity.loseAll() }
@@ -1095,7 +1003,7 @@ class ConfigurationPackageControllerTest {
     }
 
     @Test
-    fun `switching a deferred package to Android selection clears its previous verification result`() {
+    fun `switching to Android selection rewrites the auto join settings`() {
         val primary = network("office-a")
         val wifi = Harness(initialNetworks = listOf(primary), initialWifi = listOf(observation(10, primary.ssid)))
         wifi.adapter.afterDisconnect = { wifi.connectivity.loseAll() }
@@ -1104,7 +1012,7 @@ class ConfigurationPackageControllerTest {
         packages.receive(packagePayload(listOf(primary)))
         wifi.worker.runAll()
         packages.worker.runAll()
-        assertEquals("VERIFY_AFTER_REBOOT", packages.attempt()?.results?.getJSONObject("wifi")?.getString("reason"))
+        assertEquals("SAVED", packages.attempt()?.results?.getJSONObject("wifi")?.getString("reason"))
 
         packages.receive(packagePayload(listOf(primary), revision = REVISION_2, prioritizeNetworks = false))
         wifi.worker.runAll()
@@ -1115,7 +1023,7 @@ class ConfigurationPackageControllerTest {
     }
 
     @Test
-    fun `Retry for another setting keeps deferred Wi-Fi verification through a journal write failure`() {
+    fun `Retry for another setting keeps saved Wi-Fi through a journal write failure`() {
         val primary = network("office-a")
         val wifi = Harness(initialNetworks = listOf(primary), initialWifi = listOf(observation(10, primary.ssid)))
         wifi.adapter.afterDisconnect = { wifi.connectivity.loseAll() }
@@ -1132,7 +1040,7 @@ class ConfigurationPackageControllerTest {
         wifi.worker.runAll()
         packages.worker.runAll()
         assertEquals("interrupted", packages.controller.resultSnapshot()?.getString("status"))
-        assertEquals("VERIFY_AFTER_REBOOT", packages.controller.resultSnapshot()?.getJSONObject("results")
+        assertEquals("SAVED", packages.controller.resultSnapshot()?.getJSONObject("results")
             ?.getJSONObject("wifi")?.getString("reason"))
 
         failedScalars.clear()
@@ -1142,7 +1050,7 @@ class ConfigurationPackageControllerTest {
         val results = requireNotNull(packages.attempt()).results
         assertEquals(2, packages.scalarWrites.count)
         assertEquals("applied", results.getJSONObject("brightness").getString("status"))
-        assertEquals("VERIFY_AFTER_REBOOT", results.getJSONObject("wifi").getString("reason"))
+        assertEquals("SAVED", results.getJSONObject("wifi").getString("reason"))
         assertEquals(1, wifi.adapter.applyCalls.size)
         assertEquals(0, wifi.adapter.disconnectCalls)
     }
@@ -1348,7 +1256,7 @@ class ConfigurationPackageControllerTest {
     }
 
     @Test
-    fun `returning to a package fences stale applying attempt and starts a fresh apply`() {
+    fun `returning to a saved package reuses it when the intervening policy never applied`() {
         val networkA = network("office-a")
         val networkB = network("office-b")
         val policyA = packagePayload(listOf(networkA))
@@ -1364,8 +1272,7 @@ class ConfigurationPackageControllerTest {
 
         packages.receive(policyB)
         packages.receive(policyA)
-        // A repeated full snapshot must keep the forced same-boot reapply attached
-        // to the pending A assignment.
+        // A repeated full snapshot must preserve the saved result.
         packages.receive(policyA)
         wifi.connectivity.update(101, networkA.ssid)
         wifi.worker.runAll()
@@ -1373,7 +1280,7 @@ class ConfigurationPackageControllerTest {
         wifi.worker.runAll()
         packages.worker.runAll()
 
-        assertEquals(2, wifi.adapter.applyCalls.size)
+        assertEquals(1, wifi.adapter.applyCalls.size)
         assertEquals(ConfigurationVersion(PACKAGE_ID, REVISION), packages.journal().latest?.version)
         assertEquals("complete", packages.attempt()?.status)
     }
@@ -1509,6 +1416,8 @@ class ConfigurationPackageControllerTest {
         var failNext = false
         val calls = mutableListOf<Set<String>>()
         val overwriteModes = mutableListOf<Boolean>()
+        val currentValues = mutableMapOf<String, Any>()
+        val mutations = mutableListOf<Set<String>>()
 
         fun apply(values: JSONObject, overwrite: Boolean): JSONObject {
             count++
@@ -1519,10 +1428,19 @@ class ConfigurationPackageControllerTest {
             val keys = values.keys().asSequence().toSet()
             calls.add(keys)
             overwriteModes.add(overwrite)
+            val changed = mutableSetOf<String>()
+            mutations.add(changed)
             return JSONObject().apply {
                 for (key in keys) {
                     val outcome = if (key in failedKeys) settingOutcome("failed", reason = "UPDATE_FAILED")
-                        else settingOutcome("applied", values.get(key))
+                    else {
+                        val requested = values.get(key)
+                        if (overwrite || currentValues[key] != requested) {
+                            currentValues[key] = requested
+                            changed.add(key)
+                        }
+                        settingOutcome("applied", currentValues.getValue(key))
+                    }
                     put(key, outcome)
                 }
             }

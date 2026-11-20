@@ -1687,9 +1687,9 @@ def _check_deployment_impact(body: dict, token: str) -> None:
         raise PackageError("Deployment targets changed. Review the updated targets before deploying.", 409)
 
 
-def _public_package(package_id: str, profile: dict) -> dict:
+def _editor_package(package_id: str, profile: dict) -> dict:
     impact, _ = _package_impact(package_id, profile)
-    return configuration_packages.public_profile(package_id, profile, impact)
+    return configuration_packages.editor_profile(package_id, profile, impact)
 
 
 async def package_catalog_handler(request: web.Request) -> web.Response:
@@ -1708,7 +1708,7 @@ async def package_catalog_handler(request: web.Request) -> web.Response:
             "deployed_at_ms": None,
         }
         _save_package(package_id, profile)
-        response = _public_package(package_id, profile)
+        response = _editor_package(package_id, profile)
         await broadcast_group_list()
         return web.json_response(response)
     except PackageError as exc:
@@ -1719,7 +1719,8 @@ async def package_handler(request: web.Request) -> web.Response:
     try:
         package_id = request.match_info["package_id"]
         if request.method in ("GET", "HEAD"):
-            return web.json_response(_public_package(package_id, _find_package(package_id)))
+            return web.json_response(_editor_package(package_id, _find_package(package_id)),
+                                     headers={"Cache-Control": "no-store"})
 
         _require_package_origin(request)
         body = await _small_json_body(request)
@@ -1749,7 +1750,8 @@ async def package_save_and_deploy_handler(request: web.Request) -> web.Response:
         if not _commit_configuration(updated):
             raise PackageError("Configuration package could not be saved", 500)
         _schedule_configuration_publication(request.app, devices)
-        return web.json_response(_public_package(package_id, _find_package(package_id)))
+        return web.json_response(_editor_package(package_id, _find_package(package_id)),
+                                 headers={"Cache-Control": "no-store"})
     except PackageError as exc:
         return web.json_response({"error": str(exc)}, status=exc.status)
 

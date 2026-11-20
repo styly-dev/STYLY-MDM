@@ -117,10 +117,14 @@ internal class FakeAdapter(initialNetworks: List<WifiNetworkProfile>) : WifiSett
     val currentProfiles: List<WifiNetworkProfile> get() = saved.map { it.profile }
     val currentAutoJoin: List<Boolean> get() = saved.map { it.autoJoin }
     val applyCalls = mutableListOf<List<WifiNetworkProfile>>()
+    val trustedNetworkCalls = mutableListOf<List<WifiNetworkProfile>>()
+    val rewrittenNetworkCalls = mutableListOf<Set<Int>>()
+    val recreationFallbacks = mutableListOf<WifiNetworkProfile?>()
     val selectCalls = mutableListOf<WifiNetworkProfile>()
     var disconnectCalls = 0
         private set
     var application: WifiProfileApplication? = null
+    var recreatesOwnedPrimary = false
     var wifiEnabled = true
     var disconnectResult = WifiReason.NONE
     var disconnectFailure: Throwable? = null
@@ -131,6 +135,12 @@ internal class FakeAdapter(initialNetworks: List<WifiNetworkProfile>) : WifiSett
     var afterSelect: ((WifiNetworkProfile) -> Unit)? = null
     var onCheckWifiEnabled: (() -> Unit)? = null
 
+    fun setAutoJoin(profile: WifiNetworkProfile, enabled: Boolean) {
+        val entry = saved.firstOrNull { it.profile.identity == profile.identity }
+            ?: error("No saved network ${profile.ssid}")
+        entry.autoJoin = enabled
+    }
+
     override fun isWifiEnabled(): Boolean {
         onCheckWifiEnabled?.invoke()
         return wifiEnabled
@@ -139,25 +149,51 @@ internal class FakeAdapter(initialNetworks: List<WifiNetworkProfile>) : WifiSett
     override fun applyProfile(
         target: List<WifiNetworkProfile>,
         prioritizeNetworks: Boolean,
+        primaryRecreation: WifiPrimaryRecreation?,
+        trustedSavedNetworks: List<WifiNetworkProfile>,
         beforeMutation: () -> WifiReason?,
     ): WifiProfileApplication {
         applyCalls += target.toList()
+        trustedNetworkCalls += trustedSavedNetworks.toList()
+        recreationFallbacks += primaryRecreation?.fallback
         val reason = beforeMutation()
-        if (reason != null) return WifiProfileApplication(emptyList(), reason)
+        if (reason != null) {
+            rewrittenNetworkCalls.add(emptySet())
+            return WifiProfileApplication(emptyList(), reason)
+        }
 
         val result = application ?: WifiProfileApplication(target.indices.toList())
-        if (result.usableIndexes.isEmpty()) return result
+        if (result.usableIndexes.isEmpty()) {
+            rewrittenNetworkCalls += result.rewrittenIndexes
+            return result
+        }
+        val newlyAdded = result.newlyAddedIndexes.toMutableSet()
+        val rewritten = result.rewrittenIndexes.toMutableSet()
         for ((index, profile) in target.withIndex()) {
             if (index !in result.usableIndexes) continue
             val existing = saved.firstOrNull { it.profile.identity == profile.identity }
-            if (existing == null) saved += Saved(profile) else existing.profile = profile
+            if (existing == null) {
+                saved += Saved(profile)
+                newlyAdded += index
+                rewritten += index
+            } else if (profile !in trustedSavedNetworks ||
+                existing.profile.ssid != profile.ssid || existing.profile.security != profile.security ||
+                existing.profile.hidden != profile.hidden
+            ) {
+                existing.profile = profile
+                rewritten += index
+                if (index == 0 && recreatesOwnedPrimary && primaryRecreation?.isFallbackStillConnected?.invoke() == true) {
+                    newlyAdded += index
+                }
+            }
         }
         val autoJoinTargets = if (prioritizeNetworks) target.take(1) else target
         for (entry in saved) {
             entry.autoJoin = autoJoinTargets.any { it.identity == entry.profile.identity }
         }
         afterApply?.invoke()
-        return result
+        rewrittenNetworkCalls += rewritten.toSet()
+        return result.copy(newlyAddedIndexes = newlyAdded, rewrittenIndexes = rewritten)
     }
 
     override fun selectSavedCandidate(

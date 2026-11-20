@@ -5,8 +5,16 @@
 
   const MAX_WIFI_NETWORKS = 4;
   const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-  const WIFI_ORDER_HELP = 'Earlier networks in this list have higher priority.';
-  const WIFI_ANDROID_HELP = 'Android chooses among saved Wi-Fi networks. Listed SSID and security matches have auto-connect on. Other saved networks have auto-connect off.';
+  const WIFI_ANDROID_HELP = 'Android chooses the network. Auto-connect is on for listed SSID and security matches and off for other saved networks.';
+  const WIFI_ACTION_ICONS = {
+    up: 'M8 13V3m-4 4 4-4 4 4',
+    down: 'M8 3v10m-4-4 4 4 4-4',
+    remove: 'M2.5 4.5h11m-7-2h3m-5 2 .6 8a1 1 0 0 0 1 .9h3.8a1 1 0 0 0 1-.9l.6-8M7 7v3.5M9 7v3.5',
+  };
+
+  function wifiActionIcon(action) {
+    return `<svg viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="${WIFI_ACTION_ICONS[action]}"/></svg>`;
+  }
 
   function esc(value) {
     return String(value == null ? '' : value).replace(/[&<>"']/g, function (character) {
@@ -33,9 +41,16 @@
     return structuredClone(draft);
   }
 
+  function savedWifiNetwork(network, saved) {
+    return saved.find(candidate => candidate.ssid === network.ssid && candidate.security === network.security);
+  }
+
   function hasSavedPassword(network, saved) {
-    return saved.some(candidate => candidate.ssid === network.ssid &&
-      candidate.security === network.security && candidate.password_present);
+    return savedWifiNetwork(network, saved)?.password_present === true;
+  }
+
+  function wifiPasswordValue(network, saved) {
+    return network.password || savedWifiNetwork(network, saved)?.password || '';
   }
 
   function supportedValue(item, value) {
@@ -210,14 +225,9 @@
     return Boolean(deployment && report?.package_id === deployment.package_id && report.revision === deployment.revision);
   }
 
-  function wifiAwaitingReboot(report) {
+  function legacyWifiSaved(report) {
     const result = report?.results?.wifi;
     return result?.status === 'failed' && result.reason === 'VERIFY_AFTER_REBOOT';
-  }
-
-  function wifiIsOnlyPendingResult(report, deployment) {
-    return Boolean(deployment?.keys.includes('wifi') && wifiAwaitingReboot(report) &&
-      deployment.keys.every(key => key === 'wifi' || report.results?.[key]?.status === 'applied'));
   }
 
   function retryEligible(device, deployment) {
@@ -227,7 +237,7 @@
     if (report.status === 'interrupted') return true;
     if (report.status !== 'complete') return false;
     return deployment.keys.some(key => ['failed', 'unsupported'].includes(report.results?.[key]?.status) &&
-      !(key === 'wifi' && wifiAwaitingReboot(report)));
+      !(key === 'wifi' && legacyWifiSaved(report)));
   }
 
   function deviceOutcome(device, packageId, deployment) {
@@ -249,16 +259,17 @@
     if (report.status !== 'complete') {
       return ['pending', 'Pending' + connection, 'Waiting for the device to report the outcome.'];
     }
-    if (wifiIsOnlyPendingResult(report, deployment)) {
-      return ['pending', 'Saved. Verify after reboot.' + connection,
-        'Wi-Fi settings were saved. Restart the headset to verify the connection.'];
-    }
-    const results = deployment.keys.map(key => report.results?.[key]?.status);
+    const results = deployment.keys.map(key => key === 'wifi' && legacyWifiSaved(report)
+      ? 'applied' : report.results?.[key]?.status);
     const applied = results.filter(status => status === 'applied').length;
     if (results.every(status => status === 'applied')) {
-      const wifiSaved = deployment.keys.includes('wifi') && report.results?.wifi?.reason === 'SAVED';
+      const wifiSaved = deployment.keys.includes('wifi') &&
+        (report.results?.wifi?.reason === 'SAVED' || legacyWifiSaved(report));
+      const savedDetail = deployment.wifi_mode === 'android_selection'
+        ? 'Wi-Fi profiles and auto-connect flags were read back. Android selects the network.'
+        : 'Saved Wi-Fi profiles and auto-connect flags were read back.';
       return ['success', results.length ? 'Applied' + connection : 'No managed settings' + connection,
-        results.length ? wifiSaved ? 'Wi-Fi profiles and auto-connect flags were read back. Android selects the network.' : 'All managed settings were verified.' : 'The device acknowledged this revision.'];
+        results.length ? wifiSaved ? savedDetail : 'All managed settings were verified.' : 'The device acknowledged this revision.'];
     }
     if (results.every(status => status === 'unsupported')) {
       return ['unavailable', 'Unsupported' + connection, 'This device could not apply the managed settings.'];
@@ -268,10 +279,11 @@
   }
 
   function wifiPasswordHelp(network, saved) {
-    if (network.security === 'OPEN') return 'Open networks do not use a password.';
+    if (network.security === 'OPEN') return 'No password needed.';
+    const format = '1–63 ASCII characters (1–7 require WPA3).';
     return hasSavedPassword(network, saved)
-      ? 'Leave blank to keep the saved password. Use 1–63 ASCII characters; 1–7 is WPA3-only.'
-      : 'Enter 1–63 ASCII characters. Passwords of 1–7 characters require WPA3.';
+      ? 'Leave blank to keep the saved password. ' + format
+      : format;
   }
 
   function renderWifi(item, value, saved, secretType, managed) {
@@ -279,14 +291,15 @@
     const rows = networks.map(function (network, index) {
       const field = `data-setting="${esc(item.id)}" data-network="${index}"`;
       const isOpen = network.security === 'OPEN';
+      const passwordHelpId = `wifi-password-help-${index}`;
       const moveActions = value.prioritize_networks ? `
-            <button class="btn-outline wifi-move" type="button" aria-label="Move Wi-Fi ${index + 1} up" data-policy-action="move-network" data-direction="up" ${field} ${!managed || index === 0 ? 'disabled' : ''}>Up</button>
-            <button class="btn-outline wifi-move" type="button" aria-label="Move Wi-Fi ${index + 1} down" data-policy-action="move-network" data-direction="down" ${field} ${!managed || index === networks.length - 1 ? 'disabled' : ''}>Down</button>` : '';
+            <button class="btn-outline" type="button" aria-label="Move Wi-Fi ${index + 1} up" title="Move up" data-policy-action="move-network" data-direction="up" ${field} ${!managed || index === 0 ? 'disabled' : ''}>${wifiActionIcon('up')}</button>
+            <button class="btn-outline" type="button" aria-label="Move Wi-Fi ${index + 1} down" title="Move down" data-policy-action="move-network" data-direction="down" ${field} ${!managed || index === networks.length - 1 ? 'disabled' : ''}>${wifiActionIcon('down')}</button>` : '';
       return `<article class="wifi-network">
         <div class="wifi-network-head">${value.prioritize_networks ? `<strong>Wi-Fi ${index + 1}</strong>` : ''}
           <div class="wifi-network-actions">
             ${moveActions}
-          <button class="btn-outline btn-danger-outline wifi-remove" type="button" data-policy-action="remove-network" ${field}>Remove from package</button>
+            <button class="btn-outline wifi-remove" type="button" aria-label="Remove Wi-Fi ${index + 1} from package" title="Remove from package" data-policy-action="remove-network" ${field}>${wifiActionIcon('remove')}</button>
           </div>
         </div>
         <label>SSID<input class="field" ${field} data-field="ssid" value="${esc(network.ssid)}"></label>
@@ -295,26 +308,27 @@
             <option value="OPEN" ${isOpen ? 'selected' : ''}>Open</option>
             <option value="WPA2_WPA3" ${!isOpen ? 'selected' : ''}>WPA2/WPA3 Personal</option>
           </select></label>
-          <label>Password<input class="field wifi-secret" type="${secretType}" ${field} data-field="password" autocomplete="off" spellcheck="false" ${isOpen ? 'disabled' : ''}></label>
+          <label>Password<input class="field wifi-secret" type="${secretType}" ${field} data-field="password"
+            aria-describedby="${passwordHelpId}" autocomplete="off" spellcheck="false" ${isOpen ? 'disabled' : ''}></label>
         </div>
         <div class="wifi-row-foot">
-          <small data-password-help="${index}">${wifiPasswordHelp(network, saved.networks)}</small>
+          <small id="${passwordHelpId}" data-password-help="${index}">${wifiPasswordHelp(network, saved.networks)}</small>
           <label class="wifi-check"><input type="checkbox" ${field} data-field="hidden" ${network.hidden ? 'checked' : ''}> Hidden network</label>
         </div>
       </article>`;
     }).join('');
     const conflicts = wifiConflicts({ managed, value });
-    const strategyControls = value.prioritize_networks ? `<small class="wifi-order-note" data-wifi-order-note>${WIFI_ORDER_HELP}</small>
-      <label><input type="checkbox" data-setting="${esc(item.id)}" data-field="auto_return" ${value.auto_return ? 'checked' : ''}> Automatically return to a higher-priority network when it becomes available</label>
-      <small>After manual selection or fallback to a lower-priority network, the headset checks within 30 seconds, then about once a minute for 5 checks, then about every 5 minutes. If a move fails and the headset is still disconnected, it tries the previous network again. Android may delay detection.</small>` : '';
+    const strategyControls = value.prioritize_networks ? `
+      <label><input type="checkbox" data-setting="${esc(item.id)}" data-field="auto_return" ${value.auto_return ? 'checked' : ''}> Auto-return to higher-priority Wi-Fi</label>
+      <small>On lower-priority Wi-Fi, the headset scans within 30 seconds, then about every minute for 5 scans, then about every 5 minutes. Android may delay scans. If switching fails and Wi-Fi is still disconnected, the headset retries the previous network.</small>` : '';
     const priorityControls = `<div class="wifi-options">
-      <label><input type="checkbox" data-setting="${esc(item.id)}" data-field="prioritize_networks" ${value.prioritize_networks ? 'checked' : ''}> Prioritize package Wi-Fi networks</label>
+      <label><input type="checkbox" data-setting="${esc(item.id)}" data-field="prioritize_networks" ${value.prioritize_networks ? 'checked' : ''}> Prioritize Wi-Fi by list order</label>
       ${strategyControls}
-      <small class="wifi-warning" data-wifi-limit-warning role="alert" ${conflicts.tooManyNetworks ? '' : 'hidden'}>Wi-Fi supports up to 4 networks. Remove extra networks before deploying.</small>
-      <small class="wifi-warning" data-wifi-hidden-warning role="alert" ${conflicts.autoReturnWithHidden ? '' : 'hidden'}>Automatic return is not supported with hidden Wi-Fi networks. Turn off auto-return or clear Hidden network before deploying.</small>
+      <small class="wifi-warning" data-wifi-limit-warning role="alert" ${conflicts.tooManyNetworks ? '' : 'hidden'}>Remove extra networks to meet the 4-network limit.</small>
+      <small class="wifi-warning" data-wifi-hidden-warning role="alert" ${conflicts.autoReturnWithHidden ? '' : 'hidden'}>Turn off auto-return or uncheck Hidden network.</small>
     </div>`;
     return `<div class="settings-networks">
-      <div class="push-note">${value.prioritize_networks ? 'Only the first listed Wi-Fi network is enabled for Android auto-connect. Other saved networks have auto-connect off. The headset tries listed networks in order when needed.' : WIFI_ANDROID_HELP} Devices can lose contact with MDM if none of the listed networks connects.</div>
+      <div class="push-note">${value.prioritize_networks ? 'Android auto-connects only to the first network. The headset tries the list in order when needed.' : WIFI_ANDROID_HELP} If none connect, the headset may go offline in MDM.</div>
       ${rows}
       ${priorityControls}
       <button type="button" class="btn-outline" data-policy-action="add-network" data-setting="${esc(item.id)}" ${!managed || networks.length >= MAX_WIFI_NETWORKS ? 'disabled' : ''}>Add Wi-Fi network</button>
@@ -391,23 +405,29 @@
     return '';
   }
 
-  function reportedResults(report, deployment, items, id, open) {
+  function reportedResults(report, deployment, items) {
     if (!matchesDeployment(report, deployment)) return '';
-    const lines = deployment.keys.map(function (key) {
+    return deployment.keys.map(function (key) {
       const item = items.get(key);
       const result = report.results?.[key];
-      if (!result) return '';
-      const deferredWifi = key === 'wifi' && wifiAwaitingReboot(report);
-      const savedWifi = key === 'wifi' && result.status === 'applied' && result.reason === 'SAVED';
-      const status = deferredWifi ? 'Saved. Verify after reboot.' : savedWifi ? 'Saved. Android selects the network.' :
-        { applied: 'Applied', failed: 'Failed', unsupported: 'Unsupported' }[result.status];
+      const status = result
+        ? { applied: 'Applied', failed: 'Failed', unsupported: 'Unsupported' }[result.status]
+        : report.status === 'complete' ? 'Not verified' : '';
       if (!status) return '';
-      const actual = actualValue(item, result.value);
-      const reason = result.reason && !deferredWifi && !savedWifi
-        ? ' · ' + String(result.reason).replaceAll('_', ' ').toLowerCase() : '';
-      return `<li>${esc(item?.label || key)} · ${status}${actual ? ' · ' + esc(actual) : ''}${esc(reason)}</li>`;
+      const savedWifi = key === 'wifi' && (legacyWifiSaved(report) || status === 'Applied' && result.reason === 'SAVED');
+      const applied = savedWifi || status === 'Applied';
+      const actual = actualValue(item, result?.value);
+      const reason = result?.reason && !(key === 'wifi' && applied && result.reason === 'FALLBACK')
+        ? String(result.reason).replaceAll('_', ' ').toLowerCase() : '';
+      const explanation = reason.charAt(0).toUpperCase() + reason.slice(1);
+      const detail = savedWifi
+        ? (deployment.wifi_mode === 'android_selection' ? 'Saved. Android selects the network.' : 'Saved')
+        : [actual, explanation].filter(Boolean).join(' · ') || status;
+      return `<li class="${applied ? 'applied' : 'unverified'}">
+        <span class="settings-readback-icon" role="img" aria-label="${applied ? 'Applied' : status}">${applied ? '✓' : '×'}</span>
+        <span>${esc(item?.label || key)}</span><span class="settings-readback-value">${esc(detail)}</span>
+      </li>`;
     }).filter(Boolean).join('');
-    return lines ? `<details class="settings-readback" data-result-device="${esc(id)}" ${open ? 'open' : ''}><summary>Results at apply time</summary><ul>${lines}</ul></details>` : '';
   }
 
   function wifiReadiness(device, deployment) {
@@ -422,19 +442,19 @@
     return '';
   }
 
-  function wifiAutoReturnMonitor(device, deployment) {
+  function wifiAutoReturnNotice(device, deployment) {
     if (device?.status !== 'online' || !deployment?.keys.includes('wifi') ||
         deployment.wifi_mode === 'android_selection') return '';
     const labels = {
-      off: 'Not scanning', monitoring: 'Monitoring', degraded: 'Degraded',
-      switching: 'Switching', unsupported: 'Unsupported',
+      degraded: 'Wi-Fi auto-return is degraded.',
+      switching: 'Switching to a higher-priority Wi-Fi network.',
+      unsupported: 'Wi-Fi auto-return is unavailable.',
     };
-    const label = labels[device.wifi_state?.priority_monitor];
-    return label ? 'Wi-Fi auto-return monitor: ' + label + '.' : '';
+    return labels[device.wifi_state?.priority_monitor] || '';
   }
 
   function createController({
-    groupPanel, packagePanel, packageList, createForm, getGroups, getDevice, openPackages,
+    groupPanel, packagePanel, packageList, catalogNotice, createForm, getGroups, getDevice, openPackages,
     deviceIdHtml = (_, id) => esc(id), fetch = root.fetch.bind(root),
     confirmAction = message => root.confirm(message),
     onSnapshot = () => {},
@@ -444,6 +464,7 @@
     const groupEdits = new Map();
     const retrying = new Map();
     let group = null;
+    const expandedResults = new Set();
     let current = null;
     let snapshot = null;
     let catalog = null;
@@ -554,24 +575,25 @@
 
     function renderCatalog() {
       const unavailable = configurationAvailable === false;
-      const notice = unavailable
-        ? '<p class="settings-error" role="status">' + esc(catalogRefreshState === 'waiting-snapshot'
+      catalogNotice.hidden = !unavailable;
+      if (unavailable) {
+        catalogNotice.querySelector('[role="status"]').textContent = catalogRefreshState === 'waiting-snapshot'
           ? 'Checking configuration status with the server…'
           : catalogRefreshState === 'waiting-connection' || !snapshotConnectionReady
             ? 'Waiting for the server connection to check configuration status.'
-            : 'Configuration packages are unavailable. Reload after the server recovers.') + '</p>'
-        : '';
+            : 'The server could not load saved packages. Repair or restore the registry and restart the server, then reload packages.';
+      }
       const entries = catalog?.map(pkg =>
         `<button type="button" class="mg-item settings-package-item${current?.id === pkg.package_id ? ' active' : ''}" data-package-id="${esc(pkg.package_id)}" aria-pressed="${current?.id === pkg.package_id}" ${unavailable ? 'disabled' : ''}>
           <span class="mg-item-name">${esc(pkg.name)}</span>
           <span class="mg-item-count">${pkg.published_revision ? 'Deployed' : 'New'}</span>
         </button>`).join('');
-      const empty = entries || catalog?.length
+      const empty = unavailable || entries || catalog?.length
         ? ''
-        : `<p class="empty small">${esc(unavailable ? 'Package catalog unavailable.' : catalog ? 'No packages yet.' : catalogError || 'Loading packages…')}</p>`;
-      const reload = unavailable || catalogError
+        : `<p class="empty small">${esc(catalog ? 'No packages yet.' : catalogError || 'Loading packages…')}</p>`;
+      const reload = !unavailable && catalogError
         ? '<button type="button" class="btn-outline" data-refresh-packages>Reload packages</button>' : '';
-      const content = notice + (entries || '') + empty + reload;
+      const content = (entries || '') + empty + reload;
       if (catalogContent !== content) {
         catalogContent = content;
         packageList.innerHTML = content;
@@ -699,7 +721,8 @@
         <button type="button" class="btn-outline" data-policy-action="reload" hidden>Reload package</button>
       </div>`;
       for (const input of packagePanel.querySelectorAll('[data-field="password"]')) {
-        input.value = model.draft[input.dataset.setting].value.networks[Number(input.dataset.network)].password;
+        const network = model.draft[input.dataset.setting].value.networks[Number(input.dataset.network)];
+        input.value = wifiPasswordValue(network, model.savedWifiNetworks);
       }
       renderPublication();
       updateActions();
@@ -731,6 +754,7 @@
       }
       Object.assign(model, { sections: data.sections, editRevision: data.edit_revision,
         publishedRevision: data.published_revision,
+        savedWifiNetworks: data.settings?.wifi?.value.networks ?? [],
         savedName: data.name, saved, name, draft });
       readSections(data.sections, expectedInstanceId);
     }
@@ -890,6 +914,7 @@
 
     function renderGroup(name) {
       if (name !== (group?.name ?? null)) {
+        expandedResults.clear();
         if (name && resultSections.status === 'failed') resultSections = { status: 'idle' };
         group = name ? groupEdits.get(name) || { name } : null;
         groupPanel.innerHTML = group ? `<section class="settings-section">
@@ -966,14 +991,18 @@
       count.hidden = !assignedPackage(group);
       const deployment = currentDeployment(group);
       const assigned = assignedPackage(group);
-      const focusedRetryDevice = root.document?.activeElement?.matches?.('[data-group-action="retry"]')
-        ? root.document.activeElement.dataset.deviceId : null;
-      const openResults = new Set(Array.from(target.querySelectorAll('[data-result-device][open]'), result => result.dataset.resultDevice));
+      const active = root.document?.activeElement;
+      const focusSelector = ['[data-group-action="retry"]', '[data-group-action="toggle-result"]']
+        .find(selector => active?.matches?.(selector));
       const outcomes = groupOutcomes(group.name, assigned, deployment);
       const rows = [];
       for (const [id, { device, outcome: [state, label, detail] }] of outcomes) {
         const readiness = wifiReadiness(device, deployment);
-        const priorityMonitor = wifiAutoReturnMonitor(device, deployment);
+        const autoReturnNotice = wifiAutoReturnNotice(device, deployment);
+        const results = reportedResults(device?.configuration_state, deployment, items);
+        const expanded = expandedResults.has(id);
+        const name = esc(device?.label || 'Unlabeled device');
+        const listId = 'group-device-results-' + esc(id);
         let button = '';
         if (deployment) {
           const key = retryKey(id, deployment);
@@ -987,14 +1016,16 @@
             button = `<button type="button" class="btn-outline${waiting ? ' retry-pending' : ''}" data-group-action="retry" data-device-id="${esc(id)}" ${waiting ? 'aria-disabled="true"' : ''}>${waiting ? 'Retry requested' : 'Retry'}</button>`;
           }
         }
-        rows.push(`<article class="settings-device-result ${state}">
-          <div class="settings-result-body">
-            <div class="settings-result-head"><strong>${esc(device?.label || 'Unlabeled device')}</strong><span>${esc(label)}</span></div>
-            <div class="settings-meta">${deviceIdHtml(device || {}, id)} · ${esc(detail)}</div>
-            ${readiness ? `<div class="settings-meta">${readiness}</div>` : ''}
-            ${priorityMonitor ? `<div class="settings-meta">${esc(priorityMonitor)}</div>` : ''}
-            ${reportedResults(device?.configuration_state, deployment, items, id, openResults.has(id))}
-          </div>${button}
+        rows.push(`<article class="settings-device-result ${state}"${results ? ` data-result-device="${esc(id)}"` : ''}>
+          <div class="settings-result-head">
+            ${results ? `<button type="button" class="settings-result-toggle" data-group-action="toggle-result"
+              data-device-id="${esc(id)}" aria-expanded="${expanded}" aria-controls="${listId}">${name}</button>` : `<strong>${name}</strong>`}
+            <div class="settings-result-actions"><span>${esc(label)}</span>${button}</div>
+          </div>
+          <div class="settings-meta">${deviceIdHtml(device || {}, id)} · ${esc(detail)}</div>
+          ${readiness ? `<div class="settings-meta">${readiness}</div>` : ''}
+          ${autoReturnNotice ? `<div class="settings-meta">${esc(autoReturnNotice)}</div>` : ''}
+          ${results ? `<ul id="${listId}" class="settings-readback" role="list" aria-label="Results at apply time"${expanded ? '' : ' hidden'}>${results}</ul>` : ''}
         </article>`);
       }
       const summary = deploymentCount(outcomes, deployment);
@@ -1004,9 +1035,9 @@
       if (target.resultContent !== content) {
         target.resultContent = content;
         target.innerHTML = content;
-        if (focusedRetryDevice) {
-          Array.from(target.querySelectorAll('[data-group-action="retry"]'))
-            .find(button => button.dataset.deviceId === focusedRetryDevice)?.focus({ preventScroll: true });
+        if (focusSelector) {
+          Array.from(target.querySelectorAll(focusSelector))
+            .find(button => button.dataset.deviceId === active.dataset.deviceId)?.focus({ preventScroll: true });
         }
       }
       if (deployment && assigned) {
@@ -1139,13 +1170,14 @@
         if (network !== undefined) {
           const row = value.networks[Number(network)];
           row[field] = target.type === 'checkbox' ? target.checked : target.value;
-          const article = target.closest('.wifi-network');
-          if (field === 'security') {
+          if (field === 'ssid' || field === 'security') {
+            const article = target.closest('.wifi-network');
             const password = article.querySelector('[data-field="password"]');
             password.disabled = row.security === 'OPEN';
-            if (password.disabled) row.password = password.value = '';
+            if (password.disabled) row.password = '';
+            password.value = wifiPasswordValue(row, model.savedWifiNetworks);
+            article.querySelector('[data-password-help]').textContent = wifiPasswordHelp(row, model.savedWifiNetworks);
           }
-          article.querySelector('[data-password-help]').textContent = wifiPasswordHelp(row, model.saved[setting].value.networks);
           if (field === 'hidden') updateWifiWarnings(target.closest('.settings-value'), model.draft);
         } else if (setting === 'wifi' && field === 'auto_return') {
           value.auto_return = target.checked;
@@ -1247,14 +1279,21 @@
       refreshGroup();
     });
     groupPanel.addEventListener('click', event => {
+      if (!group) return;
       const button = event.target.closest('[data-group-action]');
-      if (!group || !button || button.disabled) return;
-      const action = button.dataset.groupAction;
-      if (action === 'deploy') return deployPackage(group);
-      if (action === 'retry') return retryDevice(group, button.dataset.deviceId);
-      if (action === 'edit') return showPackages(selectedPackage(group));
+      if (button) {
+        if (button.disabled) return;
+        const action = button.dataset.groupAction;
+        if (action === 'deploy') return deployPackage(group);
+        if (action === 'retry') return retryDevice(group, button.dataset.deviceId);
+        if (action === 'edit') return showPackages(selectedPackage(group));
+      } else if (event.target.closest('button, a')) return;
+      const id = event.target.closest('[data-result-device]')?.dataset.resultDevice;
+      if (!id) return;
+      if (!expandedResults.delete(id)) expandedResults.add(id);
+      renderResults();
     });
-    packageList.addEventListener('click', event => {
+    function handleCatalogClick(event) {
       const button = event.target.closest('[data-package-id], [data-refresh-packages]');
       if (!button || button.disabled) return;
       const id = button.dataset.packageId;
@@ -1269,7 +1308,9 @@
         return loadCatalog(true);
       }
       if (canSwitchPackage(id)) return selectPackage(id);
-    });
+    }
+    packageList.addEventListener('click', handleCatalogClick);
+    catalogNotice.addEventListener('click', handleCatalogClick);
     createForm.addEventListener('submit', createPackage);
     packagePanel.addEventListener('input', handleInput);
     packagePanel.addEventListener('click', handleEditorClick);

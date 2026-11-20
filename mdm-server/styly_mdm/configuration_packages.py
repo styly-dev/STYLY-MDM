@@ -5,8 +5,8 @@ import copy
 from .wifi_settings import (
     WIFI_REASONS,
     WiFiSettingsError,
+    editor_networks,
     normalize_revision,
-    public_networks,
     validate_profile_networks,
 )
 
@@ -54,7 +54,7 @@ SECTIONS = [
               "schedule", {"enabled": False, "hour": 0, "minute": 0, "repeat": 127}),
     ]},
     {"id": "network", "title": "Network & connectivity", "description": "Wi-Fi and Bluetooth", "items": [
-        _item("wifi", "Wi-Fi networks", "Choose whether the client prioritizes this list or Android selects from saved networks.",
+        _item("wifi", "Wi-Fi networks", "Manage saved Wi-Fi and how the headset connects.",
               "wifi", {"networks": [], "auto_return": False, "prioritize_networks": True}),
         _item("bluetooth", "Bluetooth", "Enable Bluetooth.", "bool", False),
         _item("wifiPower", "Wi-Fi power control", "Keep Wi-Fi connected during sleep.", "bool", True),
@@ -192,10 +192,10 @@ def public_summary(package_id, profile):
     }
 
 
-def public_profile(package_id, profile, impact):
+def editor_profile(package_id, profile, impact):
     settings = copy.deepcopy(profile["settings"])
     if "wifi" in settings:
-        settings["wifi"]["value"]["networks"] = public_networks(settings["wifi"]["value"]["networks"])
+        settings["wifi"]["value"]["networks"] = editor_networks(settings["wifi"]["value"]["networks"])
     return {
         "package_id": package_id,
         "name": profile["name"],

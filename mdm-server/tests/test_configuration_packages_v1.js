@@ -77,11 +77,11 @@ test('managed writes reject values outside the catalog', () => {
   }
 });
 
-test('managed Wi-Fi preserves stored passwords without exposing them and reorders whole candidates', async () => {
+test('managed Wi-Fi pre-fills saved passwords and reorders whole candidates', async () => {
   let latest = profile({ settings: { wifi: { managed: true, value: {
     auto_return: false,
     networks: [
-      { ssid: 'Studio', security: 'WPA2_WPA3', hidden: false, password_present: true },
+      { ssid: 'Studio', security: 'WPA2_WPA3', hidden: false, password: 'stored-secret', password_present: true },
       { ssid: 'Backup', security: 'WPA2_WPA3', hidden: false, password_present: false },
     ],
   } } } });
@@ -89,11 +89,12 @@ test('managed Wi-Fi preserves stored passwords without exposing them and reorder
     if (method === 'GET') return response(latest);
     const previousNetworks = latest.settings.wifi.value.networks;
     const wifiValue = body.settings.wifi.value;
-    const networks = wifiValue.networks.map(({ password, ...network }) => ({
-      ...network,
-      password_present: network.security === 'WPA2_WPA3' && Boolean(password || previousNetworks.some(candidate =>
-        candidate.ssid === network.ssid && candidate.security === network.security && candidate.password_present)),
-    }));
+    const networks = wifiValue.networks.map(({ password, ...network }) => {
+      const previous = previousNetworks.find(candidate =>
+        candidate.ssid === network.ssid && candidate.security === network.security);
+      const savedPassword = password ?? previous?.password ?? '';
+      return { ...network, password: savedPassword, password_present: Boolean(savedPassword) };
+    });
     latest = profile({ settings: { ...body.settings, wifi: { ...body.settings.wifi, value: { ...wifiValue, networks } } },
       editRevision: 'edit2', publishedRevision: 'r1' });
     return response(latest);
@@ -101,12 +102,28 @@ test('managed Wi-Fi preserves stored passwords without exposing them and reorder
   fixture.broadcast();
   await fixture.controller.showPackages('pkg');
   assert.doesNotMatch(fixture.packagePanel.innerHTML, /stored-secret|backup-secret/);
+  const [studioPassword, backupPassword] = fixture.passwordInputs();
+  assert.deepEqual([studioPassword.value, backupPassword.value], ['stored-secret', '']);
   assert.match(fixture.packagePanel.innerHTML, /1–63 ASCII characters/);
-  assert.match(fixture.packagePanel.innerHTML, /1–7 is WPA3-only/);
-  assert.match(fixture.packagePanel.innerHTML, /aria-label="Move Wi-Fi 1 down"[^>]*>Down/);
+  assert.match(fixture.packagePanel.innerHTML, /1–7 require WPA3/);
+  assert.match(fixture.packagePanel.innerHTML, /aria-label="Move Wi-Fi 1 down"[^>]*><svg/);
+  assert.match(fixture.packagePanel.innerHTML, /aria-label="Remove Wi-Fi 1 from package"[^>]*><svg/);
+
+  fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'ssid' }, type: 'text', value: 'Renamed' });
+  assert.equal(studioPassword.value, '');
+  fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'ssid' }, type: 'text', value: 'Studio' });
+  assert.equal(studioPassword.value, 'stored-secret');
+  fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'security' }, type: 'select-one', value: 'OPEN' });
+  assert.equal(studioPassword.value, '');
+  fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'security' }, type: 'select-one', value: 'WPA2_WPA3' });
+  assert.equal(studioPassword.value, 'stored-secret');
 
   fixture.edit({ dataset: { setting: 'wifi', network: '1', field: 'password' }, type: 'password', value: 'backup-secret' });
   fixture.policyClick({ policyAction: 'move-network', setting: 'wifi', network: '0', direction: 'down' });
+  latest.settings.wifi.value.networks[0].password = 'rotated-secret';
+  latest.edit_revision = 'rotated-revision';
+  await fixture.editClick('reload');
+  assert.deepEqual(fixture.passwordInputs().map(input => input.value), ['backup-secret', 'rotated-secret']);
   await fixture.editClick('deploy');
 
   const posted = fixture.requests.at(-1).body.settings;
@@ -119,6 +136,7 @@ test('managed Wi-Fi preserves stored passwords without exposing them and reorder
     ['Backup', true], ['Studio', true],
   ]);
   assert.doesNotMatch(fixture.packagePanel.innerHTML, /backup-secret/);
+  assert.deepEqual(fixture.passwordInputs().map(input => input.value), ['backup-secret', 'rotated-secret']);
 });
 
 test('Wi-Fi accepts short WPA3-only ASCII passwords and rejects invalid values', () => {
@@ -226,9 +244,9 @@ test('auto-return is stored inside the Wi-Fi setting and hidden networks are rej
   assert.match(fixture.packagePanel.innerHTML, /data-setting="wifi" data-field="auto_return"/);
   assert.match(fixture.packagePanel.innerHTML, /data-field="prioritize_networks" checked/);
   assert.match(fixture.packagePanel.innerHTML,
-    /within 30 seconds, then about once a minute for 5 checks, then about every 5 minutes/);
-  assert.match(fixture.packagePanel.innerHTML, /tries the previous network again/);
-  assert.match(fixture.packagePanel.innerHTML, /Only the first listed Wi-Fi network is enabled for Android auto-connect/);
+    /within 30 seconds, then about every minute for 5 scans, then about every 5 minutes/);
+  assert.match(fixture.packagePanel.innerHTML, /retries the previous network/);
+  assert.match(fixture.packagePanel.innerHTML, /Android auto-connects only to the first network/);
 
   fixture.edit({ dataset: { setting: 'wifi', field: 'auto_return' }, checked: true, type: 'checkbox' });
   await fixture.editClick('deploy');
@@ -273,15 +291,15 @@ test('Wi-Fi Android selection disables ordering and auto-return, and saves expli
   });
   fixture.broadcast();
   await fixture.controller.showPackages('pkg');
-  assert.match(fixture.packagePanel.innerHTML, /Only the first listed Wi-Fi network is enabled for Android auto-connect/);
+  assert.match(fixture.packagePanel.innerHTML, /Android auto-connects only to the first network/);
   assert.match(fixture.packagePanel.innerHTML, /data-policy-action="move-network"/);
   assert.match(fixture.packagePanel.innerHTML, /data-field="auto_return" checked/);
 
   fixture.edit({ dataset: { setting: 'wifi', field: 'prioritize_networks' }, checked: false, type: 'checkbox' });
   assert.doesNotMatch(fixture.packagePanel.innerHTML, /data-policy-action="move-network"/);
   assert.doesNotMatch(fixture.packagePanel.innerHTML, /data-field="auto_return"/);
-  assert.match(fixture.packagePanel.innerHTML, /Android chooses among saved Wi-Fi networks/);
-  assert.match(fixture.packagePanel.innerHTML, /Listed SSID and security matches have auto-connect on\. Other saved networks have auto-connect off/);
+  assert.match(fixture.packagePanel.innerHTML, /Android chooses the network/);
+  assert.match(fixture.packagePanel.innerHTML, /Auto-connect is on for listed SSID and security matches and off for other saved networks/);
   await fixture.editClick('deploy');
 
   assert.deepEqual(fixture.requests.at(-1).body.settings.wifi.value, {
@@ -342,7 +360,7 @@ test('a new package gets its first Wi-Fi network after Manage and reopens with d
   const fixture = createHarness(({ method, body }) => {
     if (method === 'GET') return response(latest);
     const networks = body.settings.wifi.value.networks.map(({ password, ...network }) => ({
-      ...network, password_present: Boolean(password),
+      ...network, password, password_present: Boolean(password),
     }));
     latest = profile({ settings: { ...body.settings, wifi: { ...body.settings.wifi,
       value: { ...body.settings.wifi.value, networks } } }, editRevision: 'edit2', publishedRevision: 'r1' });
@@ -370,7 +388,7 @@ test('a new package gets its first Wi-Fi network after Manage and reopens with d
   } });
 
   await fixture.controller.showPackages('pkg');
-  assert.deepEqual(fixture.passwordInputs().map(input => input.value), ['']);
+  assert.deepEqual(fixture.passwordInputs().map(input => input.value), ['studio-pass']);
   assert.equal(fixture.editorButtons.deploy.disabled, false);
   assert.doesNotMatch(fixture.packagePanel.innerHTML, /studio-pass/);
 });
@@ -475,21 +493,20 @@ test('Wi-Fi SAVED reports verified profiles and leaves connection selection to A
   fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
   fixture.controller.renderGroup('The Lab');
   const results = fixture.groupControls['[data-settings-results]'].innerHTML;
-  assert.match(results, /wifi · Saved\. Android selects the network\./);
-  assert.doesNotMatch(results, /wifi · Applied · saved/);
-  assert.doesNotMatch(results, /Wi-Fi auto-return monitor/);
+  assert.match(results, /aria-label="Applied">✓<\/span>\s*<span>wifi<\/span><span class="settings-readback-value">Saved\. Android selects the network\./);
+  assert.doesNotMatch(results, /auto-return|higher-priority/);
 });
 
-test('priority Wi-Fi deployments show their client auto-return monitor', () => {
+test('priority Wi-Fi deployments show a live notice when switching networks', () => {
   const deployment = { ...d1, keys: ['wifi'], wifi_mode: 'priority' };
-  const device = { ...online, wifi_state: { priority_monitor: 'monitoring' } };
+  const device = { ...online, wifi_state: { priority_monitor: 'switching' } };
   const fixture = createHarness(() => assert.fail('rendering status should not call the API'), { devices: [device] });
   fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
   fixture.controller.renderGroup('The Lab');
-  assert.match(fixture.groupControls['[data-settings-results]'].innerHTML, /Wi-Fi auto-return monitor: Monitoring/);
+  assert.match(fixture.groupControls['[data-settings-results]'].innerHTML, /Switching to a higher-priority Wi-Fi network/);
 });
 
-test('Wi-Fi fallback is reported as applied with its reason', () => {
+test('Wi-Fi fallback is displayed as Applied', () => {
   const deployment = { ...d1, keys: ['brightness', 'wifi'] };
   const report = { ...deployment, status: 'complete', results: {
     brightness: { status: 'applied', value: 60 },
@@ -503,55 +520,75 @@ test('Wi-Fi fallback is reported as applied with its reason', () => {
   const results = fixture.groupControls['[data-settings-results]'].innerHTML;
   assert.match(results, /Applied/);
   assert.match(results, /Results at apply time/);
-  assert.match(results, /wifi · Applied · fallback/);
+  assert.match(results, /aria-label="Applied">✓<\/span>\s*<span>wifi<\/span>/);
   assert.doesNotMatch(results, /rolled back|restored|reboot required/i);
   assert.equal(deviceOutcome(devices[0], 'pkg', deployment)[1], 'Applied');
 });
 
-test('Wi-Fi failure is rendered from the package application result', () => {
-  const deployment = { ...d1, keys: ['brightness', 'wifi'] };
+test('device results start collapsed and reveal failed settings and verified values on card click', async () => {
+  const deployment = { ...d1, keys: ['brightness', 'wifi', 'autoSleep', 'screenOff'] };
   const report = { ...deployment, status: 'complete', results: {
     brightness: { status: 'applied', value: 60 },
-    wifi: { status: 'failed', reason: 'UNREACHABLE' },
+    wifi: { status: 'failed', reason: 'PERMISSION_DENIED' },
+    autoSleep: { status: 'unsupported' },
   } };
   const devices = [{ ...online, configuration_state: report }];
-  const fixture = createHarness(() => assert.fail('rendering results should not call the API'), { devices });
+  const fixture = createHarness(() => response(profile()), { devices });
   fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
   fixture.controller.renderGroup('The Lab');
+  await new Promise(resolve => setImmediate(resolve));
 
-  const results = fixture.groupControls['[data-settings-results]'].innerHTML;
-  assert.match(results, /Partially applied/);
-  assert.match(results, /Results at apply time/);
-  assert.match(results, /wifi · Failed · unreachable/);
+  const results = fixture.groupControls['[data-settings-results]'];
+  assert.match(results.innerHTML, /Partially applied/);
+  assert.match(results.innerHTML, /aria-expanded="false" aria-controls="group-device-results-headset"/);
+  assert.match(results.innerHTML, /aria-label="Results at apply time" hidden/);
+  const click = fixture.groupPanel.handlers.get('click');
+  const card = { dataset: { resultDevice: 'headset' } };
+  click({ target: { closest: selector => selector === '[data-result-device]' ? card : null } });
+  assert.match(results.innerHTML, /aria-expanded="true"/);
+  assert.doesNotMatch(results.innerHTML, /aria-label="Results at apply time" hidden/);
+  assert.match(results.innerHTML, /aria-label="Applied">✓<\/span>\s*<span>Screen brightness<\/span><span class="settings-readback-value">60%/);
+  assert.match(results.innerHTML, /aria-label="Failed">×<\/span>\s*<span>Wi-Fi networks<\/span><span class="settings-readback-value">Permission denied/);
+  assert.match(results.innerHTML, /aria-label="Unsupported">×<\/span>\s*<span>Auto sleep<\/span>/);
+  assert.match(results.innerHTML, /aria-label="Not verified">×<\/span>\s*<span>Screen off delay<\/span>/);
+  fixture.controller.renderGroup('The Lab');
+  assert.match(results.innerHTML, /aria-expanded="true"/);
+  click({ target: { closest: selector => selector === 'button, a' ? {} :
+    selector === '[data-result-device]' ? card : null } });
+  assert.match(results.innerHTML, /aria-expanded="true"/);
+  const toggle = { dataset: { groupAction: 'toggle-result', deviceId: 'headset' } };
+  click({ target: { closest: selector => selector === '[data-group-action]' ? toggle : card } });
+  assert.match(results.innerHTML, /aria-expanded="false"/);
   assert.equal(deviceOutcome(devices[0], 'pkg', deployment)[1], 'Partially applied');
   assert.equal(retryEligible(devices[0], deployment), true);
 });
 
-test('saved Wi-Fi awaiting reboot has a clear result and no Wi-Fi-only Retry', () => {
+test('legacy saved Wi-Fi awaiting reboot counts as applied and has no Wi-Fi-only Retry', () => {
   const deployment = { ...d1, keys: ['brightness', 'wifi'] };
   const report = { ...deployment, status: 'complete', results: {
     brightness: { status: 'applied', value: 60 },
     wifi: { status: 'failed', reason: 'VERIFY_AFTER_REBOOT' },
   } };
   const device = { ...online, configuration_state: report };
-  assert.equal(deviceOutcome(device, pkg.package_id, deployment)[0], 'pending');
-  assert.equal(deviceOutcome(device, pkg.package_id, deployment)[1], 'Saved. Verify after reboot.');
-  assert.match(deviceOutcome(device, pkg.package_id, deployment)[2], /Restart the headset/);
+  assert.equal(deviceOutcome(device, pkg.package_id, deployment)[0], 'success');
+  assert.equal(deviceOutcome(device, pkg.package_id, deployment)[1], 'Applied');
+  assert.match(deviceOutcome(device, pkg.package_id, deployment)[2], /Saved Wi-Fi profiles and auto-connect flags were read back/);
   assert.equal(retryEligible(device, deployment), false);
 
   const fixture = createHarness(() => assert.fail('rendering results should not call the API'), { devices: [device] });
   fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
   fixture.controller.renderGroup('The Lab');
   const results = fixture.groupControls['[data-settings-results]'].innerHTML;
-  assert.match(results, /Saved\. Verify after reboot\./);
-  assert.doesNotMatch(results, /wifi · Failed|data-group-action="retry"/);
+  assert.match(results, /aria-label="Applied">✓<\/span>\s*<span>wifi<\/span><span class="settings-readback-value">Saved<\/span>/);
+  assert.doesNotMatch(results, /aria-label="Failed"|Verify after reboot|data-group-action="retry"/);
 
   const retryableMixed = { ...report, results: { ...report.results,
     brightness: { status: 'failed', reason: 'WRITE_FAILED' } } };
+  assert.equal(deviceOutcome({ ...device, configuration_state: retryableMixed }, pkg.package_id, deployment)[1], 'Partially applied');
   assert.equal(retryEligible({ ...device, configuration_state: retryableMixed }, deployment), true);
 });
 
-test('Group Settings reports live auto-return monitor status separately from applied revision results', () => {
+test('Group Settings keeps only exceptional or switching live notices next to applied results', () => {
   const deployment = { ...d1, keys: ['brightness', 'wifi'] };
   const report = { ...deployment, status: 'complete', results: {
     brightness: { status: 'applied', value: 60 }, wifi: { status: 'applied' },
@@ -562,22 +599,23 @@ test('Group Settings reports live auto-return monitor status separately from app
   });
   fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
 
-  for (const [monitor, label] of [
-    ['off', 'Not scanning'], ['monitoring', 'Monitoring'], ['degraded', 'Degraded'],
-    ['switching', 'Switching'], ['unsupported', 'Unsupported'],
+  for (const [monitor, notice] of [
+    ['off', null], ['monitoring', null], ['degraded', 'Wi-Fi auto-return is degraded.'],
+    ['switching', 'Switching to a higher-priority Wi-Fi network.'],
+    ['unsupported', 'Wi-Fi auto-return is unavailable.'],
   ]) {
     devices[0].wifi_state = { priority_monitor: monitor };
     fixture.controller.renderGroup('The Lab');
     const results = fixture.groupControls['[data-settings-results]'].innerHTML;
     assert.match(results, /Applied/);
-    assert.match(results, new RegExp('Wi-Fi auto-return monitor: ' + label + '\\.'));
-    if (monitor === 'off') assert.doesNotMatch(results, /Wi-Fi auto-return monitor: Off\\./);
+    if (notice) assert.ok(results.includes(notice));
+    else assert.doesNotMatch(results, /auto-return|higher-priority/);
     assert.equal(fixture.groupControls['[data-deployment-count]'].textContent, 'Applied 1/1');
   }
 
   devices[0].wifi_state = {};
   fixture.controller.renderGroup('The Lab');
-  assert.doesNotMatch(fixture.groupControls['[data-settings-results]'].innerHTML, /Wi-Fi auto-return monitor:/);
+  assert.doesNotMatch(fixture.groupControls['[data-settings-results]'].innerHTML, /auto-return|higher-priority/);
 });
 
 test('membership edits derive the roster from the latest snapshot and one edit map', () => {
@@ -763,6 +801,8 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
   });
   const groupPanel = createElement({ querySelector: selector => groupControls[selector] });
   const packageList = createElement();
+  const catalogStatus = createElement();
+  const catalogNotice = createElement({ querySelector: selector => selector === '[role="status"]' ? catalogStatus : null });
   const createControls = {
     input: createElement({ focus() { this.focused = true; } }),
     button: createElement(),
@@ -774,7 +814,7 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
   let lastSnapshotRevision = 0;
   let opened = 0;
   const controller = createController({
-    groupPanel, packagePanel, packageList, createForm,
+    groupPanel, packagePanel, packageList, catalogNotice, createForm,
     getGroups: () => groups,
     getDevice: id => devices.find(device => device.device_id === id),
     openPackages: () => { opened++; },
@@ -795,7 +835,11 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
   ];
   const wifiLimitWarning = { hidden: true };
   const wifiHiddenWarning = { hidden: true };
-  const wifiArticle = { querySelector: selector => selector === '[data-field="password"]' ? { disabled: false, value: '' } : ({ textContent: '' }) };
+  const wifiArticle = dataset => ({
+    querySelector: selector => selector === '[data-field="password"]'
+      ? passwordInputs.find(input => input.dataset.setting === dataset.setting && input.dataset.network === dataset.network)
+      : { textContent: '' },
+  });
   const valueField = { disabled: true, querySelector: selector => selector === '[data-wifi-limit-warning]' ? wifiLimitWarning :
     selector === '[data-wifi-hidden-warning]' ? wifiHiddenWarning :
       selector === '[data-policy-action="add-network"]' ? addNetworkButton : ({}), querySelectorAll: selector =>
@@ -809,7 +853,7 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     dataset, value, checked, type, matches: () => false, nextElementSibling: {},
     closest: selector => selector === '.settings-row' ? { querySelector: () => valueField } :
       selector === '.settings-value' ? (dataset.manage ? null : valueField) :
-        selector === '.wifi-network' ? wifiArticle :
+        selector === '.wifi-network' ? wifiArticle(dataset) :
         { dataset: { settingsSection: 'basic' }, querySelector: () => ({}), querySelectorAll: () => [] },
   } });
   const editClick = action => packagePanel.handlers.get('click')({ target: { closest: () => editorButtons[action] } });
@@ -831,7 +875,7 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     await createForm.handlers.get('submit')({ preventDefault() {} });
   };
   return {
-    controller, packagePanel, packageList, groupPanel, edit, editClick, policyClick, editorButtons, editorControls, groupControls,
+    controller, packagePanel, packageList, catalogNotice, catalogStatus, groupPanel, edit, editClick, policyClick, editorButtons, editorControls, groupControls,
     groupClick, groupButtons, select, broadcast, create, createControls, requests, confirmations,
     passwordInputs: () => passwordInputs,
     valueField, moveButtons, wifiLimitWarning, wifiHiddenWarning, addNetworkButton, footerStatus,
@@ -887,7 +931,9 @@ test('an unavailable configuration snapshot keeps known packages visible but dis
     assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
   fixture.controller.renderGroup('The Lab');
 
-  assert.match(fixture.packageList.innerHTML, /Waiting for the server connection/);
+  assert.equal(fixture.catalogNotice.hidden, false);
+  assert.match(fixture.catalogStatus.textContent, /Waiting for the server connection/);
+  assert.doesNotMatch(fixture.packageList.innerHTML, /Waiting for the server connection/);
   assert.match(fixture.packageList.innerHTML, /data-package-id="pkg"[^>]*disabled/);
   assert.equal(fixture.groupControls['[data-group-package]'].disabled, true);
   assert.equal(fixture.groupButtons.edit.disabled, true);
@@ -918,11 +964,11 @@ test('package Reload waits for a fresh group snapshot and retries after reconnec
 
   const reload = { dataset: {} };
   const requestsBeforeReload = fixture.requests.length;
-  await fixture.packageList.handlers.get('click')({ target: { closest: () => reload } });
+  await fixture.catalogNotice.handlers.get('click')({ target: { closest: () => reload } });
   assert.equal(snapshotRequests.length, 1);
   assert.equal(fixture.requests.length, requestsBeforeReload,
     'an unavailable server snapshot does not start a catalog GET while disconnected');
-  assert.match(fixture.packageList.innerHTML, /Waiting for the server connection/);
+  assert.match(fixture.catalogStatus.textContent, /Waiting for the server connection/);
   assert.equal(fixture.createControls.input.disabled, true,
     'catalog contents do not determine configuration availability');
   assert.equal(fixture.groupControls['[data-group-package]'].disabled, true);
@@ -930,10 +976,11 @@ test('package Reload waits for a fresh group snapshot and retries after reconnec
   socketConnected = true;
   fixture.controller.setGroupSnapshotConnected(true);
   assert.equal(snapshotRequests.length, 2, 'reconnection requests a fresh authoritative snapshot');
-  assert.match(fixture.packageList.innerHTML, /Checking configuration status with the server/);
+  assert.match(fixture.catalogStatus.textContent, /Checking configuration status with the server/);
 
   fixture.broadcast({ packages: [pkg], configuration_available: true,
     assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
+  assert.equal(fixture.catalogNotice.hidden, true);
   assert.equal(fixture.createControls.input.disabled, false,
     'a later authoritative GROUP_LIST restores package actions');
 });
@@ -945,7 +992,7 @@ test('opening the package catalog waits for configuration availability on the gr
   await fixture.controller.showPackages();
 
   assert.equal(fixture.requests.length, 0);
-  assert.match(fixture.packageList.innerHTML, /Waiting for the server connection/);
+  assert.match(fixture.catalogStatus.textContent, /Waiting for the server connection/);
   assert.equal(fixture.createControls.input.disabled, true);
 });
 
@@ -1500,9 +1547,10 @@ test('Retry sends exactly the current device, package and revision and ignores r
   fixture.controller.renderGroup('The Lab');
   const results = fixture.groupControls['[data-settings-results]'];
   assert.match(results.innerHTML, /Apply failed/);
-  assert.match(results.innerHTML, />Retry</);
+  assert.match(results.innerHTML, /class="settings-result-actions"><span>Apply failed<\/span><button[^>]*>Retry</);
   const retry = fixture.groupClick('retry');
   fixture.groupClick('retry');
+  assert.match(results.innerHTML, /aria-expanded="false"/);
   assert.equal(fixture.requests.filter(request => request.method === 'POST').length, 1);
   assert.deepEqual(fixture.requests.at(-1), {
     url: '/api/package-retry', method: 'POST',
@@ -1516,7 +1564,7 @@ test('Retry sends exactly the current device, package and revision and ignores r
   await retry;
   devices[0].configuration_state = { ...failed, package_id: 'pkg2' };
   fixture.controller.renderGroup('The Lab');
-  assert.doesNotMatch(results.innerHTML, /WRITE_FAILED|write failed|data-group-action="retry"/);
+  assert.doesNotMatch(results.innerHTML, /WRITE_FAILED|Write failed|data-group-action="retry"/);
 });
 
 test('Retry keeps focus on the pending result action when its row updates', async () => {
@@ -1535,7 +1583,6 @@ test('Retry keeps focus on the pending result action when its row updates', asyn
     set(value) { html = value; activeElement = null; },
   });
   results.querySelectorAll = selector => {
-    if (selector === '[data-result-device][open]') return [];
     if (selector === '[data-group-action="retry"]' && /data-group-action="retry"/.test(html)) {
       return [{ dataset: { deviceId: 'headset' }, focus(options) {
         activeElement = this;

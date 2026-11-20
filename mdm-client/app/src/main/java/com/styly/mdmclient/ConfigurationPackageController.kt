@@ -9,8 +9,6 @@ import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
 import java.io.File
-import java.security.MessageDigest
-import java.util.Base64
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
@@ -37,9 +35,6 @@ internal data class ConfigurationAttempt(
     val status: String = "applying",
     val results: JSONObject = JSONObject(),
     val retryIds: Set<String> = emptySet(),
-    val failedWifiFingerprint: String? = null,
-    val scalarTargets: JSONObject = JSONObject(),
-    val wifiConnectionCheckRevision: String? = null,
     val bootReapply: Boolean = false,
 ) {
     private val unappliedKeys: Sequence<String>
@@ -48,39 +43,32 @@ internal data class ConfigurationAttempt(
     val needsRetry: Boolean
         get() = status == "interrupted" || (status == "complete" && unappliedKeys.any())
 
-    val wifiAwaitingReboot: JSONObject?
-        get() = results.optJSONObject("wifi")?.takeIf {
-            it.optString("status") == "failed" && it.optString("reason") == WifiReason.VERIFY_AFTER_REBOOT.wireValue
-        }
-
-    fun canRetry(deferWifiVerification: Boolean): Boolean = needsRetry &&
-        (!deferWifiVerification || status == "interrupted" || wifiAwaitingReboot == null || unappliedKeys.any { it != "wifi" })
-
     fun report(): JSONObject = version.toJson().put("status", status).put("results", results)
 
     fun saved(): JSONObject = report()
         .put("boot_count", bootCount)
         .put("retry_ids", JSONArray(retryIds))
-        .put("failed_wifi_fingerprint", failedWifiFingerprint)
-        .put("scalar_targets", scalarTargets)
-        .put("wifi_connection_check_revision", wifiConnectionCheckRevision)
-        .put("boot_reapply", bootReapply.takeIf { it && wifiConnectionCheckRevision != null })
+        // Older clients require this field when reading the same journal.
+        .put("scalar_targets", JSONObject())
 
     companion object {
         fun restore(json: JSONObject): ConfigurationAttempt {
             val status = json.getString("status")
             val retryIds = json.getJSONArray("retry_ids")
+            val results = json.getJSONObject("results")
+            val wifi = results.optJSONObject("wifi")
+            // Older attempts recorded connection-only failures after the settings were read back.
+            val wifiWasSaved = status == "complete" && wifi?.optString("status") == "failed" &&
+                (wifi.optString("reason") == WifiReason.VERIFY_AFTER_REBOOT.wireValue ||
+                    (wifi.optString("reason") == WifiReason.UNREACHABLE.wireValue &&
+                        (json.opt("wifi_connection_check_revision") as? String)?.let(WifiSettingsProtocol::isValidUuid) == true))
+            if (wifiWasSaved) results.put("wifi", settingOutcome("applied", reason = WifiReason.SAVED.wireValue))
             return ConfigurationAttempt(
                 version = ConfigurationVersion.parse(json) ?: throw JSONException("Invalid saved package version"),
                 bootCount = json.getInt("boot_count"),
                 status = if (status == "applying") "interrupted" else status,
-                results = json.getJSONObject("results"),
+                results = results,
                 retryIds = (0 until retryIds.length()).map(retryIds::getString).toSet(),
-                failedWifiFingerprint = json.opt("failed_wifi_fingerprint") as? String,
-                scalarTargets = json.getJSONObject("scalar_targets"),
-                wifiConnectionCheckRevision = (json.opt("wifi_connection_check_revision") as? String)
-                    ?.takeIf(WifiSettingsProtocol::isValidUuid),
-                bootReapply = json.optBoolean("boot_reapply"),
             )
         }
     }
@@ -100,7 +88,7 @@ internal class ConfigurationJournal(private val attempts: List<ConfigurationAtte
         val sameBoot = previous.bootCount == bootCount
         val isLatest = latest?.version == version
         if (retryId != null) {
-            return retryId !in previous.retryIds && previous.canRetry(deferWifiVerification = sameBoot && isLatest)
+            return retryId !in previous.retryIds && previous.needsRetry
         }
         if (!sameBoot) return true
         // A different attempt may have changed the saved settings since the previous result.
@@ -213,7 +201,6 @@ internal class ConfigurationPackageController(
     private var sdkReady = false
     private var wifiAttempt: ConfigurationAttempt? = null
     private val applyingWifi get() = wifiAttempt != null
-    private var watchedWifiAttempt: ConfigurationAttempt? = null
     private val cachedVersionFromEarlierBoot: ConfigurationVersion?
 
     fun addStateListener(listener: () -> Unit) { listeners.add(listener) }
@@ -343,7 +330,6 @@ internal class ConfigurationPackageController(
                         assignment?.token === selected.token
                     }
             } else false
-            reconcileWifiConnection()
             publishScreenState()
             onFinished(started)
         }
@@ -410,7 +396,6 @@ internal class ConfigurationPackageController(
         try {
             reconcilePending()
         } finally {
-            reconcileWifiConnection()
             publishScreenState()
         }
     }
@@ -458,14 +443,13 @@ internal class ConfigurationPackageController(
         val applyScalars = scalarWriter() ?: return
         if (wifiPolicy != null && !wifi.canAcceptPolicy()) return
 
-        val baseline = current.latest?.takeIf {
-            retryId == null && it.bootCount == boot
-        }
         val bootReapply = afterReboot && retryId == null &&
             (cachedVersionFromEarlierBoot == version || (previous != null && previous.bootCount != boot))
         pending = null
-        startAttempt(policy, previous, retryId, applyScalars, baseline, overwriteScalars = afterReboot,
-            confirmWifiAfterTimeout = afterReboot && retryId == null, bootReapply = bootReapply,
+        startAttempt(policy, previous, retryId, applyScalars,
+            overwriteScalars = bootReapply || (retryId != null && afterReboot),
+            checkExistingWifi = retryId == null && !bootReapply,
+            bootReapply = bootReapply,
             isCurrent = delivery.isCurrent)
     }
 
@@ -474,48 +458,29 @@ internal class ConfigurationPackageController(
         previous: ConfigurationAttempt?,
         retryId: String?,
         applyScalars: (JSONObject, Boolean) -> JSONObject,
-        baseline: ConfigurationAttempt? = null,
         overwriteScalars: Boolean = false,
-        confirmWifiAfterTimeout: Boolean = false,
+        checkExistingWifi: Boolean = false,
         bootReapply: Boolean = false,
         isCurrent: () -> Boolean,
     ): Boolean {
         val version = checkNotNull(policy.version)
         val wifiPolicy = policy.values.optJSONObject("wifi")
-        val fingerprint = wifiPolicy?.let { wifiFingerprint(version.revision, it) }
-        // Keep unchanged Wi-Fi failures on automatic deltas. A same-boot Retry can
-        // rerun other settings while leaving credentials that await reboot in place.
-        val previousWifi = baseline ?: previous?.takeIf {
-            retryId != null && it.bootCount == boot && journal?.latest === it && it.wifiAwaitingReboot != null
-        }
-        val retainedWifiFailure = previousWifi?.takeIf {
-            fingerprint != null && it.failedWifiFingerprint == fingerprint
-        }?.results?.optJSONObject("wifi")
-        val scalarTargets = JSONObject()
-        val scalarValues = JSONObject()
-        val results = JSONObject().apply { retainedWifiFailure?.let { put("wifi", it) } }
-        for (key in policy.values.keys()) {
-            if (key == "wifi") continue
-            val value = policy.values.get(key)
-            scalarTargets.put(key, value)
-            val previousResult = baseline?.results?.optJSONObject(key)
-            val previousValue = baseline?.scalarTargets?.opt(key)
-            if (previousResult != null && previousResult.optString("status") != "failed" &&
-                sameScalarTarget(key, previousValue, value)
-            ) {
-                results.put(key, previousResult)
-            } else scalarValues.put(key, value)
+        // A same-revision Retry for other settings need not touch settled Wi-Fi.
+        val retainedWifi = previous?.takeIf {
+            wifiPolicy != null && retryId != null && it.bootCount == boot && journal?.latest === it
+        }?.results?.optJSONObject("wifi")?.takeIf { it.optString("status") == "applied" }
+        val results = JSONObject().apply { retainedWifi?.let { put("wifi", it) } }
+        val scalarValues = JSONObject().apply {
+            for (key in policy.values.keys()) {
+                if (key != "wifi") put(key, policy.values.get(key))
+            }
         }
 
         // Claim the pair and any explicit Retry before writing any settings.
         val attempt = ConfigurationAttempt(
             version, boot, retryIds = previous?.retryIds.orEmpty() + listOfNotNull(retryId),
-            results = JSONObject().apply { retainedWifiFailure?.let { put("wifi", it) } },
-            failedWifiFingerprint = fingerprint.takeIf { retainedWifiFailure != null },
-            scalarTargets = scalarTargets,
-            wifiConnectionCheckRevision = previousWifi?.wifiConnectionCheckRevision.takeIf { retainedWifiFailure != null },
-            // A later Wi-Fi confirmation can complete the original boot reapply.
-            bootReapply = bootReapply || (retainedWifiFailure != null && previousWifi?.bootReapply == true),
+            results = JSONObject().apply { retainedWifi?.let { put("wifi", it) } },
+            bootReapply = bootReapply,
         )
         try {
             if (!persist(attempt)) {
@@ -537,7 +502,7 @@ internal class ConfigurationPackageController(
                 }
             }
 
-            if (wifiPolicy == null || retainedWifiFailure != null) {
+            if (wifiPolicy == null || retainedWifi != null) {
                 finish(attempt.copy(status = "complete", results = results))
                 return true
             }
@@ -550,15 +515,14 @@ internal class ConfigurationPackageController(
                 return true
             }
             wifiAttempt = checkpoint
-            val reuseMatchingWifi = baseline?.results?.optJSONObject("wifi")?.optString("status") == "applied"
-            wifi.applyManagedPolicy(version.revision, wifiPolicy, reuseMatchingWifi, isCurrent, onFinished = { result ->
+            wifi.applyManagedPolicy(version.revision, wifiPolicy, checkExistingWifi, isCurrent, onFinished = { result ->
                 worker.execute {
                     if (wifiAttempt !== checkpoint) return@execute
                     wifiAttempt = null
                     try {
                         // A released or replaced assignment cannot restore its old deduplication history.
                         if (isCurrent()) {
-                            finishWifi(checkpoint, result, fingerprint, confirmWifiAfterTimeout)
+                            finishWifi(checkpoint, result)
                         } else if (journal?.find(version) === checkpoint) {
                             // Fence the stale operation while allowing a later reassignment of
                             // this version to start a fresh attempt in the same boot.
@@ -586,7 +550,8 @@ internal class ConfigurationPackageController(
 
     private fun storageError(policy: Policy, previous: ConfigurationAttempt?): ConfigurationAttempt {
         val results = JSONObject()
-        val retainedWifi = previous?.takeIf { it.version == policy.version && it.bootCount == boot }?.wifiAwaitingReboot
+        val retainedWifi = previous?.takeIf { it.version == policy.version && it.bootCount == boot }
+            ?.results?.optJSONObject("wifi")?.takeIf { it.optString("status") == "applied" }
         for (key in policy.values.keys()) {
             val result = if (key == "wifi" && retainedWifi != null) retainedWifi
                 else settingOutcome("failed", reason = "STORAGE_ERROR")
@@ -595,15 +560,12 @@ internal class ConfigurationPackageController(
         return ConfigurationAttempt(
             checkNotNull(policy.version), boot, status = "interrupted", results = results,
             retryIds = previous?.retryIds.orEmpty(),
-            failedWifiFingerprint = previous?.failedWifiFingerprint.takeIf { retainedWifi != null },
         )
     }
 
     private fun finishWifi(
         attempt: ConfigurationAttempt,
         result: WifiManualResult,
-        fingerprint: String?,
-        confirmWifiAfterTimeout: Boolean,
     ) {
         val status = when {
             result.status == "success" -> "applied"
@@ -614,46 +576,7 @@ internal class ConfigurationPackageController(
         finish(attempt.copy(
             status = if (result.status == "unknown") "interrupted" else "complete",
             results = JSONObject(attempt.results.toString()).put("wifi", outcome),
-            failedWifiFingerprint = fingerprint.takeIf { result.status == "failed" },
-            wifiConnectionCheckRevision = result.revision.takeIf { confirmWifiAfterTimeout && result.canConfirmConnectionLater },
         ))
-    }
-
-    private fun reconcileWifiConnection() {
-        val selected = assignment?.takeIf { it.cached }
-        val attempt = journal?.latest?.takeIf {
-            !applyingWifi && it.version == selected?.policy?.version && it.bootCount == boot &&
-                it.status == "complete" && it.wifiConnectionCheckRevision != null &&
-                it.results.optJSONObject("wifi")?.optString("reason") == WifiReason.UNREACHABLE.wireValue
-        }
-        if (watchedWifiAttempt === attempt) return
-        watchedWifiAttempt = attempt
-        if (attempt == null || selected == null) {
-            wifi.watchSavedConnection(null)
-            return
-        }
-        val profile = runCatching {
-            WifiSettingsProtocol.parseManagedPolicy(
-                checkNotNull(attempt.wifiConnectionCheckRevision), selected.policy.values.getJSONObject("wifi"),
-            )
-        }.getOrNull()
-        wifi.watchSavedConnection(profile) { reason ->
-            worker.execute {
-                if (watchedWifiAttempt !== attempt || journal?.latest !== attempt || assignment?.token !== selected.token) {
-                    return@execute
-                }
-                val outcome = settingOutcome("applied", reason = reason.wireValue.takeUnless { reason == WifiReason.NONE })
-                val updated = attempt.copy(
-                    results = JSONObject(attempt.results.toString()).put("wifi", outcome),
-                    failedWifiFingerprint = null,
-                    wifiConnectionCheckRevision = null,
-                )
-                if (persist(updated)) {
-                    reconcileWifiConnection()
-                    publishScreenState()
-                }
-            }
-        }
     }
 
     private fun saveJournal(updated: ConfigurationJournal): Boolean {
@@ -711,26 +634,6 @@ internal class ConfigurationPackageController(
             }
         }
     }
-}
-
-private fun sameScalarTarget(key: String, previous: Any?, requested: Any): Boolean {
-    if (key == "shutdown" && previous is JSONObject && requested is JSONObject) {
-        return runCatching { PicoShutdownSchedule.requested(previous) == PicoShutdownSchedule.requested(requested) }
-            .getOrDefault(false)
-    }
-    return previous == requested
-}
-
-/** Identify a failed Wi-Fi target without saving another copy of its password. */
-private fun wifiFingerprint(revision: String, settings: JSONObject): String? {
-    val profile = runCatching { WifiSettingsProtocol.parseManagedPolicy(revision, settings) }.getOrNull() ?: return null
-    val values = JSONArray().put(profile.autoReturn)
-    for (network in profile.networks) {
-        values.put(JSONArray().put(network.ssid).put(network.security).put(network.password).put(network.hidden))
-    }
-    if (!profile.prioritizeNetworks) values.put(false)
-    val digest = MessageDigest.getInstance("SHA-256").digest(values.toString().toByteArray(Charsets.UTF_8))
-    return Base64.getEncoder().encodeToString(digest)
 }
 
 private fun productionDependencies(context: Context): ConfigurationPackageDependencies {

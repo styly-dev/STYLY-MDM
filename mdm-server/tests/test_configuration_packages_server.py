@@ -272,10 +272,13 @@ def test_shared_publish_and_offline_reconnect_use_latest_published_snapshot(tmp_
                 })
                 assert await _receive_type(studio, "CONFIGURATION_POLICY") == wanted
                 assert await _receive_type(gallery, "CONFIGURATION_POLICY") == wanted
-                assert secret not in json.dumps(latest)
+                assert latest["settings"]["wifi"]["value"]["networks"][0]["password"] == secret
 
         async with _running_server(tmp_path) as (session, base):
-            assert await _request(session, "GET", base, _path(latest)) == latest
+            async with session.get(base + _path(latest)) as response:
+                assert response.status == 200
+                assert response.headers["Cache-Control"] == "no-store"
+                assert await response.json() == latest
             async with session.ws_connect(base + "/ws/device") as ws:
                 await _register(ws, {**REGISTRATION, "device_id": OFFLINE_ID})
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == wanted
@@ -290,7 +293,7 @@ def test_shared_publish_and_offline_reconnect_use_latest_published_snapshot(tmp_
                     )},
                 })
                 assert cleared["settings"]["wifi"]["value"]["networks"][0]["password_present"] is True
-                assert secret not in json.dumps(cleared)
+                assert cleared["settings"]["wifi"]["value"]["networks"][0]["password"] == secret
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == _policy(cleared, {})
     asyncio.run(body())
 
@@ -1854,6 +1857,7 @@ def test_unified_wifi_policy_publishes_networks_and_auto_return_together(tmp_pat
                     "value": {
                         "networks": [
                             {"ssid": network["ssid"], "security": network["security"],
+                             "password": network["password"],
                              "password_present": network["security"] == "WPA2_WPA3",
                              "hidden": network["hidden"]}
                             for network in value["networks"]
@@ -1964,9 +1968,8 @@ def test_unmanaged_hidden_wifi_auto_return_can_be_saved_but_managed_value_is_rej
             assert saved["settings"]["wifi"]["value"]["auto_return"] is True
             assert saved["settings"]["wifi"]["value"]["networks"] == [{
                 "ssid": "Hidden Office", "security": "WPA2_WPA3",
-                "password_present": True, "hidden": True,
+                "password": "test-password", "password_present": True, "hidden": True,
             }]
-            assert "test-password" not in json.dumps(saved)
 
             current = await _request(session, "GET", base, _path(saved))
             managed = _wifi_setting(managed=True, auto_return=True, hidden=True, networks=[{
