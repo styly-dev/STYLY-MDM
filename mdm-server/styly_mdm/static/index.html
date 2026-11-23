@@ -166,7 +166,7 @@
     .group-dev + .group-dev { border-top: 1px solid var(--border-soft); }
     .group-dev-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .group-dev-status { color: var(--text-secondary); font-size: 12px; white-space: nowrap; width: 66px; }
-    .current-wifi { color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }
+    .current-wifi { white-space: pre-wrap; color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }
     .group-dev .current-wifi { max-width: 40%; }
     .group-dev-task { font-size: 12px; white-space: nowrap; text-align: right; min-width: 92px; }
     .radio { width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid #41475f; flex-shrink: 0; }
@@ -967,9 +967,6 @@
         getDevice: deviceById,
         getGroups: function () { return groups; },
         sortGroupMembers,
-        readPackageFromApk: function (file) {
-          return apkManifestInfo(file).then(function (info) { return info.package; });
-        },
         openPackages: function () { managePackages = true; render(); },
         onSnapshot: applyGroupListSnapshot,
         requestGroupSnapshot: function () { return wsSend({ type: 'GET_GROUP_LIST' }, 'refresh group details'); },

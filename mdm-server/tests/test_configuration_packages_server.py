@@ -5,6 +5,7 @@ import json
 import time
 import uuid
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from urllib.parse import urlencode
 
 import aiohttp
@@ -363,6 +364,76 @@ def test_mutations_enforce_origin_draft_cas_impact_and_validation(tmp_path):
             ):
                 async with session.request(method, base + path) as response:
                     assert response.status == status
+    asyncio.run(body())
+
+
+def test_same_origin_accepts_default_ports_and_ipv6_and_rejects_mismatches():
+    for origin, scheme, host in (
+        ("http://example.test:80", "http", "example.test"),
+        ("http://example.test:80", "http", "example.test:80"),
+        ("https://example.test:443", "https", "example.test"),
+        ("http://[::1]:80", "http", "[::1]"),
+        ("http://[::1]:80", "http", "[::1]:80"),
+    ):
+        server._require_same_origin(SimpleNamespace(
+            headers={"Origin": origin}, scheme=scheme, host=host,
+        ))
+
+    for origin in (
+        "http://example.test:81", "http://attacker.invalid", "http://user@example.test",
+        "http://example.test/path", "http://example.test?x=1", "null",
+    ):
+        request = SimpleNamespace(headers={"Origin": origin}, scheme="http", host="example.test")
+        with pytest.raises(server.PackageError) as exc_info:
+            server._require_same_origin(request)
+        assert exc_info.value.status == 403
+
+
+@pytest.mark.parametrize("path", ["/ws/admin", "/ws/device"])
+def test_websocket_routes_reject_cross_origin_before_upgrade_and_allow_native_clients(tmp_path, path):
+    async def body():
+        async with _running_server(tmp_path) as (session, base):
+            async with session.get(base + path, headers={"Origin": "http://attacker.invalid"}) as response:
+                assert response.status == 403
+                assert response.content_type == "application/json"
+                assert await response.json() == {"error": "Invalid request origin"}
+
+            # aiohttp's native client omits Origin; that compatibility path remains open.
+            async with session.ws_connect(base + path):
+                pass
+
+    asyncio.run(body())
+
+
+def test_removed_group_membership_commands_return_reload_error_without_mutating_membership(tmp_path):
+    async def body():
+        groups = {"Studio": [DEVICE_ID], "Gallery": [OTHER_ID]}
+        async with _running_server(tmp_path, groups) as (session, base):
+            before = dict(server._configuration.groups)
+            async with session.ws_connect(base + "/ws/admin") as admin:
+                await admin.send_json({"type": "SET_GROUP_MEMBERS", "name": "Studio", "members": [OTHER_ID]})
+                first = await _receive_type(admin, "ERROR")
+                assert "Reload the console" in first["message"]
+                await admin.send_json({"type": "SET_DEVICE_GROUPS", "device_id": DEVICE_ID, "groups": []})
+                second = await _receive_type(admin, "ERROR")
+                assert "Reload the console" in second["message"]
+            assert server._configuration.groups == before
+
+    asyncio.run(body())
+
+
+def test_configuration_policy_escapes_legacy_surrogate_group_name(tmp_path):
+    async def body():
+        group_name = "Legacy\ud800"
+        async with _running_server(tmp_path, {group_name: [DEVICE_ID]}) as (session, base):
+            async with session.ws_connect(base + "/ws/device") as device:
+                await _register(device, {**REGISTRATION, "capabilities": [
+                    configuration_packages.CAPABILITY,
+                    configuration_packages.SUMMARY_CAPABILITY,
+                ]})
+                policy = await _receive_type(device, "CONFIGURATION_POLICY")
+                assert policy["group_name"] == group_name
+
     asyncio.run(body())
 
 
@@ -818,6 +889,9 @@ def test_current_wifi_is_normalized_and_only_exposed_while_online():
     }
     assert server.public_current_wifi({"ssid": " Guest ", "bssid": "01:00:00:00:00:00"}) == {
         "ssid": " Guest ", "bssid": None,
+    }
+    assert server.public_current_wifi({"ssid": "   ", "bssid": "01:00:00:00:00:00"}) == {
+        "ssid": "   ", "bssid": None,
     }
     assert server.public_current_wifi({"ssid": "00:11:22:33:44:55", "bssid": "00:11:22:33:44:55"}) == {
         "ssid": "00:11:22:33:44:55", "bssid": "00:11:22:33:44:55",

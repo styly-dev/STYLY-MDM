@@ -106,7 +106,10 @@ the managed settings sent to devices from the saved values.
   opens the copy under its own name and edit revision. Follow the usual
   **Save & deploy** and group assignment steps to deploy it.
 - **Save & deploy** in the editor saves the edits and publishes a new revision
-  for every group using the package, in one commit.
+  for every group using the package, in one commit. If another console deploys
+  while the editor is open, use **Reload package** to review the latest saved
+  version. Reload keeps independent edits and identifies overlapping changes
+  that need review before saving.
 - **Deploy** in group **Settings** assigns a published package to the group with
   a new group deployment revision and assignment time. A new package must be deployed once from the
   editor first. Deploying the package already selected for the group publishes
@@ -131,6 +134,7 @@ the managed settings sent to devices from the saved values.
   each device. The server rejects the whole edit if an owner changed or an
   added device has no registry record. Existing members without a record can
   still be removed.
+  A console opened before the server upgrade must be reloaded before editing membership.
 - The editor keeps one draft entry per changed device. An addition records the
   owner seen when the user selected it. The Devices tab overlays these entries
   on the latest group list, and drops each entry once the list matches it.
@@ -252,16 +256,18 @@ uses local device time and a weekday mask, and an enabled schedule blocks the
 self-update power-cycle fallback. See the
 [PICO Enterprise SDK reference](https://business.picoxr.com/us/doc/EnterpriseAPI-Intro).
 
-**PICO home app** under **USB & advanced** configures the app opened at boot
-and by the Home button. Enter the Android package name or select its APK on the
-operator’s computer to read the package name locally. Install and enable the
-app on each target before deployment. The client calls TobService
+**PICO home app** under **Basic settings** configures the app opened at boot
+and by the Home button. Enter its Android package name (for example,
+`com.example.viewer`). Install and enable the app on each target before deployment. The client calls TobService
 `setLauncher(packageName)`. A successful result confirms the API accepted the
 setting. Verify the Home action after the next headset restart. Deploy a managed
 empty package name to restore the PICO default with `setLauncher(null)`.
 Clearing **Manage** releases management and preserves the current Home setting.
-The per-device **Startup App** command launches an app from the MDM service and
-has its own settings. Older package clients report this setting as unsupported.
+The per-device **Startup App** command can bring another app to the foreground
+three seconds after the MDM service starts. Clear that per-device setting if the
+PICO home app should stay in the foreground after boot. The Home button still
+opens the configured PICO home app. Older package clients report the home app
+setting as unsupported.
 Before downgrading a server with saved `startupApp` entries, restore a registry
 backup compatible with that server.
 
@@ -340,8 +346,9 @@ the session stopped so the next readiness or connectivity check can retry it.
 **Android selection** saves the profiles and flags, reports `SAVED`, and does
 not select networks or monitor scans.
 
-A release stops Wi-Fi management and monitoring and leaves profiles and
-auto-join flags unchanged. The Wi-Fi policy state is stored in
+A release stops active selection and monitoring even if the Wi-Fi state file
+cannot be read or written. It leaves the saved networks and auto-join flags
+unchanged. The Wi-Fi policy state is stored in
 `wifi-policy.json`.
 
 #### Headset Settings screen
@@ -356,6 +363,9 @@ Reconnecting from Settings keeps that screen open. An assigned Startup App
 launches when the service starts for a boot or system reason.
 
 #### Package API and device reports
+
+The server checks browser origins on the admin and device WebSocket handshakes
+and on package changes. Native clients can connect without an Origin header.
 
 | Surface | Contract |
 |---|---|

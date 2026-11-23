@@ -9,6 +9,9 @@ import org.junit.Test
 class ConnectionRegistrationTest {
     @Test fun `current Wi-Fi snapshot omits unknown SSID and redacted BSSID`() {
         assertEquals(null, currentWifiSnapshot("<unknown ssid>", "02:00:00:00:00:00"))
+        val spaces = currentWifiSnapshot("\"   \"", "aa:bb:cc:dd:ee:ff")!!
+        assertEquals("   ", spaces.getString("ssid"))
+        assertEquals("aa:bb:cc:dd:ee:ff", spaces.getString("bssid"))
         val snapshot = currentWifiSnapshot("\"Office\"", "02:00:00:00:00:00")!!
         assertEquals("Office", snapshot.getString("ssid"))
         assertTrue(snapshot.isNull("bssid"))

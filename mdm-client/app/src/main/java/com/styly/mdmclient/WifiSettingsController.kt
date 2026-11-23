@@ -106,6 +106,7 @@ internal class WifiSettingsController internal constructor(
     private var state = runCatching { dependencies.store.read() }.getOrNull()
     private var unavailableReason: String? = "INITIALIZING"
     private var monitor = WifiPriorityMonitorStatus.OFF
+    private var managementReleased = false
     private var active: Attempt? = null
     private var pendingApply: PolicyRequest? = null
     private var priority: PriorityRuntime? = null
@@ -191,24 +192,27 @@ internal class WifiSettingsController internal constructor(
     /** Release management without changing the saved Android networks. */
     fun stopManagingPolicy(onRecorded: (Boolean) -> Unit) {
         worker.execute {
-            val current = reloadState()
-            if (current == null) {
-                onRecorded(false)
-                return@execute
-            }
-            val released = current.copy(managedWifi = false)
-            if (released != current && !save(released)) {
-                onRecorded(false)
-                return@execute
-            }
+            // The package assignment is authoritative even if the Wi-Fi state file is unavailable.
+            managementReleased = true
             resetPriority()
+            closeConnection()
+            setMonitor(WifiPriorityMonitorStatus.OFF)
             val queued = pendingApply
             pendingApply = null
             queued?.let { reportRequest(it, WifiReason.UNKNOWN, publish = false) }
-            onRecorded(true)
-            val attempt = active
-            if (attempt != null) endAttempt(attempt, failure(attempt.profile.revision, WifiReason.UNKNOWN))
-            else runIdleWork()
+
+            val current = reloadState()
+            val recorded = if (current == null) false else {
+                val released = current.copy(managedWifi = false)
+                released == current || save(released)
+            }
+            try {
+                onRecorded(recorded)
+            } finally {
+                val attempt = active
+                if (attempt != null) endAttempt(attempt, failure(attempt.profile.revision, WifiReason.UNKNOWN))
+                else runIdleWork()
+            }
         }
     }
 
@@ -284,6 +288,7 @@ internal class WifiSettingsController internal constructor(
                 reportRequest(request, WifiReason.UNKNOWN, publish = false)
                 return
             }
+            managementReleased = false
             val applied = current.lastApplied
             if (request.reuseMatchingProfile && current.managedWifi &&
                 applied != null && applied.hasSameSettings(requested)
@@ -1045,7 +1050,7 @@ internal class WifiSettingsController internal constructor(
         state?.takeIf { dependencies.platformSupported && it.managedWifi }?.lastApplied
 
     private fun activePriorityProfile(): WifiSavedProfile? {
-        if (active != null) return null
+        if (active != null || managementReleased) return null
         return managedProfile()?.takeIf { profile ->
             profile.prioritizeNetworks && profile.networks.isNotEmpty() &&
                 (profile.networks.size > 1 || profile.networks[0].identity != profile.primaryIdentity)

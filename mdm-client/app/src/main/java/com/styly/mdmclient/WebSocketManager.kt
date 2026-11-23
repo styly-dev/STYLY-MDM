@@ -844,7 +844,7 @@ class WebSocketManager internal constructor(
 internal fun currentWifiSnapshot(ssidValue: String?, bssidValue: String?): JSONObject? {
     if (ssidValue == null || ssidValue.equals("<unknown ssid>", ignoreCase = true)) return null
     val ssid = ssidValue.removeSurrounding("\"")
-    if (ssid.isBlank() || ssid.toByteArray().size > 32) return null
+    if (ssid.isEmpty() || ssid.toByteArray().size > 32) return null
     val bssid = bssidValue?.trim()?.takeUnless {
         it.isEmpty() || it.equals("02:00:00:00:00:00", ignoreCase = true)
     }

@@ -26,7 +26,8 @@
     const wifi = device?.current_wifi;
     if (device?.status !== 'online' || !wifi?.ssid) return '';
     const title = wifi.bssid ? ' title="BSSID: ' + esc(wifi.bssid) + '"' : '';
-    return '<span class="current-wifi"' + title + '>Wi-Fi: ' + esc(wifi.ssid) + '</span>';
+    const label = wifi.ssid.trim() ? wifi.ssid : JSON.stringify(wifi.ssid);
+    return '<span class="current-wifi"' + title + '>Wi-Fi: ' + esc(label) + '</span>';
   }
 
   function loadDraft(sections, settings) {
@@ -387,9 +388,7 @@
       case 'wifi':
         return renderWifi(item, value, saved, secretType, managed);
       case 'package':
-        return `<label>Android package name<input class="field" type="text" maxlength="255" autocomplete="off" ${field} value="${esc(value)}"></label>
-          <label class="settings-package-picker">Choose app APK<input type="file" accept=".apk,application/vnd.android.package-archive" data-package-apk></label>
-          <small>Select an APK on this computer to fill the package name, or enter a preinstalled app's package name. The file stays on this computer.</small>`;
+        return `<label>Android package name<input class="field" type="text" maxlength="255" autocomplete="off" ${field} value="${esc(value)}"></label>`;
       default:
         return '';
     }
@@ -493,7 +492,6 @@
     sortGroupMembers = members => members,
     deviceIdHtml = (_, id) => esc(id), fetch = root.fetch.bind(root),
     confirmAction = message => root.confirm(message),
-    readPackageFromApk = async () => { throw new Error('APK package-name reading is unavailable.'); },
     promptForValue = (message, value) => root.prompt(message, value),
     onSnapshot = () => {},
     requestGroupSnapshot = () => false,
@@ -643,10 +641,17 @@
       const target = packagePanel.querySelector('[data-package-publication]');
       if (!current || !target) return;
       const pkg = packageById(current.id);
-      const revision = pkg ? pkg.published_revision : current.publishedRevision;
-      const deployment = revision ? 'Deployed version ' + revision : 'Not deployed yet';
+      const state = currentCatalogState(current);
+      const revision = current.publishedRevision;
+      const deployment = revision ? 'Loaded version ' + revision : 'Not deployed yet';
       const refs = Object.values(snapshot?.assignments || {}).filter(id => id === current.id).length;
-      target.textContent = deployment +
+      const status = current.busy && state.removed
+        ? ' · Checking package status…'
+        : current.busy && state.stale
+          ? ' · Checking latest deployed version ' + pkg.published_revision + '…'
+        : state.removed ? ' · This package was removed elsewhere. Reload or select another package.'
+          : state.stale ? ' · Latest deployed version ' + pkg.published_revision + ' is available. Reload package before deploying.' : '';
+      target.textContent = deployment + status +
         (snapshot ? ' · Used by ' + refs + ' ' + (refs === 1 ? 'group' : 'groups') : '');
     }
 
@@ -667,6 +672,8 @@
       } finally {
         catalogLoading = false;
         renderCatalog();
+        renderPublication();
+        if (current) updateActions();
         refreshGroup();
       }
     }
@@ -679,7 +686,18 @@
         catalog.sort((a, b) => a.name.localeCompare(b.name));
       }
       renderCatalog();
+      renderPublication();
+      if (current) updateActions();
       refreshGroup();
+    }
+
+    function currentCatalogState(model) {
+      if (!model?.saved || configurationAvailable === false || !catalog) return { stale: false, removed: false };
+      const pkg = packageById(model.id);
+      return {
+        stale: Boolean(pkg && (pkg.published_revision ?? null) !== (model.publishedRevision ?? null)),
+        removed: !pkg,
+      };
     }
 
     function hasChanges(model) {
@@ -704,14 +722,17 @@
       const model = current;
       const footer = packagePanel.querySelector('.settings-actions');
       if (!model || !footer) return;
+      const catalogState = currentCatalogState(model);
       const changed = hasChanges(model);
-      const locked = model.busy || model.conflict || configurationAvailable === false;
+      const locked = model.busy || model.conflict || catalogState.stale || catalogState.removed || configurationAvailable === false;
       packagePanel.querySelector('.settings-editor').disabled = locked;
       packagePanel.querySelector('[data-package-name]').disabled = locked;
       footer.querySelector('[data-policy-action="discard"]').disabled = locked || !changed;
       let deployReason = '';
       if (model.busy) deployReason = 'Wait for the current package operation to finish.';
       else if (model.conflict) deployReason = 'Select Reload package and review the latest version before deploying.';
+      else if (catalogState.removed) deployReason = 'Select another package.';
+      else if (catalogState.stale) deployReason = 'Reload package before deploying.';
       else if (configurationAvailable === false) deployReason = 'Configuration packages are unavailable. Wait for the server to recover.';
       else if (!model.name.trim()) deployReason = 'Enter a package name before deploying.';
       updateDeployAction(footer.querySelector('[data-policy-action="deploy"]'), packagePanel.querySelector('[data-deploy-hint]'), deployReason);
@@ -719,10 +740,11 @@
       packagePanel.querySelector('[data-policy-action="duplicate"]').disabled = locked;
       footer.querySelector('.settings-meta').textContent = changed ? 'Unsaved changes' : '';
       const feedback = packagePanel.querySelector('[data-settings-feedback]');
-      feedback.textContent = model.message || (configurationAvailable === false
+      feedback.textContent = model.message || model.mergeNotice || (configurationAvailable === false
         ? 'Configuration packages are unavailable. Wait for the server to recover.' : '');
       feedback.classList.toggle('settings-error', model.error);
-      packagePanel.querySelector('[data-policy-action="reload"]').hidden = !model.conflict;
+      packagePanel.querySelector('[data-policy-action="reload"]').hidden =
+        !model.conflict && !catalogState.stale && !catalogState.removed;
     }
 
     function renderEditor() {
@@ -777,27 +799,95 @@
       renderResults();
     }
 
+    function sameValue(left, right) {
+      return JSON.stringify(left) === JSON.stringify(right);
+    }
+
+    function rebaseValue(previous, edited, latest) {
+      if (sameValue(previous, edited) || sameValue(edited, latest)) return { value: structuredClone(latest), conflict: false };
+      if (sameValue(previous, latest)) return { value: structuredClone(edited), conflict: false };
+      return { value: structuredClone(latest), conflict: true };
+    }
+
+    function networksWithPasswords(networks, savedNetworks) {
+      return networks.map(network => {
+        return { ssid: network.ssid, security: network.security, hidden: network.hidden,
+          password: wifiPasswordValue(network, savedNetworks) };
+      });
+    }
+
+    function mergeWifiValue(previous, edited, latest, previousSavedNetworks, latestSavedNetworks) {
+      const value = structuredClone(latest);
+      let conflict = false;
+      for (const key of ['auto_return', 'prioritize_networks']) {
+        const result = rebaseValue(previous[key], edited[key], latest[key]);
+        value[key] = result.value;
+        conflict ||= result.conflict;
+      }
+      const previousNetworks = networksWithPasswords(previous.networks || [], previousSavedNetworks);
+      const editedNetworks = networksWithPasswords(edited.networks || [], previousSavedNetworks);
+      const latestNetworks = networksWithPasswords(latest.networks || [], latestSavedNetworks);
+      const networkResult = rebaseValue(previousNetworks, editedNetworks, latestNetworks);
+      value.networks = networkResult.conflict || sameValue(previousNetworks, editedNetworks) || sameValue(editedNetworks, latestNetworks)
+        ? structuredClone(latest.networks) : structuredClone(edited.networks);
+      conflict ||= networkResult.conflict;
+      if (!value.prioritize_networks && value.auto_return) {
+        value.auto_return = latest.auto_return;
+        value.prioritize_networks = latest.prioritize_networks;
+        conflict = true;
+      }
+      return { value, conflict };
+    }
+
     function readProfile(model, data, preserveEdits = false, expectedInstanceId = snapshot?.server_instance_id ?? null) {
       const saved = loadDraft(data.sections, data.settings);
       const draft = structuredClone(saved);
       let name = data.name;
+      const conflicts = new Set();
+      const savedWifiNetworks = data.settings?.wifi?.value.networks ?? [];
       if (preserveEdits && model.saved) {
-        if (model.name !== model.savedName) name = model.name;
+        const nameResult = rebaseValue(model.savedName, model.name, data.name);
+        name = nameResult.value;
+        if (nameResult.conflict) conflicts.add('name');
         for (const key of Object.keys(draft)) {
           const previous = model.saved[key];
           const edited = model.draft[key];
           if (!previous || !edited) continue;
-          if (edited.managed !== previous.managed) draft[key].managed = edited.managed;
-          if (JSON.stringify(edited.value) !== JSON.stringify(previous.value)) draft[key].value = edited.value;
+          const managedResult = rebaseValue(previous.managed, edited.managed, saved[key].managed);
+          draft[key].managed = managedResult.value;
+          let conflict = managedResult.conflict;
+          if (key === 'wifi') {
+            const result = mergeWifiValue(previous.value, edited.value, saved[key].value,
+              model.savedWifiNetworks || [], savedWifiNetworks);
+            draft[key].value = result.value;
+            conflict ||= result.conflict;
+          } else if (key === 'shutdown' && previous.value && edited.value && saved[key].value) {
+            draft[key].value = structuredClone(saved[key].value);
+            for (const field of ['enabled', 'hour', 'minute', 'repeat']) {
+              const result = rebaseValue(previous.value[field], edited.value[field], saved[key].value[field]);
+              draft[key].value[field] = result.value;
+              conflict ||= result.conflict;
+            }
+          } else {
+            const result = rebaseValue(previous.value, edited.value, saved[key].value);
+            draft[key].value = result.value;
+            conflict ||= result.conflict;
+          }
+          if (conflict) conflicts.add(key);
         }
       }
       if (draft.wifi?.managed === false && saved.wifi) {
         draft.wifi.value = structuredClone(saved.wifi.value);
       }
+      const labels = Object.fromEntries(data.sections.flatMap(section => section.items.map(item => [item.id, item.label])));
+      const conflictLabels = [...conflicts].map(key => key === 'name' ? 'package name' : labels[key] || key);
       Object.assign(model, { sections: data.sections, editRevision: data.edit_revision,
-        publishedRevision: data.published_revision,
-        savedWifiNetworks: data.settings?.wifi?.value.networks ?? [],
-        savedName: data.name, saved, name, draft });
+        publishedRevision: data.published_revision, savedWifiNetworks,
+        savedName: data.name, saved, name, draft,
+        mergeNotice: conflictLabels.length
+          ? 'Some local edits overlapped newer server changes and were replaced with the latest values for ' +
+            conflictLabels.join(', ') + '. Review before deploying.'
+          : '' });
       readSections(data.sections, expectedInstanceId);
     }
 
@@ -858,7 +948,8 @@
           data = await api(path);
         } else if (action === 'deploy') {
           const fresh = await api(path);
-          if (fresh.edit_revision !== model.editRevision) {
+          if (fresh.edit_revision !== model.editRevision ||
+              (fresh.published_revision ?? null) !== (model.publishedRevision ?? null)) {
             throw Object.assign(new Error('The package changed. Reload and review the latest version before deploying.'), { status: 409 });
           }
           if (!confirmDeployment(fresh, { editorName: model.name.trim() })) return;
@@ -887,13 +978,19 @@
         readProfile(model, data, action === 'reload', beforeInstanceId);
         updateSummary(before, data, model.id);
         model.conflict = false;
-        model.message = { deploy: 'Package saved. Deployment started.',
-          reload: hasChanges(model) ? 'Latest version loaded. Review your unsaved edits before deploying.' : '' }[action];
+        model.error = false;
+        model.message = action === 'deploy' ? 'Package saved. Deployment started.'
+          : action === 'reload' && hasChanges(model) && !model.mergeNotice
+            ? 'Latest version loaded. Review your unsaved edits before deploying.' : '';
       } catch (error) {
         model.error = true;
         if (writing && (!error.status || error.status >= 500)) {
           model.conflict = true;
           model.message = 'Could not confirm the request. Reload to check the latest package.';
+        } else if (action === 'reload' && error.status === 404) {
+          catalog = (catalog || []).filter(pkg => pkg.package_id !== model.id);
+          renderCatalog();
+          model.message = 'This package was removed elsewhere. Select another package.';
         } else if (error.status === 409 && error.code !== 'package_assigned') {
           model.conflict = true;
           model.message = action === 'deploy' && writing ?
@@ -914,7 +1011,8 @@
     }
 
     async function duplicatePackage(model) {
-      if (model.busy || model.conflict || configurationAvailable === false) return;
+      const catalogState = currentCatalogState(model);
+      if (model.busy || model.conflict || catalogState.stale || catalogState.removed || configurationAvailable === false) return;
       if (hasChanges(model) && !confirmAction('Discard the unsaved changes in "' + model.savedName + '" before duplicating?')) return;
       const name = promptForValue('Name for the copied package:', Array.from(model.savedName).slice(0, 57).join('') + ' (copy)');
       if (name === null || !name.trim()) return;
@@ -1298,11 +1396,13 @@
       const action = button.dataset.policyAction;
       if (action === 'reload') return request(model, 'reload');
       if (configurationAvailable === false) return;
-      if (!model.saved || model.conflict) return;
+      const catalogState = currentCatalogState(model);
+      if (!model.saved || model.conflict || catalogState.stale || catalogState.removed) return;
       if (action === 'discard') {
         model.name = model.savedName;
         model.draft = structuredClone(model.saved);
         model.message = 'Changes discarded.';
+        model.mergeNotice = '';
         model.error = false;
         renderEditor();
       } else if (action === 'deploy') {
@@ -1394,32 +1494,6 @@
     catalogNotice.addEventListener('click', handleCatalogClick);
     createForm.addEventListener('submit', createPackage);
     packagePanel.addEventListener('input', handleInput);
-    packagePanel.addEventListener('change', async event => {
-      const input = event.target.closest('[data-package-apk]');
-      const model = current;
-      const file = input?.files?.[0];
-      if (!input || !file || !model || model.busy || model.conflict || !model.draft.startupApp?.managed) return;
-      model.busy = true;
-      model.message = 'Reading Android package name…';
-      model.error = false;
-      updateActions();
-      try {
-        const packageName = await readPackageFromApk(file);
-        if (current === model) {
-          if (!validAndroidPackageName(packageName)) throw new Error('The APK does not contain a valid Android package name.');
-          model.draft.startupApp.value = packageName;
-          model.message = 'Package name filled from the selected APK.';
-        }
-      } catch (error) {
-        if (current === model) {
-          model.message = error.message || 'Could not read the APK package name.';
-          model.error = true;
-        }
-      } finally {
-        model.busy = false;
-        if (current === model) renderEditor();
-      }
-    });
     packagePanel.addEventListener('click', handleEditorClick);
     packagePanel.addEventListener('toggle', event => {
       const section = event.target.dataset.settingsSection;

@@ -140,16 +140,31 @@ class WifiSettingsControllerTest {
 
     @Test
     fun `Wi-Fi release retries a state read that initially failed`() {
-        val profile = WifiSavedProfile(REVISION, listOf(network("office-a")))
+        val primary = network("office-a")
+        val fallback = network("office-b")
+        val profile = WifiSavedProfile(REVISION, listOf(primary, fallback), autoReturn = true)
         val harness = Harness(
             initialState = WifiLocalState(managedWifi = true, lastApplied = profile),
-            failStoreRead = true,
+            initialNetworks = listOf(primary, fallback),
+            initialWifi = listOf(observation(10, fallback.ssid)),
         )
+        assertEquals(1, harness.priorityScanSource.startCalls)
+        assertEquals(1, harness.connectivity.openSessionCount)
+
+        harness.store.failRead = true
         var firstRelease: Boolean? = null
         harness.controller.stopManagingPolicy { firstRelease = it }
         harness.worker.runAll()
 
         assertEquals(false, firstRelease)
+        assertEquals(1, harness.priorityScanSource.stopCalls)
+        assertEquals(0, harness.connectivity.openSessionCount)
+        assertEquals("off", harness.controller.stateSnapshot().getString("priority_monitor"))
+
+        harness.controller.refreshReadiness()
+        harness.worker.runAll()
+        assertEquals(1, harness.priorityScanSource.startCalls)
+        assertEquals(0, harness.connectivity.openSessionCount)
 
         harness.store.failRead = false
         var retryRelease: Boolean? = null
@@ -158,6 +173,52 @@ class WifiSettingsControllerTest {
 
         assertEquals(true, retryRelease)
         assertFalse(harness.store.state.managedWifi)
+        harness.adapter.onDisconnect = { harness.connectivity.loseAll() }
+        harness.adapter.afterSelect = { selected ->
+            if (selected == primary) harness.connectivity.update(11, primary.ssid)
+        }
+        harness.apply(listOf(primary, fallback), autoReturn = true, reuseMatchingProfile = true)
+        assertTrue(harness.store.state.managedWifi)
+        assertEquals(primary.ssid, harness.connectivity.currentUsableSsid())
+        harness.connectivity.update(11, fallback.ssid)
+        harness.worker.runAll()
+        assertEquals(2, harness.priorityScanSource.startCalls)
+        assertEquals(1, harness.connectivity.openSessionCount)
+    }
+
+    @Test
+    fun `Wi-Fi release stops an active selection when saving release fails`() {
+        val primary = network("office-a")
+        val fallback = network("office-b")
+        val profile = WifiSavedProfile(REVISION, listOf(primary, fallback), autoReturn = true)
+        val harness = Harness(
+            initialState = WifiLocalState(managedWifi = true, lastApplied = profile),
+            initialWifi = listOf(observation(10, fallback.ssid)),
+            initialNetworks = listOf(primary, fallback),
+        )
+        harness.priorityScanSource.emit(WifiPriorityScanEvent(
+            WifiPriorityMonitorStatus.MONITORING,
+            setOf(primary.identity),
+        ))
+        harness.worker.runNext()
+        harness.store.writeFailuresRemaining = 1
+
+        var releaseRecorded: Boolean? = null
+        harness.controller.stopManagingPolicy { releaseRecorded = it }
+        harness.worker.runAll()
+
+        assertEquals(false, releaseRecorded)
+        assertEquals(1, harness.adapter.disconnectCalls)
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+        assertEquals(0, harness.connectivity.openSessionCount)
+        assertEquals("off", harness.controller.stateSnapshot().getString("priority_monitor"))
+
+        harness.expireNext(12_000L)
+        harness.controller.refreshReadiness()
+        harness.worker.runAll()
+        assertTrue(harness.adapter.selectCalls.isEmpty())
+        assertEquals(1, harness.priorityScanSource.startCalls)
+        assertEquals(0, harness.connectivity.openSessionCount)
     }
 
     @Test

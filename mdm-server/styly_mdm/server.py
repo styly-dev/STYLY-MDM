@@ -24,6 +24,7 @@ from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from aiohttp import WSCloseCode, web
+from yarl import URL
 
 # Bundling and integrity references must agree on what counts as content, or a reference
 # built from a folder could never match the device that folder was pushed to.
@@ -379,7 +380,7 @@ def public_current_wifi(value) -> dict | None:
     ssid = value.get("ssid")
     if not isinstance(ssid, str):
         return None
-    if not ssid.strip():
+    if not ssid:
         return None
     try:
         if len(ssid.encode("utf-8")) > 32:
@@ -1611,13 +1612,22 @@ class _ConfigurationDelivery:
 _configuration_deliveries: dict[web.WebSocketResponse, _ConfigurationDelivery] = {}
 
 
-def _require_package_origin(request: web.Request) -> None:
+def _require_same_origin(request: web.Request) -> None:
     origin = request.headers.get("Origin")
     if origin is None:
         # Browsers send Origin for mutations. Native clients may omit it.
         return
-    expected = f"{'https' if request.secure else 'http'}://{request.host}"
-    if origin != expected:
+
+    try:
+        request_origin = URL(f"{request.scheme}://{request.host}").origin()
+        expected_origins = {str(request_origin)}
+        default_port = {"http": 80, "https": 443}.get(request_origin.scheme)
+        if default_port is not None and request_origin.port == default_port:
+            expected_origins.add(f"{request_origin}:{default_port}")
+        same_origin = origin in expected_origins
+    except (TypeError, ValueError):
+        same_origin = False
+    if not same_origin:
         raise PackageError("Invalid request origin", 403)
 
 
@@ -1727,7 +1737,7 @@ async def package_catalog_handler(request: web.Request) -> web.Response:
 
 async def package_create_handler(request: web.Request) -> web.Response:
     try:
-        _require_package_origin(request)
+        _require_same_origin(request)
         body = await _small_json_body(request)
         profile = {
             "name": configuration_packages.validate_name(body.get("name")),
@@ -1757,7 +1767,7 @@ async def package_handler(request: web.Request) -> web.Response:
             return web.json_response(_editor_package(package_id, _find_package(package_id)),
                                      headers={"Cache-Control": "no-store"})
 
-        _require_package_origin(request)
+        _require_same_origin(request)
         body = await _small_json_body(request)
         profile = _find_package(package_id)
         configuration_packages.check_expected_revision(body, profile["edit_revision"])
@@ -1775,7 +1785,7 @@ async def package_handler(request: web.Request) -> web.Response:
 
 async def package_save_and_deploy_handler(request: web.Request) -> web.Response:
     try:
-        _require_package_origin(request)
+        _require_same_origin(request)
         body = await _small_json_body(request)
         package_id = request.match_info["package_id"]
         profile = _find_package(package_id)
@@ -1795,7 +1805,7 @@ async def group_package_deploy_handler(request: web.Request) -> web.Response:
     try:
         body = None
         if request.method == "POST":
-            _require_package_origin(request)
+            _require_same_origin(request)
             body = await _small_json_body(request)
         name = _group_assignment_name(request)
         group = _configuration.groups.get(name)
@@ -1853,7 +1863,7 @@ async def group_package_deploy_handler(request: web.Request) -> web.Response:
 
 async def package_retry_handler(request: web.Request) -> web.Response:
     try:
-        _require_package_origin(request)
+        _require_same_origin(request)
         body = await _small_json_body(request)
         device_id = body.get("device_id")
         package_id = body.get("package_id")
@@ -1972,7 +1982,7 @@ async def _send_configuration(
         if delivery is not None:
             # All requests received before the write are covered by this policy.
             delivery.pending = False
-        return json.dumps({"type": "CONFIGURATION_POLICY", **policy}, ensure_ascii=False)
+        return json.dumps({"type": "CONFIGURATION_POLICY", **policy})
 
     try:
         send = ws.send_current_text(resolve)
@@ -2171,7 +2181,12 @@ async def _complete_device_registration(
         devices[device_id]["registration_ready"] = True
 
 
-async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
+async def device_ws_handler(request: web.Request) -> web.StreamResponse:
+    try:
+        _require_same_origin(request)
+    except PackageError as exc:
+        return web.json_response({"error": str(exc)}, status=exc.status)
+
     ws = _websocket_response_factory(heartbeat=30)
     await ws.prepare(request)
     log.info("Device WebSocket connected from %s", request.remote)
@@ -2700,7 +2715,12 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
 # Admin WebSocket handler  (/ws/admin)
 # ---------------------------------------------------------------------------
 
-async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
+async def admin_ws_handler(request: web.Request) -> web.StreamResponse:
+    try:
+        _require_same_origin(request)
+    except PackageError as exc:
+        return web.json_response({"error": str(exc)}, status=exc.status)
+
     # On aiohttp 3.14.3, the server-side reader rejected Chrome's first PUSH_FILES
     # text frame after a long upload with "Received frame with non-zero reserved
     # bits". The failure was observed only on the inbound Chrome admin frame.
@@ -2801,6 +2821,12 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 elif msg_type == "UPDATE_GROUP_MEMBERS":
                     await handle_update_group_members(ws, data)
+
+                elif msg_type in {"SET_GROUP_MEMBERS", "SET_DEVICE_GROUPS"}:
+                    await _send_admin_frames(ws, [json.dumps({
+                        "type": "ERROR",
+                        "message": "This membership command is no longer supported. Reload the console and try again.",
+                    })])
 
                 else:
                     log.warning("Unknown message type from admin: %s", msg_type)

@@ -45,7 +45,7 @@ def _delays(*seconds):
 
 
 SECTIONS = [
-    {"id": "basic", "title": "Basic settings", "description": "Display, sleep and power", "items": [
+    {"id": "basic", "title": "Basic settings", "description": "Display, sleep, power and home app", "items": [
         _item("brightness", "Screen brightness", "Screen brightness level.", "range", 70, min=1, max=100),
         _item("autoSleep", "Auto sleep", "Enable automatic sleep.", "bool", False),
         _item("sleepDelay", "Sleep delay", "Time before the headset sleeps.", "delay", -1,
@@ -54,6 +54,9 @@ SECTIONS = [
               options=_delays(-1, 30, 60, 300, 600)),
         _item("shutdown", "Scheduled shutdown", "Set the local time and days for shutdown.",
               "schedule", {"enabled": False, "hour": 0, "minute": 0, "repeat": 127}),
+        _item("startupApp", "PICO home app",
+              "Open this app at startup and when you press Home. An empty package name restores the PICO default.",
+              "package", ""),
     ]},
     {"id": "network", "title": "Network & connectivity", "description": "Wi-Fi and Bluetooth", "items": [
         _item("wifi", "Wi-Fi networks", "Manage saved Wi-Fi and how the headset connects.",
@@ -74,7 +77,6 @@ SECTIONS = [
         _item("seeThrough", "Quick see-through mode", "Enable quick see-through mode.", "bool", False),
     ]},
     {"id": "advanced", "title": "USB & advanced", "description": "USB, file copying and developer options", "items": [
-        _item("startupApp", "PICO home app", "Set the app that opens after reboot when you press Home. An empty package name restores the PICO default.", "package", ""),
         _item("usbBoot", "Power on when USB is connected",
               "Automatically start a powered-off headset when USB power is connected.", "bool", False),
         _item("usb", "USB debugging", "Enable USB debugging.", "bool", False),

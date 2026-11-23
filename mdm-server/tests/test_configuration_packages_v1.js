@@ -18,12 +18,12 @@ const sections = [
       { value: -1, label: 'Never' }, { value: 5, label: '5 minutes' }, { value: 20, label: '20 minutes' },
     ] },
     { id: 'shutdown', label: 'Scheduled shutdown', kind: 'schedule', default: { enabled: false, hour: 0, minute: 0, repeat: 127 } },
+    { id: 'startupApp', label: 'PICO home app', kind: 'package', default: '' },
   ] },
   { id: 'network', title: 'Network & connectivity', items: [
     { id: 'wifi', label: 'Wi-Fi networks', kind: 'wifi', default: { networks: [], auto_return: false, prioritize_networks: true } },
   ] },
   { id: 'advanced', title: 'USB & advanced', items: [
-    { id: 'startupApp', label: 'PICO home app', kind: 'package', default: '' },
     { id: 'developerMenu', label: 'Developer options menu', kind: 'bool', default: false },
   ] },
 ];
@@ -90,39 +90,21 @@ test('managed writes reject values outside the catalog', () => {
     { managed: false, value: 'com.legacy.home' }, 'saved unmanaged package IDs remain available');
 });
 
-test('managing PICO home app reads a local APK, blocks deploy while reading, then saves acceptance target', async () => {
-  let resolvePackage;
+test('PICO home app saves the Android package name entered in Basic settings', async () => {
   const latest = profile({ settings: {} });
   const fixture = createHarness(({ method, url, body }) => {
     if (method === 'GET') return response(latest);
     assert.equal(url, '/api/packages/pkg/save-and-deploy');
     assert.deepEqual(body.settings.startupApp, { managed: true, value: 'com.example.viewer' });
     return response({ ...latest, settings: body.settings, edit_revision: 'edit2', published_revision: 'r1' });
-  }, { readPackageFromApk: () => new Promise(resolve => { resolvePackage = resolve; }) });
-  await fixture.controller.showPackages('pkg');
-  fixture.edit({ dataset: { manage: 'startupApp' }, checked: true, type: 'checkbox' });
-  assert.match(fixture.packagePanel.innerHTML, /Choose app APK/);
-  assert.doesNotMatch(fixture.packagePanel.innerHTML, /data-package-apk[^>]*disabled/);
-  const reading = fixture.selectPackageApk('viewer.apk');
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(fixture.editorButtons.deploy.disabled, true, 'deploy stays disabled while the APK is inspected');
-  resolvePackage('com.example.viewer');
-  await reading;
-  assert.match(fixture.packagePanel.innerHTML, /value="com.example.viewer"/);
-  await fixture.editClick('deploy');
-  assert.equal(fixture.requests.at(-1).url, '/api/packages/pkg/save-and-deploy');
-});
-
-test('PICO home app rejects an invalid package name read from an APK', async () => {
-  const fixture = createHarness(() => response(profile({ settings: {} })), {
-    readPackageFromApk: async () => 'bad package',
   });
   await fixture.controller.showPackages('pkg');
+  assert.match(fixture.packagePanel.innerHTML, /Android package name<input[^>]*type="text"[^>]*data-setting="startupApp"/);
+  assert.doesNotMatch(fixture.packagePanel.innerHTML, /type="file"/);
   fixture.edit({ dataset: { manage: 'startupApp' }, checked: true, type: 'checkbox' });
-  await fixture.selectPackageApk('invalid.apk');
-  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /valid Android package name/);
-  assert.equal(fixture.editorButtons.deploy.disabled, false,
-    'a package-name parsing error leaves the editor available for correction');
+  fixture.edit({ dataset: { setting: 'startupApp' }, type: 'text', value: 'com.example.viewer' });
+  await fixture.editClick('deploy');
+  assert.equal(fixture.requests.at(-1).url, '/api/packages/pkg/save-and-deploy');
 });
 
 test('managed Wi-Fi pre-fills saved passwords and reorders whole candidates', async () => {
@@ -803,7 +785,6 @@ function profile({
 
 function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'] }, confirm = () => true,
   prompt = (_, value) => value,
-  readPackageFromApk = async () => 'com.example.viewer',
   onSnapshot, requestGroupSnapshot = () => false } = {}) {
   const createElement = overrides => ({
     innerHTML: '', textContent: '', value: '', hidden: false, disabled: false,
@@ -823,7 +804,6 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
       editorButtons[selector.match(/"([^"]+)"/)[1]] },
     '[data-package-name]': createElement(),
     '[data-setting="startupApp"]': createElement({ dataset: { setting: 'startupApp' } }),
-    '[data-package-apk]': createElement({ dataset: {}, files: [] }),
     '[data-package-publication]': createElement(),
     '[data-deploy-hint]': createElement(),
     '[data-settings-feedback]': createElement(),
@@ -882,7 +862,6 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     openPackages: () => { opened++; },
     confirmAction: message => { confirmations.push(message); return confirm(message); },
     promptForValue: prompt,
-    readPackageFromApk,
     onSnapshot,
     requestGroupSnapshot,
     fetch: async (url, init) => {
@@ -920,13 +899,6 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
         selector === '.wifi-network' ? wifiArticle(dataset) :
         { dataset: { settingsSection: 'basic' }, querySelector: () => ({}), querySelectorAll: () => [] },
   } });
-  const selectPackageApk = (name, inputValue = 'app.apk') => {
-    const input = editorControls['[data-package-apk]'];
-    input.value = inputValue;
-    input.files = name ? [{ name }] : [];
-    return packagePanel.handlers.get('change')({ target: { closest: selector =>
-      selector === '[data-package-apk]' ? input : null } });
-  };
   const editClick = action => packagePanel.handlers.get('click')({ target: { closest: () => editorButtons[action] } });
   const groupClick = action => groupPanel.handlers.get('click')({ target: { closest: () => groupButtons[action] } });
   const select = id => {
@@ -947,7 +919,7 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
   };
   return {
     controller, packagePanel, packageList, catalogNotice, catalogStatus, groupPanel, edit, editClick, policyClick, editorButtons, editorControls, groupControls,
-    groupClick, groupButtons, select, broadcast, create, createControls, requests, confirmations, selectPackageApk,
+    groupClick, groupButtons, select, broadcast, create, createControls, requests, confirmations,
     passwordInputs: () => passwordInputs,
     valueField, moveButtons, wifiLimitWarning, wifiHiddenWarning, addNetworkButton, footerStatus,
     opened: () => opened,
@@ -1184,7 +1156,7 @@ test('save and deploy sends the edited name and settings in one confirmed reques
   assert.equal(mutation.expected_impact, 'impact1');
   assert.match(fixture.confirmations[0], /Deploy "Day studio" to 2 groups and 5 devices/);
   assert.match(fixture.confirmations[0], /includes offline devices/);
-  assert.match(fixture.editorControls['[data-package-publication]'].textContent, /Deployed version r1/);
+  assert.match(fixture.editorControls['[data-package-publication]'].textContent, /Loaded version r1/);
 });
 
 test('duplicating a package copies saved settings and opens an unpublished package', async () => {
@@ -1275,7 +1247,7 @@ test('a revision changed by another console blocks publication before confirmati
   assert.equal(fixture.editorButtons.deploy.disabled, true);
 });
 
-test('a save conflict rebases unsaved name and setting edits onto the latest version', async () => {
+test('a save conflict preserves independent edits and replaces overlapping values with the latest version', async () => {
   let latest = profile();
   const fixture = createHarness(({ method, body }) => {
     if (method === 'GET') return response(latest);
@@ -1296,12 +1268,139 @@ test('a save conflict rebases unsaved name and setting edits onto the latest ver
   assert.equal(fixture.editorButtons.deploy.disabled, true);
   await fixture.editClick('reload');
   assert.match(fixture.packagePanel.innerHTML, /data-package-name[^>]+value="Local name"/);
-  assert.match(fixture.packagePanel.innerHTML, /type="range"[^>]+value="86"/);
+  assert.match(fixture.packagePanel.innerHTML, /type="range"[^>]+value="62"/);
+  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /overlapped newer server changes.*Screen brightness/);
   assert.equal(fixture.editorButtons.deploy.disabled, false);
   await fixture.editClick('deploy');
   assert.equal(fixture.requests.at(-1).body.expected_revision, 'remote');
   assert.equal(fixture.requests.at(-1).body.name, 'Local name');
+  assert.deepEqual(fixture.requests.at(-1).body.settings.brightness, { managed: true, value: 62 });
   assert.deepEqual(fixture.requests.at(-1).body.settings.autoSleep, { managed: true, value: true });
+});
+
+test('a Wi-Fi strategy edit rebases over a remote network addition', async () => {
+  const initialWifi = { managed: true, value: { auto_return: false, prioritize_networks: true,
+    networks: [{ ssid: 'Office', security: 'OPEN', hidden: false }] } };
+  let latest = profile({ settings: { wifi: initialWifi } });
+  const fixture = createHarness(({ method, body }) => {
+    if (method === 'GET') return response(latest);
+    if (body.expected_revision === 'edit1') {
+      latest = profile({ editRevision: 'remote', settings: { wifi: { managed: true, value: {
+        ...initialWifi.value,
+        networks: [...initialWifi.value.networks, { ssid: 'Backup', security: 'OPEN', hidden: false }],
+      } } } });
+      return response({ error: 'Draft changed.' }, 409);
+    }
+    latest = { ...latest, edit_revision: 'edit2', published_revision: 'r1', settings: body.settings };
+    return response(latest);
+  });
+  fixture.broadcast();
+  await fixture.controller.showPackages('pkg');
+  fixture.edit({ dataset: { setting: 'wifi', field: 'auto_return' }, type: 'checkbox', checked: true });
+  await fixture.editClick('deploy');
+  await fixture.editClick('reload');
+
+  assert.match(fixture.packagePanel.innerHTML, /value="Backup"/);
+  assert.equal(fixture.editorButtons.deploy.disabled, false);
+  await fixture.editClick('deploy');
+  assert.deepEqual(fixture.requests.at(-1).body.settings.wifi.value, {
+    auto_return: true,
+    networks: [
+      { ssid: 'Office', security: 'OPEN', hidden: false },
+      { ssid: 'Backup', security: 'OPEN', hidden: false },
+    ],
+  });
+});
+
+test('a masked local Wi-Fi password cannot overwrite a newer saved password', async () => {
+  const initial = profile({ settings: { wifi: { managed: true, value: {
+    auto_return: false, prioritize_networks: true,
+    networks: [{ ssid: 'Studio', security: 'WPA2_WPA3', hidden: false,
+      password: 'saved-secret', password_present: true }],
+  } } } });
+  let latest = initial;
+  const fixture = createHarness(({ method, body }) => {
+    if (method === 'GET') return response(latest);
+    if (body.expected_revision === 'edit1') {
+      latest = profile({ editRevision: 'remote', settings: { wifi: { managed: true, value: {
+        auto_return: false, prioritize_networks: true,
+        networks: [{ ssid: 'Studio', security: 'WPA2_WPA3', hidden: false,
+          password: 'remote-secret', password_present: true }],
+      } } } });
+      return response({ error: 'Draft changed.' }, 409);
+    }
+    return response({ ...latest, edit_revision: 'edit2', settings: body.settings });
+  });
+  fixture.broadcast();
+  await fixture.controller.showPackages('pkg');
+  fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'password' }, type: 'password', value: 'local-secret' });
+  await fixture.editClick('deploy');
+  await fixture.editClick('reload');
+
+  assert.deepEqual(fixture.passwordInputs().map(input => input.value), ['remote-secret']);
+  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /overlapped newer server changes.*Wi-Fi networks/);
+  await fixture.editClick('deploy');
+  assert.equal(Object.hasOwn(fixture.requests.at(-1).body.settings.wifi.value.networks[0], 'password'), false,
+    'the latest saved password is retained without resending a stale or conflicting secret');
+});
+
+test('overlapping shutdown edits keep the remote values and explain the conflict', async () => {
+  const initial = { managed: true, value: { enabled: true, hour: 22, minute: 15, repeat: 127 } };
+  let latest = profile({ settings: { shutdown: initial } });
+  const fixture = createHarness(({ method, body }) => {
+    if (method === 'GET') return response(latest);
+    if (body.expected_revision === 'edit1') {
+      latest = profile({ editRevision: 'remote', settings: { shutdown: { managed: true, value: {
+        enabled: true, hour: 20, minute: 45, repeat: 65,
+      } } } });
+      return response({ error: 'Draft changed.' }, 409);
+    }
+    return response({ ...latest, settings: body.settings, edit_revision: 'edit2' });
+  });
+  fixture.broadcast();
+  await fixture.controller.showPackages('pkg');
+  fixture.edit({ dataset: { setting: 'shutdown', field: 'time' }, type: 'time', value: '21:30' });
+  await fixture.editClick('deploy');
+  await fixture.editClick('reload');
+
+  assert.match(fixture.packagePanel.innerHTML, /data-field="time" value="20:45"/);
+  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /overlapped newer server changes.*Scheduled shutdown/);
+  await fixture.editClick('deploy');
+  assert.deepEqual(fixture.requests.at(-1).body.settings.shutdown.value,
+    { enabled: true, hour: 20, minute: 45, repeat: 65 });
+});
+
+test('a newer or removed catalog package keeps the loaded revision visible and requires reload', async () => {
+  let latest = profile();
+  let removed = false;
+  const fixture = createHarness(({ method }) => {
+    if (method === 'GET') return removed
+      ? response({ error: 'Package not found.' }, 404) : response(latest);
+    assert.fail('stale or removed packages must not be deployed');
+  });
+  fixture.broadcast();
+  await fixture.controller.showPackages('pkg');
+
+  fixture.broadcast({ packages: [{ ...pkg, published_revision: 'r1' }, pkg2] });
+  assert.match(fixture.editorControls['[data-package-publication]'].textContent,
+    /Loaded version r0.*Latest deployed version r1 is available/);
+  assert.match(fixture.editorControls['[data-deploy-hint]'].textContent, /Reload package before deploying/);
+  assert.equal(fixture.editorButtons.reload.hidden, false);
+  assert.equal(fixture.editorButtons.deploy.disabled, true);
+
+  latest = profile({ publishedRevision: 'r1' });
+  await fixture.editClick('reload');
+  assert.match(fixture.editorControls['[data-package-publication]'].textContent, /Loaded version r1/);
+  assert.equal(fixture.editorButtons.deploy.disabled, false);
+
+  removed = true;
+  fixture.broadcast({ packages: [pkg2] });
+  assert.match(fixture.editorControls['[data-package-publication]'].textContent, /removed elsewhere/);
+  assert.equal(fixture.editorButtons.reload.hidden, false);
+  assert.equal(fixture.editorButtons.deploy.disabled, true);
+  await fixture.editClick('reload');
+  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /removed elsewhere/);
+  assert.equal(fixture.editorButtons.deploy.disabled, true);
 });
 
 test('a lost publish response requires reloading the package before publishing again', async () => {
@@ -1318,7 +1417,7 @@ test('a lost publish response requires reloading the package before publishing a
   assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /Could not confirm/);
   fixture.broadcast({ packages: [{ ...pkg, published_revision: 'r1' }, pkg2] });
   await fixture.editClick('reload');
-  assert.match(fixture.editorControls['[data-package-publication]'].textContent, /Deployed version r1/);
+  assert.match(fixture.editorControls['[data-package-publication]'].textContent, /Loaded version r1/);
   assert.equal(fixture.editorButtons.deploy.disabled, false);
 });
 
@@ -1346,7 +1445,7 @@ test('a publish response after a server restart exposes reload before another de
   assert.equal(fixture.editorButtons.deploy.disabled, false);
 });
 
-test('WS catalog updates do not repaint draft inputs or yield to an older HTTP save response', async () => {
+test('an own WS publication update is not shown as loaded until the matching HTTP profile arrives', async () => {
   let finishSave;
   const fixture = createHarness(({ method }) => method === 'GET' ? response(profile()) :
     new Promise(resolve => { finishSave = resolve; }));
@@ -1358,12 +1457,15 @@ test('WS catalog updates do not repaint draft inputs or yield to an older HTTP s
   const before = fixture.packagePanel.innerHTML;
   fixture.broadcast({ packages: [{ ...pkg, name: 'Remote name', published_revision: 'newer' }, pkg2] });
   assert.equal(fixture.packagePanel.innerHTML, before);
-  assert.match(fixture.editorControls['[data-package-publication]'].textContent, /Deployed version newer/);
-  finishSave(response(profile({ editRevision: 'edit2', settings: { brightness: { managed: true, value: 63 } } })));
+  assert.match(fixture.editorControls['[data-package-publication]'].textContent,
+    /Loaded version r0.*Checking latest deployed version newer/);
+  finishSave(response(profile({ editRevision: 'edit2', publishedRevision: 'newer', settings: { brightness: { managed: true, value: 63 } } })));
   await saving;
   assert.match(fixture.packagePanel.innerHTML, /type="range"[^>]+value="63"/);
   assert.match(fixture.packageList.innerHTML, /Remote name/);
-  assert.match(fixture.editorControls['[data-package-publication]'].textContent, /Deployed version newer/);
+  assert.match(fixture.editorControls['[data-package-publication]'].textContent, /Loaded version newer/);
+  assert.equal(fixture.editorButtons.reload.hidden, true);
+  assert.equal(fixture.editorButtons.deploy.disabled, false);
 });
 
 test('the final assignment option opens package creation and preserves a staged assignment', () => {
