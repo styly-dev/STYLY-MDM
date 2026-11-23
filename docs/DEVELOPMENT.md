@@ -108,8 +108,9 @@ the managed settings sent to devices from the saved values.
 - **Save & deploy** in the editor saves the edits and publishes a new revision
   for every group using the package, in one commit. If another console deploys
   while the editor is open, use **Reload package** to review the latest saved
-  version. Reload keeps independent edits and identifies overlapping changes
-  that need review before saving.
+  version. Reload keeps edits to other settings. When both consoles changed
+  the same setting to different values, it uses the server value and names
+  that setting for review.
 - **Deploy** in group **Settings** assigns a published package to the group with
   a new group deployment revision and assignment time. A new package must be deployed once from the
   editor first. Deploying the package already selected for the group publishes
@@ -153,6 +154,8 @@ the managed settings sent to devices from the saved values.
 Expanded group rows use ascending device-name order. Both those rows and
 **Group Settings → Device status** show the online headset’s current SSID when
 available. Hover over the SSID for the access point’s BSSID when reported.
+The SSID is hidden when Android withholds it, including when location access or
+the device’s Location switch is off.
 
 #### Server registry and delivery
 
@@ -258,10 +261,12 @@ self-update power-cycle fallback. See the
 
 **PICO home app** under **Basic settings** configures the app opened at boot
 and by the Home button. Enter its Android package name (for example,
-`com.example.viewer`). Install and enable the app on each target before deployment. The client calls TobService
-`setLauncher(packageName)`. A successful result confirms the API accepted the
-setting. Verify the Home action after the next headset restart. Deploy a managed
-empty package name to restore the PICO default with `setLauncher(null)`.
+`com.example.viewer`). Install and enable the app on each target before
+deployment. A successful TobService `setLauncher(packageName)` result confirms
+the API accepted the setting. If the app was missing, install it, select
+**Retry**, and wait for acceptance. Restart the headset and verify the Home
+action. Deploy a managed empty package name to restore the PICO default with
+`setLauncher(null)`.
 Clearing **Manage** releases management and preserves the current Home setting.
 The per-device **Startup App** command can bring another app to the foreground
 three seconds after the MDM service starts. Clear that per-device setting if the
@@ -346,10 +351,12 @@ the session stopped so the next readiness or connectivity check can retry it.
 **Android selection** saves the profiles and flags, reports `SAVED`, and does
 not select networks or monitor scans.
 
-A release stops active selection and monitoring even if the Wi-Fi state file
-cannot be read or written. It leaves the saved networks and auto-join flags
-unchanged. The Wi-Fi policy state is stored in
-`wifi-policy.json`.
+A release stops active selection and monitoring in the running process even
+if `wifi-policy.json` cannot be read or written. On restart, the client reads
+the saved package release before starting Wi-Fi monitoring. If the package
+release could not be saved, the headset can resume its previous assignment
+until it receives the release again.
+The release preserves saved networks and auto-join flags.
 
 #### Headset Settings screen
 

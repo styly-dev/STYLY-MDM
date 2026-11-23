@@ -5,7 +5,6 @@ import json
 import time
 import uuid
 from contextlib import asynccontextmanager
-from types import SimpleNamespace
 from urllib.parse import urlencode
 
 import aiohttp
@@ -367,36 +366,17 @@ def test_mutations_enforce_origin_draft_cas_impact_and_validation(tmp_path):
     asyncio.run(body())
 
 
-def test_same_origin_accepts_default_ports_and_ipv6_and_rejects_mismatches():
-    for origin, scheme, host in (
-        ("http://example.test:80", "http", "example.test"),
-        ("http://example.test:80", "http", "example.test:80"),
-        ("https://example.test:443", "https", "example.test"),
-        ("http://[::1]:80", "http", "[::1]"),
-        ("http://[::1]:80", "http", "[::1]:80"),
-    ):
-        server._require_same_origin(SimpleNamespace(
-            headers={"Origin": origin}, scheme=scheme, host=host,
-        ))
-
-    for origin in (
-        "http://example.test:81", "http://attacker.invalid", "http://user@example.test",
-        "http://example.test/path", "http://example.test?x=1", "null",
-    ):
-        request = SimpleNamespace(headers={"Origin": origin}, scheme="http", host="example.test")
-        with pytest.raises(server.PackageError) as exc_info:
-            server._require_same_origin(request)
-        assert exc_info.value.status == 403
-
-
 @pytest.mark.parametrize("path", ["/ws/admin", "/ws/device"])
-def test_websocket_routes_reject_cross_origin_before_upgrade_and_allow_native_clients(tmp_path, path):
+def test_websocket_routes_check_browser_origin_and_allow_native_clients(tmp_path, path):
     async def body():
         async with _running_server(tmp_path) as (session, base):
             async with session.get(base + path, headers={"Origin": "http://attacker.invalid"}) as response:
                 assert response.status == 403
                 assert response.content_type == "application/json"
                 assert await response.json() == {"error": "Invalid request origin"}
+
+            async with session.ws_connect(base + path, origin=base):
+                pass
 
             # aiohttp's native client omits Origin; that compatibility path remains open.
             async with session.ws_connect(base + path):

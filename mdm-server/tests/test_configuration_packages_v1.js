@@ -1278,7 +1278,7 @@ test('a save conflict preserves independent edits and replaces overlapping value
   assert.deepEqual(fixture.requests.at(-1).body.settings.autoSleep, { managed: true, value: true });
 });
 
-test('a Wi-Fi strategy edit rebases over a remote network addition', async () => {
+test('a Wi-Fi strategy edit conflicts with a remote network addition', async () => {
   const initialWifi = { managed: true, value: { auto_return: false, prioritize_networks: true,
     networks: [{ ssid: 'Office', security: 'OPEN', hidden: false }] } };
   let latest = profile({ settings: { wifi: initialWifi } });
@@ -1301,10 +1301,11 @@ test('a Wi-Fi strategy edit rebases over a remote network addition', async () =>
   await fixture.editClick('reload');
 
   assert.match(fixture.packagePanel.innerHTML, /value="Backup"/);
+  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /overlapped newer server changes.*Wi-Fi networks/);
   assert.equal(fixture.editorButtons.deploy.disabled, false);
   await fixture.editClick('deploy');
   assert.deepEqual(fixture.requests.at(-1).body.settings.wifi.value, {
-    auto_return: true,
+    auto_return: false,
     networks: [
       { ssid: 'Office', security: 'OPEN', hidden: false },
       { ssid: 'Backup', security: 'OPEN', hidden: false },
@@ -1344,14 +1345,14 @@ test('a masked local Wi-Fi password cannot overwrite a newer saved password', as
     'the latest saved password is retained without resending a stale or conflicting secret');
 });
 
-test('overlapping shutdown edits keep the remote values and explain the conflict', async () => {
+test('concurrent edits to hour and minute cannot produce a third shutdown time', async () => {
   const initial = { managed: true, value: { enabled: true, hour: 22, minute: 15, repeat: 127 } };
   let latest = profile({ settings: { shutdown: initial } });
   const fixture = createHarness(({ method, body }) => {
     if (method === 'GET') return response(latest);
     if (body.expected_revision === 'edit1') {
       latest = profile({ editRevision: 'remote', settings: { shutdown: { managed: true, value: {
-        enabled: true, hour: 20, minute: 45, repeat: 65,
+        enabled: true, hour: 22, minute: 45, repeat: 127,
       } } } });
       return response({ error: 'Draft changed.' }, 409);
     }
@@ -1359,15 +1360,15 @@ test('overlapping shutdown edits keep the remote values and explain the conflict
   });
   fixture.broadcast();
   await fixture.controller.showPackages('pkg');
-  fixture.edit({ dataset: { setting: 'shutdown', field: 'time' }, type: 'time', value: '21:30' });
+  fixture.edit({ dataset: { setting: 'shutdown', field: 'time' }, type: 'time', value: '20:15' });
   await fixture.editClick('deploy');
   await fixture.editClick('reload');
 
-  assert.match(fixture.packagePanel.innerHTML, /data-field="time" value="20:45"/);
+  assert.match(fixture.packagePanel.innerHTML, /data-field="time" value="22:45"/);
   assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /overlapped newer server changes.*Scheduled shutdown/);
   await fixture.editClick('deploy');
   assert.deepEqual(fixture.requests.at(-1).body.settings.shutdown.value,
-    { enabled: true, hour: 20, minute: 45, repeat: 65 });
+    { enabled: true, hour: 22, minute: 45, repeat: 127 });
 });
 
 test('a newer or removed catalog package keeps the loaded revision visible and requires reload', async () => {

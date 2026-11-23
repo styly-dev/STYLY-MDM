@@ -24,7 +24,6 @@ from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from aiohttp import WSCloseCode, web
-from yarl import URL
 
 # Bundling and integrity references must agree on what counts as content, or a reference
 # built from a folder could never match the device that folder was pushed to.
@@ -1618,16 +1617,8 @@ def _require_same_origin(request: web.Request) -> None:
         # Browsers send Origin for mutations. Native clients may omit it.
         return
 
-    try:
-        request_origin = URL(f"{request.scheme}://{request.host}").origin()
-        expected_origins = {str(request_origin)}
-        default_port = {"http": 80, "https": 443}.get(request_origin.scheme)
-        if default_port is not None and request_origin.port == default_port:
-            expected_origins.add(f"{request_origin}:{default_port}")
-        same_origin = origin in expected_origins
-    except (TypeError, ValueError):
-        same_origin = False
-    if not same_origin:
+    expected = f"{request.scheme}://{request.host}"
+    if origin != expected:
         raise PackageError("Invalid request origin", 403)
 
 

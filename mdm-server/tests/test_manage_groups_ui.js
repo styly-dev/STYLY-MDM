@@ -646,8 +646,6 @@ test('expanded group rows sort by name and show the online access point', () => 
   assert.ok(html.indexOf('Room 2') < html.indexOf('Room 10'));
   assert.match(html, /title="BSSID: aa:bb:cc:dd:ee:ff">Wi-Fi: Office &lt;5G&gt;/);
   assert.equal(html.match(/current-wifi/g).length, 1);
-  current_wifi.ssid = '   ';
-  assert.match(context.renderGroupDevsHtml(['a']), /title="BSSID: aa:bb:cc:dd:ee:ff">Wi-Fi: &quot;   &quot;/);
 });
 
 test('group member filtering updates only the scrollable list', () => {

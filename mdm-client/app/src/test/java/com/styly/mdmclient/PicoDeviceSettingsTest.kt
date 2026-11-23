@@ -64,7 +64,8 @@ class PicoDeviceSettingsTest {
             launcherCalls += 1
             0
         }
-        val malformed = applyPicoLauncher("   ", { error("Malformed package names are not looked up") }) {
+        // The installed Android framework package is outside the home app package-name format.
+        val malformed = applyPicoLauncher("android", { true }) {
             launcherCalls += 1
             0
         }

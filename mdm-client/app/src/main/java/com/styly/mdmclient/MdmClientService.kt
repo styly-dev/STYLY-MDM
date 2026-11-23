@@ -1726,9 +1726,6 @@ class MdmClientService : Service() {
 
     private fun updateNotification(statusText: String) {
         notificationStatus = statusText
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) return
         val manager = getSystemService(NotificationManager::class.java)
         manager.notify(NOTIFICATION_ID, buildNotification(statusText))
     }

@@ -26,8 +26,7 @@
     const wifi = device?.current_wifi;
     if (device?.status !== 'online' || !wifi?.ssid) return '';
     const title = wifi.bssid ? ' title="BSSID: ' + esc(wifi.bssid) + '"' : '';
-    const label = wifi.ssid.trim() ? wifi.ssid : JSON.stringify(wifi.ssid);
-    return '<span class="current-wifi"' + title + '>Wi-Fi: ' + esc(label) + '</span>';
+    return '<span class="current-wifi"' + title + '>Wi-Fi: ' + esc(wifi.ssid) + '</span>';
   }
 
   function loadDraft(sections, settings) {
@@ -427,7 +426,6 @@
     if (!item) return '';
     if (item.kind === 'range') return typeof value === 'number' ? value + '%' : '';
     if (item.kind === 'bool') return typeof value === 'boolean' ? value ? 'On' : 'Off' : '';
-
     if (item.kind === 'delay') return item.options.find(option => option.value === value)?.label || '';
     if (item.kind === 'schedule' && value && typeof value.enabled === 'boolean') {
       return value.enabled ? scheduleTime(value) + ' · ' + DAYS.filter((_, index) => value.repeat & (1 << index)).join(', ') : 'Off';
@@ -803,90 +801,48 @@
       return JSON.stringify(left) === JSON.stringify(right);
     }
 
-    function rebaseValue(previous, edited, latest) {
-      if (sameValue(previous, edited) || sameValue(edited, latest)) return { value: structuredClone(latest), conflict: false };
-      if (sameValue(previous, latest)) return { value: structuredClone(edited), conflict: false };
-      return { value: structuredClone(latest), conflict: true };
-    }
-
-    function networksWithPasswords(networks, savedNetworks) {
-      return networks.map(network => {
-        return { ssid: network.ssid, security: network.security, hidden: network.hidden,
-          password: wifiPasswordValue(network, savedNetworks) };
-      });
-    }
-
-    function mergeWifiValue(previous, edited, latest, previousSavedNetworks, latestSavedNetworks) {
-      const value = structuredClone(latest);
-      let conflict = false;
-      for (const key of ['auto_return', 'prioritize_networks']) {
-        const result = rebaseValue(previous[key], edited[key], latest[key]);
-        value[key] = result.value;
-        conflict ||= result.conflict;
-      }
-      const previousNetworks = networksWithPasswords(previous.networks || [], previousSavedNetworks);
-      const editedNetworks = networksWithPasswords(edited.networks || [], previousSavedNetworks);
-      const latestNetworks = networksWithPasswords(latest.networks || [], latestSavedNetworks);
-      const networkResult = rebaseValue(previousNetworks, editedNetworks, latestNetworks);
-      value.networks = networkResult.conflict || sameValue(previousNetworks, editedNetworks) || sameValue(editedNetworks, latestNetworks)
-        ? structuredClone(latest.networks) : structuredClone(edited.networks);
-      conflict ||= networkResult.conflict;
-      if (!value.prioritize_networks && value.auto_return) {
-        value.auto_return = latest.auto_return;
-        value.prioritize_networks = latest.prioritize_networks;
-        conflict = true;
-      }
-      return { value, conflict };
+    // Draft password inputs can be empty while referring to a saved credential.
+    function comparableSetting(item, entry, savedNetworks) {
+      if (item.kind !== 'wifi') return entry;
+      const networks = entry.value.networks.map(network => ({
+        ssid: network.ssid, security: network.security, hidden: network.hidden,
+        password: wifiPasswordValue(network, savedNetworks),
+      }));
+      return { managed: entry.managed, value: { ...entry.value, networks } };
     }
 
     function readProfile(model, data, preserveEdits = false, expectedInstanceId = snapshot?.server_instance_id ?? null) {
       const saved = loadDraft(data.sections, data.settings);
       const draft = structuredClone(saved);
       let name = data.name;
-      const conflicts = new Set();
+      const conflicts = [];
       const savedWifiNetworks = data.settings?.wifi?.value.networks ?? [];
+      function keepLocalEdit(label, previous, edited, latest) {
+        if (sameValue(previous, edited) || sameValue(latest, edited)) return false;
+        if (sameValue(previous, latest)) return true;
+        conflicts.push(label);
+        return false;
+      }
       if (preserveEdits && model.saved) {
-        const nameResult = rebaseValue(model.savedName, model.name, data.name);
-        name = nameResult.value;
-        if (nameResult.conflict) conflicts.add('name');
-        for (const key of Object.keys(draft)) {
-          const previous = model.saved[key];
-          const edited = model.draft[key];
-          if (!previous || !edited) continue;
-          const managedResult = rebaseValue(previous.managed, edited.managed, saved[key].managed);
-          draft[key].managed = managedResult.value;
-          let conflict = managedResult.conflict;
-          if (key === 'wifi') {
-            const result = mergeWifiValue(previous.value, edited.value, saved[key].value,
-              model.savedWifiNetworks || [], savedWifiNetworks);
-            draft[key].value = result.value;
-            conflict ||= result.conflict;
-          } else if (key === 'shutdown' && previous.value && edited.value && saved[key].value) {
-            draft[key].value = structuredClone(saved[key].value);
-            for (const field of ['enabled', 'hour', 'minute', 'repeat']) {
-              const result = rebaseValue(previous.value[field], edited.value[field], saved[key].value[field]);
-              draft[key].value[field] = result.value;
-              conflict ||= result.conflict;
-            }
-          } else {
-            const result = rebaseValue(previous.value, edited.value, saved[key].value);
-            draft[key].value = result.value;
-            conflict ||= result.conflict;
-          }
-          if (conflict) conflicts.add(key);
+        if (keepLocalEdit('package name', model.savedName, model.name, data.name)) name = model.name;
+        for (const item of data.sections.flatMap(section => section.items)) {
+          const key = item.id;
+          if (!model.saved[key] || !model.draft[key]) continue;
+          const previous = comparableSetting(item, model.saved[key], model.savedWifiNetworks);
+          const edited = comparableSetting(item, model.draft[key], model.savedWifiNetworks);
+          const latest = comparableSetting(item, saved[key], savedWifiNetworks);
+          if (keepLocalEdit(item.label, previous, edited, latest)) draft[key] = structuredClone(model.draft[key]);
         }
       }
       if (draft.wifi?.managed === false && saved.wifi) {
         draft.wifi.value = structuredClone(saved.wifi.value);
       }
-      const labels = Object.fromEntries(data.sections.flatMap(section => section.items.map(item => [item.id, item.label])));
-      const conflictLabels = [...conflicts].map(key => key === 'name' ? 'package name' : labels[key] || key);
       Object.assign(model, { sections: data.sections, editRevision: data.edit_revision,
         publishedRevision: data.published_revision, savedWifiNetworks,
         savedName: data.name, saved, name, draft,
-        mergeNotice: conflictLabels.length
+        mergeNotice: conflicts.length
           ? 'Some local edits overlapped newer server changes and were replaced with the latest values for ' +
-            conflictLabels.join(', ') + '. Review before deploying.'
+            conflicts.join(', ') + '. Review before deploying.'
           : '' });
       readSections(data.sections, expectedInstanceId);
     }
