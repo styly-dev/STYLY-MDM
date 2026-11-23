@@ -964,6 +964,7 @@
         createForm: document.getElementById('createConfigurationPackage'),
         getDevice: deviceById,
         getGroups: function () { return groups; },
+        sortGroupMembers,
         openPackages: function () { managePackages = true; render(); },
         onSnapshot: applyGroupListSnapshot,
         requestGroupSnapshot: function () { return wsSend({ type: 'GET_GROUP_LIST' }, 'refresh group details'); },
@@ -1173,6 +1174,15 @@
       function filterSortDevices(search, sortKey) {
         const q = search.trim().toLowerCase();
         return sortDevices(devices.filter(function (d) { return deviceMatchesQuery(d, q); }), sortKey);
+      }
+      function sortGroupMembers(memberIds) {
+        const remaining = new Set(memberIds);
+        const members = [];
+        // Preserve the picker's input order for labels that compare equal.
+        for (const device of devices) {
+          if (remaining.delete(getDeviceId(device))) members.push(device);
+        }
+        return [...sortDevices(members, manageSort).map(getDeviceId), ...remaining];
       }
       // Status filter for the main Devices list (issue #62). 'online' mirrors getOnlineIds()
       // so "filter to Online then select all" yields a set onlineTargets() will not trim;

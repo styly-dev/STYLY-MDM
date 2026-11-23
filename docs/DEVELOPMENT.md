@@ -118,7 +118,9 @@ the managed settings sent to devices from the saved values.
   devices. The server rejects the deployment if the revision or targets changed
   since the preview.
 - **Device status** counts members that reported success for the current
-  revision, out of all members.
+  revision, out of all members. It follows the name sort of the Devices tab in
+  Manage Groups. Unlabeled devices appear first in Device ID order, and members
+  missing from the device list appear last.
 - A setting missing from the published snapshot is released on the device.
   Deleting a group releases its members. A referenced package cannot be deleted.
 - The group Devices editor sends only staged changes with the expected group of

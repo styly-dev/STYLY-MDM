@@ -463,6 +463,7 @@
 
   function createController({
     groupPanel, packagePanel, packageList, catalogNotice, createForm, getGroups, getDevice, openPackages,
+    sortGroupMembers = members => members,
     deviceIdHtml = (_, id) => esc(id), fetch = root.fetch.bind(root),
     confirmAction = message => root.confirm(message),
     onSnapshot = () => {},
@@ -1004,7 +1005,8 @@
         .find(selector => active?.matches?.(selector));
       const outcomes = groupOutcomes(group.name, assigned, deployment);
       const rows = [];
-      for (const [id, { device, outcome: [state, label, detail] }] of outcomes) {
+      for (const id of sortGroupMembers(outcomes.keys())) {
+        const { device, outcome: [state, label, detail] } = outcomes.get(id);
         const readiness = wifiReadiness(device, deployment);
         const autoReturnNotice = wifiAutoReturnNotice(device, deployment);
         const results = reportedResults(device?.configuration_state, deployment, items);

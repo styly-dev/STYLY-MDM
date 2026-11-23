@@ -604,6 +604,30 @@ test('Cancel restores the last unknown member after removing it from the staged 
   assert.match(removedMarkup, /No devices yet/);
 });
 
+test('group device status follows the Devices sort for committed members', () => {
+  const members = ['missing-2', 'room-10', 'unit-10', 'room-02', 'unit-2', 'room-2', 'missing-1'];
+  const context = vm.createContext({
+    devices: [
+      { device_id: 'room-2', label: 'Room 2', status: 'offline' },
+      { device_id: 'room-02', label: 'room 02', status: 'online' },
+      { device_id: 'unit-10', label: '' },
+      { device_id: 'unassigned', label: 'Room 1' },
+      { device_id: 'room-10', label: 'Room 10', status: 'online' },
+      { device_id: 'unit-2', label: '' },
+    ],
+    manageSort: 'label-asc',
+    getDeviceId(device) { return device.device_id; },
+  });
+  for (const name of ['sortDevices', 'sortGroupMembers']) {
+    vm.runInContext(functionSource(name), context);
+  }
+
+  const displayedIds = () => [...context.sortGroupMembers(members.values())];
+  assert.deepEqual(displayedIds(), ['unit-2', 'unit-10', 'room-2', 'room-02', 'room-10', 'missing-2', 'missing-1']);
+  context.manageSort = 'label-desc';
+  assert.deepEqual(displayedIds(), ['unit-2', 'unit-10', 'room-10', 'room-2', 'room-02', 'missing-2', 'missing-1']);
+});
+
 test('group member filtering updates only the scrollable list', () => {
   const createElement = () => ({
     scrollTop: 42,
