@@ -106,9 +106,9 @@ the managed settings sent to devices from the saved values.
   opens the copy under its own name and edit revision. Follow the usual
   **Save & deploy** and group assignment steps to deploy it.
 - **Save & deploy** in the editor saves the edits and publishes a new revision
-  for every group using the package, in one commit. If another console deploys
-  while the editor is open, use **Reload package** to review the latest saved
-  version. Reload keeps edits to other settings. When both consoles changed
+  for every group using the package, in one commit. If another console edits
+  the package, use **Reload package** to review the latest saved version.
+  Redeploying the saved package from a group leaves the editor available. Reload keeps edits to other settings. When both consoles changed
   the same setting to different values, it uses the server value and names
   that setting for review.
 - **Deploy** in group **Settings** assigns a published package to the group with
@@ -178,8 +178,8 @@ a restart. HTTP responses from the previous instance are ignored.
 
 The server sends the effective snapshot on registration, publication,
 assignment changes, group renames and deletions, and membership changes.
-Headset delivery and admin notifications run concurrently after the save, so a
-slow console cannot hold back device policy. Each connected device has at most
+The server queues headset delivery before notifying admins, so a slow console
+cannot hold back device policy. Each connected device has at most
 one coalescing delivery task. Its serialized WebSocket write waits until the
 current policy can be sent, and lifecycle cleanup cancels it on disconnect,
 replacement, or server shutdown. HTTP Retry requests have a bounded send time.
@@ -216,9 +216,8 @@ replacement for the same assignment.
   Wi-Fi checks the saved profiles and auto-join flags on the headset. When
   those settings match and the saved evidence for the requested credentials
   matches the live Android network ID, it retains the existing connection.
-  Older device caches without network IDs are still readable. A new deployment
-  writes those credentials before trusting their saved IDs. A changed assignment
-  rechecks settings even when it returns to an earlier revision.
+  Without a matching network ID, it writes the credentials again. A changed
+  assignment rechecks settings even when it returns to an earlier revision.
 - **Redelivery in the same boot:** the current revision reuses its recorded
   attempt, including after an app restart. A new assignment after a release
   clears the old attempts in the same write that caches the assignment.
@@ -228,10 +227,9 @@ replacement for the same assignment.
   again. A headset must receive a package once before it can reapply offline.
 - The client writes the current assignment or release and the
   attempt journal in one atomic private file, `configuration-packages.json`.
-  Active assignments include Wi-Fi credentials. On upgrade, the client reads
-  the previous preferences until its first successful file write. A legacy
-  cache left on disk cannot override the committed file. Clients downgraded
-  after migration need the server to deliver their assignment again.
+  Active assignments include Wi-Fi credentials. On a first install or upgrade
+  from a client without packages, the headset receives its assignment from the
+  server.
   The attempt journal records per-setting results and used Retry tokens.
   Scalar results are saved before Wi-Fi starts. A recoverable exception during
   application or a process stop before results are saved leaves an interrupted
@@ -244,7 +242,9 @@ replacement for the same assignment.
   recorded, Retry can start that attempt once storage recovers.
   A Wi-Fi state file error applies to the
   current attempt. The next deployment, Retry, or headset reapply can use the
-  saved Wi-Fi state once the file is readable and writable again.
+  saved Wi-Fi state once the file is readable and writable again. A test headset
+  with an unsupported pre-release `wifi-policy.json` needs a fresh Wi-Fi state
+  file before it can apply a new Wi-Fi package.
   A release that cannot be saved stops the current Wi-Fi work and leaves the
   previous report intact. Headset Settings shows the save failure, and the next
   delivery can persist the release. A saved release still takes effect at boot
@@ -271,17 +271,11 @@ Clearing **Manage** releases management and preserves the current Home setting.
 The per-device **Startup App** command can bring another app to the foreground
 three seconds after the MDM service starts. Clear that per-device setting if the
 PICO home app should stay in the foreground after boot. The Home button still
-opens the configured PICO home app. Older package clients report the home app
-setting as unsupported.
-Before downgrading a server with saved `startupApp` entries, restore a registry
-backup compatible with that server.
+opens the configured PICO home app.
 
 **Power on when USB is connected** under **USB & advanced** manages the PICO
 `SFS_USB_BOOT` switch. When enabled, connecting USB power starts a powered-off
-headset. The client reads the switch back after applying it. Existing packages
-can omit `usbBoot`. Older package-capable clients report it as unsupported if
-deployed. A server downgrade requires removing packages containing the new key
-or restoring a registry backup from before those packages were saved.
+headset. The client reads the switch back after applying it.
 
 **Developer options menu** under **USB & advanced** sets the PUI Developer tab
 visibility flag (0 or 1), which PUI reads when its Settings screen opens. It
@@ -331,9 +325,9 @@ the session stopped so the next readiness or connectivity check can retry it.
   and fallback can continue after that result. Save and readback failures
   are reported even when a candidate connects.
 - The client updates existing profiles by ID and retains them on update failure.
-  Android can reuse authentication from earlier in the same boot after a
-  password change. The client tracks uncertain credentials by boot count and
-  password fingerprint, independently of whether the password was saved.
+  Before changing a password, the client drops the saved network ID used to
+  trust the previous key. Android can reuse authentication from earlier in
+  the same boot, so an existing connection does not verify a changed password.
 - After a disconnection with more than one candidate, or with a cached fallback
   profile, the client waits 8 seconds plus up to 3 seconds of jitter. It keeps a
   connection Android has restored, or selects candidates in order. Failed
@@ -376,7 +370,7 @@ and on package changes. Native clients can connect without an Origin header.
 
 | Surface | Contract |
 |---|---|
-| `GET /api/packages`, `POST /api/packages` | GET returns package summaries and the setting definitions used by group results. POST creates a package by name. |
+| `GET /api/packages`, `POST /api/packages` | GET returns package names and edit/publication revisions, plus the setting definitions used by group results. POST creates a package by name. |
 | `POST /api/packages/{id}/duplicate` | Accepts the new `name` and the source package’s `expected_revision`. Returns the new editor profile. A stale source revision returns 409. |
 | `GET /api/packages/{id}` | Returns package identity and name, `edit_revision`, `published_revision`, the saved editor `settings`, including unchecked settings and Wi-Fi passwords, the editor `sections`, and `impact` with group and device counts and a token. |
 | `POST /api/packages/{id}/save-and-deploy` | Atomically saves `settings` as `{id: {managed, value}}` and deploys a new revision. Supply `expected_revision` equal to the loaded edit token `edit_revision` (null for a new package), and `expected_impact` from the preview. An optional `name` renames the package. |
@@ -397,9 +391,7 @@ The private `device_registry.json` stores `packages` and each group's `members`,
 with its scoped revision. Shared publication replaces scoped revisions and times
 with the package's new `published_revision` and `deployed_at_ms`. Wi-Fi
 passwords are plaintext in the registry and its backups. Registry writes sync
-the temporary file before atomically replacing the saved file. A
-`configuration_revision` field from earlier builds is ignored during normal
-loads and omitted from subsequent writes.
+the temporary file before atomically replacing the saved file.
 
 - The released `{"groups": {name: [device_id]}}` format is migrated to the
   package format with no packages. A device in several groups stays only in

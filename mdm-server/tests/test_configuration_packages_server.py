@@ -75,10 +75,7 @@ async def _assign(session, base, group, profile, **kwargs):
 
 async def _deploy(session, base, profile, *, settings=None, **kwargs):
     if settings is None:
-        settings = json.loads(json.dumps(profile["settings"]))
-        wifi_value = settings.get("wifi", {}).get("value", {})
-        for network in wifi_value.get("networks", []):
-            network.pop("password_present", None)
+        settings = profile["settings"]
     return await _request(session, "POST", base, _path(profile) + "/save-and-deploy", {
         "expected_revision": profile["edit_revision"], "expected_impact": profile["impact"]["token"],
         "settings": settings,
@@ -282,17 +279,18 @@ def test_shared_publish_and_offline_reconnect_use_latest_published_snapshot(tmp_
             async with session.ws_connect(base + "/ws/device") as ws:
                 await _register(ws, {**REGISTRATION, "device_id": OFFLINE_ID})
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == wanted
+                # Reject a partial credential update without changing the published package.
+                await _deploy(session, base, latest, settings={"wifi": {"managed": True, "value": _wifi_value(
+                    networks=[{k: v for k, v in network.items() if k != "password"}],
+                )}}, status=400)
                 # Unmanaged settings keep their values, including the saved Wi-Fi password.
                 cleared = await _deploy(session, base, latest, settings={
                     **_brightness(90, managed=False),
                     "usbCopy": {"managed": False, "value": False},
                     "usbBoot": {"managed": False, "value": True},
                     "developerMenu": {"managed": False, "value": False},
-                    "wifi": {"managed": False, "value": _wifi_value(
-                        networks=[{k: v for k, v in network.items() if k != "password"}],
-                    )},
+                    "wifi": {"managed": False, "value": _wifi_value(networks=[network])},
                 })
-                assert cleared["settings"]["wifi"]["value"]["networks"][0]["password_present"] is True
                 assert cleared["settings"]["wifi"]["value"]["networks"][0]["password"] == secret
                 assert await _receive_type(ws, "CONFIGURATION_POLICY") == _policy(cleared, {})
     asyncio.run(body())
@@ -441,7 +439,9 @@ def test_package_duplicate_copies_saved_settings_without_publication_or_assignme
             assert duplicate["impact"]["groups"] == 0
             catalog = await _request(session, "GET", base, "/api/packages")
             by_id = {item["package_id"]: item for item in catalog["packages"]}
+            assert by_id[source["package_id"]]["edit_revision"] == source["edit_revision"]
             assert by_id[source["package_id"]]["published_revision"] == source["published_revision"]
+            assert by_id[duplicate["package_id"]]["edit_revision"] == duplicate["edit_revision"]
             assert by_id[duplicate["package_id"]]["published_revision"] is None
 
             await _request(session, "POST", base, _path(source) + "/duplicate", {
@@ -737,13 +737,17 @@ def test_membership_save_precedes_policy_delivery(tmp_path, monkeypatch, disconn
         release_delivery = asyncio.Event()
         delivery_started = asyncio.Event()
         ack_failed = asyncio.Event()
-        publish_configuration = server._publish_configuration
+        queue_configuration = server._queue_configuration
 
-        async def hold_delivery(device_ids):
-            assert device_ids == [DEVICE_ID]
+        def hold_delivery(device_id, entry):
+            assert device_id == DEVICE_ID
             delivery_started.set()
-            await release_delivery.wait()
-            await publish_configuration(device_ids)
+
+            async def queue_after_release():
+                await release_delivery.wait()
+                queue_configuration(device_id, entry)
+
+            asyncio.create_task(queue_after_release())
 
         async with _running_server(tmp_path, {"Gallery": []}) as (session, base):
             package = await _create(session, base, "Gallery")
@@ -755,7 +759,7 @@ def test_membership_save_precedes_policy_delivery(tmp_path, monkeypatch, disconn
                 await _register(device)
                 assert await _receive_type(device, "CONFIGURATION_POLICY") == NO_POLICY
                 assert (await _receive_type(admin, "GROUP_LIST"))["groups"] == {"Gallery": []}
-                monkeypatch.setattr(server, "_publish_configuration", hold_delivery)
+                monkeypatch.setattr(server, "_queue_configuration", hold_delivery)
                 if disconnect_on_ack:
                     send_str = server.web.WebSocketResponse.send_str
 
@@ -825,33 +829,28 @@ def test_device_label_reports_a_registry_save_failure(tmp_path, monkeypatch):
     asyncio.run(body())
 
 
-def test_telemetry_coalescer_runs_once_with_the_latest_state_and_flushes():
+def test_telemetry_save_timer_coalesces_latest_state_and_flushes(monkeypatch):
     async def body():
         state = {"value": 0}
         runs = []
-        coalescer = server._Coalescer(0.05, lambda: runs.append(state["value"]), "test")
+        monkeypatch.setattr(server, "TELEMETRY_SAVE_DELAY", 0.02)
+        monkeypatch.setattr(server, "save_registry", lambda: runs.append(state["value"]))
         for value in (1, 2, 3):
             state["value"] = value
-            coalescer.schedule()
-        await asyncio.sleep(0.1)
+            server._schedule_telemetry_save()
+        await asyncio.sleep(0.04)
         assert runs == [3]
 
         state["value"] = 4
-        coalescer.schedule()
-        await coalescer.flush(run=True)
+        server._schedule_telemetry_save()
+        server._flush_telemetry_save()
         assert runs == [3, 4]
-        await coalescer.flush(run=True)
+        server._flush_telemetry_save()
         assert runs == [3, 4]
 
-        state["value"] = 5
-        coalescer.schedule()
+        server._schedule_telemetry_save()
         state["value"] = 6
-        await coalescer.flush(run=True)
-        assert runs == [3, 4, 6]
-
-        coalescer.schedule()
-        await coalescer.flush(run=False)
-        await asyncio.sleep(0.1)
+        server._flush_telemetry_save()
         assert runs == [3, 4, 6]
 
     asyncio.run(body())
@@ -918,90 +917,52 @@ def test_current_wifi_websocket_state_is_live_only_and_explicit_null_clears(tmp_
     asyncio.run(body())
 
 
-def test_coalescer_serializes_work_and_runs_once_again_for_requests_during_work():
+def test_device_list_broadcast_coalesces_bursts_and_sends_latest_state_after_an_in_flight_send(monkeypatch):
     async def body():
         state = {"value": 0}
         started = asyncio.Event()
         release_first = asyncio.Event()
-        second_finished = asyncio.Event()
-        snapshots = []
-        calls = 0
-        active = 0
-        max_active = 0
-
-        async def work():
-            nonlocal calls, active, max_active
-            calls += 1
-            active += 1
-            max_active = max(max_active, active)
-            snapshots.append(state["value"])
-            try:
-                if calls == 1:
-                    started.set()
-                    await release_first.wait()
-            finally:
-                active -= 1
-                if calls == 2:
-                    second_finished.set()
-
-        coalescer = server._Coalescer(0.01, work, "test")
-        coalescer.schedule()
-        await asyncio.wait_for(started.wait(), 1)
-        for value in (1, 2, 3):
-            state["value"] = value
-            coalescer.schedule()
-
-        await asyncio.sleep(0.04)
-        assert calls == 1
-        assert max_active == 1
-
-        state["value"] = 4
-        flush_task = asyncio.create_task(coalescer.flush(run=True))
-        await asyncio.sleep(0)
-        assert not flush_task.done()
-        release_first.set()
-        await asyncio.wait_for(flush_task, 1)
-        await asyncio.wait_for(second_finished.wait(), 1)
-        assert snapshots == [0, 4]
-        assert calls == 2
-        assert max_active == 1
-
-    asyncio.run(body())
-
-
-def test_coalescer_keeps_minimum_interval_between_pending_runs():
-    async def body():
-        started = asyncio.Event()
-        release_first = asyncio.Event()
         second_started = asyncio.Event()
+        snapshots = []
         start_times = []
-        delay = 0.08
+        delay = 0.06
+        monkeypatch.setattr(server, "admin_connections", {object()})
+        monkeypatch.setattr(server, "DEVICE_LIST_BROADCAST_DELAY", delay)
 
         async def work():
             start_times.append(asyncio.get_running_loop().time())
-            if len(start_times) == 1:
+            snapshots.append(state["value"])
+            if len(snapshots) == 1:
                 started.set()
                 await release_first.wait()
             else:
                 second_started.set()
 
-        coalescer = server._Coalescer(delay, work, "test")
-        coalescer.schedule()
+        monkeypatch.setattr(server, "broadcast_device_list", work)
+        for value in (1, 2, 3):
+            state["value"] = value
+            server._schedule_device_list_broadcast()
         await asyncio.wait_for(started.wait(), 1)
-        coalescer.schedule()
+        state["value"] = 4
+        server._schedule_device_list_broadcast()
         release_first.set()
+        await asyncio.sleep(0.01)
+        state["value"] = 5
+        server._schedule_device_list_broadcast()
         await asyncio.wait_for(second_started.wait(), 1)
-
+        assert snapshots == [3, 5]
         assert start_times[1] - start_times[0] >= delay - 0.01
-        await coalescer.flush(run=False)
+        await server._flush_device_list_broadcast()
 
     asyncio.run(body())
 
 
-def test_coalescer_flush_false_cancels_and_joins_in_flight_work():
+def test_device_list_broadcast_cleanup_cancels_and_joins_in_flight_send(monkeypatch):
     async def body():
         started = asyncio.Event()
         cancelled = asyncio.Event()
+        monkeypatch.setattr(server, "admin_connections", {object()})
+        monkeypatch.setattr(server, "DEVICE_LIST_BROADCAST_DELAY", 0)
 
         async def work():
             started.set()
@@ -1010,13 +971,12 @@ def test_coalescer_flush_false_cancels_and_joins_in_flight_work():
             finally:
                 cancelled.set()
 
-        coalescer = server._Coalescer(0.01, work, "test")
-        coalescer.schedule()
+        monkeypatch.setattr(server, "broadcast_device_list", work)
+        server._schedule_device_list_broadcast()
         await asyncio.wait_for(started.wait(), 1)
-        await asyncio.wait_for(coalescer.flush(run=False), 1)
-
+        await asyncio.wait_for(server._flush_device_list_broadcast(), 1)
         assert cancelled.is_set()
-        assert coalescer._task is None
+        assert server._device_list_broadcast_task is None
 
     asyncio.run(body())
 
@@ -1111,21 +1071,19 @@ def test_get_device_list_request_uses_the_bounded_admin_send_path(tmp_path, monk
 
 
 def test_device_list_is_not_built_or_scheduled_without_admins(monkeypatch):
-    schedules = []
-
     def fail_build():
         raise AssertionError("device list should not be built with no admins")
 
     monkeypatch.setattr(server, "admin_connections", set())
     monkeypatch.setattr(server, "build_device_list_msg", fail_build)
-    monkeypatch.setattr(server._device_list_broadcast, "schedule", lambda: schedules.append(True))
 
     async def body():
+        await server._flush_device_list_broadcast()
         await server.broadcast_device_list()
         server._schedule_device_list_broadcast()
+        assert server._device_list_broadcast_task is None
 
     asyncio.run(body())
-    assert schedules == []
 
 
 def test_register_and_disconnect_lists_are_coalesced_for_canonical_devices(tmp_path, monkeypatch):
@@ -1186,7 +1144,7 @@ def test_reconnect_registry_writes_are_coalesced_after_the_first_registration(tm
                 return original_write(configuration, records)
 
             monkeypatch.setattr(server, "_write_registry", count_write)
-            monkeypatch.setattr(server._telemetry_save, "_delay", 60)
+            monkeypatch.setattr(server, "TELEMETRY_SAVE_DELAY", 60)
             for _ in range(3):
                 async with session.ws_connect(base + "/ws/device") as device:
                     await _register(device)
@@ -1195,7 +1153,7 @@ def test_reconnect_registry_writes_are_coalesced_after_the_first_registration(tm
 
             assert DEVICE_ID not in server.devices
             final_last_seen = server.device_registry[DEVICE_ID]["last_seen"]
-            await server._telemetry_save.flush(run=True)
+            server._flush_telemetry_save()
             assert len(writes) == 2
             assert writes[-1] == final_last_seen
             saved = json.loads(server.REGISTRY_PATH.read_text())
@@ -1285,7 +1243,7 @@ def test_update_group_members_uses_expected_owners_from_each_console_snapshot(tm
         added_offline_id = "SERIAL-NEW"
         policy_targets = asyncio.Queue()
 
-        async def capture_policy_targets(device_ids):
+        def capture_policy_targets(device_ids):
             policy_targets.put_nowait(sorted(device_ids))
 
         monkeypatch.setattr(server, "_publish_configuration", capture_policy_targets)
@@ -1439,17 +1397,25 @@ def test_deploy_response_and_admin_metadata_do_not_wait_for_device_delivery(tmp_
             released = asyncio.Event()
             entered = asyncio.Event()
             holding = False
-            publish_configuration = server._publish_configuration
+            queue_configuration = server._queue_configuration
 
-            async def hold_device_delivery(members):
+            def hold_device_delivery(device_id, entry):
                 if not holding:
-                    return await publish_configuration(members)
-                assert members == [DEVICE_ID]
-                entered.set()
-                await released.wait()
+                    return queue_configuration(device_id, entry)
+                assert device_id == DEVICE_ID
 
-            monkeypatch.setattr(server, "_publish_configuration", hold_device_delivery)
-            async with session.ws_connect(base + "/ws/admin") as other_console:
+                async def queue_after_release():
+                    entered.set()
+                    await released.wait()
+                    queue_configuration(device_id, entry)
+
+                asyncio.create_task(queue_after_release())
+
+            monkeypatch.setattr(server, "_queue_configuration", hold_device_delivery)
+            async with (session.ws_connect(base + "/ws/device") as device,
+                        session.ws_connect(base + "/ws/admin") as other_console):
+                await _register(device)
+                await _receive_type(device, "CONFIGURATION_POLICY")
                 before_snapshot = await _receive_type(other_console, "GROUP_LIST")
                 before_revision = before_snapshot["revision"]
                 before = before_snapshot["deployments"]
@@ -1490,6 +1456,9 @@ def test_deploy_response_and_admin_metadata_do_not_wait_for_device_delivery(tmp_
                 finally:
                     released.set()
                     await request
+                delivered = await _receive_type(device, "CONFIGURATION_POLICY")
+                assert delivered["package_id"] == saved["package_id"]
+                assert delivered["revision"] == revision
     asyncio.run(body())
 
 
@@ -2006,13 +1975,7 @@ def test_unified_wifi_policy_publishes_networks_and_auto_return_together(tmp_pat
                 assert published["settings"]["wifi"] == {
                     "managed": True,
                     "value": {
-                        "networks": [
-                            {"ssid": network["ssid"], "security": network["security"],
-                             "password": network["password"],
-                             "password_present": network["security"] == "WPA2_WPA3",
-                             "hidden": network["hidden"]}
-                            for network in value["networks"]
-                        ],
+                        "networks": value["networks"],
                         "auto_return": value["auto_return"],
                     },
                 }
@@ -2119,7 +2082,7 @@ def test_unmanaged_hidden_wifi_auto_return_can_be_saved_but_managed_value_is_rej
             assert saved["settings"]["wifi"]["value"]["auto_return"] is True
             assert saved["settings"]["wifi"]["value"]["networks"] == [{
                 "ssid": "Hidden Office", "security": "WPA2_WPA3",
-                "password": "test-password", "password_present": True, "hidden": True,
+                "password": "test-password", "hidden": True,
             }]
 
             current = await _request(session, "GET", base, _path(saved))

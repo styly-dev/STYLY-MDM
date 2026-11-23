@@ -31,7 +31,7 @@ def normalize_revision(value: Any) -> str | None:
 
 WIFI_REASONS = {
     "NONE", "PERMISSION_DENIED", "UNSUPPORTED", "CONFIG_READ_FAILED",
-    "UPDATE_FAILED", "VERIFY_FAILED", "VERIFY_AFTER_REBOOT", "FALLBACK", "SAVED",
+    "UPDATE_FAILED", "VERIFY_FAILED", "SAVED",
     "UNREACHABLE", "UNKNOWN", "UNSUPPORTED_HIDDEN_NETWORK",
     "UNSUPPORTED_PRIORITY_NETWORK_LIMIT",
 }
@@ -55,20 +55,15 @@ def public_wifi_state(raw: Any) -> dict | None:
 
 def validate_profile_networks(
     raw_networks: Any,
-    previous: list[dict[str, Any]] | None = None,
     *,
     allow_empty: bool = False,
 ) -> list[dict[str, Any]]:
-    """Validate ordered Wi-Fi networks and preserve omitted passwords by identity."""
+    """Validate ordered Wi-Fi networks and their credentials."""
     if not isinstance(raw_networks, list) or (not raw_networks and not allow_empty):
         raise WiFiSettingsError("networks must be a non-empty list")
     if len(raw_networks) > MAX_WIFI_NETWORKS:
         raise WiFiSettingsError(f"networks may contain at most {MAX_WIFI_NETWORKS} entries")
 
-    previous_by_identity = {
-        (item.get("ssid"), item.get("security")): item
-        for item in previous or [] if isinstance(item, dict)
-    }
     result: list[dict[str, Any]] = []
     identities: set[tuple[str, str]] = set()
     for raw in raw_networks:
@@ -105,11 +100,6 @@ def validate_profile_networks(
             if supplied_password not in (None, ""):
                 raise WiFiSettingsError("OPEN networks must have an empty password")
             password = ""
-        elif supplied_password is None:
-            old = previous_by_identity.get(identity)
-            if old is None or not isinstance(old.get("password"), str) or not old["password"]:
-                raise WiFiSettingsError("a password is required for a new WPA2_WPA3 network")
-            password = old["password"]
         elif isinstance(supplied_password, str):
             try:
                 encoded = supplied_password.encode("ascii")
@@ -119,21 +109,7 @@ def validate_profile_networks(
                 raise WiFiSettingsError("WPA2_WPA3 password must be 1 to 63 printable ASCII characters")
             password = supplied_password
         else:
-            raise WiFiSettingsError("password must be a string or null")
+            raise WiFiSettingsError("WPA2_WPA3 networks require a password")
 
         result.append({"ssid": ssid, "security": security, "password": password, "hidden": hidden})
     return result
-
-
-def editor_networks(networks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return the saved networks for the package editor."""
-    return [
-        {
-            "ssid": network["ssid"],
-            "security": network["security"],
-            "password": network["password"],
-            "password_present": network["security"] == "WPA2_WPA3" and bool(network.get("password")),
-            "hidden": network["hidden"],
-        }
-        for network in networks
-    ]

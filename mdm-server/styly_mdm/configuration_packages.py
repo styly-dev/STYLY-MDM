@@ -1,12 +1,10 @@
 """PICO 4 Ultra Enterprise configuration packages, validation, and public projections."""
 
-import copy
 import re
 
 from .wifi_settings import (
     WIFI_REASONS,
     WiFiSettingsError,
-    editor_networks,
     normalize_revision,
     validate_profile_networks,
 )
@@ -125,7 +123,7 @@ def _validate_delays(settings):
         raise PackageError("Screen off delay must not exceed sleep delay")
 
 
-def _validate_wifi(value, *, managed, previous=None):
+def _validate_wifi(value, *, managed):
     if (not isinstance(value, dict) or not {"networks", "auto_return"}.issubset(value)
             or set(value) - {"networks", "auto_return", "prioritize_networks"}):
         raise PackageError("Wi-Fi value must contain networks and auto_return, with optional prioritize_networks")
@@ -137,11 +135,8 @@ def _validate_wifi(value, *, managed, previous=None):
         raise PackageError("prioritize_networks must be a boolean")
     if not prioritize_networks and auto_return:
         raise PackageError("auto_return must be false when prioritize_networks is false")
-    previous_networks = previous.get("networks") if isinstance(previous, dict) else None
     try:
-        networks = validate_profile_networks(
-            value["networks"], previous_networks, allow_empty=not managed,
-        )
+        networks = validate_profile_networks(value["networks"], allow_empty=not managed)
     except WiFiSettingsError as exc:
         raise PackageError(str(exc)) from None
     if managed and prioritize_networks and auto_return and any(network["hidden"] for network in networks):
@@ -152,30 +147,28 @@ def _validate_wifi(value, *, managed, previous=None):
     return result
 
 
-def _validate_value(key, value, *, managed=True, previous=None):
+def _validate_value(key, value, *, managed):
     item = _ITEMS.get(key)
     if item is None:
         raise PackageError("Settings contain an unsupported item")
     if key == "wifi":
-        return _validate_wifi(value, managed=managed, previous=previous)
+        return _validate_wifi(value, managed=managed)
     if not _valid_value(item, value):
         raise PackageError(f"Invalid value for {item['label']}")
     return value
 
 
-def validate_settings(settings, previous=None):
+def validate_settings(settings):
     """Validate package settings against the current setting catalog."""
     if not isinstance(settings, dict):
         raise PackageError("settings must be an object")
-    previous = previous or {}
     result = {}
     for key, entry in settings.items():
         if (not isinstance(entry, dict) or set(entry) != {"managed", "value"}
                 or type(entry["managed"]) is not bool):
             raise PackageError("Each setting must have managed and value fields")
         managed = entry["managed"]
-        value = _validate_value(key, entry["value"], managed=managed,
-                                previous=previous.get(key, {}).get("value"))
+        value = _validate_value(key, entry["value"], managed=managed)
         result[key] = {"managed": managed, "value": value}
     managed = managed_settings(result)
     _validate_delays(managed)
@@ -196,20 +189,15 @@ def public_summary(package_id, profile):
     return {
         "package_id": package_id,
         "name": profile["name"],
+        "edit_revision": profile["edit_revision"],
         "published_revision": profile["published_revision"],
     }
 
 
 def editor_profile(package_id, profile, impact):
-    settings = copy.deepcopy(profile["settings"])
-    if "wifi" in settings:
-        settings["wifi"]["value"]["networks"] = editor_networks(settings["wifi"]["value"]["networks"])
     return {
-        "package_id": package_id,
-        "name": profile["name"],
-        "edit_revision": profile["edit_revision"],
-        "published_revision": profile["published_revision"],
-        "settings": settings,
+        **public_summary(package_id, profile),
+        "settings": profile["settings"],
         "sections": SECTIONS,
         "impact": impact,
     }

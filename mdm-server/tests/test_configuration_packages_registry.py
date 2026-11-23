@@ -116,11 +116,10 @@ def test_registry_loads_other_devices_when_an_identity_kind_is_malformed(tmp_pat
     assert server.device_registry["good"]["identity_kind"] == "canonical"
 
 
-def test_configuration_revision_orders_one_snapshot_stream_and_ignores_saved_counters(tmp_path):
+def test_configuration_revision_orders_one_snapshot_stream_and_resets_on_restart(tmp_path):
     _write_package_registry(tmp_path, {"Studio": ([], None)})
     registry = json.loads(server.REGISTRY_PATH.read_text())
     registry["operator_metadata"] = {"preserve": True}
-    registry["configuration_revision"] = 23
     server.REGISTRY_PATH.write_text(json.dumps(registry))
     server.load_registry()
 
@@ -656,7 +655,7 @@ def test_wifi_editor_returns_saved_password_and_keeps_nested_policy():
     assert editor["settings"]["wifi"]["value"] == {
         "networks": [{
             "ssid": "Hidden Office", "security": "WPA2_WPA3", "password": "test-password",
-            "password_present": True, "hidden": True,
+            "hidden": True,
         }],
         "auto_return": False,
     }

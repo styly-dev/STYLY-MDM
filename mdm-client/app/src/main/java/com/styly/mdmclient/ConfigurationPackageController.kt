@@ -48,26 +48,16 @@ internal data class ConfigurationAttempt(
     fun saved(): JSONObject = report()
         .put("boot_count", bootCount)
         .put("retry_ids", JSONArray(retryIds))
-        // Older clients require this field when reading the same journal.
-        .put("scalar_targets", JSONObject())
 
     companion object {
         fun restore(json: JSONObject): ConfigurationAttempt {
             val status = json.getString("status")
             val retryIds = json.getJSONArray("retry_ids")
-            val results = json.getJSONObject("results")
-            val wifi = results.optJSONObject("wifi")
-            // Older attempts recorded connection-only failures after the settings were read back.
-            val wifiWasSaved = status == "complete" && wifi?.optString("status") == "failed" &&
-                (wifi.optString("reason") == WifiReason.VERIFY_AFTER_REBOOT.wireValue ||
-                    (wifi.optString("reason") == WifiReason.UNREACHABLE.wireValue &&
-                        (json.opt("wifi_connection_check_revision") as? String)?.let(WifiSettingsProtocol::isValidUuid) == true))
-            if (wifiWasSaved) results.put("wifi", settingOutcome("applied", reason = WifiReason.SAVED.wireValue))
             return ConfigurationAttempt(
                 version = ConfigurationVersion.parse(json) ?: throw JSONException("Invalid saved package version"),
                 bootCount = json.getInt("boot_count"),
                 status = if (status == "applying") "interrupted" else status,
-                results = results,
+                results = json.getJSONObject("results"),
                 retryIds = (0 until retryIds.length()).map(retryIds::getString).toSet(),
             )
         }
@@ -641,23 +631,9 @@ internal class ConfigurationPackageController(
 }
 
 private fun productionDependencies(context: Context): ConfigurationPackageDependencies {
-    val preferences = context.getSharedPreferences("configuration-packages", Context.MODE_PRIVATE)
     val store = ConfigurationPackageStore(
         File(context.noBackupFilesDir, "configuration-packages.json"),
         syncDirectory = ::syncDirectory,
-        readLegacy = {
-            ConfigurationPackageState(
-                lastPolicy = preferences.getString("last_policy", null),
-                journal = preferences.getString("journal", null),
-            )
-        },
-        clearLegacy = {
-            if (preferences.contains("last_policy") || preferences.contains("journal")) {
-                if (!preferences.edit().remove("last_policy").remove("journal").commit()) {
-                    Log.w("ConfigurationPackages", "Could not remove the legacy configuration cache")
-                }
-            }
-        },
     )
     val appliedNotice = PicoPackageAppliedNotice(context.applicationContext)
     return ConfigurationPackageDependencies(

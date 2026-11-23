@@ -8,9 +8,9 @@ managed LAN. Package deployment and the client implementation are described in
 
 Open **Manage Groups → Configuration Packages**, choose a package, then expand
 **Network & connectivity**. Select **Manage** on **Wi-Fi networks** and add
-Open or WPA2/WPA3 Personal networks. The editor fills in the saved password.
-Enter a new password to replace it. An empty field keeps the saved key for the
-same SSID and security. Choose **Save & deploy**. The confirmation
+Open or WPA2/WPA3 Personal networks. The editor displays saved and newly typed
+passwords in plain text. Each secured network needs a password. Edit the
+displayed value to replace it, then choose **Save & deploy**. The confirmation
 includes all assigned groups and members. Offline devices receive the latest
 revision when they connect. Group **Settings** shows Wi-Fi readiness and the
 last package result.

@@ -107,33 +107,25 @@ test('PICO home app saves the Android package name entered in Basic settings', a
   assert.equal(fixture.requests.at(-1).url, '/api/packages/pkg/save-and-deploy');
 });
 
-test('managed Wi-Fi pre-fills saved passwords and reorders whole candidates', async () => {
+test('managed Wi-Fi shows saved passwords in plaintext and keeps them with reordered candidates', async () => {
   let latest = profile({ settings: { wifi: { managed: true, value: {
     auto_return: false,
     networks: [
-      { ssid: 'Studio', security: 'WPA2_WPA3', hidden: false, password: 'stored-secret', password_present: true },
-      { ssid: 'Backup', security: 'WPA2_WPA3', hidden: false, password_present: false },
+      { ssid: 'Studio', security: 'WPA2_WPA3', hidden: false, password: 'stored-secret' },
+      { ssid: 'Backup', security: 'WPA2_WPA3', hidden: false, password: 'backup-stored' },
     ],
   } } } });
   const fixture = createHarness(({ method, body }) => {
     if (method === 'GET') return response(latest);
-    const previousNetworks = latest.settings.wifi.value.networks;
-    const wifiValue = body.settings.wifi.value;
-    const networks = wifiValue.networks.map(({ password, ...network }) => {
-      const previous = previousNetworks.find(candidate =>
-        candidate.ssid === network.ssid && candidate.security === network.security);
-      const savedPassword = password ?? previous?.password ?? '';
-      return { ...network, password: savedPassword, password_present: Boolean(savedPassword) };
-    });
-    latest = profile({ settings: { ...body.settings, wifi: { ...body.settings.wifi, value: { ...wifiValue, networks } } },
+    latest = profile({ settings: body.settings,
       editRevision: 'edit2', publishedRevision: 'r1' });
     return response(latest);
   });
   fixture.broadcast();
   await fixture.controller.showPackages('pkg');
-  assert.doesNotMatch(fixture.packagePanel.innerHTML, /stored-secret|backup-secret/);
   const [studioPassword, backupPassword] = fixture.passwordInputs();
-  assert.deepEqual([studioPassword.value, backupPassword.value], ['stored-secret', '']);
+  assert.match(fixture.packagePanel.innerHTML, /type="text"[^>]*data-field="password"/);
+  assert.deepEqual([studioPassword.value, backupPassword.value], ['stored-secret', 'backup-stored']);
   assert.match(fixture.packagePanel.innerHTML, /1–63 ASCII characters/);
   assert.match(fixture.packagePanel.innerHTML, /1–7 require WPA3/);
   assert.match(fixture.packagePanel.innerHTML, /aria-label="Move Wi-Fi 1 down"[^>]*><svg/);
@@ -148,31 +140,28 @@ test('managed Wi-Fi pre-fills saved passwords and reorders whole candidates', as
   fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'security' }, type: 'select-one', value: 'WPA2_WPA3' });
   assert.equal(studioPassword.value, 'stored-secret');
 
-  fixture.edit({ dataset: { setting: 'wifi', network: '1', field: 'password' }, type: 'password', value: 'backup-secret' });
+  fixture.edit({ dataset: { setting: 'wifi', network: '1', field: 'password' }, type: 'text', value: 'backup-secret' });
   fixture.policyClick({ policyAction: 'move-network', setting: 'wifi', network: '0', direction: 'down' });
-  latest.settings.wifi.value.networks[0].password = 'rotated-secret';
-  latest.edit_revision = 'rotated-revision';
   await fixture.editClick('reload');
-  assert.deepEqual(fixture.passwordInputs().map(input => input.value), ['backup-secret', 'rotated-secret']);
+  assert.deepEqual(fixture.passwordInputs().map(input => input.value), ['backup-secret', 'stored-secret']);
   await fixture.editClick('deploy');
 
   const posted = fixture.requests.at(-1).body.settings;
   assert.deepEqual(posted.wifi.value.networks.map(({ ssid, password }) => [ssid, password]), [
-    ['Backup', 'backup-secret'], ['Studio', undefined],
+    ['Backup', 'backup-secret'], ['Studio', 'stored-secret'],
   ]);
   assert.equal(posted.wifi.value.auto_return, false);
   assert.equal(Object.hasOwn(posted, 'wifiPriority'), false);
-  assert.deepEqual(latest.settings.wifi.value.networks.map(({ ssid, password_present }) => [ssid, password_present]), [
-    ['Backup', true], ['Studio', true],
+  assert.deepEqual(latest.settings.wifi.value.networks.map(({ ssid, password }) => [ssid, password]), [
+    ['Backup', 'backup-secret'], ['Studio', 'stored-secret'],
   ]);
-  assert.doesNotMatch(fixture.packagePanel.innerHTML, /backup-secret/);
-  assert.deepEqual(fixture.passwordInputs().map(input => input.value), ['backup-secret', 'rotated-secret']);
+  assert.deepEqual(fixture.passwordInputs().map(input => input.value), ['backup-secret', 'stored-secret']);
 });
 
 test('Wi-Fi accepts short WPA3-only ASCII passwords and rejects invalid values', () => {
   const saved = loadDraft(sections, { wifi: { managed: true, value: {
     auto_return: false,
-    networks: [{ ssid: 'Short', security: 'WPA2_WPA3', hidden: false, password_present: false }],
+    networks: [{ ssid: 'Short', security: 'WPA2_WPA3', hidden: false, password: '' }],
   } } });
   const draft = structuredClone(saved);
   draft.wifi.value.networks[0].password = '1234567';
@@ -186,13 +175,22 @@ test('Wi-Fi accepts short WPA3-only ASCII passwords and rejects invalid values',
   assert.throws(() => buildPayload(sections, draft, saved), /1 to 63 ASCII characters/);
   draft.wifi.value.networks[0].password = '';
   assert.throws(() => buildPayload(sections, draft, saved), /Enter a 1 to 63 character ASCII password/);
+
+  const savedPassword = loadDraft(sections, { wifi: { managed: true, value: {
+    auto_return: false,
+    networks: [{ ssid: 'Saved', security: 'WPA2_WPA3', hidden: false, password: 'saved-secret' }],
+  } } });
+  const omittedPassword = structuredClone(savedPassword);
+  omittedPassword.wifi.value.networks[0].password = '';
+  assert.throws(() => buildPayload(sections, omittedPassword, savedPassword),
+    /Enter a 1 to 63 character ASCII password/, 'an empty draft never inherits a saved password');
 });
 
 test('unmanaging Wi-Fi discards an incomplete draft row and retains saved metadata and credentials', () => {
   const saved = loadDraft(sections, { wifi: { managed: true, value: {
     prioritize_networks: false,
     auto_return: false,
-    networks: [{ ssid: '日本語', security: 'WPA2_WPA3', hidden: false, password_present: true }],
+    networks: [{ ssid: '日本語', security: 'WPA2_WPA3', hidden: false, password: 'saved-secret' }],
   } } });
   const draft = structuredClone(saved);
   draft.wifi.value.networks.push({ ssid: '', security: 'OPEN', hidden: false, password: '' });
@@ -200,10 +198,10 @@ test('unmanaging Wi-Fi discards an incomplete draft row and retains saved metada
 
   const payload = buildPayload(sections, draft, saved).wifi;
   assert.deepEqual(payload, { managed: false, value: {
-    networks: [{ ssid: '日本語', security: 'WPA2_WPA3', hidden: false }],
+    networks: [{ ssid: '日本語', security: 'WPA2_WPA3', hidden: false, password: 'saved-secret' }],
     auto_return: false, prioritize_networks: false,
   } });
-  assert.equal(Object.hasOwn(payload.value.networks[0], 'password'), false);
+  assert.equal(payload.value.networks[0].password, 'saved-secret');
 });
 
 test('Wi-Fi edits stop counting as dirty after unmanaging an already unmanaged setting', async () => {
@@ -260,7 +258,7 @@ test('Wi-Fi SSIDs follow the server UTF-8 byte and character rules', () => {
 test('auto-return is stored inside the Wi-Fi setting and hidden networks are rejected', async () => {
   let latest = profile({ settings: { wifi: { managed: true, value: {
     auto_return: false,
-    networks: [{ ssid: 'Studio', security: 'OPEN', hidden: false, password_present: false }],
+    networks: [{ ssid: 'Studio', security: 'OPEN', hidden: false }],
   } } } });
   const fixture = createHarness(({ method, body }) => {
     if (method === 'GET') return response(latest);
@@ -296,7 +294,7 @@ test('auto-return is stored inside the Wi-Fi setting and hidden networks are rej
 
   const hiddenSaved = loadDraft(sections, { wifi: { managed: true, value: {
     auto_return: false,
-    networks: [{ ssid: 'Hidden', security: 'OPEN', hidden: true, password_present: false }],
+    networks: [{ ssid: 'Hidden', security: 'OPEN', hidden: true }],
   } } });
   const hiddenDraft = structuredClone(hiddenSaved);
   hiddenDraft.wifi.value.auto_return = true;
@@ -310,8 +308,8 @@ test('Wi-Fi Android selection disables ordering and auto-return, and saves expli
     prioritize_networks: true,
     auto_return: true,
     networks: [
-      { ssid: 'Studio', security: 'OPEN', hidden: false, password_present: false },
-      { ssid: 'Backup', security: 'OPEN', hidden: false, password_present: false },
+      { ssid: 'Studio', security: 'OPEN', hidden: false },
+      { ssid: 'Backup', security: 'OPEN', hidden: false },
     ],
   } } } });
   const fixture = createHarness(({ method, body }) => {
@@ -342,7 +340,7 @@ test('Wi-Fi Android selection disables ordering and auto-return, and saves expli
   });
   const saved = loadDraft(sections, { wifi: { managed: true, value: {
     prioritize_networks: false, auto_return: false,
-    networks: [{ ssid: 'Studio', security: 'OPEN', hidden: false, password_present: false }],
+    networks: [{ ssid: 'Studio', security: 'OPEN', hidden: false }],
   } } });
   assert.equal(saved.wifi.value.prioritize_networks, false);
   assert.deepEqual(buildPayload(sections, saved, saved).wifi.value, {
@@ -355,7 +353,7 @@ test('Wi-Fi Android selection disables ordering and auto-return, and saves expli
 
 test('managed Wi-Fi allows at most four candidates in the editor and payload', async () => {
   const networks = Array.from({ length: 3 }, (_, index) => ({
-    ssid: `Network-${index + 1}`, security: 'OPEN', hidden: false, password_present: false,
+    ssid: `Network-${index + 1}`, security: 'OPEN', hidden: false,
   }));
   let latest = profile({ settings: { wifi: { managed: true, value: { auto_return: false, networks } } } });
   const fixture = createHarness(({ method, body }) => {
@@ -389,11 +387,7 @@ test('a new package gets its first Wi-Fi network after Manage and reopens with d
   let latest = profile({ settings: {} });
   const fixture = createHarness(({ method, body }) => {
     if (method === 'GET') return response(latest);
-    const networks = body.settings.wifi.value.networks.map(({ password, ...network }) => ({
-      ...network, password, password_present: Boolean(password),
-    }));
-    latest = profile({ settings: { ...body.settings, wifi: { ...body.settings.wifi,
-      value: { ...body.settings.wifi.value, networks } } }, editRevision: 'edit2', publishedRevision: 'r1' });
+    latest = profile({ settings: body.settings, editRevision: 'edit2', publishedRevision: 'r1' });
     return response(latest);
   });
   fixture.broadcast();
@@ -407,7 +401,7 @@ test('a new package gets its first Wi-Fi network after Manage and reopens with d
   fixture.policyClick({ policyAction: 'add-network', setting: 'wifi' });
   fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'ssid' }, value: 'Studio', type: 'text' });
   fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'security' }, value: 'WPA2_WPA3', type: 'select-one' });
-  fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'password' }, value: 'studio-pass', type: 'password' });
+  fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'password' }, value: 'studio-pass', type: 'text' });
   // Rendering a second row must restore the typed password into the first row's new input.
   fixture.policyClick({ policyAction: 'add-network', setting: 'wifi' });
   assert.deepEqual(fixture.passwordInputs().map(input => input.value), ['studio-pass', '']);
@@ -420,11 +414,11 @@ test('a new package gets its first Wi-Fi network after Manage and reopens with d
   await fixture.controller.showPackages('pkg');
   assert.deepEqual(fixture.passwordInputs().map(input => input.value), ['studio-pass']);
   assert.equal(fixture.editorButtons.deploy.disabled, false);
-  assert.doesNotMatch(fixture.packagePanel.innerHTML, /studio-pass/);
+  assert.match(fixture.packagePanel.innerHTML, /type="text"[^>]*data-field="password"/);
 });
 
-const pkg = { package_id: 'pkg', name: 'Studio', published_revision: 'r0' };
-const pkg2 = { package_id: 'pkg2', name: 'Night studio', published_revision: null };
+const pkg = { package_id: 'pkg', name: 'Studio', edit_revision: 'edit1', published_revision: 'r0' };
+const pkg2 = { package_id: 'pkg2', name: 'Night studio', edit_revision: 'edit1', published_revision: null };
 const d1 = { package_id: 'pkg', revision: 'r1', keys: ['brightness'] };
 
 function groupSnapshot(revision, { packages = [pkg, pkg2], assignments = {}, deployments = {}, groups = { 'The Lab': ['headset'] },
@@ -562,6 +556,7 @@ test('Wi-Fi fallback is displayed as Applied', () => {
   assert.match(results, /Applied/);
   assert.match(results, /Results at apply time/);
   assert.match(results, /aria-label="Applied">✓<\/span>\s*<span>wifi<\/span>/);
+  assert.match(results, /Fallback/);
   assert.doesNotMatch(results, /rolled back|restored|reboot required/i);
   assert.equal(deviceOutcome(devices[0], 'pkg', deployment)[1], 'Applied');
 });
@@ -604,28 +599,28 @@ test('device results start collapsed and reveal failed settings and verified val
   assert.equal(retryEligible(devices[0], deployment), true);
 });
 
-test('legacy saved Wi-Fi awaiting reboot counts as applied and has no Wi-Fi-only Retry', () => {
+test('failed Wi-Fi remains failed and retryable regardless of its reason', () => {
   const deployment = { ...d1, keys: ['brightness', 'wifi'] };
   const report = { ...deployment, status: 'complete', results: {
     brightness: { status: 'applied', value: 60 },
     wifi: { status: 'failed', reason: 'VERIFY_AFTER_REBOOT' },
   } };
   const device = { ...online, configuration_state: report };
-  assert.equal(deviceOutcome(device, pkg.package_id, deployment)[0], 'success');
-  assert.equal(deviceOutcome(device, pkg.package_id, deployment)[1], 'Applied');
-  assert.match(deviceOutcome(device, pkg.package_id, deployment)[2], /Saved Wi-Fi profiles and auto-connect flags were read back/);
-  assert.equal(retryEligible(device, deployment), false);
+  assert.equal(deviceOutcome(device, pkg.package_id, deployment)[0], 'failed');
+  assert.equal(deviceOutcome(device, pkg.package_id, deployment)[1], 'Partially applied');
+  assert.equal(retryEligible(device, deployment), true);
 
   const fixture = createHarness(() => assert.fail('rendering results should not call the API'), { devices: [device] });
   fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
   fixture.controller.renderGroup('The Lab');
   const results = fixture.groupControls['[data-settings-results]'].innerHTML;
-  assert.match(results, /aria-label="Applied">✓<\/span>\s*<span>wifi<\/span><span class="settings-readback-value">Saved<\/span>/);
-  assert.doesNotMatch(results, /aria-label="Failed"|Verify after reboot|data-group-action="retry"/);
+  assert.match(results, /aria-label="Failed"/);
+  assert.match(results, /Verify after reboot/);
+  assert.match(results, /data-group-action="retry"/);
 
   const retryableMixed = { ...report, results: { ...report.results,
     brightness: { status: 'failed', reason: 'WRITE_FAILED' } } };
-  assert.equal(deviceOutcome({ ...device, configuration_state: retryableMixed }, pkg.package_id, deployment)[1], 'Partially applied');
+  assert.equal(deviceOutcome({ ...device, configuration_state: retryableMixed }, pkg.package_id, deployment)[1], 'Apply failed');
   assert.equal(retryEligible({ ...device, configuration_state: retryableMixed }, deployment), true);
 });
 
@@ -1316,11 +1311,11 @@ test('a Wi-Fi strategy edit conflicts with a remote network addition', async () 
   });
 });
 
-test('a masked local Wi-Fi password cannot overwrite a newer saved password', async () => {
+test('reload replaces a conflicting local Wi-Fi password with the newer saved password', async () => {
   const initial = profile({ settings: { wifi: { managed: true, value: {
     auto_return: false, prioritize_networks: true,
     networks: [{ ssid: 'Studio', security: 'WPA2_WPA3', hidden: false,
-      password: 'saved-secret', password_present: true }],
+      password: 'saved-secret' }],
   } } } });
   let latest = initial;
   const fixture = createHarness(({ method, body }) => {
@@ -1329,7 +1324,7 @@ test('a masked local Wi-Fi password cannot overwrite a newer saved password', as
       latest = profile({ editRevision: 'remote', settings: { wifi: { managed: true, value: {
         auto_return: false, prioritize_networks: true,
         networks: [{ ssid: 'Studio', security: 'WPA2_WPA3', hidden: false,
-          password: 'remote-secret', password_present: true }],
+          password: 'remote-secret' }],
       } } } });
       return response({ error: 'Draft changed.' }, 409);
     }
@@ -1337,15 +1332,15 @@ test('a masked local Wi-Fi password cannot overwrite a newer saved password', as
   });
   fixture.broadcast();
   await fixture.controller.showPackages('pkg');
-  fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'password' }, type: 'password', value: 'local-secret' });
+  fixture.edit({ dataset: { setting: 'wifi', network: '0', field: 'password' }, type: 'text', value: 'local-secret' });
   await fixture.editClick('deploy');
   await fixture.editClick('reload');
 
   assert.deepEqual(fixture.passwordInputs().map(input => input.value), ['remote-secret']);
   assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /overlapped newer server changes.*Wi-Fi networks/);
   await fixture.editClick('deploy');
-  assert.equal(Object.hasOwn(fixture.requests.at(-1).body.settings.wifi.value.networks[0], 'password'), false,
-    'the latest saved password is retained without resending a stale or conflicting secret');
+  assert.equal(fixture.requests.at(-1).body.settings.wifi.value.networks[0].password, 'remote-secret',
+    'the latest saved password is the explicit value in the draft and request');
 });
 
 test('concurrent edits to hour and minute cannot produce a third shutdown time', async () => {
@@ -1374,7 +1369,7 @@ test('concurrent edits to hour and minute cannot produce a third shutdown time',
     { enabled: true, hour: 22, minute: 45, repeat: 127 });
 });
 
-test('a newer or removed catalog package keeps the loaded revision visible and requires reload', async () => {
+test('newer package edits or a removed package require reload', async () => {
   let latest = profile();
   let removed = false;
   const fixture = createHarness(({ method }) => {
@@ -1385,14 +1380,14 @@ test('a newer or removed catalog package keeps the loaded revision visible and r
   fixture.broadcast();
   await fixture.controller.showPackages('pkg');
 
-  fixture.broadcast({ packages: [{ ...pkg, published_revision: 'r1' }, pkg2] });
+  fixture.broadcast({ packages: [{ ...pkg, edit_revision: 'edit2', published_revision: 'r1' }, pkg2] });
   assert.match(fixture.editorControls['[data-package-publication]'].textContent,
-    /Loaded version r0.*Latest deployed version r1 is available/);
+    /Loaded version r0.*Package changes are available/);
   assert.match(fixture.editorControls['[data-deploy-hint]'].textContent, /Reload package before deploying/);
   assert.equal(fixture.editorButtons.reload.hidden, false);
   assert.equal(fixture.editorButtons.deploy.disabled, true);
 
-  latest = profile({ publishedRevision: 'r1' });
+  latest = profile({ editRevision: 'edit2', publishedRevision: 'r1' });
   await fixture.editClick('reload');
   assert.match(fixture.editorControls['[data-package-publication]'].textContent, /Loaded version r1/);
   assert.equal(fixture.editorButtons.deploy.disabled, false);
@@ -1407,11 +1402,35 @@ test('a newer or removed catalog package keeps the loaded revision visible and r
   assert.equal(fixture.editorButtons.deploy.disabled, true);
 });
 
+test('a group-only redeploy does not mark unchanged package edits stale', async () => {
+  let latest = profile({ editRevision: 'edit1', publishedRevision: 'r0' });
+  const fixture = createHarness(({ method, url, body }) => {
+    if (method === 'GET') return response(latest);
+    assert.equal(url, '/api/packages/pkg/save-and-deploy');
+    latest = profile({ editRevision: 'edit2', publishedRevision: 'r2', settings: body.settings });
+    return response(latest);
+  });
+  fixture.broadcast();
+  await fixture.controller.showPackages('pkg');
+
+  fixture.broadcast({ packages: [{ ...pkg, published_revision: 'r1' }, pkg2] });
+  assert.match(fixture.editorControls['[data-package-publication]'].textContent,
+    /Loaded version r0.*Latest deployed version r1/);
+  assert.equal(fixture.editorButtons.reload.hidden, true);
+  assert.equal(fixture.editorButtons.deploy.disabled, false);
+
+  fixture.edit({ dataset: { setting: 'brightness' }, type: 'range', value: '63' });
+  await fixture.editClick('deploy');
+  assert.equal(fixture.requests.at(-2).url, '/api/packages/pkg');
+  assert.equal(fixture.requests.at(-1).url, '/api/packages/pkg/save-and-deploy');
+  assert.equal(fixture.requests.at(-1).body.expected_impact, 'impact1');
+});
+
 test('a lost publish response requires reloading the package before publishing again', async () => {
   let latest = profile();
   const fixture = createHarness(({ method }) => {
     if (method === 'GET') return response(latest);
-    latest = profile({ publishedRevision: 'r1' });
+    latest = profile({ editRevision: 'edit2', publishedRevision: 'r1' });
     throw new Error('Connection closed before the response.');
   });
   fixture.broadcast();
@@ -1419,7 +1438,7 @@ test('a lost publish response requires reloading the package before publishing a
   await fixture.editClick('deploy');
   assert.equal(fixture.editorButtons.deploy.disabled, true);
   assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /Could not confirm/);
-  fixture.broadcast({ packages: [{ ...pkg, published_revision: 'r1' }, pkg2] });
+  fixture.broadcast({ packages: [{ ...pkg, edit_revision: 'edit2', published_revision: 'r1' }, pkg2] });
   await fixture.editClick('reload');
   assert.match(fixture.editorControls['[data-package-publication]'].textContent, /Loaded version r1/);
   assert.equal(fixture.editorButtons.deploy.disabled, false);
@@ -1459,7 +1478,7 @@ test('an own WS publication update is not shown as loaded until the matching HTT
   const saving = fixture.editClick('deploy');
   await new Promise(resolve => setImmediate(resolve));
   const before = fixture.packagePanel.innerHTML;
-  fixture.broadcast({ packages: [{ ...pkg, name: 'Remote name', published_revision: 'newer' }, pkg2] });
+  fixture.broadcast({ packages: [{ ...pkg, name: 'Remote name', edit_revision: 'edit2', published_revision: 'newer' }, pkg2] });
   assert.equal(fixture.packagePanel.innerHTML, before);
   assert.match(fixture.editorControls['[data-package-publication]'].textContent,
     /Loaded version r0.*Checking latest deployed version newer/);

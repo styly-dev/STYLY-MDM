@@ -2,14 +2,12 @@ package com.styly.mdmclient
 
 import org.json.JSONArray
 import org.json.JSONObject
-import java.security.MessageDigest
 
 internal const val WIFI_MANUAL_TIMEOUT_MS = 60_000L
 internal const val WIFI_MAX_NETWORKS = 4
 
 internal enum class WifiReason(val wireValue: String) {
     NONE("NONE"),
-    FALLBACK("FALLBACK"),
     SAVED("SAVED"),
     PERMISSION_DENIED("PERMISSION_DENIED"),
     UNSUPPORTED("UNSUPPORTED"),
@@ -18,7 +16,6 @@ internal enum class WifiReason(val wireValue: String) {
     CONFIG_READ_FAILED("CONFIG_READ_FAILED"),
     UPDATE_FAILED("UPDATE_FAILED"),
     VERIFY_FAILED("VERIFY_FAILED"),
-    VERIFY_AFTER_REBOOT("VERIFY_AFTER_REBOOT"),
     STORAGE_ERROR("STORAGE_ERROR"),
     UNREACHABLE("UNREACHABLE"),
     UNKNOWN("UNKNOWN"),
@@ -39,21 +36,10 @@ internal data class WifiNetworkProfile(
     val requiresSaeOnly: Boolean get() = security == "WPA2_WPA3" && password.length in 1..7
 }
 
-internal data class UnverifiedWifiCredential(
-    val bootCount: Int,
-    val passwordHash: String,
-)
-
-internal fun wifiPasswordHash(password: String): String = MessageDigest.getInstance("SHA-256")
-    .digest(password.toByteArray(Charsets.UTF_8))
-    .joinToString("") { byte -> "%02x".format(byte) }
-
 internal data class WifiSavedProfile(
     val revision: String,
     val networks: List<WifiNetworkProfile>,
     val autoReturn: Boolean = false,
-    /** Boot and credential fingerprint for credentials a local connection could not verify. */
-    val unverifiedOnBoot: Map<String, UnverifiedWifiCredential> = emptyMap(),
     /** Original first candidate, even if its settings could not be saved. */
     val primaryIdentity: String? = networks.firstOrNull()?.identity,
     val prioritizeNetworks: Boolean = true,
@@ -68,12 +54,6 @@ internal data class WifiSavedProfile(
         networkIds[network.identity]?.let { network to it }
     }.toMap()
 
-    fun unverifiedBoot(network: WifiNetworkProfile, bootCount: Int): Int? {
-        val marker = unverifiedOnBoot[network.identity] ?: return null
-        val markedBoot = marker.bootCount
-        if (markedBoot >= 0 && bootCount >= 0 && markedBoot != bootCount) return null
-        return markedBoot.takeIf { marker.passwordHash == wifiPasswordHash(network.password) }
-    }
 }
 
 internal data class WifiManualResult(
@@ -84,8 +64,6 @@ internal data class WifiManualResult(
 
 internal data class WifiLocalState(
     val lastApplied: WifiSavedProfile? = null,
-    /** Latest local Wi-Fi operation, including connection selection. */
-    val latestResult: WifiManualResult? = null,
     val managedWifi: Boolean = true,
 )
 
@@ -172,22 +150,19 @@ private fun requiredBoolean(json: JSONObject, key: String): Boolean =
 
 internal object WifiSettingsCodec {
     private const val VERSION = 5
-    private const val LEGACY_VERSION = 4
 
     fun encode(state: WifiLocalState): String = JSONObject().apply {
         put("version", VERSION)
         put("last_applied", state.lastApplied?.let(::encodeSavedProfile) ?: JSONObject.NULL)
-        put("latest_result", state.latestResult?.let(::encodeManualResult) ?: JSONObject.NULL)
         put("managed_wifi", state.managedWifi)
     }.toString()
 
     fun decode(text: String): WifiLocalState {
         val root = JSONObject(text)
         val version = root.optInt("version", -1)
-        require(version == VERSION || version == LEGACY_VERSION) { "unsupported Wi-Fi state version" }
+        require(version == VERSION) { "unsupported Wi-Fi state version" }
         return WifiLocalState(
             lastApplied = root.optJSONObject("last_applied")?.let(::decodeSavedProfile),
-            latestResult = root.optJSONObject("latest_result")?.let(::decodeManualResult),
             managedWifi = requiredBoolean(root, "managed_wifi"),
         )
     }
@@ -198,16 +173,6 @@ internal object WifiSettingsCodec {
         put("auto_return", profile.autoReturn)
         if (!profile.prioritizeNetworks) put("prioritize_networks", false)
         if (profile.networkIds.isNotEmpty()) put("network_ids", JSONObject(profile.networkIds))
-        if (profile.unverifiedOnBoot.isNotEmpty()) {
-            put("unverified_on_boot", JSONObject().apply {
-                profile.unverifiedOnBoot.forEach { (identity, marker) ->
-                    put(identity, JSONObject().apply {
-                        put("boot_count", marker.bootCount)
-                        put("password_hash", marker.passwordHash)
-                    })
-                }
-            })
-        }
         if (profile.primaryIdentity != profile.networks.firstOrNull()?.identity) {
             put("primary_identity", profile.primaryIdentity ?: JSONObject.NULL)
         }
@@ -220,25 +185,6 @@ internal object WifiSettingsCodec {
             revision = json.getString("revision"),
             networks = networks,
             autoReturn = requiredBoolean(json, "auto_return"),
-            unverifiedOnBoot = json.optJSONObject("unverified_on_boot")?.let { entries ->
-                entries.keys().asSequence().mapNotNull { identity ->
-                    val value = entries.get(identity)
-                    val marker = when (value) {
-                        is JSONObject -> UnverifiedWifiCredential(
-                            bootCount = value.getInt("boot_count"),
-                            passwordHash = value.getString("password_hash"),
-                        )
-                        is Number -> {
-                            // Version 4 stored only the boot count. Derive the fingerprint while
-                            // the credential is still available in the saved network list.
-                            val network = networks.firstOrNull { it.identity == identity } ?: return@mapNotNull null
-                            UnverifiedWifiCredential(value.toInt(), wifiPasswordHash(network.password))
-                        }
-                        else -> throw IllegalArgumentException("invalid unverified Wi-Fi marker")
-                    }
-                    identity to marker
-                }.toMap()
-            }.orEmpty(),
             primaryIdentity = if (json.has("primary_identity")) optionalString(json, "primary_identity")
                 else networks.firstOrNull()?.identity,
             prioritizeNetworks = !json.has("prioritize_networks") || requiredBoolean(json, "prioritize_networks"),
@@ -248,18 +194,6 @@ internal object WifiSettingsCodec {
             }.toMap(),
         )
     }
-
-    private fun encodeManualResult(result: WifiManualResult) = JSONObject().apply {
-        put("revision", result.revision)
-        put("status", result.status)
-        put("reason", result.reason.wireValue)
-    }
-
-    private fun decodeManualResult(json: JSONObject) = WifiManualResult(
-        revision = json.getString("revision"),
-        status = json.getString("status"),
-        reason = reasonFromWire(json.getString("reason")),
-    )
 
     private fun encodeNetworks(networks: List<WifiNetworkProfile>) = JSONArray().apply {
         networks.forEach { network ->
@@ -283,10 +217,6 @@ internal object WifiSettingsCodec {
             add(WifiNetworkProfile(ssid, security, password, item.getBoolean("hidden")))
         }
     }
-
-    private fun reasonFromWire(value: String): WifiReason =
-        WifiReason.entries.firstOrNull { it.wireValue == value }
-            ?: throw IllegalArgumentException("unknown Wi-Fi reason")
 
     private fun optionalString(json: JSONObject, key: String): String? {
         if (!json.has(key) || json.isNull(key)) return null

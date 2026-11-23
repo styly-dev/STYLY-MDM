@@ -20,7 +20,6 @@ def test_priority_unsupported_reasons_are_preserved_in_configuration_state():
     for reason, result_status in (
         ("UNSUPPORTED_HIDDEN_NETWORK", "unsupported"),
         ("UNSUPPORTED_PRIORITY_NETWORK_LIMIT", "unsupported"),
-        ("FALLBACK", "applied"),
     ):
         state = configuration_packages.public_configuration_state({
             "package_id": revision,

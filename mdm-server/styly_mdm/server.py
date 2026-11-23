@@ -236,7 +236,7 @@ class _ConfigurationRegistry:
 _configuration = _ConfigurationRegistry()
 _registry_extras: dict = {}
 _registry_readable = True
-_CONFIGURATION_FIELDS = ("groups", "packages", "configuration_revision")
+_CONFIGURATION_FIELDS = ("groups", "packages")
 
 # Connected admin WebSocket sessions
 admin_connections: set[web.WebSocketResponse] = set()
@@ -503,24 +503,15 @@ def _backup_registry() -> None:
     log.warning("Registry format migration: saved the previous registry to %s", backup)
 
 
-def _has_group_map_shape(value) -> bool:
-    if not isinstance(value, dict) or not value:
-        return False
-    return any(
-        isinstance(entry, list)
-        or isinstance(entry, dict) and isinstance(entry.get("members"), list)
-        for entry in value.values()
-    )
-
-
-def _has_registry_wrapper_shape(raw: dict) -> bool:
-    groups = raw.get("groups")
+def _has_configuration_data(raw: dict) -> bool:
+    # A flat device registry may have a device named "groups" or "packages".
     packages = raw.get("packages")
-    revision = raw.get("configuration_revision")
-    return (
-        _has_group_map_shape(groups)
-        or isinstance(packages, dict) and ("version" in packages or "packages" in packages)
-        or type(revision) is int and revision >= 0
+    if isinstance(packages, dict) and ("version" in packages or "packages" in packages):
+        return True
+    groups = raw.get("groups")
+    return isinstance(groups, dict) and any(
+        isinstance(entry, list) or isinstance(entry, dict) and isinstance(entry.get("members"), list)
+        for entry in groups.values()
     )
 
 
@@ -536,8 +527,8 @@ def load_registry() -> None:
         raw = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("expected a JSON object")
-        has_wrapper_shape = _has_registry_wrapper_shape(raw)
-        if has_wrapper_shape and not isinstance(raw.get("devices"), dict):
+        wrapped = isinstance(raw.get("devices"), dict)
+        if not wrapped and _has_configuration_data(raw):
             raise ValueError("configuration registry is missing its device map")
     except FileNotFoundError:
         _configuration = _ConfigurationRegistry()
@@ -551,7 +542,6 @@ def load_registry() -> None:
         log.warning("Device registry unavailable at %s: %s; saved data retained", REGISTRY_PATH, exc)
         return
 
-    wrapped = isinstance(raw.get("devices"), dict)
     devices_raw = raw["devices"] if wrapped else raw
     for device_id, value in devices_raw.items():
         if (record := _coerce_record(value)) is not None:
@@ -616,118 +606,91 @@ def save_registry() -> bool:
 TELEMETRY_SAVE_DELAY = 1.0
 DEVICE_LIST_BROADCAST_DELAY = 0.15
 
+# Telemetry writes are synchronous, so a timer can save the latest registry state
+# without a background task or in-flight coordination.
+_telemetry_save_handle: asyncio.TimerHandle | None = None
 
-class _Coalescer:
-    """Run ``work`` once after ``delay``; requests made while it waits share that run.
+# Only admin broadcasts can overlap an await. A request during a send marks one
+# follow-up send; requests during the delay before the next send share that run.
+_device_list_broadcast_task: asyncio.Task | None = None
+_device_list_broadcast_pending = False
 
-    The work reads current state when it runs, so the latest state always wins.
-    """
 
-    def __init__(self, delay: float, work, label: str) -> None:
-        self._delay = delay
-        self._work = work
-        self._label = label
-        self._task: asyncio.Task | None = None
-        self._wake_event: asyncio.Event | None = None
-        self._in_flight = False
-        self._pending = False
+def _record_telemetry() -> None:
+    _schedule_telemetry_save()
+    _schedule_device_list_broadcast()
 
-    def schedule(self) -> None:
+
+def _schedule_telemetry_save() -> None:
+    global _telemetry_save_handle
+    if _telemetry_save_handle is None:
+        _telemetry_save_handle = asyncio.get_running_loop().call_later(
+            TELEMETRY_SAVE_DELAY, _run_telemetry_save,
+        )
+
+
+def _run_telemetry_save() -> None:
+    global _telemetry_save_handle
+    _telemetry_save_handle = None
+    try:
+        save_registry()
+    except Exception:
+        log.exception("telemetry-registry-save failed")
+
+
+def _flush_telemetry_save() -> None:
+    if _telemetry_save_handle is not None:
+        _telemetry_save_handle.cancel()
+        _run_telemetry_save()
+
+
+def _schedule_device_list_broadcast() -> None:
+    global _device_list_broadcast_task, _device_list_broadcast_pending
+    if admin_connections:
         loop = asyncio.get_running_loop()
-        task = self._task
+        task = _device_list_broadcast_task
         if task is not None and not task.done() and task.get_loop() is loop:
-            if self._in_flight:
-                self._pending = True
+            _device_list_broadcast_pending = True
             return
-        self._wake_event = asyncio.Event()
-        self._task = loop.create_task(self._run(), name=self._label)
+        _device_list_broadcast_task = loop.create_task(
+            _run_device_list_broadcast(), name="device-list-broadcast",
+        )
 
-    async def _wait_before_run(self, delay: float) -> None:
-        event = self._wake_event
-        if event is None:
-            await asyncio.sleep(delay)
-            return
-        try:
-            await asyncio.wait_for(event.wait(), timeout=delay)
-        except asyncio.TimeoutError:
-            return
-        event.clear()
 
-    async def _run(self) -> None:
-        try:
-            await self._wait_before_run(self._delay)
-            while True:
-                self._pending = False
-                self._in_flight = True
-                loop = asyncio.get_running_loop()
-                started_at = loop.time()
-                try:
-                    await self._invoke()
-                finally:
-                    self._in_flight = False
-                if not self._pending:
-                    break
-                # Preserve the configured rate limit even when a request arrives
-                # during a very quick send.
-                remaining = self._delay - (loop.time() - started_at)
-                if remaining > 0:
-                    await self._wait_before_run(remaining)
-        finally:
-            current = asyncio.current_task()
-            if self._task is current:
-                self._task = None
-                self._wake_event = None
-            self._in_flight = False
-            self._pending = False
+async def _run_device_list_broadcast() -> None:
+    global _device_list_broadcast_task, _device_list_broadcast_pending
+    current = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    try:
+        await asyncio.sleep(DEVICE_LIST_BROADCAST_DELAY)
+        while True:
+            _device_list_broadcast_pending = False
+            started_at = loop.time()
+            try:
+                await broadcast_device_list()
+            except Exception:
+                log.exception("device-list-broadcast failed")
+            if not _device_list_broadcast_pending:
+                break
+            remaining = DEVICE_LIST_BROADCAST_DELAY - (loop.time() - started_at)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+    finally:
+        if _device_list_broadcast_task is current:
+            _device_list_broadcast_task = None
+            _device_list_broadcast_pending = False
 
-    async def _invoke(self) -> None:
-        try:
-            result = self._work()
-            if asyncio.iscoroutine(result):
-                await result
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("%s failed", self._label)
 
-    async def flush(self, *, run: bool) -> None:
-        """Cancel and join pending work, or wake and join it when ``run`` is true."""
-        task = self._task
-        if task is None or task.done():
-            return
-        if run:
-            if not self._in_flight and self._wake_event is not None:
-                self._wake_event.set()
-            await asyncio.shield(task)
-            return
-
-        self._pending = False
+async def _flush_device_list_broadcast() -> None:
+    task = _device_list_broadcast_task
+    if task is not None and not task.done():
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
 
-# Telemetry (battery, Wi-Fi and configuration state) changes often across many headsets.
-# Coalesce its registry writes and admin list fan-out. Devices resend state on REGISTER, so
-# a crash loses at most one delay of telemetry. Admin and package changes still save at once.
-_telemetry_save = _Coalescer(TELEMETRY_SAVE_DELAY, save_registry, "telemetry-registry-save")
-_device_list_broadcast = _Coalescer(
-    DEVICE_LIST_BROADCAST_DELAY, lambda: broadcast_device_list(), "device-list-broadcast",
-)
-
-
-def _record_telemetry() -> None:
-    _telemetry_save.schedule()
-    _schedule_device_list_broadcast()
-
-
-def _schedule_device_list_broadcast() -> None:
-    if admin_connections:
-        _device_list_broadcast.schedule()
-
-
 async def _flush_telemetry(app: web.Application) -> None:
-    await _device_list_broadcast.flush(run=False)
-    await _telemetry_save.flush(run=True)
+    await _flush_device_list_broadcast()
+    _flush_telemetry_save()
 
 
 def _commit_configuration(
@@ -955,6 +918,16 @@ async def _send_admin_frames(ws: web.WebSocketResponse, frames: list[str]) -> No
             raise
         except (Exception, asyncio.TimeoutError):
             log.warning("Could not close failed admin WebSocket", exc_info=True)
+
+
+async def _send_admin_error(
+    ws: web.WebSocketResponse, message: str, *, operation: str | None = None, name: str | None = None,
+) -> None:
+    payload = {"type": "ERROR"}
+    if operation is not None:
+        payload.update(operation=operation, name=name)
+    payload["message"] = message
+    await _send_admin_frames(ws, [json.dumps(payload)])
 
 
 def _queue_admin_message(
@@ -1688,7 +1661,7 @@ def _package_impact(package_id: str, profile: dict) -> tuple[dict, list[str]]:
 def _updated_package(profile: dict, body: dict) -> dict:
     configuration_packages.check_expected_revision(body, profile["edit_revision"])
     name = configuration_packages.validate_name(body.get("name", profile["name"]))
-    settings = configuration_packages.validate_settings(body.get("settings"), profile["settings"])
+    settings = configuration_packages.validate_settings(body.get("settings"))
     return {**profile, "name": name, "settings": settings, "edit_revision": str(uuid.uuid4())}
 
 
@@ -2026,17 +1999,15 @@ async def _publish_group_change(device_ids, admin_update=None) -> None:
     A slow admin console must not delay delivery to headsets. ``admin_update`` replaces
     the default group-list fan-out when the caller also answers the requesting console.
     """
-    results = await asyncio.gather(
-        admin_update if admin_update is not None else broadcast_group_list(),
-        _publish_configuration(device_ids),
-        return_exceptions=True,
-    )
-    for error, message in zip(results, ("Could not notify admins of the committed group change",
-                                        "Could not publish the committed configuration")):
-        if isinstance(error, asyncio.CancelledError):
-            raise error
-        if isinstance(error, BaseException):
-            log.error(message, exc_info=error)
+    try:
+        _publish_configuration(device_ids)
+    except Exception:
+        log.exception("Could not publish the committed configuration")
+
+    try:
+        await (admin_update if admin_update is not None else broadcast_group_list())
+    except Exception:
+        log.exception("Could not notify admins of the committed group change")
 
 
 def _notify_committed_group_change(admin_ws: web.WebSocketResponse, message: dict) -> Awaitable[None]:
@@ -2062,7 +2033,7 @@ async def _stop_configuration_publications(app: web.Application) -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _publish_configuration(device_ids) -> None:
+def _publish_configuration(device_ids) -> None:
     for device_id in device_ids:
         entry = devices.get(device_id)
         if entry is not None:
@@ -2341,7 +2312,7 @@ async def device_ws_handler(request: web.Request) -> web.StreamResponse:
                     if not prev or prev.get("retired") or prev.get("identity_kind") != kind:
                         save_registry()
                     else:
-                        _telemetry_save.schedule()
+                        _schedule_telemetry_save()
 
                     log.info(
                         "%s device registered: %s (%s, client v%s)",
@@ -2678,7 +2649,7 @@ async def device_ws_handler(request: web.Request) -> web.StreamResponse:
             rec = device_registry.get(device_id)
             if rec is not None:
                 rec["last_seen"] = time.time()
-                _telemetry_save.schedule()
+                _schedule_telemetry_save()
             log.info("Device disconnected: %s", device_id)
             if pend is not None and pend.get("phase") == "verifying":
                 verify_timeout = pend.get("timeout_task")
@@ -2943,12 +2914,7 @@ async def handle_create_group(admin_ws: web.WebSocketResponse, data: dict):
     name = _group_name(data.get("name"))
 
     async def reject(message: str) -> None:
-        await _send_admin_frames(admin_ws, [json.dumps({
-            "type": "ERROR",
-            "operation": "CREATE_GROUP",
-            "name": name or None,
-            "message": message,
-        })])
+        await _send_admin_error(admin_ws, message, operation="CREATE_GROUP", name=name or None)
 
     if not name:
         await reject("Group name is required")
@@ -2978,33 +2944,21 @@ async def handle_rename_group(
     new_name = _group_name(data.get("new_name"))
 
     if not name or not new_name:
-        await _send_admin_frames(admin_ws, [json.dumps({
-            "type": "ERROR",
-            "message": "Both name and new_name are required",
-        })])
+        await _send_admin_error(admin_ws, "Both name and new_name are required")
         return
 
     if name not in _configuration.groups:
-        await _send_admin_frames(admin_ws, [json.dumps({
-            "type": "ERROR",
-            "message": f"Group '{name}' does not exist",
-        })])
+        await _send_admin_error(admin_ws, f"Group '{name}' does not exist")
         return
 
     if new_name != name and new_name in _configuration.groups:
-        await _send_admin_frames(admin_ws, [json.dumps({
-            "type": "ERROR",
-            "message": f"Group '{new_name}' already exists",
-        })])
+        await _send_admin_error(admin_ws, f"Group '{new_name}' already exists")
         return
 
     groups = _configuration.groups.copy()
     groups[new_name] = groups.pop(name)
     if not _save_groups(groups):
-        await _send_admin_frames(admin_ws, [json.dumps({
-            "type": "ERROR",
-            "message": "Could not persist the group change",
-        })])
+        await _send_admin_error(admin_ws, "Could not persist the group change")
         return
     log.info("Group renamed: %r -> %r", name, new_name)
 
@@ -3026,20 +2980,14 @@ async def handle_delete_group(
     name = _group_name(data.get("name"))
 
     if not name:
-        await _send_admin_frames(admin_ws, [json.dumps({
-            "type": "ERROR",
-            "message": "Group name is required",
-        })])
+        await _send_admin_error(admin_ws, "Group name is required")
         return
 
     if name in _configuration.groups:
         groups = _configuration.groups.copy()
         group = groups.pop(name)
         if not _save_groups(groups):
-            await _send_admin_frames(admin_ws, [json.dumps({
-                "type": "ERROR",
-                "message": "Could not persist the group change",
-            })])
+            await _send_admin_error(admin_ws, "Could not persist the group change")
             return
         log.info("Group deleted: %r", name)
         members = group.members
@@ -3060,12 +3008,7 @@ async def handle_update_group_members(admin_ws: web.WebSocketResponse, data: dic
     name = _group_name(data.get("name"))
 
     async def reject(message: str, *, refresh: bool = False) -> None:
-        await _send_admin_frames(admin_ws, [json.dumps({
-            "type": "ERROR",
-            "operation": "UPDATE_GROUP_MEMBERS",
-            "name": name or None,
-            "message": message,
-        })])
+        await _send_admin_error(admin_ws, message, operation="UPDATE_GROUP_MEMBERS", name=name or None)
         if refresh:
             await broadcast_group_list()
 

@@ -70,19 +70,4 @@ class ConfigurationJournalTest {
         assertFalse(journal.shouldApply(updated, 134, "retry-one"))
     }
 
-    @Test fun `old connection only failures restore as saved while write failures remain retryable`() {
-        for ((reason, checkRevision) in listOf("VERIFY_AFTER_REBOOT" to null, "UNREACHABLE" to first.revision)) {
-            val results = JSONObject().put("wifi", settingOutcome("failed", reason = reason))
-            val legacy = ConfigurationAttempt(first, 133, "complete", results).saved()
-                .put("failed_wifi_fingerprint", "old").put("wifi_connection_check_revision", checkRevision)
-            val restored = ConfigurationAttempt.restore(legacy)
-            assertEquals("SAVED", restored.results.getJSONObject("wifi").getString("reason"))
-            assertFalse(restored.needsRetry)
-            assertFalse(restored.saved().has("failed_wifi_fingerprint"))
-        }
-
-        val failure = ConfigurationAttempt(first, 133, "complete",
-            JSONObject().put("wifi", settingOutcome("failed", reason = "VERIFY_FAILED")))
-        assertTrue(ConfigurationAttempt.restore(failure.saved()).needsRetry)
-    }
 }

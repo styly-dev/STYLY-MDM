@@ -9,7 +9,6 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Process
-import android.os.SystemClock
 import android.provider.Settings
 import androidx.annotation.ChecksSdkIntAtLeast
 import androidx.annotation.RequiresApi
@@ -33,7 +32,6 @@ internal data class WifiConfiguredView(
 internal data class WifiProfileApplication(
     val usableIndexes: List<Int>,
     val failure: WifiReason? = null,
-    val newlyAddedIndexes: Set<Int> = emptySet(),
     /** Profiles whose saved SSID/security/hidden configuration was added or rewritten. */
     val rewrittenIndexes: Set<Int> = emptySet(),
     val networkIds: Map<Int, Int> = emptyMap(),
@@ -275,7 +273,6 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         var firstFailure: WifiReason? = null
         var commonFailure: WifiReason? = null
         val writtenNetworks = linkedMapOf<Int, Pair<Int, String>>()
-        val newlyAdded = mutableSetOf<Int>()
         val rewritten = mutableSetOf<Int>()
         fun checkMutationAllowed(): Boolean {
             val reason = try {
@@ -310,7 +307,6 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
                 }
                 writtenNetworks[index] = written
                 if (reusable == null) rewritten += index
-                if (views.none { it.entry.networkId == written.first }) newlyAdded += index
                 null
             } catch (_: SecurityException) {
                 commonFailure = WifiReason.PERMISSION_DENIED
@@ -374,7 +370,6 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         WifiProfileApplication(
             usableIndexes,
             autoJoinFailure ?: firstFailure,
-            newlyAdded.intersect(usableIndexes.toSet()),
             rewritten.intersect(usableIndexes.toSet()),
             networkIds = usableIndexes.associateWith { writtenNetworks.getValue(it).first },
         )
@@ -413,15 +408,8 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
     }
 
     private fun autoJoinService(): IToBServiceProxy {
-        // Application startup binds asynchronously; wait before the first mutation, not on the main thread.
-        val deadline = SystemClock.elapsedRealtime() + 5_000L
-        while (SystemClock.elapsedRealtime() < deadline) {
-            ToBServiceHelper.getInstance().serviceBinder?.let {
-                return it as? IToBServiceProxy ?: throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
-            }
-            Thread.sleep(50)
-        }
-        throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
+        return ToBServiceHelper.getInstance().serviceBinder as? IToBServiceProxy
+            ?: throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
     }
 
     fun readinessFailure(): WifiReason? = try {

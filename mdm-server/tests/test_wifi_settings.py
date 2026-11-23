@@ -6,7 +6,6 @@ import pytest
 
 from styly_mdm.wifi_settings import (
     WiFiSettingsError,
-    editor_networks,
     public_wifi_state,
     validate_profile_networks,
 )
@@ -21,15 +20,10 @@ def _networks(password: str | None = "correct-horse") -> list[dict]:
     }]
 
 
-def test_profile_validation_preserves_saved_password_and_accepts_overwrite():
-    previous = validate_profile_networks(_networks())
-    retained = validate_profile_networks(_networks(None), previous)
-    assert retained[0]["password"] == "correct-horse"
-    assert editor_networks(retained) == [{
-        "ssid": "Studio Wi-Fi", "security": "WPA2_WPA3", "password": "correct-horse",
-        "password_present": True, "hidden": False,
-    }]
-    assert validate_profile_networks(_networks("new-password"), previous)[0]["password"] == "new-password"
+def test_profile_validation_requires_a_password_on_each_secured_network():
+    assert validate_profile_networks(_networks()) == _networks()
+    with pytest.raises(WiFiSettingsError, match="require a password"):
+        validate_profile_networks(_networks(None))
 
     assert validate_profile_networks([{
         "ssid": "日本語", "security": "OPEN", "password": "", "hidden": True,
@@ -93,21 +87,10 @@ def test_wifi_state_exposes_only_valid_readiness_and_monitor_state():
         assert public_wifi_state(raw) is None
 
 
-def test_configuration_result_preserves_verify_after_reboot_reason():
+def test_configuration_result_preserves_saved_reason():
     from styly_mdm.configuration_packages import public_configuration_state
 
     revision = "11111111-1111-4111-8111-111111111111"
-    report = public_configuration_state({
-        "package_id": "22222222-2222-4222-8222-222222222222",
-        "revision": revision,
-        "status": "complete",
-        "results": {"wifi": {"status": "failed", "reason": "VERIFY_AFTER_REBOOT"}},
-    })
-
-    assert report["results"]["wifi"] == {
-        "status": "failed", "reason": "VERIFY_AFTER_REBOOT",
-    }
-
     saved_report = public_configuration_state({
         "package_id": "22222222-2222-4222-8222-222222222222",
         "revision": revision,

@@ -36,13 +36,13 @@ internal class Harness(
     initialWifi: List<WifiLocalNetworkObservation> = emptyList(),
     preflightFailure: WifiReason? = null,
     sharedAdapter: FakeAdapter? = null,
-    bootCount: Int = 133,
     failStoreRead: Boolean = false,
 ) {
     val store = MemoryStore(initialState, failStoreRead)
     val adapter = sharedAdapter ?: FakeAdapter(initialNetworks)
     val clock = MutableClock()
     val worker = QueueExecutor()
+    val results = mutableListOf<WifiManualResult>()
     private val timers = mutableListOf<ScheduledTask>()
     val connectivity = FakeConnectivity(initialWifi) { clock.value }.apply { preflightResult = preflightFailure }
     val priorityScanSource = FakePriorityScanSource(worker)
@@ -56,7 +56,6 @@ internal class Harness(
             schedule = { task, delay -> timers += ScheduledTask(task, delay, clock.value + delay, worker) },
             readinessFailure = { connectivity.preflightResult },
             priorityScanSource = priorityScanSource,
-            bootCount = bootCount,
         ),
     )
 
@@ -75,7 +74,7 @@ internal class Harness(
             settings(networks, autoReturn, prioritizeNetworks),
             reuseMatchingProfile = reuseMatchingProfile,
             isCurrent = { true },
-            onFinished = {},
+            onFinished = results::add,
         )
         worker.runAll()
     }
@@ -171,14 +170,12 @@ internal class FakeAdapter(initialNetworks: List<WifiNetworkProfile>) : WifiSett
             rewrittenNetworkCalls += result.rewrittenIndexes
             return result
         }
-        val newlyAdded = result.newlyAddedIndexes.toMutableSet()
         val rewritten = result.rewrittenIndexes.toMutableSet()
         for ((index, profile) in target.withIndex()) {
             if (index !in result.usableIndexes) continue
             val existing = saved.firstOrNull { it.profile.identity == profile.identity }
             if (existing == null) {
                 saved += Saved(profile, nextNetworkId++)
-                newlyAdded += index
                 rewritten += index
             } else {
                 val entry = WifiConfiguredEntry(existing.networkId, existing.profile.ssid,
@@ -196,7 +193,6 @@ internal class FakeAdapter(initialNetworks: List<WifiNetworkProfile>) : WifiSett
         afterApply?.invoke()
         rewrittenNetworkCalls += rewritten.toSet()
         return result.copy(
-            newlyAddedIndexes = newlyAdded,
             rewrittenIndexes = rewritten,
             networkIds = result.usableIndexes.associateWith { savedNetworkId(target[it]) },
         )

@@ -38,8 +38,8 @@
         value = {
           auto_return: value.auto_return === true,
           prioritize_networks: value.prioritize_networks !== false,
-          networks: value.networks.map(({ ssid, security, hidden, password_present }) => ({
-            ssid, security, hidden, password_present, password: '',
+          networks: value.networks.map(({ ssid, security, hidden, password }) => ({
+            ssid, security, hidden, password: typeof password === 'string' ? password : '',
           })),
         };
       }
@@ -48,16 +48,8 @@
     return structuredClone(draft);
   }
 
-  function savedWifiNetwork(network, saved) {
-    return saved.find(candidate => candidate.ssid === network.ssid && candidate.security === network.security);
-  }
-
-  function hasSavedPassword(network, saved) {
-    return savedWifiNetwork(network, saved)?.password_present === true;
-  }
-
-  function wifiPasswordValue(network, saved) {
-    return network.password || savedWifiNetwork(network, saved)?.password || '';
+  function savedWifiPassword(network, saved) {
+    return saved.find(candidate => candidate.ssid === network.ssid && candidate.security === network.security)?.password || '';
   }
 
   function supportedValue(item, value) {
@@ -120,7 +112,7 @@
     return schedule;
   }
 
-  function wifiPayload(value, savedNetworks, managed) {
+  function wifiPayload(value, managed) {
     const networks = value?.networks;
     if (!Array.isArray(networks)) throw new Error('Wi-Fi networks must be a list.');
     // buildPayload() has already rejected the wifiConflicts() cases (network limit, hidden + auto-return).
@@ -144,17 +136,16 @@
       identities.add(identity);
       const result = { ssid, security, hidden };
       if (security === 'WPA2_WPA3') {
-        if (password != null && typeof password !== 'string') {
+        if (typeof password !== 'string') {
           throw new Error('Wi-Fi ' + (index + 1) + ' password must be text.');
         }
-        if (password) {
-          if (!/^[\x20-\x7e]{1,63}$/.test(password)) {
-            throw new Error('Wi-Fi ' + (index + 1) + ' password must be 1 to 63 ASCII characters. Passwords of 1 to 7 characters require WPA3.');
-          }
-          result.password = password;
-        } else if (!hasSavedPassword(network, savedNetworks)) {
+        if (!password) {
           throw new Error('Enter a 1 to 63 character ASCII password for Wi-Fi ' + (index + 1) + '.');
         }
+        if (!/^[\x20-\x7e]{1,63}$/.test(password)) {
+          throw new Error('Wi-Fi ' + (index + 1) + ' password must be 1 to 63 ASCII characters. Passwords of 1 to 7 characters require WPA3.');
+        }
+        result.password = password;
       }
       return result;
     });
@@ -231,8 +222,7 @@
       settings[item.id] = {
         managed,
         value: item.kind === 'wifi'
-          ? wifiPayload(value,
-            saved[item.id].value.networks, managed)
+          ? wifiPayload(value, managed)
           : payloadValue,
       };
     }
@@ -243,19 +233,13 @@
     return Boolean(deployment && report?.package_id === deployment.package_id && report.revision === deployment.revision);
   }
 
-  function legacyWifiSaved(report) {
-    const result = report?.results?.wifi;
-    return result?.status === 'failed' && result.reason === 'VERIFY_AFTER_REBOOT';
-  }
-
   function retryEligible(device, deployment) {
     const report = device?.configuration_state;
     if (device?.status !== 'online' || device.configuration_supported !== true ||
         !matchesDeployment(report, deployment)) return false;
     if (report.status === 'interrupted') return true;
     if (report.status !== 'complete') return false;
-    return deployment.keys.some(key => ['failed', 'unsupported'].includes(report.results?.[key]?.status) &&
-      !(key === 'wifi' && legacyWifiSaved(report)));
+    return deployment.keys.some(key => ['failed', 'unsupported'].includes(report.results?.[key]?.status));
   }
 
   function deviceOutcome(device, packageId, deployment) {
@@ -285,12 +269,10 @@
     if (report.status !== 'complete') {
       return ['pending', 'Pending' + connection, 'Waiting for the device to report the outcome.'];
     }
-    const results = deployment.keys.map(key => key === 'wifi' && legacyWifiSaved(report)
-      ? 'applied' : report.results?.[key]?.status);
+    const results = deployment.keys.map(key => report.results?.[key]?.status);
     const applied = results.filter(status => status === 'applied').length;
     if (results.every(status => status === 'applied')) {
-      const wifiSaved = deployment.keys.includes('wifi') &&
-        (report.results?.wifi?.reason === 'SAVED' || legacyWifiSaved(report));
+      const wifiSaved = deployment.keys.includes('wifi') && report.results?.wifi?.reason === 'SAVED';
       const savedDetail = deployment.wifi_mode === 'android_selection'
         ? 'Wi-Fi profiles and auto-connect flags were read back. Android selects the network.'
         : 'Saved Wi-Fi profiles and auto-connect flags were read back.';
@@ -304,15 +286,12 @@
       applied + ' of ' + results.length + ' managed settings verified.'];
   }
 
-  function wifiPasswordHelp(network, saved) {
+  function wifiPasswordHelp(network) {
     if (network.security === 'OPEN') return 'No password needed.';
-    const format = '1–63 ASCII characters (1–7 require WPA3).';
-    return hasSavedPassword(network, saved)
-      ? 'Leave blank to keep the saved password. ' + format
-      : format;
+    return '1–63 ASCII characters (1–7 require WPA3).';
   }
 
-  function renderWifi(item, value, saved, secretType, managed) {
+  function renderWifi(item, value, managed) {
     const networks = value.networks;
     const rows = networks.map(function (network, index) {
       const field = `data-setting="${esc(item.id)}" data-network="${index}"`;
@@ -334,11 +313,11 @@
             <option value="OPEN" ${isOpen ? 'selected' : ''}>Open</option>
             <option value="WPA2_WPA3" ${!isOpen ? 'selected' : ''}>WPA2/WPA3 Personal</option>
           </select></label>
-          <label>Password<input class="field wifi-secret" type="${secretType}" ${field} data-field="password"
+          <label>Password<input class="field" type="text" ${field} data-field="password"
             aria-describedby="${passwordHelpId}" autocomplete="off" spellcheck="false" ${isOpen ? 'disabled' : ''}></label>
         </div>
         <div class="wifi-row-foot">
-          <small id="${passwordHelpId}" data-password-help="${index}">${wifiPasswordHelp(network, saved.networks)}</small>
+          <small id="${passwordHelpId}" data-password-help="${index}">${wifiPasswordHelp(network)}</small>
           <label class="wifi-check"><input type="checkbox" ${field} data-field="hidden" ${network.hidden ? 'checked' : ''}> Hidden network</label>
         </div>
       </article>`;
@@ -366,7 +345,7 @@
       [value.hour, value.minute].map(number => String(number).padStart(2, '0')).join(':');
   }
 
-  function renderControl(item, value, saved, secretType, managed) {
+  function renderControl(item, value, managed) {
     const field = `data-setting="${esc(item.id)}"`;
     const label = esc(item.label);
     switch (item.kind) {
@@ -385,7 +364,7 @@
         </div><div class="settings-days">${DAYS.map((day, index) =>
           `<label><input type="checkbox" ${field} data-field="day" data-day="${index}" ${value.repeat & (1 << index) ? 'checked' : ''} ${value.enabled ? '' : 'disabled'}> ${day}</label>`).join('')}</div>`;
       case 'wifi':
-        return renderWifi(item, value, saved, secretType, managed);
+        return renderWifi(item, value, managed);
       case 'package':
         return `<label>Android package name<input class="field" type="text" maxlength="255" autocomplete="off" ${field} value="${esc(value)}"></label>`;
       default:
@@ -393,14 +372,14 @@
     }
   }
 
-  function renderItem(item, draft, saved, secretType) {
+  function renderItem(item, draft, saved) {
     const entry = draft[item.id];
     const wide = item.kind === 'wifi' || item.kind === 'schedule' || item.kind === 'package';
     const label = esc(item.label);
     return `<div class="settings-row${wide ? ' settings-wide' : ''}">
       <label class="settings-manage"><input type="checkbox" data-manage="${esc(item.id)}" aria-label="Manage ${label}" ${entry?.managed ? 'checked' : ''} ${entry ? '' : 'disabled'}></label>
       <div class="settings-label"><strong>${label}</strong><small>${esc(item.description)}</small></div>
-      ${entry ? `<fieldset class="settings-value" aria-label="${label}" ${entry.managed ? '' : 'disabled'}>${renderControl(item, entry.value, saved[item.id].value, secretType, entry.managed)}</fieldset>` :
+      ${entry ? `<fieldset class="settings-value" aria-label="${label}" ${entry.managed ? '' : 'disabled'}>${renderControl(item, entry.value, entry.managed)}</fieldset>` :
         '<span class="settings-meta">Unavailable</span>'}
     </div>`;
   }
@@ -410,7 +389,7 @@
     return managed + ' / ' + section.items.length + ' managed';
   }
 
-  function renderSection(section, model, secretType) {
+  function renderSection(section, model) {
     return `<details class="settings-group" data-settings-section="${esc(section.id)}" ${model.expanded.has(section.id) ? 'open' : ''}>
       <summary class="settings-group-head">
         <span><strong>${esc(section.title)}</strong><small>${esc(section.description)}</small></span>
@@ -418,7 +397,7 @@
         <span class="settings-chevron" aria-hidden="true"></span>
       </summary>
       <div class="settings-content">${section.items
-        .map(item => renderItem(item, model.draft, model.saved, secretType)).join('')}</div>
+        .map(item => renderItem(item, model.draft, model.saved)).join('')}</div>
     </details>`;
   }
 
@@ -442,13 +421,12 @@
         ? { applied: 'Applied', failed: 'Failed', unsupported: 'Unsupported' }[result.status]
         : report.status === 'complete' ? 'Not verified' : '';
       if (!status) return '';
-      const savedWifi = key === 'wifi' && (legacyWifiSaved(report) || status === 'Applied' && result.reason === 'SAVED');
+      const savedWifi = key === 'wifi' && status === 'Applied' && result.reason === 'SAVED';
       const applied = savedWifi || status === 'Applied';
       const launcherAccepted = key === 'startupApp' && status === 'Applied';
       const resultStatus = launcherAccepted ? 'Accepted' : savedWifi ? 'Applied' : status;
       const actual = actualValue(item, result?.value);
-      const reason = result?.reason && !(key === 'wifi' && applied && result.reason === 'FALLBACK')
-        ? String(result.reason).replaceAll('_', ' ').toLowerCase() : '';
+      const reason = result?.reason ? String(result.reason).replaceAll('_', ' ').toLowerCase() : '';
       const explanation = reason.charAt(0).toUpperCase() + reason.slice(1);
       const detail = savedWifi
         ? (deployment.wifi_mode === 'android_selection' ? 'Saved. Android selects the network.' : 'Saved')
@@ -494,7 +472,6 @@
     onSnapshot = () => {},
     requestGroupSnapshot = () => false,
   }) {
-    const secretType = root.CSS?.supports?.('-webkit-text-security', 'disc') ? 'text' : 'password';
     const groupEdits = new Map();
     const retrying = new Map();
     let group = null;
@@ -643,12 +620,13 @@
       const revision = current.publishedRevision;
       const deployment = revision ? 'Loaded version ' + revision : 'Not deployed yet';
       const refs = Object.values(snapshot?.assignments || {}).filter(id => id === current.id).length;
-      const status = current.busy && state.removed
-        ? ' · Checking package status…'
-        : current.busy && state.stale
-          ? ' · Checking latest deployed version ' + pkg.published_revision + '…'
-        : state.removed ? ' · This package was removed elsewhere. Reload or select another package.'
-          : state.stale ? ' · Latest deployed version ' + pkg.published_revision + ' is available. Reload package before deploying.' : '';
+      const publicationChanged = Boolean(pkg && (pkg.published_revision ?? null) !== (revision ?? null));
+      let status = '';
+      if (current.busy && state.removed) status = ' · Checking package status…';
+      else if (state.removed) status = ' · This package was removed elsewhere. Reload or select another package.';
+      else if (current.busy && publicationChanged) status = ' · Checking latest deployed version ' + pkg.published_revision + '…';
+      else if (state.stale) status = ' · Package changes are available. Reload package before deploying.';
+      else if (publicationChanged) status = ' · Latest deployed version ' + pkg.published_revision;
       target.textContent = deployment + status +
         (snapshot ? ' · Used by ' + refs + ' ' + (refs === 1 ? 'group' : 'groups') : '');
     }
@@ -681,7 +659,8 @@
       if (snapshot !== before) return;
       catalog = (catalog || []).filter(pkg => pkg.package_id !== id);
       if (profile) {
-        catalog.push({ package_id: id, name: profile.name, published_revision: profile.published_revision });
+        catalog.push({ package_id: id, name: profile.name, edit_revision: profile.edit_revision,
+          published_revision: profile.published_revision });
         catalog.sort((a, b) => a.name.localeCompare(b.name));
       }
       renderCatalog();
@@ -694,7 +673,7 @@
       if (!model?.saved || configurationAvailable === false || !catalog) return { stale: false, removed: false };
       const pkg = packageById(model.id);
       return {
-        stale: Boolean(pkg && (pkg.published_revision ?? null) !== (model.publishedRevision ?? null)),
+        stale: Boolean(pkg && pkg.edit_revision !== model.editRevision),
         removed: !pkg,
       };
     }
@@ -771,7 +750,7 @@
         </header>
         <label class="settings-name">Package name<input class="field" data-package-name maxlength="64" value="${esc(model.name)}"></label>
         <div class="push-note">Save &amp; deploy sends these settings to every group using this package. Clearing Manage leaves the device setting in place.</div>
-        <fieldset class="settings-editor" aria-label="Package settings">${model.sections.map(section => renderSection(section, model, secretType)).join('')}</fieldset>
+        <fieldset class="settings-editor" aria-label="Package settings">${model.sections.map(section => renderSection(section, model)).join('')}</fieldset>
         <div class="settings-actions">
           <span class="settings-meta"></span>
           <div class="settings-buttons">
@@ -785,7 +764,7 @@
       </div>`;
       for (const input of packagePanel.querySelectorAll('[data-field="password"]')) {
         const network = model.draft[input.dataset.setting].value.networks[Number(input.dataset.network)];
-        input.value = wifiPasswordValue(network, model.savedWifiNetworks);
+        input.value = network.password;
       }
       renderPublication();
       updateActions();
@@ -802,22 +781,11 @@
       return JSON.stringify(left) === JSON.stringify(right);
     }
 
-    // Draft password inputs can be empty while referring to a saved credential.
-    function comparableSetting(item, entry, savedNetworks) {
-      if (item.kind !== 'wifi') return entry;
-      const networks = entry.value.networks.map(network => ({
-        ssid: network.ssid, security: network.security, hidden: network.hidden,
-        password: wifiPasswordValue(network, savedNetworks),
-      }));
-      return { managed: entry.managed, value: { ...entry.value, networks } };
-    }
-
     function readProfile(model, data, preserveEdits = false, expectedInstanceId = snapshot?.server_instance_id ?? null) {
       const saved = loadDraft(data.sections, data.settings);
       const draft = structuredClone(saved);
       let name = data.name;
       const conflicts = [];
-      const savedWifiNetworks = data.settings?.wifi?.value.networks ?? [];
       function keepLocalEdit(label, previous, edited, latest) {
         if (sameValue(previous, edited) || sameValue(latest, edited)) return false;
         if (sameValue(previous, latest)) return true;
@@ -829,17 +797,16 @@
         for (const item of data.sections.flatMap(section => section.items)) {
           const key = item.id;
           if (!model.saved[key] || !model.draft[key]) continue;
-          const previous = comparableSetting(item, model.saved[key], model.savedWifiNetworks);
-          const edited = comparableSetting(item, model.draft[key], model.savedWifiNetworks);
-          const latest = comparableSetting(item, saved[key], savedWifiNetworks);
-          if (keepLocalEdit(item.label, previous, edited, latest)) draft[key] = structuredClone(model.draft[key]);
+          if (keepLocalEdit(item.label, model.saved[key], model.draft[key], saved[key])) {
+            draft[key] = structuredClone(model.draft[key]);
+          }
         }
       }
       if (draft.wifi?.managed === false && saved.wifi) {
         draft.wifi.value = structuredClone(saved.wifi.value);
       }
       Object.assign(model, { sections: data.sections, editRevision: data.edit_revision,
-        publishedRevision: data.published_revision, savedWifiNetworks,
+        publishedRevision: data.published_revision,
         savedName: data.name, saved, name, draft,
         mergeNotice: conflicts.length
           ? 'Some local edits overlapped newer server changes and were replaced with the latest values for ' +
@@ -904,8 +871,7 @@
           data = await api(path);
         } else if (action === 'deploy') {
           const fresh = await api(path);
-          if (fresh.edit_revision !== model.editRevision ||
-              (fresh.published_revision ?? null) !== (model.publishedRevision ?? null)) {
+          if (fresh.edit_revision !== model.editRevision) {
             throw Object.assign(new Error('The package changed. Reload and review the latest version before deploying.'), { status: 409 });
           }
           if (!confirmDeployment(fresh, { editorName: model.name.trim() })) return;
@@ -1305,9 +1271,9 @@
             const article = target.closest('.wifi-network');
             const password = article.querySelector('[data-field="password"]');
             password.disabled = row.security === 'OPEN';
-            if (password.disabled) row.password = '';
-            password.value = wifiPasswordValue(row, model.savedWifiNetworks);
-            article.querySelector('[data-password-help]').textContent = wifiPasswordHelp(row, model.savedWifiNetworks);
+            row.password = password.disabled ? '' : savedWifiPassword(row, model.saved.wifi.value.networks);
+            password.value = row.password;
+            article.querySelector('[data-password-help]').textContent = wifiPasswordHelp(row);
           }
           if (field === 'hidden') updateWifiWarnings(target.closest('.settings-value'), model.draft);
         } else if (setting === 'startupApp') {

@@ -179,8 +179,10 @@ class ConfigurationPackageControllerTest {
         wifi.worker.runAll()
         packages.worker.runAll()
 
-        assertEquals("applied", packages.attempt()?.results?.getJSONObject("wifi")?.getString("status"))
-        assertEquals(WifiReason.NONE, wifi.store.state.latestResult?.reason)
+        val result = requireNotNull(packages.attempt()).results.getJSONObject("wifi")
+        assertEquals("applied", result.getString("status"))
+        assertEquals("SAVED", result.getString("reason"))
+        assertEquals(listOf(primary), wifi.store.state.lastApplied?.networks)
     }
 
     @Test
@@ -540,8 +542,10 @@ class ConfigurationPackageControllerTest {
         wifi.worker.runAll()
         wifi.expireNext(WIFI_PRIOR_CONNECTION_OBSERVATION_MS)
         packages.worker.runAll()
-        val initialResult = requireNotNull(wifi.store.state.latestResult)
-        assertEquals("success", initialResult.status)
+        val initialWifi = requireNotNull(packages.attempt()).results.getJSONObject("wifi")
+        assertEquals("applied", initialWifi.getString("status"))
+        assertEquals("SAVED", initialWifi.getString("reason"))
+        val journalWrites = packages.journalWriteCalls
 
         wifi.adapter.afterSelect = null
         wifi.connectivity.loseAll()
@@ -551,7 +555,8 @@ class ConfigurationPackageControllerTest {
         wifi.advanceBy(24_000L)
         assertEquals(listOf(preferred, preferred, fallback), wifi.adapter.selectCalls)
         assertTrue(wifi.controller.canAcceptPolicy())
-        val resultAfterSelection = wifi.store.state.latestResult
+        packages.worker.runAll()
+        assertEquals(journalWrites, packages.journalWriteCalls)
 
         wifi.connectivity.update(++handle, preferred.ssid)
         wifi.worker.runAll()
@@ -571,7 +576,6 @@ class ConfigurationPackageControllerTest {
         assertEquals(applyCalls + 1, wifi.adapter.applyCalls.size)
         assertTrue(wifi.adapter.rewrittenNetworkCalls.last().isEmpty())
         assertEquals(disconnectCalls, wifi.adapter.disconnectCalls)
-        assertEquals(initialResult, resultAfterSelection)
     }
 
     @Test
@@ -1328,8 +1332,6 @@ class ConfigurationPackageControllerTest {
         return ConfigurationPackageStore(
             file,
             syncDirectory = {},
-            readLegacy = { ConfigurationPackageState() },
-            clearLegacy = {},
         )
     }
 
@@ -1425,7 +1427,6 @@ class ConfigurationPackageControllerTest {
                 initialNetworks = wifi.adapter.currentProfiles,
                 initialWifi = connected?.let { listOf(observation(90, it)) }.orEmpty(),
                 sharedAdapter = wifi.adapter,
-                bootCount = bootCount,
             )
             return PackageHarness(
                 wifi = restartedWifi,
