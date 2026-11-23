@@ -26,6 +26,9 @@ def reset_server_state(tmp_path):
     server._registry_readable = True
     server._apply_data_dir(str(tmp_path))
     yield
+    if server._telemetry_save_handle is not None:
+        server._telemetry_save_handle.cancel()
+        server._telemetry_save_handle = None
     for collection in collections:
         collection.clear()
     server.reset_transfer_slots()

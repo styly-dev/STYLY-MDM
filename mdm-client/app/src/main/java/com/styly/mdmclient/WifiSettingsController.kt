@@ -486,7 +486,6 @@ internal class WifiSettingsController internal constructor(
             resetPriority()
         }
 
-        // Even an inactive saved network can reuse authentication from earlier in this boot.
         // A failed readback or interrupted attempt can leave an updated credential on the headset.
         if (!invalidateChangedCredentialIds(current, profile)) {
             fail(attempt, WifiReason.STORAGE_ERROR)
