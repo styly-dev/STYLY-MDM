@@ -664,6 +664,7 @@
         if (snapshot === before) {
           catalog = data.packages;
           catalogError = '';
+          if (data.sections && resultSections.status !== 'loaded') readSections(data.sections);
         }
       } catch (_) {
         if (snapshot === before) catalogError = 'Could not load configuration packages.';
@@ -847,15 +848,14 @@
       readSections(data.sections, expectedInstanceId);
     }
 
-    async function readResultSections(id) {
-      if (!id) return;
+    async function readResultSections() {
       if (resultSections.status !== 'idle') return;
       const request = { status: 'loading' };
       resultSections = request;
       try {
-        const data = await api(packagePath(id));
+        const data = await api('/api/packages');
         if (resultSections !== request) return;
-        readSections(data.sections);
+        readSections(data.sections || []);
       } catch (_) {
         if (resultSections === request) resultSections = { status: 'failed' };
         // Report status is available independently of setting labels and formatters.
@@ -1172,7 +1172,7 @@
         }
       }
       if (deployment && assigned) {
-        readResultSections(assigned);
+        readResultSections();
       }
     }
 

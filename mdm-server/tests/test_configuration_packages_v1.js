@@ -489,15 +489,13 @@ test('priority and Android selection deployments use package support without a s
   }
 });
 
-test('failed package result definitions retry only when the group is reopened', async () => {
+test('group results fetch only public sections and retry failed reads on reopen', async () => {
   let attempts = 0;
   const fixture = createHarness(request => {
-    if (request.url === '/api/packages/pkg') {
-      attempts++;
-      return response({}, 503);
-    }
-    assert.fail('unexpected request: ' + request.url);
-  });
+    assert.equal(request.url, '/api/packages');
+    attempts++;
+    return attempts < 3 ? response({}, 503) : response({ packages: [pkg], sections });
+  }, { devices: [{ ...online, configuration_state: applied }] });
   fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
 
   fixture.controller.renderGroup('The Lab');
@@ -515,6 +513,11 @@ test('failed package result definitions retry only when the group is reopened', 
   for (let index = 0; index < 4; index++) fixture.controller.renderGroup('The Lab');
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(attempts, 2);
+  fixture.controller.renderGroup(null);
+  fixture.controller.renderGroup('The Lab');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(attempts, 3);
+  assert.match(fixture.groupControls['[data-settings-results]'].innerHTML, /Screen brightness/);
 });
 
 test('Wi-Fi SAVED reports verified profiles and leaves connection selection to Android', () => {
@@ -1907,32 +1910,10 @@ test('editor sections are shared with group results for other packages', async (
   assert.equal(fixture.requests.filter(request => request.url.startsWith('/api/packages/')).length, 1);
 });
 
-test('failed result sections are retried after reopening the group', async () => {
-  let packageReads = 0;
-  const fixture = createHarness(({ url }) => {
-    if (url.startsWith('/api/packages/')) {
-      packageReads++;
-      if (packageReads === 1) throw new Error('temporary read failure');
-      return response(profile());
-    }
-    assert.fail('unexpected package request');
-  }, { devices: [{ ...online, configuration_state: applied }] });
-  fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
-  fixture.controller.renderGroup('The Lab');
-  await new Promise(resolve => setImmediate(resolve));
-
-  fixture.controller.renderGroup(null);
-  fixture.controller.renderGroup('The Lab');
-  await new Promise(resolve => setImmediate(resolve));
-
-  assert.equal(packageReads, 2);
-  assert.match(fixture.groupControls['[data-settings-results]'].innerHTML, /All managed settings were verified/);
-});
-
 test('old section responses cannot replace schema after a server instance change', async () => {
   const pending = [];
   const fixture = createHarness(({ url }) => {
-    if (!url.startsWith('/api/packages/')) assert.fail('unexpected package request');
+    if (url !== '/api/packages') assert.fail('unexpected package request');
     return new Promise(resolve => pending.push(resolve));
   }, { devices: [{ ...online, configuration_state: applied }] });
   fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
@@ -1948,9 +1929,9 @@ test('old section responses cannot replace schema after a server instance change
   const namedSections = label => [{ ...sections[0], items: [
     { ...sections[0].items[0], label },
   ] }];
-  pending[0](response(profile({ itemSections: namedSections('Old server brightness') })));
+  pending[0](response({ packages: [pkg], sections: namedSections('Old server brightness') }));
   await new Promise(resolve => setImmediate(resolve));
-  pending[1](response(profile({ itemSections: namedSections('Current server brightness') })));
+  pending[1](response({ packages: [pkg], sections: namedSections('Current server brightness') }));
   await new Promise(resolve => setImmediate(resolve));
 
   const rendered = fixture.groupControls['[data-settings-results]'].innerHTML;

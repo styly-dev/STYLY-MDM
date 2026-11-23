@@ -222,14 +222,10 @@ class WifiManagerAdapterApplicationTest {
             WifiConfigManager - Configured networks End ----
         """.trimIndent()
 
-        assertEquals(
-            mapOf(
-                7 to WifiConfiguration.RANDOMIZATION_AUTO,
-                9 to WifiConfiguration.RANDOMIZATION_NONE,
-                10 to WifiConfiguration.RANDOMIZATION_NON_PERSISTENT,
-            ),
-            wifiStoredMacSettings(dump.lineSequence(), mapOf(7 to "\"office\"", 9 to "\"VR-Maintenance\"", 10 to "\"old network\"")),
-        )
+        assertEquals(WifiConfiguration.RANDOMIZATION_AUTO, wifiStoredMacSetting(dump.lineSequence(), 7, "\"office\""))
+        assertEquals(WifiConfiguration.RANDOMIZATION_NONE, wifiStoredMacSetting(dump.lineSequence(), 9, "\"VR-Maintenance\""))
+        assertEquals(WifiConfiguration.RANDOMIZATION_NON_PERSISTENT, wifiStoredMacSetting(dump.lineSequence(), 10, "\"old network\""))
+        assertNull(wifiStoredMacSetting(dump.lineSequence(), 7, "\"somewhere else\""))
     }
 
     @Test
@@ -238,11 +234,11 @@ class WifiManagerAdapterApplicationTest {
         val end = "WifiConfigManager - Configured networks End ----"
         val savedHeader = "ID: 7 SSID: \"office\" PROVIDER-NAME: null"
         val setting = " macRandomizationSetting: 3"
-        val original = mapOf(7 to "\"office\"")
+        val ssid = "\"office\""
 
-        assertTrue(wifiStoredMacSettings(sequenceOf(begin, savedHeader, setting), original).isEmpty())
-        assertTrue(wifiStoredMacSettings(sequenceOf(begin, savedHeader, setting, savedHeader, end), original).isEmpty())
-        assertTrue(wifiStoredMacSettings(sequenceOf(begin, savedHeader, setting.replace('3', '9'), end), original).isEmpty())
+        assertNull(wifiStoredMacSetting(sequenceOf(begin, savedHeader, setting), 7, ssid))
+        assertNull(wifiStoredMacSetting(sequenceOf(begin, savedHeader, setting, savedHeader, end), 7, ssid))
+        assertNull(wifiStoredMacSetting(sequenceOf(begin, savedHeader, setting.replace('3', '9'), end), 7, ssid))
     }
 
     @Test

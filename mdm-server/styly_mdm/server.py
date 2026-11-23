@@ -1721,7 +1721,7 @@ def _editor_package(package_id: str, profile: dict) -> dict:
 async def package_catalog_handler(request: web.Request) -> web.Response:
     try:
         _require_packages()
-        return web.json_response({"packages": _public_packages()})
+        return web.json_response({"packages": _public_packages(), "sections": configuration_packages.SECTIONS})
     except PackageError as exc:
         return web.json_response({"error": str(exc)}, status=exc.status)
 

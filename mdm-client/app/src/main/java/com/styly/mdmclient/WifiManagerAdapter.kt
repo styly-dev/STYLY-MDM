@@ -153,44 +153,38 @@ private val WIFI_MAC_RANDOMIZATION_SETTINGS = setOf(
 )
 private val savedWifiHeader = Regex("(?:\\* |- DSBLE )?ID: (\\d+) SSID: (.*)")
 
-/** Read the saved MAC policy of requested IDs from PUI's configured-networks section. */
-internal fun wifiStoredMacSettings(
-    lines: Sequence<String>,
-    ssidsById: Map<Int, String>,
-): Map<Int, Int> {
+/** Read one existing network's MAC policy, rejecting ambiguous or incomplete PUI dumps. */
+internal fun wifiStoredMacSetting(lines: Sequence<String>, networkId: Int, ssid: String): Int? {
     var inSavedNetworks = false
-    var requestedId: Int? = null
-    val seen = mutableSetOf<Int>()
-    val settings = mutableMapOf<Int, Int>()
+    var seenId = false
+    var readingTarget = false
+    var result: Int? = null
     for (line in lines) {
         if (!inSavedNetworks) {
             inSavedNetworks = line == SAVED_WIFI_DUMP_BEGIN
             continue
         }
-        if (line == SAVED_WIFI_DUMP_END) return settings
-        if (line == SAVED_WIFI_DUMP_BEGIN) return emptyMap()
+        if (line == SAVED_WIFI_DUMP_END) return result
+        if (line == SAVED_WIFI_DUMP_BEGIN) return null
         val header = savedWifiHeader.matchEntire(line)
         if (header != null) {
-            requestedId = null
-            val id = header.groupValues[1].toIntOrNull() ?: continue
-            val ssid = ssidsById[id] ?: continue
-            if (!seen.add(id)) return emptyMap()
+            readingTarget = false
+            if (header.groupValues[1].toIntOrNull() != networkId) continue
+            if (seenId) return null
+            seenId = true
             val displayed = header.groupValues[2]
             // PUI 5.15.7 masks indices zero through length / 4 in WifiConfiguration.toString().
             val maskedLength = ssid.length / 4 + 1
             val maskedSsid = "*".repeat(maskedLength) + ssid.drop(maskedLength)
-            if (displayed.startsWith("$ssid PROVIDER-NAME: ") ||
+            readingTarget = displayed.startsWith("$ssid PROVIDER-NAME: ") ||
                 displayed.startsWith("$maskedSsid PROVIDER-NAME: ")
-            ) requestedId = id
-            continue
+        } else if (readingTarget && line.startsWith(SAVED_WIFI_MAC_PREFIX)) {
+            if (result != null) return null
+            result = line.removePrefix(SAVED_WIFI_MAC_PREFIX).toIntOrNull()
+                ?.takeIf { it in WIFI_MAC_RANDOMIZATION_SETTINGS } ?: return null
         }
-        val id = requestedId ?: continue
-        if (!line.startsWith(SAVED_WIFI_MAC_PREFIX)) continue
-        val setting = line.removePrefix(SAVED_WIFI_MAC_PREFIX).toIntOrNull()
-        if (setting == null || setting !in WIFI_MAC_RANDOMIZATION_SETTINGS || id in settings) return emptyMap()
-        settings[id] = setting
     }
-    return emptyMap()
+    return null
 }
 
 // PUI can expose different product names to apps and to the ADB shell.
@@ -539,13 +533,12 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         }
         // PUI can mask the MAC policy in getConfiguredNetworks(). Read the stored value
         // before a privileged write, which can otherwise change that policy silently.
-        val id = view.entry.networkId
-        val ssidsById = mapOf(id to view.original.SSID)
         try {
             val dump = ProcessBuilder("/system/bin/dumpsys", "-t", "2", "wifi").redirectErrorStream(true).start()
             try {
-                val settings = dump.inputStream.bufferedReader().use { wifiStoredMacSettings(it.lineSequence(), ssidsById) }
-                return settings[id] ?: throw WifiAdapterFailure(WifiReason.CONFIG_READ_FAILED)
+                return dump.inputStream.bufferedReader().use {
+                    wifiStoredMacSetting(it.lineSequence(), view.entry.networkId, view.original.SSID)
+                } ?: throw WifiAdapterFailure(WifiReason.CONFIG_READ_FAILED)
             } finally {
                 dump.destroy()
             }
@@ -597,6 +590,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             putBoolean("allow_auto_join", original.autoJoinEnabled)
             putParcelable("wifi_configuration", update)
         }
+        // SDK 4.3.24 allowWifiAutoJoin defaults a missing result code to zero (success).
         val result = service.pbsCommonMessageLocked("allow_wifi_auto_join", arguments)
         if (result?.getInt("key_result_code", -1) != 0) {
             throw WifiAdapterFailure(WifiReason.UPDATE_FAILED)

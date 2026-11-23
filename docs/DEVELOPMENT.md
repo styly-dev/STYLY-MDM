@@ -376,7 +376,7 @@ and on package changes. Native clients can connect without an Origin header.
 
 | Surface | Contract |
 |---|---|
-| `GET /api/packages`, `POST /api/packages` | List packages or create one by name. |
+| `GET /api/packages`, `POST /api/packages` | GET returns package summaries and the setting definitions used by group results. POST creates a package by name. |
 | `POST /api/packages/{id}/duplicate` | Accepts the new `name` and the source package’s `expected_revision`. Returns the new editor profile. A stale source revision returns 409. |
 | `GET /api/packages/{id}` | Returns package identity and name, `edit_revision`, `published_revision`, the saved editor `settings`, including unchecked settings and Wi-Fi passwords, the editor `sections`, and `impact` with group and device counts and a token. |
 | `POST /api/packages/{id}/save-and-deploy` | Atomically saves `settings` as `{id: {managed, value}}` and deploys a new revision. Supply `expected_revision` equal to the loaded edit token `edit_revision` (null for a new package), and `expected_impact` from the preview. An optional `name` renames the package. |

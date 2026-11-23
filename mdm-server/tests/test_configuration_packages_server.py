@@ -1484,7 +1484,9 @@ def test_deploy_response_and_admin_metadata_do_not_wait_for_device_delivery(tmp_
                         "package_id": saved["package_id"], "revision": revision,
                         "keys": ["wifi"], "wifi_mode": "priority",
                     }}
-                    assert await _request(session, "GET", base, "/api/packages") == {"packages": group_list["packages"]}
+                    catalog = await _request(session, "GET", base, "/api/packages")
+                    assert catalog == {"packages": group_list["packages"], "sections": configuration_packages.SECTIONS}
+                    assert secret not in json.dumps(catalog)
                 finally:
                     released.set()
                     await request
