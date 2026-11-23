@@ -23,6 +23,7 @@ const sections = [
     { id: 'wifi', label: 'Wi-Fi networks', kind: 'wifi', default: { networks: [], auto_return: false, prioritize_networks: true } },
   ] },
   { id: 'advanced', title: 'USB & advanced', items: [
+    { id: 'startupApp', label: 'PICO home app', kind: 'package', default: '' },
     { id: 'developerMenu', label: 'Developer options menu', kind: 'bool', default: false },
   ] },
 ];
@@ -39,6 +40,8 @@ test('metadata defaults are visible in the draft and unmanaged', () => {
   assert.deepEqual(payload.shutdown, { managed: false, value: { enabled: true, hour: 23, minute: 10, repeat: 65 } });
   assert.deepEqual(payload.developerMenu, { managed: false, value: false });
   assert.deepEqual(payload.wifi.value, { networks: [], auto_return: false });
+  assert.equal(Object.hasOwn(payload, 'startupApp'), false,
+    'unmanaged default values are not added to packages that predate the setting');
   assert.equal(saved.shutdown.value.repeat, 127);
   assert.equal(sections[0].items.find(item => item.id === 'shutdown').default.repeat, 127);
 });
@@ -75,6 +78,51 @@ test('managed writes reject values outside the catalog', () => {
     draft[id] = { managed: true, value };
     assert.throws(() => buildPayload(sections, draft, saved), /Select a supported value/);
   }
+  const saved = loadDraft(sections, {});
+  const draft = structuredClone(saved);
+  draft.startupApp = { managed: true, value: 'bad package' };
+  assert.throws(() => buildPayload(sections, draft, saved), /Select a supported value for PICO home app/);
+  draft.startupApp.value = '';
+  assert.equal(buildPayload(sections, draft, saved).startupApp.value, '',
+    'an empty managed value restores the PICO launcher');
+  const legacy = loadDraft(sections, { startupApp: { managed: false, value: 'com.legacy.home' } });
+  assert.deepEqual(buildPayload(sections, legacy, legacy).startupApp,
+    { managed: false, value: 'com.legacy.home' }, 'saved unmanaged package IDs remain available');
+});
+
+test('managing PICO home app reads a local APK, blocks deploy while reading, then saves acceptance target', async () => {
+  let resolvePackage;
+  const latest = profile({ settings: {} });
+  const fixture = createHarness(({ method, url, body }) => {
+    if (method === 'GET') return response(latest);
+    assert.equal(url, '/api/packages/pkg/save-and-deploy');
+    assert.deepEqual(body.settings.startupApp, { managed: true, value: 'com.example.viewer' });
+    return response({ ...latest, settings: body.settings, edit_revision: 'edit2', published_revision: 'r1' });
+  }, { readPackageFromApk: () => new Promise(resolve => { resolvePackage = resolve; }) });
+  await fixture.controller.showPackages('pkg');
+  fixture.edit({ dataset: { manage: 'startupApp' }, checked: true, type: 'checkbox' });
+  assert.match(fixture.packagePanel.innerHTML, /Choose app APK/);
+  assert.doesNotMatch(fixture.packagePanel.innerHTML, /data-package-apk[^>]*disabled/);
+  const reading = fixture.selectPackageApk('viewer.apk');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fixture.editorButtons.deploy.disabled, true, 'deploy stays disabled while the APK is inspected');
+  resolvePackage('com.example.viewer');
+  await reading;
+  assert.match(fixture.packagePanel.innerHTML, /value="com.example.viewer"/);
+  await fixture.editClick('deploy');
+  assert.equal(fixture.requests.at(-1).url, '/api/packages/pkg/save-and-deploy');
+});
+
+test('PICO home app rejects an invalid package name read from an APK', async () => {
+  const fixture = createHarness(() => response(profile({ settings: {} })), {
+    readPackageFromApk: async () => 'bad package',
+  });
+  await fixture.controller.showPackages('pkg');
+  fixture.edit({ dataset: { manage: 'startupApp' }, checked: true, type: 'checkbox' });
+  await fixture.selectPackageApk('invalid.apk');
+  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /valid Android package name/);
+  assert.equal(fixture.editorButtons.deploy.disabled, false,
+    'a package-name parsing error leaves the editor available for correction');
 });
 
 test('managed Wi-Fi pre-fills saved passwords and reorders whole candidates', async () => {
@@ -754,6 +802,8 @@ function profile({
 }
 
 function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'] }, confirm = () => true,
+  prompt = (_, value) => value,
+  readPackageFromApk = async () => 'com.example.viewer',
   onSnapshot, requestGroupSnapshot = () => false } = {}) {
   const createElement = overrides => ({
     innerHTML: '', textContent: '', value: '', hidden: false, disabled: false,
@@ -763,7 +813,7 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     addEventListener(type, handler) { this.handlers.set(type, handler); },
     ...overrides,
   });
-  const editorButtons = Object.fromEntries(['deploy', 'discard', 'reload', 'delete'].map(action =>
+  const editorButtons = Object.fromEntries(['deploy', 'discard', 'reload', 'delete', 'duplicate'].map(action =>
     [action, createElement({ dataset: { policyAction: action } })]));
   const groupButtons = Object.fromEntries(['edit', 'deploy', 'retry'].map(action =>
     [action, createElement({ dataset: { groupAction: action, deviceId: 'headset' } })]));
@@ -772,6 +822,8 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     '.settings-actions': { querySelector: selector => selector === '.settings-meta' ? footerStatus :
       editorButtons[selector.match(/"([^"]+)"/)[1]] },
     '[data-package-name]': createElement(),
+    '[data-setting="startupApp"]': createElement({ dataset: { setting: 'startupApp' } }),
+    '[data-package-apk]': createElement({ dataset: {}, files: [] }),
     '[data-package-publication]': createElement(),
     '[data-deploy-hint]': createElement(),
     '[data-settings-feedback]': createElement(),
@@ -804,6 +856,8 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
         dataset: { setting: tag.match(/data-setting="([^"]*)"/)[1], network: tag.match(/data-network="([^"]*)"/)[1] },
         value: '',
       }));
+      const packageName = html.match(/data-setting="startupApp" value="([^"]*)"/);
+      editorControls['[data-setting="startupApp"]'].value = packageName ? packageName[1] : '';
       addNetworkButton.disabled = /data-policy-action="add-network"[^>]*disabled/.test(html);
     },
   });
@@ -827,6 +881,8 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     getDevice: id => devices.find(device => device.device_id === id),
     openPackages: () => { opened++; },
     confirmAction: message => { confirmations.push(message); return confirm(message); },
+    promptForValue: prompt,
+    readPackageFromApk,
     onSnapshot,
     requestGroupSnapshot,
     fetch: async (url, init) => {
@@ -864,6 +920,13 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
         selector === '.wifi-network' ? wifiArticle(dataset) :
         { dataset: { settingsSection: 'basic' }, querySelector: () => ({}), querySelectorAll: () => [] },
   } });
+  const selectPackageApk = (name, inputValue = 'app.apk') => {
+    const input = editorControls['[data-package-apk]'];
+    input.value = inputValue;
+    input.files = name ? [{ name }] : [];
+    return packagePanel.handlers.get('change')({ target: { closest: selector =>
+      selector === '[data-package-apk]' ? input : null } });
+  };
   const editClick = action => packagePanel.handlers.get('click')({ target: { closest: () => editorButtons[action] } });
   const groupClick = action => groupPanel.handlers.get('click')({ target: { closest: () => groupButtons[action] } });
   const select = id => {
@@ -884,12 +947,28 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
   };
   return {
     controller, packagePanel, packageList, catalogNotice, catalogStatus, groupPanel, edit, editClick, policyClick, editorButtons, editorControls, groupControls,
-    groupClick, groupButtons, select, broadcast, create, createControls, requests, confirmations,
+    groupClick, groupButtons, select, broadcast, create, createControls, requests, confirmations, selectPackageApk,
     passwordInputs: () => passwordInputs,
     valueField, moveButtons, wifiLimitWarning, wifiHiddenWarning, addNetworkButton, footerStatus,
     opened: () => opened,
   };
 }
+
+test('Device status follows live Wi-Fi independently of any deployment', () => {
+  const device = { ...online, current_wifi: { ssid: 'Hall', bssid: 'aa:bb:cc:dd:ee:ff' } };
+  const fixture = createHarness(() => assert.fail('unexpected fetch'), { devices: [device] });
+  fixture.broadcast();
+  fixture.controller.renderGroup('The Lab');
+  const results = fixture.groupControls['[data-settings-results]'];
+  assert.match(results.innerHTML, /title="BSSID: aa:bb:cc:dd:ee:ff">Wi-Fi: Hall/);
+  device.current_wifi = { ssid: 'Guest', bssid: null };
+  fixture.controller.renderGroup('The Lab');
+  assert.match(results.innerHTML, /Wi-Fi: Guest/);
+  assert.doesNotMatch(results.innerHTML, /BSSID|Hall/);
+  device.status = 'offline';
+  fixture.controller.renderGroup('The Lab');
+  assert.doesNotMatch(results.innerHTML, /Wi-Fi: Guest/);
+});
 
 test('group cards use the committed assignment and count only reports for its deployed revision', () => {
   const devices = [
@@ -1106,6 +1185,30 @@ test('save and deploy sends the edited name and settings in one confirmed reques
   assert.match(fixture.confirmations[0], /Deploy "Day studio" to 2 groups and 5 devices/);
   assert.match(fixture.confirmations[0], /includes offline devices/);
   assert.match(fixture.editorControls['[data-package-publication]'].textContent, /Deployed version r1/);
+});
+
+test('duplicating a package copies saved settings and opens an unpublished package', async () => {
+  const source = profile({ name: 'Office', editRevision: 'edit1', publishedRevision: 'published1' });
+  const duplicate = profile({ id: 'copy', name: 'Office (copy)', editRevision: 'edit2', publishedRevision: null });
+  const fixture = createHarness(({ url, method, body }) => {
+    if (url === '/api/packages') return response({ packages: [source] });
+    if (url === '/api/packages/pkg') return response(source);
+    if (url === '/api/packages/pkg/duplicate' && method === 'POST') return response(duplicate);
+    assert.fail('unexpected request ' + method + ' ' + url + ' ' + JSON.stringify(body));
+  });
+  fixture.broadcast({ packages: [source] });
+  fixture.controller.showPackages();
+  fixture.packageList.handlers.get('click')({ target: { closest: () => ({
+    dataset: { packageId: 'pkg' }, disabled: false,
+  }) } });
+  await new Promise(resolve => setImmediate(resolve));
+  await fixture.editClick('duplicate');
+  assert.deepEqual(fixture.requests.at(-1), {
+    url: '/api/packages/pkg/duplicate', method: 'POST',
+    body: { expected_revision: 'edit1', name: 'Office (copy)' },
+  });
+  assert.equal(fixture.packagePanel.innerHTML.includes('Edit configuration package'), true);
+  assert.match(fixture.packageList.innerHTML, /Office \(copy\)/);
 });
 
 test('Save & deploy fills a cleared shutdown time when the schedule is disabled or unmanaged', async () => {

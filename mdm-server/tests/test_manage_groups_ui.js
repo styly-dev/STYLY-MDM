@@ -628,6 +628,26 @@ test('group device status follows the Devices sort for committed members', () =>
   assert.deepEqual(displayedIds(), ['unit-2', 'unit-10', 'room-10', 'room-2', 'room-02', 'missing-2', 'missing-1']);
 });
 
+test('expanded group rows sort by name and show the online access point', () => {
+  const current_wifi = { ssid: 'Office <5G>', bssid: 'aa:bb:cc:dd:ee:ff' };
+  const devices = [
+    { device_id: 'b', label: 'Room 10', status: 'offline', current_wifi },
+    { device_id: 'a', label: 'Room 2', status: 'online', current_wifi },
+  ];
+  const context = vm.createContext({
+    devices, manageSort: 'label-desc', getDeviceId: d => d.device_id,
+    deviceById: id => devices.find(d => d.device_id === id), isOnline: d => d.status === 'online',
+    esc: String, progressCellHtml: () => '', window: { MdmConfigurationPackages: require('../styly_mdm/static/configuration-packages-v1.js') },
+  });
+  for (const name of ['sortDevices', 'sortGroupMembers', 'renderGroupDevsHtml']) {
+    vm.runInContext(functionSource(name), context);
+  }
+  const html = context.renderGroupDevsHtml(['b', 'a']);
+  assert.ok(html.indexOf('Room 2') < html.indexOf('Room 10'));
+  assert.match(html, /title="BSSID: aa:bb:cc:dd:ee:ff">Wi-Fi: Office &lt;5G&gt;/);
+  assert.equal(html.match(/current-wifi/g).length, 1);
+});
+
 test('group member filtering updates only the scrollable list', () => {
   const createElement = () => ({
     scrollTop: 42,

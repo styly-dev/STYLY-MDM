@@ -101,6 +101,10 @@ stores the editor's saved settings, including Wi-Fi passwords and unchecked
 values, with its published revision and deployment time. The server derives
 the managed settings sent to devices from the saved values.
 
+- **Duplicate package** copies the saved settings, including unchecked values,
+  Wi-Fi network order and passwords, into a new unpublished package. The editor
+  opens the copy under its own name and edit revision. Follow the usual
+  **Save & deploy** and group assignment steps to deploy it.
 - **Save & deploy** in the editor saves the edits and publishes a new revision
   for every group using the package, in one commit.
 - **Deploy** in group **Settings** assigns a published package to the group with
@@ -141,6 +145,10 @@ the managed settings sent to devices from the saved values.
   rename acknowledgment arrived before the disconnect and its group list is
   still pending, the console waits for the list on the new connection. If a
   confirmed target disappears, recreating the same name does not select it.
+
+Expanded group rows use ascending device-name order. Both those rows and
+**Group Settings → Device status** show the online headset’s current SSID when
+available. Hover over the SSID for the access point’s BSSID when reported.
 
 #### Server registry and delivery
 
@@ -238,11 +246,24 @@ replacement for the same assignment.
   notice `STYLY-MDM Package Applied!` once. After a boot reapply it first waits
   up to 30 seconds for XR Shell readiness. A reused result shows no notice.
 
-Scalar settings use the pinned PICO Enterprise SDK and read back the saved
+Most scalar settings use the pinned PICO Enterprise SDK and read back the saved
 value. The screen-off delay never exceeds the sleep delay. Scheduled shutdown
 uses local device time and a weekday mask, and an enabled schedule blocks the
 self-update power-cycle fallback. See the
 [PICO Enterprise SDK reference](https://business.picoxr.com/us/doc/EnterpriseAPI-Intro).
+
+**PICO home app** under **USB & advanced** configures the app opened at boot
+and by the Home button. Enter the Android package name or select its APK on the
+operator’s computer to read the package name locally. Install and enable the
+app on each target before deployment. The client calls TobService
+`setLauncher(packageName)`. A successful result confirms the API accepted the
+setting. Verify the Home action after the next headset restart. Deploy a managed
+empty package name to restore the PICO default with `setLauncher(null)`.
+Clearing **Manage** releases management and preserves the current Home setting.
+The per-device **Startup App** command launches an app from the MDM service and
+has its own settings. Older package clients report this setting as unsupported.
+Before downgrading a server with saved `startupApp` entries, restore a registry
+backup compatible with that server.
 
 **Power on when USB is connected** under **USB & advanced** manages the PICO
 `SFS_USB_BOOT` switch. When enabled, connecting USB power starts a powered-off
@@ -339,6 +360,7 @@ launches when the service starts for a boot or system reason.
 | Surface | Contract |
 |---|---|
 | `GET /api/packages`, `POST /api/packages` | List packages or create one by name. |
+| `POST /api/packages/{id}/duplicate` | Accepts the new `name` and the source package’s `expected_revision`. Returns the new editor profile. A stale source revision returns 409. |
 | `GET /api/packages/{id}` | Returns package identity and name, `edit_revision`, `published_revision`, the saved editor `settings`, including unchecked settings and Wi-Fi passwords, the editor `sections`, and `impact` with group and device counts and a token. |
 | `POST /api/packages/{id}/save-and-deploy` | Atomically saves `settings` as `{id: {managed, value}}` and deploys a new revision. Supply `expected_revision` equal to the loaded edit token `edit_revision` (null for a new package), and `expected_impact` from the preview. An optional `name` renames the package. |
 | `DELETE /api/packages/{id}` | Deletes an unassigned package. Send a JSON body with `expected_revision` equal to the loaded `edit_revision` (null for a new package). A stale edit revision or a current group assignment returns 409, with `code: "package_assigned"` for the assignment conflict. |
@@ -346,6 +368,7 @@ launches when the service starts for a boot or system reason.
 | `POST /api/package-retry` | Requests Retry for a currently assigned and online `device_id` with its current `package_id` and `revision`. |
 | `CONFIGURATION_POLICY` | Server to canonical `configuration_packages_v1` or `configuration_summary_v1` clients. Includes `package_id` and the group's active deployment `revision` (a null pair means no effective deployment for the client). Package-capable clients receive managed `settings` and explicit `retry_id` values. Clients with summary capability also receive nullable `group_name` and `deployed_at_ms` (Unix epoch milliseconds). Summary-only clients receive empty `settings`. |
 | `REGISTER` and `CONFIGURATION_STATE` | The secret-free `configuration_state` has `package_id`, `revision`, `status` (`applying`, `complete`, `interrupted`) and per-setting `results`. While the report is unknown, including before restoring a cached attempt, the client omits the field in `REGISTER` and sends no `CONFIGURATION_STATE` update. An explicit null clears the previous report after a durable release or when a durable first assignment is waiting for application. |
+| `REGISTER` and `WIFI_CONNECTION` | A canonical client reports `current_wifi` as `{ssid, bssid}` or null. The BSSID may be null. The headset samples while connected every 30 seconds. The server exposes the current connection in `DEVICE_LIST` for that session. |
 | `REGISTER` and `WIFI_STATE` | The device reports Wi-Fi readiness and monitoring in `wifi_state` with `busy`, `available`, `unavailable_reason` and `priority_monitor`. A repeated registration refreshes both reports when supplied. |
 | `GROUP_LIST` and `DEVICE_LIST` | Group messages expose membership, package summaries, assignments, active deployments, and the snapshot's `server_instance_id` and `revision`. Each deployment's `wifi_mode` is `priority`, `android_selection`, or null when Wi-Fi is unmanaged. Online device rows expose package support and the latest report. An offline row is last-known. |
 

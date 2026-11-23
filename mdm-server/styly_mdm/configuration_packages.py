@@ -1,6 +1,7 @@
 """PICO 4 Ultra Enterprise configuration packages, validation, and public projections."""
 
 import copy
+import re
 
 from .wifi_settings import (
     WIFI_REASONS,
@@ -14,6 +15,7 @@ CAPABILITY = "configuration_packages_v1"
 SUMMARY_CAPABILITY = "configuration_summary_v1"
 VERSION = 3
 MAX_PACKAGE_NAME_LEN = 64
+MAX_ANDROID_PACKAGE_NAME_LEN = 255
 _REASONS = WIFI_REASONS | {
     "READ_FAILED", "WRITE_FAILED", "READBACK_MISMATCH", "INVALID_VALUE",
     "DELAY_CONFLICT", "UPDATE_TIMER_ACTIVE", "CALLBACK_TIMEOUT", "STORAGE_ERROR",
@@ -72,6 +74,7 @@ SECTIONS = [
         _item("seeThrough", "Quick see-through mode", "Enable quick see-through mode.", "bool", False),
     ]},
     {"id": "advanced", "title": "USB & advanced", "description": "USB, file copying and developer options", "items": [
+        _item("startupApp", "PICO home app", "Set the app that opens after reboot when you press Home. An empty package name restores the PICO default.", "package", ""),
         _item("usbBoot", "Power on when USB is connected",
               "Automatically start a powered-off headset when USB power is connected.", "bool", False),
         _item("usb", "USB debugging", "Enable USB debugging.", "bool", False),
@@ -101,6 +104,9 @@ def _valid_schedule(value, *, require_repeat):
 
 def _valid_value(item, value, *, require_repeat=True):
     kind = item["kind"]
+    if kind == "package":
+        return (isinstance(value, str) and len(value) <= MAX_ANDROID_PACKAGE_NAME_LEN
+                and (value == "" or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+", value) is not None))
     if kind == "bool":
         return type(value) is bool
     if kind == "range":

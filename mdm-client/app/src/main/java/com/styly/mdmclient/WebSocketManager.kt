@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.wifi.SupplicantState
 import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
@@ -99,6 +100,7 @@ class WebSocketManager internal constructor(
         private const val CONNECT_TIMEOUT_SECONDS = 3L
         private const val PING_INTERVAL_SECONDS = 15L
         private const val BATTERY_UPDATE_INTERVAL_MS = 5 * 60 * 1000L
+        private const val WIFI_CONNECTION_UPDATE_INTERVAL_MS = 30 * 1000L
 
         const val PREF_STARTUP_APP_PACKAGE = "startup_app_package"
         const val PREF_STARTUP_APP_EXTRA = "startup_app_extra"
@@ -243,7 +245,7 @@ class WebSocketManager internal constructor(
     private var isRunning = false
     private val reconnectHandler = Handler(Looper.getMainLooper())
     private val reconnectToken = Object()
-    private val batteryTelemetryToken = Object()
+    private val telemetryToken = Object()
     private val wifiStateListener: () -> Unit = {
         reconnectHandler.post { publishWifiState() }
     }
@@ -254,6 +256,7 @@ class WebSocketManager internal constructor(
     // Main thread only. Internal journal writes notify often; send only public changes.
     private val wifiReport = SocketStateReport<WebSocket>("wifi_state", "WIFI_STATE")
     private val configurationReport = SocketStateReport<WebSocket>("configuration_state", "CONFIGURATION_STATE")
+    private val currentWifiReport = SocketStateReport<WebSocket>("current_wifi", "WIFI_CONNECTION")
 
     private fun publishWifiState() {
         val socket = webSocket ?: return
@@ -354,6 +357,7 @@ class WebSocketManager internal constructor(
         connectedServerAddress = null
         wifiReport.clear()
         configurationReport.clear()
+        currentWifiReport.clear()
     }
 
     fun sendMessage(json: JSONObject) {
@@ -464,7 +468,7 @@ class WebSocketManager internal constructor(
         current?.cancel()
         webSocket = null
         resetConnectionState()
-        stopBatteryTelemetry()
+        stopTelemetry()
     }
 
     private fun doConnect(url: String) {
@@ -510,7 +514,7 @@ class WebSocketManager internal constructor(
                             if (this@WebSocketManager.webSocket === webSocket &&
                                 registration.isCanonicalAcknowledged(webSocket)
                             ) {
-                                startBatteryTelemetry()
+                                startTelemetry()
                                 publishWifiState()
                                 publishConfigurationState()
                                 wifiController.refreshReadiness()
@@ -573,7 +577,7 @@ class WebSocketManager internal constructor(
             if (webSocket !== deadSocket) return@post
             webSocket = null
             resetConnectionState()
-            stopBatteryTelemetry()
+            stopTelemetry()
             onStatusChanged(false, message)
             dispatch(scheduler.onSocketDisconnected(SystemClock.uptimeMillis()))
         }
@@ -665,6 +669,7 @@ class WebSocketManager internal constructor(
                 put("capabilities", capabilities)
                 put("push_state", pushFields.getJSONObject("push_state"))
                 put("wifi_state", wifiController.stateSnapshot())
+                put("current_wifi", readCurrentWifiSnapshot())
                 put("push_runtime", pushFields.getJSONObject("push_runtime"))
                 val startupConfig = getStartupAppConfig()
                 if (startupConfig != null) {
@@ -692,6 +697,7 @@ class WebSocketManager internal constructor(
         } else {
             wifiReport.recordRegistration(socket, payload)
             configurationReport.recordRegistration(socket, payload)
+            currentWifiReport.recordRegistration(socket, payload)
         }
     }
 
@@ -726,14 +732,16 @@ class WebSocketManager internal constructor(
         onStatusChanged(true, "Connected$address$suffix")
     }
 
-    private fun startBatteryTelemetry() {
-        stopBatteryTelemetry()
+    private fun startTelemetry() {
+        stopTelemetry()
         sendBatteryUpdate()
         scheduleNextBatteryUpdate()
+        publishCurrentWifiUpdate()
+        scheduleNextCurrentWifiUpdate()
     }
 
-    private fun stopBatteryTelemetry() {
-        reconnectHandler.removeCallbacksAndMessages(batteryTelemetryToken)
+    private fun stopTelemetry() {
+        reconnectHandler.removeCallbacksAndMessages(telemetryToken)
     }
 
     private fun scheduleNextBatteryUpdate() {
@@ -742,7 +750,7 @@ class WebSocketManager internal constructor(
                 sendBatteryUpdate()
                 scheduleNextBatteryUpdate()
             }
-        }, batteryTelemetryToken, SystemClock.uptimeMillis() + BATTERY_UPDATE_INTERVAL_MS)
+        }, telemetryToken, SystemClock.uptimeMillis() + BATTERY_UPDATE_INTERVAL_MS)
     }
 
     private fun sendBatteryUpdate() {
@@ -758,6 +766,29 @@ class WebSocketManager internal constructor(
             put("timestamp", System.currentTimeMillis() / 1000)
         }
         sendMessage(update)
+    }
+
+    private fun publishCurrentWifiUpdate() {
+        val socket = webSocket ?: return
+        if (!isRunning || !registration.isCanonicalAcknowledged(socket)) return
+        currentWifiReport.publish(socket, readCurrentWifiSnapshot(), socket::send)
+    }
+
+    private fun scheduleNextCurrentWifiUpdate() {
+        reconnectHandler.postAtTime({
+            if (isRunning && webSocket != null && registration.isCanonicalAcknowledged(webSocket)) {
+                publishCurrentWifiUpdate()
+                scheduleNextCurrentWifiUpdate()
+            }
+        }, telemetryToken, SystemClock.uptimeMillis() + WIFI_CONNECTION_UPDATE_INTERVAL_MS)
+    }
+
+    private fun readCurrentWifiSnapshot(): Any {
+        val manager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            ?: return JSONObject.NULL
+        val info = runCatching { manager.connectionInfo }.getOrNull() ?: return JSONObject.NULL
+        if (info.supplicantState != SupplicantState.COMPLETED) return JSONObject.NULL
+        return currentWifiSnapshot(info.ssid, info.bssid) ?: JSONObject.NULL
     }
 
     private fun readBatterySnapshot(): BatterySnapshot? {
@@ -808,6 +839,17 @@ class WebSocketManager internal constructor(
         val level: Int,
         val charging: Boolean
     )
+}
+
+internal fun currentWifiSnapshot(ssidValue: String?, bssidValue: String?): JSONObject? {
+    if (ssidValue == null || ssidValue.equals("<unknown ssid>", ignoreCase = true)) return null
+    val ssid = ssidValue.removeSurrounding("\"")
+    if (ssid.isBlank() || ssid.toByteArray().size > 32) return null
+    val bssid = bssidValue?.trim()?.takeUnless {
+        it.isEmpty() || it.equals("02:00:00:00:00:00", ignoreCase = true)
+    }
+    return JSONObject().put("ssid", ssid)
+        .put("bssid", bssid?.lowercase(Locale.ROOT) ?: JSONObject.NULL)
 }
 
 internal class SocketStateReport<T : Any>(private val field: String, private val type: String) {

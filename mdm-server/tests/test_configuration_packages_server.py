@@ -366,6 +366,43 @@ def test_mutations_enforce_origin_draft_cas_impact_and_validation(tmp_path):
     asyncio.run(body())
 
 
+def test_package_duplicate_copies_saved_settings_without_publication_or_assignment(tmp_path):
+    async def body():
+        async with _running_server(tmp_path, {"Studio": [DEVICE_ID]}) as (session, base):
+            source = await _create(session, base, "Office")
+            source = await _deploy(session, base, source, settings={
+                **_brightness(42),
+                "wifi": {"managed": False, "value": _wifi_value()},
+            })
+            await _assign(session, base, "Studio", source)
+            source = await _request(session, "GET", base, _path(source))
+
+            duplicate = await _request(session, "POST", base, _path(source) + "/duplicate", {
+                "expected_revision": source["edit_revision"], "name": "Office copy",
+            })
+
+            assert duplicate["package_id"] != source["package_id"]
+            assert duplicate["name"] == "Office copy"
+            assert duplicate["settings"] == source["settings"]
+            assert duplicate["edit_revision"] is not None
+            assert duplicate["edit_revision"] != source["edit_revision"]
+            assert duplicate["published_revision"] is None
+            assert duplicate["impact"]["groups"] == 0
+            catalog = await _request(session, "GET", base, "/api/packages")
+            by_id = {item["package_id"]: item for item in catalog["packages"]}
+            assert by_id[source["package_id"]]["published_revision"] == source["published_revision"]
+            assert by_id[duplicate["package_id"]]["published_revision"] is None
+
+            await _request(session, "POST", base, _path(source) + "/duplicate", {
+                "expected_revision": None, "name": "Stale copy",
+            }, status=409)
+            await _request(session, "POST", base, _path(source) + "/duplicate", {
+                "expected_revision": source["edit_revision"], "name": "Forbidden",
+            }, origin="http://attacker.invalid", status=403)
+
+    asyncio.run(body())
+
+
 def test_save_and_deploy_commits_draft_and_published_settings_together(tmp_path, monkeypatch):
     async def body():
         async with _running_server(tmp_path, {"Studio": [DEVICE_ID]}) as (session, base):
@@ -765,6 +802,64 @@ def test_telemetry_coalescer_runs_once_with_the_latest_state_and_flushes():
         await coalescer.flush(run=False)
         await asyncio.sleep(0.1)
         assert runs == [3, 4, 6]
+
+    asyncio.run(body())
+
+
+def test_current_wifi_is_normalized_and_only_exposed_while_online():
+    assert server.public_current_wifi({"ssid": '"Studio"', "bssid": "AA:BB:CC:DD:EE:FF"}) == {
+        "ssid": '"Studio"', "bssid": "aa:bb:cc:dd:ee:ff",
+    }
+    assert server.public_current_wifi({"ssid": "<unknown ssid>", "bssid": "02:00:00:00:00:00"}) == {
+        "ssid": "<unknown ssid>", "bssid": None,
+    }
+    assert server.public_current_wifi({"ssid": "Guest", "bssid": "02:00:00:00:00:00"}) == {
+        "ssid": "Guest", "bssid": None,
+    }
+    assert server.public_current_wifi({"ssid": " Guest ", "bssid": "01:00:00:00:00:00"}) == {
+        "ssid": " Guest ", "bssid": None,
+    }
+    assert server.public_current_wifi({"ssid": "00:11:22:33:44:55", "bssid": "00:11:22:33:44:55"}) == {
+        "ssid": "00:11:22:33:44:55", "bssid": "00:11:22:33:44:55",
+    }
+    assert server.public_current_wifi({"ssid": "unknown ssid", "bssid": "aa:bb:cc:dd:ee:ff"})["ssid"] == "unknown ssid"
+    assert server.public_current_wifi({"ssid": "x" * 33, "bssid": "aa:bb:cc:dd:ee:ff"}) is None
+    server.devices[DEVICE_ID] = {
+        "device_id": DEVICE_ID, "label": "", "model": "PICO", "ip": "",
+        "status": "online", "current_wifi": {"ssid": "Studio", "bssid": "aa:bb:cc:dd:ee:ff"},
+    }
+    online = json.loads(server.build_device_list_msg())["devices"][0]
+    assert online["current_wifi"] == {"ssid": "Studio", "bssid": "aa:bb:cc:dd:ee:ff"}
+
+    server.devices.clear()
+    server.device_registry[DEVICE_ID] = {
+        "label": "", "model": "PICO", "ip": "", "current_wifi": {"ssid": "Stale"},
+    }
+    offline = json.loads(server.build_device_list_msg())["devices"][0]
+    assert offline["current_wifi"] is None
+
+
+def test_current_wifi_websocket_state_is_live_only_and_explicit_null_clears(tmp_path):
+    async def body():
+        async with _running_server(tmp_path) as (session, base):
+            async with session.ws_connect(base + "/ws/device", autoping=False) as device:
+                await _register(device, {**REGISTRATION, "current_wifi": {"ssid": "Guest", "bssid": None}})
+                await _receive_type(device, "CONFIGURATION_POLICY")
+                assert server.devices[DEVICE_ID]["current_wifi"]["ssid"] == "Guest"
+                assert "current_wifi" not in server.device_registry[DEVICE_ID]
+                await device.send_json({"type": "WIFI_CONNECTION", "current_wifi": {
+                    "ssid": "Office", "bssid": "00:11:22:33:44:55",
+                }})
+                await _assert_no_policy(device)
+                assert server.devices[DEVICE_ID]["current_wifi"] == {
+                    "ssid": "Office", "bssid": "00:11:22:33:44:55",
+                }
+                assert "current_wifi" not in server.device_registry[DEVICE_ID]
+                await device.send_json({"type": "WIFI_CONNECTION", "current_wifi": None})
+                await _assert_no_policy(device)
+                assert server.devices[DEVICE_ID].get("current_wifi") is None
+                assert "current_wifi" not in server.device_registry[DEVICE_ID]
+            assert json.loads(server.build_device_list_msg())["devices"][0]["current_wifi"] is None
 
     asyncio.run(body())
 

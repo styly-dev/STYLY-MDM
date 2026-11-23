@@ -7,6 +7,7 @@ Static files for the web console are served from ./static/.
 
 import argparse
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -369,6 +370,28 @@ def _coerce_battery(value) -> dict | None:
         "charging": charging,
         "last_seen": last_seen,
     }
+
+
+def public_current_wifi(value) -> dict | None:
+    """Normalize the optional currently connected Wi-Fi identity."""
+    if not isinstance(value, dict):
+        return None
+    ssid = value.get("ssid")
+    if not isinstance(ssid, str):
+        return None
+    if not ssid.strip():
+        return None
+    try:
+        if len(ssid.encode("utf-8")) > 32:
+            return None
+    except UnicodeEncodeError:
+        return None
+    raw_bssid = value.get("bssid")
+    bssid = raw_bssid.strip().lower() if isinstance(raw_bssid, str) else ""
+    if (not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", bssid)
+            or int(bssid[:2], 16) & 1 or bssid in {"00:00:00:00:00:00", "02:00:00:00:00:00"}):
+        bssid = None
+    return {"ssid": ssid, "bssid": bssid}
 
 
 def _group_name(value) -> str:
@@ -759,6 +782,7 @@ def build_device_list_msg() -> str:
             "configuration_supported": d.get("status") == "online" and _supports_configuration(d),
             "configuration_state": d.get("configuration_state"),
             "wifi_state": d.get("wifi_state"),
+            "current_wifi": d.get("current_wifi"),
         }
         for d in devices.values()
     ]
@@ -795,6 +819,7 @@ def build_device_list_msg() -> str:
             "configuration_supported": False,
             "configuration_state": rec.get("configuration_state"),
             "wifi_state": rec.get("wifi_state"),
+            "current_wifi": None,
         })
     device_list.sort(
         key=lambda e: (e["label"] == "", (e["label"] or e["device_id"]).lower())
@@ -1694,12 +1719,16 @@ def _editor_package(package_id: str, profile: dict) -> dict:
 
 async def package_catalog_handler(request: web.Request) -> web.Response:
     try:
-        if request.method in ("GET", "HEAD"):
-            _require_packages()
-            return web.json_response({"packages": _public_packages()})
+        _require_packages()
+        return web.json_response({"packages": _public_packages()})
+    except PackageError as exc:
+        return web.json_response({"error": str(exc)}, status=exc.status)
+
+
+async def package_create_handler(request: web.Request) -> web.Response:
+    try:
         _require_package_origin(request)
         body = await _small_json_body(request)
-        package_id = str(uuid.uuid4())
         profile = {
             "name": configuration_packages.validate_name(body.get("name")),
             "settings": {},
@@ -1707,10 +1736,16 @@ async def package_catalog_handler(request: web.Request) -> web.Response:
             "published_revision": None,
             "deployed_at_ms": None,
         }
+        if "source_id" in request.match_info:
+            source = _find_package(request.match_info["source_id"])
+            configuration_packages.check_expected_revision(body, source["edit_revision"])
+            profile["settings"] = copy.deepcopy(source["settings"])
+            profile["edit_revision"] = str(uuid.uuid4())
+        package_id = str(uuid.uuid4())
         _save_package(package_id, profile)
         response = _editor_package(package_id, profile)
         await broadcast_group_list()
-        return web.json_response(response)
+        return web.json_response(response, headers={"Cache-Control": "no-store"})
     except PackageError as exc:
         return web.json_response({"error": str(exc)}, status=exc.status)
 
@@ -1843,7 +1878,7 @@ def _supports_configuration(entry: dict) -> bool:
 def _reported_device_state(data: dict, entry: dict) -> dict:
     if entry.get("identity_kind") != "canonical":
         return {}
-    validators = {"wifi_state": public_wifi_state}
+    validators = {"wifi_state": public_wifi_state, "current_wifi": public_current_wifi}
     if _supports_configuration(entry):
         validators["configuration_state"] = configuration_packages.public_configuration_state
     reports = {}
@@ -1860,6 +1895,11 @@ def _reported_device_state(data: dict, entry: dict) -> dict:
 def _update_device_reports(device_id: str, reports: dict) -> None:
     entry = devices[device_id]
     record = device_registry[device_id]
+    if "current_wifi" in reports:
+        current_wifi = reports.pop("current_wifi")
+        if current_wifi != entry.get("current_wifi"):
+            entry["current_wifi"] = current_wifi
+            _schedule_device_list_broadcast()
     if any(value != entry.get(key) or value != record.get(key) for key, value in reports.items()):
         entry.update(reports)
         record.update(reports)
@@ -2274,6 +2314,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         entry["configuration_state"] = prev.get("configuration_state")
                     reports = _reported_device_state(data, entry)
                     entry.update(reports)
+                    persisted_reports = {key: value for key, value in reports.items() if key != "current_wifi"}
                     devices[device_id] = entry
                     device_registry[device_id] = {
                         **prev,
@@ -2289,7 +2330,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "identity_kind": kind,
                         "configuration_state": prev.get("configuration_state"),
                         "wifi_state": prev.get("wifi_state"),
-                        **reports,
+                        **persisted_reports,
                     }
                     if not prev or prev.get("retired") or prev.get("identity_kind") != kind:
                         save_registry()
@@ -2316,9 +2357,13 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         await broadcast_provisional_connection_list()
                     _schedule_device_list_broadcast()
 
-                elif msg_type in {"CONFIGURATION_STATE", "WIFI_STATE"}:
+                elif msg_type in {"CONFIGURATION_STATE", "WIFI_STATE", "WIFI_CONNECTION"}:
                     entry = devices[device_id]
-                    field = "configuration_state" if msg_type == "CONFIGURATION_STATE" else "wifi_state"
+                    field = {
+                        "CONFIGURATION_STATE": "configuration_state",
+                        "WIFI_STATE": "wifi_state",
+                        "WIFI_CONNECTION": "current_wifi",
+                    }[msg_type]
                     if entry.get("registration_ready") is True and field in data:
                         reports = _reported_device_state({field: data[field]}, entry)
                         _update_device_reports(device_id, reports)
@@ -4038,9 +4083,10 @@ def create_app() -> web.Application:
     app.router.add_get("/ws/device", device_ws_handler)
     app.router.add_get("/ws/admin", admin_ws_handler)
     app.router.add_get("/api/packages", package_catalog_handler)
-    app.router.add_post("/api/packages", package_catalog_handler)
+    app.router.add_post("/api/packages", package_create_handler)
     app.router.add_get("/api/packages/{package_id}", package_handler)
     app.router.add_delete("/api/packages/{package_id}", package_handler)
+    app.router.add_post("/api/packages/{source_id}/duplicate", package_create_handler)
     app.router.add_post("/api/packages/{package_id}/save-and-deploy", package_save_and_deploy_handler)
     app.router.add_get("/api/group-package/deploy", group_package_deploy_handler)
     app.router.add_post("/api/group-package/deploy", group_package_deploy_handler)

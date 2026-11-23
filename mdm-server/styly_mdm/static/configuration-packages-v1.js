@@ -22,6 +22,13 @@
     });
   }
 
+  function currentWifiHtml(device) {
+    const wifi = device?.current_wifi;
+    if (device?.status !== 'online' || !wifi?.ssid) return '';
+    const title = wifi.bssid ? ' title="BSSID: ' + esc(wifi.bssid) + '"' : '';
+    return '<span class="current-wifi"' + title + '>Wi-Fi: ' + esc(wifi.ssid) + '</span>';
+  }
+
   function loadDraft(sections, settings) {
     const draft = {};
     for (const item of sections.flatMap(section => section.items)) {
@@ -62,7 +69,13 @@
     }
     if (item.kind === 'delay') return item.options?.some(option => option.value === value) === true;
     if (item.kind === 'bool') return typeof value === 'boolean';
+    if (item.kind === 'package') return validAndroidPackageName(value, true);
     return true;
+  }
+
+  function validAndroidPackageName(value, allowDefault = false) {
+    return typeof value === 'string' && value.length <= 255 &&
+      (allowDefault && value === '' || /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$/.test(value));
   }
 
   function validScheduleTime(value) {
@@ -201,6 +214,11 @@
     for (const item of sections.flatMap(section => section.items)) {
       const entry = draft[item.id];
       if (!entry) continue;
+      if (item.kind === 'package' && !entry.managed) {
+        const value = validAndroidPackageName(entry.value) ? entry.value : saved[item.id]?.value;
+        if (value) settings[item.id] = { managed: false, value };
+        continue;
+      }
       const managed = entry.managed;
       const value = item.kind === 'wifi' && !entry.managed
         ? saved[item.id].value : entry.value;
@@ -368,6 +386,10 @@
           `<label><input type="checkbox" ${field} data-field="day" data-day="${index}" ${value.repeat & (1 << index) ? 'checked' : ''} ${value.enabled ? '' : 'disabled'}> ${day}</label>`).join('')}</div>`;
       case 'wifi':
         return renderWifi(item, value, saved, secretType, managed);
+      case 'package':
+        return `<label>Android package name<input class="field" type="text" maxlength="255" autocomplete="off" ${field} value="${esc(value)}"></label>
+          <label class="settings-package-picker">Choose app APK<input type="file" accept=".apk,application/vnd.android.package-archive" data-package-apk></label>
+          <small>Select an APK on this computer to fill the package name, or enter a preinstalled app's package name. The file stays on this computer.</small>`;
       default:
         return '';
     }
@@ -375,7 +397,7 @@
 
   function renderItem(item, draft, saved, secretType) {
     const entry = draft[item.id];
-    const wide = item.kind === 'wifi' || item.kind === 'schedule';
+    const wide = item.kind === 'wifi' || item.kind === 'schedule' || item.kind === 'package';
     const label = esc(item.label);
     return `<div class="settings-row${wide ? ' settings-wide' : ''}">
       <label class="settings-manage"><input type="checkbox" data-manage="${esc(item.id)}" aria-label="Manage ${label}" ${entry?.managed ? 'checked' : ''} ${entry ? '' : 'disabled'}></label>
@@ -406,6 +428,7 @@
     if (!item) return '';
     if (item.kind === 'range') return typeof value === 'number' ? value + '%' : '';
     if (item.kind === 'bool') return typeof value === 'boolean' ? value ? 'On' : 'Off' : '';
+
     if (item.kind === 'delay') return item.options.find(option => option.value === value)?.label || '';
     if (item.kind === 'schedule' && value && typeof value.enabled === 'boolean') {
       return value.enabled ? scheduleTime(value) + ' · ' + DAYS.filter((_, index) => value.repeat & (1 << index)).join(', ') : 'Off';
@@ -424,15 +447,19 @@
       if (!status) return '';
       const savedWifi = key === 'wifi' && (legacyWifiSaved(report) || status === 'Applied' && result.reason === 'SAVED');
       const applied = savedWifi || status === 'Applied';
+      const launcherAccepted = key === 'startupApp' && status === 'Applied';
+      const resultStatus = launcherAccepted ? 'Accepted' : savedWifi ? 'Applied' : status;
       const actual = actualValue(item, result?.value);
       const reason = result?.reason && !(key === 'wifi' && applied && result.reason === 'FALLBACK')
         ? String(result.reason).replaceAll('_', ' ').toLowerCase() : '';
       const explanation = reason.charAt(0).toUpperCase() + reason.slice(1);
       const detail = savedWifi
         ? (deployment.wifi_mode === 'android_selection' ? 'Saved. Android selects the network.' : 'Saved')
-        : [actual, explanation].filter(Boolean).join(' · ') || status;
+        : launcherAccepted
+          ? [resultStatus, result.value === '' ? 'PICO default' : result.value, 'Takes effect after reboot'].filter(Boolean).join(' · ')
+          : [actual, explanation].filter(Boolean).join(' · ') || status;
       return `<li class="${applied ? 'applied' : 'unverified'}">
-        <span class="settings-readback-icon" role="img" aria-label="${applied ? 'Applied' : status}">${applied ? '✓' : '×'}</span>
+        <span class="settings-readback-icon" role="img" aria-label="${resultStatus}">${applied ? '✓' : '×'}</span>
         <span>${esc(item?.label || key)}</span><span class="settings-readback-value">${esc(detail)}</span>
       </li>`;
     }).filter(Boolean).join('');
@@ -466,6 +493,8 @@
     sortGroupMembers = members => members,
     deviceIdHtml = (_, id) => esc(id), fetch = root.fetch.bind(root),
     confirmAction = message => root.confirm(message),
+    readPackageFromApk = async () => { throw new Error('APK package-name reading is unavailable.'); },
+    promptForValue = (message, value) => root.prompt(message, value),
     onSnapshot = () => {},
     requestGroupSnapshot = () => false,
   }) {
@@ -687,6 +716,7 @@
       else if (!model.name.trim()) deployReason = 'Enter a package name before deploying.';
       updateDeployAction(footer.querySelector('[data-policy-action="deploy"]'), packagePanel.querySelector('[data-deploy-hint]'), deployReason);
       packagePanel.querySelector('[data-policy-action="delete"]').disabled = locked;
+      packagePanel.querySelector('[data-policy-action="duplicate"]').disabled = locked;
       footer.querySelector('.settings-meta').textContent = changed ? 'Unsaved changes' : '';
       const feedback = packagePanel.querySelector('[data-settings-feedback]');
       feedback.textContent = model.message || (configurationAvailable === false
@@ -713,7 +743,10 @@
       }
       packagePanel.innerHTML = `<div class="settings-section">
         <header class="settings-package-head"><div><h3>Edit configuration package</h3><p class="settings-meta" data-package-publication></p></div>
-          <button type="button" class="btn-outline btn-danger-outline" data-policy-action="delete">Delete package</button>
+          <div class="settings-buttons">
+            <button type="button" class="btn-outline" data-policy-action="duplicate">Duplicate package</button>
+            <button type="button" class="btn-outline btn-danger-outline" data-policy-action="delete">Delete package</button>
+          </div>
         </header>
         <label class="settings-name">Package name<input class="field" data-package-name maxlength="64" value="${esc(model.name)}"></label>
         <div class="push-note">Save &amp; deploy sends these settings to every group using this package. Clearing Manage leaves the device setting in place.</div>
@@ -880,6 +913,40 @@
       return !current.saved || !hasChanges(current) || confirmAction('Discard the unsaved changes in "' + current.savedName + '"?');
     }
 
+    async function duplicatePackage(model) {
+      if (model.busy || model.conflict || configurationAvailable === false) return;
+      if (hasChanges(model) && !confirmAction('Discard the unsaved changes in "' + model.savedName + '" before duplicating?')) return;
+      const name = promptForValue('Name for the copied package:', Array.from(model.savedName).slice(0, 57).join('') + ' (copy)');
+      if (name === null || !name.trim()) return;
+      model.busy = true;
+      model.message = 'Creating package copy…';
+      model.error = false;
+      updateActions();
+      const before = snapshot;
+      const beforeInstanceId = before?.server_instance_id ?? null;
+      try {
+        const profile = await api(packagePath(model.id) + '/duplicate', 'POST', {
+          expected_revision: model.editRevision,
+          name: name.trim(),
+        });
+        if ((snapshot?.server_instance_id ?? null) !== beforeInstanceId) {
+          model.conflict = true;
+          model.error = true;
+          model.message = 'Could not confirm the copy after the server restarted. Reload the package to check its current state.';
+          return;
+        }
+        updateSummary(before, profile, profile.package_id);
+        if (current === model) selectPackage(profile.package_id, profile, beforeInstanceId);
+      } catch (error) {
+        model.error = true;
+        model.message = error.status ? error.message : 'Could not duplicate the package.';
+        if (error.status === 409) model.conflict = true;
+      } finally {
+        model.busy = false;
+        if (current === model) renderEditor();
+      }
+    }
+
     function selectPackage(id, profile, expectedInstanceId = snapshot?.server_instance_id ?? null) {
       if (current?.id === id) return;
       current = { id, expanded: new Set(['basic']) };
@@ -1032,7 +1099,7 @@
               data-device-id="${esc(id)}" aria-expanded="${expanded}" aria-controls="${listId}">${name}</button>` : `<strong>${name}</strong>`}
             <div class="settings-result-actions"><span>${esc(label)}</span>${button}</div>
           </div>
-          <div class="settings-meta">${deviceIdHtml(device || {}, id)} · ${esc(detail)}</div>
+          <div class="settings-meta">${deviceIdHtml(device || {}, id)} · ${esc(detail)} ${currentWifiHtml(device)}</div>
           ${readiness ? `<div class="settings-meta">${readiness}</div>` : ''}
           ${autoReturnNotice ? `<div class="settings-meta">${esc(autoReturnNotice)}</div>` : ''}
           ${results ? `<ul id="${listId}" class="settings-readback" role="list" aria-label="Results at apply time"${expanded ? '' : ' hidden'}>${results}</ul>` : ''}
@@ -1189,6 +1256,8 @@
             article.querySelector('[data-password-help]').textContent = wifiPasswordHelp(row, model.savedWifiNetworks);
           }
           if (field === 'hidden') updateWifiWarnings(target.closest('.settings-value'), model.draft);
+        } else if (setting === 'startupApp') {
+          entry.value = target.value;
         } else if (setting === 'wifi' && field === 'auto_return') {
           value.auto_return = target.checked;
           updateWifiWarnings(target.closest('.settings-value'), model.draft);
@@ -1254,6 +1323,8 @@
         if (confirmAction('Delete configuration package "' + model.savedName + '"?')) {
           return request(model, 'delete', { expected_revision: model.editRevision });
         }
+      } else if (action === 'duplicate') {
+        return duplicatePackage(model);
       } else if (action === 'add-network' || action === 'remove-network' || action === 'move-network') {
         const { setting, network } = button.dataset;
         const entry = model.draft[setting];
@@ -1323,6 +1394,32 @@
     catalogNotice.addEventListener('click', handleCatalogClick);
     createForm.addEventListener('submit', createPackage);
     packagePanel.addEventListener('input', handleInput);
+    packagePanel.addEventListener('change', async event => {
+      const input = event.target.closest('[data-package-apk]');
+      const model = current;
+      const file = input?.files?.[0];
+      if (!input || !file || !model || model.busy || model.conflict || !model.draft.startupApp?.managed) return;
+      model.busy = true;
+      model.message = 'Reading Android package name…';
+      model.error = false;
+      updateActions();
+      try {
+        const packageName = await readPackageFromApk(file);
+        if (current === model) {
+          if (!validAndroidPackageName(packageName)) throw new Error('The APK does not contain a valid Android package name.');
+          model.draft.startupApp.value = packageName;
+          model.message = 'Package name filled from the selected APK.';
+        }
+      } catch (error) {
+        if (current === model) {
+          model.message = error.message || 'Could not read the APK package name.';
+          model.error = true;
+        }
+      } finally {
+        model.busy = false;
+        if (current === model) renderEditor();
+      }
+    });
     packagePanel.addEventListener('click', handleEditorClick);
     packagePanel.addEventListener('toggle', event => {
       const section = event.target.dataset.settingsSection;
@@ -1353,7 +1450,7 @@
     return { renderGroup, updateSnapshot, showPackages, groupPackageSummary, setGroupSnapshotConnected };
   }
 
-  const api = { createController, loadDraft, buildPayload, deviceOutcome, retryEligible };
+  const api = { createController, currentWifiHtml, loadDraft, buildPayload, deviceOutcome, retryEligible };
   root.MdmConfigurationPackages = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);

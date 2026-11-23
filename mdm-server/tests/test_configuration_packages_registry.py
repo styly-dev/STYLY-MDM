@@ -11,6 +11,20 @@ from styly_mdm import configuration_packages, server
 from server_test_helpers import reset_server_state
 
 
+def test_startup_app_package_name_accepts_pico_default_and_valid_android_ids():
+    assert configuration_packages.validate_settings({
+        "startupApp": {"managed": True, "value": ""},
+    })["startupApp"]["value"] == ""
+    assert configuration_packages.validate_settings({
+        "startupApp": {"managed": True, "value": "com.example.viewer_2"},
+    })["startupApp"]["value"] == "com.example.viewer_2"
+    for invalid in ("com", "com..viewer", "com.example-app", "x" * 256):
+        with pytest.raises(configuration_packages.PackageError):
+            configuration_packages.validate_settings({
+                "startupApp": {"managed": True, "value": invalid},
+            })
+
+
 class _AdminSocket:
     def __init__(self):
         self.messages = []

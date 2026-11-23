@@ -166,6 +166,8 @@
     .group-dev + .group-dev { border-top: 1px solid var(--border-soft); }
     .group-dev-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .group-dev-status { color: var(--text-secondary); font-size: 12px; white-space: nowrap; width: 66px; }
+    .current-wifi { color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }
+    .group-dev .current-wifi { max-width: 40%; }
     .group-dev-task { font-size: 12px; white-space: nowrap; text-align: right; min-width: 92px; }
     .radio { width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid #41475f; flex-shrink: 0; }
     .radio.on { border: 5px solid var(--accent); background: var(--bg-card); }
@@ -965,6 +967,9 @@
         getDevice: deviceById,
         getGroups: function () { return groups; },
         sortGroupMembers,
+        readPackageFromApk: function (file) {
+          return apkManifestInfo(file).then(function (info) { return info.package; });
+        },
         openPackages: function () { managePackages = true; render(); },
         onSnapshot: applyGroupListSnapshot,
         requestGroupSnapshot: function () { return wsSend({ type: 'GET_GROUP_LIST' }, 'refresh group details'); },
@@ -1175,14 +1180,14 @@
         const q = search.trim().toLowerCase();
         return sortDevices(devices.filter(function (d) { return deviceMatchesQuery(d, q); }), sortKey);
       }
-      function sortGroupMembers(memberIds) {
+      function sortGroupMembers(memberIds, sortKey = manageSort) {
         const remaining = new Set(memberIds);
         const members = [];
         // Preserve the picker's input order for labels that compare equal.
         for (const device of devices) {
           if (remaining.delete(getDeviceId(device))) members.push(device);
         }
-        return [...sortDevices(members, manageSort).map(getDeviceId), ...remaining];
+        return [...sortDevices(members, sortKey).map(getDeviceId), ...remaining];
       }
       // Status filter for the main Devices list (issue #62). 'online' mirrors getOnlineIds()
       // so "filter to Online then select all" yields a set onlineTargets() will not trim;
@@ -1656,7 +1661,7 @@
       // Per-device rows shown when a group is expanded: online/offline + install progress.
       function renderGroupDevsHtml(members) {
         if (!members.length) return '<div class="group-empty">No members yet</div>';
-        return members.map(function (serial) {
+        return sortGroupMembers(members, 'label-asc').map(function (serial) {
           const d = deviceById(serial);
           const label = (d && d.label) ? d.label : serial;
           const updating = d && d.status === 'updating';
@@ -1665,6 +1670,7 @@
           return '<div class="group-dev">' +
             '<span class="dot ' + (updating ? 'updating' : off ? 'off' : '') + '"></span>' +
             '<span class="group-dev-name">' + esc(label) + '</span>' +
+            window.MdmConfigurationPackages.currentWifiHtml(d) +
             '<span class="group-dev-status">' + status + '</span>' +
             '<span class="group-dev-task" data-task-id="' + esc(serial) + '">' + progressCellHtml(serial) + '</span>' +
             '</div>';

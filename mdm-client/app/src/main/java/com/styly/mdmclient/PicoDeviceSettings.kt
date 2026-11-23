@@ -68,6 +68,29 @@ internal fun settingsFailureOutcome(failure: Throwable, fallback: String): JSONO
     return settingOutcome(if (reason == "UNSUPPORTED") "unsupported" else "failed", reason = reason)
 }
 
+internal fun applyPicoLauncher(
+    packageName: String?,
+    isAppEnabled: (String) -> Boolean,
+    setLauncher: (String?) -> Int,
+): JSONObject {
+    if (packageName == null || packageName.length > 255) return settingOutcome("failed", reason = "INVALID_VALUE")
+    return try {
+        if (packageName.isNotEmpty() &&
+            (!packageName.matches(Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+")) || !isAppEnabled(packageName))) {
+            return settingOutcome("failed", reason = "INVALID_VALUE")
+        }
+        when (setLauncher(packageName.ifEmpty { null })) {
+            0 -> settingOutcome("applied", packageName)
+            -2 -> settingOutcome("unsupported", reason = "UNSUPPORTED")
+            else -> settingOutcome("failed", reason = "WRITE_FAILED")
+        }
+    } catch (_: LinkageError) {
+        settingOutcome("unsupported", reason = "UNSUPPORTED")
+    } catch (failure: Exception) {
+        settingsFailureOutcome(failure, "WRITE_FAILED")
+    }
+}
+
 internal fun pollBluetoothState(
     target: Boolean?,
     nowElapsed: () -> Long = SystemClock::elapsedRealtime,
@@ -149,6 +172,20 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
         configure("sleepDelay")
         if (!screenFirst) configure("screenOff")
         configure("shutdown")
+
+        if (values.has("startupApp")) {
+            results.put("startupApp", applyPicoLauncher(
+                values.opt("startupApp") as? String,
+                isAppEnabled = { packageName ->
+                    try {
+                        context.packageManager.getApplicationInfo(packageName, 0).enabled
+                    } catch (_: PackageManager.NameNotFoundException) {
+                        false
+                    }
+                },
+                setLauncher = service::setLauncher,
+            ))
+        }
 
         for ((key, target) in written) {
             results.put(key, try {
