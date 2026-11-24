@@ -109,9 +109,10 @@ the managed settings sent to devices from the saved values.
 - **Save & deploy** in the editor saves the edits and publishes a new revision
   for every group using the package, in one commit. If another console edits
   the package, use **Reload package** to review the latest saved version.
-  Redeploying the saved package from a group leaves the editor available. Reload keeps edits to other settings. When both consoles changed
-  the same setting to different values, it uses the server value and names
-  that setting for review.
+  Redeploying the saved package from a group leaves the editor available.
+  Reload keeps edits to other settings. When both consoles changed the same
+  setting to different values, it uses the server value and names that setting
+  for review.
 - **Deploy** in group **Settings** assigns a published package to the group with
   a new group deployment revision and assignment time. A new package must be deployed once from the
   editor first. Deploying the package already selected for the group publishes
@@ -137,24 +138,12 @@ the managed settings sent to devices from the saved values.
   added device has no registry record. Save previews the package or release for affected
   devices and checks the effective deployment revisions of the edited groups.
   Delete checks the group list version captured when the operator confirms.
-  Existing members without a record can
-  still be removed.
-  Reload open consoles after upgrading the server. Older callers can omit the new
-  concurrency checks and retain their previous behavior.
-- The editor keeps one draft entry per changed device. An addition records the
-  owner seen when the user selected it. The Devices tab overlays these entries
-  on the latest group list, and drops each entry once the list matches it.
-  Unchanged device rows retain their DOM and focus. The Settings tab and device
-  commands use committed membership.
-- The console keeps one pending group selection. Creating a group waits for
-  its acknowledgement and the following WebSocket group list. Renaming the open
-  group or clicking it again preserves the membership draft. Other consoles
-  receive only the list and warn if a disappearing group had unsaved edits.
-  A later group choice replaces the pending target, and switching waits for
-  an active member save to finish. A manual choice survives reconnect. If its
-  rename acknowledgment arrived before the disconnect and its group list is
-  still pending, the console waits for the list on the new connection. If a
-  confirmed target disappears, recreating the same name does not select it.
+  Existing members without a record can still be removed. Callers that omit
+  these concurrency checks retain their previous behavior.
+- Unsaved membership edits are kept per device and overlaid on the latest group
+  list until the list matches them. The Settings tab and device commands use
+  committed membership. Renaming or reselecting the open group keeps the draft,
+  and other consoles warn if a group with unsaved edits disappears.
 
 Expanded group rows use ascending device-name order. Both those rows and
 **Group Settings → Device status** show the online headset’s current SSID when
@@ -178,8 +167,8 @@ server loads the registry. A group deployment returns the
 snapshot captured at commit, so the console can display the new deployment
 immediately. The current WebSocket can establish a new server instance after
 a restart. HTTP responses from the previous instance are ignored.
-  Package availability comes from the group snapshot. Reloading an unavailable
-  catalog requests that snapshot and waits for the WebSocket to reconnect if needed.
+Package availability comes from the group snapshot. Reloading an unavailable
+catalog requests that snapshot and waits for the WebSocket to reconnect if needed.
 
 The server sends the effective snapshot on registration, publication,
 assignment changes, group renames and deletions, and membership changes.
@@ -197,16 +186,10 @@ conflict if the assignment changed. Retry is not queued for offline devices.
 
 Telemetry registry saves (`BATTERY_UPDATE`, `WIFI_STATE`, `CONFIGURATION_STATE`),
 ordinary re-registrations, and disconnect timestamps are coalesced to one per
-second. New devices, identity-kind changes, and re-adoption after retirement
-are saved immediately. Telemetry, registrations, and ordinary disconnects
-share the 150 ms coalescer for the admin `DEVICE_LIST`. Only one broadcast runs
-at a time through this coalescer. Changes during a broadcast request one more
-broadcast of the latest list. The per-console send timeout
-(default: five seconds) includes waiting for its send lock. Replies to group
-creation and member edits use that lock and deadline, including rejections
-and no-op membership updates.
-Pending telemetry is saved on shutdown. Admin and package changes save
-immediately. The client sends `WIFI_STATE` only when its public state changes.
+second and flushed on shutdown. New devices, identity-kind changes, re-adoption
+after retirement, and admin and package changes are saved immediately. Admin
+`DEVICE_LIST` broadcasts are coalesced, and each console send has a five-second
+timeout. The client sends `WIFI_STATE` only when its public state changes.
 
 #### Client application
 
@@ -236,24 +219,13 @@ replacement for the same assignment.
   from a client without packages, the headset receives its assignment from the
   server.
   The attempt journal records per-setting results and used Retry tokens.
-  Scalar results are saved before Wi-Fi starts. A recoverable exception during
-  application or a process stop before results are saved leaves an interrupted
-  attempt. The same package remains eligible for Retry or **Reapply settings**.
-  A temporary journal read error blocks application and is retried on delivery
-  or headset reapply. If the saved record or journal is malformed, the next
-  authoritative assignment or release replaces it atomically. The client uses
-  its loaded journal when available and starts a fresh one when its contents
-  are corrupt. If saving the assignment fails before the first attempt is
-  recorded, Retry can start that attempt once storage recovers.
-  A Wi-Fi state file error applies to the
-  current attempt. The next deployment, Retry, or headset reapply can use the
-  saved Wi-Fi state once the file is readable and writable again. A test headset
-  with an unsupported pre-release `wifi-policy.json` needs a fresh Wi-Fi state
-  file before it can apply a new Wi-Fi package.
-  A release that cannot be saved stops the current Wi-Fi work and leaves the
-  previous report intact. Headset Settings shows the save failure, and the next
-  delivery can persist the release. A saved release still takes effect at boot
-  if the separate Wi-Fi state update fails.
+  Scalar results are saved before Wi-Fi starts. A recoverable exception or a
+  process stop before results are saved leaves an interrupted attempt that
+  Retry or **Reapply settings** can resume. Storage errors block application
+  until the next delivery, Retry, or headset reapply succeeds; a malformed
+  record or journal is replaced by the next authoritative assignment or release.
+  A release that cannot be saved stops the current Wi-Fi work, and the next
+  delivery retries the save.
 - **Notice:** after saving a fully applied result, the client shows the PICO
   notice `STYLY-MDM Package Applied!` once. After a boot reapply it first waits
   up to 30 seconds for XR Shell readiness. A reused result shows no notice.
@@ -334,21 +306,20 @@ On the headset, the Push Files downloader requests the exact SHA-256 ETag,
 resumes a partial file with an open-ended Range, retries network interruptions,
 and verifies the completed bytes. Push job state, destination extraction and
 sync deletion belong to Push Files. The map cache and import belong to LBE.
-The 60-second no-progress timeout applies to the byte transfer. Explicit queue
-waits for capacity are excluded from that deadline. A queue response preserves
-the time already spent on earlier network failures and backoff. A superseding
-assignment cancels the old map's HTTP request or retry wait. Download and import
-precede the other settings in the same deployment, so Wi-Fi can wait for a large map.
-If the SDK binding changes during the transfer or import, the client records an
-interrupted attempt and resumes the current assignment when the SDK is ready.
+The 60-second no-progress timeout applies to the byte transfer, not to explicit
+queue waits. A superseding assignment cancels the old map's HTTP request or
+retry wait. Download and import precede the other settings in the same
+deployment, so Wi-Fi can wait for a large map. If the SDK binding changes during
+the transfer or import, the client resumes the current assignment when the SDK
+is ready.
 
 The client verifies the complete ZIP before importing it through TobService
 from `/sdcard/maps/styly-mdm/`. After import acceptance it applies and reads
-back LBE On using the current SDK connection, then compares the active map to that exact local ZIP. A previous
-successful attempt for the same package can skip import only after the same
-live check confirms LBE On and a matching cached ZIP. On DEV-005 with PUI
-5.15.7, `isMapInEffect` returned 0 for the active ZIP and 1 for another venue.
-If the file is missing, the map differs or the pre-import comparison is
+back LBE On using the current SDK connection, then compares the active map to
+that exact local ZIP with `isMapInEffect` (0 for the active ZIP and 1 for
+another map on PUI 5.15.7). A previous successful attempt for the same package
+can skip import only after the same live check confirms LBE On and a matching
+cached ZIP. If the file is missing, the map differs or the pre-import comparison is
 unavailable, the client uses the verified acquisition/import path. An explicit
 Retry or headset Reapply forces import.
 
@@ -360,20 +331,7 @@ different active map reports `MAP_ACTIVE_MISMATCH`; a failed, unsupported
 or timed-out comparison reports `MAP_VERIFICATION_UNAVAILABLE`. The package
 reports the LBE pair as incomplete even if the mode switch reads back On.
 A timeout waiting for the **import** callback has a separate `CALLBACK_TIMEOUT`
-result because PICO may still be importing. The console retains the
-accepted/unverified display for reports from older headsets.
-
-Upgrade the server before deploying the new headset client. The previous map
-endpoint used a filesystem ETag and cannot satisfy the new client’s SHA-256
-precondition. Existing map clients can use the upgraded endpoint. If the pool
-stays full, an old client can require another policy delivery to retry; new
-clients recognize the explicit queue response.
-
-Before upgrading, manually back up `device_registry.json` and the entire
-`lbe-maps/` directory if present. New package saves can include IPD and LBE
-fields even when they are unmanaged. Older servers reject those fields. To
-roll back, stop the server and restore the pre-upgrade registry and map directory
-from the same backup. The upgrade does not create this backup automatically.
+result because PICO may still be importing.
 
 **Power on when USB is connected** under **USB & advanced** manages the PICO
 `SFS_USB_BOOT` switch. When enabled, connecting USB power starts a powered-off
@@ -400,7 +358,6 @@ it supplied. Managed Wi-Fi requires the ADB provisioning grant `DUMP`.
 Without it, readiness and apply results report `DUMP_PERMISSION_MISSING`.
 Updates read the current MAC policy from `dumpsys wifi` for both MDM-created
 and external profiles. External profiles are updated by ID through TobService.
-Upgrade the server and reload the console before installing clients that report the new reason.
 A failed candidate does not stop the others. Only after at least one candidate
 is saved and read back does the client set auto-join by saved ID with
 TobService `allowWifiAutoJoin(null, networkId, allowed)`. It confirms the flags
@@ -483,16 +440,10 @@ and on package changes. Native clients can connect without an Origin header.
 | `GET`, `POST /api/group-package/deploy?name=...&package_id=...` | GET previews the deployment scope and whether it uses the current deployed version. An empty `package_id=` previews clearing management for the group and sets `clear` to true. The preview includes the current deployment's `wifi_mode`. POST accepts `expected_impact` from the preview, commits the group reference and any new deployment revision together, and returns the committed `GROUP_LIST` snapshot. A package that has never been deployed returns 409. |
 | `POST /api/package-retry` | Requests Retry for a currently assigned and online `device_id` with its current `package_id` and `revision`. |
 | `CONFIGURATION_POLICY` | Server to canonical `configuration_packages_v1` or `configuration_summary_v1` clients. Includes `package_id` and the group's active deployment `revision` (a null pair means no effective deployment for the client). Package-capable clients receive managed `settings` and explicit `retry_id` values. Clients with summary capability also receive nullable `group_name` and `deployed_at_ms` (Unix epoch milliseconds). Summary-only clients receive empty `settings`. For a managed venue ZIP, clients advertising `configuration_lbe_map_v1` receive the same-origin `lbe_map_download` path and `lbe_map_token` bearer credential outside `settings`. |
-| `REGISTER` and `CONFIGURATION_STATE` | The secret-free `configuration_state` has `package_id`, `revision`, `status` (`applying`, `complete`, `interrupted`) and per-setting `results`. A missing `startupApp` reports `status: "waiting"` and `reason: "APP_NOT_INSTALLED"` after PICO accepts the default Home setting. A disabled `startupApp` reports `status: "failed"` and `reason: "APP_DISABLED"`. Both report the requested package name as `value`. A `complete` attempt may contain a waiting result. Successful IPD calls report `ACCEPTED_UNVERIFIED`. Current clients report `MAP_ACTIVE_VERIFIED` only after confirming LBE On and the requested ZIP. Older clients can report an accepted import as `MAP_ACTIVE_UNVERIFIED`. While the report is unknown, including before restoring a cached attempt, the client omits the field in `REGISTER` and sends no `CONFIGURATION_STATE` update. An explicit null clears the previous report after a durable release or when a durable first assignment is waiting for application. |
+| `REGISTER` and `CONFIGURATION_STATE` | The secret-free `configuration_state` has `package_id`, `revision`, `status` (`applying`, `complete`, `interrupted`) and per-setting `results`. A missing `startupApp` reports `status: "waiting"` and `reason: "APP_NOT_INSTALLED"` after PICO accepts the default Home setting. A disabled `startupApp` reports `status: "failed"` and `reason: "APP_DISABLED"`. Both report the requested package name as `value`. A `complete` attempt may contain a waiting result. Successful IPD calls report `ACCEPTED_UNVERIFIED`. Clients report `MAP_ACTIVE_VERIFIED` only after confirming LBE On and the requested ZIP. While the report is unknown, including before restoring a cached attempt, the client omits the field in `REGISTER` and sends no `CONFIGURATION_STATE` update. An explicit null clears the previous report after a durable release or when a durable first assignment is waiting for application. |
 | `REGISTER` and `WIFI_CONNECTION` | A canonical client reports `current_wifi` as `{ssid, bssid}` or null. The BSSID may be null. The headset samples while connected every 30 seconds. The server exposes the current connection in `DEVICE_LIST` for that session. |
 | `REGISTER` and `WIFI_STATE` | The device reports Wi-Fi readiness and monitoring in `wifi_state` with `busy`, `available`, `unavailable_reason` and `priority_monitor`. A repeated registration refreshes both reports when supplied. |
 | `GROUP_LIST` and `DEVICE_LIST` | Group messages expose membership, package summaries, assignments, active deployments, and the snapshot's `server_instance_id` and `revision`. Each deployment's `wifi_mode` is `priority`, `android_selection`, or null when Wi-Fi is unmanaged. Online device rows expose package support and the latest report. An offline row is last-known. |
-
-Update the server and reload the console before deploying clients that report a
-waiting home app. Older servers discard that per-setting result and strip the
-`APP_DISABLED` reason from failures. An existing
-home app failure from an older client can be reevaluated with Retry after the
-client upgrade or by a fresh deployment.
 
 #### Registry storage
 
