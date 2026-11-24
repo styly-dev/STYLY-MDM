@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
@@ -99,6 +100,9 @@ class MdmClientService : Service() {
         private val HEX = "0123456789abcdef".toCharArray()
     }
 
+    private val startupHandler = Handler(android.os.Looper.getMainLooper())
+    private var startupLaunchScheduled = false
+    @Volatile private var notificationStatus = "Initializing..."
     private lateinit var webSocketManager: WebSocketManager
 
     // Mutual watch: off the main thread because each tick is a binder round-trip to
@@ -120,6 +124,9 @@ class MdmClientService : Service() {
     // when the retire fails, which re-opens guard provisioning on the next tick.
     @Volatile
     private var retireInProgress = false
+
+    @Volatile
+    private var serviceDestroyed = false
 
     // package -> the token of the EXECUTE_UNINSTALL (#63) attempt that owns it. A
     // re-sent command must not start a second uninstall of the same package while
@@ -146,8 +153,9 @@ class MdmClientService : Service() {
         // Android 12+ when the start came from the background; startForegroundService() itself
         // can return cleanly first. Journalling only after it returns pins a failure to the
         // right call instead of leaving the two indistinguishable.
-        startForeground(NOTIFICATION_ID, buildNotification("Initializing..."))
+        promoteToForeground()
         UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_FOREGROUND_OK)
+        MdmClientApplication.wifiSettingsController().start()
 
         webSocketManager = WebSocketManager(
             context = this,
@@ -156,20 +164,25 @@ class MdmClientService : Service() {
         )
         webSocketManager.connect()
 
-        launchStartupAppIfConfigured()
-
         guardEnsureThread = HandlerThread("guard-ensure").apply { start() }
         guardEnsure = Handler(guardEnsureThread.looper)
         guardEnsure.postDelayed(::guardEnsureTick, GUARD_ENSURE_INTERVAL_MS)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // A location grant can arrive after onCreate, while this service is already running.
+        promoteToForeground()
+        MdmClientApplication.wifiSettingsController().refreshReadiness()
         // A null intent is a START_STICKY redelivery; a start with no reason extra came from
         // outside our own code — the PICO keep-alive being the case the spike is looking for.
         val reason = when {
             intent == null -> REASON_SYSTEM
             intent.action == "com.pvr.tobservice.SERVICE_AUTO_BOOT" -> "tob_auto_boot"
             else -> intent.getStringExtra(EXTRA_START_REASON) ?: REASON_SYSTEM
+        }
+        if (reason != REASON_SETTINGS && !startupLaunchScheduled) {
+            startupLaunchScheduled = true
+            launchStartupAppIfConfigured()
         }
         Log.i(TAG, "MdmClientService started (reason=$reason)")
         UpdateJournal.record(
@@ -180,9 +193,19 @@ class MdmClientService : Service() {
         return START_STICKY
     }
 
+    private fun promoteToForeground() {
+        val locationGranted = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        val types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+            if (locationGranted) ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION else 0
+        startForeground(NOTIFICATION_ID, buildNotification(notificationStatus), types)
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        serviceDestroyed = true
+        startupHandler.removeCallbacksAndMessages(null)
         Log.i(TAG, "MdmClientService destroyed")
         UpdateJournal.record(this, UpdateJournal.EVENT_SERVICE_DESTROYED)
         guardEnsureThread.quitSafely()
@@ -856,6 +879,15 @@ class MdmClientService : Service() {
                         )
                         return
                     }
+                    PowerCycleTimers.ArmOutcome.REFUSED_SHUTDOWN_SCHEDULE -> {
+                        apkFile.delete()
+                        sendInstallResult(
+                            apkFilename, "fail",
+                            "Self-update recovery unavailable: the guard app is not running and the " +
+                                "device's recurring shutdown schedule is set or unreadable; refusing an update with no way back"
+                        )
+                        return
+                    }
                     PowerCycleTimers.ArmOutcome.REFUSED_UNSAFE -> {
                         apkFile.delete()
                         sendInstallResult(
@@ -927,12 +959,12 @@ class MdmClientService : Service() {
                     }
                 }
             )
-        } catch (e: Exception) {
+        } catch (failure: Throwable) {
             apkFile.delete()
             if (isSelfUpdate && UpdateJournal.powerCycleTimersSet(this)) {
                 PowerCycleTimers.disarm(this, "install_failed")
             }
-            throw e
+            throw failure
         }
     }
 
@@ -1252,7 +1284,8 @@ class MdmClientService : Service() {
         Log.i(TAG, "Startup app configured: $packageName, launching after delay")
 
         // Delay to allow TobService binder to initialize
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+        startupHandler.postDelayed({
+            if (serviceDestroyed) return@postDelayed
             doLaunchApp(packageName, extra, killForeground = false) { status, error ->
                 Log.i(TAG, "Startup app launch result: $status ${if (error.isNotEmpty()) "- $error" else ""}")
             }
@@ -1692,6 +1725,7 @@ class MdmClientService : Service() {
     }
 
     private fun updateNotification(statusText: String) {
+        notificationStatus = statusText
         val manager = getSystemService(NotificationManager::class.java)
         manager.notify(NOTIFICATION_ID, buildNotification(statusText))
     }

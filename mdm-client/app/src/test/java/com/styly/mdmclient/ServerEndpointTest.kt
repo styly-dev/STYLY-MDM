@@ -2,9 +2,28 @@ package com.styly.mdmclient
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ServerEndpointTest {
+
+    @Test
+    fun productionPortIsAcceptedOnlyInTheProductionFlavor() {
+        val url = "ws://mdm.local:7070/ws/device"
+        val production = BuildConfig.FLAVOR == "prod"
+        assertEquals(production, WebSocketManager.isValidWsUrl(url))
+        assertEquals(
+            url.takeIf { production },
+            WebSocketManager.normalizeManualServerUrl("mdm.local:7070"),
+        )
+    }
+
+    @Test
+    fun developmentAndCustomPortsAreValidConnectionTargets() {
+        assertTrue(WebSocketManager.isValidWsUrl(WebSocketManager.DEFAULT_SERVER_URL))
+        assertTrue(WebSocketManager.isValidWsUrl("ws://mdm.local:7080/ws/device"))
+        assertTrue(WebSocketManager.isValidWsUrl("wss://mdm.local:7443/ws/device"))
+    }
 
     @Test
     fun addressIsExpandedToDeviceWebSocketUrl() {

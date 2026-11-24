@@ -1,10 +1,13 @@
 package com.styly.mdmclient
 
+import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -12,12 +15,19 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.text.TextUtils
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
+import androidx.annotation.IdRes
+import androidx.annotation.StringRes
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.text.buildSpannedString
+import androidx.core.text.color
+import java.text.DateFormat
+import java.util.Date
 
 /**
  * Settings screen for configuring the STYLY-MDM server address
@@ -30,11 +40,31 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var saveButton: Button
     private lateinit var autoDiscoveryButton: Button
     private lateinit var storagePermissionStatus: TextView
+    private lateinit var storagePermissionAction: View
     private lateinit var grantStorageButton: Button
     private lateinit var deviceIdentityStatus: TextView
     private lateinit var journalText: TextView
     private lateinit var journalRefreshButton: Button
     private lateinit var journalClearButton: Button
+    private lateinit var wifiPermissionHint: TextView
+    private lateinit var wifiPermissionButton: Button
+    private lateinit var wifiPermissionSummary: TextView
+    private lateinit var wifiDiagnosticsHint: View
+    private lateinit var permissionDetails: View
+    private lateinit var permissionDetailsToggle: Button
+    private var hadWifiLocationPermissions = false
+    private lateinit var configurationGroup: TextView
+    private lateinit var configurationDeployment: TextView
+    private lateinit var configurationDeploymentRow: View
+    private lateinit var configurationApplyStatus: TextView
+    private lateinit var reapplyButton: Button
+
+    private val configurationController get() = MdmClientApplication.configurationPackageController()
+    private var configurationVisible = false
+    private var reapplyPending = false
+    private val configurationListener: () -> Unit = {
+        runOnUiThread { if (configurationVisible) updateConfigurationUi() }
+    }
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -82,11 +112,23 @@ class SettingsActivity : AppCompatActivity() {
         saveButton = findViewById(R.id.save_button)
         autoDiscoveryButton = findViewById(R.id.use_auto_discovery_button)
         storagePermissionStatus = findViewById(R.id.storage_permission_status)
+        storagePermissionAction = findViewById(R.id.storage_permission_action)
         grantStorageButton = findViewById(R.id.grant_storage_button)
         deviceIdentityStatus = findViewById(R.id.device_identity_status)
         journalText = findViewById(R.id.journal_text)
         journalRefreshButton = findViewById(R.id.journal_refresh_button)
         journalClearButton = findViewById(R.id.journal_clear_button)
+        wifiPermissionHint = findViewById(R.id.wifi_permission_hint)
+        wifiPermissionButton = findViewById(R.id.wifi_location_permission_button)
+        wifiPermissionSummary = findViewById(R.id.wifi_permission_summary)
+        wifiDiagnosticsHint = findViewById(R.id.wifi_diagnostics_hint)
+        permissionDetails = findViewById(R.id.permission_details)
+        permissionDetailsToggle = findViewById(R.id.permission_details_toggle)
+        configurationGroup = findViewById(R.id.configuration_group)
+        configurationDeployment = findViewById(R.id.configuration_deployment)
+        configurationDeploymentRow = findViewById(R.id.configuration_deployment_row)
+        configurationApplyStatus = findViewById(R.id.configuration_apply_status)
+        reapplyButton = findViewById(R.id.configuration_reapply)
 
         serverUrlInput.setText(WebSocketManager.getManualServerAddress(this).orEmpty())
 
@@ -111,11 +153,25 @@ class SettingsActivity : AppCompatActivity() {
             refreshJournal()
         }
 
-        // Start the service if not already running
-        startForegroundService(
-            Intent(this, MdmClientService::class.java)
-                .putExtra(MdmClientService.EXTRA_START_REASON, MdmClientService.REASON_SETTINGS)
-        )
+        wifiPermissionButton.setOnClickListener { requestWifiPermission() }
+        showPermissionDetails(savedInstanceState?.getBoolean(KEY_PERMISSION_DETAILS_OPEN) == true)
+        permissionDetailsToggle.setOnClickListener {
+            showPermissionDetails(permissionDetails.visibility != View.VISIBLE)
+        }
+
+        hadWifiLocationPermissions = hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) &&
+            hasPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        startMdmService()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(KEY_PERMISSION_DETAILS_OPEN, permissionDetails.visibility == View.VISIBLE)
+    }
+
+    private fun showPermissionDetails(expanded: Boolean) {
+        permissionDetails.visibility = if (expanded) View.VISIBLE else View.GONE
+        permissionDetailsToggle.setText(if (expanded) R.string.permission_details_hide else R.string.permission_details_show)
     }
 
     override fun onResume() {
@@ -124,6 +180,10 @@ class SettingsActivity : AppCompatActivity() {
         registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         // Re-check here so returning from the system settings screen refreshes the UI.
         updateStoragePermissionUi()
+        refreshWifiPermissions()
+        configurationVisible = true
+        configurationController.addScreenListener(configurationListener)
+        updateConfigurationUi()
         permissionRecoveryPending = hasAllFilesAccess()
         MdmClientApplication.deviceIdentityResolver().addListener(identityListener)
         refreshJournal()
@@ -135,9 +195,66 @@ class SettingsActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        configurationVisible = false
+        configurationController.removeScreenListener(configurationListener)
         permissionRecoveryPending = false
         unregisterReceiver(statusReceiver)
         MdmClientApplication.deviceIdentityResolver().removeListener(identityListener)
+    }
+
+    private fun updateConfigurationUi() {
+        val state = configurationController.screenSnapshot()
+        val version = state?.version
+        configurationGroup.text = when {
+            state?.groupName != null -> state.groupName
+            state?.groupKnown == true -> getString(R.string.configuration_group_none)
+            else -> getString(R.string.configuration_group_unknown)
+        }
+        configurationDeploymentRow.visibility = if (version != null) View.VISIBLE else View.GONE
+        if (version != null) {
+            configurationDeployment.text = state.deployedAtMillis?.let {
+                DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(it))
+            } ?: getString(R.string.configuration_deployment_unknown)
+        }
+        val status = state?.applyStatus
+        val statusTextRes = when {
+            status == ConfigurationApplyStatus.RELEASE_UNSAVED -> R.string.configuration_release_unsaved
+            version == null && state?.groupKnown == true -> R.string.configuration_not_deployed
+            version == null -> null
+            status == null -> R.string.configuration_unsupported
+            status == ConfigurationApplyStatus.APPLYING -> R.string.configuration_applying
+            status == ConfigurationApplyStatus.WAITING -> R.string.configuration_waiting
+            status == ConfigurationApplyStatus.WAITING_FOR_HOME_APP -> null
+            status == ConfigurationApplyStatus.APPLIED -> R.string.configuration_applied
+            else -> R.string.configuration_incomplete
+        }
+        val waitingHomeAppText = state?.waitingHomeAppPackage?.let {
+            getString(R.string.configuration_waiting_for_home_app, it)
+        }
+        val statusText = listOfNotNull(statusTextRes?.let { getString(it) }, waitingHomeAppText).joinToString("\n")
+        configurationApplyStatus.visibility = if (statusText.isNotEmpty()) View.VISIBLE else View.GONE
+        configurationApplyStatus.text = statusText
+        reapplyButton.visibility = if (version != null && status != null) View.VISIBLE else View.GONE
+        reapplyButton.isEnabled = state?.canReapply == true && !reapplyPending
+        reapplyButton.setOnClickListener {
+            if (version != null && !reapplyPending) reapplyConfiguration(version)
+        }
+    }
+
+    private fun reapplyConfiguration(version: ConfigurationVersion) {
+        reapplyPending = true
+        reapplyButton.isEnabled = false
+        configurationController.reapply(version) { started ->
+            runOnUiThread {
+                reapplyPending = false
+                if (configurationVisible) {
+                    updateConfigurationUi()
+                    if (!started) {
+                        Toast.makeText(this, R.string.configuration_reapply_unavailable, Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
     }
 
     private fun saveAndRestart() {
@@ -154,7 +271,7 @@ class SettingsActivity : AppCompatActivity() {
         if (!WebSocketManager.saveManualServerUrl(this, url)) {
             Toast.makeText(
                 this,
-                "Enter a valid server address such as 192.168.1.100:7070",
+                getString(R.string.invalid_server_address, getString(R.string.server_url_hint)),
                 Toast.LENGTH_SHORT,
             ).show()
             return
@@ -171,11 +288,15 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun restartService(status: String) {
         stopService(Intent(this, MdmClientService::class.java))
+        startMdmService()
+        statusText.text = status
+    }
+
+    private fun startMdmService() {
         startForegroundService(
             Intent(this, MdmClientService::class.java)
                 .putExtra(MdmClientService.EXTRA_START_REASON, MdmClientService.REASON_SETTINGS)
         )
-        statusText.text = status
     }
 
     /**
@@ -190,12 +311,12 @@ class SettingsActivity : AppCompatActivity() {
     private fun updateStoragePermissionUi() {
         if (hasAllFilesAccess()) {
             storagePermissionStatus.setText(R.string.storage_permission_granted)
-            storagePermissionStatus.setTextColor(0xFF4CAF50.toInt())
-            grantStorageButton.visibility = View.GONE
+            storagePermissionStatus.setTextColor(getColor(R.color.permission_status_granted))
+            storagePermissionAction.visibility = View.GONE
         } else {
             storagePermissionStatus.setText(R.string.storage_permission_not_granted)
-            storagePermissionStatus.setTextColor(0xFFFF5722.toInt())
-            grantStorageButton.visibility = View.VISIBLE
+            storagePermissionStatus.setTextColor(getColor(R.color.permission_status_action))
+            storagePermissionAction.visibility = View.VISIBLE
         }
     }
 
@@ -240,6 +361,134 @@ class SettingsActivity : AppCompatActivity() {
             }
         }
         Toast.makeText(this, R.string.storage_permission_settings_unavailable, Toast.LENGTH_LONG).show()
+    }
+
+    private fun hasPermission(permission: String): Boolean =
+        checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+
+    private fun locationServicesEnabled(): Boolean =
+        getSystemService(LocationManager::class.java)?.isLocationEnabled == true
+
+    private fun refreshWifiPermissions() {
+        val preciseLocation = hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+        val backgroundLocation = hasPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        val overlay = hasManagedWifiReadAccess(this)
+        val locationEnabled = locationServicesEnabled()
+        val diagnostics = hasManagedWifiDiagnosticsAccess(this)
+        updateWifiPermissionRow(R.id.wifi_precise_location_status, R.string.wifi_precise_location, preciseLocation)
+        updateWifiPermissionRow(R.id.wifi_background_location_status, R.string.wifi_background_location, backgroundLocation)
+        updateWifiPermissionRow(R.id.wifi_overlay_status, R.string.wifi_overlay, overlay)
+        updateWifiPermissionRow(R.id.wifi_diagnostics_status, R.string.wifi_diagnostics, diagnostics)
+        updateWifiStatusRow(
+            R.id.wifi_location_services_status,
+            R.string.wifi_location_services,
+            getText(if (locationEnabled) R.string.wifi_location_services_on else R.string.wifi_location_services_off),
+        )
+
+        val settingsAction = when {
+            !preciseLocation -> R.string.wifi_precise_location_permission_missing to R.string.wifi_allow_precise_location
+            !backgroundLocation -> R.string.wifi_background_location_permission_missing to R.string.wifi_open_app_permissions
+            !overlay -> R.string.wifi_overlay_permission_missing to R.string.wifi_open_overlay_settings
+            !locationEnabled -> R.string.wifi_location_services_disabled to R.string.wifi_open_location_settings
+            else -> null
+        }
+        val actionVisibility = if (settingsAction == null) View.GONE else View.VISIBLE
+        wifiPermissionHint.visibility = actionVisibility
+        wifiPermissionButton.visibility = actionVisibility
+        wifiDiagnosticsHint.visibility = if (diagnostics) View.GONE else View.VISIBLE
+        if (settingsAction != null) {
+            val (hint, button) = settingsAction
+            wifiPermissionHint.setText(hint)
+            wifiPermissionButton.setText(button)
+        }
+        if (settingsAction == null && diagnostics) {
+            wifiPermissionSummary.setText(R.string.wifi_permissions_ready)
+        } else {
+            wifiPermissionSummary.text = buildSpannedString {
+                color(getColor(R.color.permission_status_action)) {
+                    append(getText(R.string.wifi_permissions_action_needed))
+                }
+            }
+        }
+
+        val hasLocationPermissions = preciseLocation && backgroundLocation
+        val locationPermissionsAcquired = hasLocationPermissions && !hadWifiLocationPermissions
+        hadWifiLocationPermissions = hasLocationPermissions
+        if (locationPermissionsAcquired) {
+            // Returning from system settings does not deliver a runtime permission result.
+            startMdmService()
+        } else {
+            MdmClientApplication.wifiSettingsController().refreshReadiness()
+        }
+    }
+
+    private fun updateWifiPermissionRow(@IdRes viewId: Int, @StringRes label: Int, granted: Boolean) {
+        val status = if (granted) {
+            buildSpannedString {
+                color(getColor(R.color.permission_status_granted)) {
+                    append(getText(R.string.wifi_permission_granted))
+                }
+            }
+        } else {
+            getText(R.string.wifi_permission_not_granted)
+        }
+        updateWifiStatusRow(viewId, label, status)
+    }
+
+    private fun updateWifiStatusRow(@IdRes viewId: Int, @StringRes label: Int, status: CharSequence) {
+        findViewById<TextView>(viewId).text =
+            TextUtils.expandTemplate(getText(R.string.wifi_status_format), getText(label), status)
+    }
+
+    private fun requestWifiPermission() {
+        val fineLocationMissing = !hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+        val permissions = getPreferences(MODE_PRIVATE)
+        if (fineLocationMissing && (!permissions.getBoolean("requested_fine_location", false) ||
+                shouldShowRequestPermissionRationale(Manifest.permission.ACCESS_FINE_LOCATION))) {
+            permissions.edit().putBoolean("requested_fine_location", true).apply()
+            requestPermissions(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION,
+                ),
+                REQUEST_WIFI_LOCATION_PERMISSION,
+            )
+            return
+        }
+
+        val packageUri = Uri.fromParts("package", packageName, null)
+        val intent = when {
+            fineLocationMissing || !hasPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) ->
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri)
+            !hasManagedWifiReadAccess(this) -> Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, packageUri)
+            !locationServicesEnabled() -> Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
+            else -> return
+        }
+        try {
+            startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+            val message = if (intent.action == Settings.ACTION_MANAGE_OVERLAY_PERMISSION) {
+                R.string.wifi_overlay_settings_unavailable
+            } else {
+                R.string.wifi_location_settings_unavailable
+            }
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    @Deprecated("Use the activity result API when migrating the settings screen")
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_WIFI_LOCATION_PERMISSION) refreshWifiPermissions()
+    }
+
+    companion object {
+        private const val REQUEST_WIFI_LOCATION_PERMISSION = 8702
+        private const val KEY_PERMISSION_DETAILS_OPEN = "permission_details_open"
     }
 
     private fun updateStatusDisplay(connected: Boolean, message: String) {

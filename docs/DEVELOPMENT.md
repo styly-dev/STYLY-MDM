@@ -22,8 +22,9 @@ For end-user setup and usage, see the [README](../README.md).
 
 **Push Files** and **Sync Folder** use server-owned UUID jobs, a SQLite-backed
 lifecycle, immutable artifacts, and an Application-scoped client coordinator.
-APK installation keeps its existing command path and shares the server-wide
-download budget with Push/Sync.
+Venue maps use the Push/Sync HTTP sender and resumable Android downloader.
+The configuration controller owns the map assignment and PICO import. APK
+installation shares the server-wide download budget with both transfer types.
 
 `PushJobStore` serializes SQLite access; `PushJobManager` owns lifecycle decisions
 and commits related state, fences, and revisions together. `push_runtime.py`
@@ -83,6 +84,393 @@ payloads and parser exception details that could contain artifact lease tokens.
 state transitions, Resume/Cancel/Retry eligibility, retention, recovery, deployment
 compatibility, and message sequences.
 
+### Configuration packages
+
+The client advertises configuration package support when the app process sees
+`Build.MANUFACTURER` equal to `Pico` (case-insensitive) and `Build.PRODUCT`
+equal to `PICO 4 Ultra Enterprise`. On DEV-005, the ADB shell reports
+`ro.product.name` as `sparrow`, while the app reports the enterprise product name.
+Operator-facing Wi-Fi behavior is in [Wi-Fi settings](WIFI_SETTINGS.md).
+Device cards in Group Settings start collapsed. Opening a card shows each
+setting's reported result for the current deployment.
+
+#### Groups and deployment
+
+A device belongs to at most one group. A group holds its members and an
+optional package reference, and several groups can share a package. A package
+stores the editor's saved settings, including Wi-Fi passwords and unchecked
+values, with its published revision and deployment time. The server derives
+the managed settings sent to devices from the saved values.
+
+- **Duplicate package** copies the saved settings, including unchecked values,
+  Wi-Fi network order and passwords, into a new unpublished package. The editor
+  opens the copy under its own name and edit revision. Follow the usual
+  **Save & deploy** and group assignment steps to deploy it.
+- **Save & deploy** in the editor saves the edits and publishes a new revision
+  for every group using the package, in one commit. If another console edits
+  the package, use **Reload package** to review the latest saved version.
+  Redeploying the saved package from a group leaves the editor available.
+  Reload keeps edits to other settings. When both consoles changed the same
+  setting to different values, it uses the server value and names that setting
+  for review.
+- **Deploy** in group **Settings** assigns a published package to the group with
+  a new group deployment revision and assignment time. A new package must be deployed once from the
+  editor first. Deploying the package already selected for the group publishes
+  a new shared revision.
+- **No managed settings** releases every managed setting for the group and leaves device
+  values in place when each device receives the release. A device still reporting
+  an earlier deployment shows **Release pending**. Offline devices receive the release
+  when they reconnect. For a Wi-Fi package, the confirmation notes that auto-connect
+  flags stay on the headset.
+- Turning off **Manage** for Wi-Fi keeps the saved network values and credentials.
+  Incomplete unsaved rows do not block deployment of the other settings.
+- The confirmation counts every affected group and member, including offline
+  devices. The server rejects the deployment if the revision or targets changed
+  since the preview.
+- **Device status** counts members that reported success for the current
+  revision, out of all members. It follows the name sort of the Devices tab in
+  Manage Groups. Unlabeled devices appear first in Device ID order, and members
+  missing from the device list appear last.
+- A setting missing from the published snapshot is released on the device.
+  Deleting a group releases its members. A referenced package cannot be deleted.
+- The group Devices editor sends only staged changes with the expected group of
+  each device. The server rejects the whole edit if an owner changed or an
+  added device has no registry record. Save previews the package or release for affected
+  devices and checks the effective deployment revisions of the edited groups.
+  Delete checks the group list version captured when the operator confirms.
+  Existing members without a record can still be removed. Callers that omit
+  these concurrency checks retain their previous behavior.
+- Unsaved membership edits are kept per device and overlaid on the latest group
+  list until the list matches them. The Settings tab and device commands use
+  committed membership. Renaming or reselecting the open group keeps the draft,
+  and other consoles warn if a group with unsaved edits disappears.
+
+Expanded group rows use ascending device-name order. Both those rows and
+**Group Settings → Device status** show the online headset’s current SSID when
+available. Hover over the SSID for the access point’s BSSID when reported.
+The SSID is hidden when Android withholds it, including when location access or
+the device’s Location switch is off.
+
+#### Server registry and delivery
+
+Groups, package references, and the package catalog form one registry snapshot.
+A mutation saves the new snapshot before readers or devices see it. Forgetting
+a device removes its record and membership in the same save. After creating,
+renaming, or deleting a group, the requesting console receives the
+acknowledgment before the group list. After a membership edit, it receives the
+updated group list followed by the acknowledgment on its own connection.
+
+Group snapshots carry a `revision` that advances with committed group or
+package changes. The console orders HTTP and WebSocket snapshots by this
+revision within one `server_instance_id`. The counter starts at zero when the
+server loads the registry. A group deployment returns the
+snapshot captured at commit, so the console can display the new deployment
+immediately. The current WebSocket can establish a new server instance after
+a restart. HTTP responses from the previous instance are ignored.
+Package availability comes from the group snapshot. Reloading an unavailable
+catalog requests that snapshot and waits for the WebSocket to reconnect if needed.
+
+The server sends the effective snapshot on registration, publication,
+assignment changes, group renames and deletions, and membership changes.
+The server queues headset delivery before notifying admins, so a slow console
+cannot hold back device policy. Each connected device has at most
+one coalescing delivery task. Its serialized WebSocket write waits until the
+current policy can be sent, and lifecycle cleanup cancels it on disconnect,
+replacement, or server shutdown. HTTP Retry requests have a bounded send time.
+There is no persisted device delivery queue: offline devices receive the latest
+snapshot when they register again.
+
+Retry sends one token for the device's current package and revision. The server
+validates it after taking the device's WebSocket send lock and returns a
+conflict if the assignment changed. Retry is not queued for offline devices.
+
+Telemetry registry saves (`BATTERY_UPDATE`, `WIFI_STATE`, `CONFIGURATION_STATE`),
+ordinary re-registrations, and disconnect timestamps are coalesced to one per
+second and flushed on shutdown. New devices, identity-kind changes, re-adoption
+after retirement, and admin and package changes are saved immediately. Admin
+`DEVICE_LIST` broadcasts are coalesced, and each console send has a five-second
+timeout. The client sends `WIFI_STATE` only when its public state changes.
+
+#### Client application
+
+The client waits for TobService, then durably claims each attempt before
+writing. It reads back every setting it writes and records the results.
+Failed or interrupted attempts wait for Retry when the same active deployment
+is delivered again in the same OS boot. An explicit Retry token is used once and survives a socket
+replacement for the same assignment.
+
+- **New deployment:** the client reads every managed setting and records fresh
+  results for the new revision. It writes and reads back settings that differ.
+  Wi-Fi checks the saved profiles and auto-join flags on the headset. When
+  those settings match and the saved evidence for the requested credentials
+  matches the live Android network ID, it retains the existing connection.
+  Without a matching network ID, it writes the credentials again. A changed
+  assignment rechecks settings even when it returns to an earlier revision.
+- **Redelivery in the same boot:** the current revision reuses its recorded
+  attempt, including after an app restart. A new assignment after a release
+  clears the old attempts in the same write that caches the assignment.
+- On **OS boot**, the client reapplies every setting in the saved assignment, even
+  without the server. A saved release disables offline reapplication and Wi-Fi
+  management. **Reapply settings** on the headset applies the saved assignment
+  again. A headset must receive a package once before it can reapply offline.
+- The client writes the current assignment or release and the
+  attempt journal in one atomic private file, `configuration-packages.json`.
+  Active assignments include Wi-Fi credentials. On a first install or upgrade
+  from a client without packages, the headset receives its assignment from the
+  server.
+  The attempt journal records per-setting results and used Retry tokens.
+  Scalar results are saved before Wi-Fi starts. A recoverable exception or a
+  process stop before results are saved leaves an interrupted attempt that
+  Retry or **Reapply settings** can resume. Storage errors block application
+  until the next delivery, Retry, or headset reapply succeeds; a malformed
+  record or journal is replaced by the next authoritative assignment or release.
+  A release that cannot be saved stops the current Wi-Fi work, and the next
+  delivery retries the save.
+- **Notice:** after saving a fully applied result, the client shows the PICO
+  notice `STYLY-MDM Package Applied!` once. After a boot reapply it first waits
+  up to 30 seconds for XR Shell readiness. A reused result shows no notice.
+
+Most scalar settings use the pinned PICO Enterprise SDK and read back the saved
+value. The screen-off delay never exceeds the sleep delay. Scheduled shutdown
+uses local device time and a weekday mask, and an enabled schedule blocks the
+self-update power-cycle fallback. See the
+[PICO Enterprise SDK reference](https://business.picoxr.com/us/doc/EnterpriseAPI-Intro).
+
+**PICO home app** under **Basic settings** configures the app opened at boot
+and by the Home button. Enter its Android package name (for example,
+`com.example.viewer`). When the target app is missing, the client requests the
+PICO default through `setLauncher(null)` before reporting
+**Waiting · App not found on the headset** with the package name. If the request
+fails, the console reports a failure and offers Retry. The client checks the
+active assignment on package removal, installation, package enablement changes, and cached startup,
+including offline startup. In-place APK updates skip the removal path.
+Headset Settings names the missing app and explains that installation resumes
+application.
+Completing the deferred application updates only the home app result in the
+current deployment. Retry remains available for other failed settings.
+An installed but disabled app appears as **App disabled on the headset** in
+the console. Enable the app, then use **Retry**. Removing the disabled app
+restores the PICO default and starts the same wait for installation.
+A successful TobService `setLauncher(packageName)` result appears as
+**Accepted**. Restart the headset and verify the Home action. Deploy a managed
+empty package name to restore the PICO default with `setLauncher(null)`.
+Clearing **Manage** releases management and preserves the current Home setting.
+The per-device **Startup App** command can bring another app to the foreground
+three seconds after the MDM service starts. Clear that per-device setting if the
+PICO home app should stay in the foreground after boot. The Home button still
+opens the configured PICO home app.
+
+**IPD** under **Basic settings** has a slider from 62 to 72 mm in 0.5 mm
+increments on PICO 4 Ultra Enterprise. The server and client enforce these
+limits. Managing IPD can move the headset's lenses. A successful `pbsSetIPD`
+callback is reported as **Accepted** because TobService exposes no supported
+physical position readback. The client reapplies
+managed IPD on each OS boot and on headset **Reapply settings**. Within one boot,
+ordinary delivery and console **Retry** reuse the accepted value only when the
+immediately preceding active assignment requested that same IPD and its latest
+attempt recorded acceptance. This also applies to a new revision or a different
+package. A change of value, an intervening assignment with no accepted IPD, or a
+release requires a new SDK request.
+
+**LBE** groups the mode and venue map. With **Manage** enabled, choose **On**
+or **Off**. **On** requires a PICO map ZIP. Upload one or choose a previously
+uploaded map. **Off** preserves the package's map selection and any ZIP
+already on the headset. PICO can open map setup when LBE is re-enabled
+without importing a ZIP, even when an earlier ZIP remains on the headset. Deploy map changes
+before a session and confirm that the headset can locate itself at the venue.
+
+The server accepts standard LBE ZIPs up to 512 MiB and stores them by SHA-256
+under `lbe-maps/` in the MDM data directory. The server deduplicates matching
+bytes. Re-uploading the original ZIP checks the stored bytes against their
+SHA-256 and repairs a missing, truncated or corrupted archive when its
+registered metadata is intact. On POSIX, the server restricts the library root to
+owner-only access. Published map ZIPs have no aggregate quota or
+console deletion action. Abandoned upload staging directories become eligible
+for cleanup after 24 hours, including when the server restarted before then.
+
+A package stores the map name, size and digest. The download credential is
+valid for 24 hours while the device's deployment revision and map match.
+It survives a WebSocket reconnect. A server restart invalidates outstanding
+credentials and the device receives a fresh credential when it reconnects.
+While the device stays connected, a battery update within ten minutes of expiry
+triggers an ordinary delivery of the current policy with a renewed credential.
+The download endpoint continues to reject expired credentials.
+The map endpoint streams the original library ZIP through the Push Files artifact
+sender. The server holds one slot from the shared transfer pool while writing the
+response. If all slots remain busy, the map endpoint returns a queued response;
+the client waits and retries while the assignment is still current. A fresh
+request rechecks the token, deployment revision and map digest.
+
+On the headset, the Push Files downloader requests the exact SHA-256 ETag,
+resumes a partial file with an open-ended Range, retries network interruptions,
+and verifies the completed bytes. Push job state, destination extraction and
+sync deletion belong to Push Files. The map cache and import belong to LBE.
+The 60-second no-progress timeout applies to the byte transfer, not to explicit
+queue waits. A superseding assignment cancels the old map's HTTP request or
+retry wait. Download and import precede the other settings in the same
+deployment, so Wi-Fi can wait for a large map. If the SDK binding changes during
+the transfer or import, the client resumes the current assignment when the SDK
+is ready.
+
+The client verifies the complete ZIP before importing it through TobService
+from `/sdcard/maps/styly-mdm/`. After import acceptance it applies and reads
+back LBE On using the current SDK connection, then compares the active map to
+that exact local ZIP with `isMapInEffect` (0 for the active ZIP and 1 for
+another map on PUI 5.15.7). A previous successful attempt for the same package
+can skip import only after the same live check confirms LBE On and a matching
+cached ZIP. If the file is missing, the map differs or the pre-import comparison is
+unavailable, the client uses the verified acquisition/import path. An explicit
+Retry or headset Reapply forces import.
+
+An invalid map descriptor reports `INVALID_VALUE`. If the import succeeds but
+the required LBE On step fails, the map reports `MAP_MODE_NOT_APPLIED` and the
+mode result gives the SDK failure. A successful comparison reports
+`MAP_ACTIVE_VERIFIED`. After import, a
+different active map reports `MAP_ACTIVE_MISMATCH`; a failed, unsupported
+or timed-out comparison reports `MAP_VERIFICATION_UNAVAILABLE`. The package
+reports the LBE pair as incomplete even if the mode switch reads back On.
+A timeout waiting for the **import** callback has a separate `CALLBACK_TIMEOUT`
+result because PICO may still be importing.
+
+**Power on when USB is connected** under **USB & advanced** manages the PICO
+`SFS_USB_BOOT` switch. When enabled, connecting USB power starts a powered-off
+headset. The client reads the switch back after applying it.
+
+**Developer options menu** under **USB & advanced** sets the PUI Developer tab
+visibility flag (0 or 1), which PUI reads when its Settings screen opens. It
+needs `WRITE_SECURE_SETTINGS`, granted over ADB with
+`pm grant --user 0 com.styly.mdmclient android.permission.WRITE_SECURE_SETTINGS`.
+Without it the item reports `PERMISSION_DENIED`.
+
+Unenroll headsets from PICO Business Device Manager before managing them with
+MDM. In testing, BDM reapplied its sleep policy after Wi-Fi connected.
+
+#### Wi-Fi implementation
+
+A managed Wi-Fi value contains `networks`, `auto_return`, and optional
+`prioritize_networks` (default `true`). Android selection uses
+`prioritize_networks: false` and requires `auto_return: false`. Wi-Fi is
+applied after the other settings.
+
+**Adapter.** MDM adds new profiles with `WifiManager` and records the MAC policy
+it supplied. Managed Wi-Fi requires the ADB provisioning grant `DUMP`.
+Without it, readiness and apply results report `DUMP_PERMISSION_MISSING`.
+Updates read the current MAC policy from `dumpsys wifi` for both MDM-created
+and external profiles. External profiles are updated by ID through TobService.
+A failed candidate does not stop the others. Only after at least one candidate
+is saved and read back does the client set auto-join by saved ID with
+TobService `allowWifiAutoJoin(null, networkId, allowed)`. It confirms the flags
+by reading `WifiConfiguration.allowAutojoin` through reflection.
+
+**Priority mode.** One scheduled worker owns policy operations, adapter writes,
+scan requests and decisions. Application and ongoing
+priority monitoring share one Wi-Fi network callback while observation is
+needed. Callback delivery prompts the worker to read the current connection
+snapshot. Android stamps observations on receipt so a synchronous adapter call
+cannot make a timely observation look late. Scan broadcasts record
+their receipt time before the worker reads and checks the scan results.
+The scan session owns its receiver registration. A registration failure leaves
+the session stopped so the next readiness or connectivity check can retry it.
+
+- If the first listed network is connected and still usable after the save,
+  the client keeps it. Otherwise it selects candidates in order. Each candidate
+  gets up to 12 seconds including disconnect and IP acquisition, within the
+  overall 60-second limit. The controller checks the latest snapshot again
+  after a disconnect request. It bases timely IP acquisition on the observation
+  timestamp and gates new adapter mutations by the current time. A fresh usable
+  connection to the candidate can finish selection during disconnect once the
+  earlier and unrelated associations have cleared.
+- The package result is `SAVED` once profile and auto-join readback succeeds
+  and the client durably stores the applied profile. Connection selection
+  and fallback can continue after that result. Save and readback failures
+  are reported even when a candidate connects.
+- The client updates existing profiles by ID and retains them on update failure.
+  Before changing a password, the client drops the saved network ID used to
+  trust the previous key. Android can reuse authentication from earlier in
+  the same boot, so an existing connection does not verify a changed password.
+- After a disconnection with more than one candidate, or with a cached fallback
+  profile, the client waits 8 seconds plus up to 3 seconds of jitter. It keeps a
+  connection Android has restored, or selects candidates in order. Failed
+  rounds double the wait up to about one minute. When Wi-Fi is off, the client
+  waits for it to become available before selecting candidates.
+- Automatic return requests its first scan within 30 seconds of starting to
+  monitor a lower candidate. Five follow-up scans use one-minute intervals,
+  then scans use five-minute intervals. Each interval adds up to 10% jitter.
+  Failed scan requests end the one-minute checks for that session and retry
+  after 10, 20, then 30 minutes. Any visible higher candidate triggers
+  a switch. If it fails, the client reselects the previous candidate. Attempts
+  wait five minutes, doubling up to 30 minutes after failures. Scans pause
+  during that wait, which is kept in memory.
+
+**Android selection** saves the profiles and flags, reports `SAVED`, and does
+not select networks or monitor scans.
+
+A release stops active selection and monitoring in the running process even
+if `wifi-policy.json` cannot be read or written. On restart, the client reads
+the saved package release before starting Wi-Fi monitoring. If the package
+release could not be saved, the headset can resume its previous assignment
+until it receives the release again.
+The release preserves saved networks and auto-join flags.
+
+#### Headset Settings screen
+
+The **Permissions** section summarizes file access and Wi-Fi readiness.
+**Permission details** lists each Wi-Fi grant and the
+Location switch, and refreshes when the operator returns from Android settings.
+When both location grants are present, the running service adds its `location`
+foreground service type. **Device configuration** shows the assigned group and
+the deployment time of its active group revision in local time.
+Reconnecting from Settings keeps that screen open. An assigned Startup App
+launches when the service starts for a boot or system reason.
+
+#### Package API and device reports
+
+The server checks browser origins on the admin and device WebSocket handshakes
+and on package changes. Native clients can connect without an Origin header.
+
+| Surface | Contract |
+|---|---|
+| `GET /api/packages`, `POST /api/packages` | GET returns package names and edit/publication revisions, plus the setting definitions used by group results. POST creates a package by name. |
+| `GET /api/lbe-maps/{sha256}/download` | The device supplies its deployment revision, device ID and map bearer credential. The response uses the Push Files transfer implementation with a SHA-256 ETag and byte ranges. A `503` with `X-MDM-Transfer-Status: queued` and `Retry-After` asks the device to wait for shared capacity. |
+| `POST /api/packages/{id}/duplicate` | Accepts the new `name` and the source package’s `expected_revision`. Returns the new editor profile. A stale source revision returns 409. |
+| `GET /api/packages/{id}` | Returns package identity and name, `edit_revision`, `published_revision`, the saved editor `settings`, including unchecked settings and Wi-Fi passwords, the editor `sections`, and `impact` with group and device counts and a token. |
+| `POST /api/packages/{id}/save-and-deploy` | Atomically saves `settings` as `{id: {managed, value}}` and deploys a new revision. Supply `expected_revision` equal to the loaded edit token `edit_revision` (null for a new package), and `expected_impact` from the preview. An optional `name` renames the package. |
+| `DELETE /api/packages/{id}` | Deletes an unassigned package. Send a JSON body with `expected_revision` equal to the loaded `edit_revision` (null for a new package). A stale edit revision or a current group assignment returns 409, with `code: "package_assigned"` for the assignment conflict. |
+| `GET`, `POST /api/group-package/deploy?name=...&package_id=...` | GET previews the deployment scope and whether it uses the current deployed version. An empty `package_id=` previews clearing management for the group and sets `clear` to true. The preview includes the current deployment's `wifi_mode`. POST accepts `expected_impact` from the preview, commits the group reference and any new deployment revision together, and returns the committed `GROUP_LIST` snapshot. A package that has never been deployed returns 409. |
+| `POST /api/package-retry` | Requests Retry for a currently assigned and online `device_id` with its current `package_id` and `revision`. |
+| `CONFIGURATION_POLICY` | Server to canonical `configuration_packages_v1` or `configuration_summary_v1` clients. Includes `package_id` and the group's active deployment `revision` (a null pair means no effective deployment for the client). Package-capable clients receive managed `settings` and explicit `retry_id` values. Clients with summary capability also receive nullable `group_name` and `deployed_at_ms` (Unix epoch milliseconds). Summary-only clients receive empty `settings`. For a managed venue ZIP, clients advertising `configuration_lbe_map_v1` receive the same-origin `lbe_map_download` path and `lbe_map_token` bearer credential outside `settings`. |
+| `REGISTER` and `CONFIGURATION_STATE` | The secret-free `configuration_state` has `package_id`, `revision`, `status` (`applying`, `complete`, `interrupted`) and per-setting `results`. A missing `startupApp` reports `status: "waiting"` and `reason: "APP_NOT_INSTALLED"` after PICO accepts the default Home setting. A disabled `startupApp` reports `status: "failed"` and `reason: "APP_DISABLED"`. Both report the requested package name as `value`. A `complete` attempt may contain a waiting result. Successful IPD calls report `ACCEPTED_UNVERIFIED`. Clients report `MAP_ACTIVE_VERIFIED` only after confirming LBE On and the requested ZIP. While the report is unknown, including before restoring a cached attempt, the client omits the field in `REGISTER` and sends no `CONFIGURATION_STATE` update. An explicit null clears the previous report after a durable release or when a durable first assignment is waiting for application. |
+| `REGISTER` and `WIFI_CONNECTION` | A canonical client reports `current_wifi` as `{ssid, bssid}` or null. The BSSID may be null. The headset samples while connected every 30 seconds. The server exposes the current connection in `DEVICE_LIST` for that session. |
+| `REGISTER` and `WIFI_STATE` | The device reports Wi-Fi readiness and monitoring in `wifi_state` with `busy`, `available`, `unavailable_reason` and `priority_monitor`. A repeated registration refreshes both reports when supplied. |
+| `GROUP_LIST` and `DEVICE_LIST` | Group messages expose membership, package summaries, assignments, active deployments, and the snapshot's `server_instance_id` and `revision`. Each deployment's `wifi_mode` is `priority`, `android_selection`, or null when Wi-Fi is unmanaged. Online device rows expose package support and the latest report. An offline row is last-known. |
+
+#### Registry storage
+
+The private `device_registry.json` stores `packages` and each group's `members`,
+`package_id`, and optional
+`deployment_revision` and `deployment_at_ms`. The group time is written together
+with its scoped revision. Shared publication replaces scoped revisions and times
+with the package's new `published_revision` and `deployed_at_ms`. Wi-Fi
+passwords are plaintext in the registry and its backups. Registry writes sync
+the temporary file before atomically replacing the saved file.
+
+- The released `{"groups": {name: [device_id]}}` format is migrated to the
+  package format with no packages. A device in several groups stays only in
+  the first by name, and each removed membership is logged. The server first
+  copies the file to `<registry>.<YYYYMMDD-HHMMSS>-<unique-id>.bak` with private
+  permissions. If the backup fails, the migration is not written and packages
+  stay unavailable. Its read-only roster preserves the original memberships for bulk operations.
+- The package catalog uses version 3. If a catalog has an unsupported version,
+  the server preserves the saved data and reports that packages are unavailable.
+- If the registry cannot be read, the server leaves the file unchanged, saves
+  no changes for that session, and the console shows a warning.
+
+Package and group deploy conflicts include a `code` field. The console uses
+`revision_conflict` and `deployment_targets_changed` to request a new review,
+and displays the map recovery instruction for `map_unavailable`.
+
+Upgrade the server and client together and reload open consoles.
+
 ## Building the MDM Client
 
 ### Build from CLI
@@ -141,7 +529,9 @@ ports, so neither environment discovers the other.
 Both flavors share the applicationId `com.styly.mdmclient`, so they **cannot be
 installed at the same time** — installing the dev build replaces the production build
 on a device. Run the dev client on a dedicated test device, or accept that it replaces
-production while you test. Isolation between the two environments is purely by port, so
+production while you test. An in-place replacement retains the last assignment and managed
+Wi-Fi state. An offline OS boot can reapply the prior environment’s settings before the
+new server delivers its assignment. Isolation between the two environments is purely by port, so
 a dev client/server never discovers a production one even on the same LAN.
 
 **Dev server** — start with the `dev` argument, which sets the dev ports for you:
@@ -166,20 +556,18 @@ adb install app/build/outputs/apk/dev/debug/app-dev-debug.apk
 
 The dev APK keeps the production applicationId `com.styly.mdmclient` and only changes
 its label to **STYLY-MDM Dev**, so installing it replaces the production build on a
-device (they share a package name and cannot coexist). It only broadcasts/listens on
-the dev discovery port (7081), so it never discovers the production server. Its
-fallback URL also targets the dev WebSocket port (7080), so even if discovery times
-out it cannot accidentally connect to a production server.
+device (they share a package name and cannot coexist). It broadcasts on the dev
+discovery port (7081) and uses 7080 as its fallback WebSocket port. The dev client
+ignores port 7070 in saved manual addresses, cached URLs and discovery replies.
+An ignored manual address triggers auto-discovery, and the dev client can still
+use other ports for a custom development server.
 
 The ports come from `BuildConfig` fields defined per flavor in
 `mdm-client/app/build.gradle` (`DISCOVERY_PORT`, `DEFAULT_WS_PORT`).
 
-> **Device owner:** because dev and prod share an applicationId, a device only ever has
-> one STYLY-MDM install, so there is never a dev-vs-prod device-owner conflict on a
-> single device. Updating a device-owner production install in place with a dev build
-> of the **same signing key** preserves device-owner status; a differently signed dev
-> build (e.g. debug over a release install) must be uninstalled first, which clears
-> device-owner status, so you would need to re-provision.
+An in-place replacement requires the same signing key. To switch signing keys,
+uninstall the current build, install its replacement, and grant the required
+permissions again. See [Wi-Fi provisioning](WIFI_SETTINGS.md#provisioning).
 
 ### Filtering and selecting devices
 
@@ -285,6 +673,8 @@ STYLY-MDM/
 │   │   ├── __init__.py      # Exports create_app / main
 │   │   ├── __main__.py      # `python -m styly_mdm` entrypoint
 │   │   ├── server.py        # Established HTTP/WebSocket handlers + CLI
+│   │   ├── configuration_packages.py # Package validation, saved values, public reports
+│   │   ├── wifi_settings.py # Managed Wi-Fi policy validation and sanitization
 │   │   ├── push_jobs.py     # Push/Sync domain state, identity, transitions
 │   │   ├── push_job_store.py    # Dedicated SQLite worker + canonical snapshots
 │   │   ├── push_job_manager.py  # Transactional queue/fence/reconciliation policy
@@ -295,6 +685,8 @@ STYLY-MDM/
 │   │   ├── integrity.py     # APK CD-digest + directory tree-hash (integrity reference)
 │   │   └── static/
 │   │       ├── index.html          # Web management console
+│   │       ├── configuration-packages-v1.js # Package editor, deployments, device results
+│   │       ├── group-membership.js # Membership drafts and scoped updates
 │   │       └── push-jobs-v1.js     # Revisioned Push/Sync job console adapter
 │   └── tests/
 │       └── test_app.py      # Smoke tests
@@ -305,6 +697,15 @@ STYLY-MDM/
     │       ├── MdmClientApplication.kt   # Application entry point
     │       ├── MdmClientService.kt       # Foreground service; executes launch commands
     │       ├── WebSocketManager.kt       # WebSocket transport + capability registration
+    │       ├── ConfigurationPackageController.kt # Assignment cache, apply worker and journal
+    │       ├── PicoDeviceSettings.kt      # Scalar settings and SDK readback
+    │       ├── PicoPackageAppliedNotice.kt # PICO notification after application
+    │       ├── WifiSettingsController.kt # Wi-Fi application, selection and recovery worker
+    │       ├── WifiLocalConnectivity.kt  # Current Wi-Fi observations and change callbacks
+    │       ├── WifiManagerAdapter.kt     # Android and PICO Wi-Fi configuration APIs
+    │       ├── WifiPriorityScanMonitor.kt # Scans for higher-priority networks
+    │       ├── WifiSettingsModels.kt    # Wi-Fi protocol and persistent state codec
+    │       ├── WifiSettingsStore.kt     # Wi-Fi state file
     │       ├── PushProtocol.kt           # Strict job-v1 wire protocol and durable codec
     │       ├── PushJobCoordinator.kt     # Application-scoped actor + single active worker
     │       ├── PushJobStore.kt           # Atomic active/outbox/receipt persistence
@@ -316,6 +717,7 @@ STYLY-MDM/
     │       ├── SettingsActivity.kt       # UI to configure server URL; shows client build; Update Journal viewer
     │       ├── ServerDiscovery.kt        # UDP broadcast server discovery
     │       ├── BundleSync.kt             # Push/sync a file bundle into a device directory
+    │       ├── AndroidDirectorySync.kt  # Android directory sync for durable file publication
     │       ├── UpdateJournal.kt          # Persistent event log; survives a self-update kill
     │       ├── UpdateJournalCodec.kt     # Journal serialization (unit-tested on the host JVM)
     │       ├── InstallPolicy.kt          # Hash gate for downloaded APKs (host-JVM tested)
@@ -546,11 +948,11 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `VERIFY_APK` | Verify an installed package against a local reference on target devices. Fields: `target_devices`, `package_name`. The reference (`size` + CD digest) is computed and compared in the browser and is **never** sent to the server. |
 | `VERIFY_DIR` | Verify a device directory against a local reference on target devices. Fields: `target_devices`, `path` (absolute, within shared storage). |
 | `GET_DEVICE_LIST` | Request the current device list |
+| `GET_GROUP_LIST` | Request the current group and configuration package snapshot. |
 | `CREATE_GROUP` | Create a new, empty device group. Fields: `name` |
 | `RENAME_GROUP` | Rename a group, preserving its members. Fields: `name`, `new_name` |
-| `DELETE_GROUP` | Delete a group (member devices are not affected). Fields: `name` |
-| `SET_DEVICE_GROUPS` | Set the exact set of groups a device belongs to. Fields: `device_id`, `groups` (list of existing group names) |
-| `SET_GROUP_MEMBERS` | Set the exact member list of an existing group (group-centric). Fields: `name`, `members` (list of device IDs; offline/unknown IDs allowed) |
+| `DELETE_GROUP` | Delete a group and release its package assignment. Devices keep their existing setting values. Fields: `name` and optional `expected_snapshot` with `server_instance_id` and group list `revision`. A changed snapshot requires a new confirmation. |
+| `UPDATE_GROUP_MEMBERS` | Edit only selected members of an existing group. Fields are `name`, `add` (device IDs with a registry record mapped to their expected current group, or null for unassigned), and `remove` (device IDs expected to belong to `name`). Offline devices in the registry are supported. The console includes `expected_deployments`, a map of affected group names to effective revision UUIDs or null. A changed deployment, changed owner or missing added device rejects the whole edit. Older callers may omit the deployment guard. Existing members without registry records may be removed. |
 | `RETIRE_DEVICE` | Make target clients uninstall themselves (remotely irreversible — the console gates it behind its heaviest confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only). See [Device Retirement](#device-retirement). |
 
 ### Admin HTTP API
@@ -594,11 +996,10 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `SELF_UPDATE_VERIFIED` | Outcome of the automatic post-update `EXECUTE_VERIFY_APK` the server runs against the client's own package. Fields: `device_id`, `correlation_id`, `status` (`verified` / `mismatch` / `skipped` / `error`), `detail` |
 | `RETIRE_SENT` | Confirmation that `EXECUTE_SELF_UNINSTALL` commands were dispatched. Fields: `sent_count`, `target_count` |
 | `RETIRE_RESULT` | Outcome of a device retire. Success is settled by *silence*: the device announced, disconnected, and stayed away for the retire window. Failure means it re-registered, reported the uninstall failed, or was still connected at the deadline. Fields: `device_id`, `correlation_id`, `status` (`success` / `fail`), `detail` |
-| `GROUP_LIST` | Current device groups. Fields: `groups` (object mapping group name → array of member device IDs). The console derives each device's group membership from this; sent on connect and after any group change. |
+| `GROUP_LIST` | Current `groups`, package summaries in `packages`, group-to-package `assignments`, and active `deployments`. Sent on connect, on request (`GET_GROUP_LIST`), and after group or package changes. The console warns when `registry_writable` is `false` because the registry is unreadable, or when `configuration_available` is `false` because the saved group and package settings could not be loaded. |
 | `GROUP_CREATED` / `GROUP_RENAMED` / `GROUP_DELETED` | Acknowledgements for group create / rename / delete. |
-| `DEVICE_GROUPS_SET` | Acknowledgement of a device's group membership change. Fields: `device_id`, `groups` |
-| `GROUP_MEMBERS_SET` | Acknowledgement of a group's member list change. Fields: `name`, `members` |
-| `ERROR` | Error message. Fields: `message` |
+| `GROUP_MEMBERS_SET` | Acknowledgement of a group's committed member list change. Fields: `name`, `members`. Scoped edits also include `operation: UPDATE_GROUP_MEMBERS` |
+| `ERROR` | Error message. Fields: `message`. Rejected group creation and scoped membership edits also include `operation` and `name`. |
 
 > **Client/server compatibility** is keyed on `major.minor`. Policy: any change
 > that requires the client and server to move together (a wire-protocol or shared
@@ -657,9 +1058,10 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > means sideloading or hand-installing a client never requires reaching this
 > repository's GitHub Releases page — the console alone is enough.
 
-> **Device groups** are a many-to-many grouping keyed by `device_id`, persisted
-> server-side in `device_registry.json` (under a `groups` key). Selecting a group
-> in the console is a client-side convenience: it sets the device selection to that
+> **Device groups** allow at most one group per `device_id`, persisted
+> server-side in `device_registry.json` under `groups`. Migration resolves
+> legacy overlaps by keeping the first group by name. Selecting a group in
+> the console sets the device selection to that
 > group's members (devices not in the group are deselected), so commands still
 > dispatch via the normal `target_devices` path (online members only). Group
 > membership can include offline devices.
@@ -677,9 +1079,9 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > (an APK can be up to 2 GiB, a push bundle likewise), spiking LAN/server bandwidth.
 > Instead the server owns a pool of **N** transfer slots
 > (`MDM_MAX_CONCURRENT_TRANSFERS` env var / `--max-concurrent-transfers` flag,
-> default **5**) and every byte-moving fan-out — install, push, sync — must take one
-> before it dispatches. Remaining targets are queued; each slot frees as soon as its
-> device signals the download finished, and the next queued device is dispatched.
+> default **5**). Install, Push and Sync reserve a slot before command dispatch.
+> Venue maps reserve one when the headset requests bytes and release it when the
+> HTTP stream ends. A map cache hit and PICO import consume no network slot.
 >
 > The pool is **server-wide, not per job**. The throttle belongs to the transfer
 > *resource* (the LAN, the server's uplink), not to any one action: a per-job
@@ -974,8 +1376,11 @@ The self-update flow:
 2. **Arm recovery.** The client confirms the guard is running before relying on it:
    `GuardLink.ensureRunning` checks the guard's process, starts it if needed, and polls up
    to 5 s for it to appear. With the guard confirmed, the update proceeds with
-   `recovery=guard`. Otherwise the client falls back to the power-cycle timers:
-   `PowerCycleTimers.arm` schedules a one-shot shutdown at now+2 min and startup at
+   `recovery=guard`. Otherwise the client falls back to the power-cycle timers.
+   On PICO 4 Ultra Enterprise, `PowerCycleTimers.arm` first checks that the
+   device's recurring shutdown timer is available. An enabled recurring schedule
+   or unreadable status returns `REFUSED_SHUTDOWN_SCHEDULE` before either timer is
+   changed. If available, `arm` schedules a one-shot shutdown at now+2 min and startup at
    now+3 min via the PICO timing APIs (`IToBServiceProxy.openTimingShutdown` /
    `openTimingStartup`, absolute `(year, month-1-based, day, hour, minute)`; computed by
    `PowerCycleSchedule`, which is unit-tested for the 0- vs 1-based month and date
@@ -1443,7 +1848,7 @@ before either is answering and miss each other.
 
 ## MDM Client Permissions
 
-The MDM client requires the following Android permissions:
+The MDM client uses the following Android permissions:
 
 | Permission | Purpose |
 |---|---|
@@ -1451,7 +1856,13 @@ The MDM client requires the following Android permissions:
 | `FOREGROUND_SERVICE` | Run as a persistent background service |
 | `RECEIVE_BOOT_COMPLETED` | Auto-start on device boot |
 | `ACCESS_NETWORK_STATE` | Monitor network connectivity |
-| `ACCESS_WIFI_STATE` | Retrieve the device IP address |
+| `ACCESS_WIFI_STATE` | Retrieve the device IP address and read saved Wi-Fi settings with the overlay app-op |
+| `CHANGE_WIFI_STATE` | Apply managed Wi-Fi profiles on authorized devices |
+| `ACCESS_FINE_LOCATION` / `ACCESS_COARSE_LOCATION` | Request precise location access together on Android 12+ for saved-network reads; the adapter requires the precise grant |
+| `ACCESS_BACKGROUND_LOCATION` | Keep saved-network reads and SSID observation available during background policy application on PICO |
+| `SYSTEM_ALERT_WINDOW` | Read saved networks on PICO with the `SYSTEM_ALERT_WINDOW` app-op granted during provisioning |
+| `DUMP` | Read the current stored MAC randomization policy for Wi-Fi profile updates with the grant applied through ADB during provisioning |
+| `WRITE_SECURE_SETTINGS` | Optional ADB grant for applying the managed **Developer options menu** setting |
 | `MANAGE_EXTERNAL_STORAGE` | Write downloaded APKs to shared storage so the PICO ToBService can read them for silent install; read/write shared-storage directories for file/folder push (sync); and read shared storage for directory integrity checks (`VERIFY_DIR`) |
 | `QUERY_ALL_PACKAGES` | Resolve an arbitrary installed package via `PackageManager` for APK integrity checks (`VERIFY_APK`). On API 30+ package visibility is filtered; an operator may verify any package, so a `<queries>` allowlist cannot cover it. This client is privately distributed (not on Google Play), so the Play-policy restriction on this permission does not apply. |
 

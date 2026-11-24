@@ -7,17 +7,26 @@ Static files for the web console are served from ./static/.
 
 import argparse
 import asyncio
+import copy
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import socket
 import sys
+import tempfile
 import time
 import uuid
 import zipfile
+from collections.abc import Awaitable
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlencode
 from aiohttp import WSCloseCode, web
 
 # Bundling and integrity references must agree on what counts as content, or a reference
@@ -28,14 +37,21 @@ from .device_policy import (
     CommandNotAllowedError,
     command_allowed,
 )
+from . import configuration_packages
+from .configuration_packages import PackageError
 from .integrity import apk_cd_digest, file_sha256, is_os_metadata
+from .file_transfer import stream_file
+from .lbe_maps import LBE_MAP_STAGING_MAX_AGE_SECONDS, LbeMapError, LbeMapStore
 from .push_jobs import parse_capabilities
+from .push_transfer_leases import TRANSFER_IDLE_SECONDS
+from .wifi_settings import normalize_revision, public_wifi_state
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("stylymdm")
+SERVER_INSTANCE_ID = str(uuid.uuid4())
 
 
 class _RedactPushLeaseFilter(logging.Filter):
@@ -75,13 +91,11 @@ MAX_APK_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB
 BUNDLED_CLIENT_DIR = Path(__file__).resolve().parent / "client"
 CLIENT_APK_RE = re.compile(r"^styly-mdm-client_v?(\d+(?:\.\d+)+)(?:-.*)?\.apk$")
 
-# Maximum number of device downloads allowed in flight across the whole server.
-# Fanning a file out to a large group otherwise makes every device pull it from the
-# server at the same instant (an APK can be up to 2 GiB, a push bundle likewise),
-# spiking LAN/server bandwidth and stalling transfers. Every byte-moving fan-out —
-# install, push, sync — gates its dispatch on the same pool of this many slots; a
-# slot frees as soon as its device reports the download finished. Read when the pool
-# is first created so tests and the --max-concurrent-transfers flag can override it.
+# Maximum number of downloads allowed in flight across the whole server. Fanning a
+# file out to a large group otherwise makes every device pull it at once, spiking
+# LAN/server bandwidth. Install and Push hold a slot through device completion;
+# LBE map GETs hold one through the HTTP stream. Read when first created so tests and
+# the --max-concurrent-transfers flag can override it.
 MAX_CONCURRENT_TRANSFERS = max(1, int(os.environ.get("MDM_MAX_CONCURRENT_TRANSFERS", "5")))
 
 # Seconds a single device may hold a transfer slot before it is force-released, so
@@ -99,7 +113,6 @@ ADMIN_SEND_TIMEOUT = max(0.1, float(os.environ.get("MDM_ADMIN_SEND_TIMEOUT", "5"
 # (an admin can push files to a group already installing an APK), so both the slot
 # registry and the release path are keyed by task, never by device alone.
 TASK_INSTALL = "install"
-TASK_PUSH = "push"
 
 # Seconds a self-updating client may stay away before the update is declared lost.
 # The client schedules a device power cycle (shutdown at +2 min, startup at +3 min)
@@ -206,11 +219,29 @@ provisional_connections: dict[web.WebSocketResponse, dict] = {}
 # while offline. Survives restarts (persisted to REGISTRY_PATH).
 device_registry: dict[str, dict] = {}
 
-# Named device groups (many-to-many): group name -> list of member serials. A
-# device can belong to zero or more groups; membership is keyed by serial so an
-# offline (or not-yet-registered) device can still be grouped. Persisted to
-# REGISTRY_PATH alongside the device registry.
-device_groups: dict[str, list[str]] = {}
+@dataclass(frozen=True)
+class _DeviceGroup:
+    members: tuple[str, ...] = ()
+    package_id: str | None = None
+    deployment_revision: str | None = None
+    deployment_at_ms: int | None = None
+
+    def effective_revision(self, profile: dict) -> str:
+        return self.deployment_revision or profile["published_revision"]
+
+
+@dataclass(frozen=True)
+class _ConfigurationRegistry:
+    # Writers replace these maps in a detached candidate.
+    groups: dict[str, _DeviceGroup] = field(default_factory=dict)
+    packages: dict[str, dict] | None = field(default_factory=dict)
+    revision: int = 0
+
+
+_configuration = _ConfigurationRegistry()
+_registry_extras: dict = {}
+_registry_readable = True
+_CONFIGURATION_FIELDS = ("groups", "packages")
 
 # Connected admin WebSocket sessions
 admin_connections: set[web.WebSocketResponse] = set()
@@ -299,6 +330,7 @@ def _coerce_record(value) -> dict | None:
             version_code = None
         version_name = value.get("version_name")
         return {
+            **value,
             "label": label.strip() if isinstance(label, str) else "",
             "model": model if isinstance(model, str) else "",
             "ip": ip if isinstance(ip, str) else "",
@@ -308,11 +340,9 @@ def _coerce_record(value) -> dict | None:
             "version_code": version_code,
             "version_name": version_name if isinstance(version_name, str) else "",
             "retired": value.get("retired") is True,
-            "identity_kind": (
-                value.get("identity_kind")
-                if value.get("identity_kind") in {"canonical", "legacy"}
-                else "legacy"
-            ),
+            "identity_kind": "canonical" if value.get("identity_kind") == "canonical" else "legacy",
+            "configuration_state": configuration_packages.public_configuration_state(value.get("configuration_state")),
+            "wifi_state": public_wifi_state(value.get("wifi_state")),
         }
     return None
 
@@ -347,87 +377,346 @@ def _coerce_battery(value) -> dict | None:
     }
 
 
-def _coerce_groups(value) -> dict[str, list[str]]:
-    """Normalize the persisted groups mapping into {name: [serial, ...]}.
-
-    Drops non-string names/serials, strips and length-caps names, and dedupes
-    members while preserving order. Returns an empty mapping for anything else.
-    """
-    result: dict[str, list[str]] = {}
+def public_current_wifi(value) -> dict | None:
+    """Normalize the optional currently connected Wi-Fi identity."""
     if not isinstance(value, dict):
-        return result
-    for name, members in value.items():
-        if not isinstance(name, str):
-            continue
-        clean_name = name.strip()[:MAX_GROUP_NAME_LEN]
-        if not clean_name:
-            continue
-        serials: list[str] = []
-        if isinstance(members, list):
-            for s in members:
-                if isinstance(s, str) and s and s not in serials:
-                    serials.append(s)
-        result[clean_name] = serials
-    return result
+        return None
+    ssid = value.get("ssid")
+    if not isinstance(ssid, str):
+        return None
+    if not ssid:
+        return None
+    try:
+        if len(ssid.encode("utf-8")) > 32:
+            return None
+    except UnicodeEncodeError:
+        return None
+    raw_bssid = value.get("bssid")
+    bssid = raw_bssid.strip().lower() if isinstance(raw_bssid, str) else ""
+    if (not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", bssid)
+            or int(bssid[:2], 16) & 1 or bssid in {"00:00:00:00:00:00", "02:00:00:00:00:00"}):
+        bssid = None
+    return {"ssid": ssid, "bssid": bssid}
+
+
+def _group_name(value) -> str:
+    return value.strip()[:MAX_GROUP_NAME_LEN].rstrip() if isinstance(value, str) else ""
+
+
+def _coerce_group_members(value) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(dict.fromkeys(member for member in value if isinstance(member, str) and member))
+
+
+def _remove_duplicate_memberships(groups: dict[str, _DeviceGroup]) -> None:
+    owner: dict[str, str] = {}
+    for name, group in sorted(groups.items()):
+        unique = []
+        for device_id in group.members:
+            if device_id in owner:
+                log.warning("Duplicate group membership for %s: kept %r, removed from %r",
+                            device_id, owner[device_id], name)
+                continue
+            owner[device_id] = name
+            unique.append(device_id)
+        groups[name] = replace(group, members=tuple(unique))
+
+
+def _serialized_groups(configuration: _ConfigurationRegistry) -> dict:
+    groups = {}
+    for name, group in configuration.groups.items():
+        entry = {"members": list(group.members), "package_id": group.package_id}
+        if group.deployment_revision is not None:
+            entry["deployment_revision"] = group.deployment_revision
+        if group.deployment_at_ms is not None:
+            entry["deployment_at_ms"] = group.deployment_at_ms
+        groups[name] = entry
+    return groups
+
+
+def _read_configuration(raw: dict) -> _ConfigurationRegistry:
+    raw_groups = raw.get("groups", {})
+    if not isinstance(raw_groups, dict):
+        raise PackageError("Invalid saved groups")
+
+    groups: dict[str, _DeviceGroup] = {}
+    if "packages" in raw:
+        packages = configuration_packages.load_packages(raw["packages"])
+        for raw_name, entry in raw_groups.items():
+            name = _group_name(raw_name)
+            if (not name or name in groups or len(raw_name) > MAX_GROUP_NAME_LEN
+                    or not isinstance(entry, dict)
+                    or set(entry) - {"deployment_revision", "deployment_at_ms"} != {"members", "package_id"}
+                    or not isinstance(entry["members"], list)
+                    or any(not isinstance(member, str) or not member for member in entry["members"])):
+                raise PackageError("Invalid saved group")
+            package_id = entry["package_id"]
+            if package_id is not None and (normalize_revision(package_id) is None or package_id not in packages):
+                raise PackageError("Invalid saved package assignment")
+            revision = entry.get("deployment_revision")
+            if revision is not None and (normalize_revision(revision) is None or package_id is None
+                                        or packages[package_id]["published_revision"] is None):
+                raise PackageError("Invalid saved group deployment revision")
+            deployed_at = entry.get("deployment_at_ms")
+            if deployed_at is not None and (type(deployed_at) is not int or not 1 <= deployed_at <= 253402300799999
+                                            or revision is None):
+                raise PackageError("Invalid saved group deployment time")
+            groups[name] = _DeviceGroup(_coerce_group_members(entry["members"]), package_id, revision, deployed_at)
+    else:
+        # Released servers saved {name: [device_id]} and allowed several groups per device.
+        packages = {}
+        for raw_name, members in raw_groups.items():
+            name = _group_name(raw_name)
+            if name in groups or not isinstance(members, list):
+                raise PackageError("Invalid saved groups")
+            if name:
+                groups[name] = _DeviceGroup(_coerce_group_members(members))
+
+    _remove_duplicate_memberships(groups)
+    return _ConfigurationRegistry(groups, packages)
+
+
+def _unavailable_configuration(raw_groups, *, legacy: bool = False) -> _ConfigurationRegistry:
+    groups = {}
+    if isinstance(raw_groups, dict):
+        for raw_name, entry in raw_groups.items():
+            if name := _group_name(raw_name):
+                members = entry.get("members") if isinstance(entry, dict) else entry
+                groups[name] = _DeviceGroup(_coerce_group_members(members))
+        if not legacy:
+            _remove_duplicate_memberships(groups)
+    return _ConfigurationRegistry(groups, None)
+
+
+def _backup_registry() -> None:
+    """Copy the registry aside before a format migration that cannot be undone."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = REGISTRY_PATH.with_name(f"{REGISTRY_PATH.name}.{stamp}-{uuid.uuid4().hex}.bak")
+    tmp = None
+    try:
+        # NamedTemporaryFile creates the copy with the registry's private mode.
+        with tempfile.NamedTemporaryFile(dir=REGISTRY_PATH.parent, delete=False) as output:
+            tmp = Path(output.name)
+            output.write(REGISTRY_PATH.read_bytes())
+            output.flush()
+            os.fsync(output.fileno())
+        tmp.replace(backup)
+    except OSError as exc:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        raise PackageError(f"Registry backup could not be saved: {exc}") from None
+    log.warning("Registry format migration: saved the previous registry to %s", backup)
+
+
+def _has_configuration_data(raw: dict) -> bool:
+    # A flat device registry may have a device named "groups" or "packages".
+    packages = raw.get("packages")
+    if isinstance(packages, dict) and ("version" in packages or "packages" in packages):
+        return True
+    groups = raw.get("groups")
+    return isinstance(groups, dict) and any(
+        isinstance(entry, list) or isinstance(entry, dict) and isinstance(entry.get("members"), list)
+        for entry in groups.values()
+    )
 
 
 def load_registry() -> None:
-    """Load the per-device registry and groups from disk, tolerating a missing/corrupt file.
-
-    Accepts two on-disk shapes:
-    - Legacy flat: serial -> label string, or serial -> record dict (no groups).
-    - Current wrapped: {"devices": {serial -> record}, "groups": {name -> [serial]}}.
-
-    The wrapped shape is detected by a dict-valued "devices" key. Device serials
-    are formatted like "PA94U0...", so a real serial never collides with the
-    "devices"/"groups" keys. The server always writes the wrapped shape, so this
-    is a one-way auto-migration; an older server reading a new file would mistake
-    "devices"/"groups" for phantom devices (downgrade-only, acceptable).
-    """
+    """Load the registry and atomically migrate supported older configurations."""
+    global _configuration, _registry_readable, SERVER_INSTANCE_ID
+    SERVER_INSTANCE_ID = str(uuid.uuid4())
     device_registry.clear()
-    device_groups.clear()
+    _registry_extras.clear()
+    _registry_readable = True
+    raw = None
     try:
         raw = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("expected a JSON object")
+        wrapped = isinstance(raw.get("devices"), dict)
+        if not wrapped and _has_configuration_data(raw):
+            raise ValueError("configuration registry is missing its device map")
     except FileNotFoundError:
+        _configuration = _ConfigurationRegistry()
         return
-    except (json.JSONDecodeError, OSError) as e:
-        log.warning("Ignoring unreadable device registry %s: %s", REGISTRY_PATH, e)
-        return
-    if not isinstance(raw, dict):
-        log.warning("Device registry is not an object; ignoring")
+    except (ValueError, OSError, RecursionError) as exc:
+        _registry_readable = False
+        if isinstance(raw, dict):
+            _configuration = _unavailable_configuration(raw.get("groups"), legacy="packages" not in raw)
+        else:
+            _configuration = _ConfigurationRegistry(packages=None)
+        log.warning("Device registry unavailable at %s: %s; saved data retained", REGISTRY_PATH, exc)
         return
 
-    loaded_groups: dict[str, list[str]] = {}
-    if isinstance(raw.get("devices"), dict):
-        devices_raw = raw["devices"]
-        loaded_groups = _coerce_groups(raw.get("groups"))
+    devices_raw = raw["devices"] if wrapped else raw
+    for device_id, value in devices_raw.items():
+        if (record := _coerce_record(value)) is not None:
+            device_registry[device_id] = record
+
+    if wrapped:
+        raw_groups = raw.get("groups", {})
+        _registry_extras.update({
+            key: value for key, value in raw.items()
+            if key != "devices" and key not in _CONFIGURATION_FIELDS
+        })
+        try:
+            candidate = _read_configuration(raw)
+            if "packages" not in raw or raw_groups != _serialized_groups(candidate):
+                _backup_registry()
+                if not _write_registry(candidate, device_registry):
+                    raise PackageError("Configuration migration could not be saved")
+            _configuration = candidate
+        except PackageError as exc:
+            _configuration = _unavailable_configuration(raw_groups, legacy="packages" not in raw)
+            _registry_extras.update({key: raw[key] for key in _CONFIGURATION_FIELDS if key in raw})
+            log.warning("Configuration packages unavailable: %s; saved data retained", exc)
     else:
-        devices_raw = raw  # legacy flat shape: the whole object is serial -> value
-
-    loaded_devices: dict[str, dict] = {}
-    for serial, value in devices_raw.items():
-        if not isinstance(serial, str):
-            continue
-        record = _coerce_record(value)
-        if record is not None:
-            loaded_devices[serial] = record
-
-    device_registry.update(loaded_devices)
-    device_groups.update(loaded_groups)
+        _configuration = _ConfigurationRegistry()
     log.info("Loaded %d device(s) and %d group(s) from registry",
-             len(device_registry), len(device_groups))
+             len(device_registry), len(_configuration.groups))
 
 
-def save_registry() -> None:
-    """Persist the per-device registry and groups atomically (temp file + replace)."""
-    tmp = REGISTRY_PATH.with_suffix(".json.tmp")
-    payload = {"devices": device_registry, "groups": device_groups}
+def _write_registry(configuration: _ConfigurationRegistry, records: dict[str, dict]) -> bool:
+    """Persist device and group state with one private, atomic registry replace."""
+    if not _registry_readable:
+        return False
+    payload = {**_registry_extras, "devices": records}
+    if configuration.packages is not None:
+        payload["groups"] = _serialized_groups(configuration)
+        payload["packages"] = {"version": configuration_packages.VERSION, "packages": configuration.packages}
+
+    tmp = None
     try:
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        with tempfile.NamedTemporaryFile(dir=REGISTRY_PATH.parent, delete=False) as output:
+            tmp = Path(output.name)
+            data = json.dumps(payload, ensure_ascii=False, indent=2)
+            output.write(data.encode("utf-8", errors="backslashreplace"))
+            output.flush()
+            os.fsync(output.fileno())
         tmp.replace(REGISTRY_PATH)
-    except OSError as e:
-        log.error("Failed to persist device registry: %s", e)
-        tmp.unlink(missing_ok=True)
+        return True
+    except (OSError, RecursionError) as exc:
+        log.error("Failed to persist device registry: %s", exc)
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                log.warning("Could not remove temporary device registry: %s", cleanup_error)
+        return False
+
+
+def save_registry() -> bool:
+    return _write_registry(_configuration, device_registry)
+
+
+TELEMETRY_SAVE_DELAY = 1.0
+DEVICE_LIST_BROADCAST_DELAY = 0.15
+
+# Telemetry writes are synchronous, so a timer can save the latest registry state
+# without a background task or in-flight coordination.
+_telemetry_save_handle: asyncio.TimerHandle | None = None
+
+# Only admin broadcasts can overlap an await. A request during a send marks one
+# follow-up send; requests during the delay before the next send share that run.
+_device_list_broadcast_task: asyncio.Task | None = None
+_device_list_broadcast_pending = False
+
+
+def _record_telemetry() -> None:
+    _schedule_telemetry_save()
+    _schedule_device_list_broadcast()
+
+
+def _schedule_telemetry_save() -> None:
+    global _telemetry_save_handle
+    if _telemetry_save_handle is None:
+        _telemetry_save_handle = asyncio.get_running_loop().call_later(
+            TELEMETRY_SAVE_DELAY, _run_telemetry_save,
+        )
+
+
+def _run_telemetry_save() -> None:
+    global _telemetry_save_handle
+    _telemetry_save_handle = None
+    try:
+        save_registry()
+    except Exception:
+        log.exception("telemetry-registry-save failed")
+
+
+def _flush_telemetry_save() -> None:
+    if _telemetry_save_handle is not None:
+        _telemetry_save_handle.cancel()
+        _run_telemetry_save()
+
+
+def _schedule_device_list_broadcast() -> None:
+    global _device_list_broadcast_task, _device_list_broadcast_pending
+    if admin_connections:
+        loop = asyncio.get_running_loop()
+        task = _device_list_broadcast_task
+        if task is not None and not task.done() and task.get_loop() is loop:
+            _device_list_broadcast_pending = True
+            return
+        _device_list_broadcast_task = loop.create_task(
+            _run_device_list_broadcast(), name="device-list-broadcast",
+        )
+
+
+async def _run_device_list_broadcast() -> None:
+    global _device_list_broadcast_task, _device_list_broadcast_pending
+    current = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    try:
+        await asyncio.sleep(DEVICE_LIST_BROADCAST_DELAY)
+        while True:
+            _device_list_broadcast_pending = False
+            started_at = loop.time()
+            try:
+                await broadcast_device_list()
+            except Exception:
+                log.exception("device-list-broadcast failed")
+            if not _device_list_broadcast_pending:
+                break
+            remaining = DEVICE_LIST_BROADCAST_DELAY - (loop.time() - started_at)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+    finally:
+        if _device_list_broadcast_task is current:
+            _device_list_broadcast_task = None
+            _device_list_broadcast_pending = False
+
+
+async def _flush_device_list_broadcast() -> None:
+    task = _device_list_broadcast_task
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def _flush_telemetry(app: web.Application) -> None:
+    await _flush_device_list_broadcast()
+    _flush_telemetry_save()
+
+
+def _commit_configuration(
+    candidate: _ConfigurationRegistry, *, records: dict[str, dict] | None = None,
+) -> bool:
+    """Expose a proposed change only after its registry replacement succeeds."""
+    global _configuration
+    changed = candidate.groups != _configuration.groups or candidate.packages != _configuration.packages
+    committed = replace(candidate, revision=_configuration.revision + int(changed))
+    if not _write_registry(committed, device_registry if records is None else records):
+        return False
+    if records is not None:
+        device_registry.clear()
+        device_registry.update(records)
+    _configuration = committed
+    return True
+
+
+def _save_groups(groups: dict[str, _DeviceGroup]) -> bool:
+    return _configuration.packages is not None and _commit_configuration(replace(_configuration, groups=groups))
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +748,10 @@ def build_device_list_msg() -> str:
             "version_name": d.get("version_name", ""),
             # Live-only: whether the connected client can currently accept Push.
             "push_state_status": d.get("push_state_status"),
+            "configuration_supported": d.get("status") == "online" and _supports_configuration(d),
+            "configuration_state": d.get("configuration_state"),
+            "wifi_state": d.get("wifi_state"),
+            "current_wifi": d.get("current_wifi"),
         }
         for d in devices.values()
     ]
@@ -492,11 +785,15 @@ def build_device_list_msg() -> str:
             "version_name": rec.get("version_name", ""),
             "identity_kind": rec.get("identity_kind", "legacy"),
             "push_state_status": None,
+            "configuration_supported": False,
+            "configuration_state": rec.get("configuration_state"),
+            "wifi_state": rec.get("wifi_state"),
+            "current_wifi": None,
         })
     device_list.sort(
         key=lambda e: (e["label"] == "", (e["label"] or e["device_id"]).lower())
     )
-    return json.dumps({"type": "DEVICE_LIST", "devices": device_list})
+    return json.dumps({"type": "DEVICE_LIST", "devices": device_list}, separators=(",", ":"))
 
 
 def build_provisional_connection_list_msg() -> str:
@@ -522,23 +819,56 @@ def build_provisional_connection_list_msg() -> str:
 
 async def broadcast_device_list():
     """Send the current device list to every connected admin."""
+    if not admin_connections:
+        return
     await _broadcast_admin_message(build_device_list_msg())
 
 
 async def broadcast_provisional_connection_list() -> None:
+    if not admin_connections:
+        return
     await _broadcast_admin_message(build_provisional_connection_list_msg())
 
 
-def build_group_list_msg() -> str:
-    """Build a GROUP_LIST payload: every group with its member serials.
+def _public_packages() -> list[dict]:
+    packages = _configuration.packages or {}
+    return [
+        configuration_packages.public_summary(package_id, packages[package_id])
+        for package_id in sorted(packages, key=lambda key: (packages[key]["name"], key))
+    ]
 
-    This is the single source of truth for group membership; the admin console
-    derives the per-device "which groups" view from it. Groups are sorted by name
-    for a stable display, and members are emitted as plain serial lists (a serial
-    may reference an offline or not-yet-registered device).
-    """
-    groups = {name: list(members) for name, members in sorted(device_groups.items())}
-    return json.dumps({"type": "GROUP_LIST", "groups": groups})
+
+def _published_group_profile(group: _DeviceGroup) -> dict | None:
+    profile = (_configuration.packages or {}).get(group.package_id)
+    if profile is not None and profile["published_revision"] is not None:
+        return profile
+    return None
+
+
+def build_group_list_msg() -> str:
+    """Build group membership, package references and public deployment metadata."""
+    group_entries = sorted(_configuration.groups.items())
+    groups = {name: list(group.members) for name, group in group_entries}
+    assignments = {name: group.package_id for name, group in group_entries if group.package_id is not None}
+    deployments = {}
+    for name, group in group_entries:
+        profile = _published_group_profile(group)
+        if profile is None:
+            continue
+        settings = configuration_packages.published_settings(profile)
+        deployment = {
+            "package_id": group.package_id,
+            "revision": group.effective_revision(profile),
+            "keys": list(settings),
+        }
+        deployment["wifi_mode"] = _wifi_mode(settings)
+        deployments[name] = deployment
+    return json.dumps({"type": "GROUP_LIST", "groups": groups, "assignments": assignments,
+                       "packages": _public_packages(), "deployments": deployments,
+                       "registry_writable": _registry_readable,
+                       "configuration_available": _configuration.packages is not None,
+                       "revision": _configuration.revision,
+                       "server_instance_id": SERVER_INSTANCE_ID})
 
 
 async def broadcast_group_list():
@@ -547,47 +877,94 @@ async def broadcast_group_list():
 
 
 async def _broadcast_admin_message(message: str) -> None:
-    """Best-effort admin fan-out; one stale socket must not stop server work."""
-    async def send_one(ws: web.WebSocketResponse) -> None:
-        lock = _admin_send_locks.setdefault(ws, asyncio.Lock())
-        try:
+    await _queue_admin_message(message)
+
+
+async def _send_admin_frames(ws: web.WebSocketResponse, frames: list[str]) -> None:
+    # Check membership before creating a lock. A fan-out already queued when this
+    # console disconnects must not recreate a stale lock after its handler removes it.
+    if ws not in admin_connections:
+        return
+    lock = _admin_send_locks.get(ws)
+    if lock is None:
+        lock = asyncio.Lock()
+        _admin_send_locks[ws] = lock
+
+    try:
+        async def send_locked() -> None:
             async with lock:
                 if ws not in admin_connections:
                     return
-                await asyncio.wait_for(ws.send_str(message), ADMIN_SEND_TIMEOUT)
+                for frame in frames:
+                    await ws.send_str(frame)
+
+        # Bound the whole operation, including time spent queued behind another
+        # send to this console.
+        await asyncio.wait_for(send_locked(), ADMIN_SEND_TIMEOUT)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Several queued sends can hit their deadline at once. Only the first
+        # failure that still owns a connected socket should close it.
+        if ws not in admin_connections:
+            return
+        log.warning("Could not send message to admin WebSocket", exc_info=True)
+        admin_connections.discard(ws)
+        _admin_send_locks.pop(ws, None)
+        try:
+            await asyncio.wait_for(
+                ws.close(
+                    code=WSCloseCode.GOING_AWAY,
+                    message=b"admin send failed",
+                    drain=False,
+                ),
+                ADMIN_SEND_TIMEOUT,
+            )
         except asyncio.CancelledError:
             raise
         except (Exception, asyncio.TimeoutError):
-            log.warning("Could not send message to admin WebSocket", exc_info=True)
-            admin_connections.discard(ws)
-            _admin_send_locks.pop(ws, None)
-            try:
-                await asyncio.wait_for(
-                    ws.close(
-                        code=WSCloseCode.GOING_AWAY,
-                        message=b"admin send failed",
-                        drain=False,
-                    ),
-                    ADMIN_SEND_TIMEOUT,
-                )
-            except asyncio.CancelledError:
-                raise
-            except (Exception, asyncio.TimeoutError):
-                log.warning("Could not close failed admin WebSocket", exc_info=True)
+            log.warning("Could not close failed admin WebSocket", exc_info=True)
 
-    connections = tuple(admin_connections)
-    if not connections:
-        return
 
-    fanout = asyncio.gather(*(send_one(ws) for ws in connections))
-    try:
-        await asyncio.shield(fanout)
-    except asyncio.CancelledError:
-        # aiohttp may cancel a device request handler while its finally block is
-        # broadcasting the disconnect. Keep the already-bounded admin sends alive
-        # so the console receives that terminal state before cancellation escapes.
-        await asyncio.shield(fanout)
-        raise
+async def _send_admin_error(
+    ws: web.WebSocketResponse, message: str, *, operation: str | None = None, name: str | None = None,
+) -> None:
+    payload = {"type": "ERROR"}
+    if operation is not None:
+        payload.update(operation=operation, name=name)
+    payload["message"] = message
+    await _send_admin_frames(ws, [json.dumps(payload)])
+
+
+def _queue_admin_message(
+    message: str,
+    *,
+    acknowledgement: tuple[web.WebSocketResponse, str] | None = None,
+    acknowledgement_after: bool = False,
+) -> Awaitable[None]:
+    """Schedule best-effort sends with an optional frame before or after the message."""
+    async def send_one(ws: web.WebSocketResponse) -> None:
+        frames = []
+        is_requester = acknowledgement is not None and ws is acknowledgement[0]
+        if is_requester and not acknowledgement_after:
+            frames.append(acknowledgement[1])
+        frames.append(message)
+        if is_requester and acknowledgement_after:
+            frames.append(acknowledgement[1])
+        await _send_admin_frames(ws, frames)
+
+    fanout = asyncio.gather(*(send_one(ws) for ws in tuple(admin_connections)))
+
+    async def finish() -> None:
+        try:
+            await asyncio.shield(fanout)
+        except asyncio.CancelledError:
+            # Keep already-bounded sends alive when aiohttp cancels a request
+            # handler while it is publishing its final state.
+            await asyncio.shield(fanout)
+            raise
+
+    return finish()
 
 
 async def forward_to_admins(payload: dict):
@@ -696,7 +1073,7 @@ def reset_transfer_slots() -> None:
 
 
 def release_transfer_slot(device_id: str, reason: str, task: str | None = None) -> bool:
-    """Free the transfer slot(s) a device holds, if any.
+    """Free a device's pending install transfer, if any.
 
     Resolving the pending future wakes the dispatcher coroutine parked on it so the
     next queued device is dispatched. Safe to call for a device that holds no slot
@@ -704,28 +1081,21 @@ def release_transfer_slot(device_id: str, reason: str, task: str | None = None) 
     more than once for the same device and task (e.g. DOWNLOAD_COMPLETE followed by
     INSTALL_RESULT) — the second call is a no-op.
 
-    ``task`` names which job to release: a device may be transferring for an install
-    and a push at the same time, and each job's terminal message must free only its
-    own slot. Pass None to free every slot the device holds, which is what a
-    disconnect means.
+    The pending-transfers view contains Install only. Push owns exact typed keys
+    and HTTP leases separately; a WebSocket disconnect must not release them.
+    Pass None on disconnect to release any pending Install for this device.
 
     Returns True only when this call actually released a live slot, so callers can
     tell a real transfer→apply transition from a late message for a device whose
     transfer already timed out or finished.
     """
-    if task is not None:
-        fut = pending_transfers.get((device_id, task))
-        if fut is not None and not fut.done():
-            fut.set_result(reason)
-            return True
+    if task not in (None, TASK_INSTALL):
         return False
-
-    released = False
-    for (did, _task), fut in list(pending_transfers.items()):
-        if did == device_id and not fut.done():
-            fut.set_result(reason)
-            released = True
-    return released
+    fut = pending_transfers.get((device_id, TASK_INSTALL))
+    if fut is None or fut.done():
+        return False
+    fut.set_result(reason)
+    return True
 
 
 async def broadcast_install_state(
@@ -1203,6 +1573,661 @@ def zip_tree(root: Path, dest_zip: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Group settings API and policy publication
+# ---------------------------------------------------------------------------
+
+PACKAGE_REQUEST_MAX_BYTES = 256 * 1024
+CONFIGURATION_SEND_TIMEOUT = 5.0
+_CONFIGURATION_PUBLICATIONS = web.AppKey("configuration_publications", set)
+_LBE_MAP_TOKEN_KEY = secrets.token_bytes(32)
+LBE_MAP_TOKEN_TTL_SECONDS = 24 * 60 * 60
+LBE_MAP_TOKEN_REFRESH_WINDOW_SECONDS = 10 * 60
+LBE_MAP_TRANSFER_QUEUE_TIMEOUT_SECONDS = 15.0
+
+
+@dataclass
+class _ConfigurationDelivery:
+    pending: bool = True
+    task: asyncio.Task[None] = field(init=False)
+
+
+_configuration_deliveries: dict[web.WebSocketResponse, _ConfigurationDelivery] = {}
+
+
+def _require_same_origin(request: web.Request) -> None:
+    origin = request.headers.get("Origin")
+    if origin is None:
+        # Browsers send Origin for mutations. Native clients may omit it.
+        return
+
+    expected = f"{request.scheme}://{request.host}"
+    if origin != expected:
+        raise PackageError("Invalid request origin", 403)
+
+
+def _lbe_map_store() -> LbeMapStore:
+    return LbeMapStore(DATA_DIR / "lbe-maps")
+
+
+async def lbe_maps_handler(request: web.Request) -> web.Response:
+    try:
+        if request.method in ("GET", "HEAD"):
+            payload = {"maps": await asyncio.to_thread(lambda: _lbe_map_store().list_maps())}
+        else:
+            _require_same_origin(request)
+            payload = {"map": await _lbe_map_store().save_upload(request)}
+        return web.json_response(payload, headers={"Cache-Control": "no-store"})
+    except (PackageError, LbeMapError) as exc:
+        return web.json_response({"error": str(exc)}, status=exc.status)
+    except OSError as exc:
+        log.error("Could not access LBE map storage", exc_info=exc)
+        return web.json_response({"error": "Could not access the map library"}, status=500)
+
+
+async def _expire_startup_map_staging(store: LbeMapStore, candidates: tuple[Path, ...]) -> None:
+    await asyncio.sleep(LBE_MAP_STAGING_MAX_AGE_SECONDS)
+    try:
+        removed = await asyncio.to_thread(store.remove_stale_staging, candidates)
+        if removed:
+            log.info("Removed %d abandoned LBE map upload(s)", removed)
+    except (LbeMapError, OSError):
+        log.warning("Could not clean up abandoned LBE map uploads", exc_info=True)
+
+
+async def _map_staging_cleanup(_app: web.Application):
+    cleanup_task = None
+    try:
+        store = _lbe_map_store()
+        # mkdir(mode=...) does not restrict a pre-existing library root.
+        if os.name == "posix" and store.root.stat().st_mode & 0o777 != 0o700:
+            store.root.chmod(0o700)
+        candidates = await asyncio.to_thread(store.staging_directories)
+        removed = await asyncio.to_thread(store.remove_stale_staging, candidates)
+        if removed:
+            log.info("Removed %d abandoned LBE map upload(s)", removed)
+        pending = tuple(candidate for candidate in candidates if candidate.is_dir())
+        if pending:
+            cleanup_task = asyncio.create_task(_expire_startup_map_staging(store, pending))
+    except (LbeMapError, OSError):
+        log.warning("Could not prepare LBE map upload cleanup", exc_info=True)
+
+    try:
+        yield
+    finally:
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            await asyncio.gather(cleanup_task, return_exceptions=True)
+
+
+def _lbe_map_token(device_id: str, revision: str, digest: str, expires_at: int) -> str:
+    scope = json.dumps(
+        [device_id, revision, digest, expires_at], separators=(",", ":"),
+    ).encode("utf-8")
+    signature = hmac.new(_LBE_MAP_TOKEN_KEY, scope, hashlib.sha256).hexdigest()
+    return f"{expires_at}.{signature}"
+
+
+def _valid_lbe_map_token(token: str, device_id: str, revision: str, digest: str) -> bool:
+    try:
+        expiry_text, _signature = token.split(".", 1)
+        expires_at = int(expiry_text)
+    except (AttributeError, ValueError):
+        return False
+    if str(expires_at) != expiry_text or expires_at <= int(time.time()):
+        return False
+    expected = _lbe_map_token(device_id, revision, digest, expires_at)
+    try:
+        token_bytes = token.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return hmac.compare_digest(token_bytes, expected.encode("ascii"))
+
+
+def _authorized_lbe_map_reference(request: web.Request) -> dict[str, Any]:
+    device_id = request.query.get("device_id", "")
+    revision = request.query.get("revision", "")
+    digest = request.match_info["sha256"]
+    token = request.headers.get("Authorization", "")
+    if not token.startswith("Bearer ") or not _valid_lbe_map_token(
+            token[len("Bearer "):], device_id, revision, digest):
+        raise web.HTTPForbidden()
+    policy = _desired_configuration(device_id)
+    reference = policy["settings"].get("lbeMap")
+    if revision != policy["revision"] or reference is None or digest != reference["sha256"]:
+        raise web.HTTPForbidden()
+
+    return reference
+
+
+def _lbe_map_download_path(reference: dict[str, Any]) -> Path:
+    path = _lbe_map_store().path_for(reference)
+    if path is None:
+        raise web.HTTPNotFound()
+    return path
+
+
+async def lbe_map_download_handler(request: web.Request) -> web.StreamResponse:
+    reference = _authorized_lbe_map_reference(request)
+    slots = transfer_slots()
+    try:
+        await asyncio.wait_for(
+            slots.acquire(), timeout=LBE_MAP_TRANSFER_QUEUE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return web.Response(
+            status=503,
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-MDM-Transfer-Status": "queued",
+                "Retry-After": "1",
+            },
+        )
+    try:
+        # A device can be unassigned or receive new credentials while queued.
+        reference = _authorized_lbe_map_reference(request)
+        path = _lbe_map_download_path(reference)
+        return await stream_file(
+            request,
+            path,
+            reference["size"],
+            reference["sha256"],
+            cache_control="private, no-store",
+            write_timeout_seconds=TRANSFER_IDLE_SECONDS,
+        )
+    finally:
+        slots.release()
+
+
+async def _small_json_body(request: web.Request) -> dict:
+    if (request.content_length is not None
+            and request.content_length > PACKAGE_REQUEST_MAX_BYTES):
+        raise PackageError("Request body is too large", 413)
+    body = bytearray()
+    async for chunk in request.content.iter_chunked(8192):
+        body.extend(chunk)
+        if len(body) > PACKAGE_REQUEST_MAX_BYTES:
+            raise PackageError("Request body is too large", 413)
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (ValueError, RecursionError):
+        raise PackageError("Request body must be a JSON object") from None
+    if not isinstance(parsed, dict):
+        raise PackageError("Request body must be a JSON object")
+    return parsed
+
+
+def _group_assignment_name(request: web.Request) -> str:
+    names = request.query.getall("name", [])
+    if len(names) != 1:
+        raise PackageError("Exactly one group name is required")
+    name = names[0]
+    if not name or name != _group_name(name):
+        raise PackageError("Invalid group name")
+    return name
+
+
+def _require_packages() -> dict[str, dict]:
+    packages = _configuration.packages
+    if packages is None:
+        raise PackageError("Saved configuration packages are unavailable", 503)
+    return packages
+
+
+def _find_package(package_id: str) -> dict:
+    packages = _require_packages()
+    if package_id not in packages:
+        raise PackageError("Configuration package does not exist", 404)
+    return packages[package_id]
+
+
+def _save_package(package_id: str, profile: dict | None) -> None:
+    packages = _require_packages().copy()
+    if profile is None:
+        del packages[package_id]
+    else:
+        packages[package_id] = profile
+    if not _commit_configuration(replace(_configuration, packages=packages)):
+        raise PackageError("Configuration package could not be saved", 500)
+
+
+def _package_impact(package_id: str, profile: dict) -> tuple[dict, list[str]]:
+    membership = {
+        name: sorted(group.members)
+        for name, group in sorted(_configuration.groups.items()) if group.package_id == package_id
+    }
+    revision = profile["published_revision"]
+    token = hashlib.sha256(json.dumps([package_id, revision, membership]).encode("utf-8")).hexdigest()
+    devices = sorted({device_id for members in membership.values() for device_id in members})
+    return {"groups": len(membership), "devices": len(devices), "token": token}, devices
+
+
+def _updated_package(profile: dict, body: dict) -> dict:
+    configuration_packages.check_expected_revision(body, profile["edit_revision"])
+    name = configuration_packages.validate_name(body.get("name", profile["name"]))
+    settings = configuration_packages.validate_settings(body.get("settings"))
+    reference = configuration_packages.managed_settings(settings).get("lbeMap")
+    if reference is not None and _lbe_map_store().path_for(reference) is None:
+        raise PackageError("The selected LBE map is unavailable. Upload or select it again.", 409, "map_unavailable")
+    return {**profile, "name": name, "settings": settings, "edit_revision": str(uuid.uuid4())}
+
+
+def _published_configuration(package_id: str, profile: dict) -> _ConfigurationRegistry:
+    published = {
+        **profile,
+        "published_revision": str(uuid.uuid4()),
+        "deployed_at_ms": time.time_ns() // 1_000_000,
+    }
+    groups = {
+        name: replace(group, deployment_revision=None, deployment_at_ms=None) if group.package_id == package_id else group
+        for name, group in _configuration.groups.items()
+    }
+    return replace(_configuration, groups=groups, packages={**_require_packages(), package_id: published})
+
+
+def _check_deployment_impact(body: dict, token: str) -> None:
+    expected = body.get("expected_impact")
+    if not isinstance(expected, str) or not expected:
+        raise PackageError("expected_impact is required")
+    if expected != token:
+        raise PackageError("Deployment targets changed. Review the updated targets before deploying.", 409, "deployment_targets_changed")
+
+
+def _lbe_deployment_details(settings: dict) -> dict:
+    if "lbeMode" not in settings:
+        return {}
+    reference = settings.get("lbeMap")
+    return {"lbe_mode": settings["lbeMode"], "lbe_map_name": reference["name"] if reference else None}
+
+
+def _editor_package(package_id: str, profile: dict) -> dict:
+    impact, _ = _package_impact(package_id, profile)
+    return configuration_packages.editor_profile(package_id, profile, impact)
+
+
+async def package_catalog_handler(request: web.Request) -> web.Response:
+    try:
+        _require_packages()
+        return web.json_response({"packages": _public_packages(), "sections": configuration_packages.SECTIONS})
+    except PackageError as exc:
+        return web.json_response(exc.payload(), status=exc.status)
+
+
+async def package_create_handler(request: web.Request) -> web.Response:
+    try:
+        _require_same_origin(request)
+        body = await _small_json_body(request)
+        profile = {
+            "name": configuration_packages.validate_name(body.get("name")),
+            "settings": {},
+            "edit_revision": None,
+            "published_revision": None,
+            "deployed_at_ms": None,
+        }
+        if "source_id" in request.match_info:
+            source = _find_package(request.match_info["source_id"])
+            configuration_packages.check_expected_revision(body, source["edit_revision"])
+            profile["settings"] = copy.deepcopy(source["settings"])
+            profile["edit_revision"] = str(uuid.uuid4())
+        package_id = str(uuid.uuid4())
+        _save_package(package_id, profile)
+        response = _editor_package(package_id, profile)
+        await broadcast_group_list()
+        return web.json_response(response, headers={"Cache-Control": "no-store"})
+    except PackageError as exc:
+        return web.json_response(exc.payload(), status=exc.status)
+
+
+async def package_handler(request: web.Request) -> web.Response:
+    try:
+        package_id = request.match_info["package_id"]
+        if request.method in ("GET", "HEAD"):
+            return web.json_response(_editor_package(package_id, _find_package(package_id)),
+                                     headers={"Cache-Control": "no-store"})
+
+        _require_same_origin(request)
+        body = await _small_json_body(request)
+        profile = _find_package(package_id)
+        configuration_packages.check_expected_revision(body, profile["edit_revision"])
+        if any(group.package_id == package_id for group in _configuration.groups.values()):
+            raise PackageError("Configuration package is assigned to a group", 409, "package_assigned")
+        _save_package(package_id, None)
+        await broadcast_group_list()
+        return web.json_response({"deleted": True})
+    except PackageError as exc:
+        return web.json_response(exc.payload(), status=exc.status)
+
+
+async def package_save_and_deploy_handler(request: web.Request) -> web.Response:
+    try:
+        _require_same_origin(request)
+        body = await _small_json_body(request)
+        package_id = request.match_info["package_id"]
+        profile = _find_package(package_id)
+        impact, devices = _package_impact(package_id, profile)
+        _check_deployment_impact(body, impact["token"])
+        updated = _published_configuration(package_id, _updated_package(profile, body))
+        if not _commit_configuration(updated):
+            raise PackageError("Configuration package could not be saved", 500)
+        _schedule_configuration_publication(request.app, devices)
+        return web.json_response(_editor_package(package_id, _find_package(package_id)),
+                                 headers={"Cache-Control": "no-store"})
+    except PackageError as exc:
+        return web.json_response(exc.payload(), status=exc.status)
+
+
+async def group_package_deploy_handler(request: web.Request) -> web.Response:
+    try:
+        body = None
+        if request.method == "POST":
+            _require_same_origin(request)
+            body = await _small_json_body(request)
+        name = _group_assignment_name(request)
+        group = _configuration.groups.get(name)
+        if group is None:
+            raise PackageError("Group does not exist", 404)
+        ids = request.query.getall("package_id", [])
+        if len(ids) != 1 or (ids[0] and normalize_revision(ids[0]) is None):
+            raise PackageError("Exactly one package_id is required, a canonical UUID or empty for No managed settings")
+        package_id = ids[0] or None
+        _require_packages()
+        profile = _find_package(package_id) if package_id is not None else None
+        package_name = profile["name"] if profile is not None else "No managed settings"
+        published_revision = profile["published_revision"] if profile is not None else None
+        if profile is not None and published_revision is None:
+            raise PackageError("Edit this package and select Save & deploy to deploy it first.", 409)
+        use_current = published_revision is not None and group.package_id != package_id
+        if profile is None or use_current:
+            devices = sorted(group.members)
+            impact = {"groups": 1, "devices": len(devices)}
+            target = [published_revision, devices]
+        else:
+            # Redeploying the group's current package republishes its saved settings
+            # as a new revision to every group that uses it.
+            impact, devices = _package_impact(package_id, profile)
+            target = [profile["edit_revision"], impact["token"]]
+        # Bind the preview to the current assignment, settings revision, and device set.
+        current_profile = _published_group_profile(group)
+        current_revision = group.effective_revision(current_profile) if current_profile is not None else None
+        scope = [name, group.package_id, group.deployment_revision, current_revision,
+                 package_id, package_name, use_current, target]
+        token = hashlib.sha256(json.dumps(scope).encode()).hexdigest()
+        if body is None:
+            return web.json_response({
+                "name": package_name, "use_current": use_current, "clear": profile is None,
+                "wifi_mode": (_wifi_mode(configuration_packages.published_settings(current_profile))
+                              if current_profile is not None else None),
+                "impact": {**impact, "token": token},
+                **_lbe_deployment_details(configuration_packages.published_settings(profile) if profile else {}),
+            })
+        _check_deployment_impact(body, token)
+        if profile is not None:
+            reference = configuration_packages.published_settings(profile).get("lbeMap")
+            if reference is not None and _lbe_map_store().path_for(reference) is None:
+                raise PackageError("The selected LBE map is unavailable. Upload or select it again.", 409, "map_unavailable")
+        if profile is not None and not use_current:
+            updated = _published_configuration(package_id, profile)
+        else:
+            # A scoped deployment uses the published settings with a fresh revision for this group.
+            revision = str(uuid.uuid4()) if use_current else None
+            deployed_at = time.time_ns() // 1_000_000 if use_current else None
+            assignment = replace(group, package_id=package_id, deployment_revision=revision, deployment_at_ms=deployed_at)
+            updated = replace(_configuration, groups={**_configuration.groups, name: assignment})
+        if not _commit_configuration(updated):
+            raise PackageError("Group deployment could not be saved", 500)
+        _schedule_configuration_publication(request.app, devices)
+        return web.Response(text=build_group_list_msg(), content_type="application/json")
+    except PackageError as exc:
+        return web.json_response(exc.payload(), status=exc.status)
+
+
+async def package_retry_handler(request: web.Request) -> web.Response:
+    try:
+        _require_same_origin(request)
+        body = await _small_json_body(request)
+        device_id = body.get("device_id")
+        package_id = body.get("package_id")
+        revision = body.get("revision")
+        if not isinstance(device_id, str) or not CANONICAL_DEVICE_ID_RE.fullmatch(device_id):
+            raise PackageError("device_id must be a canonical device ID")
+        if normalize_revision(package_id) is None or normalize_revision(revision) is None:
+            raise PackageError("package_id and revision must be canonical UUIDs")
+        entry = devices.get(device_id)
+        if entry is None or not await _send_configuration(device_id, entry, retry=(package_id, revision)):
+            raise PackageError("The device or published package is no longer available for retry", 409)
+        return web.json_response({"sent": True})
+    except PackageError as exc:
+        return web.json_response(exc.payload(), status=exc.status)
+
+
+def _supports_configuration(entry: dict) -> bool:
+    return (entry.get("identity_kind") == "canonical"
+            and configuration_packages.CAPABILITY in entry.get("capabilities", ()))
+
+
+def _reported_device_state(data: dict, entry: dict) -> dict:
+    if entry.get("identity_kind") != "canonical":
+        return {}
+    validators = {"wifi_state": public_wifi_state, "current_wifi": public_current_wifi}
+    if _supports_configuration(entry):
+        validators["configuration_state"] = configuration_packages.public_configuration_state
+    reports = {}
+    for field, validate in validators.items():
+        if field in data:
+            raw = data[field]
+            clean = validate(raw)
+            # An explicit null clears telemetry. Older clients can omit the field.
+            if raw is None or clean is not None:
+                reports[field] = clean
+    return reports
+
+
+def _update_device_reports(device_id: str, reports: dict) -> None:
+    entry = devices[device_id]
+    record = device_registry[device_id]
+    if "current_wifi" in reports:
+        current_wifi = reports.pop("current_wifi")
+        if current_wifi != entry.get("current_wifi"):
+            entry["current_wifi"] = current_wifi
+            _schedule_device_list_broadcast()
+    if any(value != entry.get(key) or value != record.get(key) for key, value in reports.items()):
+        entry.update(reports)
+        record.update(reports)
+        _record_telemetry()
+
+
+def _wifi_mode(settings: dict) -> str | None:
+    wifi = settings.get("wifi")
+    if not isinstance(wifi, dict):
+        return None
+    return "android_selection" if wifi.get("prioritize_networks") is False else "priority"
+
+
+def _desired_configuration(device_id: str, *, include_summary: bool = False, include_settings: bool = True) -> dict:
+    group_name = None
+    package_id = None
+    revision = None
+    published = None
+    deployed_at = None
+    for name, group in _configuration.groups.items():
+        if device_id in group.members:
+            group_name = name
+            published = _published_group_profile(group)
+            if published is not None:
+                package_id = group.package_id
+                revision = group.effective_revision(published)
+                deployed_at = (group.deployment_at_ms if group.deployment_revision is not None
+                               else published.get("deployed_at_ms"))
+            break
+    policy = {
+        "package_id": package_id,
+        "revision": revision,
+        "settings": (configuration_packages.published_settings(published)
+                     if published is not None and include_settings else {}),
+    }
+    if include_summary:
+        policy["group_name"] = group_name
+        policy["deployed_at_ms"] = deployed_at
+    return policy
+
+
+def _configuration_connection_ready(device_id: str, entry: dict) -> bool:
+    return (_configuration.packages is not None and devices.get(device_id) is entry
+            and entry.get("status") == "online" and entry.get("registration_ready") is True
+            and not entry["ws"].closed)
+
+
+def _lbe_map_credential_needs_refresh(device_id: str, entry: dict, now: int | None = None) -> bool:
+    expires_at = entry.get("lbe_map_token_expires_at")
+    if (not isinstance(expires_at, int)
+            or entry.get("identity_kind") != "canonical"
+            or configuration_packages.LBE_MAP_CAPABILITY not in entry.get("capabilities", ())
+            or not _configuration_connection_ready(device_id, entry)):
+        return False
+    current_time = int(time.time()) if now is None else now
+    return expires_at <= current_time + LBE_MAP_TOKEN_REFRESH_WINDOW_SECONDS
+
+
+async def _send_configuration(
+    device_id: str, entry: dict, *, retry: tuple[str, str] | None = None,
+    delivery: _ConfigurationDelivery | None = None,
+) -> bool:
+    """Send one current policy. A timeout bounds explicit HTTP Retry requests."""
+    if not _configuration_connection_ready(device_id, entry):
+        return False
+    ws = entry["ws"]
+    include_settings = _supports_configuration(entry)
+    include_summary = (entry.get("identity_kind") == "canonical"
+                       and configuration_packages.SUMMARY_CAPABILITY in entry.get("capabilities", ()))
+    if not include_settings and (not include_summary or retry is not None):
+        return False
+
+    map_token_expires_at: int | None = None
+
+    def resolve() -> str | None:
+        nonlocal map_token_expires_at
+        if not _configuration_connection_ready(device_id, entry):
+            return None
+        policy = _desired_configuration(device_id, include_summary=include_summary, include_settings=include_settings)
+        if retry is not None:
+            if retry != (policy["package_id"], policy["revision"]):
+                return None
+            policy["retry_id"] = str(uuid.uuid4())
+        reference = policy["settings"].get("lbeMap")
+        if reference is not None and configuration_packages.LBE_MAP_CAPABILITY in entry.get("capabilities", ()):
+            digest = reference["sha256"]
+            query = urlencode({"device_id": device_id, "revision": policy["revision"]})
+            policy["lbe_map_download"] = f"/api/lbe-maps/{digest}/download?{query}"
+            map_token_expires_at = int(time.time()) + LBE_MAP_TOKEN_TTL_SECONDS
+            policy["lbe_map_token"] = _lbe_map_token(
+                device_id, policy["revision"], digest, map_token_expires_at,
+            )
+        else:
+            map_token_expires_at = None
+        if delivery is not None:
+            # All requests received before the write are covered by this policy.
+            delivery.pending = False
+        return json.dumps({"type": "CONFIGURATION_POLICY", **policy})
+
+    try:
+        send = ws.send_current_text(resolve)
+        if retry is not None:
+            sent = await asyncio.wait_for(send, timeout=CONFIGURATION_SEND_TIMEOUT)
+        else:
+            sent = await send
+        if sent and devices.get(device_id) is entry:
+            if map_token_expires_at is None:
+                entry.pop("lbe_map_token_expires_at", None)
+            else:
+                entry["lbe_map_token_expires_at"] = map_token_expires_at
+        return sent
+    except (asyncio.TimeoutError, ConnectionError, RuntimeError):
+        log.info("Configuration delivery could not be confirmed for %s", device_id)
+        return False
+
+
+async def _deliver_configuration(device_id: str, entry: dict, delivery: _ConfigurationDelivery) -> None:
+    while delivery.pending:
+        if not await _send_configuration(device_id, entry, delivery=delivery):
+            return
+
+
+def _queue_configuration(device_id: str, entry: dict) -> None:
+    if not _configuration_connection_ready(device_id, entry):
+        return
+    ws = entry["ws"]
+    current = _configuration_deliveries.get(ws)
+    if current is not None and not current.task.done():
+        current.pending = True
+        return
+
+    delivery = _ConfigurationDelivery()
+    delivery.task = asyncio.create_task(_deliver_configuration(device_id, entry, delivery),
+                                        name="configuration-delivery")
+    _configuration_deliveries[ws] = delivery
+
+    def finish(task: asyncio.Task[None]) -> None:
+        if _configuration_deliveries.get(ws) is delivery:
+            del _configuration_deliveries[ws]
+        if not task.cancelled() and (error := task.exception()) is not None:
+            log.error("Could not deliver configuration for %s", device_id, exc_info=error)
+
+    delivery.task.add_done_callback(finish)
+
+
+def _cancel_configuration_delivery(ws: web.WebSocketResponse) -> None:
+    delivery = _configuration_deliveries.get(ws)
+    if delivery is not None:
+        delivery.task.cancel()
+
+
+async def _publish_group_change(device_ids, admin_update=None) -> None:
+    """Deliver a committed group change to headsets and admins independently.
+
+    A slow admin console must not delay delivery to headsets. ``admin_update`` replaces
+    the default group-list fan-out when the caller also answers the requesting console.
+    """
+    try:
+        _publish_configuration(device_ids)
+    except Exception:
+        log.exception("Could not publish the committed configuration")
+
+    try:
+        await (admin_update if admin_update is not None else broadcast_group_list())
+    except Exception:
+        log.exception("Could not notify admins of the committed group change")
+
+
+def _notify_committed_group_change(admin_ws: web.WebSocketResponse, message: dict) -> Awaitable[None]:
+    # Queue each socket's send before yielding after the commit. A concurrent
+    # snapshot that reflects this change must queue behind the requester's ACK.
+    return _queue_admin_message(
+        build_group_list_msg(),
+        acknowledgement=(admin_ws, json.dumps(message)),
+    )
+
+
+def _schedule_configuration_publication(app: web.Application, device_ids: list[str]) -> None:
+    tasks = app[_CONFIGURATION_PUBLICATIONS]
+    task = asyncio.create_task(_publish_group_change(device_ids), name="configuration-publication")
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+async def _stop_configuration_publications(app: web.Application) -> None:
+    tasks = (*app[_CONFIGURATION_PUBLICATIONS], *(delivery.task for delivery in _configuration_deliveries.values()))
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _publish_configuration(device_ids) -> None:
+    for device_id in device_ids:
+        entry = devices.get(device_id)
+        if entry is not None:
+            _queue_configuration(device_id, entry)
+
+
+# ---------------------------------------------------------------------------
 # Device WebSocket handler  (/ws/device)
 # ---------------------------------------------------------------------------
 
@@ -1228,11 +2253,12 @@ def _bounded_registration_text(value, fallback: str, limit: int) -> str:
 def _parse_registration(data: dict, remote: str | None) -> tuple[str, dict] | tuple[None, str]:
     scheme = data.get("identity_scheme")
     device_id = data.get("device_id")
+    capabilities = sorted(parse_capabilities(data.get("capabilities")))
     common = {
         "model": _bounded_registration_text(data.get("model"), "unknown", MAX_DEVICE_MODEL_LEN),
         "ip": _bounded_registration_text(data.get("ip"), remote or "unknown", MAX_DEVICE_IP_LEN),
         "version_name": _bounded_registration_text(data.get("version_name"), "", MAX_VERSION_NAME_LEN),
-        "capabilities": sorted(parse_capabilities(data.get("capabilities"))),
+        "capabilities": capabilities,
     }
     version_code = data.get("version_code")
     common["version_code"] = (
@@ -1304,14 +2330,18 @@ async def _complete_device_registration(
         devices[device_id]["registration_ready"] = True
 
 
-async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
+async def device_ws_handler(request: web.Request) -> web.StreamResponse:
+    try:
+        _require_same_origin(request)
+    except PackageError as exc:
+        return web.json_response(exc.payload(), status=exc.status)
+
     ws = _websocket_response_factory(heartbeat=30)
     await ws.prepare(request)
     log.info("Device WebSocket connected from %s", request.remote)
 
     device_id: str | None = None
     socket_identity_kind: str | None = None
-
     try:
         async for raw_msg in ws:
             if raw_msg.type == web.WSMsgType.TEXT:
@@ -1373,6 +2403,11 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                             data,
                             idempotent=True,
                         )
+                        if _owns_device(device_id, ws):
+                            entry = devices[device_id]
+                            if entry.get("registration_ready") is True:
+                                _update_device_reports(device_id, _reported_device_state(data, entry))
+                            _queue_configuration(device_id, entry)
                         continue
                     if kind == "provisional":
                         now = time.time()
@@ -1417,11 +2452,13 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     prev = device_registry.get(new_device_id, {})
                     # Promotion is one synchronous mutation: no task can observe this
                     # socket in both the provisional and canonical collections.
-                    provisional_connections.pop(ws, None)
+                    promoted_from_provisional = provisional_connections.pop(ws, None) is not None
                     device_id = new_device_id
                     socket_identity_kind = kind
                     push_state_status = parse_push_state_status(data.get("push_state"))
-                    devices[device_id] = {
+                    if device_id in devices:
+                        _cancel_configuration_delivery(devices[device_id]["ws"])
+                    entry = {
                         "ws": ws,
                         "device_id": device_id,
                         "identity_kind": kind,
@@ -1434,9 +2471,19 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "version_code": version_code,
                         "version_name": version_name,
                         "push_state_status": push_state_status,
+                        "capabilities": registration["capabilities"],
+                        "wifi_state": None,
                     }
+                    if _supports_configuration(entry):
+                        entry["configuration_state"] = prev.get("configuration_state")
+                    reports = _reported_device_state(data, entry)
+                    entry.update(reports)
+                    persisted_reports = {key: value for key, value in reports.items() if key != "current_wifi"}
+                    devices[device_id] = entry
                     device_registry[device_id] = {
+                        **prev,
                         "label": prev.get("label", ""),
+                        "retired": False,
                         "model": model,
                         "ip": ip,
                         "last_seen": time.time(),
@@ -1445,8 +2492,14 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         "version_code": version_code,
                         "version_name": version_name,
                         "identity_kind": kind,
+                        "configuration_state": prev.get("configuration_state"),
+                        "wifi_state": prev.get("wifi_state"),
+                        **persisted_reports,
                     }
-                    save_registry()
+                    if not prev or prev.get("retired") or prev.get("identity_kind") != kind:
+                        save_registry()
+                    else:
+                        _schedule_telemetry_save()
 
                     log.info(
                         "%s device registered: %s (%s, client v%s)",
@@ -1459,13 +2512,25 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     if not _owns_device(device_id, ws):
                         continue
                     devices[device_id]["status"] = "online"
+                    _queue_configuration(device_id, devices[device_id])
                     if prev.get("retired"):
                         log.info("Retired device re-registered, re-adopting: %s", device_id)
                     await _resolve_pending_retire(device_id)
                     await _resolve_pending_self_update(device_id, ws, version_code)
-                    if kind == "canonical":
+                    if promoted_from_provisional:
                         await broadcast_provisional_connection_list()
-                    await broadcast_device_list()
+                    _schedule_device_list_broadcast()
+
+                elif msg_type in {"CONFIGURATION_STATE", "WIFI_STATE", "WIFI_CONNECTION"}:
+                    entry = devices[device_id]
+                    field = {
+                        "CONFIGURATION_STATE": "configuration_state",
+                        "WIFI_STATE": "wifi_state",
+                        "WIFI_CONNECTION": "current_wifi",
+                    }[msg_type]
+                    if entry.get("registration_ready") is True and field in data:
+                        reports = _reported_device_state({field: data[field]}, entry)
+                        _update_device_reports(device_id, reports)
 
                 elif msg_type == "BATTERY_UPDATE":
                     if not device_id:
@@ -1489,12 +2554,14 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     if rec is not None:
                         rec["battery"] = battery
                         rec["last_seen"] = time.time()
-                    save_registry()
                     log.info(
                         "Battery update from %s: %d%% charging=%s",
                         device_id, battery["level"], battery["charging"],
                     )
-                    await broadcast_device_list()
+                    _record_telemetry()
+                    entry = devices.get(device_id)
+                    if entry is not None and _lbe_map_credential_needs_refresh(device_id, entry):
+                        _queue_configuration(device_id, entry)
 
                 elif msg_type == "DOWNLOAD_COMPLETE":
                     # Primary transfer-slot release: the network-heavy download has
@@ -1727,6 +2794,7 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
             elif raw_msg.type == web.WSMsgType.ERROR:
                 log.error("Device WS error: %s", ws.exception())
     finally:
+        _cancel_configuration_delivery(ws)
         # Abrupt TCP loss can end iteration without calling WebSocket.close().
         # Notify the Push adapter while this socket's registration is still present.
         notify_disconnect = getattr(ws, "notify_canonical_disconnect", None)
@@ -1762,6 +2830,17 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
             # the row as "updating". A disconnect during the post-update verification
             # phase, however, means the answer will never arrive: close it out.
             pend = pending_self_updates.get(device_id)
+            transition_pending = (
+                (pend is not None and pend.get("phase") == "updating")
+                or device_id in pending_retires
+            )
+            # Release this registration before any admin send yields to a reconnect.
+            del devices[device_id]
+            rec = device_registry.get(device_id)
+            if rec is not None:
+                rec["last_seen"] = time.time()
+                _schedule_telemetry_save()
+            log.info("Device disconnected: %s", device_id)
             if pend is not None and pend.get("phase") == "verifying":
                 verify_timeout = pend.get("timeout_task")
                 if verify_timeout is not None:
@@ -1774,16 +2853,10 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     "status": "error",
                     "detail": "device disconnected before verification completed",
                 })
-        if device_id and is_current:
-            del devices[device_id]
-            # Keep the registry entry; just stop reporting the device as online and
-            # stamp when it was last seen so it shows as offline in the list.
-            rec = device_registry.get(device_id)
-            if rec is not None:
-                rec["last_seen"] = time.time()
-                save_registry()
-            log.info("Device disconnected: %s", device_id)
-            await broadcast_device_list()
+            if transition_pending:
+                await broadcast_device_list()
+            else:
+                _schedule_device_list_broadcast()
         if was_provisional:
             await broadcast_provisional_connection_list()
 
@@ -1794,16 +2867,18 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
 # Admin WebSocket handler  (/ws/admin)
 # ---------------------------------------------------------------------------
 
-async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
+async def admin_ws_handler(request: web.Request) -> web.StreamResponse:
+    try:
+        _require_same_origin(request)
+    except PackageError as exc:
+        return web.json_response(exc.payload(), status=exc.status)
+
     # On aiohttp 3.14.3, the server-side reader rejected Chrome's first PUSH_FILES
     # text frame after a long upload with "Received frame with non-zero reserved
     # bits". The failure was observed only on the inbound Chrome admin frame.
     # The device channel receives compressed OkHttp frames through the same
     # reader, so device-side immunity is unverified and remains under observation.
-    # Admin messages are small control JSON, so compression saves effectively
-    # nothing on this channel.
-    # Keep compression enabled for the device channel, where messages can be
-    # larger, but remove the extension from this browser-facing channel.
+    # Remove the extension from this browser-facing channel.
     ws = _websocket_response_factory(heartbeat=30, compress=False)
     await ws.prepare(request)
     admin_connections.add(ws)
@@ -1813,17 +2888,15 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
     # __version__ is imported lazily to avoid a circular import (see run_server).
     from . import __version__
     try:
-        await ws.send_str(json.dumps({"type": "SERVER_INFO", "version": __version__}))
-        await ws.send_str(build_client_apk_msg())
-        await ws.send_str(build_device_list_msg())
-        await ws.send_str(build_provisional_connection_list_msg())
-        await ws.send_str(build_group_list_msg())
-    except ConnectionResetError:
-        admin_connections.discard(ws)
-        _admin_send_locks.pop(ws, None)
-        return ws
-
-    try:
+        await _send_admin_frames(ws, [
+            json.dumps({"type": "SERVER_INFO", "version": __version__}),
+            build_client_apk_msg(),
+            build_device_list_msg(),
+            build_provisional_connection_list_msg(),
+            build_group_list_msg(),
+        ])
+        if ws not in admin_connections:
+            return ws
         async for raw_msg in ws:
             if raw_msg.type == web.WSMsgType.TEXT:
                 try:
@@ -1875,7 +2948,10 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     await handle_clear_startup_app(ws, data)
 
                 elif msg_type == "GET_DEVICE_LIST":
-                    await ws.send_str(build_device_list_msg())
+                    await _send_admin_frames(ws, [build_device_list_msg()])
+
+                elif msg_type == "GET_GROUP_LIST":
+                    await _send_admin_frames(ws, [build_group_list_msg()])
 
                 elif msg_type == "SET_DEVICE_LABEL":
                     await handle_set_device_label(ws, data)
@@ -1895,11 +2971,14 @@ async def admin_ws_handler(request: web.Request) -> web.WebSocketResponse:
                 elif msg_type == "DELETE_GROUP":
                     await handle_delete_group(ws, data)
 
-                elif msg_type == "SET_DEVICE_GROUPS":
-                    await handle_set_device_groups(ws, data)
+                elif msg_type == "UPDATE_GROUP_MEMBERS":
+                    await handle_update_group_members(ws, data)
 
-                elif msg_type == "SET_GROUP_MEMBERS":
-                    await handle_set_group_members(ws, data)
+                elif msg_type in {"SET_GROUP_MEMBERS", "SET_DEVICE_GROUPS"}:
+                    await _send_admin_frames(ws, [json.dumps({
+                        "type": "ERROR",
+                        "message": "This membership command is no longer supported. Reload the console and try again.",
+                    })])
 
                 else:
                     log.warning("Unknown message type from admin: %s", msg_type)
@@ -1920,10 +2999,10 @@ async def handle_set_device_label(admin_ws: web.WebSocketResponse, data: dict):
     label: str = (data.get("label") or "").strip()[:MAX_LABEL_LEN]
 
     if not serial:
-        await admin_ws.send_str(json.dumps({
+        await _send_admin_frames(admin_ws, [json.dumps({
             "type": "ERROR",
             "message": "device_id is required",
-        }))
+        })])
         return
 
     if label:
@@ -1934,29 +3013,33 @@ async def handle_set_device_label(admin_ws: web.WebSocketResponse, data: dict):
             None,
         )
         if owner is not None:
-            await admin_ws.send_str(json.dumps({
+            await _send_admin_frames(admin_ws, [json.dumps({
                 "type": "ERROR",
                 "message": f"Label '{label}' is already assigned to {owner}",
-            }))
+            })])
             return
 
     # Upsert the record. An empty label clears the assignment but keeps the device
     # known, so it stays listed as offline until explicitly forgotten.
-    rec = device_registry.get(serial)
-    if rec is None:
-        rec = {"label": "", "model": "", "ip": "", "last_seen": None, "startup_app": None}
-        device_registry[serial] = rec
+    records = device_registry.copy()
+    rec = dict(records.get(serial) or
+               {"label": "", "model": "", "ip": "", "last_seen": None, "startup_app": None})
     rec["label"] = label
-
-    save_registry()
+    records[serial] = rec
+    if not _commit_configuration(_configuration, records=records):
+        await _send_admin_frames(admin_ws, [json.dumps({
+            "type": "ERROR",
+            "message": "Could not persist the device label",
+        })])
+        return
     log.info("Device label set: %s -> %r", serial, label)
 
-    await admin_ws.send_str(json.dumps({
+    acknowledgement = json.dumps({
         "type": "DEVICE_LABEL_SET",
         "device_id": serial,
         "label": label,
-    }))
-    await broadcast_device_list()
+    })
+    await _queue_admin_message(build_device_list_msg(), acknowledgement=(admin_ws, acknowledgement))
 
 
 async def handle_forget_device(admin_ws: web.WebSocketResponse, data: dict):
@@ -1968,244 +3051,267 @@ async def handle_forget_device(admin_ws: web.WebSocketResponse, data: dict):
     serial: str = data.get("device_id", "")
 
     if not serial:
-        await admin_ws.send_str(json.dumps({
+        await _send_admin_frames(admin_ws, [json.dumps({
             "type": "ERROR",
             "message": "device_id is required",
-        }))
+        })])
         return
 
     if serial in devices:
-        await admin_ws.send_str(json.dumps({
+        await _send_admin_frames(admin_ws, [json.dumps({
             "type": "ERROR",
             "message": "Cannot forget an online device; disconnect it first",
-        }))
+        })])
         return
 
-    removed = device_registry.pop(serial, None) is not None
+    removed = serial in device_registry
+    changed_groups = {
+        name: replace(group, members=tuple(member for member in group.members if member != serial))
+        for name, group in _configuration.groups.items() if serial in group.members
+    }
+
+    if removed or changed_groups:
+        records = device_registry.copy()
+        records.pop(serial, None)
+        candidate = replace(_configuration, groups={**_configuration.groups, **changed_groups})
+        if (changed_groups and candidate.packages is None) or not _commit_configuration(candidate, records=records):
+            await _send_admin_frames(admin_ws, [json.dumps({
+                "type": "ERROR",
+                "message": "Could not persist the device change",
+            })])
+            return
     # A forget mid-"retiring" must also drop the pending retire, or its timeout
     # would later report a result for a device the operator already removed.
     pend = pending_retires.pop(serial, None)
     if pend is not None and pend.get("timeout_task"):
         pend["timeout_task"].cancel()
-    # Decommission cleanly: drop the serial from every group so no group keeps a
-    # dangling reference to a device that is no longer known.
-    groups_changed = False
-    for members in device_groups.values():
-        if serial in members:
-            members.remove(serial)
-            groups_changed = True
-
-    if removed or groups_changed:
-        save_registry()
     if removed:
         log.info("Device forgotten: %s", serial)
 
-    await admin_ws.send_str(json.dumps({
+    acknowledgement = json.dumps({
         "type": "DEVICE_FORGOTTEN",
         "device_id": serial,
-    }))
-    await broadcast_device_list()
-    if groups_changed:
-        await broadcast_group_list()
+    })
+    try:
+        await _queue_admin_message(build_device_list_msg(), acknowledgement=(admin_ws, acknowledgement))
+    finally:
+        if changed_groups:
+            await broadcast_group_list()
 
 
 async def handle_create_group(admin_ws: web.WebSocketResponse, data: dict):
     """Create a new, empty named group and persist it."""
-    name: str = (data.get("name") or "").strip()[:MAX_GROUP_NAME_LEN]
+    name = _group_name(data.get("name"))
+
+    async def reject(message: str) -> None:
+        await _send_admin_error(admin_ws, message, operation="CREATE_GROUP", name=name or None)
 
     if not name:
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": "Group name is required",
-        }))
+        await reject("Group name is required")
         return
 
-    if name in device_groups:
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": f"Group '{name}' already exists",
-        }))
+    if name in _configuration.groups:
+        await reject(f"Group '{name}' already exists")
         return
 
-    device_groups[name] = []
-    save_registry()
+    if not _save_groups({**_configuration.groups, name: _DeviceGroup()}):
+        await reject("Could not persist the group change")
+        return
     log.info("Group created: %r", name)
 
-    await admin_ws.send_str(json.dumps({
+    await _publish_group_change((), _notify_committed_group_change(admin_ws, {
         "type": "GROUP_CREATED",
         "name": name,
     }))
-    await broadcast_group_list()
 
 
-async def handle_rename_group(admin_ws: web.WebSocketResponse, data: dict):
+async def handle_rename_group(
+    admin_ws: web.WebSocketResponse,
+    data: dict,
+):
     """Rename an existing group, preserving its membership."""
-    name: str = (data.get("name") or "").strip()[:MAX_GROUP_NAME_LEN]
-    new_name: str = (data.get("new_name") or "").strip()[:MAX_GROUP_NAME_LEN]
+    name = _group_name(data.get("name"))
+    new_name = _group_name(data.get("new_name"))
 
     if not name or not new_name:
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": "Both name and new_name are required",
-        }))
+        await _send_admin_error(admin_ws, "Both name and new_name are required")
         return
 
-    if name not in device_groups:
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": f"Group '{name}' does not exist",
-        }))
+    if name not in _configuration.groups:
+        await _send_admin_error(admin_ws, f"Group '{name}' does not exist")
         return
 
-    if new_name != name and new_name in device_groups:
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": f"Group '{new_name}' already exists",
-        }))
+    if new_name != name and new_name in _configuration.groups:
+        await _send_admin_error(admin_ws, f"Group '{new_name}' already exists")
         return
 
-    # Rebuild to preserve insertion order while swapping the key.
-    device_groups[new_name] = device_groups.pop(name)
-    save_registry()
+    groups = _configuration.groups.copy()
+    groups[new_name] = groups.pop(name)
+    if not _save_groups(groups):
+        await _send_admin_error(admin_ws, "Could not persist the group change")
+        return
     log.info("Group renamed: %r -> %r", name, new_name)
 
-    await admin_ws.send_str(json.dumps({
-        "type": "GROUP_RENAMED",
-        "name": name,
-        "new_name": new_name,
-    }))
-    await broadcast_group_list()
+    await _publish_group_change(
+        groups[new_name].members if new_name != name else (),
+        _notify_committed_group_change(admin_ws, {
+            "type": "GROUP_RENAMED",
+            "name": name,
+            "new_name": new_name,
+        }),
+    )
 
 
-async def handle_delete_group(admin_ws: web.WebSocketResponse, data: dict):
-    """Delete a group. Devices are never affected, only the grouping is removed."""
-    name: str = (data.get("name") or "").strip()[:MAX_GROUP_NAME_LEN]
+async def handle_delete_group(
+    admin_ws: web.WebSocketResponse,
+    data: dict,
+):
+    """Remove the group and its package reference in one write."""
+    name = _group_name(data.get("name"))
 
     if not name:
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": "Group name is required",
-        }))
+        await _send_admin_error(admin_ws, "Group name is required")
         return
 
-    if device_groups.pop(name, None) is not None:
-        save_registry()
+    if "expected_snapshot" in data and data["expected_snapshot"] != {
+        "server_instance_id": SERVER_INSTANCE_ID, "revision": _configuration.revision,
+    }:
+        await _send_admin_error(admin_ws, "Group details changed. Review the current group before deleting it.",
+                                operation="DELETE_GROUP", name=name)
+        await broadcast_group_list()
+        return
+
+    if name in _configuration.groups:
+        groups = _configuration.groups.copy()
+        group = groups.pop(name)
+        if not _save_groups(groups):
+            await _send_admin_error(admin_ws, "Could not persist the group change")
+            return
         log.info("Group deleted: %r", name)
+        members = group.members
+    else:
+        members = ()
 
-    await admin_ws.send_str(json.dumps({
-        "type": "GROUP_DELETED",
-        "name": name,
-    }))
-    await broadcast_group_list()
-
-
-async def handle_set_device_groups(admin_ws: web.WebSocketResponse, data: dict):
-    """Set the exact set of groups a device belongs to.
-
-    Every named group must already exist (created via CREATE_GROUP); unknown names
-    are rejected so typos never spawn phantom groups. Membership is keyed by serial
-    so an offline device can be (re)assigned.
-    """
-    serial: str = data.get("device_id", "")
-    requested = data.get("groups", [])
-
-    if not serial:
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": "device_id is required",
-        }))
-        return
-
-    if not isinstance(requested, list):
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": "groups must be a list of group names",
-        }))
-        return
-
-    # Normalize and validate: dedupe, and require every name to exist already.
-    target_names: list[str] = []
-    for raw_name in requested:
-        if not isinstance(raw_name, str):
-            continue
-        clean = raw_name.strip()[:MAX_GROUP_NAME_LEN]
-        if clean and clean not in target_names:
-            target_names.append(clean)
-
-    unknown = [n for n in target_names if n not in device_groups]
-    if unknown:
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": f"Unknown group(s): {', '.join(unknown)}",
-        }))
-        return
-
-    # Rebuild membership so the device is in exactly the requested groups.
-    target_set = set(target_names)
-    for name, members in device_groups.items():
-        in_group = serial in members
-        if name in target_set and not in_group:
-            members.append(serial)
-        elif name not in target_set and in_group:
-            members.remove(serial)
-
-    save_registry()
-    log.info("Device groups set: %s -> %s", serial, target_names)
-
-    await admin_ws.send_str(json.dumps({
-        "type": "DEVICE_GROUPS_SET",
-        "device_id": serial,
-        "groups": target_names,
-    }))
-    await broadcast_group_list()
+    await _publish_group_change(
+        members,
+        _notify_committed_group_change(admin_ws, {
+            "type": "GROUP_DELETED",
+            "name": name,
+        }),
+    )
 
 
-async def handle_set_group_members(admin_ws: web.WebSocketResponse, data: dict):
-    """Set the exact member list of a group (group-centric assignment).
+async def handle_update_group_members(admin_ws: web.WebSocketResponse, data: dict):
+    """Apply membership edits against the exact owners observed by the console."""
+    name = _group_name(data.get("name"))
 
-    The group must already exist. Members are stored as serials; offline or
-    not-yet-registered serials are allowed (a device can be grouped while offline),
-    so members are NOT filtered against the live device list.
-    """
-    name: str = (data.get("name") or "").strip()[:MAX_GROUP_NAME_LEN]
-    requested = data.get("members", [])
+    async def reject(message: str, *, refresh: bool = False) -> None:
+        await _send_admin_error(admin_ws, message, operation="UPDATE_GROUP_MEMBERS", name=name or None)
+        if refresh:
+            await broadcast_group_list()
 
     if not name:
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": "Group name is required",
-        }))
+        await reject("Group name is required")
         return
 
-    if name not in device_groups:
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": f"Group '{name}' does not exist",
-        }))
+    target = _configuration.groups.get(name)
+    if target is None:
+        await reject(f"Group '{name}' does not exist", refresh=True)
         return
 
-    if not isinstance(requested, list):
-        await admin_ws.send_str(json.dumps({
-            "type": "ERROR",
-            "message": "members must be a list of serials",
-        }))
+    additions = data.get("add", {})
+    removals = data.get("remove", [])
+    if not isinstance(additions, dict):
+        await reject("add must be an object of device IDs and expected owner names")
+        return
+    if any(not isinstance(device_id, str) or not device_id
+           or (owner is not None and not isinstance(owner, str))
+           for device_id, owner in additions.items()):
+        await reject("add must map non-empty device IDs to an expected group name or null")
+        return
+    if not isinstance(removals, list) or any(not isinstance(device_id, str) or not device_id
+                                               for device_id in removals):
+        await reject("remove must be a list of non-empty device IDs")
+        return
+    if len(set(removals)) != len(removals) or set(additions).intersection(removals):
+        await reject("A device may appear only once in add or remove")
+        return
+    if any(device_id not in device_registry for device_id in additions):
+        await reject("A device being added no longer exists. Review the current group and try again.", refresh=True)
         return
 
-    members: list[str] = []
-    for serial in requested:
-        if isinstance(serial, str) and serial and serial not in members:
-            members.append(serial)
+    owners: dict[str, str] = {}
+    for group_name, group in _configuration.groups.items():
+        for device_id in group.members:
+            owners.setdefault(device_id, group_name)
 
-    device_groups[name] = members
-    save_registry()
-    log.info("Group members set: %r -> %d member(s)", name, len(members))
+    stale = [device_id for device_id, expected_owner in additions.items()
+             if owners.get(device_id) != expected_owner]
+    stale.extend(device_id for device_id in removals if owners.get(device_id) != name)
+    if stale:
+        await reject("Group membership changed in another console. Reload the console and retry.", refresh=True)
+        return
 
-    await admin_ws.send_str(json.dumps({
+    if "expected_deployments" in data:
+        involved = {name, *(owner for owner in additions.values() if owner is not None)}
+        current_deployments = {}
+        for group_name in involved:
+            group = _configuration.groups[group_name]
+            profile = _published_group_profile(group)
+            current_deployments[group_name] = group.effective_revision(profile) if profile else None
+        if data["expected_deployments"] != current_deployments:
+            await reject("Group deployment changed. Review the current package before saving members.", refresh=True)
+            return
+
+    groups = _configuration.groups.copy()
+    changed: set[str] = set()
+    for device_id, expected_owner in additions.items():
+        if expected_owner == name:
+            continue
+        if expected_owner is not None:
+            previous = groups[expected_owner]
+            groups[expected_owner] = replace(
+                previous,
+                members=tuple(member for member in previous.members if member != device_id),
+            )
+        current = groups[name]
+        if device_id not in current.members:
+            groups[name] = replace(current, members=(*current.members, device_id))
+        changed.add(device_id)
+
+    if removals:
+        removal_set = set(removals)
+        current = groups[name]
+        groups[name] = replace(
+            current,
+            members=tuple(member for member in current.members if member not in removal_set),
+        )
+        changed.update(removals)
+
+    if changed and not _save_groups(groups):
+        await reject("Could not persist the membership change")
+        return
+
+    result = json.dumps({
         "type": "GROUP_MEMBERS_SET",
+        "operation": "UPDATE_GROUP_MEMBERS",
         "name": name,
-        "members": members,
-    }))
-    await broadcast_group_list()
+        "members": list(groups[name].members),
+    })
+    async def notify_admins() -> None:
+        if changed:
+            await _queue_admin_message(
+                build_group_list_msg(),
+                acknowledgement=(admin_ws, result),
+                acknowledgement_after=True,
+            )
+        else:
+            await _send_admin_frames(admin_ws, [result])
+
+    if changed:
+        await _publish_group_change(sorted(changed), notify_admins())
+    else:
+        await notify_admins()
 
 
 async def handle_launch_app(admin_ws: web.WebSocketResponse, data: dict):
@@ -2899,19 +4005,19 @@ async def handle_set_startup_app(admin_ws: web.WebSocketResponse, data: dict):
     extra_data: str = data.get("extra_data", "")
 
     if not package_name:
-        await admin_ws.send_str(json.dumps({
+        await _send_admin_frames(admin_ws, [json.dumps({
             "type": "ERROR",
             "message": "package_name is required for SET_STARTUP_APP",
-        }))
+        })])
         return
 
     target_ids = resolve_target_ids(target_devices)
 
     if not target_ids:
-        await admin_ws.send_str(json.dumps({
+        await _send_admin_frames(admin_ws, [json.dumps({
             "type": "ERROR",
             "message": "No matching online devices found",
-        }))
+        })])
         return
 
     set_msg = json.dumps({
@@ -2940,15 +4046,21 @@ async def handle_set_startup_app(admin_ws: web.WebSocketResponse, data: dict):
             except ConnectionResetError:
                 log.warning("Failed to send SET_STARTUP_APP to %s (disconnected)", did)
 
-    save_registry()
+    admin_frames = []
+    if not save_registry():
+        admin_frames.append(json.dumps({
+            "type": "ERROR",
+            "message": "The startup app was sent but could not be saved on the server",
+        }))
     log.info("SET_STARTUP_APP: %s to %d/%d devices", package_name, sent_count, len(target_ids))
 
-    await admin_ws.send_str(json.dumps({
+    admin_frames.append(json.dumps({
         "type": "SET_STARTUP_APP_SENT",
         "package_name": package_name,
         "sent_count": sent_count,
         "target_count": len(target_ids),
     }))
+    await _send_admin_frames(admin_ws, admin_frames)
 
     await broadcast_device_list()
 
@@ -2960,10 +4072,10 @@ async def handle_clear_startup_app(admin_ws: web.WebSocketResponse, data: dict):
     target_ids = resolve_target_ids(target_devices)
 
     if not target_ids:
-        await admin_ws.send_str(json.dumps({
+        await _send_admin_frames(admin_ws, [json.dumps({
             "type": "ERROR",
             "message": "No matching online devices found",
-        }))
+        })])
         return
 
     clear_msg = json.dumps({"type": "CLEAR_STARTUP_APP"})
@@ -2984,14 +4096,20 @@ async def handle_clear_startup_app(admin_ws: web.WebSocketResponse, data: dict):
             except ConnectionResetError:
                 log.warning("Failed to send CLEAR_STARTUP_APP to %s (disconnected)", did)
 
-    save_registry()
+    admin_frames = []
+    if not save_registry():
+        admin_frames.append(json.dumps({
+            "type": "ERROR",
+            "message": "The startup app was cleared but the change could not be saved on the server",
+        }))
     log.info("CLEAR_STARTUP_APP: sent to %d/%d devices", sent_count, len(target_ids))
 
-    await admin_ws.send_str(json.dumps({
+    admin_frames.append(json.dumps({
         "type": "CLEAR_STARTUP_APP_SENT",
         "sent_count": sent_count,
         "target_count": len(target_ids),
     }))
+    await _send_admin_frames(admin_ws, admin_frames)
 
     await broadcast_device_list()
 
@@ -3128,9 +4246,24 @@ def create_app() -> web.Application:
     app = web.Application(
         client_max_size=max(MAX_APK_SIZE, MAX_BUNDLE_SIZE) + 10 * 1024 * 1024)
 
-    # WebSocket endpoints
+    app[_CONFIGURATION_PUBLICATIONS] = set()
+    app.cleanup_ctx.append(_map_staging_cleanup)
+    app.on_cleanup.append(_stop_configuration_publications)
+    app.on_cleanup.append(_flush_telemetry)
     app.router.add_get("/ws/device", device_ws_handler)
     app.router.add_get("/ws/admin", admin_ws_handler)
+    app.router.add_get("/api/packages", package_catalog_handler)
+    app.router.add_post("/api/packages", package_create_handler)
+    app.router.add_get("/api/packages/{package_id}", package_handler)
+    app.router.add_delete("/api/packages/{package_id}", package_handler)
+    app.router.add_post("/api/packages/{source_id}/duplicate", package_create_handler)
+    app.router.add_post("/api/packages/{package_id}/save-and-deploy", package_save_and_deploy_handler)
+    app.router.add_get("/api/group-package/deploy", group_package_deploy_handler)
+    app.router.add_post("/api/group-package/deploy", group_package_deploy_handler)
+    app.router.add_post("/api/package-retry", package_retry_handler)
+    app.router.add_get("/api/lbe-maps", lbe_maps_handler)
+    app.router.add_post("/api/lbe-maps", lbe_maps_handler)
+    app.router.add_get(r"/api/lbe-maps/{sha256:[0-9a-f]{64}}/download", lbe_map_download_handler)
     app.router.add_post("/api/apks", upload_apk_handler)
     app.router.add_post("/api/bundles", upload_bundle_handler)
 
@@ -3286,7 +4419,7 @@ def main():
         type=int,
         default=None,
         help="Max simultaneous device downloads server-wide, across all install "
-        "and push jobs (default: $MDM_MAX_CONCURRENT_TRANSFERS or 5).",
+        "and push jobs plus LBE map downloads (default: $MDM_MAX_CONCURRENT_TRANSFERS or 5).",
     )
     subparsers = parser.add_subparsers(dest="command")
     hash_parser = subparsers.add_parser(

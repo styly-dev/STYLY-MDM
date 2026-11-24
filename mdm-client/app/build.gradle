@@ -133,10 +133,10 @@ dependencies {
     implementation 'androidx.core:core-ktx:1.10.1'
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.squareup.okhttp3:okhttp:4.11.0'
-    implementation 'com.picoxr.tobservice:tobservicelib:4.3.16'
+    implementation 'com.picoxr.tobservice:tobservicelib:4.3.24'
     // tobservicelib's timing APIs (openTimingShutdown/openTimingStartup) serialize
-    // their request through com.google.gson.JsonObject but the AAR ships no POM, so
-    // Gson is not pulled transitively. Without it those calls raise NoClassDefFoundError
+    // their request through com.google.gson.JsonObject but the SDK POM declares no
+    // dependencies. Without Gson those calls raise NoClassDefFoundError
     // (an Error, not an Exception) that bypasses every catch and kills the process.
     implementation 'com.google.code.gson:gson:2.11.0'
 

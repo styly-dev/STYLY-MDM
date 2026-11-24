@@ -49,13 +49,14 @@ class FakeWS:
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(monkeypatch):
+    monkeypatch.setattr(server, "_configuration", server._ConfigurationRegistry())
     saved_r = server.RETIRE_TIMEOUT
     saved_u = server.SELF_UPDATE_TIMEOUT
     collections = (
         server.devices, server.admin_connections, server.pending_transfers,
         server._transfer_tasks, server.pending_self_updates, server.pending_retires,
-        server._apk_hash_cache, server.device_registry, server.device_groups,
+        server._apk_hash_cache, server.device_registry,
     )
     for coll in collections:
         coll.clear()

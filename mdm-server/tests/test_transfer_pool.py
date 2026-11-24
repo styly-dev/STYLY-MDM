@@ -1,4 +1,4 @@
-"""Tests that install and Push job-v1 share one server-wide transfer budget."""
+"""Verify that APK, Push and venue map transfers share one server-wide budget."""
 
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ def reset_state():
 
 def prepare_job_v1_dispatch(manager, capabilities, snapshot, assignment, slots):
     from push_test_helpers import dispatch_scheduler
-    from styly_mdm.push_runtime import _LegacyTransferAdapter
+    from styly_mdm.push_runtime import _InstallTransferAdapter
     from styly_mdm.push_scheduler import LiveSession
     from styly_mdm.push_transfer_leases import PushTransferLeases
     from styly_mdm.transfer_registry import TransferKey, TransferRegistry
@@ -87,7 +87,7 @@ def prepare_job_v1_dispatch(manager, capabilities, snapshot, assignment, slots):
     registry = TransferRegistry(leases.revoke_now)
     # The install path still uses the tuple-key facade. Back it with the same typed
     # registry as Push-v1 so the tests exercise the production shared-release boundary.
-    server.pending_transfers = _LegacyTransferAdapter(registry)
+    server.pending_transfers = _InstallTransferAdapter(registry)
     sessions = {}
     scheduler = dispatch_scheduler(manager, registry, leases, sessions, slots)
     sent = asyncio.Event()
@@ -173,13 +173,14 @@ async def test_job_v1_push_waits_for_install_to_release_shared_budget(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_install_completion_does_not_release_job_v1_push_transfer(tmp_path):
+@pytest.mark.parametrize("reason,task", [("install_result", server.TASK_INSTALL), ("disconnect", None)])
+async def test_install_release_does_not_release_job_v1_push_transfer(tmp_path, reason, task):
     from push_test_helpers import claimed_job_context
 
     async with claimed_job_context(tmp_path) as (manager, capabilities, snapshot, assignment):
         server.MAX_CONCURRENT_TRANSFERS = 2
         slots = server.transfer_slots()
-        start_dispatch, push_sent, waiting, registry, _leases, key = (
+        start_dispatch, push_sent, waiting, registry, leases, key = (
             prepare_job_v1_dispatch(manager, capabilities, snapshot, assignment, slots)
         )
         install_ws = add_install_device("D1")
@@ -193,10 +194,17 @@ async def test_install_completion_does_not_release_job_v1_push_transfer(tmp_path
             assert push_transfer is not None and not push_transfer.done()
             assert ("D1", server.TASK_INSTALL) in server.pending_transfers
 
-            assert server.release_transfer_slot("D1", "install_result", task=server.TASK_INSTALL)
+            lease_token = leases.token(key)
+            assert lease_token is not None
+            assert server.release_transfer_slot("D1", reason, task=task)
             await asyncio.wait_for(install_task, 1)
+            assert not server.release_transfer_slot("D1", reason, task=task)
             assert not push_transfer.done()
             assert not push_task.done()
+            assert leases.token(key) == lease_token
+
+            assert not server.release_transfer_slot("D1", reason, task="unknown")
+            assert not push_transfer.done()
 
             registry.release_exact(key, "download_complete")
             await asyncio.wait_for(push_task, 1)
@@ -206,3 +214,62 @@ async def test_install_completion_does_not_release_job_v1_push_transfer(tmp_path
                 if not task.done():
                     task.cancel()
             await asyncio.gather(install_task, push_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_map_request_waits_for_active_push_then_resumes_on_the_same_budget(tmp_path, monkeypatch):
+    import hashlib
+    import time
+    from types import SimpleNamespace
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from push_test_helpers import claimed_job_context
+
+    payload = b"test venue map bytes"
+    archive = tmp_path / "venue.zip"
+    archive.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    reference = {"name": archive.name, "sha256": digest, "size": len(payload)}
+    deployment = {"revision": "revision", "settings": {"lbeMap": reference}}
+    monkeypatch.setattr(server, "_desired_configuration", lambda _device_id: deployment)
+    monkeypatch.setattr(server, "_lbe_map_store", lambda: SimpleNamespace(path_for=lambda _ref: archive))
+    server.MAX_CONCURRENT_TRANSFERS = 1
+    slots = server.transfer_slots()
+    app = web.Application()
+    app.router.add_get("/maps/{sha256}", server.lbe_map_download_handler)
+    async with claimed_job_context(tmp_path) as (manager, capabilities, snapshot, assignment), TestClient(TestServer(app)) as client:
+        dispatch, _, waiting, registry, _, key = prepare_job_v1_dispatch(manager, capabilities, snapshot, assignment, slots)
+        push = dispatch()
+        pending_map = None
+        try:
+            await asyncio.wait_for(waiting.wait(), 2)
+            assert slots.locked()
+            map_waiting = asyncio.Event()
+            acquire = slots.acquire
+
+            async def observe_map_wait():
+                map_waiting.set()
+                return await acquire()
+
+            monkeypatch.setattr(slots, "acquire", observe_map_wait)
+            token = server._lbe_map_token("D1", "revision", digest, int(time.time()) + 60)
+            pending_map = asyncio.create_task(client.get(
+                f"/maps/{digest}?device_id=D1&revision=revision",
+                headers={"Authorization": f"Bearer {token}", "Range": "bytes=5-", "If-Match": f'"{digest}"'},
+            ))
+            await asyncio.wait_for(map_waiting.wait(), 2)
+            assert not pending_map.done()
+            registry.release_exact(key, "download_complete")
+            async with await asyncio.wait_for(pending_map, 2) as response:
+                assert response.status == 206
+                assert await response.read() == payload[5:]
+            await asyncio.wait_for(push, 2)
+            # The client can read the last byte before the server finishes write_eof.
+            await asyncio.wait_for(acquire(), 2)
+            slots.release()
+        finally:
+            for task in (push, pending_map):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(*(t for t in (push, pending_map) if t is not None), return_exceptions=True)

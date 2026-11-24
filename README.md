@@ -4,7 +4,7 @@ A lightweight Mobile Device Management (MDM) system purpose-built for Location B
 
 STYLY-MDM currently supports PICO devices (PICO OS with Business Mode). Support for other device platforms is planned for the future.
 
-> **Note:** STYLY-MDM is designed for use within a local area network (LAN). It does not include any authentication mechanism. Do not expose the server to the public internet.
+> **Note:** STYLY-MDM is designed for use within a local area network (LAN). It does not include any authentication mechanism. Restrict management access to trusted operators. The package editor can display saved Wi-Fi passwords across all packages. Do not expose the server to the public internet.
 
 <img width="898" height="913" alt="STYLY-MDM" src="docs/images/screenshot.png" />
 
@@ -13,6 +13,7 @@ STYLY-MDM currently supports PICO devices (PICO OS with Business Mode). Support 
 - **Multi-device launch** — select devices with the checkboxes (use the header checkbox to select all) and send an app launch command to them at once; offline devices are skipped automatically
 - **Persistent device list** — once an HMD has connected it stays in the list with an `online`/`offline` status instead of vanishing on disconnect; offline devices keep their last-known details, can be pre-labeled, and can be forgotten when decommissioned
 - **Battery monitoring** — connected clients report battery percentage and charging state, and the console highlights low-battery devices
+- **Configuration packages** — share published settings across groups of PICO 4 Ultra Enterprise devices. Offline members receive the latest version when they connect. Manage Groups shows per-device readback and Retry. See [configuration packages](docs/DEVELOPMENT.md#configuration-packages) and [Wi-Fi setup and recovery](docs/WIFI_SETTINGS.md).
 - **Auto-reconnect with a bounded window** — the web console reconnects automatically with exponential backoff; the MDM client retries (with UDP discovery) only inside a short connection window after a network change or disconnect, then goes fully silent — `Standby (no server found)` — so a fleet running without a server pays no standby-battery or network cost. Toggling Wi-Fi, rebooting, or restarting the client opens a fresh window; the window length and retry interval are configurable via `/sdcard/styly-mdm/config.json` (see [Client standby behavior](#client-standby-behavior-and-how-to-tune-it))
 - **Boot persistence** — the MDM client starts automatically on HMD boot via `BOOT_COMPLETED` and PICO auto-boot intents
 - **Activity log** — every launch command and result is shown in the web console with timestamps

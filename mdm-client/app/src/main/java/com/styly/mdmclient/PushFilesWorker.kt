@@ -6,154 +6,11 @@ import android.os.SystemClock
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
-import java.io.InputStream
-import java.net.HttpURLConnection
-import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
-import java.nio.file.StandardCopyOption
-import java.security.MessageDigest
 import java.util.UUID
 import java.util.zip.ZipFile
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
-import okhttp3.Call
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-
-/** One monotonic deadline across connections and retries, refreshed only by received bytes. */
-internal class PushDownloadDeadline(
-    private val clock: () -> Long,
-    private val timeoutMs: Long,
-) : AutoCloseable {
-    companion object {
-        private val timer = Executors.newSingleThreadScheduledExecutor { task ->
-            Thread(task, "push-download-deadline").apply { isDaemon = true }
-        }
-    }
-    private var lastProgress = clock()
-    private var expired = false
-    private var closed = false
-    private var call: Call? = null
-    private var wakeup: ScheduledFuture<*>? = null
-
-    init {
-        require(timeoutMs > 0L)
-        schedule(timeoutMs)
-    }
-
-    @Synchronized fun remaining(): Long = remainingAt(clock())
-
-    private fun remainingAt(now: Long): Long {
-        val elapsed = now - lastProgress
-        if (expired || elapsed >= timeoutMs) {
-            expired = true
-            call?.cancel()
-            throw PushWorkerException(
-                "download_failed", "No download data received for ${timeoutMs}ms",
-                recovery = PushFailureRecovery.RetryWithinDeadline,
-            )
-        }
-        return timeoutMs - elapsed
-    }
-
-    @Synchronized fun receivedBytes() {
-        val now = clock()
-        remainingAt(now) // Bytes arriving at or after expiry cannot revive this execution.
-        lastProgress = now
-    }
-
-    @Synchronized fun attach(value: Call?) {
-        if (value != null) remaining()
-        call = value
-    }
-
-    private fun schedule(delay: Long) {
-        wakeup = timer.schedule({
-            synchronized(this) {
-                if (!closed) {
-                    try { schedule(remaining()) }
-                    catch (_: PushWorkerException) { /* remaining cancels the blocked call. */ }
-                }
-            }
-        }, delay.coerceAtLeast(1L), TimeUnit.MILLISECONDS)
-    }
-
-    @Synchronized override fun close() {
-        closed = true
-        wakeup?.cancel(false)
-        call = null
-    }
-}
-
-/**
- * SHA-256 of received buffers after successful writes to [file]. This does not
- * reread stored bytes to detect same-size changes after writing.
- *
- * The file is never reread while a transfer is in progress, because the server's
- * HTTP lease idle timer keeps running during that time. When the tracked length stops
- * matching the file length (a prefix kept from an earlier execution, or a write that
- * failed after reaching disk), incremental hashing stops and [finishHex] hashes the
- * whole file once during validation instead.
- */
-internal class PartialFileDigest(private val file: File) {
-    private val digest = MessageDigest.getInstance("SHA-256")
-    private var length = 0L
-    private var tracking = true
-    /** Bytes reread from disk at validation; exposed for tests. */
-    var rehashedBytes = 0L
-        private set
-
-    /** Call right after opening [file] for writing, before the first [update]. */
-    fun beginWrite(append: Boolean) {
-        if (!append) {
-            // Opening without append truncated the file; restart from byte zero.
-            restart()
-        } else if (!tracking || file.length() != length) {
-            tracking = false
-        }
-    }
-
-    fun update(buffer: ByteArray, offset: Int, count: Int) {
-        if (!tracking) return
-        digest.update(buffer, offset, count)
-        length += count
-    }
-
-    /** Finalizes the tracked hash, rereading the file if tracking was lost, and resets. */
-    fun finishHex(): String {
-        val actual = if (file.isFile) file.length() else 0L
-        if (!tracking || actual != length) {
-            digest.reset()
-            if (actual > 0L) digest.updateWithFile(file)
-            rehashedBytes += actual
-        }
-        return digest.hexDigest().also { restart() }
-    }
-
-    private fun restart() {
-        digest.reset()
-        length = 0L
-        tracking = true
-    }
-}
-
-/** Streams the whole of [file] into this digest. */
-private fun MessageDigest.updateWithFile(file: File) {
-    file.inputStream().use { input ->
-        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-        while (true) {
-            val read = input.read(buffer)
-            if (read < 0) break
-            update(buffer, 0, read)
-        }
-    }
-}
-
-/** Completes this digest (which also resets it) as lowercase hexadecimal. */
-private fun MessageDigest.hexDigest(): String =
-    digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
 
 /** Blocking Push/Sync download, validation, extraction, and apply worker. */
 class PushFilesWorker internal constructor(
@@ -184,8 +41,6 @@ class PushFilesWorker internal constructor(
         private const val PUSH_LEASE_REVOKED = "push_lease_revoked"
         private const val CONNECT_TIMEOUT_MS = 15_000
         internal const val DOWNLOAD_NO_PROGRESS_TIMEOUT_MS = 60_000L
-        private const val INITIAL_RETRY_BACKOFF_MS = 1_000L
-        private const val MAX_RETRY_BACKOFF_MS = 8_000L
         private const val MAX_ARCHIVE_ENTRIES = 5_000
         private const val MAX_EXTRACTED_BYTES = 2L * 1024 * 1024 * 1024
         private val PROTECTED_TOPLEVEL_DIRS = setOf(
@@ -205,14 +60,6 @@ class PushFilesWorker internal constructor(
             return File(downloads, "styly-mdm/.push-tmp/jobs/$key/${command.attempt}")
         }
 
-        internal fun retryDelayMillis(retryIndex: Int): Long {
-            require(retryIndex >= 0)
-            var delay = INITIAL_RETRY_BACKOFF_MS
-            repeat(retryIndex.coerceAtMost(3)) {
-                delay = (delay * 2).coerceAtMost(MAX_RETRY_BACKOFF_MS)
-            }
-            return delay
-        }
     }
 
     data class Callbacks(
@@ -302,8 +149,7 @@ class PushFilesWorker internal constructor(
                 added = 0,
                 updated = 0,
                 deleted = 0,
-                failureCode = if (error.hasStorageCleanupFailure() && error.isRecoverableDownloadFailure())
-                    "storage_write_failed" else failure?.code ?: classifyFailure(error),
+                failureCode = failure?.code ?: classifyFailure(error),
                 detail = downloadFailureDetail(error),
             )
         }
@@ -503,7 +349,7 @@ class PushFilesWorker internal constructor(
         } finally {
             storageWrite { output.close() }
         }
-        storageWrite { atomicMove(temporary, target) }
+        storageWrite { atomicMoveArtifact(temporary, target) }
     }
 
     private fun openStorageOutput(file: File, append: Boolean): FileOutputStream =
@@ -531,64 +377,31 @@ class PushFilesWorker internal constructor(
         work: File,
         onValidationStart: () -> Unit,
     ): File {
-        val expectedSize = requireNotNull(command.artifactSize)
         val partial = File(work, "artifact.part")
         val completed = File(work, "artifact.zip")
-        if (completed.isFile) {
-            onValidationStart()
-            if (matchesArtifactIdentity(command, completed)) return completed
-            completed.delete()
-            throw PushWorkerException("artifact_identity_mismatch", "completed artifact SHA-256 did not match")
-        }
-        // A prefix kept from an earlier execution is hashed during validation, not
-        // here: rereading it before the request would consume the HTTP lease window.
-        val digest = digestFactory(partial)
-        if (partial.isFile && partial.length() == expectedSize) {
-            onValidationStart()
-            verifyAndFinalize(command, partial, completed, digest)
-            return completed
-        }
-        PushDownloadDeadline(monotonicMillis, noProgressTimeoutMs).use { deadline ->
-            var retryIndex = 0
-            var receivedSinceRetry = false
-            while (true) {
-                deadline.remaining()
-                try {
-                    val offset = partial.takeIf { it.isFile }?.length() ?: 0L
-                    if (offset > expectedSize) throw PushWorkerException("artifact_identity_mismatch", "partial exceeds expected size")
-                    downloadOnce(command, partial, offset, deadline, digest) {
-                        receivedSinceRetry = true
-                    }
-                    if (partial.length() == expectedSize) break
-                    throw PushWorkerException(
-                        "download_failed", "artifact response ended before declared size",
-                        recovery = PushFailureRecovery.RetryWithinDeadline,
-                    )
-                } catch (error: Exception) {
-                    val policy = failurePolicy(command, error)
-                    discardPartialOnFailure(command, partial, error, policy = policy)
-                    when (policy.recovery) {
-                        PushFailureRecovery.RetryWithinDeadline -> Unit
-                        PushFailureRecovery.AwaitOperatorResume,
-                        PushFailureRecovery.TerminalFailure -> throw error
-                    }
-                }
-                if (partial.isFile && partial.length() == expectedSize) {
-                    break
-                }
-                // Back off across consecutive failures only; a retry that received
-                // artifact bytes starts the backoff over.
-                if (receivedSinceRetry) retryIndex = 0
-                receivedSinceRetry = false
-                val delay = retryDelayMillis(retryIndex).coerceAtMost(deadline.remaining())
-                retryIndex = (retryIndex + 1).coerceAtMost(3)
-                retryDelay(delay)
-            }
-        }
-        // Validation is outside both the download deadline and the network retry loop.
-        onValidationStart()
-        verifyAndFinalize(command, partial, completed, digest)
-        return completed
+        return downloadArtifact(ArtifactDownloadRequest(
+            url = command.artifactUrl,
+            partialFile = partial,
+            completedFile = completed,
+            expectedSize = requireNotNull(command.artifactSize),
+            expectedSha256 = requireNotNull(command.artifactSha256),
+            expectedEtag = requireNotNull(command.artifactEtag),
+            client = resumableHttpClient,
+            onValidationStart = onValidationStart,
+            noProgressTimeoutMs = noProgressTimeoutMs,
+            monotonicMillis = monotonicMillis,
+            retryDelay = retryDelay,
+            digestFactory = digestFactory,
+            storageOutputFactory = ::openStorageOutput,
+            failurePolicy = { error ->
+                val policy = failurePolicy(command, error)
+                ArtifactDownloadFailurePolicy(
+                    retryWithinDeadline = policy.recovery == PushFailureRecovery.RetryWithinDeadline,
+                    retainPartial = policy.retainPartial,
+                )
+            },
+            onIntegrityFailure = { File(work, "metadata.json").delete() },
+        ))
     }
 
     internal fun failurePolicy(
@@ -597,9 +410,6 @@ class PushFilesWorker internal constructor(
     ): FailurePolicy {
         if (error == null) return FailurePolicy()
         val failure = error as? PushWorkerException
-        if (error.isRecoverableDownloadFailure() && error.hasStorageCleanupFailure()) {
-            return failurePolicy(command, PushWorkerException("storage_write_failed", "Download cleanup failed"))
-        }
         if (failure == null) return FailurePolicy(
             retainPartial = error is IOException,
             recovery = if (error is IOException) PushFailureRecovery.RetryWithinDeadline
@@ -636,246 +446,11 @@ class PushFilesWorker internal constructor(
         }
     }
 
-    /** Keep failure cleanup in the worker even if the coordinator cannot save its result. */
-    private fun discardPartialOnFailure(
-        command: PushProtocol.Command,
-        partial: File,
-        failure: Throwable,
-        invalidateMetadata: Boolean = false,
-        policy: FailurePolicy = failurePolicy(command, failure),
-    ) {
-        if (policy.retainPartial) return
-        partial.deleteRecursively()
-        if (invalidateMetadata) File(partial.parentFile, "metadata.json").delete()
-    }
-
     private val resumableHttpClient = OkHttpClient.Builder()
         .connectTimeout(CONNECT_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
         .readTimeout(DOWNLOAD_NO_PROGRESS_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .retryOnConnectionFailure(false)
         .build()
-
-    private fun openResumableResponse(
-        command: PushProtocol.Command,
-        offset: Long,
-        deadline: PushDownloadDeadline,
-    ): Response {
-        val request = Request.Builder().url(command.artifactUrl)
-            .header("Accept-Encoding", "identity")
-            .header("If-Match", requireNotNull(command.artifactEtag))
-        if (offset > 0L) request.header("Range", "bytes=$offset-")
-        val call = resumableHttpClient.newCall(request.build())
-        deadline.attach(call)
-        return try { call.execute() }
-        catch (error: IOException) {
-            deadline.attach(null)
-            throw error
-        }
-    }
-
-    private fun writeDownloadBody(
-        input: InputStream,
-        partial: File,
-        append: Boolean,
-        expectedLength: Long?,
-        digest: PartialFileDigest,
-        beforeRead: () -> Unit = {},
-        onBytesWritten: () -> Unit = {},
-    ) {
-        var received = 0L
-        input.use {
-            val output = openStorageOutput(partial, append)
-            var primaryFailure: Throwable? = null
-            try {
-                digest.beginWrite(append)
-                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                while (true) {
-                    beforeRead()
-                    val read = input.read(buffer)
-                    if (read < 0) break
-                    if (read == 0) continue
-                    received = safeAdd(received, read.toLong())
-                    if (expectedLength != null && received > expectedLength) {
-                        throw PushWorkerException("artifact_identity_mismatch", "HTTP body exceeded its declared range")
-                    }
-                    storageWrite { output.write(buffer, 0, read) }
-                    digest.update(buffer, 0, read)
-                    onBytesWritten()
-                }
-                if (expectedLength != null && received != expectedLength) {
-                    throw PushWorkerException(
-                        "download_failed", "HTTP body ended before its declared range",
-                        recovery = PushFailureRecovery.RetryWithinDeadline,
-                    )
-                }
-            } catch (error: Throwable) {
-                primaryFailure = error
-                throw error
-            } finally {
-                // Attempt every persistence/close step without hiding the body failure.
-                finishDownloadOutput(
-                    primaryFailure,
-                    { output.flush() },
-                    { output.fd.sync() },
-                    { output.close() },
-                )
-            }
-        }
-    }
-
-    private fun downloadOnce(
-        command: PushProtocol.Command,
-        partial: File,
-        offset: Long,
-        deadline: PushDownloadDeadline,
-        digest: PartialFileDigest,
-        onBytesWritten: () -> Unit,
-    ) {
-        val expectedSize = requireNotNull(command.artifactSize)
-        val connection = openResumableResponse(command, offset, deadline)
-        try {
-            deadline.remaining()
-            val status = connection.code
-            val responseEtag = connection.header("ETag")
-            if (status == 409 && connection.header("X-Push-Lease-Status")
-                    ?.equals("revoked", ignoreCase = true) == true
-            ) {
-                throw PushWorkerException(
-                    PUSH_LEASE_REVOKED,
-                    "server revoked the Push/Sync transfer lease",
-                )
-            }
-            if (status == HttpURLConnection.HTTP_PRECON_FAILED) {
-                throw PushWorkerException("artifact_identity_mismatch", "artifact precondition failed (HTTP 412)")
-            }
-            if (status == HttpURLConnection.HTTP_NOT_FOUND || status == HttpURLConnection.HTTP_GONE) {
-                throw PushWorkerException("artifact_unavailable", "artifact is unavailable (HTTP $status)")
-            }
-            if (status == 408 || status == 429 || status >= 500) {
-                throw PushWorkerException(
-                    "download_failed", "artifact download returned HTTP $status",
-                    recovery = PushFailureRecovery.RetryWithinDeadline,
-                )
-            }
-            val handledStatuses = if (offset == 0L) {
-                setOf(HttpURLConnection.HTTP_OK)
-            } else {
-                setOf(HttpURLConnection.HTTP_PARTIAL, HttpURLConnection.HTTP_OK, 416)
-            }
-            if (status !in handledStatuses) {
-                val failure = "artifact download returned unexpected HTTP $status"
-                if (offset == 0L) throw PushWorkerException("download_failed", failure)
-                // The status says nothing about the stored bytes: keep the validated
-                // partial and end this attempt as interrupted for manual Resume.
-                throw PushWorkerException(
-                    "download_failed", failure,
-                    recovery = PushFailureRecovery.AwaitOperatorResume,
-                )
-            }
-            fun rejectInvalidResponse(detail: String): Nothing {
-                // Reject this response before writing, without discarding an authorized prefix.
-                if (offset > 0L) {
-                    throw PushWorkerException(
-                        "download_failed", detail,
-                        recovery = PushFailureRecovery.AwaitOperatorResume,
-                    )
-                }
-                throw PushWorkerException("artifact_identity_mismatch", detail)
-            }
-            if (responseEtag == null || !PushProtocol.isStrongEtag(responseEtag)) {
-                rejectInvalidResponse("response did not provide a strong ETag")
-            }
-            if (responseEtag != command.artifactEtag) {
-                throw PushWorkerException("artifact_identity_mismatch", "artifact ETag changed while resuming")
-            }
-            val contentEncoding = connection.header("Content-Encoding")
-                ?.trim()
-                ?.takeIf { it.isNotEmpty() }
-            if (contentEncoding != null && !contentEncoding.equals("identity", ignoreCase = true)) {
-                rejectInvalidResponse("artifact response used non-identity Content-Encoding")
-            }
-
-            fun writeBody(append: Boolean, expectedLength: Long) {
-                val body = requireNotNull(connection.body)
-                val declared = body.contentLength()
-                if (declared >= 0L && declared != expectedLength) {
-                    rejectInvalidResponse("HTTP body length does not match the expected range")
-                }
-                writeDownloadBody(
-                    body.byteStream(), partial, append, expectedLength, digest,
-                    beforeRead = { deadline.remaining() },
-                    onBytesWritten = {
-                        deadline.receivedBytes()
-                        onBytesWritten()
-                    },
-                )
-            }
-
-            if (offset == 0L) {
-                writeBody(append = false, expectedLength = expectedSize)
-                return
-            }
-
-            when (status) {
-                HttpURLConnection.HTTP_PARTIAL -> {
-                    val range = parseContentRange(connection.header("Content-Range"))
-                        ?: rejectInvalidResponse("missing or malformed Content-Range")
-                    if (range.start != offset || range.totalLength != expectedSize ||
-                        range.endInclusive < range.start || range.endInclusive >= range.totalLength
-                    ) {
-                        rejectInvalidResponse("Content-Range does not match the requested offset or expected size")
-                    }
-                    val rangeLength = range.endInclusive - range.start + 1L
-                    if ((connection.body?.contentLength() ?: -1L) != rangeLength) {
-                        rejectInvalidResponse("Content-Length does not match Content-Range")
-                    }
-                    writeBody(append = true, expectedLength = rangeLength)
-                }
-                HttpURLConnection.HTTP_OK -> {
-                    // A server that ignored Range must never be appended to a partial file.
-                    writeBody(append = false, expectedLength = expectedSize)
-                }
-                416 -> rejectInvalidResponse("416 range cannot describe an incomplete local artifact")
-            }
-        } finally {
-            deadline.attach(null)
-            connection.close()
-        }
-    }
-
-    private data class ContentRange(val start: Long, val endInclusive: Long, val totalLength: Long)
-
-    private fun parseContentRange(value: String?): ContentRange? {
-        val match = Regex("^bytes ([0-9]+)-([0-9]+)/([0-9]+)$").matchEntire(value ?: "") ?: return null
-        return try {
-            ContentRange(match.groupValues[1].toLong(), match.groupValues[2].toLong(), match.groupValues[3].toLong())
-        } catch (_: NumberFormatException) { null }
-    }
-
-    private fun verifyAndFinalize(
-        command: PushProtocol.Command,
-        partial: File,
-        completed: File,
-        digest: PartialFileDigest,
-    ) {
-        val expectedSize = requireNotNull(command.artifactSize)
-        if (!partial.isFile || partial.length() != expectedSize) {
-            throw PushWorkerException("artifact_identity_mismatch", "received size did not match the declared size")
-        }
-        val expectedSha = requireNotNull(command.artifactSha256)
-        if (!digest.finishHex().equals(expectedSha, ignoreCase = true)) {
-            val failure = PushWorkerException("artifact_identity_mismatch", "artifact SHA-256 did not match its declared identity")
-            discardPartialOnFailure(command, partial, failure, invalidateMetadata = true)
-            throw failure
-        }
-        atomicMove(partial, completed)
-    }
-
-    private fun matchesArtifactIdentity(command: PushProtocol.Command, file: File): Boolean {
-        if (!file.isFile || file.length() != requireNotNull(command.artifactSize)) return false
-        val digest = MessageDigest.getInstance("SHA-256").apply { updateWithFile(file) }
-        return digest.hexDigest().equals(requireNotNull(command.artifactSha256), ignoreCase = true)
-    }
 
     internal fun validateAndExtract(bundle: File, staging: File) {
         recreateDirectory(staging)
@@ -990,23 +565,6 @@ class PushFilesWorker internal constructor(
         }
     }
 
-    private fun atomicMove(source: File, destination: File) {
-        try {
-            Files.move(
-                source.toPath(),
-                destination.toPath(),
-                StandardCopyOption.ATOMIC_MOVE,
-                StandardCopyOption.REPLACE_EXISTING,
-            )
-        } catch (_: AtomicMoveNotSupportedException) {
-            Files.move(
-                source.toPath(),
-                destination.toPath(),
-                StandardCopyOption.REPLACE_EXISTING,
-            )
-        }
-    }
-
     private fun safeAdd(left: Long, right: Long): Long {
         if (right > 0 && left > Long.MAX_VALUE - right) {
             throw PushWorkerException("validation_failed", "artifact size overflow")
@@ -1024,48 +582,3 @@ class PushFilesWorker internal constructor(
         }
     }
 }
-
-/** Download recovery is independent of the failure code and partial-file cleanup. */
-enum class PushFailureRecovery {
-    RetryWithinDeadline,
-    AwaitOperatorResume,
-    TerminalFailure,
-}
-
-class PushWorkerException(
-    val code: String,
-    message: String,
-    cause: Throwable? = null,
-    val recovery: PushFailureRecovery = PushFailureRecovery.TerminalFailure,
-) : Exception(message, cause)
-
-/** Preserve the body failure while recording every failed persistence/close operation. */
-internal fun finishDownloadOutput(primaryFailure: Throwable?, vararg operations: () -> Unit) {
-    var failure = primaryFailure
-    for (operation in operations) {
-        try {
-            operation()
-        } catch (error: IOException) {
-            val storageFailure = PushWorkerException(
-                "storage_write_failed", error.message ?: "Could not persist download data", error,
-            )
-            if (failure == null) failure = storageFailure else failure.addSuppressed(storageFailure)
-        }
-    }
-    if (primaryFailure == null && failure != null) throw failure
-}
-
-internal fun downloadFailureDetail(error: Throwable): String = buildString {
-    append(error.message ?: error.javaClass.simpleName)
-    error.suppressed.forEach {
-        append("; cleanup: ")
-        append(it.message ?: it.javaClass.simpleName)
-    }
-}
-
-private fun Throwable.hasStorageCleanupFailure(): Boolean = suppressed.any {
-    it is PushWorkerException && it.code == "storage_write_failed"
-}
-
-private fun Throwable.isRecoverableDownloadFailure(): Boolean = this is IOException ||
-    this is PushWorkerException && recovery != PushFailureRecovery.TerminalFailure

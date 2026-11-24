@@ -659,6 +659,7 @@ class PushJobCoordinatorIntegrationTest {
 
         releaseWorker.countDown()
         await { harness.events.contains("save:failed") }
+        harness.snapshot() // Let the actor finish scheduling recovery after the failed save.
         assertFalse(harness.durableState.get().active?.interrupted == true)
         assertTrue(harness.messages.none { it.optString("type") == "PUSH_RECONCILE_REPORT" })
 

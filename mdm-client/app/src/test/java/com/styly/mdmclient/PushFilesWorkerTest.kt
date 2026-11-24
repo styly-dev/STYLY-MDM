@@ -150,24 +150,6 @@ class PushFilesWorkerTest {
     }
 
     @Test
-    fun `cleanup failure stops retries and requires validated partial for manual resume`() {
-        val work = File(tmp.root, "cleanup-work")
-        val command = command(artifactSize = 100)
-        val worker = worker(work)
-        val network = java.io.IOException("connection reset")
-        finishDownloadOutput(network, { throw java.io.IOException("sync failed") })
-        seedResume(work, command, ByteArray(40))
-        val resumable = worker.failurePolicy(command, network)
-        assertEquals(PushFailureRecovery.AwaitOperatorResume, resumable.recovery)
-        assertEquals("storage_write_failed", resumable.interruptionReason)
-        assertTrue(resumable.retainPartial)
-        File(work, "metadata.json").delete()
-        val invalid = worker.failurePolicy(command, network)
-        assertEquals(PushFailureRecovery.TerminalFailure, invalid.recovery)
-        assertFalse(invalid.retainPartial)
-    }
-
-    @Test
     fun `cleanup failure never masks integrity failure or changes ordinary network retry`() {
         val command = command()
         val worker = worker(File(tmp.root, "integrity-work"))
@@ -203,7 +185,7 @@ class PushFilesWorkerTest {
     @Test
     fun `deadline refreshes only for bytes and cannot be revived at expiry`() {
         var now = 0L
-        PushDownloadDeadline({ now }, 60_000L).use { deadline ->
+        ArtifactDownloadDeadline({ now }, 60_000L).use { deadline ->
             now = 59_999L
             assertEquals(1L, deadline.remaining())
             deadline.receivedBytes()

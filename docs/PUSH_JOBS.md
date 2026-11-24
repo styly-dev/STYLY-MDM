@@ -26,6 +26,13 @@ not in the backup. Schema 2 was never released.
 
 ## Resumable artifact transfer
 
+Push Files and venue maps share the HTTP implementation for Range, strong ETags
+and streaming, and the headset downloader for retry, resume and integrity
+verification. Each feature retains its own authorization and completion rules.
+A map is authorized by the configuration assignment, stays in the map library,
+and goes to PICO import after verification. Only Push jobs enter the Push job
+store, extraction, sync and result-acknowledgement lifecycle.
+
 Published bytes are immutable for the lifetime of an opaque `artifact_id`. The
 SQLite artifact row stores the unique storage name, exact byte size, SHA-256,
 creation time, and retention state. The SHA-256 is also exposed as a quoted
