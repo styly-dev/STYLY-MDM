@@ -7,17 +7,23 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.SystemClock
 import android.provider.Settings
+import android.util.Log
 import com.pvr.tobservice.enums.PBS_ScreenOffDelayTimeEnum
 import com.pvr.tobservice.enums.PBS_SleepDelayTimeEnum
 import com.pvr.tobservice.enums.PBS_SwitchEnum.S_OFF
 import com.pvr.tobservice.enums.PBS_SwitchEnum.S_ON
+import com.pvr.tobservice.enums.PBS_SystemInfoEnum.LARGESPACE_MAP_INFO
 import com.pvr.tobservice.enums.PBS_SystemFunctionSwitchEnum.*
+import com.pvr.tobservice.interfaces.IBoolCallback
 import com.pvr.tobservice.interfaces.IIntCallback
+import com.pvr.tobservice.interfaces.IStringCallback
 import com.pvr.tobservice.interfaces.IToBServiceProxy
 import org.json.JSONObject
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.function.Consumer
+import java.math.BigDecimal
 
 internal data class PicoShutdownSchedule(
     val enabled: Boolean,
@@ -57,6 +63,51 @@ internal fun settingOutcome(
     if (reason != null) put("reason", reason)
 }
 
+internal fun normalizeIpd(value: Any?): Double {
+    val number = value as? Number ?: throw IllegalArgumentException("IPD must be numeric")
+    val decimal = try {
+        BigDecimal(number.toString())
+    } catch (_: NumberFormatException) {
+        throw IllegalArgumentException("IPD must be finite")
+    }
+    if (decimal < BigDecimal("58") || decimal > BigDecimal("72") ||
+        decimal.movePointRight(1).stripTrailingZeros().scale() > 0
+    ) throw IllegalArgumentException("IPD must be 58.0–72.0 in 0.1 steps")
+    return decimal.toDouble()
+}
+
+internal enum class LbeMapImportResult {
+    ACCEPTED, FAILED, CALLBACK_TIMEOUT,
+}
+
+internal fun awaitStableAvailability(
+    isAvailable: () -> Boolean,
+    nowElapsed: () -> Long = SystemClock::elapsedRealtime,
+    sleep: (Long) -> Unit = Thread::sleep,
+    stableMillis: Long = 800L,
+    timeoutMillis: Long = 10_000L,
+    pollMillis: Long = 100L,
+): Boolean {
+    require(stableMillis > 0 && timeoutMillis >= stableMillis && pollMillis > 0)
+    val deadline = nowElapsed() + timeoutMillis
+    var stableSince: Long? = null
+    while (true) {
+        val available = isAvailable()
+        val observedAt = nowElapsed()
+        if (observedAt > deadline) return false
+        if (available) {
+            val since = stableSince ?: observedAt.also { stableSince = it }
+            if (observedAt - since >= stableMillis) return true
+        } else {
+            stableSince = null
+        }
+        val remaining = deadline - nowElapsed()
+        if (remaining <= 0) return false
+        val stableRemaining = stableSince?.let { stableMillis - (nowElapsed() - it) } ?: pollMillis
+        sleep(minOf(pollMillis, remaining, stableRemaining.coerceAtLeast(1L)))
+    }
+}
+
 internal fun settingsFailureOutcome(failure: Throwable, fallback: String): JSONObject {
     val reason = when (failure) {
         is PicoDeviceSettings.SettingFailure -> failure.reason
@@ -75,18 +126,20 @@ internal fun applyPicoLauncher(
 ): JSONObject {
     if (packageName == null || packageName.length > 255) return settingOutcome("failed", reason = "INVALID_VALUE")
     return try {
+        var missing = false
         if (packageName.isNotEmpty()) {
             if (!packageName.matches(Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+"))) {
                 return settingOutcome("failed", reason = "INVALID_VALUE")
             }
             when (appEnabled(packageName)) {
-                null -> return settingOutcome("waiting", packageName, "APP_NOT_INSTALLED")
+                null -> missing = true
                 false -> return settingOutcome("failed", packageName, "APP_DISABLED")
                 true -> Unit
             }
         }
-        when (setLauncher(packageName.ifEmpty { null })) {
-            0 -> settingOutcome("applied", packageName)
+        when (setLauncher(packageName.takeUnless { missing || it.isEmpty() })) {
+            0 -> if (missing) settingOutcome("waiting", packageName, "APP_NOT_INSTALLED")
+                else settingOutcome("applied", packageName)
             -2 -> settingOutcome("unsupported", reason = "UNSUPPORTED")
             else -> settingOutcome("failed", reason = "WRITE_FAILED")
         }
@@ -95,6 +148,12 @@ internal fun applyPicoLauncher(
     } catch (failure: Exception) {
         settingsFailureOutcome(failure, "WRITE_FAILED")
     }
+}
+
+internal fun picoHomeAppEnabled(context: Context, packageName: String): Boolean? = try {
+    context.packageManager.getApplicationInfo(packageName, 0).enabled
+} catch (_: PackageManager.NameNotFoundException) {
+    null
 }
 
 internal fun pollBluetoothState(
@@ -140,7 +199,11 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
         private const val DEVELOPER_MENU_VISIBLE = "tab_key_developerextra_item_visible"
     }
 
-    fun apply(values: JSONObject, overwrite: Boolean): JSONObject {
+    fun apply(
+        values: JSONObject,
+        overwrite: Boolean,
+        lbeMapFailureReason: String? = null,
+    ): JSONObject {
         val results = JSONObject()
         val written = linkedMapOf<String, Any>()
 
@@ -149,13 +212,28 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
             var error = "READ_FAILED"
             try {
                 val target = requested(key, values)
+                if (key == "ipd") {
+                    results.put(key, applyIpd(target as Double))
+                    return
+                }
+                if (key == "lbeMode" && target == true && lbeMapFailureReason != null) {
+                    val actual = read("lbeMode") as Boolean
+                    val available = actual && hasLbeMapMetadata()
+                    results.put(key, if (available) {
+                        settingOutcome("applied", actual)
+                    } else {
+                        settingOutcome("failed", actual, "MAP_REQUIRED")
+                    })
+                    return
+                }
                 val current = read(key)
-                if (overwrite || !matches(key, current, target)) {
+                // Repeating the LBE switch can bring the PICO app to the foreground.
+                if ((overwrite && key != "lbeMode") || !matches(key, current, target)) {
                     error = "WRITE_FAILED"
                     write(key, target)
                     // Dependent settings such as screen-off delay read the current
                     // sleep delay, so let the firmware finish each write.
-                    awaitValue(key, target)
+                    if (key != "lbeMode" || target != true) awaitValue(key, target)
                 }
                 written[key] = target
             } catch (failure: LinkageError) {
@@ -178,27 +256,34 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
         configure("sleepDelay")
         if (!screenFirst) configure("screenOff")
         configure("shutdown")
+        configure("ipd")
+        configure("lbeMode")
 
         if (values.has("startupApp")) {
             results.put("startupApp", applyPicoLauncher(
                 values.opt("startupApp") as? String,
-                appEnabled = { packageName ->
-                    try {
-                        context.packageManager.getApplicationInfo(packageName, 0).enabled
-                    } catch (_: PackageManager.NameNotFoundException) {
-                        null
-                    }
-                },
+                appEnabled = { packageName -> picoHomeAppEnabled(context, packageName) },
                 setLauncher = service::setLauncher,
             ))
         }
 
         for ((key, target) in written) {
             results.put(key, try {
-                val actual = read(key)
-                val value = if (actual is PicoShutdownSchedule) actual.toJson() else actual
-                if (matches(key, actual, target)) settingOutcome("applied", value)
-                else settingOutcome("failed", value, "READBACK_MISMATCH")
+                if (key == "lbeMode" && target == true) {
+                    val stable = awaitStableAvailability(::isLbeMapAvailable)
+                    val actual = readLbeMode()
+                    val hasMetadata = actual && hasLbeMapMetadata()
+                    when {
+                        stable && actual && hasMetadata -> settingOutcome("applied", true)
+                        actual -> settingOutcome("failed", actual, "MAP_NOT_LOADED")
+                        else -> settingOutcome("failed", actual, "READBACK_MISMATCH")
+                    }
+                } else {
+                    val actual = read(key)
+                    val value = if (actual is PicoShutdownSchedule) actual.toJson() else actual
+                    if (matches(key, actual, target)) settingOutcome("applied", value)
+                    else settingOutcome("failed", value, "READBACK_MISMATCH")
+                }
             } catch (failure: LinkageError) {
                 settingsFailureOutcome(failure, "READ_FAILED")
             } catch (failure: Exception) {
@@ -213,6 +298,7 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
         "sleepDelay" -> values.getInt(key).also { require(it in sleepDelays) }
         "screenOff" -> values.getInt(key).also { require(it in screenOffDelays) }
         "shutdown" -> PicoShutdownSchedule.requested(values.getJSONObject(key))
+        "ipd" -> normalizeIpd(values.opt(key))
         else -> values.getBoolean(key)
     }
 
@@ -224,6 +310,7 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
         "sleepDelay" -> readSleepDelay()
         "screenOff" -> readScreenOffDelay()
         "shutdown" -> synchronized(PowerCycleTimers) { PicoShutdownSchedule.read(service) }
+        "lbeMode" -> readLbeMode()
         "bluetooth" -> awaitBluetooth()
         "developerMenu" -> {
             if (context.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) != PackageManager.PERMISSION_GRANTED) {
@@ -269,6 +356,11 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
                     service.closeTimingShutdown()
                 })
             }
+            "lbeMode" -> {
+                val opened = awaitLbeSwitch(target as Boolean)
+                if (!opened) throw SettingFailure("WRITE_FAILED")
+            }
+            "ipd" -> throw SettingFailure("WRITE_FAILED")
             "developerMenu" -> {
                 if (!Settings.Global.putInt(context.contentResolver, DEVELOPER_MENU_VISIBLE, if (target as Boolean) 1 else 0)) {
                     throw SettingFailure("WRITE_FAILED")
@@ -280,6 +372,91 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
 
     private fun readSleepDelay(): Int = service.pbsPropertyGetSleepDelay(0).index
     private fun readScreenOffDelay(): Int = service.pbsPropertyGetScreenOffDelay(0).index
+
+    private fun applyIpd(target: Double): JSONObject = try {
+        val result = awaitIpdCallback { callback -> service.pbsSetIPD(target.toFloat(), callback) }
+        when (result) {
+            0 -> settingOutcome("applied", target, "ACCEPTED_UNVERIFIED")
+            -2 -> settingOutcome("unsupported", reason = "UNSUPPORTED")
+            else -> settingOutcome("failed", target, "WRITE_FAILED")
+        }
+    } catch (failure: Exception) {
+        settingsFailureOutcome(failure, "WRITE_FAILED")
+    } catch (failure: LinkageError) {
+        settingOutcome("unsupported", reason = "UNSUPPORTED")
+    }
+
+    fun importLbeMap(path: String): LbeMapImportResult = try {
+        val result = awaitMapImportCallback { callback -> service.importMapByPath(path, callback, 0) }
+        Log.i("ConfigurationPackages", "LBE map import callback code=$result")
+        if (result == 0) LbeMapImportResult.ACCEPTED else LbeMapImportResult.FAILED
+    } catch (_: TimeoutException) {
+        LbeMapImportResult.CALLBACK_TIMEOUT
+    } catch (_: LinkageError) {
+        LbeMapImportResult.FAILED
+    } catch (_: Exception) {
+        LbeMapImportResult.FAILED
+    }
+
+    fun isLbeMapAvailable(): Boolean = try {
+        readLbeMode() && hasLbeMapMetadata()
+    } catch (_: Exception) {
+        false
+    } catch (_: LinkageError) {
+        false
+    }
+
+    private fun hasLbeMapMetadata(): Boolean = try {
+        JSONObject(service.pbsStateGetDeviceInfo(LARGESPACE_MAP_INFO, 0)).length() > 0
+    } catch (_: Exception) {
+        false
+    } catch (_: LinkageError) {
+        false
+    }
+
+    private fun readLbeMode(): Boolean = when (awaitLbeStatus()) {
+        "0" -> false
+        "1" -> true
+        else -> throw SettingFailure("READ_FAILED")
+    }
+
+    private fun awaitLbeStatus(): String = awaitLbeStatusCallback { callback ->
+        service.pbsGetSwitchLargeSpaceStatus(callback, 0)
+    }
+
+    private fun awaitLbeSwitch(target: Boolean): Boolean = awaitLbeSwitchCallback { callback ->
+        service.pbsSwitchLargeSpaceScene(callback, target, 0)
+    }
+
+    private fun awaitIpdCallback(register: (Consumer<Int>) -> Unit): Int {
+        val result = CompletableFuture<Int>()
+        register(Consumer { value -> result.complete(value) })
+        return result.get(15, TimeUnit.SECONDS)
+    }
+
+    private fun awaitMapImportCallback(register: (IIntCallback) -> Unit): Int {
+        val result = CompletableFuture<Int>()
+        register(object : IIntCallback.Stub() {
+            override fun callback(value: Int) { result.complete(value) }
+        })
+        return result.get(60, TimeUnit.SECONDS)
+    }
+
+    private fun awaitLbeStatusCallback(register: (IStringCallback) -> Unit): String {
+        val result = CompletableFuture<String>()
+        register(object : IStringCallback.Stub() {
+            override fun callback(value: String) { result.complete(value) }
+        })
+        return result.get(2, TimeUnit.SECONDS)
+    }
+
+    private fun awaitLbeSwitchCallback(register: (IBoolCallback) -> Unit): Boolean {
+        val result = CompletableFuture<Boolean>()
+        register(object : IBoolCallback.Stub() {
+            override fun callBack(value: Boolean) { result.complete(value) }
+        })
+        return result.get(30, TimeUnit.SECONDS)
+    }
 
     private fun awaitBluetooth(target: Boolean? = null): Boolean {
         val adapter = context.getSystemService(BluetoothManager::class.java)?.adapter

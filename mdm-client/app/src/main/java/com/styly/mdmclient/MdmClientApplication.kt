@@ -64,14 +64,21 @@ class MdmClientApplication : Application() {
         wifiController = WifiSettingsController(this)
         configurationPackages = ConfigurationPackageController(this, wifiSettingsController())
         if (supportsPico4UltraEnterpriseSettings()) {
-            // The package controller and its installation listener share the process lifetime.
+            // The package controller and its package listener share the process lifetime.
             ContextCompat.registerReceiver(this, object : BroadcastReceiver() {
                 override fun onReceive(context: Context, intent: Intent) {
-                    if (intent.action == Intent.ACTION_PACKAGE_ADDED) {
-                        intent.data?.schemeSpecificPart?.let(configurationPackages::onAppInstalled)
+                    when (intent.action) {
+                        Intent.ACTION_PACKAGE_ADDED ->
+                            intent.data?.schemeSpecificPart?.let(configurationPackages::onAppInstalled)
+                        Intent.ACTION_PACKAGE_REMOVED -> if (!intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) {
+                            intent.data?.schemeSpecificPart?.let(configurationPackages::onAppRemoved)
+                        }
                     }
                 }
-            }, IntentFilter(Intent.ACTION_PACKAGE_ADDED).apply { addDataScheme("package") },
+            }, IntentFilter(Intent.ACTION_PACKAGE_ADDED).apply {
+                addAction(Intent.ACTION_PACKAGE_REMOVED)
+                addDataScheme("package")
+            },
                 ContextCompat.RECEIVER_EXPORTED)
         }
         identityResolver = DeviceIdentityResolver.create(this).also {

@@ -261,12 +261,14 @@ self-update power-cycle fallback. See the
 
 **PICO home app** under **Basic settings** configures the app opened at boot
 and by the Home button. Enter its Android package name (for example,
-`com.example.viewer`). A headset missing the app keeps its current Home setting
-and reports **Waiting · App not found on the headset** with the package name.
-Headset Settings also names the missing app and says it will be applied after
-installation. The message remains visible alongside any other setting failure.
-It checks again when Android reports that the target app was installed and when
-the client restores its cached assignment, including at boot and offline.
+`com.example.viewer`). When the target app is missing, the client requests the
+PICO default through `setLauncher(null)` before reporting
+**Waiting · App not found on the headset** with the package name. If the request
+fails, the console reports a failure and offers Retry. The client checks the
+active assignment on package removal, installation, and cached startup,
+including offline startup. In-place APK updates skip the removal path.
+Headset Settings names the missing app and explains that installation resumes
+application.
 Completing the deferred application updates only the home app result in the
 current deployment. Retry remains available for other failed settings.
 An installed but disabled app appears as **App disabled on the headset** in
@@ -279,6 +281,49 @@ The per-device **Startup App** command can bring another app to the foreground
 three seconds after the MDM service starts. Clear that per-device setting if the
 PICO home app should stay in the foreground after boot. The Home button still
 opens the configured PICO home app.
+
+**IPD** under **Basic settings** sets lens spacing from 58 to 72 mm in 0.1 mm
+increments on PICO 4 Ultra Enterprise. Managing IPD can move the headset's
+lenses. A successful `pbsSetIPD` callback is reported as **Accepted** because
+TobService exposes no supported physical position readback. The client reapplies
+managed IPD on each OS boot.
+
+**LBE** groups the mode and venue map. With **Manage** enabled, choose **On**
+or **Off**. **On** requires a PICO map ZIP. Upload one or choose a previously
+uploaded map. **Off** preserves the package's map selection and any ZIP
+already on the headset. PICO can open map setup when LBE is re-enabled
+without importing a ZIP, even when an earlier ZIP remains on the headset. Deploy map changes
+before a session and confirm that the headset can locate itself at the venue.
+
+The server accepts standard LBE ZIPs up to 512 MiB and stores them by SHA-256
+under `lbe-maps/` in the MDM data directory. The server deduplicates matching
+bytes. Published map ZIPs have no aggregate quota or console deletion action.
+Server startup removes abandoned upload staging directories older than 24 hours.
+
+A package stores the map name, size and digest. The download credential is
+valid for 24 hours while the device's deployment revision and map match.
+It survives a WebSocket reconnect. A server restart invalidates outstanding
+credentials and the device receives a fresh credential when it reconnects.
+The client resumes partial HTTP downloads when the server supports Range.
+There is no whole-download deadline. A stalled read times out after 60
+seconds. Download and import are attempted before the other settings in the
+same deployment, including Wi-Fi, so those settings can wait for a large map.
+
+The client verifies the complete ZIP before importing it through TobService
+from `/sdcard/maps/styly-mdm/`. The import may itself enable LBE. The client
+confirms that the mode stays on and PICO reports a loaded map before marking
+**On** as applied. Device status shows the accepted import with active map
+identity unverified. The client waits up to 60 seconds for the import callback.
+After a callback timeout, the import may still be running. An unconfirmed or
+rejected import blocks a requested enable. A later deployment of the same map
+reuses the prior import while PICO still reports a loaded map. If the map is
+missing, the client imports the selected ZIP again.
+
+Before upgrading, manually back up `device_registry.json` and the entire
+`lbe-maps/` directory if present. New package saves can include IPD and LBE
+fields even when they are unmanaged. Older servers reject those fields. To
+roll back, stop the server and restore the pre-upgrade registry and map directory
+from the same backup. The upgrade does not create this backup automatically.
 
 **Power on when USB is connected** under **USB & advanced** manages the PICO
 `SFS_USB_BOOT` switch. When enabled, connecting USB power starts a powered-off
@@ -384,8 +429,8 @@ and on package changes. Native clients can connect without an Origin header.
 | `DELETE /api/packages/{id}` | Deletes an unassigned package. Send a JSON body with `expected_revision` equal to the loaded `edit_revision` (null for a new package). A stale edit revision or a current group assignment returns 409, with `code: "package_assigned"` for the assignment conflict. |
 | `GET`, `POST /api/group-package/deploy?name=...&package_id=...` | GET previews the deployment scope and whether it uses the current deployed version. An empty `package_id=` previews clearing management for the group and sets `clear` to true. The preview includes the current deployment's `wifi_mode`. POST accepts `expected_impact` from the preview, commits the group reference and any new deployment revision together, and returns the committed `GROUP_LIST` snapshot. A package that has never been deployed returns 409. |
 | `POST /api/package-retry` | Requests Retry for a currently assigned and online `device_id` with its current `package_id` and `revision`. |
-| `CONFIGURATION_POLICY` | Server to canonical `configuration_packages_v1` or `configuration_summary_v1` clients. Includes `package_id` and the group's active deployment `revision` (a null pair means no effective deployment for the client). Package-capable clients receive managed `settings` and explicit `retry_id` values. Clients with summary capability also receive nullable `group_name` and `deployed_at_ms` (Unix epoch milliseconds). Summary-only clients receive empty `settings`. |
-| `REGISTER` and `CONFIGURATION_STATE` | The secret-free `configuration_state` has `package_id`, `revision`, `status` (`applying`, `complete`, `interrupted`) and per-setting `results`. A missing `startupApp` reports `status: "waiting"` and `reason: "APP_NOT_INSTALLED"`. A disabled `startupApp` reports `status: "failed"` and `reason: "APP_DISABLED"`. Both report the requested package name as `value`. A `complete` attempt may contain a waiting result. While the report is unknown, including before restoring a cached attempt, the client omits the field in `REGISTER` and sends no `CONFIGURATION_STATE` update. An explicit null clears the previous report after a durable release or when a durable first assignment is waiting for application. |
+| `CONFIGURATION_POLICY` | Server to canonical `configuration_packages_v1` or `configuration_summary_v1` clients. Includes `package_id` and the group's active deployment `revision` (a null pair means no effective deployment for the client). Package-capable clients receive managed `settings` and explicit `retry_id` values. Clients with summary capability also receive nullable `group_name` and `deployed_at_ms` (Unix epoch milliseconds). Summary-only clients receive empty `settings`. For a managed venue ZIP, clients advertising `configuration_lbe_map_v1` receive the same-origin `lbe_map_download` path and `lbe_map_token` bearer credential outside `settings`. |
+| `REGISTER` and `CONFIGURATION_STATE` | The secret-free `configuration_state` has `package_id`, `revision`, `status` (`applying`, `complete`, `interrupted`) and per-setting `results`. A missing `startupApp` reports `status: "waiting"` and `reason: "APP_NOT_INSTALLED"` after PICO accepts the default Home setting. A disabled `startupApp` reports `status: "failed"` and `reason: "APP_DISABLED"`. Both report the requested package name as `value`. A `complete` attempt may contain a waiting result. Successful IPD calls report `ACCEPTED_UNVERIFIED`. Accepted map imports report `MAP_ACTIVE_UNVERIFIED`. While the report is unknown, including before restoring a cached attempt, the client omits the field in `REGISTER` and sends no `CONFIGURATION_STATE` update. An explicit null clears the previous report after a durable release or when a durable first assignment is waiting for application. |
 | `REGISTER` and `WIFI_CONNECTION` | A canonical client reports `current_wifi` as `{ssid, bssid}` or null. The BSSID may be null. The headset samples while connected every 30 seconds. The server exposes the current connection in `DEVICE_LIST` for that session. |
 | `REGISTER` and `WIFI_STATE` | The device reports Wi-Fi readiness and monitoring in `wifi_state` with `busy`, `available`, `unavailable_reason` and `priority_monitor`. A repeated registration refreshes both reports when supplied. |
 | `GROUP_LIST` and `DEVICE_LIST` | Group messages expose membership, package summaries, assignments, active deployments, and the snapshot's `server_instance_id` and `revision`. Each deployment's `wifi_mode` is `priority`, `android_selection`, or null when Wi-Fi is unmanaged. Online device rows expose package support and the latest report. An offline row is last-known. |

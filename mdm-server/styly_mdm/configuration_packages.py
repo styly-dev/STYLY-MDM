@@ -2,6 +2,7 @@
 
 import re
 
+from .lbe_maps import valid_map_reference
 from .wifi_settings import (
     WIFI_REASONS,
     WiFiSettingsError,
@@ -11,6 +12,7 @@ from .wifi_settings import (
 
 CAPABILITY = "configuration_packages_v1"
 SUMMARY_CAPABILITY = "configuration_summary_v1"
+LBE_MAP_CAPABILITY = "configuration_lbe_map_v1"
 VERSION = 3
 MAX_PACKAGE_NAME_LEN = 64
 MAX_ANDROID_PACKAGE_NAME_LEN = 255
@@ -43,8 +45,10 @@ def _delays(*seconds):
 
 
 SECTIONS = [
-    {"id": "basic", "title": "Basic settings", "description": "Display, sleep, power and home app", "items": [
+    {"id": "basic", "title": "Basic settings", "description": "Display, lenses, sleep, power and home app", "items": [
         _item("brightness", "Screen brightness", "Screen brightness level.", "range", 70, min=1, max=100),
+        _item("ipd", "IPD", "Set the distance between the headset lenses for the wearer.", "decimal",
+              63, min=58, max=72, step=0.1, unit="mm"),
         _item("autoSleep", "Auto sleep", "Enable automatic sleep.", "bool", False),
         _item("sleepDelay", "Sleep delay", "Time before the headset sleeps.", "delay", -1,
               options=_delays(-1, 300, 600, 1800)),
@@ -73,6 +77,10 @@ SECTIONS = [
         _item("securityZone", "Safety zone", "Enable the permanent safety zone.", "bool", False),
         _item("proximity", "Proximity sensor", "Enable the proximity sensor.", "bool", False),
         _item("seeThrough", "Quick see-through mode", "Enable quick see-through mode.", "bool", False),
+    ]},
+    {"id": "lbe", "title": "LBE", "description": "LBE mode and venue map", "items": [
+        _item("lbeMode", "LBE mode", "Turning on may bring the PICO LBE app to the foreground.", "bool", False),
+        _item("lbeMap", "LBE map", "Choose a venue ZIP to import when deploying LBE mode on.", "lbe-map", None),
     ]},
     {"id": "advanced", "title": "USB & advanced", "description": "USB, file copying and developer options", "items": [
         _item("usbBoot", "Power on when USB is connected",
@@ -111,6 +119,11 @@ def _valid_value(item, value, *, require_repeat=True):
         return type(value) is bool
     if kind == "range":
         return _bounded_int(value, item["min"], item["max"])
+    if kind == "decimal":
+        return (type(value) in (int, float) and item["min"] <= value <= item["max"]
+                and round(value, 1) == value)
+    if kind == "lbe-map":
+        return value is None or valid_map_reference(value)
     if kind == "delay":
         return type(value) is int and any(value == option["value"] for option in item["options"])
     return kind == "schedule" and _valid_schedule(value, require_repeat=require_repeat)
@@ -153,6 +166,8 @@ def _validate_value(key, value, *, managed):
         raise PackageError("Settings contain an unsupported item")
     if key == "wifi":
         return _validate_wifi(value, managed=managed)
+    if key == "lbeMap" and managed and value is None:
+        raise PackageError("Select an LBE map ZIP or turn off map management")
     if not _valid_value(item, value):
         raise PackageError(f"Invalid value for {item['label']}")
     return value
@@ -172,11 +187,16 @@ def validate_settings(settings):
         result[key] = {"managed": managed, "value": value}
     managed = managed_settings(result)
     _validate_delays(managed)
+    if managed.get("lbeMode") is True and "lbeMap" not in managed:
+        raise PackageError("Select an LBE map ZIP before enabling LBE mode")
     return result
 
 
 def managed_settings(settings):
-    return {key: item["value"] for key, item in settings.items() if item["managed"]}
+    managed = {key: item["value"] for key, item in settings.items() if item["managed"]}
+    if managed.get("lbeMode") is not True or managed.get("lbeMap") is None:
+        managed.pop("lbeMap", None)
+    return managed
 
 
 def validate_name(value):
@@ -268,11 +288,19 @@ def public_configuration_state(raw):
         if status not in ("applied", "failed", "unsupported"):
             continue
         clean = {"status": status}
-        if _valid_value(item, value, require_repeat=False):
+        if value is not None and _valid_value(item, value, require_repeat=False):
             clean["value"] = value
         if key == "startupApp" and status == "failed" and reason == "APP_DISABLED":
             clean["reason"] = reason
         elif isinstance(reason, str) and reason in _REASONS:
+            clean["reason"] = reason
+        elif key == "ipd" and status == "applied" and reason == "ACCEPTED_UNVERIFIED":
+            clean["reason"] = reason
+        elif key == "lbeMap" and (
+                (status == "applied" and reason == "MAP_ACTIVE_UNVERIFIED")
+                or (status == "failed" and reason in ("MAP_DOWNLOAD_FAILED", "MAP_IMPORT_FAILED"))):
+            clean["reason"] = reason
+        elif key == "lbeMode" and status == "failed" and reason in ("MAP_REQUIRED", "MAP_NOT_LOADED"):
             clean["reason"] = reason
         results[key] = clean
     return {**state, "results": results}

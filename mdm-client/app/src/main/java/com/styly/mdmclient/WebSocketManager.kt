@@ -152,6 +152,16 @@ class WebSocketManager internal constructor(
             return "$formattedHost:${httpUrl.port}"
         }
 
+        internal fun serverHttpOrigin(url: String): String {
+            val httpUrl = Request.Builder().url(url).build().url
+            return httpUrl.newBuilder()
+                .encodedPath("/")
+                .query(null)
+                .fragment(null)
+                .build()
+                .toString()
+        }
+
         private fun getCachedServerUrl(context: Context): String {
             return preferences(context)
                 .getString(PREF_SERVER_URL, null)
@@ -544,7 +554,14 @@ class WebSocketManager internal constructor(
                         Log.w(TAG, "Ignoring $logType for a different provisional connection")
                     } else if (type == "CONFIGURATION_POLICY") {
                         val owner = commandContext(webSocket) ?: return
-                        configurationPackages.receive(json, supportsPico4UltraEnterpriseSettings(), owner::isActive)
+                        val deviceId = (identityResolver.snapshot() as? DeviceIdentityState.Ready)?.deviceId
+                        configurationPackages.receive(
+                            json,
+                            supportsPico4UltraEnterpriseSettings(),
+                            serverHttpOrigin(url),
+                            deviceId,
+                            owner::isActive,
+                        )
                     } else if (type.isNotEmpty() && !pushCoordinator.handleServerMessage(type, json)) {
                         onCommand(type, json, commandContext(webSocket))
                     }
@@ -664,6 +681,7 @@ class WebSocketManager internal constructor(
                 capabilities.put(CONFIGURATION_SUMMARY_CAPABILITY)
                 if (supportsPico4UltraEnterpriseSettings()) {
                     capabilities.put(CONFIGURATION_PACKAGES_CAPABILITY)
+                    capabilities.put(CONFIGURATION_LBE_MAP_CAPABILITY)
                     put("configuration_state", configurationPackages.reportValue())
                 }
                 put("capabilities", capabilities)

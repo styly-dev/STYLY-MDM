@@ -9,10 +9,12 @@ import argparse
 import asyncio
 import copy
 import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import socket
 import sys
@@ -23,6 +25,7 @@ import zipfile
 from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from urllib.parse import urlencode
 from aiohttp import WSCloseCode, web
 
 # Bundling and integrity references must agree on what counts as content, or a reference
@@ -36,6 +39,7 @@ from .device_policy import (
 from . import configuration_packages
 from .configuration_packages import PackageError
 from .integrity import apk_cd_digest, file_sha256, is_os_metadata
+from .lbe_maps import LbeMapError, LbeMapStore
 from .push_jobs import parse_capabilities
 from .wifi_settings import normalize_revision, public_wifi_state
 
@@ -1573,6 +1577,8 @@ def zip_tree(root: Path, dest_zip: Path) -> None:
 PACKAGE_REQUEST_MAX_BYTES = 256 * 1024
 CONFIGURATION_SEND_TIMEOUT = 5.0
 _CONFIGURATION_PUBLICATIONS = web.AppKey("configuration_publications", set)
+_LBE_MAP_TOKEN_KEY = secrets.token_bytes(32)
+LBE_MAP_TOKEN_TTL_SECONDS = 24 * 60 * 60
 
 
 @dataclass
@@ -1593,6 +1599,64 @@ def _require_same_origin(request: web.Request) -> None:
     expected = f"{request.scheme}://{request.host}"
     if origin != expected:
         raise PackageError("Invalid request origin", 403)
+
+
+def _lbe_map_store() -> LbeMapStore:
+    return LbeMapStore(DATA_DIR / "lbe-maps")
+
+
+async def lbe_maps_handler(request: web.Request) -> web.Response:
+    try:
+        if request.method in ("GET", "HEAD"):
+            payload = {"maps": await asyncio.to_thread(lambda: _lbe_map_store().list_maps())}
+        else:
+            _require_same_origin(request)
+            payload = {"map": await _lbe_map_store().save_upload(request)}
+        return web.json_response(payload, headers={"Cache-Control": "no-store"})
+    except (PackageError, LbeMapError) as exc:
+        return web.json_response({"error": str(exc)}, status=exc.status)
+
+
+def _lbe_map_token(device_id: str, revision: str, digest: str, expires_at: int) -> str:
+    scope = json.dumps(
+        [device_id, revision, digest, expires_at], separators=(",", ":"),
+    ).encode("utf-8")
+    signature = hmac.new(_LBE_MAP_TOKEN_KEY, scope, hashlib.sha256).hexdigest()
+    return f"{expires_at}.{signature}"
+
+
+def _valid_lbe_map_token(token: str, device_id: str, revision: str, digest: str) -> bool:
+    try:
+        expiry_text, _signature = token.split(".", 1)
+        expires_at = int(expiry_text)
+    except (AttributeError, ValueError):
+        return False
+    if str(expires_at) != expiry_text or expires_at <= int(time.time()):
+        return False
+    expected = _lbe_map_token(device_id, revision, digest, expires_at)
+    try:
+        token_bytes = token.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return hmac.compare_digest(token_bytes, expected.encode("ascii"))
+
+
+async def lbe_map_download_handler(request: web.Request) -> web.StreamResponse:
+    device_id = request.query.get("device_id", "")
+    revision = request.query.get("revision", "")
+    digest = request.match_info["sha256"]
+    token = request.headers.get("Authorization", "")
+    if not token.startswith("Bearer ") or not _valid_lbe_map_token(
+            token[len("Bearer "):], device_id, revision, digest):
+        raise web.HTTPForbidden()
+    policy = _desired_configuration(device_id)
+    reference = policy["settings"].get("lbeMap")
+    if revision != policy["revision"] or reference is None or digest != reference["sha256"]:
+        raise web.HTTPForbidden()
+    path = _lbe_map_store().path_for(reference)
+    if path is None:
+        raise web.HTTPNotFound()
+    return web.FileResponse(path, headers={"Cache-Control": "private, no-store", "Content-Type": "application/zip"})
 
 
 async def _small_json_body(request: web.Request) -> dict:
@@ -1662,6 +1726,9 @@ def _updated_package(profile: dict, body: dict) -> dict:
     configuration_packages.check_expected_revision(body, profile["edit_revision"])
     name = configuration_packages.validate_name(body.get("name", profile["name"]))
     settings = configuration_packages.validate_settings(body.get("settings"))
+    reference = configuration_packages.managed_settings(settings).get("lbeMap")
+    if reference is not None and _lbe_map_store().path_for(reference) is None:
+        raise PackageError("The selected LBE map is unavailable. Upload or select it again.", 409)
     return {**profile, "name": name, "settings": settings, "edit_revision": str(uuid.uuid4())}
 
 
@@ -1684,6 +1751,13 @@ def _check_deployment_impact(body: dict, token: str) -> None:
         raise PackageError("expected_impact is required")
     if expected != token:
         raise PackageError("Deployment targets changed. Review the updated targets before deploying.", 409)
+
+
+def _lbe_deployment_details(settings: dict) -> dict:
+    if "lbeMode" not in settings:
+        return {}
+    reference = settings.get("lbeMap")
+    return {"lbe_mode": settings["lbeMode"], "lbe_map_name": reference["name"] if reference else None}
 
 
 def _editor_package(package_id: str, profile: dict) -> dict:
@@ -1807,8 +1881,13 @@ async def group_package_deploy_handler(request: web.Request) -> web.Response:
                 "wifi_mode": (_wifi_mode(configuration_packages.published_settings(current_profile))
                               if current_profile is not None else None),
                 "impact": {**impact, "token": token},
+                **_lbe_deployment_details(configuration_packages.published_settings(profile) if profile else {}),
             })
         _check_deployment_impact(body, token)
+        if profile is not None:
+            reference = configuration_packages.published_settings(profile).get("lbeMap")
+            if reference is not None and _lbe_map_store().path_for(reference) is None:
+                raise PackageError("The selected LBE map is unavailable. Upload or select it again.", 409)
         if profile is not None and not use_current:
             updated = _published_configuration(package_id, profile)
         else:
@@ -1943,6 +2022,15 @@ async def _send_configuration(
             if retry != (policy["package_id"], policy["revision"]):
                 return None
             policy["retry_id"] = str(uuid.uuid4())
+        reference = policy["settings"].get("lbeMap")
+        if reference is not None and configuration_packages.LBE_MAP_CAPABILITY in entry.get("capabilities", ()):
+            digest = reference["sha256"]
+            query = urlencode({"device_id": device_id, "revision": policy["revision"]})
+            policy["lbe_map_download"] = f"/api/lbe-maps/{digest}/download?{query}"
+            policy["lbe_map_token"] = _lbe_map_token(
+                device_id, policy["revision"], digest,
+                int(time.time()) + LBE_MAP_TOKEN_TTL_SECONDS,
+            )
         if delivery is not None:
             # All requests received before the write are covered by this policy.
             delivery.pending = False
@@ -4033,6 +4121,12 @@ def probe_existing_server(timeout: float = 1.0) -> str | None:
 def create_app() -> web.Application:
     # Ensure the writable data directory exists before loading/saving the registry.
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        stale_maps_removed = LbeMapStore(DATA_DIR / "lbe-maps").cleanup_stale_staging()
+        if stale_maps_removed:
+            log.info("Removed %d abandoned LBE map upload(s)", stale_maps_removed)
+    except OSError:
+        log.warning("Could not prepare LBE map storage", exc_info=True)
     load_registry()
     app = web.Application(
         client_max_size=max(MAX_APK_SIZE, MAX_BUNDLE_SIZE) + 10 * 1024 * 1024)
@@ -4051,6 +4145,9 @@ def create_app() -> web.Application:
     app.router.add_get("/api/group-package/deploy", group_package_deploy_handler)
     app.router.add_post("/api/group-package/deploy", group_package_deploy_handler)
     app.router.add_post("/api/package-retry", package_retry_handler)
+    app.router.add_get("/api/lbe-maps", lbe_maps_handler)
+    app.router.add_post("/api/lbe-maps", lbe_maps_handler)
+    app.router.add_get(r"/api/lbe-maps/{sha256:[0-9a-f]{64}}/download", lbe_map_download_handler)
     app.router.add_post("/api/apks", upload_apk_handler)
     app.router.add_post("/api/bundles", upload_bundle_handler)
 

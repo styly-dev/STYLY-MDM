@@ -440,8 +440,10 @@
     .settings-package-head, .settings-assignment { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
     .settings-package-head { justify-content: space-between; }
     .settings-package-head .btn-outline:disabled, .settings-device-result .btn-outline:disabled { opacity: .4; cursor: not-allowed; }
-    .settings-name { display: block; width: min(100%, 360px); margin-top: 12px; color: var(--text-secondary); font-size: 12px; }
-    .settings-name .field { display: block; margin-top: 5px; }
+    .settings-name, .settings-field-label { display: block; width: min(100%, 360px); color: var(--text-secondary); font-size: 12px; }
+    .settings-name { margin-top: 12px; }
+    .settings-name .field, .settings-field-label .field { display: block; margin-top: 5px; }
+    .settings-field-label .field:disabled::placeholder { color: transparent; }
     .settings-assignment .settings-name { flex: 1 1 180px; }
     .settings-section { max-width: 980px; }
     .settings-section h3 { font-size: 16px; }
@@ -469,6 +471,8 @@
     .settings-value:disabled { opacity: .4; }
     .settings-editor :disabled { cursor: not-allowed; }
     .settings-value > .field { max-width: 260px; }
+    .settings-unit { display: flex; align-items: center; gap: 8px; max-width: 260px; color: var(--text-secondary); font-size: 12px; }
+    .settings-unit .field { width: 100%; }
     .settings-radios, .settings-schedule, .settings-range { display: flex; align-items: center; gap: 10px; font-size: 12px; }
     .settings-radios { gap: 18px; }
     .settings-radios label, .settings-schedule label, .settings-days label { display: flex; align-items: center; gap: 5px; }
@@ -483,8 +487,12 @@
     .wifi-network { padding: 12px; background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 8px; }
     .wifi-network-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
     .wifi-network-head strong { font-size: 12px; color: var(--text-secondary); }
+    .wifi-network-head-compact { align-items: flex-end; gap: 10px; margin-bottom: 0; }
+    .wifi-network-head-compact > label { flex: 1; }
     .wifi-network-actions { display: flex; justify-content: flex-end; gap: 5px; margin-left: auto; }
     .wifi-network-actions .btn-outline { display: grid; place-items: center; width: 28px; height: 28px; margin: 0; padding: 0; }
+    .wifi-network-head-compact .field, .wifi-network-head-compact .wifi-remove { height: 36px; }
+    .wifi-network-head-compact .wifi-remove { width: 36px; }
     .wifi-network-actions svg { width: 16px; height: 16px; }
     .wifi-network-actions .btn-outline:disabled { opacity: .4; cursor: not-allowed; }
     .wifi-network-actions .wifi-remove:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }

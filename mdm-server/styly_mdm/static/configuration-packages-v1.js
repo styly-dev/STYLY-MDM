@@ -59,10 +59,38 @@
       const max = Number(item.max ?? 100);
       return value >= min && value <= max;
     }
+    if (item.kind === 'decimal') {
+      if (typeof value !== 'number' || !Number.isFinite(value)) return false;
+      const min = Number(item.min ?? 0);
+      const max = Number(item.max ?? Number.MAX_SAFE_INTEGER);
+      const step = Number(item.step ?? 1);
+      const steps = (value - min) / step;
+      const aligned = step === 0.1
+        ? Number(value.toFixed(1)) === value
+        : Math.abs(steps - Math.round(steps)) < 1e-7;
+      return value >= min && value <= max && aligned;
+    }
     if (item.kind === 'delay') return item.options?.some(option => option.value === value) === true;
     if (item.kind === 'bool') return typeof value === 'boolean';
     if (item.kind === 'package') return validAndroidPackageName(value, true);
+    if (item.kind === 'lbe-map') return value === null || validLbeMap(value);
     return true;
+  }
+
+  function isSettingManaged(id, draft) {
+    if (id === 'lbeMap') return draft.lbeMode?.managed === true && draft.lbeMode.value === true;
+    return draft[id]?.managed === true;
+  }
+
+  function validLbeMap(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value) ||
+        Object.keys(value).sort().join(',') !== 'name,sha256,size') return false;
+    const name = value.name;
+    return typeof value.sha256 === 'string' && /^[a-f0-9]{64}$/.test(value.sha256) &&
+      typeof name === 'string' && name === name.trim() && name.length > 0 && Array.from(name).length <= 128 &&
+      name !== '.' && name !== '..' && !/[\\/]/.test(name) && !/[\u0000-\u001f\u007f]/.test(name) &&
+      name.toLowerCase().endsWith('.zip') &&
+      Number.isSafeInteger(value.size) && value.size > 0 && value.size <= 512 * 1024 * 1024;
   }
 
   function validAndroidPackageName(value, allowDefault = false) {
@@ -210,7 +238,7 @@
         if (value) settings[item.id] = { managed: false, value };
         continue;
       }
-      const managed = entry.managed;
+      const managed = item.id === 'lbeMap' ? isSettingManaged(item.id, draft) : entry.managed;
       const value = item.kind === 'wifi' && !entry.managed
         ? saved[item.id].value : entry.value;
       let payloadValue = value;
@@ -218,6 +246,9 @@
         payloadValue = schedulePayload(item, value, saved[item.id]?.value, managed && value.enabled === true);
       } else if (managed && !supportedValue(item, value)) {
         throw new Error('Select a supported value for ' + item.label + '.');
+      }
+      if (item.id === 'lbeMap' && managed && !validLbeMap(value)) {
+        throw new Error('Select a map ZIP before enabling LBE mode.');
       }
       settings[item.id] = {
         managed,
@@ -283,8 +314,16 @@
       const savedDetail = deployment.wifi_mode === 'android_selection'
         ? 'Wi-Fi profiles and auto-connect flags were read back. Android selects the network.'
         : 'Saved Wi-Fi profiles and auto-connect flags were read back.';
+      const unverifiedDetails = [];
+      if (deployment.keys.some(key => report.results?.[key]?.reason === 'ACCEPTED_UNVERIFIED')) {
+        unverifiedDetails.push('PICO accepted the IPD setting, which cannot be read back.');
+      }
+      if (deployment.keys.some(key => report.results?.[key]?.reason === 'MAP_ACTIVE_UNVERIFIED')) {
+        unverifiedDetails.push('Map import succeeded, but the active map cannot be confirmed.');
+      }
       return ['success', results.length ? 'Applied' + connection : 'No managed settings' + connection,
-        results.length ? wifiSaved ? savedDetail : 'All managed settings were verified.' : 'The device acknowledged this revision.'];
+        results.length ? wifiSaved ? savedDetail : unverifiedDetails.length ? unverifiedDetails.join(' ') :
+          'All managed settings were verified.' : 'The device acknowledged this revision.'];
     }
     if (results.every(status => status === 'unsupported')) {
       return ['unavailable', 'Unsupported' + connection, 'This device could not apply the managed settings.'];
@@ -307,17 +346,19 @@
       const field = `data-setting="${esc(item.id)}" data-network="${index}"`;
       const isOpen = network.security === 'OPEN';
       const passwordHelpId = `wifi-password-help-${index}`;
+      const ssid = `<label>SSID<input class="field" ${field} data-field="ssid" value="${esc(network.ssid)}"></label>`;
       const moveActions = value.prioritize_networks ? `
             <button class="btn-outline" type="button" aria-label="Move Wi-Fi ${index + 1} up" title="Move up" data-policy-action="move-network" data-direction="up" ${field} ${!managed || index === 0 ? 'disabled' : ''}>${wifiActionIcon('up')}</button>
             <button class="btn-outline" type="button" aria-label="Move Wi-Fi ${index + 1} down" title="Move down" data-policy-action="move-network" data-direction="down" ${field} ${!managed || index === networks.length - 1 ? 'disabled' : ''}>${wifiActionIcon('down')}</button>` : '';
       return `<article class="wifi-network">
-        <div class="wifi-network-head">${value.prioritize_networks ? `<strong>Wi-Fi ${index + 1}</strong>` : ''}
+        <div class="wifi-network-head${value.prioritize_networks ? '' : ' wifi-network-head-compact'}">
+          ${value.prioritize_networks ? `<strong>Wi-Fi ${index + 1}</strong>` : ssid}
           <div class="wifi-network-actions">
             ${moveActions}
             <button class="btn-outline wifi-remove" type="button" aria-label="Remove Wi-Fi ${index + 1} from package" title="Remove from package" data-policy-action="remove-network" ${field}>${wifiActionIcon('remove')}</button>
           </div>
         </div>
-        <label>SSID<input class="field" ${field} data-field="ssid" value="${esc(network.ssid)}"></label>
+        ${value.prioritize_networks ? ssid : ''}
         <div class="wifi-fields">
           <label>Security<select class="field" ${field} data-field="security">
             <option value="OPEN" ${isOpen ? 'selected' : ''}>Open</option>
@@ -355,7 +396,7 @@
       [value.hour, value.minute].map(number => String(number).padStart(2, '0')).join(':');
   }
 
-  function renderControl(item, value, managed) {
+  function renderControl(item, value, managed, model) {
     const field = `data-setting="${esc(item.id)}"`;
     const label = esc(item.label);
     switch (item.kind) {
@@ -364,6 +405,8 @@
           `<label><input type="radio" name="setting-${esc(item.id)}" ${field} value="${on}" ${value === on ? 'checked' : ''}> ${on ? 'On' : 'Off'}</label>`).join('')}</div>`;
       case 'range':
         return `<div class="settings-range"><input aria-label="${label}" type="range" min="${esc(item.min ?? 0)}" max="${esc(item.max ?? 100)}" ${field} value="${esc(value)}"><output>${esc(value)}%</output></div>`;
+      case 'decimal':
+        return `<label class="settings-unit"><input class="field" aria-label="${label}" type="number" min="${esc(item.min)}" max="${esc(item.max)}" step="${esc(item.step)}" ${field} value="${esc(value)}"><span>${esc(item.unit || '')}</span></label>`;
       case 'delay':
         return `<select class="field" aria-label="${label}" ${field}>${item.options.map(option =>
           `<option value="${esc(option.value)}" ${option.value === value ? 'selected' : ''}>${esc(option.label)}</option>`).join('')}</select>`;
@@ -376,27 +419,69 @@
       case 'wifi':
         return renderWifi(item, value, managed);
       case 'package':
-        return `<label>Android package name<input class="field" type="text" maxlength="255" autocomplete="off" ${field} value="${esc(value)}"></label>`;
+        return `<label class="settings-field-label">Android package name<input class="field" type="text" maxlength="255" autocomplete="off" ${field} value="${esc(value)}" placeholder="PICO default"></label>`;
+      case 'lbe-map':
+        return renderLbeMap(item, value, managed, model);
       default:
         return '';
     }
   }
 
-  function renderItem(item, draft, saved) {
+  function renderLbeMap(item, value, managed, model) {
+    const maps = model.maps || [];
+    const selected = validLbeMap(value) ? value.sha256 : '';
+    const options = maps.map(map => `<option value="${esc(map.sha256)}" ${map.sha256 === selected ? 'selected' : ''}>${esc(map.name)} · ${formatBytes(map.size)}</option>`).join('');
+    const selectedMapUnavailable = selected && model.mapsStatus === 'loaded' && !maps.some(map => map.sha256 === selected);
+    const selectedMapMissing = selected && !maps.some(map => map.sha256 === selected)
+      ? `<option value="${esc(selected)}" selected>${esc(value.name)} · ${selectedMapUnavailable ? 'Not in map library' : 'Stored in this package'}</option>` : '';
+    const noMapsLabel = model.mapsStatus === 'failed' ? 'Map list unavailable' :
+      model.mapsStatus === 'loading' ? 'Loading map list…' : 'No map ZIPs uploaded';
+    const noMaps = maps.length ? '' : `<option value="" disabled>${noMapsLabel}</option>`;
+    const error = model.uploadError ? `<small class="wifi-warning" role="alert">${esc(model.uploadError)}</small>` : '';
+    const busy = model.uploading === true;
+    const mapControlsDisabled = !managed || busy || model.mapsStatus === 'loading';
+    const retry = ['failed', 'loading'].includes(model.mapsStatus)
+      ? `<button class="btn-outline" type="button" data-map-retry ${model.mapsStatus === 'loading' ? 'aria-disabled="true"' : ''}>${model.mapsStatus === 'loading' ? 'Loading map list…' : 'Retry map list'}</button>` : '';
+    const unavailable = selectedMapUnavailable
+      ? '<small class="wifi-warning" role="alert">This map ZIP is missing from the server library. Upload it again to import this map.</small>' : '';
+    const unmanagedNote = !managed && selected
+      ? '<small>This ZIP stays selected in the package and will be imported when managed LBE mode turns on.</small>' : '';
+    const placeholder = managed ? 'Select a map ZIP' : 'Enable managed LBE mode to select a ZIP';
+    return `<div class="settings-networks">
+      <label>Venue map ZIP<select class="field" aria-label="Venue map ZIP" data-setting="${esc(item.id)}" ${mapControlsDisabled ? 'disabled' : ''}>
+        <option value="" ${selected ? '' : 'selected'}>${placeholder}</option>${selectedMapMissing}${noMaps}${options}</select></label>
+      <div class="settings-buttons"><button class="btn-outline" type="button" data-map-choose ${mapControlsDisabled ? 'disabled' : ''}>Upload ZIP…</button>${retry}
+        <input type="file" accept=".zip,application/zip" data-map-upload hidden ${mapControlsDisabled ? 'disabled' : ''}>
+        <span class="settings-meta" data-map-status role="status">${busy ? 'Uploading…' : model.mapsStatus === 'loading' ? 'Loading uploaded maps…' : model.mapsStatus === 'failed' ? 'Could not load uploaded maps.' : maps.length ? maps.length + ' map ZIPs available' : 'Upload a map ZIP to use it on headsets.'}</span></div>
+      ${unavailable}${unmanagedNote}${error}<small>Select a ZIP to import whenever managed LBE mode turns on. Turning LBE mode off retains the ZIP selection in this package.</small>
+    </div>`;
+  }
+
+  function formatBytes(size) {
+    if (!Number.isFinite(size) || size < 1) return '';
+    if (size < 1024 * 1024) return Math.ceil(size / 1024) + ' KB';
+    return (size / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+
+  function renderItem(item, draft, saved, model) {
     const entry = draft[item.id];
-    const wide = item.kind === 'wifi' || item.kind === 'schedule' || item.kind === 'package';
+    const wide = item.kind === 'wifi' || item.kind === 'schedule' || item.kind === 'package' || item.kind === 'lbe-map';
+    const managed = item.kind === 'lbe-map' ? isSettingManaged(item.id, draft) : entry?.managed === true;
     const label = esc(item.label);
+    const manageControl = item.kind === 'lbe-map' ? '<span aria-hidden="true"></span>' :
+      `<label class="settings-manage"><input type="checkbox" data-manage="${esc(item.id)}" aria-label="Manage ${label}" ${entry?.managed ? 'checked' : ''} ${entry ? '' : 'disabled'}></label>`;
     return `<div class="settings-row${wide ? ' settings-wide' : ''}">
-      <label class="settings-manage"><input type="checkbox" data-manage="${esc(item.id)}" aria-label="Manage ${label}" ${entry?.managed ? 'checked' : ''} ${entry ? '' : 'disabled'}></label>
+      ${manageControl}
       <div class="settings-label"><strong>${label}</strong><small>${esc(item.description)}</small></div>
-      ${entry ? `<fieldset class="settings-value" aria-label="${label}" ${entry.managed ? '' : 'disabled'}>${renderControl(item, entry.value, entry.managed)}</fieldset>` :
+      ${entry ? `<fieldset class="settings-value" aria-label="${label}" ${managed || item.kind === 'lbe-map' ? '' : 'disabled'}>${renderControl(item, entry.value, managed, model)}</fieldset>` :
         '<span class="settings-meta">Unavailable</span>'}
     </div>`;
   }
 
   function sectionCount(section, draft) {
-    const managed = section.items.filter(item => draft[item.id]?.managed).length;
-    return managed + ' / ' + section.items.length + ' managed';
+    const manageable = section.items.filter(item => item.kind !== 'lbe-map');
+    const managed = manageable.filter(item => draft[item.id]?.managed).length;
+    return managed + ' / ' + manageable.length + ' managed';
   }
 
   function renderSection(section, model) {
@@ -407,13 +492,15 @@
         <span class="settings-chevron" aria-hidden="true"></span>
       </summary>
       <div class="settings-content">${section.items
-        .map(item => renderItem(item, model.draft, model.saved)).join('')}</div>
+        .map(item => renderItem(item, model.draft, model.saved, model)).join('')}</div>
     </details>`;
   }
 
   function actualValue(item, value) {
     if (!item) return '';
     if (item.kind === 'range') return typeof value === 'number' ? value + '%' : '';
+    if (item.kind === 'decimal') return typeof value === 'number' ? value.toFixed(1) + ' mm' : '';
+    if (item.kind === 'lbe-map') return validLbeMap(value) ? value.name : '';
     if (item.kind === 'bool') return typeof value === 'boolean' ? value ? 'On' : 'Off' : '';
     if (item.kind === 'delay') return item.options.find(option => option.value === value)?.label || '';
     if (item.kind === 'schedule' && value && typeof value.enabled === 'boolean') {
@@ -439,9 +526,19 @@
       const actual = actualValue(item, result?.value);
       const reason = result?.reason ? String(result.reason).replaceAll('_', ' ').toLowerCase() : '';
       const homeAppDisabled = key === 'startupApp' && result?.reason === 'APP_DISABLED';
+      const specialReasons = {
+        ACCEPTED_UNVERIFIED: 'PICO accepted the IPD setting. The headset does not expose an IPD readback.',
+        MAP_ACTIVE_UNVERIFIED: 'Map import succeeded. The headset does not confirm which map is active.',
+        MAP_DOWNLOAD_FAILED: 'Map ZIP could not be downloaded or verified.',
+        MAP_IMPORT_FAILED: 'PICO could not import the selected map ZIP.',
+        MAP_REQUIRED: 'The selected map must be imported before LBE mode can turn on.',
+        MAP_NOT_LOADED: 'PICO did not confirm a loaded map.',
+      };
       const explanation = homeAppDisabled
         ? 'App disabled on the headset' + (result.value ? ' (' + result.value + ')' : '')
-        : reason.charAt(0).toUpperCase() + reason.slice(1);
+        : key === 'lbeMap' && result?.reason === 'CALLBACK_TIMEOUT'
+          ? 'PICO did not confirm the import in time. The import may still be running.'
+        : specialReasons[result?.reason] || reason.charAt(0).toUpperCase() + reason.slice(1);
       const detail = savedWifi
         ? (deployment.wifi_mode === 'android_selection' ? 'Saved. Android selects the network.' : 'Saved')
         : launcherAccepted
@@ -503,6 +600,7 @@
     let items = new Map();
     let resultSections = { status: 'idle' };
     let creating = false;
+    let pendingLbeOpen = null;
     const packagePath = id => '/api/packages/' + encodeURIComponent(id);
     const packageById = id => catalog?.find(candidate => candidate.package_id === id);
     const assignment = name => Object.hasOwn(snapshot?.assignments || {}, name) ? snapshot.assignments[name] : null;
@@ -553,10 +651,17 @@
       };
     }
 
-    async function api(path, method = 'GET', body) {
+    async function api(path, method = 'GET', body, multipart = false) {
       const headers = { Accept: 'application/json' };
-      if (body !== undefined) headers['Content-Type'] = 'application/json';
-      const response = await fetch(path, { method, headers, body: JSON.stringify(body) });
+      const options = { method, headers };
+      if (body !== undefined) {
+        if (multipart) options.body = body;
+        else {
+          headers['Content-Type'] = 'application/json';
+          options.body = JSON.stringify(body);
+        }
+      }
+      const response = await fetch(path, options);
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
         throw Object.assign(new Error(data?.error || `Request failed (HTTP ${response.status}).`), {
@@ -564,6 +669,72 @@
         });
       }
       return response.json();
+    }
+
+    async function loadLbeMaps(model, refresh = false) {
+      if (model.mapsStatus === 'loading' ||
+          (!refresh && (model.mapsStatus === 'loaded' || model.mapsStatus === 'failed'))) return;
+      const expectedInstanceId = snapshot?.server_instance_id ?? null;
+      const requestId = model.mapsRequestId = (model.mapsRequestId || 0) + 1;
+      model.mapsStatus = 'loading';
+      renderEditorPreservingFocus();
+      try {
+        const data = await api('/api/lbe-maps');
+        if (current !== model || requestId !== model.mapsRequestId ||
+            expectedInstanceId !== (snapshot?.server_instance_id ?? null)) return;
+        model.maps = Array.isArray(data.maps) ? data.maps.filter(validLbeMap) : [];
+        model.mapsStatus = 'loaded';
+      } catch (_) {
+        if (current !== model || requestId !== model.mapsRequestId ||
+            expectedInstanceId !== (snapshot?.server_instance_id ?? null)) return;
+        model.mapsStatus = 'failed';
+      }
+      const reference = model.draft?.lbeMap?.value;
+      const missingReference = model.mapsStatus === 'loaded' && validLbeMap(reference) &&
+        !model.maps.some(map => map.sha256 === reference.sha256);
+      const refreshMissingReference = missingReference && model.mapsMissingRefreshFor !== reference.sha256;
+      if (missingReference) model.mapsMissingRefreshFor = reference.sha256;
+      else if (model.mapsStatus === 'loaded') model.mapsMissingRefreshFor = '';
+      renderEditorPreservingFocus();
+      if (refreshMissingReference) return loadLbeMaps(model, true);
+    }
+
+    async function uploadLbeMap(model, file) {
+      if (!file || !isSettingManaged('lbeMap', model.draft) || current !== model || model.uploading || model.mapsStatus === 'loading') return;
+      if (!file.name.toLowerCase().endsWith('.zip')) {
+        model.uploadError = 'Select a ZIP file.';
+        renderEditorPreservingFocus();
+        return;
+      }
+      const expectedInstanceId = snapshot?.server_instance_id ?? null;
+      model.uploading = true;
+      model.uploadError = '';
+      model.error = false;
+      model.message = '';
+      updateActions();
+      renderEditorPreservingFocus();
+      const formData = new root.FormData();
+      formData.append('map', file, file.name);
+      try {
+        const data = await api('/api/lbe-maps', 'POST', formData, true);
+        const map = data?.map;
+        if (current !== model || expectedInstanceId !== (snapshot?.server_instance_id ?? null)) return;
+        if (!validLbeMap(map)) throw new Error('The server returned invalid map ZIP details.');
+        model.maps = [...(model.maps || []).filter(candidate => candidate.sha256 !== map.sha256), map]
+          .sort((left, right) => left.name.localeCompare(right.name));
+        model.mapsStatus = 'loaded';
+        model.draft.lbeMap.value = map;
+        model.message = 'Map ZIP uploaded and selected.';
+      } catch (error) {
+        if (current !== model || expectedInstanceId !== (snapshot?.server_instance_id ?? null)) return;
+        model.uploadError = error.status ? error.message : 'Could not upload the map ZIP.';
+        model.error = true;
+      } finally {
+        if (current === model) {
+          model.uploading = false;
+          renderEditorPreservingFocus();
+        }
+      }
     }
 
     function updateSnapshot(data, source = 'http') {
@@ -577,6 +748,13 @@
         resultSections = { status: 'idle' };
         items = new Map();
         catalog = null;
+        if (current) {
+          current.maps = [];
+          current.mapsStatus = 'idle';
+          current.mapsRequestId = (current.mapsRequestId || 0) + 1;
+          current.mapsMissingRefreshFor = '';
+          current.uploadError = '';
+        }
       }
       snapshot = { server_instance_id: data.server_instance_id, revision: data.revision,
         assignments: data.assignments || {}, deployments: data.deployments || {} };
@@ -596,6 +774,7 @@
       renderPublication();
       if (current) updateActions();
       onSnapshot(data, source);
+      if (instanceChanged && current?.expanded.has('lbe')) loadLbeMaps(current);
       return true;
     }
 
@@ -694,7 +873,10 @@
     }
 
     function hasChanges(model) {
-      return model.name !== model.savedName || JSON.stringify(model.draft) !== JSON.stringify(model.saved);
+      if (model.name !== model.savedName) return true;
+      return Object.keys(model.draft).some(key => key === 'lbeMap'
+        ? !sameValue(model.draft[key]?.value, model.saved[key]?.value)
+        : !sameValue(model.draft[key], model.saved[key]));
     }
 
     function updateDeployAction(button, hint, reason) {
@@ -717,16 +899,17 @@
       if (!model || !footer) return;
       const catalogState = currentCatalogState(model);
       const changed = hasChanges(model);
-      const locked = model.busy || model.conflict || catalogState.stale || catalogState.removed || configurationAvailable === false;
+      const locked = model.busy || model.uploading || model.conflict || catalogState.stale || catalogState.removed || configurationAvailable === false;
       packagePanel.querySelector('.settings-editor').disabled = locked;
       packagePanel.querySelector('[data-package-name]').disabled = locked;
       footer.querySelector('[data-policy-action="discard"]').disabled = locked || !changed;
       let deployReason = '';
-      if (model.busy) deployReason = 'Wait for the current package operation to finish.';
+      if (model.busy || model.uploading) deployReason = 'Wait for the current package operation to finish.';
       else if (model.conflict) deployReason = 'Select Reload package and review the latest version before deploying.';
       else if (catalogState.removed) deployReason = 'Select another package.';
       else if (catalogState.stale) deployReason = 'Reload package before deploying.';
       else if (configurationAvailable === false) deployReason = 'Configuration packages are unavailable. Wait for the server to recover.';
+      else if (isSettingManaged('lbeMap', model.draft) && !validLbeMap(model.draft.lbeMap?.value)) deployReason = 'Select a map ZIP before enabling LBE mode.';
       else if (!model.name.trim()) deployReason = 'Enter a package name before deploying.';
       updateDeployAction(footer.querySelector('[data-policy-action="deploy"]'), packagePanel.querySelector('[data-deploy-hint]'), deployReason);
       packagePanel.querySelector('[data-policy-action="delete"]').disabled = locked;
@@ -785,6 +968,54 @@
       updateActions();
     }
 
+    function captureEditorFocus() {
+      const active = root.document?.activeElement;
+      if (!active || !packagePanel.contains?.(active)) return null;
+      const data = active.dataset || {};
+      if (Object.hasOwn(data, 'manage')) return { kind: 'manage', id: data.manage };
+      if (Object.hasOwn(data, 'setting')) {
+        return { kind: 'setting', id: data.setting, field: data.field, network: data.network,
+          day: data.day, type: active.type, value: active.value };
+      }
+      if (active.hasAttribute?.('data-map-choose')) return { kind: 'map-choose' };
+      if (active.hasAttribute?.('data-map-retry')) return { kind: 'map-retry' };
+      if (active.hasAttribute?.('data-package-name')) return { kind: 'package-name' };
+      if (data.policyAction) return { kind: 'policy-action', action: data.policyAction };
+      const section = active.closest?.('[data-settings-section]');
+      if (active.tagName === 'SUMMARY' && section?.dataset.settingsSection) {
+        return { kind: 'summary', id: section.dataset.settingsSection };
+      }
+      return null;
+    }
+
+    function renderEditorPreservingFocus() {
+      const focus = captureEditorFocus();
+      renderEditor();
+      if (!focus) return;
+      const candidates = packagePanel.querySelectorAll(
+        '[data-manage], [data-setting], [data-map-choose], [data-map-retry], [data-package-name], [data-policy-action], [data-settings-section] > summary');
+      const target = Array.from(candidates).find(element => {
+        const data = element.dataset || {};
+        if (focus.kind === 'manage') return data.manage === focus.id;
+        if (focus.kind === 'setting') return data.setting === focus.id && data.field === focus.field &&
+          data.network === focus.network && data.day === focus.day &&
+          (focus.type !== 'radio' || element.value === focus.value);
+        if (focus.kind === 'map-choose') return element.hasAttribute('data-map-choose');
+        if (focus.kind === 'map-retry') return element.hasAttribute('data-map-retry');
+        if (focus.kind === 'package-name') return element.hasAttribute('data-package-name');
+        if (focus.kind === 'policy-action') return data.policyAction === focus.action;
+        return focus.kind === 'summary' && element.tagName === 'SUMMARY' &&
+          element.closest('[data-settings-section]')?.dataset.settingsSection === focus.id;
+      });
+      if (target && !target.hidden) target.focus({ preventScroll: true });
+      else if (focus.kind === 'map-retry') {
+        const fallback = packagePanel.querySelector('[data-map-choose]:enabled') ||
+          packagePanel.querySelector('[data-settings-section="lbe"] > summary');
+        fallback?.focus({ preventScroll: true });
+      }
+      else if (focus.kind === 'policy-action' && focus.action === 'reload') packagePanel.querySelector('[data-package-name]')?.focus({ preventScroll: true });
+    }
+
     function readSections(sections, expectedInstanceId = snapshot?.server_instance_id ?? null) {
       if ((snapshot?.server_instance_id ?? null) !== expectedInstanceId) return;
       resultSections = { status: 'loaded' };
@@ -801,9 +1032,9 @@
       const draft = structuredClone(saved);
       let name = data.name;
       const conflicts = [];
-      function keepLocalEdit(label, previous, edited, latest) {
-        if (sameValue(previous, edited) || sameValue(latest, edited)) return false;
-        if (sameValue(previous, latest)) return true;
+      function keepLocalEdit(label, previous, edited, latest, compare = sameValue) {
+        if (compare(previous, edited) || compare(latest, edited)) return false;
+        if (compare(previous, latest)) return true;
         conflicts.push(label);
         return false;
       }
@@ -812,8 +1043,12 @@
         for (const item of data.sections.flatMap(section => section.items)) {
           const key = item.id;
           if (!model.saved[key] || !model.draft[key]) continue;
-          if (keepLocalEdit(item.label, model.saved[key], model.draft[key], saved[key])) {
+          const compare = key === 'lbeMap'
+            ? (left, right) => sameValue(left?.value, right?.value)
+            : sameValue;
+          if (keepLocalEdit(item.label, model.saved[key], model.draft[key], saved[key], compare)) {
             draft[key] = structuredClone(model.draft[key]);
+            if (key === 'lbeMap') draft[key].managed = saved[key].managed;
           }
         }
       }
@@ -851,6 +1086,14 @@
       const delivery = groups
         ? 'The count includes offline devices, which receive the deployed version when they connect.'
         : 'Devices will receive this version once a group uses this package.';
+      let lbeDetail = '';
+      if (profile.lbe_mode === true) {
+        lbeDetail = profile.lbe_map_name
+          ? ' LBE mode will turn on and import ' + profile.lbe_map_name + '. The PICO LBE app may open in the foreground.'
+          : ' LBE mode will turn on with its selected map ZIP. The PICO LBE app may open in the foreground.';
+      } else if (profile.lbe_mode === false) {
+        lbeDetail = ' LBE mode will turn off. Any selected ZIP stays in this package for the next On deployment.';
+      }
       if (profile.clear) {
         return confirmAction('Stop managing settings for "' + groupName + '" (' + deviceCount + ')?\n\n' +
           'This stops managing all settings for this group and leaves current device values in place. ' +
@@ -861,13 +1104,13 @@
       }
       if (profile.use_current) {
         return confirmAction('Deploy the current version of "' + profile.name + '" to "' + groupName +
-          '" (' + deviceCount + ')?\n\n' + delivery);
+          '" (' + deviceCount + ')?\n\n' + delivery + lbeDetail);
       }
       const detail = groupName
         ? 'This deploys the saved settings again as a new version to all groups using it.'
         : 'This saves your edits and deploys them.';
       return confirmAction('Deploy "' + (editorName ?? profile.name) + '" to ' + groupCount + ' and ' + deviceCount +
-        '?\n\n' + detail + ' ' + delivery);
+        '?\n\n' + detail + ' ' + delivery + lbeDetail);
     }
 
     async function request(model, action, body) {
@@ -889,7 +1132,11 @@
           if (fresh.edit_revision !== model.editRevision) {
             throw Object.assign(new Error('The package changed. Reload and review the latest version before deploying.'), { status: 409 });
           }
-          if (!confirmDeployment(fresh, { editorName: model.name.trim() })) return;
+          const lbeMode = body.settings.lbeMode?.managed === true ? body.settings.lbeMode.value : null;
+          const lbeMap = lbeMode === true && body.settings.lbeMap?.managed === true
+            ? body.settings.lbeMap.value : null;
+          if (!confirmDeployment({ ...fresh, lbe_mode: lbeMode,
+            lbe_map_name: validLbeMap(lbeMap) ? lbeMap.name : null }, { editorName: model.name.trim() })) return;
           writing = true;
           data = await api(path + '/save-and-deploy', 'POST', { ...body, expected_impact: fresh.impact.token });
         } else if (action === 'delete') {
@@ -913,6 +1160,13 @@
           return;
         }
         readProfile(model, data, action === 'reload', beforeInstanceId);
+        if (action === 'reload') {
+          model.maps = [];
+          model.mapsStatus = 'idle';
+          model.mapsRequestId = (model.mapsRequestId || 0) + 1;
+          model.mapsMissingRefreshFor = '';
+          model.refreshMapsAfterReload = true;
+        }
         updateSummary(before, data, model.id);
         model.conflict = false;
         model.error = false;
@@ -928,7 +1182,11 @@
           catalog = (catalog || []).filter(pkg => pkg.package_id !== model.id);
           renderCatalog();
           model.message = 'This package was removed elsewhere. Select another package.';
-        } else if (error.status === 409 && error.code !== 'package_assigned') {
+        } else if (error.status === 409 && error.code !== 'package_assigned' &&
+            (error.message === 'The package changed. Reload and review the latest version before deploying.' ||
+             error.message === 'The package changed. Reload the package.' ||
+             error.message === 'Deployment targets changed. Review the updated targets before deploying.' ||
+             action === 'delete')) {
           model.conflict = true;
           model.message = action === 'deploy' && writing ?
             'The package or deployment targets changed. Reload and review before deploying again.' : error.message;
@@ -937,19 +1195,23 @@
         }
       } finally {
         model.busy = false;
-        renderEditor();
+        renderEditorPreservingFocus();
+        if (model.refreshMapsAfterReload && current === model) {
+          model.refreshMapsAfterReload = false;
+          loadLbeMaps(model);
+        }
       }
     }
 
     function canSwitchPackage(id) {
       if (!current || current.id === id) return true;
-      if (current.busy) return false;
+      if (current.busy || current.uploading) return false;
       return !current.saved || !hasChanges(current) || confirmAction('Discard the unsaved changes in "' + current.savedName + '"?');
     }
 
     async function duplicatePackage(model) {
       const catalogState = currentCatalogState(model);
-      if (model.busy || model.conflict || catalogState.stale || catalogState.removed || configurationAvailable === false) return;
+      if (model.busy || model.uploading || model.conflict || catalogState.stale || catalogState.removed || configurationAvailable === false) return;
       if (hasChanges(model) && !confirmAction('Discard the unsaved changes in "' + model.savedName + '" before duplicating?')) return;
       const name = promptForValue('Name for the copied package:', Array.from(model.savedName).slice(0, 57).join('') + ' (copy)');
       if (name === null || !name.trim()) return;
@@ -1258,6 +1520,13 @@
         model.name = target.value;
       } else if (manage) {
         model.draft[manage].managed = target.checked;
+        if (manage === 'lbeMode') {
+          model.error = false;
+          model.message = '';
+          renderEditorPreservingFocus();
+          packagePanel.querySelector('[data-manage="lbeMode"]')?.focus({ preventScroll: true });
+          return;
+        }
         if (manage === 'wifi') {
           if (!target.checked) {
             model.draft.wifi.value = structuredClone(model.saved.wifi.value);
@@ -1278,7 +1547,7 @@
       } else if (setting) {
         const entry = model.draft[setting];
         const value = entry.value;
-        if (!entry.managed) return;
+        if (!isSettingManaged(setting, model.draft)) return;
         if (network !== undefined) {
           const row = value.networks[Number(network)];
           row[field] = target.type === 'checkbox' ? target.checked : target.value;
@@ -1291,6 +1560,14 @@
             article.querySelector('[data-password-help]').textContent = wifiPasswordHelp(row);
           }
           if (field === 'hidden') updateWifiWarnings(target.closest('.settings-value'), model.draft);
+        } else if (setting === 'lbeMap') {
+          entry.value = model.maps?.find(map => map.sha256 === target.value) || null;
+        } else if (setting === 'lbeMode' && target.type === 'radio') {
+          entry.value = target.value === 'true';
+          model.error = false;
+          model.message = '';
+          renderEditorPreservingFocus();
+          return;
         } else if (setting === 'startupApp') {
           entry.value = target.value;
         } else if (setting === 'wifi' && field === 'auto_return') {
@@ -1327,6 +1604,23 @@
     }
 
     function handleEditorClick(event) {
+      if (event.isTrusted) {
+        const summary = event.target.closest('summary');
+        const section = summary?.closest('[data-settings-section]');
+        pendingLbeOpen = section?.dataset.settingsSection === 'lbe' && !section.open ? section : null;
+      }
+      const retryMaps = event.target.closest('[data-map-retry]');
+      if (retryMaps) {
+        if (!retryMaps.disabled && current && current.mapsStatus !== 'loading') loadLbeMaps(current, true);
+        return;
+      }
+      const mapChoose = event.target.closest('[data-map-choose]');
+      if (mapChoose) {
+        if (mapChoose.disabled || !current || !isSettingManaged('lbeMap', current.draft) || current.busy ||
+            current.uploading || current.mapsStatus === 'loading' || current.conflict) return;
+        packagePanel.querySelector('[data-map-upload]')?.click();
+        return;
+      }
       const button = event.target.closest('[data-policy-action]');
       const model = current;
       if (!button || button.disabled || !model || model.busy) return;
@@ -1437,7 +1731,23 @@
       if (!section || !current) return;
       if (event.target.open) current.expanded.add(section);
       else current.expanded.delete(section);
+      if (section === 'lbe' && event.target.open && pendingLbeOpen === event.target) {
+        pendingLbeOpen = null;
+        loadLbeMaps(current);
+      }
     }, true);
+
+    packagePanel.addEventListener('change', event => {
+      const input = event.target.closest('[data-map-upload]');
+      if (input) {
+        if (!current || current.busy || current.conflict || input.matches(':disabled')) return;
+        const file = input.files?.[0];
+        input.value = '';
+        if (file) return uploadLbeMap(current, file);
+        return;
+      }
+      if (event.target.closest('[data-setting="lbeMap"]')) handleInput(event);
+    });
 
     function showPackages(id) {
       if (id && !canSwitchPackage(id)) return;

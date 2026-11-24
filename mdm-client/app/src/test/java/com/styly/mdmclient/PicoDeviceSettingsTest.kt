@@ -2,9 +2,62 @@ package com.styly.mdmclient
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PicoDeviceSettingsTest {
+    @Test
+    fun `IPD accepts only tenths inside the SDK range`() {
+        assertEquals(58.0, normalizeIpd(58), 0.0)
+        assertEquals(63.1, normalizeIpd(63.1), 0.0)
+        assertEquals(72.0, normalizeIpd(72L), 0.0)
+    }
+
+    @Test
+    fun `IPD rejects off-grid and out-of-range values`() {
+        for (value in listOf(57.9, 72.1, 58.00001, Double.NaN, Double.POSITIVE_INFINITY, "63.1")) {
+            try {
+                normalizeIpd(value)
+                throw AssertionError("Expected IPD $value to be rejected")
+            } catch (_: IllegalArgumentException) {
+                // Expected.
+            }
+        }
+    }
+
+    @Test
+    fun `LBE map availability must stay active for the full observation window`() {
+        var now = 0L
+        val stable = awaitStableAvailability(
+            isAvailable = { now >= 600L },
+            nowElapsed = { now },
+            sleep = { now += it },
+            stableMillis = 800L,
+            timeoutMillis = 2_000L,
+            pollMillis = 100L,
+        )
+
+        assertTrue(stable)
+        assertEquals(1_400L, now)
+    }
+
+    @Test
+    fun `flapping LBE map availability times out`() {
+        var now = 0L
+        val stable = awaitStableAvailability(
+            isAvailable = { (now / 200L) % 2L == 0L },
+            nowElapsed = { now },
+            sleep = { now += it },
+            stableMillis = 800L,
+            timeoutMillis = 1_500L,
+            pollMillis = 100L,
+        )
+
+        assertFalse(stable)
+        assertEquals(1_500L, now)
+    }
+
     @Test
     fun `SDK linkage errors use the existing failed setting reason`() {
         val outcome = settingsFailureOutcome(NoSuchMethodError("missing SDK method"), "WRITE_FAILED")
@@ -53,20 +106,20 @@ class PicoDeviceSettingsTest {
     }
 
     @Test
-    fun `missing startup app waits but disabled or malformed apps fail without changing the launcher`() {
-        var launcherCalls = 0
+    fun `missing startup app restores the default before waiting and invalid values do not write`() {
+        val launcherCalls = mutableListOf<String?>()
 
-        val missing = applyPicoLauncher("com.example.missing", { null }) {
-            launcherCalls += 1
+        val missing = applyPicoLauncher("com.example.missing", { null }) { target ->
+            launcherCalls += target
             0
         }
-        val disabled = applyPicoLauncher("com.example.disabled", { false }) {
-            launcherCalls += 1
+        val disabled = applyPicoLauncher("com.example.disabled", { false }) { target ->
+            launcherCalls += target
             0
         }
         // The installed Android framework package is outside the home app package-name format.
-        val malformed = applyPicoLauncher("android", { true }) {
-            launcherCalls += 1
+        val malformed = applyPicoLauncher("android", { true }) { target ->
+            launcherCalls += target
             0
         }
 
@@ -78,7 +131,14 @@ class PicoDeviceSettingsTest {
         assertEquals("com.example.disabled", disabled.getString("value"))
         assertEquals("failed", malformed.getString("status"))
         assertEquals("INVALID_VALUE", malformed.getString("reason"))
-        assertEquals(0, launcherCalls)
+        assertEquals(listOf<String?>(null), launcherCalls)
+    }
+
+    @Test
+    fun `a failed default home reset is retryable instead of reporting waiting`() {
+        val rejected = applyPicoLauncher("com.example.missing", { null }) { 1 }
+        assertEquals("failed", rejected.getString("status"))
+        assertEquals("WRITE_FAILED", rejected.getString("reason"))
     }
 
     @Test

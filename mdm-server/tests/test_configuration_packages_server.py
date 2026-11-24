@@ -1,9 +1,12 @@
 """Configuration package lifecycle and policy delivery through the real routes."""
 
 import asyncio
+import hashlib
+import io
 import json
 import time
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from urllib.parse import urlencode
 
@@ -143,6 +146,130 @@ async def _assert_no_policy(ws):
             assert json.loads(frame.data)["type"] != "CONFIGURATION_POLICY"
     await ws.ping(b"processed")
     await asyncio.wait_for(receive(), 2)
+
+
+def test_lbe_map_download_survives_disconnect_and_requires_current_revision(tmp_path):
+    async def body():
+        groups = {"Studio": [DEVICE_ID, OTHER_ID]}
+        with io.BytesIO() as buffer:
+            with zipfile.ZipFile(buffer, "w") as archive:
+                archive.writestr("mapinfo.json", "{}")
+                archive.writestr("0.finchz", b"test")
+            content = buffer.getvalue()
+        async with _running_server(tmp_path, groups) as (session, base):
+            async def upload(origin):
+                form = aiohttp.FormData()
+                form.add_field("map", content, filename="Studio.zip", content_type="application/zip")
+                async with session.post(base + "/api/lbe-maps", data=form, headers={"Origin": origin}) as response:
+                    return response.status, await response.json()
+
+            assert (await upload("http://another-site.test"))[0] == 403
+            status, result = await upload(base)
+            assert status == 200, result
+            reference = {"sha256": hashlib.sha256(content).hexdigest(), "name": "Studio.zip", "size": len(content)}
+            assert result == {"map": reference}
+            assert await _request(session, "GET", base, "/api/lbe-maps") == {"maps": [reference]}
+
+            settings = {
+                "ipd": {"managed": True, "value": 63.1},
+                "lbeMode": {"managed": True, "value": True},
+                "lbeMap": {"managed": True, "value": reference},
+            }
+            package = await _create(session, base, "Studio")
+            await _deploy(session, base, package, settings={
+                "lbeMode": {"managed": True, "value": True},
+            }, status=400)
+            await _deploy(session, base, package, settings={
+                **settings, "lbeMap": {"managed": False, "value": reference},
+            }, status=400)
+            invalid = {**settings, "lbeMap": {"managed": True, "value": {**reference, "name": "Another.zip"}}}
+            await _deploy(session, base, package, settings=invalid, status=409)
+            deployed = await _deploy_to(session, base, package, settings, "Studio")
+            preview = await _request(session, "GET", base, _deployment_path("Studio", deployed["package_id"]))
+            assert preview["lbe_mode"] is True and preview["lbe_map_name"] == "Studio.zip"
+            supported = {**REGISTRATION, "capabilities": [*REGISTRATION["capabilities"],
+                                                           configuration_packages.LBE_MAP_CAPABILITY]}
+            legacy = {**REGISTRATION, "device_id": OTHER_ID}
+
+            async def download(policy, *, token=None, path=None, expected=200, byte_range=None):
+                headers = {"Authorization": "Bearer " + token} if token is not None else {}
+                if byte_range is not None:
+                    headers["Range"] = byte_range
+                async with session.get(base + (path or policy["lbe_map_download"]), headers=headers) as response:
+                    assert response.status == expected
+                    if expected == 200:
+                        assert response.headers["Cache-Control"] == "private, no-store"
+                        assert await response.read() == content
+                    elif expected == 206:
+                        assert response.headers["Content-Range"] == f"bytes 0-15/{len(content)}"
+                        assert await response.read() == content[:16]
+
+            async with (session.ws_connect(base + "/ws/device") as ws,
+                        session.ws_connect(base + "/ws/device") as legacy_ws):
+                await _register(ws, supported)
+                await _register(legacy_ws, legacy)
+                policy = await _receive_type(ws, "CONFIGURATION_POLICY")
+                old_policy = await _receive_type(legacy_ws, "CONFIGURATION_POLICY")
+                assert policy["settings"] == old_policy["settings"] == {
+                    "ipd": 63.1, "lbeMode": True, "lbeMap": reference,
+                }
+                assert "lbe_map_download" not in old_policy and "lbe_map_token" not in old_policy
+                await download(policy, expected=403)
+                await download(policy, token=policy["lbe_map_token"])
+                await download(policy, token=policy["lbe_map_token"],
+                               path=policy["lbe_map_download"].replace(DEVICE_ID, OTHER_ID), expected=403)
+                expired = server._lbe_map_token(
+                    DEVICE_ID, policy["revision"], reference["sha256"], int(time.time()) - 1,
+                )
+                await download(policy, token=expired, expected=403)
+                await download(policy, token=policy["lbe_map_token"],
+                               expected=206, byte_range="bytes=0-15")
+            async with session.ws_connect(base + "/ws/device") as reconnected:
+                # Download tokens authorize the current assignment, not one socket.
+                # A device may continue or resume the transfer after disconnect.
+                async def wait_for_disconnect():
+                    while DEVICE_ID in server.devices:
+                        await asyncio.sleep(0.005)
+
+                await asyncio.wait_for(wait_for_disconnect(), 2)
+                assert DEVICE_ID not in server.devices
+                await download(policy, token=policy["lbe_map_token"])
+                await _register(reconnected, supported)
+                current = await _receive_type(reconnected, "CONFIGURATION_POLICY")
+                assert current["revision"] == policy["revision"]
+                await download(policy, token=policy["lbe_map_token"])
+                await download(current, token=current["lbe_map_token"])
+
+                off = {**invalid, "lbeMode": {"managed": True, "value": False}}
+                saved_off = await _deploy(session, base, deployed, settings=off)
+                assert saved_off["settings"]["lbeMap"] == invalid["lbeMap"]
+                disabled = await _receive_type(reconnected, "CONFIGURATION_POLICY")
+                assert disabled["settings"] == {"ipd": 63.1, "lbeMode": False}
+                assert "lbe_map_token" not in disabled
+                await download(current, token=current["lbe_map_token"], expected=403)
+
+    asyncio.run(body())
+
+
+def test_public_configuration_state_preserves_lbe_and_ipd_evidence():
+    reference = {"sha256": "a" * 64, "name": "Studio.zip", "size": 64}
+    report = {
+        "package_id": str(uuid.uuid4()), "revision": str(uuid.uuid4()), "status": "complete",
+        "results": {
+            "ipd": {"status": "applied", "value": 63.1, "reason": "ACCEPTED_UNVERIFIED", "token": "private"},
+            "lbeMap": {"status": "applied", "value": reference, "reason": "MAP_ACTIVE_UNVERIFIED"},
+            "lbeMode": {"status": "failed", "value": False, "reason": "MAP_REQUIRED"},
+            "brightness": {"status": "applied", "value": 40, "reason": "ACCEPTED_UNVERIFIED"},
+        },
+    }
+    assert configuration_packages.public_configuration_state(report)["results"] == {
+        "ipd": {"status": "applied", "value": 63.1, "reason": "ACCEPTED_UNVERIFIED"},
+        "lbeMap": {"status": "applied", "value": reference, "reason": "MAP_ACTIVE_UNVERIFIED"},
+        "lbeMode": {"status": "failed", "value": False, "reason": "MAP_REQUIRED"},
+        "brightness": {"status": "applied", "value": 40},
+    }
+    report["results"]["lbeMode"] = {"status": "failed", "value": True, "reason": "MAP_NOT_LOADED"}
+    assert configuration_packages.public_configuration_state(report)["results"]["lbeMode"] == report["results"]["lbeMode"]
 
 
 def test_device_summary_tracks_group_and_deployment_without_sending_settings_to_summary_only_clients(tmp_path):
@@ -304,7 +431,11 @@ def test_mutations_enforce_origin_draft_cas_impact_and_validation(tmp_path):
             initial = await _create(session, base, " Studio ")
             assert initial["name"] == "Studio"
             assert initial["settings"] == {} and initial["edit_revision"] is None
-            assert [section["id"] for section in initial["sections"]] == ["basic", "network", "input", "safety", "advanced"]
+            assert [section["id"] for section in initial["sections"]] == ["basic", "network", "input", "safety", "lbe", "advanced"]
+            ipd = next(item for item in initial["sections"][0]["items"] if item["id"] == "ipd")
+            assert (ipd["kind"], ipd["min"], ipd["max"], ipd["step"], ipd["unit"]) == (
+                "decimal", 58, 72, 0.1, "mm",
+            )
             advanced = next(section for section in initial["sections"] if section["id"] == "advanced")
             usb_boot = next(item for item in advanced["items"] if item["id"] == "usbBoot")
             assert usb_boot["kind"] == "bool" and usb_boot["default"] is False
@@ -341,6 +472,10 @@ def test_mutations_enforce_origin_draft_cas_impact_and_validation(tmp_path):
 
             for invalid in (
                 _brightness(False),
+                {"ipd": {"managed": True, "value": 57.9}},
+                {"ipd": {"managed": True, "value": 64.05}},
+                {"ipd": {"managed": True, "value": True}},
+                {"lbeMap": {"managed": True, "value": None}},
                 {"usbCopy": {"managed": True, "value": "on"}},
                 {"developerMenu": {"managed": False, "value": None}},
                 {"wifi": {"managed": True, "value": _wifi_value(networks=[])}},

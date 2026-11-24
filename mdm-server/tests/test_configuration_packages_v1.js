@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const { File } = require('node:buffer');
 const test = require('node:test');
 const {
   createController, loadDraft, buildPayload, deviceOutcome, retryEligible,
@@ -27,6 +28,16 @@ const sections = [
     { id: 'developerMenu', label: 'Developer options menu', kind: 'bool', default: false },
   ] },
 ];
+const lbeSections = [
+  { ...sections[0], items: [...sections[0].items,
+    { id: 'ipd', label: 'IPD', kind: 'decimal', min: 58, max: 72, step: 0.1, unit: 'mm', default: 64 }],
+  },
+  { id: 'lbe', title: 'LBE', description: 'Location-based experience', items: [
+    { id: 'lbeMode', label: 'LBE mode', kind: 'bool', default: false },
+    { id: 'lbeMap', label: 'LBE map', kind: 'lbe-map', default: null },
+  ] },
+];
+const mapReference = { sha256: 'a'.repeat(64), name: 'Venue.zip', size: 1024 };
 test('metadata defaults are visible in the draft and unmanaged', () => {
   const saved = loadDraft(sections, {});
   const draft = structuredClone(saved);
@@ -90,6 +101,62 @@ test('managed writes reject values outside the catalog', () => {
     { managed: false, value: 'com.legacy.home' }, 'saved unmanaged package IDs remain available');
 });
 
+test('IPD enforces the decimal range and one tenth millimeter step', () => {
+  const saved = loadDraft(lbeSections, {});
+  const draft = structuredClone(saved);
+  draft.ipd = { managed: true, value: 64.7 };
+  assert.equal(buildPayload(lbeSections, draft, saved).ipd.value, 64.7);
+  for (const value of [57.9, 72.1, 64.05, NaN]) {
+    draft.ipd.value = value;
+    assert.throws(() => buildPayload(lbeSections, draft, saved), /Select a supported value for IPD/);
+  }
+});
+
+test('LBE mode alone manages its map and retains the selected ZIP while Off or unmanaged', () => {
+  const saved = loadDraft(lbeSections, {
+    lbeMode: { managed: true, value: true }, lbeMap: { managed: true, value: mapReference },
+  });
+  const draft = structuredClone(saved);
+  draft.lbeMode = { managed: true, value: false };
+  assert.deepEqual(buildPayload(lbeSections, draft, saved).lbeMap,
+    { managed: false, value: mapReference }, 'turning LBE off retains the ZIP but stops managing it');
+  draft.lbeMode.managed = false;
+  assert.deepEqual(buildPayload(lbeSections, draft, saved).lbeMap,
+    { managed: false, value: mapReference }, 'unmanaged LBE mode retains the ZIP without sending it');
+
+  draft.lbeMode = { managed: true, value: true };
+  assert.deepEqual(buildPayload(lbeSections, draft, saved).lbeMap, { managed: true, value: mapReference },
+    'managed On sends the selected ZIP');
+
+  draft.lbeMap.value = null;
+  assert.throws(() => buildPayload(lbeSections, draft, saved), /Select a map ZIP/,
+    'managed On cannot be deployed without a ZIP');
+  for (const invalid of [
+    { ...mapReference, sha256: mapReference.sha256.toUpperCase() },
+    { ...mapReference, name: '../Venue.zip' },
+    { ...mapReference, name: 'Venue.zip', extra: true },
+    { ...mapReference, size: 512 * 1024 * 1024 + 1 },
+  ]) {
+    draft.lbeMap = { managed: true, value: invalid };
+    assert.throws(() => buildPayload(lbeSections, draft, saved), /Select a supported value for LBE map/);
+  }
+});
+
+test('device result explains that IPD and active map cannot be read back', () => {
+  const deployment = { package_id: 'pkg', revision: 'r1', keys: ['ipd', 'lbeMap'] };
+  const device = { status: 'online', configuration_supported: true, configuration_state: {
+    package_id: 'pkg', revision: 'r1', status: 'complete', results: {
+      ipd: { status: 'applied', reason: 'ACCEPTED_UNVERIFIED' },
+      lbeMap: { status: 'applied', reason: 'MAP_ACTIVE_UNVERIFIED' },
+    },
+  } };
+  const [state, heading, detail] = deviceOutcome(device, 'pkg', deployment);
+  assert.equal(state, 'success');
+  assert.equal(heading, 'Applied');
+  assert.match(detail, /accepted the IPD setting, which cannot be read back/);
+  assert.match(detail, /Map import succeeded, but the active map cannot be confirmed/);
+});
+
 test('PICO home app saves the Android package name entered in Basic settings', async () => {
   const latest = profile({ settings: {} });
   const fixture = createHarness(({ method, url, body }) => {
@@ -99,7 +166,8 @@ test('PICO home app saves the Android package name entered in Basic settings', a
     return response({ ...latest, settings: body.settings, edit_revision: 'edit2', published_revision: 'r1' });
   });
   await fixture.controller.showPackages('pkg');
-  assert.match(fixture.packagePanel.innerHTML, /Android package name<input[^>]*type="text"[^>]*data-setting="startupApp"/);
+  assert.match(fixture.packagePanel.innerHTML,
+    /<label class="settings-field-label">Android package name<input[^>]*type="text"[^>]*data-setting="startupApp" value="" placeholder="PICO default"/);
   assert.doesNotMatch(fixture.packagePanel.innerHTML, /type="file"/);
   fixture.edit({ dataset: { manage: 'startupApp' }, checked: true, type: 'checkbox' });
   fixture.edit({ dataset: { setting: 'startupApp' }, type: 'text', value: 'com.example.viewer' });
@@ -322,10 +390,13 @@ test('Wi-Fi Android selection disables ordering and auto-return, and saves expli
   assert.match(fixture.packagePanel.innerHTML, /Android auto-connects only to the first network/);
   assert.match(fixture.packagePanel.innerHTML, /data-policy-action="move-network"/);
   assert.match(fixture.packagePanel.innerHTML, /data-field="auto_return" checked/);
+  assert.doesNotMatch(fixture.packagePanel.innerHTML, /wifi-network-head-compact/);
 
   fixture.edit({ dataset: { setting: 'wifi', field: 'prioritize_networks' }, checked: false, type: 'checkbox' });
   assert.doesNotMatch(fixture.packagePanel.innerHTML, /data-policy-action="move-network"/);
   assert.doesNotMatch(fixture.packagePanel.innerHTML, /data-field="auto_return"/);
+  assert.match(fixture.packagePanel.innerHTML,
+    /class="wifi-network-head wifi-network-head-compact">\s*<label>SSID<input[^>]*><\/label>\s*<div class="wifi-network-actions">\s*<button[^>]*data-policy-action="remove-network"/);
   assert.match(fixture.packagePanel.innerHTML, /Android chooses the network/);
   assert.match(fixture.packagePanel.innerHTML, /Auto-connect is on for listed SSID and security matches and off for other saved networks/);
   await fixture.editClick('deploy');
@@ -854,6 +925,8 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     ...Object.fromEntries(Object.entries(editorButtons).map(([key, button]) => [`[data-policy-action="${key}"]`, button])),
   };
   const footerStatus = createElement();
+  const mapFileInput = createElement({ clicked: false, click() { this.clicked = true; } });
+  const lbeManageControl = createElement({ focused: false, focus() { this.focused = true; } });
   const groupControls = {
     '[data-group-package]': createElement({ matches: () => true }),
     '[data-assignment-feedback]': createElement(),
@@ -869,7 +942,9 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
   let panelHtml = '';
   let passwordInputs = [];
   const packagePanel = createElement({
-    querySelector: selector => packagePanel.innerHTML.includes('settings-editor') ? editorControls[selector] : null,
+    querySelector: selector => selector === '[data-map-upload]' ? mapFileInput :
+      selector === '[data-manage="lbeMode"]' ? lbeManageControl :
+        packagePanel.innerHTML.includes('settings-editor') ? editorControls[selector] : null,
     querySelectorAll: selector => selector === '[data-field="password"]' ? passwordInputs : [],
   });
   Object.defineProperty(packagePanel, 'innerHTML', {
@@ -909,7 +984,7 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     onSnapshot,
     requestGroupSnapshot,
     fetch: async (url, init) => {
-      const request = { url, method: init.method, body: init.body && JSON.parse(init.body) };
+      const request = { url, method: init.method, body: typeof init.body === 'string' ? JSON.parse(init.body) : init.body };
       requests.push(request);
       return respond(request);
     },
@@ -933,7 +1008,8 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     selector.includes('move-network') ? moveButtons : [] };
   const policyClick = dataset => {
     const button = { dataset, disabled: dataset.policyAction === 'add-network' ? addNetworkButton.disabled : false };
-    return packagePanel.handlers.get('click')({ target: { closest: () => button } });
+    return packagePanel.handlers.get('click')({ target: { closest: selector =>
+      selector === '[data-policy-action]' ? button : null } });
   };
   // A Manage checkbox sits beside the value fieldset, not inside it.
   const edit = ({ dataset, value, checked, type }) => packagePanel.handlers.get('input')({ target: {
@@ -943,7 +1019,15 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
         selector === '.wifi-network' ? wifiArticle(dataset) :
         { dataset: { settingsSection: 'basic' }, querySelector: () => ({}), querySelectorAll: () => [] },
   } });
-  const editClick = action => packagePanel.handlers.get('click')({ target: { closest: () => editorButtons[action] } });
+  const editClick = action => packagePanel.handlers.get('click')({ target: { closest: selector =>
+    selector === '[data-policy-action]' ? editorButtons[action] : null } });
+  const openLbe = () => {
+    const section = { dataset: { settingsSection: 'lbe' }, open: false };
+    const summary = { closest: selector => selector === '[data-settings-section]' ? section : null };
+    packagePanel.handlers.get('click')({ isTrusted: true, target: { closest: selector => selector === 'summary' ? summary : null } });
+    section.open = true;
+    packagePanel.handlers.get('toggle')({ target: section });
+  };
   const groupClick = action => groupPanel.handlers.get('click')({ target: { closest: () => groupButtons[action] } });
   const select = id => {
     const control = groupControls['[data-group-package]'];
@@ -965,6 +1049,7 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
     controller, packagePanel, packageList, catalogNotice, catalogStatus, groupPanel, edit, editClick, policyClick, editorButtons, editorControls, groupControls,
     groupClick, groupButtons, select, broadcast, create, createControls, requests, confirmations,
     passwordInputs: () => passwordInputs,
+    mapFileInput, lbeManageControl, openLbe,
     valueField, moveButtons, wifiLimitWarning, wifiHiddenWarning, addNetworkButton, footerStatus,
     opened: () => opened,
   };
@@ -984,6 +1069,177 @@ test('Device status follows live Wi-Fi independently of any deployment', () => {
   device.status = 'offline';
   fixture.controller.renderGroup('The Lab');
   assert.doesNotMatch(results.innerHTML, /Wi-Fi: Guest/);
+});
+
+test('LBE editor uploads a ZIP, keeps the manage control usable, and confirms the selected map', async () => {
+  let latest = profile({ settings: { lbeMode: { managed: false, value: false },
+    lbeMap: { managed: false, value: null } }, itemSections: lbeSections });
+  const maps = [];
+  const fixture = createHarness(({ method, url, body }) => {
+    if (url === '/api/packages' && method === 'GET') return response({ packages: [pkg] });
+    if (url === '/api/lbe-maps' && method === 'GET') return response({ maps });
+    if (url === '/api/lbe-maps' && method === 'POST') {
+      assert.equal(body.get('map').name, 'Venue.zip');
+      maps.push(mapReference);
+      return response({ map: mapReference });
+    }
+    if (url === '/api/packages/pkg' && method === 'GET') return response(latest);
+    if (url === '/api/packages/pkg/save-and-deploy') {
+      latest = { ...latest, settings: body.settings, edit_revision: 'edit2', published_revision: 'r1' };
+      return response(latest);
+    }
+    assert.fail(`Unexpected request: ${method} ${url}`);
+  });
+  fixture.broadcast({ packages: [pkg] });
+  await fixture.controller.showPackages('pkg');
+  fixture.openLbe();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(fixture.packagePanel.innerHTML, /No map ZIPs uploaded/);
+
+  assert.doesNotMatch(fixture.packagePanel.innerHTML, /data-manage="lbeMap"/,
+    'the map does not have a separate Manage checkbox');
+  fixture.edit({ dataset: { manage: 'lbeMode' }, checked: true, type: 'checkbox' });
+  assert.equal(fixture.lbeManageControl.focused, true, 'rerender preserves keyboard focus on Manage');
+  assert.match(fixture.packagePanel.innerHTML, /data-map-choose disabled/,
+    'the map controls stay disabled until LBE mode is On');
+  fixture.edit({ dataset: { setting: 'lbeMode' }, type: 'radio', value: 'true' });
+  assert.equal(fixture.editorButtons.deploy.disabled, true, 'managed On requires a selected ZIP');
+  assert.doesNotMatch(fixture.packagePanel.innerHTML, /data-map-choose disabled/,
+    'the map controls enable with managed LBE On');
+  assert.match(fixture.packagePanel.innerHTML, /Select a map ZIP/);
+  assert.match(fixture.packagePanel.innerHTML, /<button class="btn-outline" type="button" data-map-choose\s*>Upload ZIP…<\/button>/,
+    'upload is a keyboard reachable button');
+  fixture.packagePanel.handlers.get('click')({ target: { closest: selector =>
+    selector === '[data-map-choose]' ? { disabled: false } : null } });
+  assert.equal(fixture.mapFileInput.clicked, true);
+
+  const file = new File(['zip-bytes'], 'Venue.zip', { type: 'application/zip' });
+  await fixture.packagePanel.handlers.get('change')({ target: {
+    files: [file], value: '', matches: () => false,
+    closest(selector) { return selector === '[data-map-upload]' ? this : null; },
+  } });
+  assert.match(fixture.packagePanel.innerHTML, /Venue\.zip · 1 KB/);
+
+  fixture.edit({ dataset: { setting: 'lbeMode' }, type: 'radio', value: 'false' });
+  assert.match(fixture.packagePanel.innerHTML, /Venue\.zip/,
+    'switching LBE Off retains the selected ZIP in the draft');
+  fixture.edit({ dataset: { setting: 'lbeMode' }, type: 'radio', value: 'true' });
+  await fixture.editClick('deploy');
+  assert.match(fixture.confirmations[0], /LBE mode will turn on and import Venue\.zip/);
+  assert.match(fixture.confirmations[0], /may open in the foreground/);
+  assert.deepEqual(fixture.requests.at(-1).body.settings.lbeMap, { managed: true, value: mapReference });
+
+  fixture.broadcast({ server_instance_id: 'server-b', packages: [pkg] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fixture.requests.filter(request => request.url === '/api/lbe-maps' && request.method === 'GET').length, 2,
+    'a new server instance reloads the map library while its section is open');
+});
+
+test('selecting a registered map on managed LBE On enables Save & deploy', async () => {
+  let latest = profile({ settings: { lbeMode: { managed: true, value: true },
+    lbeMap: { managed: false, value: null } }, itemSections: lbeSections });
+  const fixture = createHarness(({ method, url, body }) => {
+    if (url === '/api/packages' && method === 'GET') return response({ packages: [pkg] });
+    if (url === '/api/lbe-maps' && method === 'GET') return response({ maps: [mapReference] });
+    if (url === '/api/packages/pkg' && method === 'GET') return response(latest);
+    if (url === '/api/packages/pkg/save-and-deploy') {
+      latest = { ...latest, settings: body.settings, edit_revision: 'edit2', published_revision: 'r1' };
+      return response(latest);
+    }
+    assert.fail(`Unexpected request: ${method} ${url}`);
+  });
+  fixture.broadcast({ packages: [pkg] });
+  await fixture.controller.showPackages('pkg');
+  fixture.openLbe();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fixture.editorButtons.deploy.disabled, true, 'LBE On blocks until a map is selected');
+
+  const select = {
+    dataset: { setting: 'lbeMap' }, value: mapReference.sha256, type: 'select-one', matches: () => false,
+    closest(selector) { return selector === '[data-setting="lbeMap"]' ? this : null; },
+  };
+  fixture.packagePanel.handlers.get('change')({ target: select });
+  assert.equal(fixture.editorButtons.deploy.disabled, false,
+    'the ZIP change event updates the draft and unblocks deployment');
+  await fixture.editClick('deploy');
+  assert.match(fixture.confirmations[0], /import Venue\.zip/);
+  assert.deepEqual(fixture.requests.at(-1).body.settings.lbeMap, { managed: true, value: mapReference });
+});
+
+test('a failed map library request waits for explicit Retry without a rerender loop', async () => {
+  let requests = 0;
+  const fixture = createHarness(({ url }) => {
+    if (url === '/api/packages') return response({ packages: [pkg] });
+    if (url === '/api/packages/pkg') return response(profile({ itemSections: lbeSections }));
+    if (url === '/api/lbe-maps') {
+      requests += 1;
+      return requests === 1 ? response({}, 503) : response({ maps: [mapReference] });
+    }
+    assert.fail(`Unexpected request: ${url}`);
+  });
+  fixture.broadcast({ packages: [pkg] });
+  await fixture.controller.showPackages('pkg');
+  fixture.openLbe();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(fixture.packagePanel.innerHTML, /Retry map list/);
+  assert.doesNotMatch(fixture.packagePanel.innerHTML, /aria-label="LBE map" disabled/,
+    'the catalog can be retried before enabling LBE');
+  fixture.packagePanel.handlers.get('toggle')({ target: { dataset: { settingsSection: 'lbe' }, open: true } });
+  fixture.openLbe();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests, 1);
+  fixture.packagePanel.handlers.get('click')({ target: { closest: selector =>
+    selector === '[data-map-retry]' ? { disabled: false } : null } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests, 2);
+  assert.match(fixture.packagePanel.innerHTML, /Venue\.zip/);
+});
+
+test('Reload fetches map metadata again before warning about a new remote selection', async () => {
+  let latest = profile({ itemSections: lbeSections });
+  let maps = [];
+  const fixture = createHarness(({ url }) => {
+    if (url === '/api/packages') return response({ packages: [pkg] });
+    if (url === '/api/packages/pkg') return response(latest);
+    if (url === '/api/lbe-maps') return response({ maps });
+    assert.fail(`Unexpected request: ${url}`);
+  });
+  fixture.broadcast({ packages: [pkg] });
+  await fixture.controller.showPackages('pkg');
+  fixture.openLbe();
+  await new Promise(resolve => setImmediate(resolve));
+  latest = profile({
+    editRevision: 'edit2', itemSections: lbeSections,
+    settings: { lbeMode: { managed: true, value: true }, lbeMap: { managed: true, value: mapReference } },
+  });
+  maps = [mapReference];
+  await fixture.editClick('reload');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fixture.requests.filter(request => request.url === '/api/lbe-maps').length, 2);
+  assert.match(fixture.packagePanel.innerHTML, /Venue\.zip/);
+  assert.doesNotMatch(fixture.packagePanel.innerHTML, /Not in map library/);
+});
+
+test('group redeploy confirmation explains LBE mode and map behavior', async () => {
+  const fixture = createHarness(({ method }) => method === 'POST'
+    ? response(groupSnapshot(2, { packages: [pkg], assignments: { 'The Lab': 'pkg' },
+      deployments: { 'The Lab': d1 } }))
+    : response({ ...profile(), use_current: true, lbe_mode: true, lbe_map_name: 'Hall.zip',
+      impact: { groups: 1, devices: 1, token: 'impact1' } }));
+  fixture.broadcast({ packages: [pkg], assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
+  fixture.controller.renderGroup('The Lab');
+  await fixture.groupClick('deploy');
+  assert.match(fixture.confirmations[0], /LBE mode will turn on and import Hall\.zip/);
+  assert.match(fixture.confirmations[0], /may open in the foreground/);
+
+  const offFixture = createHarness(({ method }) => method === 'POST'
+    ? response(groupSnapshot(2, { packages: [pkg], assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } }))
+    : response({ ...profile(), use_current: true, lbe_mode: false,
+      impact: { groups: 1, devices: 1, token: 'impact1' } }));
+  offFixture.broadcast({ packages: [pkg], assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': d1 } });
+  offFixture.controller.renderGroup('The Lab');
+  await offFixture.groupClick('deploy');
+  assert.match(offFixture.confirmations[0], /LBE mode will turn off[\s\S]*selected ZIP stays in this package/);
 });
 
 test('group cards use the committed assignment and count only reports for its deployed revision', () => {
@@ -1259,7 +1515,7 @@ test('a stale impact never republishes automatically and a subsequent confirmati
     if (method === 'GET') return response(latest);
     if (body.expected_impact === 'impact1') {
       latest = profile({ impact: { groups: 1, devices: 4, token: 'impact2' } });
-      return response({ error: 'Impact changed.' }, 409);
+      return response({ error: 'Deployment targets changed. Review the updated targets before deploying.' }, 409);
     }
     return response({ ...latest, published_revision: 'r2' });
   });
@@ -1291,6 +1547,24 @@ test('a revision changed by another console blocks publication before confirmati
   assert.equal(fixture.editorButtons.deploy.disabled, true);
 });
 
+test('a rejected LBE map selection leaves the editor available for correction', async () => {
+  const latest = profile({ itemSections: lbeSections, settings: {
+    lbeMode: { managed: true, value: true }, lbeMap: { managed: true, value: mapReference },
+  } });
+  const fixture = createHarness(({ url, method }) => {
+    if (url === '/api/packages/pkg' && method === 'GET') return response(latest);
+    if (url === '/api/packages/pkg/save-and-deploy') {
+      return response({ error: 'The selected LBE map is unavailable. Upload or select it again.' }, 409);
+    }
+    assert.fail(`Unexpected request: ${method} ${url}`);
+  });
+  fixture.broadcast({ packages: [pkg] });
+  await fixture.controller.showPackages('pkg');
+  await fixture.editClick('deploy');
+  assert.match(fixture.editorControls['[data-settings-feedback]'].textContent, /selected LBE map is unavailable/);
+  assert.equal(fixture.editorButtons.deploy.disabled, false);
+});
+
 test('a save conflict preserves independent edits and replaces overlapping values with the latest version', async () => {
   let latest = profile();
   const fixture = createHarness(({ method, body }) => {
@@ -1299,7 +1573,7 @@ test('a save conflict preserves independent edits and replaces overlapping value
       latest = profile({ editRevision: 'remote', settings: {
         brightness: { managed: true, value: 62 }, autoSleep: { managed: true, value: true },
       } });
-      return response({ error: 'Draft changed.' }, 409);
+      return response({ error: 'The package changed. Reload the package.' }, 409);
     }
     return response({ ...latest, edit_revision: 'edit2', settings: body.settings, name: body.name });
   });
@@ -1333,7 +1607,7 @@ test('a Wi-Fi strategy edit conflicts with a remote network addition', async () 
         ...initialWifi.value,
         networks: [...initialWifi.value.networks, { ssid: 'Backup', security: 'OPEN', hidden: false }],
       } } } });
-      return response({ error: 'Draft changed.' }, 409);
+      return response({ error: 'The package changed. Reload the package.' }, 409);
     }
     latest = { ...latest, edit_revision: 'edit2', published_revision: 'r1', settings: body.settings };
     return response(latest);
@@ -1372,7 +1646,7 @@ test('reload replaces a conflicting local Wi-Fi password with the newer saved pa
         networks: [{ ssid: 'Studio', security: 'WPA2_WPA3', hidden: false,
           password: 'remote-secret' }],
       } } } });
-      return response({ error: 'Draft changed.' }, 409);
+      return response({ error: 'The package changed. Reload the package.' }, 409);
     }
     return response({ ...latest, edit_revision: 'edit2', settings: body.settings });
   });
@@ -1398,7 +1672,7 @@ test('concurrent edits to hour and minute cannot produce a third shutdown time',
       latest = profile({ editRevision: 'remote', settings: { shutdown: { managed: true, value: {
         enabled: true, hour: 22, minute: 45, repeat: 127,
       } } } });
-      return response({ error: 'Draft changed.' }, 409);
+      return response({ error: 'The package changed. Reload the package.' }, 409);
     }
     return response({ ...latest, settings: body.settings, edit_revision: 'edit2' });
   });

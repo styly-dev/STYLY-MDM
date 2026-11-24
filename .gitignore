@@ -41,6 +41,7 @@ mdm-server/device_registry.json.tmp
 mdm-server/device_registry.json.*.bak
 mdm-server/push_jobs.sqlite3*
 mdm-server/bundles/
+mdm-server/lbe-maps/
 mdm-server/push-artifacts/
 
 # === Agent workflow scratch ===
