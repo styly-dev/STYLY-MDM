@@ -1638,7 +1638,9 @@ async def _map_staging_cleanup(_app: web.Application):
     cleanup_task = None
     try:
         store = _lbe_map_store()
-        await asyncio.to_thread(store.restore_legacy_permissions)
+        # mkdir(mode=...) does not restrict a pre-existing library root.
+        if os.name == "posix" and store.root.stat().st_mode & 0o777 != 0o700:
+            store.root.chmod(0o700)
         candidates = await asyncio.to_thread(store.staging_directories)
         removed = await asyncio.to_thread(store.remove_stale_staging, candidates)
         if removed:

@@ -92,40 +92,6 @@ class LbeMapStore:
             if not candidate.is_symlink() and candidate.is_dir()
         )
 
-    def restore_legacy_permissions(self) -> None:
-        """Make legacy read-only entries manageable under the private storage root."""
-        if stat.S_IMODE(self.root.lstat().st_mode) != 0o700:
-            os.chmod(self.root, 0o700)
-        try:
-            entries = tuple(self.root.iterdir())
-        except OSError as exc:
-            raise LbeMapError("Could not read map storage", 500) from exc
-        for entry in entries:
-            if (_SHA256_PATTERN.fullmatch(entry.name) is None
-                    and not entry.name.startswith(LBE_MAP_STAGING_PREFIX)):
-                continue
-            self._restore_entry_permissions(entry)
-
-    @staticmethod
-    def _restore_entry_permissions(directory: Path) -> None:
-        try:
-            info = directory.lstat()
-        except FileNotFoundError:
-            return
-        if not stat.S_ISDIR(info.st_mode):
-            return
-        if stat.S_IMODE(info.st_mode) != 0o700:
-            os.chmod(directory, 0o700)
-        for name in ("map.zip", "metadata.json"):
-            child = directory / name
-            try:
-                child_info = child.lstat()
-            except FileNotFoundError:
-                continue
-            if (stat.S_ISREG(child_info.st_mode)
-                    and stat.S_IMODE(child_info.st_mode) != 0o600):
-                os.chmod(child, 0o600)
-
     def remove_stale_staging(self, candidates: Iterable[Path], *, now: float | None = None) -> int:
         """Remove only startup candidates whose last upload write exceeded the TTL."""
         current_time = time.time() if now is None else now
@@ -143,7 +109,6 @@ class LbeMapStore:
                     last_write = candidate.stat().st_mtime
                 if current_time - last_write < LBE_MAP_STAGING_MAX_AGE_SECONDS:
                     continue
-                self._restore_entry_permissions(candidate)
                 self._remove_tree(candidate)
                 removed += 1
             except OSError:
@@ -236,7 +201,6 @@ class LbeMapStore:
 
             reference = {"sha256": digest.hexdigest(), "name": name, "size": size}
             destination = self.root / reference["sha256"]
-            self._restore_entry_permissions(destination)
             existing_metadata = None
             if destination.exists() or destination.is_symlink():
                 existing_metadata = self._read_metadata(destination)

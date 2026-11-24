@@ -144,9 +144,7 @@ def test_upload_repairs_same_size_corruption_from_valid_duplicate(tmp_path):
     assert archive is not None
     damaged = bytearray(data)
     damaged[-1] ^= 0x01
-    os.chmod(archive, 0o600)
     archive.write_bytes(damaged)
-    os.chmod(archive.parent, 0o500)
 
     repaired_status, repaired_reference = asyncio.run(upload(store, data=data))
 
@@ -182,9 +180,7 @@ def test_upload_repairs_a_missing_archive_from_valid_bytes(tmp_path):
     destination = store.root / reference["sha256"]
     archive = destination / "map.zip"
 
-    os.chmod(destination, 0o700)
     archive.unlink()
-    os.chmod(destination, 0o500)
     repaired_status, repaired_reference = asyncio.run(upload(store, data=data))
 
     assert repaired_status == 200
@@ -200,38 +196,12 @@ def test_upload_repairs_a_truncated_archive_atomically(tmp_path):
     destination = store.root / reference["sha256"]
     archive = destination / "map.zip"
 
-    os.chmod(destination, 0o700)
-    os.chmod(archive, 0o600)
     archive.write_bytes(data[:8])
-    os.chmod(destination, 0o500)
     repaired_status, repaired_reference = asyncio.run(upload(store, data=data))
 
     assert repaired_status == 200
     assert repaired_reference == reference
     assert archive.read_bytes() == data
-
-
-def test_startup_restores_legacy_read_only_map_permissions(tmp_path):
-    store = LbeMapStore(tmp_path / "maps")
-    data = make_zip({"mapinfo.json": b"{}"})
-    status, reference = asyncio.run(upload(store, data=data))
-    assert status == 200
-    destination = store.root / reference["sha256"]
-    archive = destination / "map.zip"
-    metadata = destination / "metadata.json"
-
-    os.chmod(archive, 0o400)
-    os.chmod(metadata, 0o400)
-    os.chmod(destination, 0o500)
-
-    restarted = LbeMapStore(store.root)
-    restarted.restore_legacy_permissions()
-
-    assert destination.stat().st_mode & 0o777 == 0o700
-    assert archive.stat().st_mode & 0o777 == 0o600
-    assert metadata.stat().st_mode & 0o777 == 0o600
-    archive.write_bytes(b"manual backup restore")
-    assert archive.read_bytes() == b"manual backup restore"
 
 
 def test_invalid_stored_metadata_returns_an_actionable_repair_message(tmp_path):
@@ -242,11 +212,7 @@ def test_invalid_stored_metadata_returns_an_actionable_repair_message(tmp_path):
     destination = store.root / reference["sha256"]
     metadata = destination / "metadata.json"
 
-    os.chmod(destination, 0o700)
-    os.chmod(metadata, 0o600)
     metadata.write_text("{}", encoding="utf-8")
-    os.chmod(metadata, 0o400)
-    os.chmod(destination, 0o500)
     retry_status, error = asyncio.run(upload(store, data=data))
 
     assert retry_status == 500
@@ -424,13 +390,11 @@ def test_upload_rejects_nested_multipart_without_server_error(tmp_path):
     assert store.list_maps() == []
 
 
-def test_stale_read_only_staging_is_recovered(tmp_path):
+def test_stale_staging_is_removed(tmp_path):
     store = LbeMapStore(tmp_path / "maps")
     stale = store.root / ".lbe-map-upload-stale"
     stale.mkdir()
     (stale / "map.zip").write_bytes(b"partial")
-    os.chmod(stale / "map.zip", 0o400)
-    os.chmod(stale, 0o500)
     now = time.time()
     old_time = now - lbe_maps.LBE_MAP_STAGING_MAX_AGE_SECONDS - 1
     os.utime(stale / "map.zip", (old_time, old_time))

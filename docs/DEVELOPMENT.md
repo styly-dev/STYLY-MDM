@@ -283,9 +283,8 @@ The server accepts standard LBE ZIPs up to 512 MiB and stores them by SHA-256
 under `lbe-maps/` in the MDM data directory. The server deduplicates matching
 bytes. Re-uploading the original ZIP checks the stored bytes against their
 SHA-256 and repairs a missing, truncated or corrupted archive when its
-registered metadata is intact. The private library directory restricts access.
-The server restores owner write access to legacy read-only map entries at
-startup so administrators can remove or restore them. Published map ZIPs have no aggregate quota or
+registered metadata is intact. On POSIX, the server restricts the library root to
+owner-only access. Published map ZIPs have no aggregate quota or
 console deletion action. Abandoned upload staging directories become eligible
 for cleanup after 24 hours, including when the server restarted before then.
 
