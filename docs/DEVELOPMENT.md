@@ -22,8 +22,9 @@ For end-user setup and usage, see the [README](../README.md).
 
 **Push Files** and **Sync Folder** use server-owned UUID jobs, a SQLite-backed
 lifecycle, immutable artifacts, and an Application-scoped client coordinator.
-APK installation keeps its existing command path and shares the server-wide
-download budget with Push/Sync.
+Venue maps use the Push/Sync HTTP sender and resumable Android downloader.
+The configuration controller owns the map assignment and PICO import. APK
+installation shares the server-wide download budget with both transfer types.
 
 `PushJobStore` serializes SQLite access; `PushJobManager` owns lifecycle decisions
 and commits related state, fences, and revisions together. `push_runtime.py`
@@ -133,9 +134,13 @@ the managed settings sent to devices from the saved values.
   Deleting a group releases its members. A referenced package cannot be deleted.
 - The group Devices editor sends only staged changes with the expected group of
   each device. The server rejects the whole edit if an owner changed or an
-  added device has no registry record. Existing members without a record can
+  added device has no registry record. Save previews the package or release for affected
+  devices and checks the effective deployment revisions of the edited groups.
+  Delete checks the group list version captured when the operator confirms.
+  Existing members without a record can
   still be removed.
-  A console opened before the server upgrade must be reloaded before editing membership.
+  Reload open consoles after upgrading the server. Older callers can omit the new
+  concurrency checks and retain their previous behavior.
 - The editor keeps one draft entry per changed device. An addition records the
   owner seen when the user selected it. The Devices tab overlays these entries
   on the latest group list, and drops each entry once the list matches it.
@@ -265,14 +270,15 @@ and by the Home button. Enter its Android package name (for example,
 PICO default through `setLauncher(null)` before reporting
 **Waiting · App not found on the headset** with the package name. If the request
 fails, the console reports a failure and offers Retry. The client checks the
-active assignment on package removal, installation, and cached startup,
+active assignment on package removal, installation, package enablement changes, and cached startup,
 including offline startup. In-place APK updates skip the removal path.
 Headset Settings names the missing app and explains that installation resumes
 application.
 Completing the deferred application updates only the home app result in the
 current deployment. Retry remains available for other failed settings.
 An installed but disabled app appears as **App disabled on the headset** in
-the console. Enable the app, then use **Retry**.
+the console. Enable the app, then use **Retry**. Removing the disabled app
+restores the PICO default and starts the same wait for installation.
 A successful TobService `setLauncher(packageName)` result appears as
 **Accepted**. Restart the headset and verify the Home action. Deploy a managed
 empty package name to restore the PICO default with `setLauncher(null)`.
@@ -286,7 +292,12 @@ opens the configured PICO home app.
 increments on PICO 4 Ultra Enterprise. Managing IPD can move the headset's
 lenses. A successful `pbsSetIPD` callback is reported as **Accepted** because
 TobService exposes no supported physical position readback. The client reapplies
-managed IPD on each OS boot.
+managed IPD on each OS boot and on headset **Reapply settings**. Within one boot,
+ordinary delivery and console **Retry** reuse the accepted value only when the
+immediately preceding active assignment requested that same IPD and its latest
+attempt recorded acceptance. This also applies to a new revision or a different
+package. A change of value, an intervening assignment with no accepted IPD, or a
+release requires a new SDK request.
 
 **LBE** groups the mode and venue map. With **Manage** enabled, choose **On**
 or **Off**. **On** requires a PICO map ZIP. Upload one or choose a previously
@@ -297,27 +308,65 @@ before a session and confirm that the headset can locate itself at the venue.
 
 The server accepts standard LBE ZIPs up to 512 MiB and stores them by SHA-256
 under `lbe-maps/` in the MDM data directory. The server deduplicates matching
-bytes. Published map ZIPs have no aggregate quota or console deletion action.
-Server startup removes abandoned upload staging directories older than 24 hours.
+bytes. Re-uploading the original ZIP checks the stored bytes against their
+SHA-256 and repairs a missing, truncated or corrupted archive when its
+registered metadata is intact. The private library directory restricts access.
+The server restores owner write access to legacy read-only map entries at
+startup so administrators can remove or restore them. Published map ZIPs have no aggregate quota or
+console deletion action. Abandoned upload staging directories become eligible
+for cleanup after 24 hours, including when the server restarted before then.
 
 A package stores the map name, size and digest. The download credential is
 valid for 24 hours while the device's deployment revision and map match.
 It survives a WebSocket reconnect. A server restart invalidates outstanding
 credentials and the device receives a fresh credential when it reconnects.
-The client resumes partial HTTP downloads when the server supports Range.
-There is no whole-download deadline. A stalled read times out after 60
-seconds. Download and import are attempted before the other settings in the
-same deployment, including Wi-Fi, so those settings can wait for a large map.
+While the device stays connected, a battery update within ten minutes of expiry
+triggers an ordinary delivery of the current policy with a renewed credential.
+The download endpoint continues to reject expired credentials.
+The map endpoint streams the original library ZIP through the Push Files artifact
+sender. The server holds one slot from the shared transfer pool while writing the
+response. If all slots remain busy, the map endpoint returns a queued response;
+the client waits and retries while the assignment is still current. A fresh
+request rechecks the token, deployment revision and map digest.
+
+On the headset, the Push Files downloader requests the exact SHA-256 ETag,
+resumes a partial file with an open-ended Range, retries network interruptions,
+and verifies the completed bytes. Push job state, destination extraction and
+sync deletion belong to Push Files. The map cache and import belong to LBE.
+The 60-second no-progress timeout applies to the byte transfer. Explicit queue
+waits for capacity are excluded from that deadline. A queue response preserves
+the time already spent on earlier network failures and backoff. A superseding
+assignment cancels the old map's HTTP request or retry wait. Download and import
+precede the other settings in the same deployment, so Wi-Fi can wait for a large map.
+If the SDK binding changes during the transfer or import, the client records an
+interrupted attempt and resumes the current assignment when the SDK is ready.
 
 The client verifies the complete ZIP before importing it through TobService
-from `/sdcard/maps/styly-mdm/`. The import may itself enable LBE. The client
-confirms that the mode stays on and PICO reports a loaded map before marking
-**On** as applied. Device status shows the accepted import with active map
-identity unverified. The client waits up to 60 seconds for the import callback.
-After a callback timeout, the import may still be running. An unconfirmed or
-rejected import blocks a requested enable. A later deployment of the same map
-reuses the prior import while PICO still reports a loaded map. If the map is
-missing, the client imports the selected ZIP again.
+from `/sdcard/maps/styly-mdm/`. After import acceptance it applies and reads
+back LBE On using the current SDK connection, then compares the active map to that exact local ZIP. A previous
+successful attempt for the same package can skip import only after the same
+live check confirms LBE On and a matching cached ZIP. On DEV-005 with PUI
+5.15.7, `isMapInEffect` returned 0 for the active ZIP and 1 for another venue.
+If the file is missing, the map differs or the pre-import comparison is
+unavailable, the client uses the verified acquisition/import path. An explicit
+Retry or headset Reapply forces import.
+
+An invalid map descriptor reports `INVALID_VALUE`. If the import succeeds but
+the required LBE On step fails, the map reports `MAP_MODE_NOT_APPLIED` and the
+mode result gives the SDK failure. A successful comparison reports
+`MAP_ACTIVE_VERIFIED`. After import, a
+different active map reports `MAP_ACTIVE_MISMATCH`; a failed, unsupported
+or timed-out comparison reports `MAP_VERIFICATION_UNAVAILABLE`. The package
+reports the LBE pair as incomplete even if the mode switch reads back On.
+A timeout waiting for the **import** callback has a separate `CALLBACK_TIMEOUT`
+result because PICO may still be importing. The console retains the
+accepted/unverified display for reports from older headsets.
+
+Upgrade the server before deploying the new headset client. The previous map
+endpoint used a filesystem ETag and cannot satisfy the new client’s SHA-256
+precondition. Existing map clients can use the upgraded endpoint. If the pool
+stays full, an old client can require another policy delivery to retry; new
+clients recognize the explicit queue response.
 
 Before upgrading, manually back up `device_registry.json` and the entire
 `lbe-maps/` directory if present. New package saves can include IPD and LBE
@@ -346,9 +395,11 @@ A managed Wi-Fi value contains `networks`, `auto_return`, and optional
 applied after the other settings.
 
 **Adapter.** MDM adds new profiles with `WifiManager` and records the MAC policy
-it supplied. It updates its own profiles with `WifiManager.updateNetwork()` and
-that policy. For other profiles it reads the stored MAC policy from
-`dumpsys wifi`, which needs `DUMP`, and updates them by ID through TobService.
+it supplied. Managed Wi-Fi requires the ADB provisioning grant `DUMP`.
+Without it, readiness and apply results report `DUMP_PERMISSION_MISSING`.
+Updates read the current MAC policy from `dumpsys wifi` for both MDM-created
+and external profiles. External profiles are updated by ID through TobService.
+Upgrade the server and reload the console before installing clients that report the new reason.
 A failed candidate does not stop the others. Only after at least one candidate
 is saved and read back does the client set auto-join by saved ID with
 TobService `allowWifiAutoJoin(null, networkId, allowed)`. It confirms the flags
@@ -423,6 +474,7 @@ and on package changes. Native clients can connect without an Origin header.
 | Surface | Contract |
 |---|---|
 | `GET /api/packages`, `POST /api/packages` | GET returns package names and edit/publication revisions, plus the setting definitions used by group results. POST creates a package by name. |
+| `GET /api/lbe-maps/{sha256}/download` | The device supplies its deployment revision, device ID and map bearer credential. The response uses the Push Files transfer implementation with a SHA-256 ETag and byte ranges. A `503` with `X-MDM-Transfer-Status: queued` and `Retry-After` asks the device to wait for shared capacity. |
 | `POST /api/packages/{id}/duplicate` | Accepts the new `name` and the source package’s `expected_revision`. Returns the new editor profile. A stale source revision returns 409. |
 | `GET /api/packages/{id}` | Returns package identity and name, `edit_revision`, `published_revision`, the saved editor `settings`, including unchecked settings and Wi-Fi passwords, the editor `sections`, and `impact` with group and device counts and a token. |
 | `POST /api/packages/{id}/save-and-deploy` | Atomically saves `settings` as `{id: {managed, value}}` and deploys a new revision. Supply `expected_revision` equal to the loaded edit token `edit_revision` (null for a new package), and `expected_impact` from the preview. An optional `name` renames the package. |
@@ -430,7 +482,7 @@ and on package changes. Native clients can connect without an Origin header.
 | `GET`, `POST /api/group-package/deploy?name=...&package_id=...` | GET previews the deployment scope and whether it uses the current deployed version. An empty `package_id=` previews clearing management for the group and sets `clear` to true. The preview includes the current deployment's `wifi_mode`. POST accepts `expected_impact` from the preview, commits the group reference and any new deployment revision together, and returns the committed `GROUP_LIST` snapshot. A package that has never been deployed returns 409. |
 | `POST /api/package-retry` | Requests Retry for a currently assigned and online `device_id` with its current `package_id` and `revision`. |
 | `CONFIGURATION_POLICY` | Server to canonical `configuration_packages_v1` or `configuration_summary_v1` clients. Includes `package_id` and the group's active deployment `revision` (a null pair means no effective deployment for the client). Package-capable clients receive managed `settings` and explicit `retry_id` values. Clients with summary capability also receive nullable `group_name` and `deployed_at_ms` (Unix epoch milliseconds). Summary-only clients receive empty `settings`. For a managed venue ZIP, clients advertising `configuration_lbe_map_v1` receive the same-origin `lbe_map_download` path and `lbe_map_token` bearer credential outside `settings`. |
-| `REGISTER` and `CONFIGURATION_STATE` | The secret-free `configuration_state` has `package_id`, `revision`, `status` (`applying`, `complete`, `interrupted`) and per-setting `results`. A missing `startupApp` reports `status: "waiting"` and `reason: "APP_NOT_INSTALLED"` after PICO accepts the default Home setting. A disabled `startupApp` reports `status: "failed"` and `reason: "APP_DISABLED"`. Both report the requested package name as `value`. A `complete` attempt may contain a waiting result. Successful IPD calls report `ACCEPTED_UNVERIFIED`. Accepted map imports report `MAP_ACTIVE_UNVERIFIED`. While the report is unknown, including before restoring a cached attempt, the client omits the field in `REGISTER` and sends no `CONFIGURATION_STATE` update. An explicit null clears the previous report after a durable release or when a durable first assignment is waiting for application. |
+| `REGISTER` and `CONFIGURATION_STATE` | The secret-free `configuration_state` has `package_id`, `revision`, `status` (`applying`, `complete`, `interrupted`) and per-setting `results`. A missing `startupApp` reports `status: "waiting"` and `reason: "APP_NOT_INSTALLED"` after PICO accepts the default Home setting. A disabled `startupApp` reports `status: "failed"` and `reason: "APP_DISABLED"`. Both report the requested package name as `value`. A `complete` attempt may contain a waiting result. Successful IPD calls report `ACCEPTED_UNVERIFIED`. Current clients report `MAP_ACTIVE_VERIFIED` only after confirming LBE On and the requested ZIP. Older clients can report an accepted import as `MAP_ACTIVE_UNVERIFIED`. While the report is unknown, including before restoring a cached attempt, the client omits the field in `REGISTER` and sends no `CONFIGURATION_STATE` update. An explicit null clears the previous report after a durable release or when a durable first assignment is waiting for application. |
 | `REGISTER` and `WIFI_CONNECTION` | A canonical client reports `current_wifi` as `{ssid, bssid}` or null. The BSSID may be null. The headset samples while connected every 30 seconds. The server exposes the current connection in `DEVICE_LIST` for that session. |
 | `REGISTER` and `WIFI_STATE` | The device reports Wi-Fi readiness and monitoring in `wifi_state` with `busy`, `available`, `unavailable_reason` and `priority_monitor`. A repeated registration refreshes both reports when supplied. |
 | `GROUP_LIST` and `DEVICE_LIST` | Group messages expose membership, package summaries, assignments, active deployments, and the snapshot's `server_instance_id` and `revision`. Each deployment's `wifi_mode` is `priority`, `android_selection`, or null when Wi-Fi is unmanaged. Online device rows expose package support and the latest report. An offline row is last-known. |
@@ -456,11 +508,15 @@ the temporary file before atomically replacing the saved file.
   the first by name, and each removed membership is logged. The server first
   copies the file to `<registry>.<YYYYMMDD-HHMMSS>-<unique-id>.bak` with private
   permissions. If the backup fails, the migration is not written and packages
-  stay unavailable.
+  stay unavailable. Its read-only roster preserves the original memberships for bulk operations.
 - The package catalog uses version 3. If a catalog has an unsupported version,
   the server preserves the saved data and reports that packages are unavailable.
 - If the registry cannot be read, the server leaves the file unchanged, saves
   no changes for that session, and the console shows a warning.
+
+Package and group deploy conflicts include a `code` field. The console uses
+`revision_conflict` and `deployment_targets_changed` to request a new review,
+and displays the map recovery instruction for `map_unavailable`.
 
 Upgrade the server and client together and reload open consoles.
 
@@ -522,7 +578,9 @@ ports, so neither environment discovers the other.
 Both flavors share the applicationId `com.styly.mdmclient`, so they **cannot be
 installed at the same time** — installing the dev build replaces the production build
 on a device. Run the dev client on a dedicated test device, or accept that it replaces
-production while you test. Isolation between the two environments is purely by port, so
+production while you test. An in-place replacement retains the last assignment and managed
+Wi-Fi state. An offline OS boot can reapply the prior environment’s settings before the
+new server delivers its assignment. Isolation between the two environments is purely by port, so
 a dev client/server never discovers a production one even on the same LAN.
 
 **Dev server** — start with the `dev` argument, which sets the dev ports for you:
@@ -942,8 +1000,8 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 | `GET_GROUP_LIST` | Request the current group and configuration package snapshot. |
 | `CREATE_GROUP` | Create a new, empty device group. Fields: `name` |
 | `RENAME_GROUP` | Rename a group, preserving its members. Fields: `name`, `new_name` |
-| `DELETE_GROUP` | Delete a group (member devices are not affected). Fields: `name` |
-| `UPDATE_GROUP_MEMBERS` | Edit only selected members of an existing group. Fields are `name`, `add` (device IDs with a registry record mapped to their expected current group, or null for unassigned), and `remove` (device IDs expected to belong to `name`). Offline devices in the registry are supported. A changed owner or a missing added device rejects the whole edit. Existing members without registry records may be removed. |
+| `DELETE_GROUP` | Delete a group and release its package assignment. Devices keep their existing setting values. Fields: `name` and optional `expected_snapshot` with `server_instance_id` and group list `revision`. A changed snapshot requires a new confirmation. |
+| `UPDATE_GROUP_MEMBERS` | Edit only selected members of an existing group. Fields are `name`, `add` (device IDs with a registry record mapped to their expected current group, or null for unassigned), and `remove` (device IDs expected to belong to `name`). Offline devices in the registry are supported. The console includes `expected_deployments`, a map of affected group names to effective revision UUIDs or null. A changed deployment, changed owner or missing added device rejects the whole edit. Older callers may omit the deployment guard. Existing members without registry records may be removed. |
 | `RETIRE_DEVICE` | Make target clients uninstall themselves (remotely irreversible — the console gates it behind its heaviest confirmation). Fields: `target_devices` (list of device IDs or `["*"]`; online devices only). See [Device Retirement](#device-retirement). |
 
 ### Admin HTTP API
@@ -1070,9 +1128,9 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 > (an APK can be up to 2 GiB, a push bundle likewise), spiking LAN/server bandwidth.
 > Instead the server owns a pool of **N** transfer slots
 > (`MDM_MAX_CONCURRENT_TRANSFERS` env var / `--max-concurrent-transfers` flag,
-> default **5**) and every byte-moving fan-out — install, push, sync — must take one
-> before it dispatches. Remaining targets are queued; each slot frees as soon as its
-> device signals the download finished, and the next queued device is dispatched.
+> default **5**). Install, Push and Sync reserve a slot before command dispatch.
+> Venue maps reserve one when the headset requests bytes and release it when the
+> HTTP stream ends. A map cache hit and PICO import consume no network slot.
 >
 > The pool is **server-wide, not per job**. The throttle belongs to the transfer
 > *resource* (the LAN, the server's uplink), not to any one action: a per-job
@@ -1852,7 +1910,7 @@ The MDM client uses the following Android permissions:
 | `ACCESS_FINE_LOCATION` / `ACCESS_COARSE_LOCATION` | Request precise location access together on Android 12+ for saved-network reads; the adapter requires the precise grant |
 | `ACCESS_BACKGROUND_LOCATION` | Keep saved-network reads and SSID observation available during background policy application on PICO |
 | `SYSTEM_ALERT_WINDOW` | Read saved networks on PICO with the `SYSTEM_ALERT_WINDOW` app-op granted during provisioning |
-| `DUMP` | Read stored MAC randomization policy for TobService profile updates with the grant applied through ADB during provisioning |
+| `DUMP` | Read the current stored MAC randomization policy for Wi-Fi profile updates with the grant applied through ADB during provisioning |
 | `WRITE_SECURE_SETTINGS` | Optional ADB grant for applying the managed **Developer options menu** setting |
 | `MANAGE_EXTERNAL_STORAGE` | Write downloaded APKs to shared storage so the PICO ToBService can read them for silent install; read/write shared-storage directories for file/folder push (sync); and read shared storage for directory integrity checks (`VERIFY_DIR`) |
 | `QUERY_ALL_PACKAGES` | Resolve an arbitrary installed package via `PackageManager` for APK integrity checks (`VERIFY_APK`). On API 30+ package visibility is filtered; an operator may verify any package, so a `<queries>` allowlist cannot cover it. This client is privately distributed (not on Google Play), so the Play-policy restriction on this permission does not apply. |

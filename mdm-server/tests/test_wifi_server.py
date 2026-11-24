@@ -159,7 +159,7 @@ def test_device_wifi_reports_survive_reconnect_and_reject_stale_socket(tmp_path)
             await live.send_json(registration)
             await receive_type(live, "REGISTERED")
             await receive_type(admin, "DEVICE_LIST")
-            unavailable = {**state, "available": False, "unavailable_reason": "PERMISSION_DENIED"}
+            unavailable = {**state, "available": False, "unavailable_reason": "DUMP_PERMISSION_MISSING"}
             await old.send_json({"type": "WIFI_STATE", "wifi_state": {**state, "busy": True}})
             # PONG proves the server read the preceding frame on this socket before
             # the live connection can overwrite an incorrectly accepted update.

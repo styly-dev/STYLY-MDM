@@ -24,7 +24,8 @@ from .device_policy import (
     PROVISIONAL_POWER_COMMANDS,
     command_allowed,
 )
-from .push_artifacts import ArtifactStore, strong_etag
+from .push_artifacts import ArtifactStore
+from .file_transfer import stream_file
 from .push_job_manager import PushJobManager
 from .push_job_store import (
     PushJobStore,
@@ -796,85 +797,14 @@ class PushRuntime:
         if not await asyncio.to_thread(_is_file_of_size, path, total):
             log.error("Push artifact bytes are missing or have the wrong size: %s", path)
             raise aiohttp_web.HTTPNotFound()
-        etag = strong_etag(record["sha256"])
-        headers = {
-            "ETag": etag,
-            "Accept-Ranges": "bytes",
-            "Cache-Control": "no-store",
-            "Content-Type": "application/zip",
-        }
-        if not self._if_match_satisfied(request.headers.get("If-Match"), etag):
-            headers["Content-Length"] = "0"
-            response = aiohttp_web.StreamResponse(status=412, headers=headers)
-            await response.prepare(request)
-            await response.write_eof()
-            return response
-
-        start, end = 0, total - 1
-        status = 200
-        range_header = request.headers.get("Range")
-        if range_header is not None:
-            try:
-                parsed = self._parse_range(range_header, total)
-            except ValueError:
-                # RFC 9110 requires invalid or unsupported Range syntax to be
-                # ignored, so serve the complete immutable representation.
-                pass
-            else:
-                if parsed is None:
-                    headers.update(
-                        {"Content-Range": f"bytes */{total}", "Content-Length": "0"}
-                    )
-                    response = aiohttp_web.StreamResponse(status=416, headers=headers)
-                    await response.prepare(request)
-                    await response.write_eof()
-                    return response
-                start, end = parsed
-                status = 206
-                headers["Content-Range"] = f"bytes {start}-{end}/{total}"
-        body_length = max(0, end - start + 1)
-        headers["Content-Length"] = str(body_length)
-        response = aiohttp_web.StreamResponse(status=status, headers=headers)
-        await response.prepare(request)
-        if request.method != "HEAD":
-            handle = await asyncio.to_thread(path.open, "rb")
-            try:
-                await asyncio.to_thread(handle.seek, start)
-                remaining = body_length
-                while True:
-                    if remaining <= 0:
-                        break
-                    chunk = await asyncio.to_thread(
-                        handle.read, min(1024 * 1024, remaining)
-                    )
-                    if not chunk:
-                        break
-                    await response.write(chunk)
-                    self.leases.progress(token, len(chunk))
-                    remaining -= len(chunk)
-            finally:
-                await asyncio.to_thread(handle.close)
-        await response.write_eof()
-        return response
-
-    @staticmethod
-    def _if_match_satisfied(value: str | None, etag: str) -> bool:
-        if value is None:
-            return True
-        # This endpoint accepts one exact strong ETag, matching the job client.
-        return value.strip() == etag
-
-    @staticmethod
-    def _parse_range(value: str, total: int) -> tuple[int, int] | None:
-        if not isinstance(value, str):
-            raise ValueError("invalid Range syntax")
-        match = re.fullmatch(r"bytes=(\d+)-", value.strip())
-        if match is None:
-            raise ValueError("unsupported Range syntax")
-        start = int(match.group(1))
-        if total <= 0 or start >= total:
-            return None
-        return start, total - 1
+        return await stream_file(
+            request,
+            path,
+            total,
+            record["sha256"],
+            cache_control="no-store",
+            on_progress=lambda byte_count: self.leases.progress(token, byte_count),
+        )
 
     @staticmethod
     def _registered_capabilities(payload: dict[str, Any]) -> frozenset[str]:

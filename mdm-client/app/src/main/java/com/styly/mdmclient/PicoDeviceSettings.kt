@@ -12,7 +12,6 @@ import com.pvr.tobservice.enums.PBS_ScreenOffDelayTimeEnum
 import com.pvr.tobservice.enums.PBS_SleepDelayTimeEnum
 import com.pvr.tobservice.enums.PBS_SwitchEnum.S_OFF
 import com.pvr.tobservice.enums.PBS_SwitchEnum.S_ON
-import com.pvr.tobservice.enums.PBS_SystemInfoEnum.LARGESPACE_MAP_INFO
 import com.pvr.tobservice.enums.PBS_SystemFunctionSwitchEnum.*
 import com.pvr.tobservice.interfaces.IBoolCallback
 import com.pvr.tobservice.interfaces.IIntCallback
@@ -80,6 +79,20 @@ internal enum class LbeMapImportResult {
     ACCEPTED, FAILED, CALLBACK_TIMEOUT,
 }
 
+internal enum class ActiveLbeMap { MATCH, DIFFERENT, MODE_OFF, UNKNOWN }
+
+internal fun inspectActiveLbeMap(readMode: () -> Boolean, compareZip: () -> Int): ActiveLbeMap = try {
+    if (!readMode()) ActiveLbeMap.MODE_OFF else when (compareZip()) {
+        0 -> ActiveLbeMap.MATCH
+        1 -> ActiveLbeMap.DIFFERENT
+        else -> ActiveLbeMap.UNKNOWN
+    }
+} catch (_: Exception) {
+    ActiveLbeMap.UNKNOWN
+} catch (_: LinkageError) {
+    ActiveLbeMap.UNKNOWN
+}
+
 internal fun awaitStableAvailability(
     isAvailable: () -> Boolean,
     nowElapsed: () -> Long = SystemClock::elapsedRealtime,
@@ -92,7 +105,17 @@ internal fun awaitStableAvailability(
     val deadline = nowElapsed() + timeoutMillis
     var stableSince: Long? = null
     while (true) {
-        val available = isAvailable()
+        val available = try {
+            isAvailable()
+        } catch (failure: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw failure
+        } catch (failure: PicoDeviceSettings.SettingFailure) {
+            if (failure.reason != "READ_FAILED") throw failure
+            false
+        } catch (_: TimeoutException) {
+            false
+        }
         val observedAt = nowElapsed()
         if (observedAt > deadline) return false
         if (available) {
@@ -173,8 +196,42 @@ internal fun pollBluetoothState(
     return actual
 }
 
+/** Blocking adapter for the two asynchronous Large Space mode calls on TobService. */
+internal class PicoLbeMode(
+    val readStatus: () -> String,
+    val setEnabled: (Boolean) -> Boolean,
+) {
+    constructor(service: IToBServiceProxy) : this(
+        readStatus = {
+            val result = CompletableFuture<String>()
+            service.pbsGetSwitchLargeSpaceStatus(object : IStringCallback.Stub() {
+                override fun callback(value: String) { result.complete(value) }
+            }, 0)
+            result.get(2, TimeUnit.SECONDS)
+        },
+        setEnabled = { target ->
+            val result = CompletableFuture<Boolean>()
+            service.pbsSwitchLargeSpaceScene(object : IBoolCallback.Stub() {
+                override fun callBack(value: Boolean) { result.complete(value) }
+            }, target, 0)
+            result.get(30, TimeUnit.SECONDS)
+        },
+    )
+
+    fun isEnabled(): Boolean = when (readStatus()) {
+        "0" -> false
+        "1" -> true
+        else -> throw PicoDeviceSettings.SettingFailure("READ_FAILED")
+    }
+}
+
 /** Applies persistent PUI settings off the main thread and reads them back after all writes. */
-internal class PicoDeviceSettings(private val context: Context, private val service: IToBServiceProxy) {
+internal class PicoDeviceSettings(
+    private val context: Context,
+    private val service: IToBServiceProxy,
+    private val lbeMode: PicoLbeMode = PicoLbeMode(service),
+    private val nowElapsed: () -> Long = SystemClock::elapsedRealtime,
+) {
     companion object {
         private val switches = linkedMapOf(
             "autoSleep" to SFS_AUTOSLEEP,
@@ -202,7 +259,6 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
     fun apply(
         values: JSONObject,
         overwrite: Boolean,
-        lbeMapFailureReason: String? = null,
     ): JSONObject {
         val results = JSONObject()
         val written = linkedMapOf<String, Any>()
@@ -214,16 +270,6 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
                 val target = requested(key, values)
                 if (key == "ipd") {
                     results.put(key, applyIpd(target as Double))
-                    return
-                }
-                if (key == "lbeMode" && target == true && lbeMapFailureReason != null) {
-                    val actual = read("lbeMode") as Boolean
-                    val available = actual && hasLbeMapMetadata()
-                    results.put(key, if (available) {
-                        settingOutcome("applied", actual)
-                    } else {
-                        settingOutcome("failed", actual, "MAP_REQUIRED")
-                    })
                     return
                 }
                 val current = read(key)
@@ -270,14 +316,10 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
         for ((key, target) in written) {
             results.put(key, try {
                 if (key == "lbeMode" && target == true) {
-                    val stable = awaitStableAvailability(::isLbeMapAvailable)
-                    val actual = readLbeMode()
-                    val hasMetadata = actual && hasLbeMapMetadata()
-                    when {
-                        stable && actual && hasMetadata -> settingOutcome("applied", true)
-                        actual -> settingOutcome("failed", actual, "MAP_NOT_LOADED")
-                        else -> settingOutcome("failed", actual, "READBACK_MISMATCH")
-                    }
+                    val stable = awaitStableAvailability(isAvailable = lbeMode::isEnabled, nowElapsed = nowElapsed)
+                    val actual = lbeMode.isEnabled()
+                    if (stable && actual) settingOutcome("applied", true)
+                    else settingOutcome("failed", actual, "READBACK_MISMATCH")
                 } else {
                     val actual = read(key)
                     val value = if (actual is PicoShutdownSchedule) actual.toJson() else actual
@@ -310,7 +352,7 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
         "sleepDelay" -> readSleepDelay()
         "screenOff" -> readScreenOffDelay()
         "shutdown" -> synchronized(PowerCycleTimers) { PicoShutdownSchedule.read(service) }
-        "lbeMode" -> readLbeMode()
+        "lbeMode" -> lbeMode.isEnabled()
         "bluetooth" -> awaitBluetooth()
         "developerMenu" -> {
             if (context.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) != PackageManager.PERMISSION_GRANTED) {
@@ -357,10 +399,9 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
                 })
             }
             "lbeMode" -> {
-                val opened = awaitLbeSwitch(target as Boolean)
+                val opened = lbeMode.setEnabled(target as Boolean)
                 if (!opened) throw SettingFailure("WRITE_FAILED")
             }
-            "ipd" -> throw SettingFailure("WRITE_FAILED")
             "developerMenu" -> {
                 if (!Settings.Global.putInt(context.contentResolver, DEVELOPER_MENU_VISIBLE, if (target as Boolean) 1 else 0)) {
                     throw SettingFailure("WRITE_FAILED")
@@ -398,34 +439,8 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
         LbeMapImportResult.FAILED
     }
 
-    fun isLbeMapAvailable(): Boolean = try {
-        readLbeMode() && hasLbeMapMetadata()
-    } catch (_: Exception) {
-        false
-    } catch (_: LinkageError) {
-        false
-    }
-
-    private fun hasLbeMapMetadata(): Boolean = try {
-        JSONObject(service.pbsStateGetDeviceInfo(LARGESPACE_MAP_INFO, 0)).length() > 0
-    } catch (_: Exception) {
-        false
-    } catch (_: LinkageError) {
-        false
-    }
-
-    private fun readLbeMode(): Boolean = when (awaitLbeStatus()) {
-        "0" -> false
-        "1" -> true
-        else -> throw SettingFailure("READ_FAILED")
-    }
-
-    private fun awaitLbeStatus(): String = awaitLbeStatusCallback { callback ->
-        service.pbsGetSwitchLargeSpaceStatus(callback, 0)
-    }
-
-    private fun awaitLbeSwitch(target: Boolean): Boolean = awaitLbeSwitchCallback { callback ->
-        service.pbsSwitchLargeSpaceScene(callback, target, 0)
+    fun activeLbeMap(path: String): ActiveLbeMap = inspectActiveLbeMap(lbeMode::isEnabled) {
+        awaitCallback { service.isMapInEffect(path, it, 0) }
     }
 
     private fun awaitIpdCallback(register: (Consumer<Int>) -> Unit): Int {
@@ -440,22 +455,6 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
             override fun callback(value: Int) { result.complete(value) }
         })
         return result.get(60, TimeUnit.SECONDS)
-    }
-
-    private fun awaitLbeStatusCallback(register: (IStringCallback) -> Unit): String {
-        val result = CompletableFuture<String>()
-        register(object : IStringCallback.Stub() {
-            override fun callback(value: String) { result.complete(value) }
-        })
-        return result.get(2, TimeUnit.SECONDS)
-    }
-
-    private fun awaitLbeSwitchCallback(register: (IBoolCallback) -> Unit): Boolean {
-        val result = CompletableFuture<Boolean>()
-        register(object : IBoolCallback.Stub() {
-            override fun callBack(value: Boolean) { result.complete(value) }
-        })
-        return result.get(30, TimeUnit.SECONDS)
     }
 
     private fun awaitBluetooth(target: Boolean? = null): Boolean {
@@ -475,8 +474,8 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
             awaitBluetooth(target as Boolean)
             return
         }
-        val deadline = SystemClock.elapsedRealtime() + 2_000L
-        while (!matches(key, read(key), target) && SystemClock.elapsedRealtime() < deadline) {
+        val deadline = nowElapsed() + 2_000L
+        while (!matches(key, read(key), target) && nowElapsed() < deadline) {
             Thread.sleep(100)
         }
     }

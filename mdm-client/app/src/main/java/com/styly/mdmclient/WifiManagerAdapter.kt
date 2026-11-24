@@ -423,6 +423,7 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
 
     private fun requireAuthority() {
         if (!supportsManagedWifi()) throw WifiAdapterFailure(WifiReason.UNSUPPORTED)
+        if (!hasManagedWifiDiagnosticsAccess(appContext)) throw WifiAdapterFailure(WifiReason.DUMP_PERMISSION_MISSING)
         if (!hasManagedWifiLocationPermissions(appContext)) throw WifiAdapterFailure(WifiReason.PERMISSION_DENIED)
         if (!hasManagedWifiReadAccess(appContext)) throw WifiAdapterFailure(WifiReason.PERMISSION_DENIED)
     }
@@ -516,9 +517,6 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
     }
 
     private fun readStoredMacSetting(view: WifiConfiguredView): Int {
-        if (!hasManagedWifiDiagnosticsAccess(appContext)) {
-            throw WifiAdapterFailure(WifiReason.PERMISSION_DENIED)
-        }
         // PUI can mask the MAC policy in getConfiguredNetworks(). Read the stored value
         // before a privileged write, which can otherwise change that policy silently.
         try {
@@ -549,7 +547,12 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
         val knownMac = runCatching { ownedMacSettings.getInt(ownedMacSettingKey(existing.entry), -1) }
             .getOrNull()?.takeIf { it in WIFI_MAC_RANDOMIZATION_SETTINGS }
         if (knownMac != null) {
-            val update = configuration(profile, existing.original).apply { macRandomizationSetting = knownMac }
+            // PUI can mask a user change in the public configuration. Use the live policy
+            // on provisioned devices, including for profiles that MDM originally created.
+            val mac = readStoredMacSetting(existing)
+            val current = resolveView(profile)
+            if (current == null || current.entry != existing.entry) throw WifiAdapterFailure(WifiReason.VERIFY_FAILED)
+            val update = configuration(profile, current.original).apply { macRandomizationSetting = mac }
             beforeMutation()?.let { throw WifiAdapterFailure(it) }
             // Android checks whether this app can update the current saved ID and MAC policy.
             val updatedId = try { wifi.updateNetwork(update) } catch (_: SecurityException) { -1 }
@@ -560,11 +563,11 @@ internal class WifiManagerAdapter(context: Context) : WifiSettingsAdapter {
             }
         }
 
-        val external = if (knownMac == null) existing else resolveView(profile)
-            ?: throw WifiAdapterFailure(WifiReason.VERIFY_FAILED)
-        val storedMacSetting = readStoredMacSetting(external)
+        // After an unsuccessful Android write, TobService still needs the live MAC
+        // policy. Public WifiConfiguration can mask changes to it.
+        val storedMacSetting = readStoredMacSetting(existing)
         val current = resolveView(profile)
-        if (current == null || current.entry != external.entry) throw WifiAdapterFailure(WifiReason.VERIFY_FAILED)
+        if (current == null || current.entry != existing.entry) throw WifiAdapterFailure(WifiReason.VERIFY_FAILED)
         val original = current.entry
         // A named parcel for an existing SSID only toggles auto-join. Omitting the SSID
         // sends the saved ID through TobService's add-or-update path without selecting it.

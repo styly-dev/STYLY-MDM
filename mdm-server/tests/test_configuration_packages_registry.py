@@ -185,6 +185,7 @@ def test_migration_is_not_written_when_the_backup_fails(tmp_path, monkeypatch):
     server.load_registry()
     assert server._configuration.packages is None
     assert server.REGISTRY_PATH.read_bytes() == before_bytes
+    assert json.loads(server.build_group_list_msg())["groups"] == {"Alpha": ["device-a"], "Beta": ["device-a"]}
 
 
 def test_group_rename_forget_and_delete_persist_references_and_keep_package(tmp_path, monkeypatch):

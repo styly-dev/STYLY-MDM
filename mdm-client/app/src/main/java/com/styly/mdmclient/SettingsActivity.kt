@@ -396,12 +396,14 @@ class SettingsActivity : AppCompatActivity() {
         wifiPermissionHint.visibility = actionVisibility
         wifiPermissionButton.visibility = actionVisibility
         wifiDiagnosticsHint.visibility = if (diagnostics) View.GONE else View.VISIBLE
-        if (settingsAction == null) {
-            wifiPermissionSummary.setText(R.string.wifi_permissions_ready)
-        } else {
+        if (settingsAction != null) {
             val (hint, button) = settingsAction
             wifiPermissionHint.setText(hint)
             wifiPermissionButton.setText(button)
+        }
+        if (settingsAction == null && diagnostics) {
+            wifiPermissionSummary.setText(R.string.wifi_permissions_ready)
+        } else {
             wifiPermissionSummary.text = buildSpannedString {
                 color(getColor(R.color.permission_status_action)) {
                     append(getText(R.string.wifi_permissions_action_needed))

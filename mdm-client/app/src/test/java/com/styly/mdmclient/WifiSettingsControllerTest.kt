@@ -1642,6 +1642,23 @@ class WifiSettingsControllerTest {
     }
 
     @Test
+    fun `missing DUMP is reported before deployment and blocks managed changes until granted`() {
+        val wifi = Harness(preflightFailure = WifiReason.DUMP_PERMISSION_MISSING)
+        val snapshot = wifi.controller.stateSnapshot()
+        assertFalse(snapshot.getBoolean("available"))
+        assertEquals("DUMP_PERMISSION_MISSING", snapshot.getString("unavailable_reason"))
+        wifi.apply(listOf(network("office")), prioritizeNetworks = false)
+        assertEquals(WifiReason.DUMP_PERMISSION_MISSING, wifi.results.single().reason)
+        assertTrue(wifi.adapter.applyCalls.isEmpty())
+        wifi.connectivity.preflightResult = null
+        wifi.controller.refreshReadiness()
+        wifi.worker.runAll()
+        assertTrue(wifi.controller.stateSnapshot().getBoolean("available"))
+        wifi.apply(listOf(network("office")), prioritizeNetworks = false)
+        assertEquals("success", wifi.results.last().status)
+    }
+
+    @Test
     fun `Wi-Fi telemetry carries only readiness and monitor state after application`() {
         val preferred = network("office-a", password = "secret-a")
         val fallback = network("office-b", password = "secret-b")

@@ -4,17 +4,19 @@ import asyncio
 import hashlib
 import io
 import json
+import os
 import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
+from pathlib import Path
 from urllib.parse import urlencode
 
 import aiohttp
 import pytest
 from aiohttp.test_utils import TestServer
 
-from styly_mdm import configuration_packages, server
+from styly_mdm import configuration_packages, lbe_maps, server
 from server_test_helpers import reset_server_state
 
 
@@ -148,7 +150,7 @@ async def _assert_no_policy(ws):
     await asyncio.wait_for(receive(), 2)
 
 
-def test_lbe_map_download_survives_disconnect_and_requires_current_revision(tmp_path):
+def test_lbe_map_download_survives_disconnect_and_requires_current_revision(tmp_path, monkeypatch):
     async def body():
         groups = {"Studio": [DEVICE_ID, OTHER_ID]}
         with io.BytesIO() as buffer:
@@ -182,11 +184,18 @@ def test_lbe_map_download_survives_disconnect_and_requires_current_revision(tmp_
             await _deploy(session, base, package, settings={
                 **settings, "lbeMap": {"managed": False, "value": reference},
             }, status=400)
-            invalid = {**settings, "lbeMap": {"managed": True, "value": {**reference, "name": "Another.zip"}}}
-            await _deploy(session, base, package, settings=invalid, status=409)
+            invalid = {**settings, "lbeMap": {"managed": True, "value": {
+                **reference, "sha256": "b" * 64,
+            }}}
+            missing = await _deploy(session, base, package, settings=invalid, status=409)
+            assert missing["code"] == "map_unavailable"
             deployed = await _deploy_to(session, base, package, settings, "Studio")
             preview = await _request(session, "GET", base, _deployment_path("Studio", deployed["package_id"]))
             assert preview["lbe_mode"] is True and preview["lbe_map_name"] == "Studio.zip"
+            with monkeypatch.context() as patch:
+                patch.setattr(server.LbeMapStore, "path_for", lambda _self, _ref: None)
+                missing = await _assign(session, base, "Studio", deployed, status=409)
+                assert missing["code"] == "map_unavailable"
             supported = {**REGISTRATION, "capabilities": [*REGISTRATION["capabilities"],
                                                            configuration_packages.LBE_MAP_CAPABILITY]}
             legacy = {**REGISTRATION, "device_id": OTHER_ID}
@@ -199,10 +208,13 @@ def test_lbe_map_download_survives_disconnect_and_requires_current_revision(tmp_
                     assert response.status == expected
                     if expected == 200:
                         assert response.headers["Cache-Control"] == "private, no-store"
+                        assert response.headers["ETag"] == f'"{reference["sha256"]}"'
+                        assert response.headers["Accept-Ranges"] == "bytes"
                         assert await response.read() == content
                     elif expected == 206:
-                        assert response.headers["Content-Range"] == f"bytes 0-15/{len(content)}"
-                        assert await response.read() == content[:16]
+                        assert response.headers["Content-Range"] == f"bytes 0-{len(content) - 1}/{len(content)}"
+                        assert response.headers["ETag"] == f'"{reference["sha256"]}"'
+                        assert await response.read() == content
 
             async with (session.ws_connect(base + "/ws/device") as ws,
                         session.ws_connect(base + "/ws/device") as legacy_ws):
@@ -223,7 +235,44 @@ def test_lbe_map_download_survives_disconnect_and_requires_current_revision(tmp_
                 )
                 await download(policy, token=expired, expected=403)
                 await download(policy, token=policy["lbe_map_token"],
-                               expected=206, byte_range="bytes=0-15")
+                               expected=206, byte_range="bytes=0-")
+                async with session.get(
+                        base + policy["lbe_map_download"],
+                        headers={"Authorization": "Bearer " + policy["lbe_map_token"],
+                                 "Range": "bytes=-3"}) as response:
+                    assert response.status == 200
+                    assert await response.read() == content
+                async with session.head(
+                        base + policy["lbe_map_download"],
+                        headers={"Authorization": "Bearer " + policy["lbe_map_token"]}) as response:
+                    assert response.status == 200
+                    assert response.headers["ETag"] == f'"{reference["sha256"]}"'
+                    assert response.headers["Content-Length"] == str(len(content))
+                    assert await response.read() == b""
+
+                old_expiry = server.devices[DEVICE_ID]["lbe_map_token_expires_at"]
+                assert not server._lbe_map_credential_needs_refresh(
+                    DEVICE_ID, server.devices[DEVICE_ID],
+                    now=old_expiry - server.LBE_MAP_TOKEN_REFRESH_WINDOW_SECONDS - 1,
+                )
+                assert server._lbe_map_credential_needs_refresh(
+                    DEVICE_ID, server.devices[DEVICE_ID],
+                    now=old_expiry - server.LBE_MAP_TOKEN_REFRESH_WINDOW_SECONDS,
+                )
+                assert "lbe_map_token_expires_at" not in server.devices[OTHER_ID]
+                original_time = time.time
+                fake_now = old_expiry - server.LBE_MAP_TOKEN_REFRESH_WINDOW_SECONDS
+                monkeypatch.setattr(server.time, "time", lambda: fake_now)
+                await ws.send_json({
+                    "type": "BATTERY_UPDATE", "level": 80, "charging": True,
+                    "timestamp": fake_now,
+                })
+                refreshed = await _receive_type(ws, "CONFIGURATION_POLICY")
+                assert refreshed["revision"] == policy["revision"]
+                assert "retry_id" not in refreshed
+                assert refreshed["lbe_map_token"] != policy["lbe_map_token"]
+                assert int(refreshed["lbe_map_token"].split(".", 1)[0]) > old_expiry
+                monkeypatch.setattr(server.time, "time", original_time)
             async with session.ws_connect(base + "/ws/device") as reconnected:
                 # Download tokens authorize the current assignment, not one socket.
                 # A device may continue or resume the transfer after disconnect.
@@ -246,7 +295,77 @@ def test_lbe_map_download_survives_disconnect_and_requires_current_revision(tmp_
                 disabled = await _receive_type(reconnected, "CONFIGURATION_POLICY")
                 assert disabled["settings"] == {"ipd": 63.1, "lbeMode": False}
                 assert "lbe_map_token" not in disabled
+                assert "lbe_map_token_expires_at" not in server.devices[DEVICE_ID]
                 await download(current, token=current["lbe_map_token"], expected=403)
+
+    asyncio.run(body())
+
+
+def test_lbe_map_list_storage_failure_is_returned_to_console(tmp_path, monkeypatch):
+    async def body():
+        library = (tmp_path / "lbe-maps").resolve()
+        original_iterdir = Path.iterdir
+
+        def fail_library_listing(path):
+            if path.resolve() == library:
+                raise PermissionError("injected map storage error")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fail_library_listing)
+        async with _running_server(tmp_path) as (session, base):
+            async with session.get(base + "/api/lbe-maps") as response:
+                assert response.status == 500
+                assert await response.json() == {"error": "Could not read map library"}
+
+    asyncio.run(body())
+
+
+def test_startup_cleanup_rescans_only_its_initial_candidates_after_ttl(tmp_path, monkeypatch):
+    async def body():
+        monkeypatch.setattr(lbe_maps, "LBE_MAP_STAGING_MAX_AGE_SECONDS", 0.12)
+        monkeypatch.setattr(server, "LBE_MAP_STAGING_MAX_AGE_SECONDS", 0.12)
+        library = tmp_path / "lbe-maps"
+        library.mkdir()
+        startup_candidate = library / ".lbe-map-upload-before-start"
+        startup_candidate.mkdir()
+        archive = startup_candidate / "map.zip"
+        archive.write_bytes(b"partial")
+        recent = time.time() - 0.06
+        os.utime(archive, (recent, recent))
+
+        async with _running_server(tmp_path) as (_session, _base):
+            assert startup_candidate.exists()
+            late_candidate = library / ".lbe-map-upload-after-start"
+            late_candidate.mkdir()
+            late_archive = late_candidate / "map.zip"
+            late_archive.write_bytes(b"partial")
+            old = time.time() - 1
+            os.utime(late_archive, (old, old))
+            await asyncio.sleep(0.18)
+            assert not startup_candidate.exists()
+            assert late_candidate.exists()
+
+    asyncio.run(body())
+
+
+def test_startup_cleanup_preserves_a_candidate_with_recent_upload_writes(tmp_path, monkeypatch):
+    async def body():
+        monkeypatch.setattr(lbe_maps, "LBE_MAP_STAGING_MAX_AGE_SECONDS", 0.12)
+        monkeypatch.setattr(server, "LBE_MAP_STAGING_MAX_AGE_SECONDS", 0.12)
+        library = tmp_path / "lbe-maps"
+        library.mkdir()
+        active = library / ".lbe-map-upload-active-at-start"
+        active.mkdir()
+        archive = active / "map.zip"
+        archive.write_bytes(b"partial")
+        recent = time.time() - 0.06
+        os.utime(archive, (recent, recent))
+
+        async with _running_server(tmp_path) as (_session, _base):
+            await asyncio.sleep(0.05)
+            archive.write_bytes(b"more data")
+            await asyncio.sleep(0.10)
+            assert active.exists()
 
     asyncio.run(body())
 
@@ -270,6 +389,60 @@ def test_public_configuration_state_preserves_lbe_and_ipd_evidence():
     }
     report["results"]["lbeMode"] = {"status": "failed", "value": True, "reason": "MAP_NOT_LOADED"}
     assert configuration_packages.public_configuration_state(report)["results"]["lbeMode"] == report["results"]["lbeMode"]
+
+
+def test_public_configuration_state_preserves_map_verification_outcomes_and_requested_values():
+    reference = {"sha256": "a" * 64, "name": "Studio.zip", "size": 64}
+    report = {
+        "package_id": str(uuid.uuid4()), "revision": str(uuid.uuid4()), "status": "complete",
+        "results": {
+            "lbeMap": {"status": "failed", "value": reference, "reason": "MAP_ACTIVE_MISMATCH"},
+            "lbeMode": {"status": "failed", "value": True, "reason": "MAP_ACTIVE_MISMATCH"},
+        },
+    }
+
+    normalized = configuration_packages.public_configuration_state(report)
+    assert normalized["results"] == {
+        "lbeMap": {"status": "failed", "value": reference, "reason": "MAP_ACTIVE_MISMATCH"},
+        "lbeMode": {"status": "failed", "value": True, "reason": "MAP_ACTIVE_MISMATCH"},
+    }
+
+    for key, result in report["results"].items():
+        result["reason"] = "MAP_VERIFICATION_UNAVAILABLE"
+    normalized = configuration_packages.public_configuration_state(report)
+    assert normalized["results"] == {
+        "lbeMap": {"status": "failed", "value": reference, "reason": "MAP_VERIFICATION_UNAVAILABLE"},
+        "lbeMode": {"status": "failed", "value": True, "reason": "MAP_VERIFICATION_UNAVAILABLE"},
+    }
+
+    report["results"] = {
+        "lbeMap": {"status": "applied", "value": reference, "reason": "MAP_ACTIVE_VERIFIED"},
+        "lbeMode": {"status": "applied", "value": True},
+    }
+    assert configuration_packages.public_configuration_state(report)["results"] == report["results"]
+
+    report["results"] = {
+        "lbeMap": {"status": "failed", "reason": "MAP_REQUIRED"},
+        "lbeMode": {"status": "failed", "reason": "MAP_REQUIRED", "value": False},
+    }
+    assert configuration_packages.public_configuration_state(report)["results"] == report["results"]
+
+    report["results"] = {
+        "lbeMap": {"status": "failed", "value": reference, "reason": "MAP_MODE_NOT_APPLIED"},
+    }
+    assert configuration_packages.public_configuration_state(report)["results"] == report["results"]
+
+    report["results"] = {
+        "lbeMap": {"status": "failed", "value": reference, "reason": "CALLBACK_TIMEOUT"},
+        "lbeMode": {"status": "failed", "value": True, "reason": "MAP_NOT_LOADED"},
+    }
+    assert configuration_packages.public_configuration_state(report)["results"] == report["results"]
+
+    report["results"] = {
+        "lbeMap": {"status": "applied", "value": reference, "reason": "MAP_ACTIVE_MISMATCH"},
+        "lbeMode": {"status": "applied", "value": True, "reason": "MAP_VERIFICATION_UNAVAILABLE"},
+    }
+    assert configuration_packages.public_configuration_state(report)["results"] == {}
 
 
 def test_device_summary_tracks_group_and_deployment_without_sending_settings_to_summary_only_clients(tmp_path):
@@ -444,14 +617,16 @@ def test_mutations_enforce_origin_draft_cas_impact_and_validation(tmp_path):
             await _assign(session, base, "Studio", first)
             first = await _request(session, "GET", base, _path(first))
             await _deploy(session, base, first, settings=_brightness(50), origin="http://attacker.invalid", status=403)
-            await _deploy(session, base, {**first, "edit_revision": None}, settings=_brightness(50), status=409)
+            conflict = await _deploy(session, base, {**first, "edit_revision": None}, settings=_brightness(50), status=409)
+            assert conflict["code"] == "revision_conflict"
 
             # Both roster changes and moves within a shared package invalidate confirmation.
             async with session.ws_connect(base + "/ws/admin") as admin:
                 await admin.send_json({"type": "UPDATE_GROUP_MEMBERS", "name": "Studio",
                                        "add": {OFFLINE_ID: None}, "remove": []})
                 await _receive_type(admin, "GROUP_MEMBERS_SET")
-                await _deploy(session, base, first, status=409)
+                conflict = await _deploy(session, base, first, status=409)
+                assert conflict["code"] == "deployment_targets_changed"
                 await _assign(session, base, "Gallery", first)
                 current = await _request(session, "GET", base, _path(first))
                 assert current["impact"]["groups"] == 2 and current["impact"]["devices"] == 3
@@ -1474,6 +1649,42 @@ def test_update_group_members_uses_expected_owners_from_each_console_snapshot(tm
                 for console in (first, stale):
                     with pytest.raises(asyncio.TimeoutError):
                         await asyncio.wait_for(console.receive(), 0.05)
+
+    asyncio.run(body())
+
+
+def test_membership_save_rechecks_effective_deployments_and_delete_rechecks_group_list(tmp_path):
+    async def body():
+        async with _running_server(tmp_path, {"Gallery": []}, devices={DEVICE_ID: {"label": "Headset"}}) as (session, base):
+            async with session.ws_connect(base + "/ws/admin") as admin:
+                initial = await _receive_type(admin, "GROUP_LIST")
+                profile = await _create(session, base, "Venue")
+                published = await _deploy(session, base, profile, settings=_brightness(50))
+                await _assign(session, base, "Gallery", published)
+                edit = {"type": "UPDATE_GROUP_MEMBERS", "name": "Gallery", "add": {DEVICE_ID: None},
+                        "remove": [], "expected_deployments": {"Gallery": None}}
+                await admin.send_json(edit)
+                assert "deployment changed" in (await _receive_type(admin, "ERROR"))["message"]
+                latest = json.loads(server.build_group_list_msg())
+                assert latest["groups"]["Gallery"] == []
+
+                edit["expected_deployments"]["Gallery"] = latest["deployments"]["Gallery"]["revision"]
+                await admin.send_json(edit)
+                assert (await _receive_type(admin, "GROUP_MEMBERS_SET"))["members"] == [DEVICE_ID]
+
+                def delete_at(snapshot):
+                    return {"type": "DELETE_GROUP", "name": "Gallery", "expected_snapshot": {
+                        key: snapshot[key] for key in ("server_instance_id", "revision")}}
+
+                current = json.loads(server.build_group_list_msg())
+                await admin.send_json(delete_at(current))
+                await _receive_type(admin, "GROUP_DELETED")
+                await admin.send_json({"type": "CREATE_GROUP", "name": "Gallery"})
+                await _receive_type(admin, "GROUP_CREATED")
+                for stale in (current, initial):
+                    await admin.send_json(delete_at(stale))
+                    assert (await _receive_type(admin, "ERROR"))["operation"] == "DELETE_GROUP"
+                    assert "Gallery" in json.loads(server.build_group_list_msg())["groups"]
 
     asyncio.run(body())
 

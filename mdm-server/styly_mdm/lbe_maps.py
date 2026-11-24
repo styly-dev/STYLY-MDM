@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import os
@@ -12,7 +13,9 @@ import stat
 import struct
 import tempfile
 import time
+import zlib
 import zipfile
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -78,35 +81,95 @@ class LbeMapStore:
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root = self.root.resolve()
 
-    def cleanup_stale_staging(self, *, now: float | None = None) -> int:
-        """Remove abandoned upload directories left by a prior server process."""
-        current_time = time.time() if now is None else now
-        removed = 0
+    def staging_directories(self) -> tuple[Path, ...]:
+        """Return staging paths present when the server starts."""
         try:
             candidates = tuple(self.root.glob(f"{LBE_MAP_STAGING_PREFIX}*"))
         except OSError:
-            return removed
+            raise LbeMapError("Could not read map upload storage", 500)
+        return tuple(
+            candidate for candidate in candidates
+            if not candidate.is_symlink() and candidate.is_dir()
+        )
+
+    def restore_legacy_permissions(self) -> None:
+        """Make legacy read-only entries manageable under the private storage root."""
+        if stat.S_IMODE(self.root.lstat().st_mode) != 0o700:
+            os.chmod(self.root, 0o700)
+        try:
+            entries = tuple(self.root.iterdir())
+        except OSError as exc:
+            raise LbeMapError("Could not read map storage", 500) from exc
+        for entry in entries:
+            if (_SHA256_PATTERN.fullmatch(entry.name) is None
+                    and not entry.name.startswith(LBE_MAP_STAGING_PREFIX)):
+                continue
+            self._restore_entry_permissions(entry)
+
+    @staticmethod
+    def _restore_entry_permissions(directory: Path) -> None:
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(info.st_mode):
+            return
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.chmod(directory, 0o700)
+        for name in ("map.zip", "metadata.json"):
+            child = directory / name
+            try:
+                child_info = child.lstat()
+            except FileNotFoundError:
+                continue
+            if (stat.S_ISREG(child_info.st_mode)
+                    and stat.S_IMODE(child_info.st_mode) != 0o600):
+                os.chmod(child, 0o600)
+
+    def remove_stale_staging(self, candidates: Iterable[Path], *, now: float | None = None) -> int:
+        """Remove only startup candidates whose last upload write exceeded the TTL."""
+        current_time = time.time() if now is None else now
+        removed = 0
         for candidate in candidates:
+            if candidate.parent != self.root or not candidate.name.startswith(LBE_MAP_STAGING_PREFIX):
+                continue
             try:
                 if candidate.is_symlink() or not candidate.is_dir():
                     continue
-                if current_time - candidate.stat().st_mtime < LBE_MAP_STAGING_MAX_AGE_SECONDS:
+                archive = candidate / "map.zip"
+                try:
+                    last_write = archive.stat().st_mtime
+                except FileNotFoundError:
+                    last_write = candidate.stat().st_mtime
+                if current_time - last_write < LBE_MAP_STAGING_MAX_AGE_SECONDS:
                     continue
-                # Older releases chmodded staging directories to 0500 before
-                # promotion. Restore owner write access before removing one.
-                os.chmod(candidate, 0o700)
-                shutil.rmtree(candidate)
+                self._restore_entry_permissions(candidate)
+                self._remove_tree(candidate)
                 removed += 1
             except OSError:
                 continue
         return removed
 
+    @staticmethod
+    def _archive_matches_reference(archive: Path, reference: dict[str, Any]) -> bool:
+        try:
+            info = archive.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size != reference["size"]:
+                return False
+            digest = hashlib.sha256()
+            with archive.open("rb") as source:
+                while chunk := source.read(LBE_MAP_CHUNK_SIZE):
+                    digest.update(chunk)
+            return digest.hexdigest() == reference["sha256"]
+        except FileNotFoundError:
+            return False
+
     def list_maps(self) -> list[dict[str, Any]]:
         references = []
         try:
             directories = tuple(self.root.iterdir())
-        except OSError:
-            return references
+        except OSError as exc:
+            raise LbeMapError("Could not read map library", 500) from exc
         for directory in directories:
             if _SHA256_PATTERN.fullmatch(directory.name) is None:
                 continue
@@ -120,21 +183,15 @@ class LbeMapStore:
             return None
         directory = self.root / reference["sha256"]
         registered = self._read_reference(directory)
-        if registered != reference:
+        if (registered is None
+                or registered["sha256"] != reference["sha256"]
+                or registered["size"] != reference["size"]):
             return None
-        archive = directory / "map.zip"
-        try:
-            if archive.stat().st_size != reference["size"]:
-                return None
-        except OSError:
-            return None
-        return archive
+        return directory / "map.zip"
 
     async def save_upload(self, request: web.Request) -> dict[str, Any]:
         try:
             reader = await request.multipart()
-        except web.HTTPRequestEntityTooLarge as exc:
-            raise LbeMapError("Map upload exceeds the request size limit", 413) from exc
         except (AssertionError, ValueError, web.HTTPException) as exc:
             raise LbeMapError("Expected a multipart upload with a map ZIP", 400) from exc
 
@@ -177,28 +234,41 @@ class LbeMapStore:
             if size == 0:
                 raise LbeMapError("Map ZIP is empty", 400)
 
-            try:
-                await self._run_blocking(self._validate_zip, archive)
-            except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile, RuntimeError,
-                    EOFError, UnicodeError) as exc:
-                raise LbeMapError("Map upload is not a valid ZIP archive", 400) from exc
-
             reference = {"sha256": digest.hexdigest(), "name": name, "size": size}
             destination = self.root / reference["sha256"]
-            if destination.exists():
-                registered = self._read_reference(destination)
-                if registered is None:
-                    raise LbeMapError("Stored map metadata is unavailable", 500)
-                return registered
+            self._restore_entry_permissions(destination)
+            existing_metadata = None
+            if destination.exists() or destination.is_symlink():
+                existing_metadata = self._read_metadata(destination)
+                if existing_metadata is None:
+                    raise self._unrepairable_entry_error(reference["sha256"])
+                if existing_metadata["size"] == size and await self._run_blocking(
+                    self._archive_matches_reference, destination / "map.zip", existing_metadata,
+                ):
+                    return existing_metadata
+                if existing_metadata["size"] != size:
+                    raise self._unrepairable_entry_error(reference["sha256"])
 
-            try:
-                await self._run_blocking(self._publish_staging, staging, destination, reference)
-            except FileExistsError:
-                # Another request may have published the same bytes after the first
-                # existence check. Treat that exact hash as a deduplicated success.
-                registered = self._read_reference(destination)
-                if registered is None:
-                    raise LbeMapError("Stored map metadata is unavailable", 500)
+            await self._run_blocking(self._validate_zip, archive)
+
+            if existing_metadata is not None:
+                await self._run_blocking(
+                    self._replace_damaged_archive, destination, archive, existing_metadata,
+                )
+                return existing_metadata
+
+            published = await self._run_blocking(self._publish_staging, staging, destination, reference)
+            if not published:
+                registered = self._read_metadata(destination)
+                if registered is None or registered["size"] != size:
+                    raise self._unrepairable_entry_error(reference["sha256"])
+                if await self._run_blocking(
+                    self._archive_matches_reference, destination / "map.zip", registered,
+                ):
+                    return registered
+                await self._run_blocking(
+                    self._replace_damaged_archive, destination, archive, registered,
+                )
                 return registered
             return reference
         except OSError as exc:
@@ -211,8 +281,6 @@ class LbeMapStore:
     async def _next_part(reader: MultipartReader) -> BodyPartReader | MultipartReader | None:
         try:
             return await reader.next()
-        except web.HTTPRequestEntityTooLarge as exc:
-            raise LbeMapError("Map upload exceeds the request size limit", 413) from exc
         except (AssertionError, TypeError, ValueError, web.HTTPException) as exc:
             raise LbeMapError("Invalid map upload form", 400) from exc
 
@@ -220,8 +288,6 @@ class LbeMapStore:
     async def _read_chunk(part: BodyPartReader) -> bytes:
         try:
             return await part.read_chunk(size=LBE_MAP_CHUNK_SIZE)
-        except web.HTTPRequestEntityTooLarge as exc:
-            raise LbeMapError("Map upload exceeds the request size limit", 413) from exc
         except (AssertionError, TypeError, ValueError, web.HTTPException) as exc:
             raise LbeMapError("Could not read the map ZIP upload", 400) from exc
 
@@ -242,28 +308,41 @@ class LbeMapStore:
         handle.flush()
         os.fsync(handle.fileno())
 
-    def _publish_staging(self, staging: Path, destination: Path, reference: dict[str, Any]) -> None:
+    def _publish_staging(self, staging: Path, destination: Path, reference: dict[str, Any]) -> bool:
         metadata = staging / "metadata.json"
         with metadata.open("x", encoding="utf-8") as output:
             json.dump(reference, output, ensure_ascii=False, separators=(",", ":"))
             output.flush()
             os.fsync(output.fileno())
-        os.chmod(staging / "map.zip", 0o400)
-        os.chmod(metadata, 0o400)
         self._fsync_directory(staging)
-        # Keep the staging directory writable until after rename. A crash before
-        # promotion then leaves a removable directory instead of a 0500 orphan.
-        self._promote(staging, destination)
-        os.chmod(destination, 0o500)
+        try:
+            self._promote(staging, destination)
+        except OSError as exc:
+            if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                raise
+            return False
         self._fsync_directory(destination.parent)
+        return True
 
     @staticmethod
     def _remove_staging(staging: Path) -> None:
         try:
-            os.chmod(staging, 0o700)
+            LbeMapStore._remove_tree(staging)
         except OSError:
             pass
-        shutil.rmtree(staging, ignore_errors=True)
+
+    @staticmethod
+    def _remove_tree(path: Path) -> None:
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(mode):
+            path.unlink()
+            return
+        if not stat.S_ISDIR(mode):
+            return
+        shutil.rmtree(path)
 
     @staticmethod
     def _check_directory(archive: Path) -> None:
@@ -363,12 +442,20 @@ class LbeMapStore:
                 bad_entry = zipped.testzip()
                 if bad_entry is not None:
                     raise LbeMapError("Map ZIP contains a corrupt file", 400)
-        except LbeMapError:
-            raise
-        except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, RuntimeError, EOFError, UnicodeError) as exc:
+        except (zipfile.BadZipFile, zipfile.LargeZipFile, RuntimeError, EOFError, UnicodeError, zlib.error) as exc:
             raise LbeMapError("Map upload is not a valid ZIP archive", 400) from exc
 
     def _read_reference(self, directory: Path) -> dict[str, Any] | None:
+        reference = self._read_metadata(directory)
+        if reference is None:
+            return None
+        try:
+            archive = (directory / "map.zip").lstat()
+        except OSError:
+            return None
+        return reference if stat.S_ISREG(archive.st_mode) and archive.st_size == reference["size"] else None
+
+    def _read_metadata(self, directory: Path) -> dict[str, Any] | None:
         try:
             if directory.is_symlink() or not directory.is_dir():
                 return None
@@ -377,17 +464,39 @@ class LbeMapStore:
             if _SHA256_PATTERN.fullmatch(directory.name) is None:
                 return None
             metadata_path = directory / "metadata.json"
-            archive = directory / "map.zip"
-            if metadata_path.is_symlink() or archive.is_symlink():
+            if metadata_path.is_symlink():
                 return None
             raw = json.loads(metadata_path.read_text(encoding="utf-8"))
             if not valid_map_reference(raw) or raw["sha256"] != directory.name:
                 return None
-            if not archive.is_file() or archive.stat().st_size != raw["size"]:
-                return None
             return raw
         except (OSError, ValueError, TypeError, RecursionError):
             return None
+
+    @staticmethod
+    def _unrepairable_entry_error(digest: str) -> LbeMapError:
+        return LbeMapError(
+            "Stored map entry is damaged and cannot be repaired automatically. "
+            f"Ask the server administrator to remove map entry {digest} from the lbe-maps directory, then upload the ZIP again.",
+            500,
+        )
+
+    def _replace_damaged_archive(
+        self,
+        directory: Path,
+        staged_archive: Path,
+        expected_metadata: dict[str, Any],
+    ) -> None:
+        if self._read_metadata(directory) != expected_metadata:
+            raise self._unrepairable_entry_error(directory.name)
+        archive = directory / "map.zip"
+        if archive.is_symlink() or (archive.exists() and not archive.is_file()):
+            raise self._unrepairable_entry_error(directory.name)
+
+        # Both files live under the storage root, so replace publishes the complete,
+        # verified ZIP atomically without exposing a partially copied archive.
+        os.replace(staged_archive, archive)
+        self._fsync_directory(directory)
 
     @staticmethod
     def _promote(staging: Path, destination: Path) -> None:

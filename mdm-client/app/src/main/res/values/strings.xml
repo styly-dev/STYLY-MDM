@@ -45,7 +45,7 @@
     <string name="wifi_location_settings_unavailable">Location settings are unavailable on this device</string>
     <string name="wifi_overlay_permission_missing">Grant “Display over other apps” so MDM can read saved Wi-Fi networks on PICO.</string>
     <string name="wifi_overlay_settings_unavailable">Overlay permission settings are unavailable on this device</string>
-    <string name="wifi_diagnostics_permission_missing">DUMP is only needed when updating Wi-Fi profiles whose MAC policy MDM cannot identify, typically profiles created outside MDM. Grant it with ADB during provisioning if those profiles need updates.</string>
+    <string name="wifi_diagnostics_permission_missing">Wi-Fi management requires the DUMP permission. Grant it with ADB during device setup.</string>
     <string name="wifi_allow_precise_location">Allow precise location</string>
     <string name="wifi_open_app_permissions">Open app permissions</string>
     <string name="wifi_open_overlay_settings">Open overlay settings</string>

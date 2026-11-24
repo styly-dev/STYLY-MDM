@@ -25,6 +25,7 @@ import zipfile
 from collections.abc import Awaitable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlencode
 from aiohttp import WSCloseCode, web
 
@@ -39,8 +40,10 @@ from .device_policy import (
 from . import configuration_packages
 from .configuration_packages import PackageError
 from .integrity import apk_cd_digest, file_sha256, is_os_metadata
-from .lbe_maps import LbeMapError, LbeMapStore
+from .file_transfer import stream_file
+from .lbe_maps import LBE_MAP_STAGING_MAX_AGE_SECONDS, LbeMapError, LbeMapStore
 from .push_jobs import parse_capabilities
+from .push_transfer_leases import TRANSFER_IDLE_SECONDS
 from .wifi_settings import normalize_revision, public_wifi_state
 
 logging.basicConfig(
@@ -88,13 +91,11 @@ MAX_APK_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB
 BUNDLED_CLIENT_DIR = Path(__file__).resolve().parent / "client"
 CLIENT_APK_RE = re.compile(r"^styly-mdm-client_v?(\d+(?:\.\d+)+)(?:-.*)?\.apk$")
 
-# Maximum number of device downloads allowed in flight across the whole server.
-# Fanning a file out to a large group otherwise makes every device pull it from the
-# server at the same instant (an APK can be up to 2 GiB, a push bundle likewise),
-# spiking LAN/server bandwidth and stalling transfers. Every byte-moving fan-out —
-# install, push, sync — gates its dispatch on the same pool of this many slots; a
-# slot frees as soon as its device reports the download finished. Read when the pool
-# is first created so tests and the --max-concurrent-transfers flag can override it.
+# Maximum number of downloads allowed in flight across the whole server. Fanning a
+# file out to a large group otherwise makes every device pull it at once, spiking
+# LAN/server bandwidth. Install and Push hold a slot through device completion;
+# LBE map GETs hold one through the HTTP stream. Read when first created so tests and
+# the --max-concurrent-transfers flag can override it.
 MAX_CONCURRENT_TRANSFERS = max(1, int(os.environ.get("MDM_MAX_CONCURRENT_TRANSFERS", "5")))
 
 # Seconds a single device may hold a transfer slot before it is force-released, so
@@ -476,14 +477,15 @@ def _read_configuration(raw: dict) -> _ConfigurationRegistry:
     return _ConfigurationRegistry(groups, packages)
 
 
-def _unavailable_configuration(raw_groups) -> _ConfigurationRegistry:
+def _unavailable_configuration(raw_groups, *, legacy: bool = False) -> _ConfigurationRegistry:
     groups = {}
     if isinstance(raw_groups, dict):
         for raw_name, entry in raw_groups.items():
             if name := _group_name(raw_name):
                 members = entry.get("members") if isinstance(entry, dict) else entry
                 groups[name] = _DeviceGroup(_coerce_group_members(members))
-        _remove_duplicate_memberships(groups)
+        if not legacy:
+            _remove_duplicate_memberships(groups)
     return _ConfigurationRegistry(groups, None)
 
 
@@ -540,7 +542,7 @@ def load_registry() -> None:
     except (ValueError, OSError, RecursionError) as exc:
         _registry_readable = False
         if isinstance(raw, dict):
-            _configuration = _unavailable_configuration(raw.get("groups"))
+            _configuration = _unavailable_configuration(raw.get("groups"), legacy="packages" not in raw)
         else:
             _configuration = _ConfigurationRegistry(packages=None)
         log.warning("Device registry unavailable at %s: %s; saved data retained", REGISTRY_PATH, exc)
@@ -565,7 +567,7 @@ def load_registry() -> None:
                     raise PackageError("Configuration migration could not be saved")
             _configuration = candidate
         except PackageError as exc:
-            _configuration = _unavailable_configuration(raw_groups)
+            _configuration = _unavailable_configuration(raw_groups, legacy="packages" not in raw)
             _registry_extras.update({key: raw[key] for key in _CONFIGURATION_FIELDS if key in raw})
             log.warning("Configuration packages unavailable: %s; saved data retained", exc)
     else:
@@ -1579,6 +1581,8 @@ CONFIGURATION_SEND_TIMEOUT = 5.0
 _CONFIGURATION_PUBLICATIONS = web.AppKey("configuration_publications", set)
 _LBE_MAP_TOKEN_KEY = secrets.token_bytes(32)
 LBE_MAP_TOKEN_TTL_SECONDS = 24 * 60 * 60
+LBE_MAP_TOKEN_REFRESH_WINDOW_SECONDS = 10 * 60
+LBE_MAP_TRANSFER_QUEUE_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass
@@ -1615,6 +1619,42 @@ async def lbe_maps_handler(request: web.Request) -> web.Response:
         return web.json_response(payload, headers={"Cache-Control": "no-store"})
     except (PackageError, LbeMapError) as exc:
         return web.json_response({"error": str(exc)}, status=exc.status)
+    except OSError as exc:
+        log.error("Could not access LBE map storage", exc_info=exc)
+        return web.json_response({"error": "Could not access the map library"}, status=500)
+
+
+async def _expire_startup_map_staging(store: LbeMapStore, candidates: tuple[Path, ...]) -> None:
+    await asyncio.sleep(LBE_MAP_STAGING_MAX_AGE_SECONDS)
+    try:
+        removed = await asyncio.to_thread(store.remove_stale_staging, candidates)
+        if removed:
+            log.info("Removed %d abandoned LBE map upload(s)", removed)
+    except (LbeMapError, OSError):
+        log.warning("Could not clean up abandoned LBE map uploads", exc_info=True)
+
+
+async def _map_staging_cleanup(_app: web.Application):
+    cleanup_task = None
+    try:
+        store = _lbe_map_store()
+        await asyncio.to_thread(store.restore_legacy_permissions)
+        candidates = await asyncio.to_thread(store.staging_directories)
+        removed = await asyncio.to_thread(store.remove_stale_staging, candidates)
+        if removed:
+            log.info("Removed %d abandoned LBE map upload(s)", removed)
+        pending = tuple(candidate for candidate in candidates if candidate.is_dir())
+        if pending:
+            cleanup_task = asyncio.create_task(_expire_startup_map_staging(store, pending))
+    except (LbeMapError, OSError):
+        log.warning("Could not prepare LBE map upload cleanup", exc_info=True)
+
+    try:
+        yield
+    finally:
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            await asyncio.gather(cleanup_task, return_exceptions=True)
 
 
 def _lbe_map_token(device_id: str, revision: str, digest: str, expires_at: int) -> str:
@@ -1641,7 +1681,7 @@ def _valid_lbe_map_token(token: str, device_id: str, revision: str, digest: str)
     return hmac.compare_digest(token_bytes, expected.encode("ascii"))
 
 
-async def lbe_map_download_handler(request: web.Request) -> web.StreamResponse:
+def _authorized_lbe_map_reference(request: web.Request) -> dict[str, Any]:
     device_id = request.query.get("device_id", "")
     revision = request.query.get("revision", "")
     digest = request.match_info["sha256"]
@@ -1653,10 +1693,47 @@ async def lbe_map_download_handler(request: web.Request) -> web.StreamResponse:
     reference = policy["settings"].get("lbeMap")
     if revision != policy["revision"] or reference is None or digest != reference["sha256"]:
         raise web.HTTPForbidden()
+
+    return reference
+
+
+def _lbe_map_download_path(reference: dict[str, Any]) -> Path:
     path = _lbe_map_store().path_for(reference)
     if path is None:
         raise web.HTTPNotFound()
-    return web.FileResponse(path, headers={"Cache-Control": "private, no-store", "Content-Type": "application/zip"})
+    return path
+
+
+async def lbe_map_download_handler(request: web.Request) -> web.StreamResponse:
+    reference = _authorized_lbe_map_reference(request)
+    slots = transfer_slots()
+    try:
+        await asyncio.wait_for(
+            slots.acquire(), timeout=LBE_MAP_TRANSFER_QUEUE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return web.Response(
+            status=503,
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-MDM-Transfer-Status": "queued",
+                "Retry-After": "1",
+            },
+        )
+    try:
+        # A device can be unassigned or receive new credentials while queued.
+        reference = _authorized_lbe_map_reference(request)
+        path = _lbe_map_download_path(reference)
+        return await stream_file(
+            request,
+            path,
+            reference["size"],
+            reference["sha256"],
+            cache_control="private, no-store",
+            write_timeout_seconds=TRANSFER_IDLE_SECONDS,
+        )
+    finally:
+        slots.release()
 
 
 async def _small_json_body(request: web.Request) -> dict:
@@ -1728,7 +1805,7 @@ def _updated_package(profile: dict, body: dict) -> dict:
     settings = configuration_packages.validate_settings(body.get("settings"))
     reference = configuration_packages.managed_settings(settings).get("lbeMap")
     if reference is not None and _lbe_map_store().path_for(reference) is None:
-        raise PackageError("The selected LBE map is unavailable. Upload or select it again.", 409)
+        raise PackageError("The selected LBE map is unavailable. Upload or select it again.", 409, "map_unavailable")
     return {**profile, "name": name, "settings": settings, "edit_revision": str(uuid.uuid4())}
 
 
@@ -1750,7 +1827,7 @@ def _check_deployment_impact(body: dict, token: str) -> None:
     if not isinstance(expected, str) or not expected:
         raise PackageError("expected_impact is required")
     if expected != token:
-        raise PackageError("Deployment targets changed. Review the updated targets before deploying.", 409)
+        raise PackageError("Deployment targets changed. Review the updated targets before deploying.", 409, "deployment_targets_changed")
 
 
 def _lbe_deployment_details(settings: dict) -> dict:
@@ -1770,7 +1847,7 @@ async def package_catalog_handler(request: web.Request) -> web.Response:
         _require_packages()
         return web.json_response({"packages": _public_packages(), "sections": configuration_packages.SECTIONS})
     except PackageError as exc:
-        return web.json_response({"error": str(exc)}, status=exc.status)
+        return web.json_response(exc.payload(), status=exc.status)
 
 
 async def package_create_handler(request: web.Request) -> web.Response:
@@ -1795,7 +1872,7 @@ async def package_create_handler(request: web.Request) -> web.Response:
         await broadcast_group_list()
         return web.json_response(response, headers={"Cache-Control": "no-store"})
     except PackageError as exc:
-        return web.json_response({"error": str(exc)}, status=exc.status)
+        return web.json_response(exc.payload(), status=exc.status)
 
 
 async def package_handler(request: web.Request) -> web.Response:
@@ -1810,15 +1887,12 @@ async def package_handler(request: web.Request) -> web.Response:
         profile = _find_package(package_id)
         configuration_packages.check_expected_revision(body, profile["edit_revision"])
         if any(group.package_id == package_id for group in _configuration.groups.values()):
-            return web.json_response({
-                "error": "Configuration package is assigned to a group",
-                "code": "package_assigned",
-            }, status=409)
+            raise PackageError("Configuration package is assigned to a group", 409, "package_assigned")
         _save_package(package_id, None)
         await broadcast_group_list()
         return web.json_response({"deleted": True})
     except PackageError as exc:
-        return web.json_response({"error": str(exc)}, status=exc.status)
+        return web.json_response(exc.payload(), status=exc.status)
 
 
 async def package_save_and_deploy_handler(request: web.Request) -> web.Response:
@@ -1836,7 +1910,7 @@ async def package_save_and_deploy_handler(request: web.Request) -> web.Response:
         return web.json_response(_editor_package(package_id, _find_package(package_id)),
                                  headers={"Cache-Control": "no-store"})
     except PackageError as exc:
-        return web.json_response({"error": str(exc)}, status=exc.status)
+        return web.json_response(exc.payload(), status=exc.status)
 
 
 async def group_package_deploy_handler(request: web.Request) -> web.Response:
@@ -1887,7 +1961,7 @@ async def group_package_deploy_handler(request: web.Request) -> web.Response:
         if profile is not None:
             reference = configuration_packages.published_settings(profile).get("lbeMap")
             if reference is not None and _lbe_map_store().path_for(reference) is None:
-                raise PackageError("The selected LBE map is unavailable. Upload or select it again.", 409)
+                raise PackageError("The selected LBE map is unavailable. Upload or select it again.", 409, "map_unavailable")
         if profile is not None and not use_current:
             updated = _published_configuration(package_id, profile)
         else:
@@ -1901,7 +1975,7 @@ async def group_package_deploy_handler(request: web.Request) -> web.Response:
         _schedule_configuration_publication(request.app, devices)
         return web.Response(text=build_group_list_msg(), content_type="application/json")
     except PackageError as exc:
-        return web.json_response({"error": str(exc)}, status=exc.status)
+        return web.json_response(exc.payload(), status=exc.status)
 
 
 async def package_retry_handler(request: web.Request) -> web.Response:
@@ -1920,7 +1994,7 @@ async def package_retry_handler(request: web.Request) -> web.Response:
             raise PackageError("The device or published package is no longer available for retry", 409)
         return web.json_response({"sent": True})
     except PackageError as exc:
-        return web.json_response({"error": str(exc)}, status=exc.status)
+        return web.json_response(exc.payload(), status=exc.status)
 
 
 def _supports_configuration(entry: dict) -> bool:
@@ -2000,6 +2074,17 @@ def _configuration_connection_ready(device_id: str, entry: dict) -> bool:
             and not entry["ws"].closed)
 
 
+def _lbe_map_credential_needs_refresh(device_id: str, entry: dict, now: int | None = None) -> bool:
+    expires_at = entry.get("lbe_map_token_expires_at")
+    if (not isinstance(expires_at, int)
+            or entry.get("identity_kind") != "canonical"
+            or configuration_packages.LBE_MAP_CAPABILITY not in entry.get("capabilities", ())
+            or not _configuration_connection_ready(device_id, entry)):
+        return False
+    current_time = int(time.time()) if now is None else now
+    return expires_at <= current_time + LBE_MAP_TOKEN_REFRESH_WINDOW_SECONDS
+
+
 async def _send_configuration(
     device_id: str, entry: dict, *, retry: tuple[str, str] | None = None,
     delivery: _ConfigurationDelivery | None = None,
@@ -2014,7 +2099,10 @@ async def _send_configuration(
     if not include_settings and (not include_summary or retry is not None):
         return False
 
+    map_token_expires_at: int | None = None
+
     def resolve() -> str | None:
+        nonlocal map_token_expires_at
         if not _configuration_connection_ready(device_id, entry):
             return None
         policy = _desired_configuration(device_id, include_summary=include_summary, include_settings=include_settings)
@@ -2027,10 +2115,12 @@ async def _send_configuration(
             digest = reference["sha256"]
             query = urlencode({"device_id": device_id, "revision": policy["revision"]})
             policy["lbe_map_download"] = f"/api/lbe-maps/{digest}/download?{query}"
+            map_token_expires_at = int(time.time()) + LBE_MAP_TOKEN_TTL_SECONDS
             policy["lbe_map_token"] = _lbe_map_token(
-                device_id, policy["revision"], digest,
-                int(time.time()) + LBE_MAP_TOKEN_TTL_SECONDS,
+                device_id, policy["revision"], digest, map_token_expires_at,
             )
+        else:
+            map_token_expires_at = None
         if delivery is not None:
             # All requests received before the write are covered by this policy.
             delivery.pending = False
@@ -2039,8 +2129,15 @@ async def _send_configuration(
     try:
         send = ws.send_current_text(resolve)
         if retry is not None:
-            return await asyncio.wait_for(send, timeout=CONFIGURATION_SEND_TIMEOUT)
-        return await send
+            sent = await asyncio.wait_for(send, timeout=CONFIGURATION_SEND_TIMEOUT)
+        else:
+            sent = await send
+        if sent and devices.get(device_id) is entry:
+            if map_token_expires_at is None:
+                entry.pop("lbe_map_token_expires_at", None)
+            else:
+                entry["lbe_map_token_expires_at"] = map_token_expires_at
+        return sent
     except (asyncio.TimeoutError, ConnectionError, RuntimeError):
         log.info("Configuration delivery could not be confirmed for %s", device_id)
         return False
@@ -2235,7 +2332,7 @@ async def device_ws_handler(request: web.Request) -> web.StreamResponse:
     try:
         _require_same_origin(request)
     except PackageError as exc:
-        return web.json_response({"error": str(exc)}, status=exc.status)
+        return web.json_response(exc.payload(), status=exc.status)
 
     ws = _websocket_response_factory(heartbeat=30)
     await ws.prepare(request)
@@ -2460,6 +2557,9 @@ async def device_ws_handler(request: web.Request) -> web.StreamResponse:
                         device_id, battery["level"], battery["charging"],
                     )
                     _record_telemetry()
+                    entry = devices.get(device_id)
+                    if entry is not None and _lbe_map_credential_needs_refresh(device_id, entry):
+                        _queue_configuration(device_id, entry)
 
                 elif msg_type == "DOWNLOAD_COMPLETE":
                     # Primary transfer-slot release: the network-heavy download has
@@ -2769,7 +2869,7 @@ async def admin_ws_handler(request: web.Request) -> web.StreamResponse:
     try:
         _require_same_origin(request)
     except PackageError as exc:
-        return web.json_response({"error": str(exc)}, status=exc.status)
+        return web.json_response(exc.payload(), status=exc.status)
 
     # On aiohttp 3.14.3, the server-side reader rejected Chrome's first PUSH_FILES
     # text frame after a long upload with "Received frame with non-zero reserved
@@ -3071,6 +3171,14 @@ async def handle_delete_group(
         await _send_admin_error(admin_ws, "Group name is required")
         return
 
+    if "expected_snapshot" in data and data["expected_snapshot"] != {
+        "server_instance_id": SERVER_INSTANCE_ID, "revision": _configuration.revision,
+    }:
+        await _send_admin_error(admin_ws, "Group details changed. Review the current group before deleting it.",
+                                operation="DELETE_GROUP", name=name)
+        await broadcast_group_list()
+        return
+
     if name in _configuration.groups:
         groups = _configuration.groups.copy()
         group = groups.pop(name)
@@ -3141,6 +3249,17 @@ async def handle_update_group_members(admin_ws: web.WebSocketResponse, data: dic
     if stale:
         await reject("Group membership changed in another console. Reload the console and retry.", refresh=True)
         return
+
+    if "expected_deployments" in data:
+        involved = {name, *(owner for owner in additions.values() if owner is not None)}
+        current_deployments = {}
+        for group_name in involved:
+            group = _configuration.groups[group_name]
+            profile = _published_group_profile(group)
+            current_deployments[group_name] = group.effective_revision(profile) if profile else None
+        if data["expected_deployments"] != current_deployments:
+            await reject("Group deployment changed. Review the current package before saving members.", refresh=True)
+            return
 
     groups = _configuration.groups.copy()
     changed: set[str] = set()
@@ -4121,17 +4240,12 @@ def probe_existing_server(timeout: float = 1.0) -> str | None:
 def create_app() -> web.Application:
     # Ensure the writable data directory exists before loading/saving the registry.
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        stale_maps_removed = LbeMapStore(DATA_DIR / "lbe-maps").cleanup_stale_staging()
-        if stale_maps_removed:
-            log.info("Removed %d abandoned LBE map upload(s)", stale_maps_removed)
-    except OSError:
-        log.warning("Could not prepare LBE map storage", exc_info=True)
     load_registry()
     app = web.Application(
         client_max_size=max(MAX_APK_SIZE, MAX_BUNDLE_SIZE) + 10 * 1024 * 1024)
 
     app[_CONFIGURATION_PUBLICATIONS] = set()
+    app.cleanup_ctx.append(_map_staging_cleanup)
     app.on_cleanup.append(_stop_configuration_publications)
     app.on_cleanup.append(_flush_telemetry)
     app.router.add_get("/ws/device", device_ws_handler)
@@ -4303,7 +4417,7 @@ def main():
         type=int,
         default=None,
         help="Max simultaneous device downloads server-wide, across all install "
-        "and push jobs (default: $MDM_MAX_CONCURRENT_TRANSFERS or 5).",
+        "and push jobs plus LBE map downloads (default: $MDM_MAX_CONCURRENT_TRANSFERS or 5).",
     )
     subparsers = parser.add_subparsers(dest="command")
     hash_parser = subparsers.add_parser(

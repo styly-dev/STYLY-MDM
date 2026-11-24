@@ -69,14 +69,17 @@ class MdmClientApplication : Application() {
                 override fun onReceive(context: Context, intent: Intent) {
                     when (intent.action) {
                         Intent.ACTION_PACKAGE_ADDED ->
-                            intent.data?.schemeSpecificPart?.let(configurationPackages::onAppInstalled)
+                            intent.data?.schemeSpecificPart?.let(configurationPackages::onHomePackageChanged)
                         Intent.ACTION_PACKAGE_REMOVED -> if (!intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) {
-                            intent.data?.schemeSpecificPart?.let(configurationPackages::onAppRemoved)
+                            intent.data?.schemeSpecificPart?.let(configurationPackages::onHomePackageChanged)
                         }
+                        Intent.ACTION_PACKAGE_CHANGED ->
+                            intent.data?.schemeSpecificPart?.let(configurationPackages::onHomePackageChanged)
                     }
                 }
             }, IntentFilter(Intent.ACTION_PACKAGE_ADDED).apply {
                 addAction(Intent.ACTION_PACKAGE_REMOVED)
+                addAction(Intent.ACTION_PACKAGE_CHANGED)
                 addDataScheme("package")
             },
                 ContextCompat.RECEIVER_EXPORTED)

@@ -277,6 +277,10 @@ internal class WifiSettingsController internal constructor(
                 return
             }
             updateReadiness()
+            if (unavailableReason == WifiReason.DUMP_PERMISSION_MISSING.wireValue) {
+                reportRequest(request, WifiReason.DUMP_PERMISSION_MISSING)
+                return
+            }
             val requested = WifiSettingsProtocol.parseManagedPolicy(request.revision, request.settings)
             if (!dependencies.platformSupported || (requested.autoReturn && priorityScanner == null)) {
                 reportRequest(request, WifiReason.UNSUPPORTED)
@@ -371,7 +375,7 @@ internal class WifiSettingsController internal constructor(
             return
         }
         if (!attempt.profile.prioritizeNetworks) {
-            if (applyRequestedProfile(attempt, previousAssociations = emptyList())) {
+            if (applyRequestedProfile(attempt)) {
                 complete(attempt, WifiReason.SAVED)
             }
             return
@@ -410,7 +414,7 @@ internal class WifiSettingsController internal constructor(
     private fun finishWithoutConnectionObserver(attempt: Attempt, reason: WifiReason) {
         if (attempt.request == null) {
             fail(attempt, reason)
-        } else if (applyRequestedProfile(attempt, previousAssociations = null)) {
+        } else if (applyRequestedProfile(attempt)) {
             endAttempt(attempt, failure(attempt.profile.revision, reason))
         }
     }
@@ -440,7 +444,7 @@ internal class WifiSettingsController internal constructor(
         }
 
         if (attempt.request != null) {
-            if (!applyRequestedProfile(attempt, snapshot.observations)) return
+            if (!applyRequestedProfile(attempt)) return
             if (shouldKeepExistingAssociation(attempt, previous)) {
                 complete(attempt, WifiReason.SAVED)
                 return
@@ -465,10 +469,7 @@ internal class WifiSettingsController internal constructor(
         disconnectForCandidate(attempt)
     }
 
-    private fun applyRequestedProfile(
-        attempt: Attempt,
-        previousAssociations: List<WifiLocalNetworkObservation>?,
-    ): Boolean {
+    private fun applyRequestedProfile(attempt: Attempt): Boolean {
         if (attempt.request?.isCurrent?.invoke() == false) {
             endAttempt(attempt, failure(attempt.profile.revision, WifiReason.UNKNOWN))
             return false

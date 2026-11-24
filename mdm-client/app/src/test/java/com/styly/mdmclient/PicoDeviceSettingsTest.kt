@@ -1,5 +1,10 @@
 package com.styly.mdmclient
 
+import android.content.ContextWrapper
+import com.pvr.tobservice.interfaces.IToBServiceProxy
+import org.json.JSONObject
+import java.lang.reflect.Proxy
+import java.util.function.Consumer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertFalse
@@ -7,6 +12,55 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PicoDeviceSettingsTest {
+    @Test
+    fun `apply owns the LBE switch and reports the IPD callback without reading a lens position`() {
+        var ipdCode = 0
+        val lensRequests = mutableListOf<Float>()
+        val sdk = IToBServiceProxy::class.java
+        val service = Proxy.newProxyInstance(sdk.classLoader, arrayOf(sdk)) { _, method, args ->
+            check(method.name == "pbsSetIPD") { method.name }
+            lensRequests += args[0] as Float
+            @Suppress("UNCHECKED_CAST")
+            (args[1] as Consumer<Int>).accept(ipdCode)
+            null
+        } as IToBServiceProxy
+        var mode = false
+        val switchCalls = mutableListOf<Boolean>()
+        val lbe = PicoLbeMode(
+            readStatus = { if (mode) "1" else "0" },
+            setEnabled = { target -> switchCalls += target; mode = target; true },
+        )
+        var elapsed = 0L
+        val settings = PicoDeviceSettings(ContextWrapper(null), service, lbe) { elapsed += 200L; elapsed }
+        val request = JSONObject().put("lbeMode", true).put("ipd", 62.5)
+        val applied = settings.apply(request, overwrite = false)
+        assertEquals("applied", applied.getJSONObject("lbeMode").getString("status"))
+        assertEquals(true, applied.getJSONObject("lbeMode").getBoolean("value"))
+        assertEquals("ACCEPTED_UNVERIFIED", applied.getJSONObject("ipd").getString("reason"))
+        assertEquals(62.5, applied.getJSONObject("ipd").getDouble("value"), 0.0)
+
+        ipdCode = -2
+        val overwrite = settings.apply(request, overwrite = true)
+        assertEquals("applied", overwrite.getJSONObject("lbeMode").getString("status"))
+        assertEquals("unsupported", overwrite.getJSONObject("ipd").getString("status"))
+        assertEquals(listOf(true), switchCalls)
+        assertEquals(listOf(62.5f, 62.5f), lensRequests)
+
+        val disabled = settings.apply(JSONObject().put("lbeMode", false), overwrite = false)
+        assertEquals(false, disabled.getJSONObject("lbeMode").getBoolean("value"))
+        assertEquals(listOf(true, false), switchCalls)
+    }
+
+    @Test
+    fun `only the SDK match code while LBE is On verifies a venue ZIP`() {
+        assertEquals(ActiveLbeMap.MODE_OFF, inspectActiveLbeMap({ false }) { error("unexpected comparison") })
+        assertEquals(ActiveLbeMap.MATCH, inspectActiveLbeMap({ true }) { 0 })
+        assertEquals(ActiveLbeMap.DIFFERENT, inspectActiveLbeMap({ true }) { 1 })
+        assertEquals(ActiveLbeMap.UNKNOWN, inspectActiveLbeMap({ true }) { -2 })
+        assertEquals(ActiveLbeMap.UNKNOWN, inspectActiveLbeMap({ true }) { throw NoSuchMethodError() })
+        assertEquals(ActiveLbeMap.UNKNOWN, inspectActiveLbeMap({ throw java.util.concurrent.TimeoutException() }) { 0 })
+    }
+
     @Test
     fun `IPD accepts only tenths inside the SDK range`() {
         assertEquals(58.0, normalizeIpd(58), 0.0)
@@ -56,6 +110,47 @@ class PicoDeviceSettingsTest {
 
         assertFalse(stable)
         assertEquals(1_500L, now)
+    }
+
+    @Test
+    fun `a transient LBE read timeout resets stability and keeps polling`() {
+        var now = 0L
+        var reads = 0
+        val stable = awaitStableAvailability(
+            isAvailable = {
+                reads++
+                if (reads == 1) throw java.util.concurrent.TimeoutException()
+                true
+            },
+            nowElapsed = { now },
+            sleep = { now += it },
+            stableMillis = 200L,
+            timeoutMillis = 1_000L,
+            pollMillis = 100L,
+        )
+
+        assertTrue(stable)
+        assertEquals(300L, now)
+        assertEquals(4, reads)
+    }
+
+    @Test
+    fun `a permanent security failure stops LBE observation immediately`() {
+        var reads = 0
+        var now = 0L
+        try {
+            awaitStableAvailability(
+                isAvailable = {
+                    reads++
+                    throw SecurityException("permission denied")
+                },
+                nowElapsed = { now },
+                sleep = { now += it },
+            )
+            throw AssertionError("Expected the permanent read failure to escape")
+        } catch (_: SecurityException) {
+            assertEquals(1, reads)
+        }
     }
 
     @Test

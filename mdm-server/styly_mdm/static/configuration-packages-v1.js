@@ -4,6 +4,7 @@
   const CREATE_PACKAGE_OPTION = 'create-package';
 
   const MAX_WIFI_NETWORKS = 4;
+  const MAX_LBE_MAP_BYTES = 512 * 1024 * 1024;
   const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   const WIFI_ANDROID_HELP = 'Android chooses the network. Auto-connect is on for listed SSID and security matches and off for other saved networks.';
   const WIFI_ACTION_ICONS = {
@@ -22,11 +23,18 @@
     });
   }
 
+  function wifiPermissionWarningHtml(device) {
+    return device?.status === 'online' && device.wifi_state?.unavailable_reason === 'DUMP_PERMISSION_MISSING'
+      ? '<span class="wifi-warning">Wi-Fi management requires the DUMP permission.</span>' : '';
+  }
+
   function currentWifiHtml(device) {
     const wifi = device?.current_wifi;
-    if (device?.status !== 'online' || !wifi?.ssid) return '';
+    if (device?.status !== 'online') return '';
+    const warning = wifiPermissionWarningHtml(device);
+    if (!wifi?.ssid) return warning;
     const title = wifi.bssid ? ' title="BSSID: ' + esc(wifi.bssid) + '"' : '';
-    return '<span class="current-wifi"' + title + '>Wi-Fi: ' + esc(wifi.ssid) + '</span>';
+    return '<span class="current-wifi"' + title + '>Wi-Fi: ' + esc(wifi.ssid) + '</span>' + (warning ? ' ' + warning : '');
   }
 
   function loadDraft(sections, settings) {
@@ -65,15 +73,12 @@
       const max = Number(item.max ?? Number.MAX_SAFE_INTEGER);
       const step = Number(item.step ?? 1);
       const steps = (value - min) / step;
-      const aligned = step === 0.1
-        ? Number(value.toFixed(1)) === value
-        : Math.abs(steps - Math.round(steps)) < 1e-7;
+      const aligned = Math.abs(steps - Math.round(steps)) < 1e-7;
       return value >= min && value <= max && aligned;
     }
     if (item.kind === 'delay') return item.options?.some(option => option.value === value) === true;
     if (item.kind === 'bool') return typeof value === 'boolean';
     if (item.kind === 'package') return validAndroidPackageName(value, true);
-    if (item.kind === 'lbe-map') return value === null || validLbeMap(value);
     return true;
   }
 
@@ -85,12 +90,8 @@
   function validLbeMap(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value) ||
         Object.keys(value).sort().join(',') !== 'name,sha256,size') return false;
-    const name = value.name;
     return typeof value.sha256 === 'string' && /^[a-f0-9]{64}$/.test(value.sha256) &&
-      typeof name === 'string' && name === name.trim() && name.length > 0 && Array.from(name).length <= 128 &&
-      name !== '.' && name !== '..' && !/[\\/]/.test(name) && !/[\u0000-\u001f\u007f]/.test(name) &&
-      name.toLowerCase().endsWith('.zip') &&
-      Number.isSafeInteger(value.size) && value.size > 0 && value.size <= 512 * 1024 * 1024;
+      typeof value.name === 'string' && Number.isSafeInteger(value.size) && value.size > 0;
   }
 
   function validAndroidPackageName(value, allowDefault = false) {
@@ -234,8 +235,10 @@
       const entry = draft[item.id];
       if (!entry) continue;
       if (item.kind === 'package' && !entry.managed) {
-        const value = validAndroidPackageName(entry.value) ? entry.value : saved[item.id]?.value;
-        if (value) settings[item.id] = { managed: false, value };
+        const value = validAndroidPackageName(entry.value, true) ? entry.value : saved[item.id]?.value;
+        if (validAndroidPackageName(value, true) && (value !== '' || saved[item.id]?.managed || saved[item.id]?.value)) {
+          settings[item.id] = { managed: false, value };
+        }
         continue;
       }
       const managed = item.id === 'lbeMap' ? isSettingManaged(item.id, draft) : entry.managed;
@@ -246,6 +249,9 @@
         payloadValue = schedulePayload(item, value, saved[item.id]?.value, managed && value.enabled === true);
       } else if (managed && !supportedValue(item, value)) {
         throw new Error('Select a supported value for ' + item.label + '.');
+      } else if (!managed && item.kind === 'decimal' && !supportedValue(item, value)) {
+        const savedValue = saved[item.id]?.value;
+        payloadValue = supportedValue(item, savedValue) ? savedValue : item.default;
       }
       if (item.id === 'lbeMap' && managed && !validLbeMap(value)) {
         throw new Error('Select a map ZIP before enabling LBE mode.');
@@ -274,7 +280,37 @@
   }
 
   function waitingHomeAppDetail(result) {
-    return 'App not found on the headset (' + result.value + ')';
+    return 'App not found on the headset (' + result.value + ').';
+  }
+
+  function lbeReasonDetail(key, reason) {
+    if (key !== 'lbeMap' && key !== 'lbeMode') return '';
+    if (reason === 'CALLBACK_TIMEOUT') {
+      return key === 'lbeMode' ? 'PICO did not confirm the LBE mode in time.'
+        : 'PICO did not confirm the import in time. The import may still be running.';
+    }
+    return ({
+      MAP_ACTIVE_VERIFIED: 'PICO confirmed that the selected map is active.',
+      MAP_ACTIVE_UNVERIFIED: 'Map import succeeded, but the active map cannot be confirmed.',
+      MAP_ACTIVE_MISMATCH: 'PICO reports a different active map than the selected ZIP.',
+      MAP_VERIFICATION_UNAVAILABLE: 'PICO could not query which map is active.',
+      MAP_DOWNLOAD_FAILED: 'Map ZIP could not be downloaded or verified.',
+      MAP_IMPORT_FAILED: 'PICO could not import the selected map ZIP.',
+      MAP_MODE_NOT_APPLIED: 'PICO accepted the map import, but did not apply the requested LBE mode.',
+      MAP_REQUIRED: 'The selected map must be imported before LBE mode can turn on.',
+      MAP_NOT_LOADED: 'PICO did not confirm a loaded map.',
+    })[reason] || '';
+  }
+
+  function resultStatusLabel(key, result) {
+    const status = result
+      ? { applied: 'Applied', failed: 'Failed', unsupported: 'Unsupported', waiting: 'Waiting' }[result.status]
+      : '';
+    if (status !== 'Applied') return status;
+    if (key === 'startupApp' || key === 'ipd' ||
+        (key === 'lbeMap' && result.reason !== 'MAP_ACTIVE_VERIFIED')) return 'Accepted';
+    if (key === 'lbeMap') return 'Verified';
+    return status;
   }
 
   function deviceOutcome(device, packageId, deployment) {
@@ -306,33 +342,60 @@
     }
     const results = deployment.keys.map(key => report.results?.[key]?.status);
     const applied = results.filter(status => status === 'applied').length;
-    if (results.every(status => status === 'applied')) {
-      if (results.length === 1 && deployment.keys[0] === 'startupApp') {
-        return ['success', 'Accepted' + connection, 'Takes effect after reboot.'];
-      }
-      const wifiSaved = deployment.keys.includes('wifi') && report.results?.wifi?.reason === 'SAVED';
-      const savedDetail = deployment.wifi_mode === 'android_selection'
-        ? 'Wi-Fi profiles and auto-connect flags were read back. Android selects the network.'
-        : 'Saved Wi-Fi profiles and auto-connect flags were read back.';
-      const unverifiedDetails = [];
-      if (deployment.keys.some(key => report.results?.[key]?.reason === 'ACCEPTED_UNVERIFIED')) {
-        unverifiedDetails.push('PICO accepted the IPD setting, which cannot be read back.');
-      }
-      if (deployment.keys.some(key => report.results?.[key]?.reason === 'MAP_ACTIVE_UNVERIFIED')) {
-        unverifiedDetails.push('Map import succeeded, but the active map cannot be confirmed.');
-      }
-      return ['success', results.length ? 'Applied' + connection : 'No managed settings' + connection,
-        results.length ? wifiSaved ? savedDetail : unverifiedDetails.length ? unverifiedDetails.join(' ') :
-          'All managed settings were verified.' : 'The device acknowledged this revision.'];
-    }
+    if (!results.length) return ['success', 'No managed settings' + connection, 'The device acknowledged this revision.'];
     if (results.every(status => status === 'unsupported')) {
       return ['unavailable', 'Unsupported' + connection, 'This device could not apply the managed settings.'];
     }
-    if (results.includes('waiting') && results.every(status => status === 'applied' || status === 'waiting')) {
-      return ['pending', 'Waiting' + connection, waitingHomeAppDetail(report.results.startupApp)];
+    const details = [];
+    let verified = 0;
+    let hasVerifiedScalars = false;
+    for (const key of deployment.keys) {
+      const result = report.results?.[key];
+      if (key === 'startupApp' && result?.status === 'waiting') {
+        details.push(waitingHomeAppDetail(result));
+        continue;
+      }
+      if (result?.status === 'failed') {
+        const detail = lbeReasonDetail(key, result.reason);
+        if (detail && !details.includes(detail)) details.push(detail);
+      }
+      if (result?.status !== 'applied') continue;
+      if (key === 'startupApp') {
+        details.push('The Home app setting was accepted and takes effect after reboot.');
+      } else if (key === 'ipd') {
+        details.push('PICO accepted the IPD setting, which cannot be read back.');
+      } else if (key === 'lbeMap') {
+        if (result.reason === 'MAP_ACTIVE_VERIFIED') {
+          verified++;
+          details.push(lbeReasonDetail(key, result.reason));
+        } else {
+          details.push(lbeReasonDetail(key, result.reason) ||
+            'PICO accepted the map import, but the active map was not reported.');
+        }
+      } else {
+        verified++;
+        if (key === 'wifi' && result.reason === 'SAVED') {
+          details.push(deployment.wifi_mode === 'android_selection'
+            ? 'Wi-Fi profiles and auto-connect flags were read back. Android selects the network.'
+            : 'Saved Wi-Fi profiles and auto-connect flags were read back.');
+        } else {
+          hasVerifiedScalars = true;
+        }
+      }
     }
-    return ['failed', (applied ? 'Partially applied' : 'Apply failed') + connection,
-      applied + ' of ' + results.length + ' managed settings verified.'];
+
+    if (applied === results.length) {
+      if (!details.length) details.push('All managed settings were verified.');
+      else if (hasVerifiedScalars) details.push('Other managed settings were verified.');
+      const accepted = deployment.keys.some(key =>
+        resultStatusLabel(key, report.results?.[key]) === 'Accepted');
+      return ['success', (accepted ? 'Accepted' : 'Applied') + connection, details.join(' ')];
+    }
+    if (results.includes('waiting') && results.every(status => status === 'applied' || status === 'waiting')) {
+      return ['pending', 'Waiting' + connection, details.join(' ')];
+    }
+    details.unshift(verified + ' of ' + results.length + ' managed settings were read back and verified.');
+    return ['failed', (applied ? 'Partially applied' : 'Apply failed') + connection, details.join(' ')];
   }
 
   function wifiPasswordHelp(network) {
@@ -419,7 +482,7 @@
       case 'wifi':
         return renderWifi(item, value, managed);
       case 'package':
-        return `<label class="settings-field-label">Android package name<input class="field" type="text" maxlength="255" autocomplete="off" ${field} value="${esc(value)}" placeholder="PICO default"></label>`;
+        return `<label class="settings-field-label">Android package name<input class="field" type="text" maxlength="255" autocomplete="off" ${field} value="${esc(value)}" placeholder="com.example.app"></label>`;
       case 'lbe-map':
         return renderLbeMap(item, value, managed, model);
       default:
@@ -431,29 +494,37 @@
     const maps = model.maps || [];
     const selected = validLbeMap(value) ? value.sha256 : '';
     const options = maps.map(map => `<option value="${esc(map.sha256)}" ${map.sha256 === selected ? 'selected' : ''}>${esc(map.name)} · ${formatBytes(map.size)}</option>`).join('');
-    const selectedMapUnavailable = selected && model.mapsStatus === 'loaded' && !maps.some(map => map.sha256 === selected);
-    const selectedMapMissing = selected && !maps.some(map => map.sha256 === selected)
-      ? `<option value="${esc(selected)}" selected>${esc(value.name)} · ${selectedMapUnavailable ? 'Not in map library' : 'Stored in this package'}</option>` : '';
-    const noMapsLabel = model.mapsStatus === 'failed' ? 'Map list unavailable' :
-      model.mapsStatus === 'loading' ? 'Loading map list…' : 'No map ZIPs uploaded';
-    const noMaps = maps.length ? '' : `<option value="" disabled>${noMapsLabel}</option>`;
-    const error = model.uploadError ? `<small class="wifi-warning" role="alert">${esc(model.uploadError)}</small>` : '';
+    const missingSelection = selected && !maps.some(map => map.sha256 === selected);
+    const selectedMapUnavailable = missingSelection && model.mapsStatus === 'loaded';
+    const stored = missingSelection ? value : model.saved?.lbeMap?.value;
+    const storedOption = validLbeMap(stored) && !maps.some(map => map.sha256 === stored.sha256)
+      ? `<option value="${esc(stored.sha256)}" ${stored.sha256 === selected ? 'selected' : ''}>${esc(stored.name)} · ${model.mapsStatus === 'loaded' ? 'Not in map library' : 'Stored in this package'}</option>` : '';
+    const error = model.uploadError ? `<small class="settings-error" role="alert">${esc(model.uploadError)}</small>` : '';
     const busy = model.uploading === true;
-    const mapControlsDisabled = !managed || busy || model.mapsStatus === 'loading';
-    const retry = ['failed', 'loading'].includes(model.mapsStatus)
-      ? `<button class="btn-outline" type="button" data-map-retry ${model.mapsStatus === 'loading' ? 'aria-disabled="true"' : ''}>${model.mapsStatus === 'loading' ? 'Loading map list…' : 'Retry map list'}</button>` : '';
+    const loading = model.mapsStatus === 'loading';
+    const listFailed = model.mapsStatus === 'failed';
+    const mapControlsDisabled = !managed || busy || loading;
+    const retry = listFailed || loading
+      ? `<button class="btn-outline" type="button" data-map-retry ${loading ? 'aria-disabled="true"' : ''}>Retry map list</button>` : '';
     const unavailable = selectedMapUnavailable
-      ? '<small class="wifi-warning" role="alert">This map ZIP is missing from the server library. Upload it again to import this map.</small>' : '';
-    const unmanagedNote = !managed && selected
-      ? '<small>This ZIP stays selected in the package and will be imported when managed LBE mode turns on.</small>' : '';
-    const placeholder = managed ? 'Select a map ZIP' : 'Enable managed LBE mode to select a ZIP';
+      ? '<small class="settings-error" role="alert">This ZIP is missing from the server library. Upload it again.</small>' : '';
+    const status = busy ? 'Uploading…' : loading ? 'Loading map list…' :
+      listFailed ? 'Could not load uploaded maps.' :
+        managed && model.mapsStatus === 'loaded' && !maps.length ? 'No map ZIPs uploaded.' : '';
+    const upload = managed || busy ? `<button class="btn-outline" type="button" data-map-choose ${mapControlsDisabled ? 'disabled' : ''}>Upload ZIP…</button>
+      <input type="file" accept=".zip,application/zip" data-map-upload hidden ${mapControlsDisabled ? 'disabled' : ''}>` : '';
+    const actions = upload || retry || status ? `<div class="settings-buttons settings-map-actions">
+      ${upload}${retry}${status ? `<span class="settings-meta" data-map-status role="status">${status}</span>` : ''}</div>` : '';
+    const control = managed
+      ? `<select class="field" aria-label="Venue map ZIP" data-setting="${esc(item.id)}" ${mapControlsDisabled ? 'disabled' : ''}>
+          <option value="" ${selected ? '' : 'selected'}>Select a map ZIP</option>${storedOption}${options}</select>`
+      : `<div class="settings-map-summary" data-setting="${esc(item.id)}">
+          ${selected
+            ? `<span class="settings-map-filename">${esc(value.name)}</span><span class="settings-meta">${formatBytes(value.size)} · Kept in this package</span>`
+            : '<span class="settings-meta">LBE On required</span>'}
+        </div>`;
     return `<div class="settings-networks">
-      <label>Venue map ZIP<select class="field" aria-label="Venue map ZIP" data-setting="${esc(item.id)}" ${mapControlsDisabled ? 'disabled' : ''}>
-        <option value="" ${selected ? '' : 'selected'}>${placeholder}</option>${selectedMapMissing}${noMaps}${options}</select></label>
-      <div class="settings-buttons"><button class="btn-outline" type="button" data-map-choose ${mapControlsDisabled ? 'disabled' : ''}>Upload ZIP…</button>${retry}
-        <input type="file" accept=".zip,application/zip" data-map-upload hidden ${mapControlsDisabled ? 'disabled' : ''}>
-        <span class="settings-meta" data-map-status role="status">${busy ? 'Uploading…' : model.mapsStatus === 'loading' ? 'Loading uploaded maps…' : model.mapsStatus === 'failed' ? 'Could not load uploaded maps.' : maps.length ? maps.length + ' map ZIPs available' : 'Upload a map ZIP to use it on headsets.'}</span></div>
-      ${unavailable}${unmanagedNote}${error}<small>Select a ZIP to import whenever managed LBE mode turns on. Turning LBE mode off retains the ZIP selection in this package.</small>
+      ${control}${actions}${unavailable}${error}
     </div>`;
   }
 
@@ -463,16 +534,18 @@
     return (size / (1024 * 1024)).toFixed(1) + ' MB';
   }
 
-  function renderItem(item, draft, saved, model) {
+  function renderItem(item, model) {
+    const draft = model.draft;
     const entry = draft[item.id];
-    const wide = item.kind === 'wifi' || item.kind === 'schedule' || item.kind === 'package' || item.kind === 'lbe-map';
+    const wide = item.kind === 'wifi' || item.kind === 'schedule' || item.kind === 'package';
     const managed = item.kind === 'lbe-map' ? isSettingManaged(item.id, draft) : entry?.managed === true;
     const label = esc(item.label);
     const manageControl = item.kind === 'lbe-map' ? '<span aria-hidden="true"></span>' :
       `<label class="settings-manage"><input type="checkbox" data-manage="${esc(item.id)}" aria-label="Manage ${label}" ${entry?.managed ? 'checked' : ''} ${entry ? '' : 'disabled'}></label>`;
     return `<div class="settings-row${wide ? ' settings-wide' : ''}">
       ${manageControl}
-      <div class="settings-label"><strong>${label}</strong><small>${esc(item.description)}</small></div>
+      <div class="settings-label"><strong>${label}</strong><small>${esc(item.description)}</small>
+        ${item.id === 'lbeMode' ? '<small>Turning LBE off requires a headset restart.</small>' : ''}</div>
       ${entry ? `<fieldset class="settings-value" aria-label="${label}" ${managed || item.kind === 'lbe-map' ? '' : 'disabled'}>${renderControl(item, entry.value, managed, model)}</fieldset>` :
         '<span class="settings-meta">Unavailable</span>'}
     </div>`;
@@ -492,7 +565,7 @@
         <span class="settings-chevron" aria-hidden="true"></span>
       </summary>
       <div class="settings-content">${section.items
-        .map(item => renderItem(item, model.draft, model.saved, model)).join('')}</div>
+        .map(item => renderItem(item, model)).join('')}</div>
     </details>`;
   }
 
@@ -514,37 +587,31 @@
     return deployment.keys.map(function (key) {
       const item = items.get(key);
       const result = report.results?.[key];
-      const status = result
-        ? { applied: 'Applied', failed: 'Failed', unsupported: 'Unsupported', waiting: 'Waiting' }[result.status]
-        : report.status === 'complete' ? 'Not verified' : '';
+      const status = resultStatusLabel(key, result) ||
+        (report.status === 'complete' ? 'Not verified' : '');
       if (!status) return '';
-      const savedWifi = key === 'wifi' && status === 'Applied' && result.reason === 'SAVED';
-      const applied = savedWifi || status === 'Applied';
-      const waiting = key === 'startupApp' && status === 'Waiting';
-      const launcherAccepted = key === 'startupApp' && status === 'Applied';
-      const resultStatus = launcherAccepted ? 'Accepted' : savedWifi ? 'Applied' : status;
+      const applied = result?.status === 'applied';
+      const waiting = key === 'startupApp' && result?.status === 'waiting';
+      const savedWifi = key === 'wifi' && applied && result.reason === 'SAVED';
+      const launcherAccepted = key === 'startupApp' && applied;
+      const resultStatus = resultStatusLabel(key, result) || status;
       const actual = actualValue(item, result?.value);
       const reason = result?.reason ? String(result.reason).replaceAll('_', ' ').toLowerCase() : '';
       const homeAppDisabled = key === 'startupApp' && result?.reason === 'APP_DISABLED';
       const specialReasons = {
+        DUMP_PERMISSION_MISSING: 'Grant the DUMP permission with ADB during device setup.',
         ACCEPTED_UNVERIFIED: 'PICO accepted the IPD setting. The headset does not expose an IPD readback.',
-        MAP_ACTIVE_UNVERIFIED: 'Map import succeeded. The headset does not confirm which map is active.',
-        MAP_DOWNLOAD_FAILED: 'Map ZIP could not be downloaded or verified.',
-        MAP_IMPORT_FAILED: 'PICO could not import the selected map ZIP.',
-        MAP_REQUIRED: 'The selected map must be imported before LBE mode can turn on.',
-        MAP_NOT_LOADED: 'PICO did not confirm a loaded map.',
       };
       const explanation = homeAppDisabled
         ? 'App disabled on the headset' + (result.value ? ' (' + result.value + ')' : '')
-        : key === 'lbeMap' && result?.reason === 'CALLBACK_TIMEOUT'
-          ? 'PICO did not confirm the import in time. The import may still be running.'
-        : specialReasons[result?.reason] || reason.charAt(0).toUpperCase() + reason.slice(1);
+        : lbeReasonDetail(key, result?.reason) || specialReasons[result?.reason] || reason.charAt(0).toUpperCase() + reason.slice(1);
       const detail = savedWifi
         ? (deployment.wifi_mode === 'android_selection' ? 'Saved. Android selects the network.' : 'Saved')
         : launcherAccepted
           ? [resultStatus, result.value === '' ? 'PICO default' : result.value, 'Takes effect after reboot'].filter(Boolean).join(' · ')
           : waiting ? 'Waiting · ' + waitingHomeAppDetail(result)
-          : [actual, explanation].filter(Boolean).join(' · ') || status;
+          : [actual, explanation || (key === 'lbeMap' && applied
+            ? 'PICO accepted the import without reporting which map is active.' : '')].filter(Boolean).join(' · ') || status;
       return `<li class="${applied ? 'applied' : waiting ? 'waiting' : 'unverified'}">
         <span class="settings-readback-icon" role="img" aria-label="${resultStatus}">${applied ? '✓' : waiting ? '…' : '×'}</span>
         <span>${esc(item?.label || key)}</span><span class="settings-readback-value">${esc(detail)}</span>
@@ -597,16 +664,40 @@
     let catalogLoading = false;
     let catalogError = '';
     let catalogContent = '';
+    let packageNameCatalog = null;
+    let packageNames = new Map();
     let items = new Map();
     let resultSections = { status: 'idle' };
     let creating = false;
-    let pendingLbeOpen = null;
     const packagePath = id => '/api/packages/' + encodeURIComponent(id);
     const packageById = id => catalog?.find(candidate => candidate.package_id === id);
     const assignment = name => Object.hasOwn(snapshot?.assignments || {}, name) ? snapshot.assignments[name] : null;
     const assignedPackage = model => assignment(model.name);
     function selectedPackage(model) {
       return model.selection === undefined ? assignedPackage(model) : model.selection;
+    }
+    function packageNameCounts() {
+      if (catalog === packageNameCatalog) return packageNames;
+      const counts = new Map();
+      for (const pkg of catalog || []) {
+        let entry = counts.get(pkg.name);
+        if (!entry) {
+          entry = { count: 0, prefixes: new Map() };
+          counts.set(pkg.name, entry);
+        }
+        entry.count++;
+        const prefix = pkg.package_id.slice(0, 8);
+        entry.prefixes.set(prefix, (entry.prefixes.get(prefix) || 0) + 1);
+      }
+      packageNameCatalog = catalog;
+      packageNames = counts;
+      return packageNames;
+    }
+    function packageDisplayName(packageId, name, nameCounts = packageNameCounts()) {
+      const entry = nameCounts.get(name);
+      if (!entry || entry.count < 2 || typeof packageId !== 'string') return name;
+      const prefix = packageId.slice(0, 8);
+      return name + ' (' + (entry.prefixes.get(prefix) > 1 ? packageId : prefix) + ')';
     }
     function deploymentFor(name, packageId) {
       const deployment = Object.hasOwn(snapshot?.deployments || {}, name) ? snapshot.deployments[name] : null;
@@ -646,7 +737,7 @@
       if (!packageId) return null;
       const deployment = deploymentFor(name, packageId);
       return {
-        name: packageById(packageId)?.name,
+        name: packageDisplayName(packageId, packageById(packageId)?.name),
         count: deployment ? deploymentCount(groupOutcomes(name, packageId, deployment), deployment) : null,
       };
     }
@@ -672,12 +763,11 @@
     }
 
     async function loadLbeMaps(model, refresh = false) {
-      if (model.mapsStatus === 'loading' ||
-          (!refresh && (model.mapsStatus === 'loaded' || model.mapsStatus === 'failed'))) return;
+      if (!refresh && model.mapsStatus !== 'idle') return;
       const expectedInstanceId = snapshot?.server_instance_id ?? null;
       const requestId = model.mapsRequestId = (model.mapsRequestId || 0) + 1;
       model.mapsStatus = 'loading';
-      renderEditorPreservingFocus();
+      renderLbeMapControl(model);
       try {
         const data = await api('/api/lbe-maps');
         if (current !== model || requestId !== model.mapsRequestId ||
@@ -689,50 +779,87 @@
             expectedInstanceId !== (snapshot?.server_instance_id ?? null)) return;
         model.mapsStatus = 'failed';
       }
-      const reference = model.draft?.lbeMap?.value;
-      const missingReference = model.mapsStatus === 'loaded' && validLbeMap(reference) &&
-        !model.maps.some(map => map.sha256 === reference.sha256);
-      const refreshMissingReference = missingReference && model.mapsMissingRefreshFor !== reference.sha256;
-      if (missingReference) model.mapsMissingRefreshFor = reference.sha256;
-      else if (model.mapsStatus === 'loaded') model.mapsMissingRefreshFor = '';
-      renderEditorPreservingFocus();
-      if (refreshMissingReference) return loadLbeMaps(model, true);
+      renderLbeMapControl(model);
+    }
+
+    function refreshLbeMapLibrary() {
+      if (current) loadLbeMaps(current, true);
+    }
+
+    function renderLbeMapControl(model) {
+      const control = packagePanel.querySelector('[data-setting="lbeMap"]');
+      const fieldset = control?.closest('.settings-value');
+      const section = model.sections?.find(candidate => candidate.items.some(item => item.id === 'lbeMap'));
+      const item = section?.items.find(candidate => candidate.id === 'lbeMap');
+      if (!fieldset || !item) return;
+
+      const active = root.document?.activeElement;
+      const keepMapFocus = active && fieldset.contains?.(active);
+      const focusKind = keepMapFocus
+        ? active.hasAttribute?.('data-map-retry') ? 'retry'
+          : active.hasAttribute?.('data-map-choose') ? 'choose'
+            : active.matches?.('[data-setting="lbeMap"]') ? 'select' : null
+        : null;
+      fieldset.innerHTML = renderLbeMap(item, model.draft.lbeMap.value,
+        isSettingManaged('lbeMap', model.draft), model);
+      if (!focusKind) return;
+      const replacement = focusKind === 'retry' ? fieldset.querySelector('[data-map-retry]')
+        : focusKind === 'choose' ? fieldset.querySelector('[data-map-choose]')
+          : fieldset.querySelector('[data-setting="lbeMap"]');
+      replacement?.focus({ preventScroll: true });
     }
 
     async function uploadLbeMap(model, file) {
       if (!file || !isSettingManaged('lbeMap', model.draft) || current !== model || model.uploading || model.mapsStatus === 'loading') return;
       if (!file.name.toLowerCase().endsWith('.zip')) {
         model.uploadError = 'Select a ZIP file.';
-        renderEditorPreservingFocus();
+        renderLbeMapControl(model);
+        return;
+      }
+      if (!Number.isSafeInteger(file.size) || file.size === 0 || file.size > MAX_LBE_MAP_BYTES) {
+        model.uploadError = file.size === 0
+          ? 'The ZIP file is empty.' : 'The ZIP file must be no larger than 512 MiB.';
+        renderLbeMapControl(model);
         return;
       }
       const expectedInstanceId = snapshot?.server_instance_id ?? null;
+      const refreshAfterUpload = model.mapsStatus !== 'loaded';
+      let refreshMapList = false;
       model.uploading = true;
       model.uploadError = '';
       model.error = false;
       model.message = '';
       updateActions();
-      renderEditorPreservingFocus();
+      renderLbeMapControl(model);
       const formData = new root.FormData();
       formData.append('map', file, file.name);
       try {
         const data = await api('/api/lbe-maps', 'POST', formData, true);
         const map = data?.map;
-        if (current !== model || expectedInstanceId !== (snapshot?.server_instance_id ?? null)) return;
+        if (current !== model) return;
+        if (expectedInstanceId !== (snapshot?.server_instance_id ?? null)) {
+          model.uploadError = 'The server restarted during upload. Check the map list before retrying.';
+          return;
+        }
         if (!validLbeMap(map)) throw new Error('The server returned invalid map ZIP details.');
         model.maps = [...(model.maps || []).filter(candidate => candidate.sha256 !== map.sha256), map]
           .sort((left, right) => left.name.localeCompare(right.name));
-        model.mapsStatus = 'loaded';
+        refreshMapList = refreshAfterUpload;
         model.draft.lbeMap.value = map;
         model.message = 'Map ZIP uploaded and selected.';
       } catch (error) {
-        if (current !== model || expectedInstanceId !== (snapshot?.server_instance_id ?? null)) return;
+        if (current !== model) return;
+        if (expectedInstanceId !== (snapshot?.server_instance_id ?? null)) {
+          model.uploadError = 'The server restarted during upload. Check the map list before retrying.';
+          return;
+        }
         model.uploadError = error.status ? error.message : 'Could not upload the map ZIP.';
-        model.error = true;
       } finally {
         if (current === model) {
           model.uploading = false;
-          renderEditorPreservingFocus();
+          updateActions();
+          renderLbeMapControl(model);
+          if (refreshMapList) loadLbeMaps(model, true);
         }
       }
     }
@@ -752,7 +879,6 @@
           current.maps = [];
           current.mapsStatus = 'idle';
           current.mapsRequestId = (current.mapsRequestId || 0) + 1;
-          current.mapsMissingRefreshFor = '';
           current.uploadError = '';
         }
       }
@@ -780,6 +906,7 @@
 
     function renderCatalog() {
       const unavailable = configurationAvailable === false;
+      const nameCounts = packageNameCounts();
       catalogNotice.hidden = !unavailable;
       if (unavailable) {
         catalogNotice.querySelector('[role="status"]').textContent = catalogRefreshState === 'waiting-snapshot'
@@ -790,7 +917,7 @@
       }
       const entries = catalog?.map(pkg =>
         `<button type="button" class="mg-item settings-package-item${current?.id === pkg.package_id ? ' active' : ''}" data-package-id="${esc(pkg.package_id)}" aria-pressed="${current?.id === pkg.package_id}" ${unavailable ? 'disabled' : ''}>
-          <span class="mg-item-name">${esc(pkg.name)}</span>
+          <span class="mg-item-name">${esc(packageDisplayName(pkg.package_id, pkg.name, nameCounts))}</span>
           <span class="mg-item-count">${pkg.published_revision ? 'Deployed' : 'New'}</span>
         </button>`).join('');
       const empty = unavailable || entries || catalog?.length
@@ -1079,7 +1206,7 @@
       }
     }
 
-    function confirmDeployment(profile, { editorName, groupName } = {}) {
+    function confirmDeployment(profile, { editorName, groupName, packageId } = {}) {
       const { groups, devices } = profile.impact;
       const groupCount = groups + ' ' + (groups === 1 ? 'group' : 'groups');
       const deviceCount = devices + ' ' + (devices === 1 ? 'device' : 'devices');
@@ -1103,13 +1230,13 @@
           'Offline devices receive the updated policy when they connect.');
       }
       if (profile.use_current) {
-        return confirmAction('Deploy the current version of "' + profile.name + '" to "' + groupName +
+        return confirmAction('Deploy the current version of "' + packageDisplayName(packageId, profile.name) + '" to "' + groupName +
           '" (' + deviceCount + ')?\n\n' + delivery + lbeDetail);
       }
       const detail = groupName
         ? 'This deploys the saved settings again as a new version to all groups using it.'
         : 'This saves your edits and deploys them.';
-      return confirmAction('Deploy "' + (editorName ?? profile.name) + '" to ' + groupCount + ' and ' + deviceCount +
+      return confirmAction('Deploy "' + packageDisplayName(packageId, editorName ?? profile.name) + '" to ' + groupCount + ' and ' + deviceCount +
         '?\n\n' + detail + ' ' + delivery + lbeDetail);
     }
 
@@ -1117,6 +1244,7 @@
       model.busy = true;
       model.message = '';
       model.error = false;
+      if (action === 'reload') model.uploadError = '';
       if (model.saved) updateActions();
       else renderEditor();
       const path = packagePath(model.id);
@@ -1130,13 +1258,15 @@
         } else if (action === 'deploy') {
           const fresh = await api(path);
           if (fresh.edit_revision !== model.editRevision) {
-            throw Object.assign(new Error('The package changed. Reload and review the latest version before deploying.'), { status: 409 });
+            throw Object.assign(new Error('The package changed. Reload and review the latest version before deploying.'),
+              { status: 409, code: 'revision_conflict' });
           }
           const lbeMode = body.settings.lbeMode?.managed === true ? body.settings.lbeMode.value : null;
           const lbeMap = lbeMode === true && body.settings.lbeMap?.managed === true
             ? body.settings.lbeMap.value : null;
           if (!confirmDeployment({ ...fresh, lbe_mode: lbeMode,
-            lbe_map_name: validLbeMap(lbeMap) ? lbeMap.name : null }, { editorName: model.name.trim() })) return;
+            lbe_map_name: validLbeMap(lbeMap) ? lbeMap.name : null },
+          { editorName: model.name.trim(), packageId: model.id })) return;
           writing = true;
           data = await api(path + '/save-and-deploy', 'POST', { ...body, expected_impact: fresh.impact.token });
         } else if (action === 'delete') {
@@ -1164,12 +1294,11 @@
           model.maps = [];
           model.mapsStatus = 'idle';
           model.mapsRequestId = (model.mapsRequestId || 0) + 1;
-          model.mapsMissingRefreshFor = '';
-          model.refreshMapsAfterReload = true;
         }
         updateSummary(before, data, model.id);
         model.conflict = false;
         model.error = false;
+        model.uploadError = '';
         model.message = action === 'deploy' ? 'Package saved. Deployment started.'
           : action === 'reload' && hasChanges(model) && !model.mergeNotice
             ? 'Latest version loaded. Review your unsaved edits before deploying.' : '';
@@ -1178,28 +1307,26 @@
         if (writing && (!error.status || error.status >= 500)) {
           model.conflict = true;
           model.message = 'Could not confirm the request. Reload to check the latest package.';
+        } else if (error.code === 'map_unavailable') {
+          model.message = error.message;
+          refreshLbeMapLibrary();
         } else if (action === 'reload' && error.status === 404) {
           catalog = (catalog || []).filter(pkg => pkg.package_id !== model.id);
           renderCatalog();
           model.message = 'This package was removed elsewhere. Select another package.';
-        } else if (error.status === 409 && error.code !== 'package_assigned' &&
-            (error.message === 'The package changed. Reload and review the latest version before deploying.' ||
-             error.message === 'The package changed. Reload the package.' ||
-             error.message === 'Deployment targets changed. Review the updated targets before deploying.' ||
-             action === 'delete')) {
+        } else if (error.status === 409 &&
+            ['revision_conflict', 'deployment_targets_changed'].includes(error.code)) {
           model.conflict = true;
-          model.message = action === 'deploy' && writing ?
-            'The package or deployment targets changed. Reload and review before deploying again.' : error.message;
+          model.message = action === 'deploy' && writing
+            ? 'The package or deployment targets changed. Reload and review before deploying again.'
+            : error.message;
         } else {
           model.message = error.status ? error.message : 'Could not ' + action + ' the package.';
         }
       } finally {
         model.busy = false;
         renderEditorPreservingFocus();
-        if (model.refreshMapsAfterReload && current === model) {
-          model.refreshMapsAfterReload = false;
-          loadLbeMaps(model);
-        }
+        if (action === 'reload' && model.expanded.has('lbe') && current === model) loadLbeMaps(model);
       }
     }
 
@@ -1237,7 +1364,7 @@
       } catch (error) {
         model.error = true;
         model.message = error.status ? error.message : 'Could not duplicate the package.';
-        if (error.status === 409) model.conflict = true;
+        if (error.status === 409 && error.code === 'revision_conflict') model.conflict = true;
       } finally {
         model.busy = false;
         if (current === model) renderEditor();
@@ -1246,7 +1373,7 @@
 
     function selectPackage(id, profile, expectedInstanceId = snapshot?.server_instance_id ?? null) {
       if (current?.id === id) return;
-      current = { id, expanded: new Set(['basic']) };
+      current = { id, expanded: new Set(['basic']), maps: [], mapsStatus: 'idle' };
       renderCatalog();
       if (!profile || expectedInstanceId !== (snapshot?.server_instance_id ?? null)) return request(current, 'reload');
       readProfile(current, profile, false, expectedInstanceId);
@@ -1320,8 +1447,9 @@
       const selected = selectedPackage(group);
       const select = groupPanel.querySelector('[data-group-package]');
       const known = packageById(selected);
+      const nameCounts = packageNameCounts();
       const options = '<option value="">No managed settings</option>' +
-        (catalog || []).map(pkg => `<option value="${esc(pkg.package_id)}">${esc(pkg.name)}</option>`).join('') +
+        (catalog || []).map(pkg => `<option value="${esc(pkg.package_id)}">${esc(packageDisplayName(pkg.package_id, pkg.name, nameCounts))}</option>`).join('') +
         (selected && !known ? `<option value="${esc(selected)}" disabled>Package unavailable</option>` : '') +
         `<option value="${CREATE_PACKAGE_OPTION}">Create package…</option>`;
       if (select.packageOptions !== options) {
@@ -1444,7 +1572,7 @@
           model.message = 'The group package changed. Check the current package before deploying.';
           return;
         }
-        if (!confirmDeployment(fresh, { groupName: model.name })) return;
+        if (!confirmDeployment(fresh, { groupName: model.name, packageId: id })) return;
         writing = true;
         model.busy = 'Starting deployment…';
         refreshGroup();
@@ -1465,9 +1593,13 @@
         }
       } catch (error) {
         model.error = true;
-        model.message = writing && (!error.status || error.status >= 500)
+        if (error.code === 'map_unavailable') {
+          model.message = error.message;
+          refreshLbeMapLibrary();
+        } else model.message = writing && (!error.status || error.status >= 500)
           ? 'Could not confirm deployment. Check the group package before trying again.'
-          : writing && error.status === 409 ? 'The package or deployment targets changed. Select Deploy to review them again.'
+          : writing && ['revision_conflict', 'deployment_targets_changed'].includes(error.code)
+            ? 'The package or deployment targets changed. Select Deploy to review them again.'
             : error.status ? error.message : 'Could not check the deployment targets.';
       } finally {
         model.busy = false;
@@ -1523,9 +1655,7 @@
         if (manage === 'lbeMode') {
           model.error = false;
           model.message = '';
-          renderEditorPreservingFocus();
-          packagePanel.querySelector('[data-manage="lbeMode"]')?.focus({ preventScroll: true });
-          return;
+          model.uploadError = '';
         }
         if (manage === 'wifi') {
           if (!target.checked) {
@@ -1541,6 +1671,7 @@
           updateWifiWarnings(valuePanel, model.draft);
         }
         target.closest('.settings-row').querySelector('.settings-value').disabled = !target.checked;
+        if (manage === 'lbeMode') renderLbeMapControl(model);
         const section = target.closest('[data-settings-section]');
         section.querySelector('.settings-count').textContent =
           sectionCount(model.sections.find(candidate => candidate.id === section.dataset.settingsSection), model.draft);
@@ -1548,6 +1679,7 @@
         const entry = model.draft[setting];
         const value = entry.value;
         if (!isSettingManaged(setting, model.draft)) return;
+        if (setting === 'lbeMap' || setting === 'lbeMode') model.uploadError = '';
         if (network !== undefined) {
           const row = value.networks[Number(network)];
           row[field] = target.type === 'checkbox' ? target.checked : target.value;
@@ -1561,13 +1693,14 @@
           }
           if (field === 'hidden') updateWifiWarnings(target.closest('.settings-value'), model.draft);
         } else if (setting === 'lbeMap') {
-          entry.value = model.maps?.find(map => map.sha256 === target.value) || null;
+          entry.value = model.maps?.find(map => map.sha256 === target.value) ||
+            (model.saved?.lbeMap?.value?.sha256 === target.value ? model.saved.lbeMap.value : null);
+          renderLbeMapControl(model);
         } else if (setting === 'lbeMode' && target.type === 'radio') {
           entry.value = target.value === 'true';
           model.error = false;
           model.message = '';
-          renderEditorPreservingFocus();
-          return;
+          renderLbeMapControl(model);
         } else if (setting === 'startupApp') {
           entry.value = target.value;
         } else if (setting === 'wifi' && field === 'auto_return') {
@@ -1604,11 +1737,6 @@
     }
 
     function handleEditorClick(event) {
-      if (event.isTrusted) {
-        const summary = event.target.closest('summary');
-        const section = summary?.closest('[data-settings-section]');
-        pendingLbeOpen = section?.dataset.settingsSection === 'lbe' && !section.open ? section : null;
-      }
       const retryMaps = event.target.closest('[data-map-retry]');
       if (retryMaps) {
         if (!retryMaps.disabled && current && current.mapsStatus !== 'loading') loadLbeMaps(current, true);
@@ -1635,6 +1763,7 @@
         model.message = 'Changes discarded.';
         model.mergeNotice = '';
         model.error = false;
+        model.uploadError = '';
         renderEditor();
       } else if (action === 'deploy') {
         const name = model.name.trim();
@@ -1731,10 +1860,7 @@
       if (!section || !current) return;
       if (event.target.open) current.expanded.add(section);
       else current.expanded.delete(section);
-      if (section === 'lbe' && event.target.open && pendingLbeOpen === event.target) {
-        pendingLbeOpen = null;
-        loadLbeMaps(current);
-      }
+      if (section === 'lbe' && event.target.open) loadLbeMaps(current);
     }, true);
 
     packagePanel.addEventListener('change', event => {
@@ -1771,7 +1897,7 @@
     return { renderGroup, updateSnapshot, showPackages, groupPackageSummary, setGroupSnapshotConnected };
   }
 
-  const api = { createController, currentWifiHtml, loadDraft, buildPayload, deviceOutcome, retryEligible };
+  const api = { createController, currentWifiHtml, wifiPermissionWarningHtml, loadDraft, buildPayload, deviceOutcome, retryEligible };
   root.MdmConfigurationPackages = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);

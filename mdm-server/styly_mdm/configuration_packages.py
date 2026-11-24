@@ -20,12 +20,30 @@ _REASONS = WIFI_REASONS | {
     "READ_FAILED", "WRITE_FAILED", "READBACK_MISMATCH", "INVALID_VALUE",
     "DELAY_CONFLICT", "UPDATE_TIMER_ACTIVE", "CALLBACK_TIMEOUT", "STORAGE_ERROR",
 }
+_LBE_MAP_RESULT_STATUSES = {
+    "MAP_ACTIVE_VERIFIED": {"applied"},
+    "MAP_ACTIVE_UNVERIFIED": {"applied"},
+    "MAP_ACTIVE_MISMATCH": {"failed"},
+    "MAP_VERIFICATION_UNAVAILABLE": {"failed"},
+    "MAP_MODE_NOT_APPLIED": {"failed"},
+    "MAP_REQUIRED": {"failed"},
+    "MAP_DOWNLOAD_FAILED": {"failed"},
+    "MAP_IMPORT_FAILED": {"failed"},
+}
+_LBE_MODE_FAILURE_REASONS = {
+    "MAP_REQUIRED", "MAP_NOT_LOADED", "MAP_ACTIVE_MISMATCH", "MAP_VERIFICATION_UNAVAILABLE",
+}
+_LBE_REPORT_REASONS = set(_LBE_MAP_RESULT_STATUSES) | _LBE_MODE_FAILURE_REASONS
 
 
 class PackageError(ValueError):
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, code: str | None = None):
         super().__init__(message)
         self.status = status
+        self.code = code
+
+    def payload(self) -> dict:
+        return {"error": str(self), **({"code": self.code} if self.code else {})}
 
 
 def _item(key, label, description, kind, default, **extra):
@@ -230,7 +248,7 @@ def check_expected_revision(body, current_revision):
     if expected is not None and normalize_revision(expected) is None:
         raise PackageError("expected_revision must be a canonical revision UUID")
     if expected != current_revision:
-        raise PackageError("The package changed. Reload the package.", 409)
+        raise PackageError("The package changed. Reload the package.", 409, "revision_conflict")
 
 
 def load_packages(raw):
@@ -290,17 +308,21 @@ def public_configuration_state(raw):
         clean = {"status": status}
         if value is not None and _valid_value(item, value, require_repeat=False):
             clean["value"] = value
-        if key == "startupApp" and status == "failed" and reason == "APP_DISABLED":
+        if isinstance(reason, str) and reason in _LBE_REPORT_REASONS:
+            if key == "lbeMap":
+                if status not in _LBE_MAP_RESULT_STATUSES.get(reason, set()):
+                    continue
+            elif key == "lbeMode":
+                if status != "failed" or reason not in _LBE_MODE_FAILURE_REASONS:
+                    continue
+            else:
+                continue
+            clean["reason"] = reason
+        elif key == "startupApp" and status == "failed" and reason == "APP_DISABLED":
             clean["reason"] = reason
         elif isinstance(reason, str) and reason in _REASONS:
             clean["reason"] = reason
         elif key == "ipd" and status == "applied" and reason == "ACCEPTED_UNVERIFIED":
-            clean["reason"] = reason
-        elif key == "lbeMap" and (
-                (status == "applied" and reason == "MAP_ACTIVE_UNVERIFIED")
-                or (status == "failed" and reason in ("MAP_DOWNLOAD_FAILED", "MAP_IMPORT_FAILED"))):
-            clean["reason"] = reason
-        elif key == "lbeMode" and status == "failed" and reason in ("MAP_REQUIRED", "MAP_NOT_LOADED"):
             clean["reason"] = reason
         results[key] = clean
     return {**state, "results": results}

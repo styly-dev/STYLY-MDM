@@ -16,7 +16,11 @@
     return selected;
   }
 
-  function toggleMember(name, groups, edits, deviceId) {
+  function deploymentRevision(deployments, name) {
+    return name !== null && Object.hasOwn(deployments, name) ? deployments[name].revision : null;
+  }
+
+  function toggleMember(name, groups, edits, deviceId, deployments) {
     const committed = (groups[name] || []).includes(deviceId);
     const edit = edits.get(deviceId);
     const currentMember = edit ? edit.kind === 'add' : committed;
@@ -33,6 +37,11 @@
     } else {
       edits.set(deviceId, { kind: 'remove' });
     }
+    const pending = edits.get(deviceId);
+    if (pending && deployments) {
+      pending.targetRevision = deploymentRevision(deployments, name);
+      if (pending.kind === 'add') pending.sourceRevision = deploymentRevision(deployments, pending.expectedOwner);
+    }
     return nowMember;
   }
 
@@ -47,7 +56,7 @@
     }
   }
 
-  function buildMembershipEdit(name, groups, edits) {
+  function buildMembershipEdit(name, groups, edits, deployments) {
     const currentMembers = groups[name] || [];
     const current = new Set(currentMembers);
     if (current.size !== currentMembers.length) {
@@ -58,6 +67,11 @@
     const remove = [];
 
     for (const [deviceId, edit] of edits) {
+      if (deployments && Object.hasOwn(edit, 'targetRevision') &&
+          (edit.targetRevision !== deploymentRevision(deployments, name) ||
+           (edit.kind === 'add' && edit.sourceRevision !== deploymentRevision(deployments, edit.expectedOwner)))) {
+        throw new Error('A package changed while you were editing members. Cancel the edits and review the current package.');
+      }
       if (edit.kind === 'add') {
         if (current.has(deviceId)) continue;
 
@@ -82,12 +96,32 @@
     return { type: 'UPDATE_GROUP_MEMBERS', name, add: Object.fromEntries(add), remove };
   }
 
+  function reviewMembershipDeployment(edit, snapshot) {
+    const groups = new Set([edit.name, ...Object.values(edit.add).filter(name => name !== null)]);
+    const deployments = snapshot.deployments || {};
+    const expected = Object.fromEntries([...groups].map(name => [
+      name, deploymentRevision(deployments, name),
+    ]));
+    const target = expected[edit.name];
+    const changed = Object.values(edit.add).filter(owner => (owner === null ? null : expected[owner]) !== target).length;
+    const details = [];
+    if (changed && target) {
+      const id = deployments[edit.name].package_id;
+      const pkg = snapshot.packages?.find(item => item.package_id === id);
+      details.push('Apply "' + (pkg?.name || id) + '" (' + id + ') to ' + changed + ' device(s).');
+    }
+    const released = (target ? edit.remove.length : changed);
+    if (released) details.push('Release managed settings on ' + released + ' device(s).');
+    return { expected, message: details.join('\n') };
+  }
+
   const api = {
     membershipGroups,
     selectedMembers,
     toggleMember,
     reconcileMembers,
     buildMembershipEdit,
+    reviewMembershipDeployment,
   };
   root.MdmGroupMembership = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

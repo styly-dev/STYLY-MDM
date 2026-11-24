@@ -8,8 +8,11 @@ many headsets at once over the LAN.
 > STYLY-MDM is designed for use within a local area network (LAN). It has no
 > authentication. **Do not expose the server to the public internet.**
 > Restrict server access to trusted devices and operators when deploying Wi-Fi
-> settings. A client that can reach the server can claim an assigned Device ID
-> and receive its Wi-Fi credentials.
+> settings. Anyone who can reach the package editor can read saved Wi-Fi passwords
+> across packages, including unassigned packages and settings with Manage off.
+> Restrict management routes to operators when venue devices have a different trust level.
+> The device connection also trusts the reported Device ID. A client claiming an
+> assigned ID can receive that device's Wi-Fi credentials.
 
 ## Install & run
 
@@ -53,8 +56,8 @@ earlier release keeps its groups and starts with no packages.
 See [the package contract](../docs/DEVELOPMENT.md#configuration-packages).
 
 Transfer throttling bounds how many devices download at once — one server-wide
-pool shared by every install and push/sync job; the rest queue until a slot
-frees.
+pool shared by APK installs, Push/Sync jobs and venue map downloads. Venue maps
+use the same resumable HTTP transfer as Push Files.
 
 The server always accepts both scheme-less serial clients and GUID clients; no
 identity-mode setting or database reset is required. Serial clients are limited to

@@ -4,11 +4,8 @@ import android.os.Environment
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
-import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipFile
 
@@ -43,17 +40,20 @@ internal data class LbeMapDescriptor(
     }
 }
 
-internal data class LbeMapTransfer(
+internal class LbeMapTransfer(
     val path: String,
     val token: String?,
     val serverOrigin: String?,
     val expectedDeviceId: String?,
 )
 
-internal class StaleConfigurationException : IOException()
+internal data class LbeMapAcquisition(
+    val file: File,
+    val verifiedCacheHit: Boolean,
+)
 
 /** The next live policy delivery can provide a usable network route or a fresh token. */
-internal class RetryableMapDownloadException(message: String, cause: IOException? = null) : IOException(message, cause)
+internal class RetryableMapDownloadException(message: String, cause: Throwable? = null) : IOException(message, cause)
 
 internal fun validatedLbeMapUrl(
     serverOrigin: String,
@@ -90,48 +90,117 @@ internal class LbeMapArtifactStore(
         .followSslRedirects(false)
         .build(),
 ) {
+    private data class TransferSession(
+        val revision: ConfigurationVersion,
+        val cancellation: ArtifactDownloadCancellation,
+    )
+
+    private val transferLock = Any()
+    private val activeTransfers = linkedSetOf<TransferSession>()
+
+    fun cancelLbeMapTransfer(keepVersion: ConfigurationVersion?) {
+        val cancelled = synchronized(transferLock) {
+            activeTransfers.filter { keepVersion == null || it.revision != keepVersion }
+                .map(TransferSession::cancellation)
+        }
+        cancelled.forEach(ArtifactDownloadCancellation::cancel)
+    }
+
     fun acquire(
         descriptor: LbeMapDescriptor,
         transfer: LbeMapTransfer?,
         revision: ConfigurationVersion,
         isCurrent: () -> Boolean,
-    ): File {
-        if (!isCurrent()) throw StaleConfigurationException()
-        if (!directory.isDirectory && !directory.mkdirs()) throw IOException("Map cache directory is unavailable")
-        val target = File(directory, "${descriptor.sha256}.zip")
-        val partial = File(directory, "${descriptor.sha256}.part")
-        pruneForAcquisition(target, partial)
-        if (isVerified(target, descriptor, isCurrent)) {
-            target.setLastModified(System.currentTimeMillis())
-            return target
+    ): LbeMapAcquisition {
+        val session = TransferSession(revision, ArtifactDownloadCancellation())
+        synchronized(transferLock) { activeTransfers += session }
+        try {
+            return acquire(descriptor, transfer, revision, isCurrent, session.cancellation)
+        } finally {
+            synchronized(transferLock) { activeTransfers -= session }
         }
+    }
+
+    private fun acquire(
+        descriptor: LbeMapDescriptor,
+        transfer: LbeMapTransfer?,
+        revision: ConfigurationVersion,
+        isCurrent: () -> Boolean,
+        cancellation: ArtifactDownloadCancellation,
+    ): LbeMapAcquisition {
+        fun checkCurrent() {
+            if (!isCurrent() || cancellation.isCancelled()) throw StaleConfigurationException()
+        }
+        val transferIsCurrent = { isCurrent() && !cancellation.isCancelled() }
+        checkCurrent()
+        if (!directory.isDirectory && !directory.mkdirs()) throw IOException("Map cache directory is unavailable")
+        val target = File(directory, descriptor.sha256 + ".zip")
+        val partial = File(directory, descriptor.sha256 + ".part")
+        pruneForAcquisition(target, partial)
+        verifiedCachedFile(descriptor, transferIsCurrent)?.let { return LbeMapAcquisition(it, verifiedCacheHit = true) }
         java.nio.file.Files.deleteIfExists(target.toPath())
         if (partial.length() > descriptor.size) java.nio.file.Files.delete(partial.toPath())
+        var downloadUrl: String? = null
+        var authorization: String? = null
         if (partial.length() < descriptor.size) {
             val details = transfer ?: throw RetryableMapDownloadException("Map transfer awaits a live policy")
             val origin = details.serverOrigin ?: throw IOException("Map server origin is unavailable")
             val token = details.token?.takeIf { it.isNotBlank() && it.length <= 4096 }
                 ?: throw IOException("Map download token is invalid")
             if (token.any { it !in '!'..'~' }) throw IOException("Map download token is invalid")
-            val url = validatedLbeMapUrl(origin, details.path, descriptor, revision, details.expectedDeviceId)
-                ?: throw IOException("Map download route is invalid")
-            download(url, token, descriptor, partial, isCurrent)
+            downloadUrl = validatedLbeMapUrl(origin, details.path, descriptor, revision, details.expectedDeviceId)
+                ?.toString() ?: throw IOException("Map download route is invalid")
+            authorization = "Bearer $token"
         }
 
-        if (!isVerified(partial, descriptor, isCurrent)) {
-            java.nio.file.Files.deleteIfExists(partial.toPath())
-            throw IOException("Downloaded map failed ZIP, size or SHA-256 verification")
-        }
-        if (!isCurrent()) throw StaleConfigurationException()
         try {
-            java.nio.file.Files.move(
-                partial.toPath(), target.toPath(),
-                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
-                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-            )
-        } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
-            java.nio.file.Files.move(partial.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            downloadArtifact(ArtifactDownloadRequest(
+                url = downloadUrl,
+                partialFile = partial,
+                completedFile = target,
+                expectedSize = descriptor.size,
+                expectedSha256 = descriptor.sha256,
+                expectedEtag = "\"${descriptor.sha256}\"",
+                client = client,
+                authorization = authorization,
+                accept = "application/zip",
+                isCurrent = transferIsCurrent,
+                supportsQueuedResponse = true,
+                retryDelay = cancellation::await,
+                cancellation = cancellation,
+                failurePolicy = ::mapDownloadFailurePolicy,
+            ))
+        } catch (failure: PushWorkerException) {
+            if (failure.recovery == PushFailureRecovery.RetryWithinDeadline) {
+                throw RetryableMapDownloadException("Map transfer interrupted", failure)
+            }
+            throw IOException(failure.message ?: "Map transfer failed", failure)
         }
+
+        checkCurrent()
+        if (!hasZipEntries(target)) {
+            java.nio.file.Files.deleteIfExists(target.toPath())
+            throw IOException("Downloaded map is not a valid ZIP archive")
+        }
+        checkCurrent()
+        return LbeMapAcquisition(target, verifiedCacheHit = false)
+    }
+
+    private fun verifiedCachedFile(descriptor: LbeMapDescriptor, isCurrent: () -> Boolean): File? {
+        if (!isCurrent()) throw StaleConfigurationException()
+        val target = File(directory, "${descriptor.sha256}.zip")
+        val verified = try {
+            matchesArtifactIdentity(target, descriptor.size, descriptor.sha256, isCurrent) && hasZipEntries(target)
+        } catch (stale: StaleConfigurationException) {
+            throw stale
+        } catch (error: IOException) {
+            if (!isCurrent()) throw StaleConfigurationException()
+            if (!target.isFile) return null
+            throw error
+        }
+        if (!verified || !target.isFile) return null
+        if (!isCurrent()) throw StaleConfigurationException()
+        target.setLastModified(System.currentTimeMillis())
         return target
     }
 
@@ -147,83 +216,26 @@ internal class LbeMapArtifactStore(
         }
     }
 
-    private fun download(
-        url: HttpUrl,
-        token: String,
-        descriptor: LbeMapDescriptor,
-        destination: File,
-        isCurrent: () -> Boolean,
-    ) {
-        val offset = destination.length()
-        val request = Request.Builder()
-            .url(url)
-            .header("Authorization", "Bearer $token")
-            .header("Accept", "application/zip")
-            .header("Accept-Encoding", "identity")
-            .apply { if (offset > 0) header("Range", "bytes=$offset-") }
-            .build()
-
-        readNetwork { client.newCall(request).execute() }.use { response ->
-            val append = when (response.code) {
-                200 -> false // A server may ignore Range and send the entire archive.
-                206 -> {
-                    if (offset == 0L || response.header("Content-Range") != "bytes $offset-${descriptor.size - 1}/${descriptor.size}") {
-                        throw IOException("Map download returned an unexpected Content-Range")
-                    }
-                    true
-                }
-                401, 403, 408, 429, in 500..599 ->
-                    throw RetryableMapDownloadException("Map download returned HTTP ${response.code}")
-                else -> throw IOException("Map download returned HTTP ${response.code}")
+    private fun mapDownloadFailurePolicy(error: Throwable): ArtifactDownloadFailurePolicy {
+        return when (error) {
+            is PushWorkerException -> when {
+                error.httpStatus == 401 || error.httpStatus == 403 ->
+                    throw RetryableMapDownloadException("Map transfer needs a fresh credential", error)
+                error.code == "artifact_unavailable" -> ArtifactDownloadFailurePolicy(false, true)
+                error.code == "download_failed" && error.recovery == PushFailureRecovery.RetryWithinDeadline ->
+                    ArtifactDownloadFailurePolicy(true, true)
+                error.recovery == PushFailureRecovery.AwaitOperatorResume -> ArtifactDownloadFailurePolicy(false, true)
+                else -> ArtifactDownloadFailurePolicy(false, false)
             }
-            val body = response.body ?: throw IOException("Map download body is empty")
-            var received = if (append) offset else 0L
-            if (body.contentLength() >= 0 && body.contentLength() != descriptor.size - received) {
-                throw IOException("Map download size did not match its descriptor")
-            }
-            body.byteStream().use { input ->
-                FileOutputStream(destination, append).use { output ->
-                    val buffer = ByteArray(64 * 1024)
-                    while (true) {
-                        if (!isCurrent()) throw StaleConfigurationException()
-                        val count = readNetwork { input.read(buffer) }
-                        if (count < 0) break
-                        received += count
-                        if (received > descriptor.size) throw IOException("Map download exceeded its declared size")
-                        output.write(buffer, 0, count)
-                    }
-                    if (received < descriptor.size) throw RetryableMapDownloadException("Map download ended early")
-                    output.fd.sync()
-                }
-            }
+            is IOException -> ArtifactDownloadFailurePolicy(true, true)
+            else -> ArtifactDownloadFailurePolicy(false, false)
         }
     }
 
-    private fun isVerified(file: File, descriptor: LbeMapDescriptor, isCurrent: () -> Boolean): Boolean {
-        if (!file.isFile || file.length() != descriptor.size) return false
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buffer = ByteArray(64 * 1024)
-            while (true) {
-                if (!isCurrent()) throw StaleConfigurationException()
-                val count = input.read(buffer)
-                if (count < 0) break
-                digest.update(buffer, 0, count)
-            }
-        }
-        val hash = digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
-        if (hash != descriptor.sha256) return false
-        return try {
-            ZipFile(file).use { it.entries().hasMoreElements() }
-        } catch (_: java.util.zip.ZipException) {
-            false
-        }
-    }
-
-    private inline fun <T> readNetwork(action: () -> T): T = try {
-        action()
-    } catch (failure: IOException) {
-        throw RetryableMapDownloadException("Map transfer interrupted", failure)
+    private fun hasZipEntries(file: File): Boolean = try {
+        ZipFile(file).use { it.entries().hasMoreElements() }
+    } catch (_: java.util.zip.ZipException) {
+        false
     }
 
     companion object {

@@ -31,6 +31,8 @@ internal data class ConfigurationVersion(val packageId: String, val revision: St
     }
 }
 
+internal data class ConfigurationResume(val overwriteScalars: Boolean, val checkExistingWifi: Boolean)
+
 internal data class ConfigurationAttempt(
     val version: ConfigurationVersion,
     val bootCount: Int,
@@ -39,6 +41,9 @@ internal data class ConfigurationAttempt(
     val retryIds: Set<String> = emptySet(),
     val bootReapply: Boolean = false,
     val retryMapOnDelivery: Boolean = false,
+    // Only a live, superseded operation resumes automatically. A restored crash
+    // still requires Retry. Preserve the original write mode across an SDK rebind.
+    val resume: ConfigurationResume? = null,
 ) {
     val waitingHomeAppPackage: String?
         get() = results.optJSONObject("startupApp")
@@ -91,7 +96,7 @@ internal class ConfigurationJournal(private val attempts: List<ConfigurationAtte
         }
         if (!sameBoot) return true
         // A different attempt may have changed the saved settings since the previous result.
-        return !isLatest
+        return !isLatest || previous.resume != null
     }
 
     fun encode(): String = JSONArray(attempts.map(ConfigurationAttempt::saved)).toString()
@@ -113,15 +118,16 @@ internal data class ConfigurationPackageDependencies(
     val writeJournal: (String) -> Boolean,
     val readLastPolicy: () -> String?,
     val writePolicy: (lastPolicy: String, journal: String?) -> Boolean,
-    val scalarWriter: () -> ((JSONObject, Boolean, String?) -> JSONObject)?,
+    val scalarWriter: () -> ((JSONObject, Boolean) -> JSONObject)?,
     val homeAppEnabled: (String) -> Boolean?,
     val logJournalError: (String) -> Unit = {},
     val onApplied: (bootReapply: Boolean, isCurrent: () -> Boolean) -> Unit = { _, _ -> },
     val lbeMapWorker: Executor = worker,
-    val acquireLbeMap: (LbeMapDescriptor, LbeMapTransfer?, ConfigurationVersion, () -> Boolean) -> File =
+    val acquireLbeMap: (LbeMapDescriptor, LbeMapTransfer?, ConfigurationVersion, () -> Boolean) -> LbeMapAcquisition =
         { _, _, _, _ -> throw IOException("Map download is unavailable") },
     val importLbeMap: (String) -> LbeMapImportResult = { LbeMapImportResult.FAILED },
-    val isLbeMapAvailable: () -> Boolean = { false },
+    val activeLbeMap: (String) -> ActiveLbeMap = { ActiveLbeMap.UNKNOWN },
+    val cancelLbeMapTransfer: (ConfigurationVersion?) -> Unit = {},
 )
 
 internal enum class ConfigurationApplyStatus {
@@ -190,7 +196,12 @@ internal class ConfigurationPackageController(
         }
     }
 
-    private class Assignment(val policy: Policy, val token: Any = Any(), val cached: Boolean = true)
+    private class Assignment(
+        val policy: Policy,
+        val token: Any = Any(),
+        val cached: Boolean = true,
+        val resetJournalOnSave: Boolean = false,
+    )
 
     private sealed interface Report {
         data object Unknown : Report
@@ -202,8 +213,7 @@ internal class ConfigurationPackageController(
         val policy: Policy,
         val retryId: String?,
         val isCurrent: () -> Boolean,
-        val mapIsLatest: () -> Boolean,
-        var forceApply: Boolean,
+        val automatic: Boolean,
         var ready: Boolean,
         val retainedIpd: JSONObject?,
     )
@@ -212,6 +222,7 @@ internal class ConfigurationPackageController(
     private val boot = dependencies.bootCount
     private val listeners = CopyOnWriteArraySet<() -> Unit>()
     private val screenListeners = CopyOnWriteArraySet<() -> Unit>()
+    private val policyAcceptanceLock = Any()
     private var journalCorrupt = false
     private var journal = loadJournal()
     @Volatile private var latestReceivedVersion: ConfigurationVersion? = null
@@ -221,12 +232,11 @@ internal class ConfigurationPackageController(
     @Volatile private var assignment: Assignment?
     private val latestPolicy get() = assignment?.policy
     private var pending: Delivery? = null
-    private var sdkReady = false
+    private class SdkBinding(val isCurrent: () -> Boolean)
+    @Volatile private var sdkBinding: SdkBinding? = null
+    private val sdkReady get() = sdkBinding?.isCurrent?.invoke() == true
     private var homeAppCheckPending = true
-    private var wifiAttempt: ConfigurationAttempt? = null
-    private val applyingWifi get() = wifiAttempt != null
-    private var lbeMapAttempt: ConfigurationAttempt? = null
-    private val applyingLbeMap get() = lbeMapAttempt != null
+    private var activeAttempt: ConfigurationAttempt? = null
     private val cachedVersionFromEarlierBoot: ConfigurationVersion?
 
     fun addStateListener(listener: () -> Unit) { listeners.add(listener) }
@@ -266,17 +276,13 @@ internal class ConfigurationPackageController(
     fun onSdkReady(ready: Boolean, isCurrent: () -> Boolean = { true }) {
         worker.execute {
             if (!isCurrent()) return@execute
-            sdkReady = ready
+            sdkBinding = if (ready) SdkBinding(isCurrent) else null
             if (ready) reloadJournal()
             reconcile()
         }
     }
 
-    fun onAppInstalled(packageName: String) = onHomePackageChanged(packageName)
-
-    fun onAppRemoved(packageName: String) = onHomePackageChanged(packageName)
-
-    private fun onHomePackageChanged(packageName: String) {
+    fun onHomePackageChanged(packageName: String) {
         worker.execute {
             if (latestPolicy?.values?.opt("startupApp") == packageName) {
                 homeAppCheckPending = true
@@ -297,50 +303,67 @@ internal class ConfigurationPackageController(
         if (payload.has("retry_id") &&
             (!supportsApply || retryId == null || policy.version == null || !WifiSettingsProtocol.isValidUuid(retryId))
         ) return
-        if (!isCurrent()) return
-        // Fence a background map transfer immediately, before this delivery reaches the
-        // serial worker. The same revision remains valid across reconnects and retries.
-        if (supportsApply) latestReceivedVersion = policy.version
-        worker.execute {
-            if (!isCurrent() || (supportsApply && latestReceivedVersion != policy.version)) return@execute
-            reloadJournal()
-            val startingAssignment = supportsApply && policy.version != null && latestPolicy?.version == null
-            val resetJournal = startingAssignment || journalCorrupt
-            val cached = supportsApply && savePolicy(policy, resetJournal)
-            if (startingAssignment && !cached) {
-                publish(storageError(policy, previous = null))
-                return@execute
+        synchronized(policyAcceptanceLock) {
+            if (!isCurrent()) return
+            // Fence a background map transfer immediately, before this delivery reaches
+            // the serial worker. Serialize fencing, cancellation and queueing so an older
+            // receive cannot cancel a transfer accepted from a newer socket afterward.
+            if (supportsApply) {
+                latestReceivedVersion = policy.version
+                dependencies.cancelLbeMapTransfer(policy.version)
             }
-            if (cached && resetJournal && policy.version != null) setReport(Report.Cleared)
-            val token = assignment?.takeIf { it.policy.version == policy.version && it.policy.supportsApply == supportsApply }
-                ?.token ?: Any()
-            val retainedIpd = retainAcceptedIpd(policy, latestPolicy)
-            val resumesSupersededApply =
-                pending?.takeIf { assignment?.token === token }?.forceApply == true ||
-                ((applyingWifi || applyingLbeMap) && assignment?.policy?.version != policy.version &&
-                    policy.version?.let { journal?.find(it)?.status == "applying" } == true)
-            val effectiveRetry = retryId ?: pending?.takeIf { assignment?.token === token }?.retryId
-            val selected = Assignment(policy, token, cached)
-            assignment = selected
-            pending = null
-            // An authoritative removal still stops live management if writing its marker failed.
-            if (cached || (supportsApply && policy.version == null)) {
-                queue(
-                    selected, effectiveRetry,
-                    forceApply = resumesSupersededApply || (resetJournal && retryId != null),
-                    retainedIpd = retainedIpd,
-                )
-            } else if (supportsApply && policy.version != null) {
-                publish(storageError(policy, journal?.find(policy.version)))
+            worker.execute {
+                // A release is a state transition even when a later policy arrived before
+                // this worker ran. Applying it in receive order lets the following package
+                // reset the journal instead of reusing an older assignment's result. The
+                // policy was accepted while its socket was current, so a later disconnect
+                // does not revoke the accepted delivery.
+                if (!supportsApply && !isCurrent()) return@execute
+                if (supportsApply && policy.version != null && latestReceivedVersion != policy.version) return@execute
+                reloadJournal()
+                val startingAssignment = supportsApply && policy.version != null &&
+                    (latestPolicy?.version == null ||
+                        (assignment?.cached == false && assignment?.resetJournalOnSave == true))
+                val resetJournal = startingAssignment || journalCorrupt
+                val cached = supportsApply && savePolicy(policy, resetJournal)
+                if (supportsApply && policy.version != null && !cached) {
+                    val previous = if (startingAssignment) null else journal?.find(policy.version)
+                    assignment = Assignment(policy, Any(), cached = false, resetJournalOnSave = startingAssignment)
+                    pending = null
+                    publish(storageError(policy, previous))
+                    publishScreenState()
+                    reconcile()
+                    return@execute
+                }
+                if (cached && resetJournal && policy.version != null) setReport(Report.Cleared)
+                val token = assignment?.takeIf { it.policy.version == policy.version && it.policy.supportsApply == supportsApply }
+                    ?.token ?: Any()
+                val waiting = pending?.takeIf { assignment?.token === token }
+                val effectiveRetry = retryId ?: waiting?.retryId
+                // A Retry arriving before the first SDK/Wi-Fi-ready apply joins that
+                // claim, so it cannot displace the automatic delivery and lose both.
+                val automatic = retryId == null || resetJournal || waiting?.automatic == true
+                val retainedIpd = retainAcceptedIpd(policy, latestPolicy)
+                val selected = Assignment(policy, token, cached)
+                assignment = selected
+                pending = null
+                // An authoritative removal still stops live management if writing its marker failed.
+                if (cached || (supportsApply && policy.version == null)) {
+                    queue(
+                        selected, effectiveRetry,
+                        automatic = automatic,
+                        retainedIpd = retainedIpd,
+                    )
+                }
+                reconcile()
             }
-            reconcile()
         }
     }
 
     private fun queue(
         selected: Assignment,
         retryId: String?,
-        forceApply: Boolean = false,
+        automatic: Boolean = retryId == null,
         retainedIpd: JSONObject? = null,
     ) {
         val policy = selected.policy
@@ -349,8 +372,7 @@ internal class ConfigurationPackageController(
         val delivery = Delivery(
             policy, retryId,
             { assignment?.token === selected.token },
-            { latestReceivedVersion == policy.version },
-            forceApply, ready = !releasing,
+            automatic, ready = !releasing,
             retainedIpd = retainedIpd,
         )
         pending = delivery
@@ -370,7 +392,9 @@ internal class ConfigurationPackageController(
         val priorRequested = priorPolicy?.values?.opt("ipd") as? Number ?: return null
         if (requested.toDouble() != priorRequested.toDouble()) return null
         val priorVersion = priorPolicy.version ?: return null
-        val previous = journal?.find(priorVersion)?.takeIf { it.bootCount == boot } ?: return null
+        val previous = journal?.latest?.takeIf {
+            it.version == priorVersion && it.bootCount == boot
+        } ?: return null
         val result = previous.results.optJSONObject("ipd") ?: return null
         if (result.optString("status") != "applied") return null
         val accepted = result.opt("value") as? Number ?: return null
@@ -401,12 +425,11 @@ internal class ConfigurationPackageController(
             val selected = assignment
             val policy = selected?.policy
             val started = if (journalLoaded && selected != null && policy?.version == expected && canReapply(policy)) {
-                val applyScalars = scalarWriter()
+                val applyScalars = dependencies.scalarWriter()
                 applyScalars != null &&
                     startAttempt(
                         policy, journal?.find(expected), null, applyScalars,
                         overwriteScalars = true, forceMapRecovery = true,
-                        mapIsLatest = { latestReceivedVersion == expected },
                     ) {
                         assignment?.token === selected.token
                     }
@@ -418,7 +441,7 @@ internal class ConfigurationPackageController(
 
     private fun canReapply(policy: Policy): Boolean =
         policy.supportsApply && policy.version != null && assignment?.cached == true &&
-            pending == null && !applyingWifi && !applyingLbeMap && boot >= 0 && sdkReady &&
+            pending == null && activeAttempt == null && boot >= 0 && sdkReady &&
             journal?.find(policy.version)?.status != "applying" &&
             (policy.values.optJSONObject("wifi") == null || wifi.canAcceptPolicy())
 
@@ -440,14 +463,6 @@ internal class ConfigurationPackageController(
             dependencies.logJournalError("Could not read package application journal")
             null
         }
-    }
-
-    private fun scalarWriter(): ((JSONObject, Boolean, String?) -> JSONObject)? = try {
-        dependencies.scalarWriter()
-    } catch (_: LinkageError) {
-        { values, _, _ -> JSONObject().apply {
-            for (key in values.keys()) put(key, settingOutcome("failed", reason = "READ_FAILED"))
-        } }
     }
 
     private fun publishScreenState() {
@@ -485,7 +500,7 @@ internal class ConfigurationPackageController(
     }
 
     private fun reconcilePending() {
-        if (applyingWifi || applyingLbeMap) return
+        if (activeAttempt != null) return
 
         val delivery = pending ?: return
         if (!delivery.ready) return
@@ -513,14 +528,15 @@ internal class ConfigurationPackageController(
         // A Retry can claim an assignment whose first write failed, even if this
         // version was applied before a different package changed the device.
         val needsFreshAttempt = current.shouldApply(version, boot, null)
-        val firstClaim = needsFreshAttempt && (delivery.forceApply ||
+        val firstClaim = needsFreshAttempt && (delivery.automatic ||
             reported?.takeIf { it.version == version }?.status == "interrupted")
         val retryId = delivery.retryId?.takeIf {
             (firstClaim && it !in previous?.retryIds.orEmpty()) || current.shouldApply(version, boot, it)
         }
         val resumeMap = delivery.retryId == null && policy.lbeMapTransfer != null && previous?.retryMapOnDelivery == true
-        val automatic = delivery.forceApply || resumeMap ||
-            ((delivery.retryId == null || afterReboot) && needsFreshAttempt)
+        val resumeInterrupted = previous?.resume != null
+        val automatic = resumeInterrupted || resumeMap ||
+            ((delivery.automatic || afterReboot) && needsFreshAttempt)
         if (retryId == null && !automatic) {
             pending = null
             if (previous != null && !needsFreshAttempt) {
@@ -529,44 +545,51 @@ internal class ConfigurationPackageController(
             return
         }
         if (boot < 0 || !sdkReady) return
-        val applyScalars = scalarWriter() ?: return
+        val applyScalars = dependencies.scalarWriter() ?: return
         if (wifiPolicy != null && !wifi.canAcceptPolicy()) return
 
-        val bootReapply = afterReboot && retryId == null &&
-            (cachedVersionFromEarlierBoot == version || (previous != null && previous.bootCount != boot))
+        val bootReapply = (resumeInterrupted && previous?.bootReapply == true) ||
+            (afterReboot && retryId == null &&
+                (cachedVersionFromEarlierBoot == version || (previous != null && previous.bootCount != boot)))
         pending = null
         startAttempt(policy, previous, retryId, applyScalars,
-            overwriteScalars = bootReapply || (retryId != null && afterReboot),
-            checkExistingWifi = retryId == null && !bootReapply,
+            overwriteScalars = previous?.resume?.overwriteScalars == true || bootReapply || (retryId != null && afterReboot),
+            checkExistingWifi = previous?.resume?.checkExistingWifi ?: (retryId == null && !bootReapply),
             bootReapply = bootReapply,
-            retainedIpd = (delivery.retainedIpd ?: if (resumeMap) retainAcceptedIpd(policy, policy) else null)
-                .takeUnless { bootReapply || afterReboot },
-            forceMapRecovery = retryId != null || delivery.forceApply,
-            mapIsLatest = delivery.mapIsLatest,
+            retainedIpd = delivery.retainedIpd ?: if (resumeMap || resumeInterrupted) retainAcceptedIpd(policy, policy) else null,
+            forceMapRecovery = retryId != null || resumeInterrupted,
+            retainWifiForMapResume = resumeMap || resumeInterrupted,
             isCurrent = delivery.isCurrent)
     }
 
     private fun reconcileHomeApp() {
-        if (!homeAppCheckPending || !sdkReady || pending != null || applyingWifi || applyingLbeMap) return
+        if (!homeAppCheckPending || !sdkReady || pending != null || activeAttempt != null) return
         val policy = assignment?.takeIf { it.cached }?.policy ?: return
         val version = policy.version ?: return
         val attempt = journal?.latest ?: return
         if (attempt.version != version || attempt.bootCount != boot || attempt.status != "complete") return
         val packageName = (policy.values.opt("startupApp") as? String)?.takeIf { it.isNotEmpty() } ?: return
         if (latestReceivedVersion != version) return
-        val applyScalars = scalarWriter() ?: return
+        val applyScalars = dependencies.scalarWriter() ?: return
         homeAppCheckPending = false
         val previous = attempt.results.optJSONObject("startupApp") ?: return
-        if (previous.optString("status") != "waiting") {
-            // An already accepted launcher only needs attention if the app disappeared.
-            val missing = runCatching { dependencies.homeAppEnabled(packageName) == null }.getOrDefault(false)
-            if (!missing) return
+        val previousStatus = previous.optString("status")
+        val unavailable = when {
+            previousStatus == "waiting" -> true
+            previousStatus == "applied" -> {
+                // Reconcile removal or disablement even if its package broadcast was missed.
+                runCatching { dependencies.homeAppEnabled(packageName) != true }.getOrDefault(false)
+            }
+            previousStatus == "failed" && previous.optString("reason") == "APP_DISABLED" ->
+                // The app may be disabled first and uninstalled later. Only a missing
+                // package restores PICO default; re-enabling still waits for Retry.
+                runCatching { dependencies.homeAppEnabled(packageName) == null }.getOrDefault(false)
+            else -> false
         }
+        if (!unavailable) return
         val outcome = try {
-            applyScalars(JSONObject().put("startupApp", packageName), false, null)
+            applyScalars(JSONObject().put("startupApp", packageName), false)
                 .optJSONObject("startupApp") ?: settingOutcome("unsupported", reason = "UNSUPPORTED")
-        } catch (failure: LinkageError) {
-            settingsFailureOutcome(failure, "WRITE_FAILED")
         } catch (failure: Exception) {
             settingsFailureOutcome(failure, "WRITE_FAILED")
         }
@@ -579,43 +602,38 @@ internal class ConfigurationPackageController(
         policy: Policy,
         previous: ConfigurationAttempt?,
         retryId: String?,
-        applyScalars: (JSONObject, Boolean, String?) -> JSONObject,
+        applyScalars: (JSONObject, Boolean) -> JSONObject,
         overwriteScalars: Boolean = false,
         checkExistingWifi: Boolean = false,
         bootReapply: Boolean = false,
         retainedIpd: JSONObject? = null,
         forceMapRecovery: Boolean = false,
-        mapIsLatest: () -> Boolean,
+        retainWifiForMapResume: Boolean = false,
         isCurrent: () -> Boolean,
     ): Boolean {
         val version = checkNotNull(policy.version)
         val wifiPolicy = policy.values.optJSONObject("wifi")
         // A same-revision retry need not touch settled Wi-Fi.
         val retainedWifi = previous?.takeIf {
-            wifiPolicy != null && (retryId != null || it.retryMapOnDelivery) &&
+            wifiPolicy != null && (retryId != null || retainWifiForMapResume) &&
                 it.bootCount == boot && journal?.latest === it
         }?.results?.optJSONObject("wifi")?.takeIf { it.optString("status") == "applied" }
         val requestedLbeMode = policy.values.opt("lbeMode") == true
         val hasMapDescriptor = policy.values.has("lbeMap") && policy.values.opt("lbeMap") !== JSONObject.NULL
         val mapDescriptor = LbeMapDescriptor.parse(policy.values.opt("lbeMap"))
-        val invalidMapPolicy = if (requestedLbeMode) mapDescriptor == null else hasMapDescriptor
+        val invalidMapPolicy = requestedLbeMode && mapDescriptor == null
         val mapRequested = requestedLbeMode && mapDescriptor != null
-        val priorMapAttempt = journal?.latest?.takeIf { it.version.packageId == version.packageId }
-        val retainedMap = priorMapAttempt?.takeIf {
-            mapRequested && !forceMapRecovery &&
-                runCatching { dependencies.isLbeMapAvailable() }.getOrDefault(false)
-        }?.results?.optJSONObject("lbeMap")?.takeIf {
-            it.optString("status") == "applied" &&
-                LbeMapDescriptor.parse(it.optJSONObject("value")) == mapDescriptor
-        }
+        val previousMap = journal?.latest?.takeIf { it.version.packageId == version.packageId }
+            ?.results?.optJSONObject("lbeMap")
+        val canReuseMap = !forceMapRecovery && previousMap?.optString("status") == "applied" &&
+            LbeMapDescriptor.parse(previousMap.optJSONObject("value")) == mapDescriptor
         val results = JSONObject().apply {
             retainedWifi?.let { put("wifi", it) }
             retainedIpd?.let { put("ipd", it) }
-            retainedMap?.let { put("lbeMap", it) }
         }
         val scalarValues = JSONObject().apply {
             for (key in policy.values.keys()) {
-                if (key == "wifi" || key == "lbeMap") continue
+                if (key == "wifi" || key == "lbeMap" || (key == "lbeMode" && requestedLbeMode)) continue
                 if (key == "ipd" && retainedIpd != null) continue
                 put(key, policy.values.get(key))
             }
@@ -627,7 +645,6 @@ internal class ConfigurationPackageController(
             results = JSONObject().apply {
                 retainedWifi?.let { put("wifi", it) }
                 retainedIpd?.let { put("ipd", it) }
-                retainedMap?.let { put("lbeMap", it) }
             },
             bootReapply = bootReapply,
         )
@@ -641,61 +658,64 @@ internal class ConfigurationPackageController(
             if (invalidMapPolicy) {
                 results.put("lbeMap", settingOutcome(
                     "failed",
-                    reason = if (!requestedLbeMode || !hasMapDescriptor) "MAP_REQUIRED" else "MAP_DOWNLOAD_FAILED",
+                    reason = if (!hasMapDescriptor) "MAP_REQUIRED" else "INVALID_VALUE",
                 ))
+                results.put("lbeMode", settingOutcome("failed", reason = "MAP_REQUIRED"))
                 applyScalarsAndWifi(
                     policy, version, attempt, results, scalarValues, applyScalars, overwriteScalars,
                     checkExistingWifi, isCurrent,
-                    mapFailureReason = if (requestedLbeMode) "MAP_REQUIRED" else null,
                 )
                 return true
             }
 
-            if (mapRequested && retainedMap == null) {
+            if (mapRequested) {
                 val descriptor = checkNotNull(mapDescriptor)
-                lbeMapAttempt = attempt
+                val binding = checkNotNull(sdkBinding)
+                val mapIsCurrent = { isCurrent() && latestReceivedVersion == version }
+                val sdkIsCurrent = { sdkBinding === binding && binding.isCurrent() }
+                activeAttempt = attempt
                 dependencies.lbeMapWorker.execute {
-                    val mapIsCurrent = { isCurrent() && mapIsLatest() }
                     var retryMapOnDelivery = false
                     val mapOutcome = try {
-                        val file = dependencies.acquireLbeMap(descriptor, policy.lbeMapTransfer, version, mapIsCurrent)
-                        if (!mapIsCurrent()) throw StaleConfigurationException()
-                        when (dependencies.importLbeMap(file.absolutePath)) {
-                            LbeMapImportResult.ACCEPTED -> settingOutcome("applied", descriptor.toJson(), "MAP_ACTIVE_UNVERIFIED")
-                            LbeMapImportResult.FAILED -> settingOutcome("failed", reason = "MAP_IMPORT_FAILED")
-                            LbeMapImportResult.CALLBACK_TIMEOUT -> settingOutcome("failed", reason = "CALLBACK_TIMEOUT")
-                        }
+                        applyMap(descriptor, policy.lbeMapTransfer, version, canReuseMap, mapIsCurrent, sdkIsCurrent)
                     } catch (_: RetryableMapDownloadException) {
                         retryMapOnDelivery = true
-                        settingOutcome("failed", reason = "MAP_DOWNLOAD_FAILED")
+                        LbeOutcome(settingOutcome("failed", reason = "MAP_DOWNLOAD_FAILED"))
                     } catch (_: StaleConfigurationException) {
                         null
                     } catch (_: Exception) {
-                        settingOutcome("failed", reason = "MAP_DOWNLOAD_FAILED")
-                    } catch (_: LinkageError) {
-                        settingOutcome("failed", reason = "MAP_DOWNLOAD_FAILED")
+                        LbeOutcome(settingOutcome("failed", reason = "MAP_DOWNLOAD_FAILED"))
                     }
                     worker.execute mapFinished@{
-                        if (lbeMapAttempt !== attempt) return@mapFinished
-                        lbeMapAttempt = null
+                        if (activeAttempt !== attempt) return@mapFinished
+                        activeAttempt = null
                         try {
-                            if (mapOutcome == null || !mapIsCurrent()) {
-                                pending?.takeIf { it.policy.version == version }?.forceApply = true
-                                if (journal?.find(version)?.status == "applying") {
-                                    finish(attempt.copy(status = "interrupted", results = results))
+                            val currentWriter = if (sdkIsCurrent()) dependencies.scalarWriter() else null
+                            if (mapOutcome == null || !mapIsCurrent() || currentWriter == null) {
+                                if (pending == null && mapIsCurrent()) {
+                                    pending = Delivery(policy, retryId, isCurrent, automatic = true,
+                                        ready = true, retainedIpd = retainedIpd)
+                                }
+                                if (journal?.find(version) === attempt) {
+                                    finish(
+                                        attempt.copy(
+                                            status = "interrupted", results = results,
+                                            resume = ConfigurationResume(overwriteScalars, checkExistingWifi),
+                                        ),
+                                        publishResult = mapIsCurrent(),
+                                    )
                                 }
                             } else {
-                                results.put("lbeMap", mapOutcome)
+                                results.put("lbeMap", mapOutcome.map)
+                                results.put("lbeMode", mapOutcome.mode)
                                 applyScalarsAndWifi(
                                     policy, version, attempt.copy(retryMapOnDelivery = retryMapOnDelivery),
-                                    results, scalarValues, applyScalars, overwriteScalars,
+                                    results, scalarValues, currentWriter, overwriteScalars,
                                     checkExistingWifi, isCurrent,
-                                    mapFailureReason = if (mapOutcome.optString("status") == "applied") null
-                                    else mapOutcome.optString("reason", "MAP_DOWNLOAD_FAILED"),
                                 )
                             }
                         } catch (failure: Exception) {
-                            interruptApplyingAttempt(version, results, failure)
+                            interruptApplyingAttempt(attempt, results, failure, publishResult = mapIsCurrent())
                         } finally {
                             reconcile()
                         }
@@ -709,11 +729,74 @@ internal class ConfigurationPackageController(
                 checkExistingWifi, isCurrent,
             )
         } catch (failure: Exception) {
-            wifiAttempt = null
-            if (lbeMapAttempt === attempt) lbeMapAttempt = null
-            interruptApplyingAttempt(version, results, failure)
+            activeAttempt = null
+            journal?.find(version)?.takeIf { it.status == "applying" }?.let {
+                interruptApplyingAttempt(it, results, failure)
+            }
         }
         return true
+    }
+
+    private data class LbeOutcome(val map: JSONObject, val mode: JSONObject = settingOutcome("failed", reason = "MAP_REQUIRED"))
+
+    private fun applyMap(
+        descriptor: LbeMapDescriptor,
+        transfer: LbeMapTransfer?,
+        version: ConfigurationVersion,
+        canReuse: Boolean,
+        isCurrent: () -> Boolean,
+        sdkIsCurrent: () -> Boolean,
+    ): LbeOutcome {
+        fun checkCurrent() {
+            if (!isCurrent() || !sdkIsCurrent()) throw StaleConfigurationException()
+        }
+        fun activeMap(file: File): ActiveLbeMap {
+            checkCurrent()
+            val state = dependencies.activeLbeMap(file.absolutePath)
+            checkCurrent()
+            return state
+        }
+        fun verified() = LbeOutcome(
+            settingOutcome("applied", descriptor.toJson(), "MAP_ACTIVE_VERIFIED"),
+            settingOutcome("applied", true),
+        )
+
+        checkCurrent()
+        // Acquisition verifies a completed cache entry itself. Reusing that one result
+        // avoids reading a corrupt large ZIP twice before deciding to download again.
+        val acquisition = dependencies.acquireLbeMap(descriptor, transfer, version, isCurrent)
+        checkCurrent()
+        val file = acquisition.file
+        if (canReuse && acquisition.verifiedCacheHit && activeMap(file) == ActiveLbeMap.MATCH) return verified()
+        when (dependencies.importLbeMap(file.absolutePath)) {
+            LbeMapImportResult.FAILED -> return LbeOutcome(settingOutcome("failed", reason = "MAP_IMPORT_FAILED"))
+            LbeMapImportResult.CALLBACK_TIMEOUT -> return LbeOutcome(settingOutcome("failed", reason = "CALLBACK_TIMEOUT"))
+            LbeMapImportResult.ACCEPTED -> Unit
+        }
+
+        checkCurrent()
+        // A large transfer or import may span a TobService reconnect. Resolve the
+        // writer after that wait and use the same live binding for LBE On and scalars.
+        val applyCurrentScalars = dependencies.scalarWriter() ?: throw StaleConfigurationException()
+        val mode = try {
+            applyCurrentScalars(JSONObject().put("lbeMode", true), false).optJSONObject("lbeMode")
+                ?: settingOutcome("unsupported", reason = "UNSUPPORTED")
+        } catch (error: Exception) {
+            settingsFailureOutcome(error, "WRITE_FAILED")
+        }
+        checkCurrent()
+        if (mode.optString("status") != "applied" || mode.opt("value") != true) {
+            return LbeOutcome(settingOutcome("failed", descriptor.toJson(), "MAP_MODE_NOT_APPLIED"), mode)
+        }
+        val state = activeMap(file)
+        val reason = when (state) {
+            ActiveLbeMap.MATCH -> return verified()
+            ActiveLbeMap.DIFFERENT -> "MAP_ACTIVE_MISMATCH"
+            ActiveLbeMap.MODE_OFF, ActiveLbeMap.UNKNOWN -> "MAP_VERIFICATION_UNAVAILABLE"
+        }
+        val modeResult = if (state == ActiveLbeMap.MODE_OFF) settingOutcome("failed", false, "READBACK_MISMATCH")
+            else settingOutcome("failed", mode.opt("value"), reason)
+        return LbeOutcome(settingOutcome("failed", descriptor.toJson(), reason), modeResult)
     }
 
     private fun applyScalarsAndWifi(
@@ -722,22 +805,15 @@ internal class ConfigurationPackageController(
         attempt: ConfigurationAttempt,
         results: JSONObject,
         scalarValues: JSONObject,
-        applyScalars: (JSONObject, Boolean, String?) -> JSONObject,
+        applyScalars: (JSONObject, Boolean) -> JSONObject,
         overwriteScalars: Boolean,
         checkExistingWifi: Boolean,
         isCurrent: () -> Boolean,
-        mapFailureReason: String? = null,
     ) {
         val wifiPolicy = policy.values.optJSONObject("wifi")
         if (scalarValues.length() > 0) {
             if (scalarValues.has("startupApp")) homeAppCheckPending = false
-            val scalarResults = try {
-                applyScalars(scalarValues, overwriteScalars, mapFailureReason)
-            } catch (failure: LinkageError) {
-                JSONObject().apply {
-                    for (key in scalarValues.keys()) put(key, settingOutcome("failed", reason = "WRITE_FAILED"))
-                }
-            }
+            val scalarResults = applyScalars(scalarValues, overwriteScalars)
             for (key in scalarValues.keys()) {
                 results.put(key, scalarResults.optJSONObject(key) ?: settingOutcome("unsupported", reason = "UNSUPPORTED"))
             }
@@ -754,19 +830,21 @@ internal class ConfigurationPackageController(
             updateAttempt(attempt.copy(status = "interrupted", results = results))
             return
         }
-        wifiAttempt = checkpoint
+        activeAttempt = checkpoint
         wifi.applyManagedPolicy(version.revision, wifiPolicy, checkExistingWifi, isCurrent, onFinished = { result ->
             worker.execute {
-                if (wifiAttempt !== checkpoint) return@execute
-                wifiAttempt = null
+                if (activeAttempt !== checkpoint) return@execute
+                activeAttempt = null
                 try {
                     if (isCurrent()) {
                         finishWifi(checkpoint, result)
                     } else if (journal?.find(version) === checkpoint) {
-                        finish(checkpoint.copy(status = "interrupted"))
+                        finish(checkpoint.copy(
+                            status = "interrupted", resume = ConfigurationResume(overwriteScalars, checkExistingWifi),
+                        ), publishResult = false)
                     }
                 } catch (failure: Exception) {
-                    interruptApplyingAttempt(version, results, failure)
+                    interruptApplyingAttempt(checkpoint, results, failure, publishResult = isCurrent())
                 } finally {
                     reconcile()
                 }
@@ -774,10 +852,15 @@ internal class ConfigurationPackageController(
         })
     }
 
-    private fun interruptApplyingAttempt(version: ConfigurationVersion, results: JSONObject, failure: Exception) {
+    private fun interruptApplyingAttempt(
+        attempt: ConfigurationAttempt,
+        results: JSONObject,
+        failure: Exception,
+        publishResult: Boolean = true,
+    ) {
         dependencies.logJournalError("Package application interrupted (${failure.javaClass.simpleName})")
-        val claimed = journal?.find(version)?.takeIf { it.status == "applying" } ?: return
-        finish(claimed.copy(status = "interrupted", results = results))
+        if (journal?.find(attempt.version) !== attempt || attempt.status != "applying") return
+        finish(attempt.copy(status = "interrupted", results = results), publishResult)
     }
 
     private fun storageError(policy: Policy, previous: ConfigurationAttempt?): ConfigurationAttempt {
@@ -825,11 +908,11 @@ internal class ConfigurationPackageController(
         return true
     }
 
-    private fun persist(next: ConfigurationAttempt): Boolean {
+    private fun persist(next: ConfigurationAttempt, publishResult: Boolean = true): Boolean {
         if (!saveJournal(checkNotNull(journal).withAttempt(next))) return false
-        publish(next)
+        if (publishResult) publish(next)
         val token = assignment?.token
-        if (token != null && next.status == "complete" && !next.needsRetry && next.waitingHomeAppPackage == null) {
+        if (publishResult && token != null && next.status == "complete" && !next.needsRetry && next.waitingHomeAppPackage == null) {
             try {
                 dependencies.onApplied(next.bootReapply) { assignment?.token === token && reported === next }
             } catch (_: Exception) {
@@ -839,14 +922,14 @@ internal class ConfigurationPackageController(
         return true
     }
 
-    private fun finish(next: ConfigurationAttempt) {
+    private fun finish(next: ConfigurationAttempt, publishResult: Boolean = true) {
         // The durable claim still reads as interrupted on restart if this save fails.
-        if (!persist(next)) updateAttempt(next.copy(status = "interrupted"))
+        if (!persist(next, publishResult)) updateAttempt(next.copy(status = "interrupted"), publishResult)
     }
 
-    private fun updateAttempt(next: ConfigurationAttempt) {
+    private fun updateAttempt(next: ConfigurationAttempt, publishResult: Boolean = true) {
         journal = checkNotNull(journal).withAttempt(next)
-        publish(next)
+        if (publishResult) publish(next)
     }
 
     private fun publish(next: ConfigurationAttempt) = setReport(Report.Available(next))
@@ -873,7 +956,7 @@ private fun productionDependencies(context: Context): ConfigurationPackageDepend
         File(context.noBackupFilesDir, "configuration-packages.json"),
         syncDirectory = ::syncDirectory,
     )
-    val lbeMapStore by lazy { LbeMapArtifactStore() }
+    val lbeMapStore = LbeMapArtifactStore()
     val appliedNotice = PicoPackageAppliedNotice(context.applicationContext)
     return ConfigurationPackageDependencies(
         worker = Executors.newSingleThreadExecutor(),
@@ -905,9 +988,10 @@ private fun productionDependencies(context: Context): ConfigurationPackageDepend
             (ToBServiceHelper.getInstance().serviceBinder as? IToBServiceProxy)
                 ?.let { PicoDeviceSettings(context, it).importLbeMap(path) } ?: LbeMapImportResult.FAILED
         },
-        isLbeMapAvailable = {
+        activeLbeMap = { path ->
             (ToBServiceHelper.getInstance().serviceBinder as? IToBServiceProxy)
-                ?.let { PicoDeviceSettings(context, it).isLbeMapAvailable() } == true
+                ?.let { PicoDeviceSettings(context, it).activeLbeMap(path) } ?: ActiveLbeMap.UNKNOWN
         },
+        cancelLbeMapTransfer = lbeMapStore::cancelLbeMapTransfer,
     )
 }

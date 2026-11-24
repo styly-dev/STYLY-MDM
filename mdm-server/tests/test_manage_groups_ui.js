@@ -7,12 +7,16 @@ const membership = require('../styly_mdm/static/group-membership.js');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'styly_mdm', 'static', 'index.html'), 'utf8').replace(/\r\n/g, '\n');
 
+const inlineScript = source.match(/<script>([\s\S]*?)<\/script>/)[1];
+const functionSources = new Map();
+
 function functionSource(name) {
-  const start = source.indexOf('function ' + name + '(');
-  assert.notEqual(start, -1, 'function ' + name + ' exists');
-  const end = source.indexOf('\n      }', start);
-  assert.notEqual(end, -1, 'function ' + name + ' has a closing boundary');
-  return source.slice(start, end + '\n      }'.length);
+  if (!functionSources.has(name)) {
+    // Read the hoisted declaration before the console initializes its DOM and socket.
+    const script = inlineScript.replace(/\(function\s*\(\s*\)\s*\{/, '$& return ' + name + ';');
+    functionSources.set(name, vm.runInNewContext(script).toString());
+  }
+  return functionSources.get(name);
 }
 
 function makeManageContext(overrides = {}) {
@@ -61,6 +65,7 @@ function makeGroupSnapshotContext(overrides = {}) {
     selectedIds: new Set(),
     powerConfirm: { checked: false },
     membershipSnapshotReady: false,
+    membershipSnapshot: null,
     groupsLoaded: false,
     document: { getElementById() { return { hidden: false }; } },
     window: { MdmGroupMembership: membership },
@@ -92,14 +97,11 @@ function receiveGroupList(context, groups, source = 'ws') {
   else context.handleMessage(message);
 }
 
-function installSocketCloseHandler(context) {
-  const close = source.match(/socket\.onclose = function \(\) \{([\s\S]*?)\n        \};/);
-  assert.ok(close, 'actual WebSocket close handler exists');
-  vm.runInContext(
-    'function simulateSocketClose(socket) { ws = socket; socket.onclose = function () {' +
-      close[1] + '\n}; socket.onclose(); }',
-    context,
-  );
+function disconnectConsole(context) {
+  Object.assign(context, { ws: null, WebSocket: class {}, location: { protocol: 'http:', host: 'localhost' } });
+  vm.runInContext(functionSource('connect'), context);
+  context.connect();
+  context.ws.onclose();
 }
 
 function makeManageDetailContext() {
@@ -137,6 +139,7 @@ function makeManageDetailContext() {
     groups: { Studio: ['online'], Gallery: ['offline'] },
     devices,
     manageSelectedGroup: 'Studio',
+    membershipSnapshot: null,
     manageTab: 'devices',
     manageSearch: 'on',
     manageSort: 'label-asc',
@@ -449,8 +452,7 @@ test('a manual selection of a renamed group survives disconnect before its snaps
   assert.equal(context.pendingSelection.intent, 'manual');
   assert.equal(context.pendingSelection.phase, 'snapshot');
 
-  installSocketCloseHandler(context);
-  context.simulateSocketClose({});
+  disconnectConsole(context);
   assert.equal(context.pendingSelection.name, 'Gallery');
   assert.equal(context.pendingSelection.intent, 'manual');
   assert.equal(context.manageSelectedGroup, 'Current');
@@ -492,8 +494,7 @@ test('disconnect finishes the in-flight save and preserves a deferred manual cho
   context.sendCreateGroup('New group');
   context.selectManageGroup('Other');
   context.membershipSnapshotReady = true;
-  installSocketCloseHandler(context);
-  context.simulateSocketClose({});
+  disconnectConsole(context);
 
   assert.equal(context.manageSelectedGroup, 'Other');
   assert.equal(feedback[0].state, 'error');
@@ -548,9 +549,7 @@ test('existing ghost members are rendered as removable rows even with no live de
 
 function makeMemberClickFixture(devices, members) {
   const context = makeManageDetailContext();
-  let handler;
   Object.assign(context, {
-    manageView: { addEventListener(_type, listener) { handler = listener; } },
     manageSearch: '',
     membershipSave: null,
     groups: { Studio: members },
@@ -561,11 +560,9 @@ function makeMemberClickFixture(devices, members) {
     deviceIdHtml(_device, id) { return id; },
   });
   vm.runInContext(functionSource('renderMgDevListHtml'), context);
-  const start = source.indexOf("manageView.addEventListener('click', function (e) {");
-  const end = source.indexOf('\n      });', start);
-  vm.runInContext(source.slice(start, end + '\n      });'.length), context);
+  vm.runInContext(functionSource('handleManageClick'), context);
   context.renderManageDetail();
-  return { context, list: context.mgDetail.list, click: target => handler({ target: { closest: () => target } }) };
+  return { context, list: context.mgDetail.list, click: target => context.handleManageClick({ target: { closest: () => target } }) };
 }
 
 test('Cancel restores the checkbox after an in-place membership edit', () => {
@@ -717,23 +714,60 @@ test('delete is disabled and guarded while the current group membership is savin
   feedbackContext.renderMembershipFeedback();
   assert.equal(controls['[data-act="deleteGroup"]'].disabled, true);
 
-  let handler;
   const deleted = [];
   const clickContext = vm.createContext({
-    manageView: { addEventListener(_type, listener) { handler = listener; } },
     membershipSave: { name: 'Studio', state: 'saving' },
     confirm() { return true; },
     sendDeleteGroup(name) { deleted.push(name); },
   });
-  const start = source.indexOf("manageView.addEventListener('click', function (e) {");
-  const end = source.indexOf('\n      });', start);
-  assert.ok(start !== -1 && end !== -1, 'actual delegated manage click handler exists');
-  vm.runInContext(source.slice(start, end + '\n      });'.length), clickContext);
+  vm.runInContext(functionSource('handleManageClick'), clickContext);
   const target = { dataset: { act: 'deleteGroup', group: 'Studio' } };
-  handler({ target: { closest() { return target; } } });
+  clickContext.handleManageClick({ target: { closest() { return target; } } });
   assert.deepEqual(deleted, []);
 
   clickContext.membershipSave.state = 'saved';
-  handler({ target: { closest() { return target; } } });
+  clickContext.handleManageClick({ target: { closest() { return target; } } });
   assert.deepEqual(deleted, ['Studio']);
+});
+
+test('membership review checks all affected deployments and counts only changed assignments', () => {
+  const snapshot = { packages: [{ package_id: 'venue-id', name: 'Venue' }], deployments: {
+    Studio: { package_id: 'venue-id', revision: 'active' },
+    Shared: { package_id: 'venue-id', revision: 'active' },
+  } };
+  const edit = { name: 'Studio', add: { a: 'Shared', b: null, c: 'Empty' }, remove: ['d'] };
+  const review = membership.reviewMembershipDeployment(edit, snapshot);
+  assert.deepEqual(review.expected, { Studio: 'active', Shared: 'active', Empty: null });
+  assert.match(review.message, /Apply "Venue".*2 device/);
+  assert.match(review.message, /Release managed settings on 1 device/);
+  assert.equal(membership.reviewMembershipDeployment({ ...edit, add: { a: 'Shared' }, remove: [] }, snapshot).message, '');
+});
+
+test('group deletion sends the confirmed snapshot and shows a conflict in the selected group', () => {
+  const sent = [];
+  const context = makeManageContext({
+    manageSelectedGroup: 'Studio', membershipSnapshotReady: true,
+    membershipSnapshot: { server_instance_id: 'instance', revision: 4 },
+    confirm() { return true; }, wsSend(message) { sent.push(message); },
+  });
+  vm.runInContext(functionSource('sendDeleteGroup'), context);
+  context.sendDeleteGroup('Studio');
+  assert.deepEqual(JSON.parse(JSON.stringify(sent)), [{
+    type: 'DELETE_GROUP', name: 'Studio', expected_snapshot: { server_instance_id: 'instance', revision: 4 },
+  }]);
+  context.handleMessage({ type: 'ERROR', operation: 'DELETE_GROUP', name: 'Studio', message: 'Group details changed.' });
+  assert.equal(context.membershipSave.state, 'error');
+  assert.equal(context.membershipSave.message, 'Group details changed.');
+});
+
+test('a package changed after the checkbox was selected must be reviewed before Save', () => {
+  const groups = { Studio: [], Other: ['h'] };
+  const before = { Studio: { revision: 'a' }, Other: { revision: 'b' } };
+  const edits = new Map();
+  membership.toggleMember('Studio', groups, edits, 'h', before);
+  for (const name of Object.keys(before)) {
+    const changed = { ...before, [name]: { revision: 'new' } };
+    assert.throws(() => membership.buildMembershipEdit('Studio', groups, edits, changed), /package changed/);
+  }
+  assert.deepEqual(membership.buildMembershipEdit('Studio', groups, edits, before).add, { h: 'Other' });
 });

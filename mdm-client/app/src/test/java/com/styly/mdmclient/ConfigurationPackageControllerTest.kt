@@ -32,14 +32,14 @@ class ConfigurationPackageControllerTest {
 
         packages.receiveAndRunWorkers(JSONObject(policy.toString()).put("retry_id", RETRY_ID))
         val callsWhileWaiting = packages.scalarWrites.count
-        packages.controller.onAppInstalled("com.example.unrelated")
+        packages.controller.onHomePackageChanged("com.example.unrelated")
         packages.worker.runAll()
         assertEquals(emptySet<String>(), packages.attempt()?.retryIds)
         assertEquals(callsWhileWaiting, packages.scalarWrites.count)
 
         packages.installedHomeApps += HOME_APP
-        packages.controller.onAppInstalled(HOME_APP)
-        packages.controller.onAppInstalled(HOME_APP)
+        packages.controller.onHomePackageChanged(HOME_APP)
+        packages.controller.onHomePackageChanged(HOME_APP)
         packages.worker.runAll()
 
         val accepted = checkNotNull(packages.attempt())
@@ -62,11 +62,11 @@ class ConfigurationPackageControllerTest {
         assertEquals(HOME_APP, packages.scalarWrites.currentValues["startupApp"])
 
         packages.installedHomeApps -= HOME_APP
-        packages.controller.onAppRemoved("com.example.unrelated")
+        packages.controller.onHomePackageChanged("com.example.unrelated")
         packages.worker.runAll()
         assertEquals(HOME_APP, packages.scalarWrites.currentValues["startupApp"])
 
-        packages.controller.onAppRemoved(HOME_APP)
+        packages.controller.onHomePackageChanged(HOME_APP)
         packages.worker.runAll()
         assertEquals("", packages.scalarWrites.currentValues["startupApp"])
         assertEquals(HOME_APP, packages.attempt()?.waitingHomeAppPackage)
@@ -74,10 +74,69 @@ class ConfigurationPackageControllerTest {
         assertEquals(setOf("startupApp"), packages.scalarWrites.calls.last())
 
         packages.installedHomeApps += HOME_APP
-        packages.controller.onAppInstalled(HOME_APP)
+        packages.controller.onHomePackageChanged(HOME_APP)
         packages.worker.runAll()
         assertEquals(HOME_APP, packages.scalarWrites.currentValues["startupApp"])
         assertNull(packages.attempt()?.waitingHomeAppPackage)
+    }
+
+    @Test
+    fun `disabling an accepted home app is reported and re-enable waits for Retry`() {
+        val packages = PackageHarness()
+        packages.installedHomeApps += HOME_APP
+        val policy = scalarPackagePayload().apply { getJSONObject("settings").put("startupApp", HOME_APP) }
+        packages.receiveAndRunWorkers(policy)
+
+        packages.disabledHomeApps += HOME_APP
+        packages.controller.onHomePackageChanged(HOME_APP)
+        packages.worker.runAll()
+        assertEquals("failed", packages.attempt()?.results?.getJSONObject("startupApp")?.getString("status"))
+        assertEquals("APP_DISABLED", packages.attempt()?.results?.getJSONObject("startupApp")?.getString("reason"))
+
+        packages.disabledHomeApps -= HOME_APP
+        packages.controller.onHomePackageChanged(HOME_APP)
+        packages.worker.runAll()
+        assertEquals("failed", packages.attempt()?.results?.getJSONObject("startupApp")?.getString("status"))
+
+        packages.receiveAndRunWorkers(JSONObject(policy.toString()).put("retry_id", RETRY_ID))
+        assertEquals("applied", packages.attempt()?.results?.getJSONObject("startupApp")?.getString("status"))
+    }
+
+    @Test
+    fun `uninstalling a disabled home app restores the PICO default`() {
+        val packages = PackageHarness()
+        packages.installedHomeApps += HOME_APP
+        val policy = scalarPackagePayload().apply { getJSONObject("settings").put("startupApp", HOME_APP) }
+        packages.receiveAndRunWorkers(policy)
+
+        packages.disabledHomeApps += HOME_APP
+        packages.controller.onHomePackageChanged(HOME_APP)
+        packages.worker.runAll()
+        assertEquals("APP_DISABLED", packages.attempt()?.results?.getJSONObject("startupApp")?.getString("reason"))
+
+        packages.installedHomeApps -= HOME_APP
+        packages.disabledHomeApps -= HOME_APP
+        packages.controller.onHomePackageChanged(HOME_APP)
+        packages.worker.runAll()
+
+        assertEquals("", packages.scalarWrites.currentValues["startupApp"])
+        assertEquals("waiting", packages.attempt()?.results?.getJSONObject("startupApp")?.getString("status"))
+        assertEquals("APP_NOT_INSTALLED", packages.attempt()?.results?.getJSONObject("startupApp")?.getString("reason"))
+    }
+
+    @Test
+    fun `a disabled home app is reconciled after process restart`() {
+        val packages = PackageHarness()
+        packages.installedHomeApps += HOME_APP
+        val policy = scalarPackagePayload().apply { getJSONObject("settings").put("startupApp", HOME_APP) }
+        packages.receiveAndRunWorkers(policy)
+        packages.disabledHomeApps += HOME_APP
+
+        val restarted = packages.restart(bootCount = 133)
+        restarted.wifi.worker.runAll()
+        restarted.worker.runAll()
+        assertEquals("failed", restarted.attempt()?.results?.getJSONObject("startupApp")?.getString("status"))
+        assertEquals("APP_DISABLED", restarted.attempt()?.results?.getJSONObject("startupApp")?.getString("reason"))
     }
 
     @Test
@@ -176,6 +235,31 @@ class ConfigurationPackageControllerTest {
     }
 
     @Test
+    fun `renewed credential arriving during download resumes once and leaves completed map alone`() {
+        val mapWorker = QueueExecutor()
+        val packages = PackageHarness(deferredMapWorker = mapWorker)
+        val tokens = mutableListOf<String?>()
+        packages.onMapDownload = { transfer ->
+            tokens += transfer?.token
+            if (transfer?.token == "test-token") throw RetryableMapDownloadException("Expired credential")
+        }
+        packages.receiveAndRunWorkers(mapPackagePayload())
+        packages.receiveAndRunWorkers(mapPackagePayload().put("lbe_map_token", "renewed"))
+        // The old transfer fails after the renewal has reached the controller.
+        mapWorker.runAll()
+        packages.worker.runAll()
+        mapWorker.runAll()
+        packages.worker.runAll()
+        assertEquals(listOf("test-token", "renewed"), tokens)
+        assertEquals("MAP_ACTIVE_VERIFIED", packages.attempt()?.results?.getJSONObject("lbeMap")?.getString("reason"))
+        packages.receiveAndRunWorkers(mapPackagePayload().put("lbe_map_token", "renewed-again"))
+        mapWorker.runAll()
+        packages.worker.runAll()
+        assertEquals(2, packages.mapDownloadCount)
+        assertEquals(1, packages.mapImportCount)
+    }
+
+    @Test
     fun `map import timeout is reported separately and does not repeat on reconnect`() {
         val packages = PackageHarness()
         packages.mapImportResult = LbeMapImportResult.CALLBACK_TIMEOUT
@@ -213,12 +297,27 @@ class ConfigurationPackageControllerTest {
     }
 
     @Test
+    fun `invalid unused map data does not fail an LBE Off policy`() {
+        val packages = PackageHarness()
+        val policy = scalarPackagePayload().apply {
+            getJSONObject("settings").put("lbeMode", false).put("lbeMap", JSONObject().put("invalid", true))
+        }
+
+        packages.receiveAndRunWorkers(policy)
+
+        val results = checkNotNull(packages.attempt()).results
+        assertEquals("applied", results.getJSONObject("lbeMode").getString("status"))
+        assertFalse(results.has("lbeMap"))
+        assertEquals(false, packages.scalarWrites.currentValues["lbeMode"])
+    }
+
+    @Test
     fun `successful map imports are retained across reboot and unrelated revisions but explicit Retry restores them`() {
         val packages = PackageHarness(failedScalars = setOf("brightness"))
         val policy = mapPackagePayload().apply { getJSONObject("settings").put("brightness", 60) }
         packages.receiveAndRunWorkers(policy)
         assertEquals(1, packages.mapImportCount)
-        assertEquals("MAP_ACTIVE_UNVERIFIED", packages.attempt()?.results?.getJSONObject("lbeMap")?.getString("reason"))
+        assertEquals("MAP_ACTIVE_VERIFIED", packages.attempt()?.results?.getJSONObject("lbeMap")?.getString("reason"))
 
         val rebooted = packages.restart(bootCount = 134)
         rebooted.wifi.worker.runAll()
@@ -229,23 +328,105 @@ class ConfigurationPackageControllerTest {
         unrelatedRevision.getJSONObject("settings").put("brightness", 61)
         rebooted.receiveAndRunWorkers(unrelatedRevision)
         assertEquals(1, rebooted.mapImportCount)
+        assertEquals(rebooted.cachedMapPath, rebooted.mapQueries.last())
 
         rebooted.receiveAndRunWorkers(JSONObject(unrelatedRevision.toString()).put("retry_id", RETRY_ID))
         assertEquals(2, rebooted.mapImportCount)
     }
 
     @Test
-    fun `a previous map import is repeated when PICO reports no active map`() {
+    fun `the same package redeploys A after PICO switches externally to B`() {
         val packages = PackageHarness()
         packages.receiveAndRunWorkers(mapPackagePayload())
         assertEquals(1, packages.mapImportCount)
-        packages.activeMapAvailable = false
+        val cachedA = checkNotNull(packages.activeMapPath)
+        packages.activeMapPath = "/tmp/external-venue-B.zip"
+        packages.mapQueries.clear()
 
         val newerRevision = mapPackagePayload().put("revision", REVISION_2)
         packages.receiveAndRunWorkers(newerRevision)
 
+        assertEquals(listOf(cachedA, cachedA), packages.mapQueries)
         assertEquals(2, packages.mapImportCount)
-        assertEquals("MAP_ACTIVE_UNVERIFIED", packages.attempt()?.results?.getJSONObject("lbeMap")?.getString("reason"))
+        assertEquals(cachedA, packages.activeMapPath)
+        assertEquals("MAP_ACTIVE_VERIFIED", packages.attempt()?.results?.getJSONObject("lbeMap")?.getString("reason"))
+    }
+
+    @Test
+    fun `a comparison timeout reimports the verified cache but cannot confirm the pair`() {
+        val packages = PackageHarness()
+        packages.receiveAndRunWorkers(mapPackagePayload())
+        val cachedA = checkNotNull(packages.cachedMapPath)
+        packages.mapQueries.clear()
+        packages.onMapQuery = { throw java.util.concurrent.TimeoutException("no PICO callback") }
+        packages.receiveAndRunWorkers(mapPackagePayload().put("revision", REVISION_2))
+        assertEquals(listOf(cachedA, cachedA), packages.mapQueries)
+        assertEquals(1, packages.mapDownloadCount)
+        assertEquals(2, packages.mapImportCount)
+        val failed = checkNotNull(packages.attempt()).results
+        for (key in listOf("lbeMap", "lbeMode")) {
+            assertEquals("failed", failed.getJSONObject(key).getString("status"))
+            assertEquals("MAP_VERIFICATION_UNAVAILABLE", failed.getJSONObject(key).getString("reason"))
+        }
+    }
+
+    @Test
+    fun `a previously verified import needs the actual cached ZIP and LBE On to be reused`() {
+        for (dropCache in listOf(true, false)) {
+            val packages = PackageHarness()
+            packages.receiveAndRunWorkers(mapPackagePayload())
+            val cachedA = checkNotNull(packages.cachedMapPath)
+            packages.mapQueries.clear()
+            if (dropCache) packages.cachedMapPath = null else packages.scalarWrites.currentValues["lbeMode"] = false
+            packages.receiveAndRunWorkers(mapPackagePayload().put("revision", REVISION_2))
+            assertEquals(listOf(cachedA), packages.mapQueries)
+            assertEquals(if (dropCache) 2 else 1, packages.mapDownloadCount)
+            assertEquals(2, packages.mapImportCount)
+            assertEquals("MAP_ACTIVE_VERIFIED", packages.attempt()?.results?.getJSONObject("lbeMap")?.getString("reason"))
+        }
+    }
+
+    @Test
+    fun `SDK acceptance cannot verify A if B remains active after import`() {
+        val packages = PackageHarness()
+        packages.activeMapPath = "/tmp/external-venue-B.zip"
+        packages.importChangesActiveMap = false
+        packages.receiveAndRunWorkers(mapPackagePayload())
+        assertEquals(1, packages.mapImportCount)
+        val failed = checkNotNull(packages.attempt()).results
+        for (key in listOf("lbeMap", "lbeMode")) {
+            assertEquals("failed", failed.getJSONObject(key).getString("status"))
+            assertEquals("MAP_ACTIVE_MISMATCH", failed.getJSONObject(key).getString("reason"))
+        }
+        assertTrue(failed.getJSONObject("lbeMode").getBoolean("value"))
+    }
+
+    @Test
+    fun `superseding a map during the identity query cannot start an old import`() {
+        val packages = PackageHarness()
+        packages.receiveAndRunWorkers(mapPackagePayload())
+        packages.activeMapPath = "/tmp/external-venue-B.zip"
+        val replacement = scalarPackagePayload().put("package_id", PACKAGE_ID_2)
+        packages.onMapQuery = { packages.controller.receive(replacement, isCurrent = { true }) }
+        packages.receiveAndRunWorkers(mapPackagePayload().put("revision", REVISION_2))
+        packages.wifi.worker.runAll()
+        packages.worker.runAll()
+        assertEquals(1, packages.mapImportCount)
+        assertEquals(PACKAGE_ID_2, packages.controller.screenSnapshot()?.version?.packageId)
+        assertEquals(PACKAGE_ID_2, packages.controller.resultSnapshot()?.getString("package_id"))
+    }
+
+    @Test
+    fun `a new policy during post-import verification owns the final report`() {
+        val packages = PackageHarness()
+        val replacement = scalarPackagePayload().put("package_id", PACKAGE_ID_2)
+        packages.onMapQuery = { packages.controller.receive(replacement, isCurrent = { true }) }
+        packages.receiveAndRunWorkers(mapPackagePayload())
+        packages.wifi.worker.runAll()
+        packages.worker.runAll()
+        assertEquals(1, packages.mapImportCount)
+        assertEquals(PACKAGE_ID_2, packages.controller.resultSnapshot()?.getString("package_id"))
+        assertFalse(packages.attempt()?.results?.has("lbeMap") == true)
     }
 
     @Test
@@ -264,6 +445,43 @@ class ConfigurationPackageControllerTest {
     }
 
     @Test
+    fun `an accepted map policy survives socket loss before its worker runs`() {
+        val mapWorker = QueueExecutor()
+        val packages = PackageHarness(deferredMapWorker = mapWorker)
+        packages.receiveAndRunWorkers(mapPackagePayload())
+        assertEquals(0, packages.mapImportCount)
+
+        var socketOpen = true
+        val replacement = mapPackagePayload().put("revision", REVISION_2)
+        packages.controller.receive(replacement, isCurrent = { socketOpen })
+        socketOpen = false
+        packages.wifi.worker.runAll()
+        packages.worker.runAll()
+
+        assertTrue(checkNotNull(packages.persistedPolicy).contains(REVISION_2))
+        assertEquals(
+            listOf(
+                ConfigurationVersion(PACKAGE_ID, REVISION),
+                ConfigurationVersion(PACKAGE_ID, REVISION_2),
+            ),
+            packages.cancelledLbeMapVersions,
+        )
+
+        // The replacement first stops Wi-Fi management asynchronously. Its callback
+        // queues the package continuation that starts the replacement map application.
+        packages.wifi.worker.runAll()
+        packages.worker.runAll()
+        mapWorker.runAll()
+        packages.worker.runAll()
+        mapWorker.runAll()
+        packages.worker.runAll()
+
+        assertEquals(1, packages.mapImportCount)
+        assertEquals(REVISION_2, packages.attempt()?.version?.revision)
+        assertEquals("MAP_ACTIVE_VERIFIED", packages.attempt()?.results?.getJSONObject("lbeMap")?.getString("reason"))
+    }
+
+    @Test
     fun `installation during Wi-Fi application retains its result and does not mask other failures`() {
         val packages = PackageHarness(failedScalars = setOf("brightness"))
         val policy = packagePayload(listOf(network("office-a")), prioritizeNetworks = false)
@@ -273,7 +491,7 @@ class ConfigurationPackageControllerTest {
         assertEquals("applying", packages.controller.resultSnapshot()?.getString("status"))
         assertEquals("waiting", packages.attempt()?.results?.getJSONObject("startupApp")?.getString("status"))
         packages.installedHomeApps += HOME_APP
-        packages.controller.onAppInstalled(HOME_APP)
+        packages.controller.onHomePackageChanged(HOME_APP)
         packages.worker.runAll()
         packages.wifi.worker.runAll()
         packages.worker.runAll()
@@ -297,7 +515,7 @@ class ConfigurationPackageControllerTest {
 
             val callsAfterReplacement = packages.scalarWrites.count
             packages.installedHomeApps += HOME_APP
-            packages.controller.onAppInstalled(HOME_APP)
+            packages.controller.onHomePackageChanged(HOME_APP)
             packages.worker.runAll()
 
             assertEquals(callsAfterReplacement, packages.scalarWrites.count)
@@ -1240,6 +1458,172 @@ class ConfigurationPackageControllerTest {
     }
 
     @Test
+    fun `a queued release followed by the same assignment starts a fresh attempt`() {
+        val packages = PackageHarness()
+        val policy = scalarPackagePayload()
+        packages.receiveAndRunWorkers(policy)
+        val previousWrites = packages.scalarWrites.count
+
+        packages.controller.receive(noPackagePayload(), isCurrent = { true })
+        packages.controller.receive(JSONObject(policy.toString()), isCurrent = { true })
+        packages.worker.runAll()
+        packages.wifi.worker.runAll()
+        packages.worker.runAll()
+
+        assertEquals(REVISION, packages.controller.screenSnapshot()?.version?.revision)
+        assertEquals(previousWrites + 1, packages.scalarWrites.count)
+        assertEquals("complete", packages.attempt()?.status)
+        assertEquals("applied", packages.attempt()?.results?.getJSONObject("brightness")?.getString("status"))
+        assertFalse(packages.wifi.store.state.managedWifi)
+    }
+
+    @Test
+    fun `a failed assignment after release keeps the reset boundary for the returning revision`() {
+        val packages = PackageHarness()
+        val original = scalarPackagePayload()
+        packages.receiveAndRunWorkers(original)
+        val writesBeforeReturn = packages.scalarWrites.count
+
+        packages.receive(noPackagePayload())
+        packages.wifi.worker.runAll()
+        packages.worker.runAll()
+        packages.policyWritesToFail = 1
+        packages.receive(scalarPackagePayload().put("revision", REVISION_2))
+        assertEquals("STORAGE_ERROR", packages.controller.resultSnapshot()?.getJSONObject("results")
+            ?.getJSONObject("brightness")?.getString("reason"))
+
+        packages.receiveAndRunWorkers(JSONObject(original.toString()))
+
+        assertEquals(writesBeforeReturn + 1, packages.scalarWrites.count)
+        assertEquals(ConfigurationVersion(PACKAGE_ID, REVISION), packages.attempt()?.version)
+        assertEquals("complete", packages.attempt()?.status)
+        assertEquals("applied", packages.attempt()?.results?.getJSONObject("brightness")?.getString("status"))
+    }
+
+    @Test
+    fun `a failed first assignment after release keeps the reset boundary for a different package`() {
+        val packages = PackageHarness()
+        packages.receiveAndRunWorkers(scalarPackagePayload())
+        packages.receive(noPackagePayload())
+        packages.wifi.worker.runAll()
+        packages.worker.runAll()
+
+        packages.policyWritesToFail = 1
+        packages.receive(scalarPackagePayload().put("revision", REVISION_2))
+        val later = scalarPackagePayload()
+            .put("package_id", "ffffffff-ffff-4fff-8fff-ffffffffffff")
+            .put("revision", "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+        packages.receiveAndRunWorkers(later)
+
+        val journal = packages.journal()
+        val latestVersion = ConfigurationVersion("ffffffff-ffff-4fff-8fff-ffffffffffff", "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+        assertEquals(latestVersion, packages.attempt()?.version)
+        assertEquals(latestVersion, journal.latest?.version)
+        assertNull(journal.find(ConfigurationVersion(PACKAGE_ID, REVISION)))
+    }
+
+    @Test
+    fun `an old release completion does not clear a failed first assignment`() {
+        val packages = PackageHarness()
+        packages.controller.receive(noPackagePayload(), isCurrent = { true })
+        packages.worker.runAll()
+        packages.policyWritesToFail = 1
+
+        packages.controller.receive(scalarPackagePayload(), isCurrent = { true })
+        packages.worker.runAll()
+        val failed = checkNotNull(packages.controller.resultSnapshot())
+        assertEquals(REVISION, packages.controller.screenSnapshot()?.version?.revision)
+        assertEquals("STORAGE_ERROR", failed.getJSONObject("results").getJSONObject("brightness").getString("reason"))
+
+        packages.wifi.worker.runAll()
+        packages.worker.runAll()
+
+        assertEquals(failed.toString(), packages.controller.resultSnapshot()?.toString())
+        assertEquals(REVISION, packages.controller.screenSnapshot()?.version?.revision)
+        assertEquals(ConfigurationApplyStatus.INCOMPLETE, packages.controller.screenSnapshot()?.applyStatus)
+    }
+
+    @Test
+    fun `stale Wi-Fi completion keeps the new assignment storage error visible`() {
+        val oldNetwork = network("old-office")
+        val wifi = Harness()
+        val packages = PackageHarness(wifi)
+        packages.receive(packagePayload(listOf(oldNetwork)))
+        wifi.worker.runAll()
+        wifi.expireNext(WIFI_PRIOR_CONNECTION_OBSERVATION_MS)
+        assertEquals(listOf(oldNetwork), wifi.adapter.selectCalls)
+        wifi.connectivity.update(100, oldNetwork.ssid)
+
+        packages.policyWritesToFail = 1
+        val newPolicy = packagePayload(listOf(network("new-office")), revision = REVISION_2)
+        packages.receive(newPolicy)
+        val storageError = checkNotNull(packages.controller.resultSnapshot())
+        assertEquals(REVISION_2, storageError.getString("revision"))
+        assertEquals("STORAGE_ERROR", storageError.getJSONObject("results")
+            .getJSONObject("brightness").getString("reason"))
+
+        wifi.worker.runAll()
+        packages.worker.runAll()
+
+        val latestReport = checkNotNull(packages.controller.resultSnapshot())
+        assertEquals(REVISION_2, latestReport.getString("revision"))
+        assertEquals("STORAGE_ERROR", latestReport.getJSONObject("results")
+            .getJSONObject("brightness").getString("reason"))
+        assertEquals(REVISION_2, packages.controller.screenSnapshot()?.version?.revision)
+    }
+
+    @Test
+    fun `stale map completion keeps the new assignment storage error visible`() {
+        val deferredMapWorker = QueueExecutor()
+        val packages = PackageHarness(deferredMapWorker = deferredMapWorker)
+        packages.receive(mapPackagePayload())
+        packages.policyWritesToFail = 1
+        val newPolicy = scalarPackagePayload().put("revision", REVISION_2)
+        packages.receive(newPolicy)
+        val storageError = checkNotNull(packages.controller.resultSnapshot())
+        assertEquals(REVISION_2, storageError.getString("revision"))
+        assertEquals("STORAGE_ERROR", storageError.getJSONObject("results")
+            .getJSONObject("brightness").getString("reason"))
+
+        deferredMapWorker.runAll()
+        packages.worker.runAll()
+
+        val latestReport = checkNotNull(packages.controller.resultSnapshot())
+        assertEquals(REVISION_2, latestReport.getString("revision"))
+        assertEquals("STORAGE_ERROR", latestReport.getJSONObject("results")
+            .getJSONObject("brightness").getString("reason"))
+        assertEquals(REVISION_2, packages.controller.screenSnapshot()?.version?.revision)
+    }
+
+    @Test
+    fun `a later assignment after a failed noninitial save preserves the old journal`() {
+        val mutableFailures = mutableSetOf("brightness")
+        val packages = PackageHarness(failedScalars = mutableFailures)
+        val original = scalarPackagePayload()
+        packages.receiveAndRunWorkers(original)
+        packages.receiveAndRunWorkers(JSONObject(original.toString()).put("retry_id", RETRY_ID))
+        mutableFailures.clear()
+
+        packages.policyWritesToFail = 1
+        val unsaved = scalarPackagePayload().put("package_id", PACKAGE_ID_2).put("revision", REVISION_2)
+        packages.controller.receive(unsaved, isCurrent = { true })
+        packages.worker.runAll()
+        assertEquals("STORAGE_ERROR", packages.controller.resultSnapshot()?.getJSONObject("results")
+            ?.getJSONObject("brightness")?.getString("reason"))
+
+        packages.receiveAndRunWorkers(JSONObject(unsaved.toString()))
+        assertTrue(packages.journal().find(ConfigurationVersion(PACKAGE_ID, REVISION))?.retryIds?.contains(RETRY_ID) == true)
+
+        val latest = scalarPackagePayload().put("package_id", "ffffffff-ffff-4fff-8fff-ffffffffffff")
+            .put("revision", "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+        packages.receiveAndRunWorkers(latest)
+
+        assertTrue(packages.journal().find(ConfigurationVersion(PACKAGE_ID, REVISION))?.retryIds?.contains(RETRY_ID) == true)
+        assertEquals(ConfigurationVersion("ffffffff-ffff-4fff-8fff-ffffffffffff", "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+            packages.attempt()?.version)
+    }
+
+    @Test
     fun `explicit Retry is applied once and duplicate retry id does not write again`() {
         val packages = PackageHarness(failedScalars = setOf("brightness"))
         val payload = scalarPackagePayload()
@@ -1263,6 +1647,197 @@ class ConfigurationPackageControllerTest {
         packages.worker.runAll()
         assertEquals(2, packages.scalarWrites.count)
         assertTrue(requireNotNull(packages.attempt()).retryIds.contains(retryId))
+    }
+
+    @Test
+    fun `Retry retains accepted IPD while headset Reapply sends it again`() {
+        val packages = PackageHarness(failedScalars = setOf("brightness"))
+        val policy = scalarPackagePayload().apply { getJSONObject("settings").put("ipd", 63.1) }
+        packages.receiveAndRunWorkers(policy)
+        assertTrue(packages.scalarWrites.calls.last().contains("ipd"))
+
+        packages.receiveAndRunWorkers(JSONObject(policy.toString()).put("retry_id", RETRY_ID))
+        assertFalse(packages.scalarWrites.calls.last().contains("ipd"))
+
+        packages.controller.reapply(ConfigurationVersion(PACKAGE_ID, REVISION)) { assertTrue(it) }
+        packages.worker.runAll()
+        assertTrue(packages.scalarWrites.calls.last().contains("ipd"))
+    }
+
+    @Test
+    fun `a failed assignment save cannot retain IPD from a superseded package`() {
+        val packages = PackageHarness()
+        val policyA = scalarPackagePayload().apply { getJSONObject("settings").put("ipd", 60.0) }
+        packages.receiveAndRunWorkers(policyA)
+        assertEquals(60.0, packages.scalarWrites.currentValues["ipd"])
+
+        val policyB = scalarPackagePayload()
+            .put("package_id", PACKAGE_ID_2)
+            .put("revision", REVISION_2)
+            .apply { getJSONObject("settings").put("ipd", 65.0) }
+        packages.receiveAndRunWorkers(policyB)
+        assertEquals(65.0, packages.scalarWrites.currentValues["ipd"])
+
+        // Reuse the exact historical revision so the old journal.find(version)
+        // implementation would incorrectly reuse A's earlier IPD success.
+        val reassignedA = JSONObject(policyA.toString())
+        packages.policyWritesToFail = 1
+        packages.receive(reassignedA)
+        assertEquals("STORAGE_ERROR", packages.controller.resultSnapshot()
+            ?.getJSONObject("results")?.getJSONObject("brightness")?.getString("reason"))
+
+        packages.receiveAndRunWorkers(reassignedA)
+
+        assertEquals(60.0, (packages.scalarWrites.currentValues["ipd"] as Number).toDouble(), 0.0)
+        val ipd = packages.attempt()?.results?.getJSONObject("ipd")
+        assertEquals("applied", ipd?.getString("status"))
+        assertEquals(60.0, ipd?.getDouble("value") ?: Double.NaN, 0.0)
+    }
+
+    @Test
+    fun `a lost TobService interrupts the map and reconnect resumes without another delivery`() {
+        for (reconnectBeforeCompletion in listOf(false, true)) {
+            val mapWorker = QueueExecutor()
+            val packages = PackageHarness(deferredMapWorker = mapWorker)
+            packages.onMapDownload = {
+                packages.controller.onSdkReady(false)
+                packages.worker.runAll()
+                if (reconnectBeforeCompletion) packages.enableSdk()
+            }
+            packages.receiveAndRunWorkers(mapPackagePayload())
+            mapWorker.runAll()
+            packages.worker.runAll()
+            assertEquals(0, packages.mapImportCount)
+            assertTrue(packages.scalarWrites.calls.isEmpty())
+            if (!reconnectBeforeCompletion) {
+                assertEquals("interrupted", packages.attempt()?.status)
+                packages.enableSdk()
+            }
+
+            mapWorker.runAll()
+            packages.worker.runAll()
+            assertEquals(1, packages.mapDownloadCount)
+            assertEquals(1, packages.mapImportCount)
+            val completed = checkNotNull(packages.attempt())
+            assertEquals("complete", completed.status)
+            assertEquals("MAP_ACTIVE_VERIFIED", completed.results.getJSONObject("lbeMap").getString("reason"))
+            assertEquals(60, completed.results.getJSONObject("brightness").getInt("value"))
+        }
+    }
+
+    @Test
+    fun `a new assignment replaces an SDK-interrupted map while waiting for reconnection`() {
+        val mapWorker = QueueExecutor()
+        val packages = PackageHarness(deferredMapWorker = mapWorker)
+        packages.receiveAndRunWorkers(mapPackagePayload())
+        packages.controller.onSdkReady(false)
+        packages.worker.runAll()
+        mapWorker.runAll()
+        packages.worker.runAll()
+        assertEquals("interrupted", packages.attempt()?.status)
+        packages.receiveAndRunWorkers(scalarPackagePayload().put("revision", REVISION_2))
+        packages.enableSdk()
+        mapWorker.runAll()
+        packages.worker.runAll()
+        assertEquals(0, packages.mapImportCount)
+        assertEquals(REVISION_2, packages.attempt()?.version?.revision)
+        assertFalse(packages.attempt()!!.results.has("lbeMap"))
+    }
+
+    @Test
+    fun `a Retry joining the initial delivery before SDK readiness claims one automatic apply`() {
+        val packages = PackageHarness(deferSdk = true)
+        val policy = scalarPackagePayload()
+        packages.receiveAndRunWorkers(policy)
+        packages.receiveAndRunWorkers(JSONObject(policy.toString()).put("retry_id", RETRY_ID))
+        assertEquals(0, packages.scalarWrites.count)
+        packages.enableSdk()
+        assertEquals(1, packages.scalarWrites.count)
+        assertEquals(setOf(RETRY_ID), packages.attempt()?.retryIds)
+    }
+
+    @Test
+    fun `a consumed Retry cannot suppress a pending automatic return to an earlier revision`() {
+        val packages = PackageHarness(failedScalars = setOf("brightness"))
+        val first = scalarPackagePayload()
+        val oldRetry = JSONObject(first.toString()).put("retry_id", RETRY_ID)
+        packages.receiveAndRunWorkers(first)
+        packages.receiveAndRunWorkers(oldRetry)
+        packages.receiveAndRunWorkers(JSONObject(first.toString()).put("package_id", PACKAGE_ID_2))
+        packages.controller.onSdkReady(false)
+        packages.worker.runAll()
+        packages.receiveAndRunWorkers(first)
+        packages.receiveAndRunWorkers(oldRetry)
+        assertEquals(3, packages.scalarWrites.count)
+        packages.enableSdk()
+        assertEquals(4, packages.scalarWrites.count)
+        assertEquals(PACKAGE_ID, packages.attempt()?.version?.packageId)
+    }
+
+    @Test
+    fun `IPD acceptance carries across adjacent revisions and packages but resets on reboot`() {
+        val packages = PackageHarness()
+        val policy = scalarPackagePayload().apply { getJSONObject("settings").put("ipd", 63.1) }
+        packages.receiveAndRunWorkers(policy)
+        packages.receiveAndRunWorkers(JSONObject(policy.toString()).put("revision", REVISION_2))
+        packages.receiveAndRunWorkers(JSONObject(policy.toString()).put("package_id", PACKAGE_ID_2))
+        assertEquals(1, packages.scalarWrites.calls.count { "ipd" in it })
+        assertEquals("ACCEPTED_UNVERIFIED", packages.attempt()?.results?.getJSONObject("ipd")?.getString("reason"))
+        val restarted = packages.restart()
+        restarted.wifi.worker.runAll()
+        restarted.worker.runAll()
+        assertTrue(restarted.scalarWrites.calls.any { "ipd" in it })
+    }
+
+    @Test
+    fun `invalid map data and an unconfirmed LBE enable report the step that failed`() {
+        val malformed = PackageHarness()
+        val policy = mapPackagePayload().apply { getJSONObject("settings").put("lbeMap", JSONObject()) }
+        malformed.receiveAndRunWorkers(policy)
+        assertEquals("INVALID_VALUE", malformed.attempt()?.results?.getJSONObject("lbeMap")?.getString("reason"))
+        assertEquals(0, malformed.mapDownloadCount)
+        val modeFailed = PackageHarness(failedScalars = setOf("lbeMode"))
+        modeFailed.receiveAndRunWorkers(mapPackagePayload())
+        assertEquals(1, modeFailed.mapImportCount)
+        val results = checkNotNull(modeFailed.attempt()).results
+        assertEquals("MAP_MODE_NOT_APPLIED", results.getJSONObject("lbeMap").getString("reason"))
+        assertEquals("UPDATE_FAILED", results.getJSONObject("lbeMode").getString("reason"))
+    }
+
+    @Test
+    fun `map application resolves a new SDK writer after download and import`() {
+        val packages = PackageHarness()
+        packages.onMapDownload = { packages.scalarGeneration++ }
+
+        packages.receiveAndRunWorkers(mapPackagePayload())
+
+        assertEquals("applied", packages.attempt()?.results?.getJSONObject("lbeMode")?.getString("status"))
+        assertEquals(true, packages.scalarWrites.currentValues["lbeMode"])
+        assertEquals(60, packages.scalarWrites.currentValues["brightness"])
+        assertEquals("MAP_ACTIVE_VERIFIED", packages.attempt()?.results?.getJSONObject("lbeMap")?.getString("reason"))
+    }
+
+    @Test
+    fun `manual Reapply rewrites Wi-Fi after a transient map download failure`() {
+        val wifi = Harness()
+        val packages = PackageHarness(wifi)
+        val preferred = network("office-a")
+        wifi.adapter.afterSelect = { selected -> wifi.connectivity.update(70, selected.ssid) }
+        val policy = mapPackagePayload().apply {
+            getJSONObject("settings").put("wifi", settings(listOf(preferred), prioritizeNetworks = false))
+        }
+        packages.mapDownloadFailure = RetryableMapDownloadException("Temporary download failure")
+        packages.receiveAndRunWorkers(policy)
+        assertTrue(checkNotNull(packages.attempt()).retryMapOnDelivery)
+        assertEquals("applied", packages.attempt()?.results?.getJSONObject("wifi")?.getString("status"))
+        val wifiWrites = wifi.adapter.applyCalls.size
+
+        packages.controller.reapply(ConfigurationVersion(PACKAGE_ID, REVISION)) { assertTrue(it) }
+        packages.worker.runAll()
+        wifi.worker.runAll()
+        packages.worker.runAll()
+
+        assertEquals(wifiWrites + 1, wifi.adapter.applyCalls.size)
     }
 
     @Test
@@ -1635,16 +2210,24 @@ class ConfigurationPackageControllerTest {
         var journalReadFailuresRemaining: Int = 0,
         private val packageStore: ConfigurationPackageStore? = null,
         val installedHomeApps: MutableSet<String> = mutableSetOf(),
+        val disabledHomeApps: MutableSet<String> = mutableSetOf(),
+        private val deferredMapWorker: QueueExecutor? = null,
     ) {
         val worker = QueueExecutor()
-        val scalarWrites = ScalarWrites(failedScalars, installedHomeApps)
+        val scalarWrites = ScalarWrites(failedScalars, installedHomeApps, disabledHomeApps)
         val appliedNotices = mutableListOf<AppliedNotice>()
         var mapDownloadCount = 0
         var mapImportCount = 0
+        var scalarGeneration = 0
+        val cancelledLbeMapVersions = mutableListOf<ConfigurationVersion?>()
         var mapDownloadFailure: java.io.IOException? = null
         var mapImportResult = LbeMapImportResult.ACCEPTED
-        var activeMapAvailable = false
-        var onMapDownload: (() -> Unit)? = null
+        var cachedMapPath: String? = null
+        var activeMapPath: String? = null
+        var importChangesActiveMap = true
+        val mapQueries = mutableListOf<String>()
+        var onMapQuery: (() -> Unit)? = null
+        var onMapDownload: ((LbeMapTransfer?) -> Unit)? = null
         var persistedPolicy: String? = initialPolicy
             private set
         var policyWritesToFail = 0
@@ -1692,25 +2275,55 @@ class ConfigurationPackageControllerTest {
                         false
                     }
                 },
-                scalarWriter = { { values, overwrite, mapFailureReason ->
-                    scalarWrites.apply(values, overwrite, mapFailureReason)
-                } },
-                homeAppEnabled = { packageName -> true.takeIf { packageName in installedHomeApps } },
-                onApplied = { bootReapply, isCurrent -> appliedNotices += AppliedNotice(bootReapply, isCurrent) },
-                lbeMapWorker = worker,
-                acquireLbeMap = { descriptor, _, _, isCurrent ->
-                    mapDownloadCount++
-                    onMapDownload?.invoke()
-                    if (!isCurrent()) throw StaleConfigurationException()
-                    mapDownloadFailure?.let { throw it }
-                    File("/tmp/${descriptor.sha256}.zip")
+                scalarWriter = {
+                    val generation = scalarGeneration
+                    { values, overwrite ->
+                        if (generation == scalarGeneration) {
+                            scalarWrites.apply(values, overwrite)
+                        } else {
+                            JSONObject().apply {
+                                for (key in values.keys()) {
+                                    put(key, settingOutcome("failed", reason = "READ_FAILED"))
+                                }
+                            }
+                        }
+                    }
                 },
-                importLbeMap = { _ ->
+                homeAppEnabled = { packageName ->
+                    when {
+                        packageName in disabledHomeApps -> false
+                        packageName in installedHomeApps -> true
+                        else -> null
+                    }
+                },
+                onApplied = { bootReapply, isCurrent -> appliedNotices += AppliedNotice(bootReapply, isCurrent) },
+                lbeMapWorker = deferredMapWorker ?: worker,
+                acquireLbeMap = { descriptor, transfer, _, isCurrent ->
+                    val path = File("/tmp/${descriptor.sha256}.zip")
+                    if (path.absolutePath == cachedMapPath) {
+                        LbeMapAcquisition(path, verifiedCacheHit = true)
+                    } else {
+                        mapDownloadCount++
+                        onMapDownload?.invoke(transfer)
+                        if (!isCurrent()) throw StaleConfigurationException()
+                        mapDownloadFailure?.let { throw it }
+                        cachedMapPath = path.absolutePath
+                        LbeMapAcquisition(path, verifiedCacheHit = false)
+                    }
+                },
+                importLbeMap = { path ->
                     mapImportCount++
-                    if (mapImportResult == LbeMapImportResult.ACCEPTED) activeMapAvailable = true
+                    if (mapImportResult == LbeMapImportResult.ACCEPTED && importChangesActiveMap) activeMapPath = path
                     mapImportResult
                 },
-                isLbeMapAvailable = { activeMapAvailable },
+                activeLbeMap = { path ->
+                    inspectActiveLbeMap({ scalarWrites.currentValues["lbeMode"] == true }) {
+                        mapQueries += path
+                        onMapQuery?.invoke()
+                        if (activeMapPath == path) 0 else 1
+                    }
+                },
+                cancelLbeMapTransfer = { keepVersion -> cancelledLbeMapVersions += keepVersion },
             ),
             wifi.controller,
         )
@@ -1751,12 +2364,15 @@ class ConfigurationPackageControllerTest {
                 failedScalars = scalarWrites.failedKeys,
                 packageStore = packageStore,
                 installedHomeApps = installedHomeApps,
+                disabledHomeApps = disabledHomeApps,
             )
             restarted.mapDownloadCount = mapDownloadCount
             restarted.mapImportCount = mapImportCount
             restarted.mapDownloadFailure = mapDownloadFailure
             restarted.mapImportResult = mapImportResult
-            restarted.activeMapAvailable = activeMapAvailable
+            restarted.cachedMapPath = cachedMapPath
+            restarted.activeMapPath = activeMapPath
+            restarted.scalarWrites.currentValues.putAll(scalarWrites.currentValues.filterKeys { it == "lbeMode" })
             return restarted
         }
 
@@ -1766,7 +2382,11 @@ class ConfigurationPackageControllerTest {
             ?: ConfigurationJournal()
     }
 
-    private class ScalarWrites(val failedKeys: Set<String>, private val installedHomeApps: Set<String>) {
+    private class ScalarWrites(
+        val failedKeys: Set<String>,
+        private val installedHomeApps: Set<String>,
+        private val disabledHomeApps: Set<String>,
+    ) {
         var count = 0
             private set
         var failNext = false
@@ -1775,7 +2395,7 @@ class ConfigurationPackageControllerTest {
         val currentValues = mutableMapOf<String, Any>()
         val mutations = mutableListOf<Set<String>>()
 
-        fun apply(values: JSONObject, overwrite: Boolean, mapFailureReason: String? = null): JSONObject {
+        fun apply(values: JSONObject, overwrite: Boolean): JSONObject {
             count++
             if (failNext) {
                 failNext = false
@@ -1789,12 +2409,12 @@ class ConfigurationPackageControllerTest {
             return JSONObject().apply {
                 for (key in keys) {
                     val outcome = if (key in failedKeys) settingOutcome("failed", reason = "UPDATE_FAILED")
-                    else if (key == "lbeMode" && values.optBoolean(key) && mapFailureReason != null) {
-                        val actual = currentValues[key] as? Boolean ?: false
-                        if (actual) settingOutcome("applied", actual)
-                        else settingOutcome("failed", actual, "MAP_REQUIRED")
-                    } else if (key == "startupApp") applyPicoLauncher(values.opt(key) as? String, { packageName ->
-                        if (packageName in installedHomeApps) true else null
+                    else if (key == "startupApp") applyPicoLauncher(values.opt(key) as? String, { packageName ->
+                        when {
+                            packageName in disabledHomeApps -> false
+                            packageName in installedHomeApps -> true
+                            else -> null
+                        }
                     }) { packageName ->
                         currentValues[key] = packageName.orEmpty()
                         changed.add(key)
@@ -1802,11 +2422,11 @@ class ConfigurationPackageControllerTest {
                     }
                     else {
                         val requested = values.get(key)
-                        if (overwrite || currentValues[key] != requested) {
+                        if (key == "ipd" || (overwrite && key != "lbeMode") || currentValues[key] != requested) {
                             currentValues[key] = requested
                             changed.add(key)
                         }
-                        settingOutcome("applied", currentValues.getValue(key))
+                        settingOutcome("applied", currentValues.getValue(key), "ACCEPTED_UNVERIFIED".takeIf { key == "ipd" })
                     }
                     put(key, outcome)
                 }

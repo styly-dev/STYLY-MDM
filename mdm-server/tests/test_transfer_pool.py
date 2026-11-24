@@ -1,4 +1,4 @@
-"""Tests that install and Push job-v1 share one server-wide transfer budget."""
+"""Verify that APK, Push and venue map transfers share one server-wide budget."""
 
 from __future__ import annotations
 
@@ -214,3 +214,62 @@ async def test_install_release_does_not_release_job_v1_push_transfer(tmp_path, r
                 if not task.done():
                     task.cancel()
             await asyncio.gather(install_task, push_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_map_request_waits_for_active_push_then_resumes_on_the_same_budget(tmp_path, monkeypatch):
+    import hashlib
+    import time
+    from types import SimpleNamespace
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from push_test_helpers import claimed_job_context
+
+    payload = b"test venue map bytes"
+    archive = tmp_path / "venue.zip"
+    archive.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    reference = {"name": archive.name, "sha256": digest, "size": len(payload)}
+    deployment = {"revision": "revision", "settings": {"lbeMap": reference}}
+    monkeypatch.setattr(server, "_desired_configuration", lambda _device_id: deployment)
+    monkeypatch.setattr(server, "_lbe_map_store", lambda: SimpleNamespace(path_for=lambda _ref: archive))
+    server.MAX_CONCURRENT_TRANSFERS = 1
+    slots = server.transfer_slots()
+    app = web.Application()
+    app.router.add_get("/maps/{sha256}", server.lbe_map_download_handler)
+    async with claimed_job_context(tmp_path) as (manager, capabilities, snapshot, assignment), TestClient(TestServer(app)) as client:
+        dispatch, _, waiting, registry, _, key = prepare_job_v1_dispatch(manager, capabilities, snapshot, assignment, slots)
+        push = dispatch()
+        pending_map = None
+        try:
+            await asyncio.wait_for(waiting.wait(), 2)
+            assert slots.locked()
+            map_waiting = asyncio.Event()
+            acquire = slots.acquire
+
+            async def observe_map_wait():
+                map_waiting.set()
+                return await acquire()
+
+            monkeypatch.setattr(slots, "acquire", observe_map_wait)
+            token = server._lbe_map_token("D1", "revision", digest, int(time.time()) + 60)
+            pending_map = asyncio.create_task(client.get(
+                f"/maps/{digest}?device_id=D1&revision=revision",
+                headers={"Authorization": f"Bearer {token}", "Range": "bytes=5-", "If-Match": f'"{digest}"'},
+            ))
+            await asyncio.wait_for(map_waiting.wait(), 2)
+            assert not pending_map.done()
+            registry.release_exact(key, "download_complete")
+            async with await asyncio.wait_for(pending_map, 2) as response:
+                assert response.status == 206
+                assert await response.read() == payload[5:]
+            await asyncio.wait_for(push, 2)
+            # The client can read the last byte before the server finishes write_eof.
+            await asyncio.wait_for(acquire(), 2)
+            slots.release()
+        finally:
+            for task in (push, pending_map):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(*(t for t in (push, pending_map) if t is not None), return_exceptions=True)

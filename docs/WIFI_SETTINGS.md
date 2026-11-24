@@ -115,9 +115,9 @@ Also turn on **Location** in the headset's system settings. On the headset,
 **Permissions → Wi-Fi configuration** shows each grant and the Location switch.
 **Review Wi-Fi permissions** opens the next setting that needs attention.
 
-Grant `DUMP` as well when MDM must update networks it did not create, such as
-the network added by the ADBK Wi-Fi step or in Android Settings. Without it,
-updating those networks fails.
+Grant `DUMP` during provisioning. Without it, the headset reports
+`DUMP_PERMISSION_MISSING` and cannot apply managed profiles, verify saved networks, or run managed network selection and recovery. The console shows
+the missing permission when the headset reports its readiness, even before deployment.
 
 ```sh
 adb shell pm grant com.styly.mdmclient android.permission.DUMP

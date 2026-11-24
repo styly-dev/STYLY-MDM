@@ -509,6 +509,9 @@
     .wifi-options .wifi-warning { color: var(--danger); font-weight: 600; }
     .settings-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
     .settings-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+    .settings-map-actions { align-items: center; }
+    .settings-map-summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 8px; }
+    .settings-map-filename { color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }
     .settings-buttons .btn, .settings-buttons .btn-outline { width: auto; margin: 0; padding: 9px 14px; font-size: 13px; font-weight: 600; line-height: 18px; }
     .settings-buttons .btn { border: 1px solid transparent; }
     .settings-buttons .btn-outline:disabled, .settings-networks .btn-outline:disabled { opacity: .4; cursor: not-allowed; }
@@ -896,6 +899,7 @@
       const membership = window.MdmGroupMembership;
       const memberEdits = new Map();
       let membershipSnapshotReady = false;
+      let membershipSnapshot = null;
       let membershipSave = null;
       let manageSearch = '';
       let manageSort = 'label-asc';
@@ -983,6 +987,7 @@
 
       function applyGroupListSnapshot(msg, source = 'ws') {
         const previousPowerTargets = selectedIds.size ? powerDeviceTargets(Array.from(selectedIds)) : null;
+        membershipSnapshot = msg;
         groups = msg.groups || {};
         if (source === 'ws') membershipSnapshotReady = true;
         const registryUnreadable = msg.registry_writable === false;
@@ -1479,6 +1484,9 @@
               showMembershipFeedback(msg.name, msg.message || 'Could not save members. Review the current group and try again.', 'error');
               if (applyPendingManageGroupSelection()) render();
             }
+            if (msg.operation === 'DELETE_GROUP' && manageSelectedGroup === msg.name) {
+              showMembershipFeedback(msg.name, msg.message || 'Review the current group before deleting it.', 'error');
+            }
             addLog('[ERROR] ' + (msg.message || 'Unknown error'), 'fail');
             break;
           default: addLog('Received: ' + msg.type, 'info');
@@ -1754,7 +1762,8 @@
             (startup ? '<span class="badge-startup" title="' + esc(startup) + '">★</span>' : '') +
             '</div>';
         }
-        deviceCell += '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.ip || '-') + '</div>';
+        deviceCell += '<div class="dev-sub">' + deviceIdHtml(d, id) + ' · ' + esc(d.ip || '-') + '</div>' +
+          window.MdmConfigurationPackages.wifiPermissionWarningHtml(d);
 
         let status;
         if (d.status === 'registering') {
@@ -2618,7 +2627,16 @@
         return true;
       }
       function sendRenameGroup(name, nn) { wsSend({ type: 'RENAME_GROUP', name: name, new_name: nn }, 'rename group'); }
-      function sendDeleteGroup(name) { wsSend({ type: 'DELETE_GROUP', name: name }, 'delete group'); }
+      function sendDeleteGroup(name) {
+        if (!membershipSnapshotReady || !membershipSnapshot) {
+          showMembershipFeedback(name, 'Wait for the current group list before deleting.', 'error');
+          return;
+        }
+        const { server_instance_id, revision } = membershipSnapshot;
+        if (confirm('Delete group "' + name + '"?\nThis removes the group and its package assignment. Existing values on devices stay in place.')) {
+          wsSend({ type: 'DELETE_GROUP', name, expected_snapshot: { server_instance_id, revision } }, 'delete group');
+        }
+      }
 
       function showMembershipFeedback(name, message, state) {
         membershipSave = { name, message, state };
@@ -2650,7 +2668,7 @@
         }
         let edit;
         try {
-          edit = membership.buildMembershipEdit(name, groups, memberEdits);
+          edit = membership.buildMembershipEdit(name, groups, memberEdits, membershipSnapshot.deployments);
         } catch (error) {
           showMembershipFeedback(name, error.message, 'error');
           return;
@@ -2660,6 +2678,9 @@
           showMembershipFeedback(name, 'No membership changes.', 'saved');
           return;
         }
+        const review = membership.reviewMembershipDeployment(edit, membershipSnapshot);
+        if (review.message && !confirm('Save group membership changes?\n\n' + review.message)) return;
+        edit.expected_deployments = review.expected;
         if (!wsSend(edit, 'save members')) {
           showMembershipFeedback(name, 'Connect to the server before saving members.', 'error');
           return;
@@ -3565,7 +3586,7 @@
       });
 
       // Manage view delegation (click)
-      manageView.addEventListener('click', function (e) {
+      function handleManageClick(e) {
         const t = e.target.closest('[data-act]');
         if (!t) return;
         const act = t.dataset.act;
@@ -3596,7 +3617,7 @@
           const id = t.dataset.id;
           let nowMember;
           try {
-            nowMember = membership.toggleMember(manageSelectedGroup, groups, memberEdits, id);
+            nowMember = membership.toggleMember(manageSelectedGroup, groups, memberEdits, id, membershipSnapshot?.deployments);
           } catch (error) {
             showMembershipFeedback(manageSelectedGroup, error.message, 'error');
             return;
@@ -3627,9 +3648,10 @@
         else if (act === 'deleteGroup') {
           const name = t.dataset.group;
           if (membershipSave?.state === 'saving' && membershipSave.name === name) return;
-          if (confirm('Delete group "' + name + '"?\nThis removes the group and its package assignment. Existing values on devices stay in place.')) sendDeleteGroup(name);
+          sendDeleteGroup(name);
         }
-      });
+      }
+      manageView.addEventListener('click', handleManageClick);
       // Manage search + keyboard
       manageView.addEventListener('input', function (e) {
         if (e.target.matches('[data-mg-search]')) { manageSearch = e.target.value; refreshMgDevList(); }
