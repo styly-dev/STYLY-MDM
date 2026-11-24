@@ -242,6 +242,10 @@
     return deployment.keys.some(key => ['failed', 'unsupported'].includes(report.results?.[key]?.status));
   }
 
+  function waitingHomeAppDetail(result) {
+    return 'App not found on the headset (' + result.value + ')';
+  }
+
   function deviceOutcome(device, packageId, deployment) {
     const online = device?.status === 'online';
     const connection = online ? '' : ' · Offline';
@@ -272,6 +276,9 @@
     const results = deployment.keys.map(key => report.results?.[key]?.status);
     const applied = results.filter(status => status === 'applied').length;
     if (results.every(status => status === 'applied')) {
+      if (results.length === 1 && deployment.keys[0] === 'startupApp') {
+        return ['success', 'Accepted' + connection, 'Takes effect after reboot.'];
+      }
       const wifiSaved = deployment.keys.includes('wifi') && report.results?.wifi?.reason === 'SAVED';
       const savedDetail = deployment.wifi_mode === 'android_selection'
         ? 'Wi-Fi profiles and auto-connect flags were read back. Android selects the network.'
@@ -281,6 +288,9 @@
     }
     if (results.every(status => status === 'unsupported')) {
       return ['unavailable', 'Unsupported' + connection, 'This device could not apply the managed settings.'];
+    }
+    if (results.includes('waiting') && results.every(status => status === 'applied' || status === 'waiting')) {
+      return ['pending', 'Waiting' + connection, waitingHomeAppDetail(report.results.startupApp)];
     }
     return ['failed', (applied ? 'Partially applied' : 'Apply failed') + connection,
       applied + ' of ' + results.length + ' managed settings verified.'];
@@ -418,23 +428,28 @@
       const item = items.get(key);
       const result = report.results?.[key];
       const status = result
-        ? { applied: 'Applied', failed: 'Failed', unsupported: 'Unsupported' }[result.status]
+        ? { applied: 'Applied', failed: 'Failed', unsupported: 'Unsupported', waiting: 'Waiting' }[result.status]
         : report.status === 'complete' ? 'Not verified' : '';
       if (!status) return '';
       const savedWifi = key === 'wifi' && status === 'Applied' && result.reason === 'SAVED';
       const applied = savedWifi || status === 'Applied';
+      const waiting = key === 'startupApp' && status === 'Waiting';
       const launcherAccepted = key === 'startupApp' && status === 'Applied';
       const resultStatus = launcherAccepted ? 'Accepted' : savedWifi ? 'Applied' : status;
       const actual = actualValue(item, result?.value);
       const reason = result?.reason ? String(result.reason).replaceAll('_', ' ').toLowerCase() : '';
-      const explanation = reason.charAt(0).toUpperCase() + reason.slice(1);
+      const homeAppDisabled = key === 'startupApp' && result?.reason === 'APP_DISABLED';
+      const explanation = homeAppDisabled
+        ? 'App disabled on the headset' + (result.value ? ' (' + result.value + ')' : '')
+        : reason.charAt(0).toUpperCase() + reason.slice(1);
       const detail = savedWifi
         ? (deployment.wifi_mode === 'android_selection' ? 'Saved. Android selects the network.' : 'Saved')
         : launcherAccepted
           ? [resultStatus, result.value === '' ? 'PICO default' : result.value, 'Takes effect after reboot'].filter(Boolean).join(' · ')
+          : waiting ? 'Waiting · ' + waitingHomeAppDetail(result)
           : [actual, explanation].filter(Boolean).join(' · ') || status;
-      return `<li class="${applied ? 'applied' : 'unverified'}">
-        <span class="settings-readback-icon" role="img" aria-label="${resultStatus}">${applied ? '✓' : '×'}</span>
+      return `<li class="${applied ? 'applied' : waiting ? 'waiting' : 'unverified'}">
+        <span class="settings-readback-icon" role="img" aria-label="${resultStatus}">${applied ? '✓' : waiting ? '…' : '×'}</span>
         <span>${esc(item?.label || key)}</span><span class="settings-readback-value">${esc(detail)}</span>
       </li>`;
     }).filter(Boolean).join('');

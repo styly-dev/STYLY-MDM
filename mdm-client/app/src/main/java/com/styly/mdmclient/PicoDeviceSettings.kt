@@ -70,14 +70,20 @@ internal fun settingsFailureOutcome(failure: Throwable, fallback: String): JSONO
 
 internal fun applyPicoLauncher(
     packageName: String?,
-    isAppEnabled: (String) -> Boolean,
+    appEnabled: (String) -> Boolean?,
     setLauncher: (String?) -> Int,
 ): JSONObject {
     if (packageName == null || packageName.length > 255) return settingOutcome("failed", reason = "INVALID_VALUE")
     return try {
-        if (packageName.isNotEmpty() &&
-            (!packageName.matches(Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+")) || !isAppEnabled(packageName))) {
-            return settingOutcome("failed", reason = "INVALID_VALUE")
+        if (packageName.isNotEmpty()) {
+            if (!packageName.matches(Regex("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+"))) {
+                return settingOutcome("failed", reason = "INVALID_VALUE")
+            }
+            when (appEnabled(packageName)) {
+                null -> return settingOutcome("waiting", packageName, "APP_NOT_INSTALLED")
+                false -> return settingOutcome("failed", packageName, "APP_DISABLED")
+                true -> Unit
+            }
         }
         when (setLauncher(packageName.ifEmpty { null })) {
             0 -> settingOutcome("applied", packageName)
@@ -176,11 +182,11 @@ internal class PicoDeviceSettings(private val context: Context, private val serv
         if (values.has("startupApp")) {
             results.put("startupApp", applyPicoLauncher(
                 values.opt("startupApp") as? String,
-                isAppEnabled = { packageName ->
+                appEnabled = { packageName ->
                     try {
                         context.packageManager.getApplicationInfo(packageName, 0).enabled
                     } catch (_: PackageManager.NameNotFoundException) {
-                        false
+                        null
                     }
                 },
                 setLauncher = service::setLauncher,

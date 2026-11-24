@@ -256,14 +256,23 @@ def public_configuration_state(raw):
     results = {}
     for key, item in _ITEMS.items():
         result = raw["results"].get(key)
-        if not isinstance(result, dict) or result.get("status") not in ("applied", "failed", "unsupported"):
+        if not isinstance(result, dict):
             continue
-        clean = {"status": result["status"]}
+        status = result.get("status")
         value = result.get("value")
+        reason = result.get("reason")
+        if status == "waiting":
+            if key == "startupApp" and reason == "APP_NOT_INSTALLED" and value and _valid_value(item, value):
+                results[key] = {"status": status, "value": value, "reason": reason}
+            continue
+        if status not in ("applied", "failed", "unsupported"):
+            continue
+        clean = {"status": status}
         if _valid_value(item, value, require_repeat=False):
             clean["value"] = value
-        reason = result.get("reason")
-        if isinstance(reason, str) and reason in _REASONS:
+        if key == "startupApp" and status == "failed" and reason == "APP_DISABLED":
+            clean["reason"] = reason
+        elif isinstance(reason, str) and reason in _REASONS:
             clean["reason"] = reason
         results[key] = clean
     return {**state, "results": results}

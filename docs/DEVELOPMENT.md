@@ -261,12 +261,19 @@ self-update power-cycle fallback. See the
 
 **PICO home app** under **Basic settings** configures the app opened at boot
 and by the Home button. Enter its Android package name (for example,
-`com.example.viewer`). Install and enable the app on each target before
-deployment. A successful TobService `setLauncher(packageName)` result confirms
-the API accepted the setting. If the app was missing, install it, select
-**Retry**, and wait for acceptance. Restart the headset and verify the Home
-action. Deploy a managed empty package name to restore the PICO default with
-`setLauncher(null)`.
+`com.example.viewer`). A headset missing the app keeps its current Home setting
+and reports **Waiting · App not found on the headset** with the package name.
+Headset Settings also names the missing app and says it will be applied after
+installation. The message remains visible alongside any other setting failure.
+It checks again when Android reports that the target app was installed and when
+the client restores its cached assignment, including at boot and offline.
+Completing the deferred application updates only the home app result in the
+current deployment. Retry remains available for other failed settings.
+An installed but disabled app appears as **App disabled on the headset** in
+the console. Enable the app, then use **Retry**.
+A successful TobService `setLauncher(packageName)` result appears as
+**Accepted**. Restart the headset and verify the Home action. Deploy a managed
+empty package name to restore the PICO default with `setLauncher(null)`.
 Clearing **Manage** releases management and preserves the current Home setting.
 The per-device **Startup App** command can bring another app to the foreground
 three seconds after the MDM service starts. Clear that per-device setting if the
@@ -378,10 +385,16 @@ and on package changes. Native clients can connect without an Origin header.
 | `GET`, `POST /api/group-package/deploy?name=...&package_id=...` | GET previews the deployment scope and whether it uses the current deployed version. An empty `package_id=` previews clearing management for the group and sets `clear` to true. The preview includes the current deployment's `wifi_mode`. POST accepts `expected_impact` from the preview, commits the group reference and any new deployment revision together, and returns the committed `GROUP_LIST` snapshot. A package that has never been deployed returns 409. |
 | `POST /api/package-retry` | Requests Retry for a currently assigned and online `device_id` with its current `package_id` and `revision`. |
 | `CONFIGURATION_POLICY` | Server to canonical `configuration_packages_v1` or `configuration_summary_v1` clients. Includes `package_id` and the group's active deployment `revision` (a null pair means no effective deployment for the client). Package-capable clients receive managed `settings` and explicit `retry_id` values. Clients with summary capability also receive nullable `group_name` and `deployed_at_ms` (Unix epoch milliseconds). Summary-only clients receive empty `settings`. |
-| `REGISTER` and `CONFIGURATION_STATE` | The secret-free `configuration_state` has `package_id`, `revision`, `status` (`applying`, `complete`, `interrupted`) and per-setting `results`. While the report is unknown, including before restoring a cached attempt, the client omits the field in `REGISTER` and sends no `CONFIGURATION_STATE` update. An explicit null clears the previous report after a durable release or when a durable first assignment is waiting for application. |
+| `REGISTER` and `CONFIGURATION_STATE` | The secret-free `configuration_state` has `package_id`, `revision`, `status` (`applying`, `complete`, `interrupted`) and per-setting `results`. A missing `startupApp` reports `status: "waiting"` and `reason: "APP_NOT_INSTALLED"`. A disabled `startupApp` reports `status: "failed"` and `reason: "APP_DISABLED"`. Both report the requested package name as `value`. A `complete` attempt may contain a waiting result. While the report is unknown, including before restoring a cached attempt, the client omits the field in `REGISTER` and sends no `CONFIGURATION_STATE` update. An explicit null clears the previous report after a durable release or when a durable first assignment is waiting for application. |
 | `REGISTER` and `WIFI_CONNECTION` | A canonical client reports `current_wifi` as `{ssid, bssid}` or null. The BSSID may be null. The headset samples while connected every 30 seconds. The server exposes the current connection in `DEVICE_LIST` for that session. |
 | `REGISTER` and `WIFI_STATE` | The device reports Wi-Fi readiness and monitoring in `wifi_state` with `busy`, `available`, `unavailable_reason` and `priority_monitor`. A repeated registration refreshes both reports when supplied. |
 | `GROUP_LIST` and `DEVICE_LIST` | Group messages expose membership, package summaries, assignments, active deployments, and the snapshot's `server_instance_id` and `revision`. Each deployment's `wifi_mode` is `priority`, `android_selection`, or null when Wi-Fi is unmanaged. Online device rows expose package support and the latest report. An offline row is last-known. |
+
+Update the server and reload the console before deploying clients that report a
+waiting home app. Older servers discard that per-setting result and strip the
+`APP_DISABLED` reason from failures. An existing
+home app failure from an older client can be reevaluated with Retry after the
+client upgrade or by a fresh deployment.
 
 #### Registry storage
 

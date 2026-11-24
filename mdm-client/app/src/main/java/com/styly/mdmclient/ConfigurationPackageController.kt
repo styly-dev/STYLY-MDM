@@ -37,11 +37,15 @@ internal data class ConfigurationAttempt(
     val retryIds: Set<String> = emptySet(),
     val bootReapply: Boolean = false,
 ) {
-    private val unappliedKeys: Sequence<String>
-        get() = results.keys().asSequence().filter { results.optJSONObject(it)?.optString("status") != "applied" }
+    val waitingHomeAppPackage: String?
+        get() = results.optJSONObject("startupApp")
+            ?.takeIf { it.optString("status") == "waiting" }?.opt("value") as? String
 
     val needsRetry: Boolean
-        get() = status == "interrupted" || (status == "complete" && unappliedKeys.any())
+        get() = status == "interrupted" || (status == "complete" && results.keys().asSequence().any {
+            results.optJSONObject(it)?.optString("status") != "applied" &&
+                !(it == "startupApp" && waitingHomeAppPackage != null)
+        })
 
     fun report(): JSONObject = version.toJson().put("status", status).put("results", results)
 
@@ -109,7 +113,9 @@ internal data class ConfigurationPackageDependencies(
     val onApplied: (bootReapply: Boolean, isCurrent: () -> Boolean) -> Unit = { _, _ -> },
 )
 
-internal enum class ConfigurationApplyStatus { WAITING, APPLYING, APPLIED, INCOMPLETE, RELEASE_UNSAVED }
+internal enum class ConfigurationApplyStatus {
+    WAITING, WAITING_FOR_HOME_APP, APPLYING, APPLIED, INCOMPLETE, RELEASE_UNSAVED,
+}
 
 internal data class ConfigurationScreenState(
     val groupKnown: Boolean,
@@ -117,6 +123,7 @@ internal data class ConfigurationScreenState(
     val version: ConfigurationVersion?,
     val deployedAtMillis: Long?,
     val applyStatus: ConfigurationApplyStatus?,
+    val waitingHomeAppPackage: String?,
     val canReapply: Boolean,
 )
 
@@ -232,6 +239,12 @@ internal class ConfigurationPackageController(
             sdkReady = ready
             if (ready) reloadJournal()
             reconcile()
+        }
+    }
+
+    fun onAppInstalled(packageName: String) {
+        worker.execute {
+            if (latestPolicy?.values?.opt("startupApp") == packageName) reconcile()
         }
     }
 
@@ -364,6 +377,7 @@ internal class ConfigurationPackageController(
         val attempt = policy.version?.let { version ->
             reported?.takeIf { it.version == version } ?: journal?.find(version)
         }
+        val waitingHomeAppPackage = if (policy.supportsApply) attempt?.waitingHomeAppPackage else null
         val applyStatus = when {
             !policy.supportsApply -> null
             policy.version == null -> ConfigurationApplyStatus.RELEASE_UNSAVED.takeIf { assignment?.cached == false }
@@ -371,11 +385,12 @@ internal class ConfigurationPackageController(
             pending?.policy === policy && pending?.isCurrent() == true -> ConfigurationApplyStatus.WAITING
             attempt == null -> ConfigurationApplyStatus.WAITING
             attempt.needsRetry -> ConfigurationApplyStatus.INCOMPLETE
+            waitingHomeAppPackage != null -> ConfigurationApplyStatus.WAITING_FOR_HOME_APP
             else -> ConfigurationApplyStatus.APPLIED
         }
         val next = ConfigurationScreenState(
             policy.groupKnown, policy.groupName, policy.version, policy.deployedAtMillis, applyStatus,
-            canReapply(policy),
+            waitingHomeAppPackage, canReapply(policy),
         )
         if (screenState == next) return
         screenState = next
@@ -385,6 +400,7 @@ internal class ConfigurationPackageController(
     private fun reconcile() {
         try {
             reconcilePending()
+            reconcileWaitingHomeApp()
         } finally {
             publishScreenState()
         }
@@ -445,6 +461,28 @@ internal class ConfigurationPackageController(
             checkExistingWifi = retryId == null && !bootReapply,
             bootReapply = bootReapply,
             isCurrent = delivery.isCurrent)
+    }
+
+    private fun reconcileWaitingHomeApp() {
+        if (!sdkReady || pending != null || applyingWifi) return
+        val policy = assignment?.takeIf { it.cached }?.policy ?: return
+        val version = policy.version ?: return
+        val attempt = journal?.latest ?: return
+        if (attempt.version != version || attempt.bootCount != boot) return
+        val packageName = attempt.waitingHomeAppPackage ?: return
+        if (policy.values.opt("startupApp") != packageName) return
+        val applyScalars = scalarWriter() ?: return
+        val outcome = try {
+            applyScalars(JSONObject().put("startupApp", packageName), false)
+                .optJSONObject("startupApp") ?: settingOutcome("unsupported", reason = "UNSUPPORTED")
+        } catch (failure: LinkageError) {
+            settingsFailureOutcome(failure, "WRITE_FAILED")
+        } catch (failure: Exception) {
+            settingsFailureOutcome(failure, "WRITE_FAILED")
+        }
+        if (outcome.optString("status") == "waiting") return
+        // The saved waiting result can be resumed if the process stops before this update is saved.
+        finish(attempt.copy(results = JSONObject(attempt.results.toString()).put("startupApp", outcome)))
     }
 
     private fun startAttempt(
@@ -591,7 +629,7 @@ internal class ConfigurationPackageController(
         if (!saveJournal(checkNotNull(journal).withAttempt(next))) return false
         publish(next)
         val token = assignment?.token
-        if (token != null && next.status == "complete" && !next.needsRetry) {
+        if (token != null && next.status == "complete" && !next.needsRetry && next.waitingHomeAppPackage == null) {
             try {
                 dependencies.onApplied(next.bootReapply) { assignment?.token === token && reported === next }
             } catch (_: Exception) {

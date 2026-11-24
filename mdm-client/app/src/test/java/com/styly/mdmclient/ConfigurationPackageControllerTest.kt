@@ -17,6 +17,123 @@ class ConfigurationPackageControllerTest {
     @get:Rule val temporary = TemporaryFolder()
 
     @Test
+    fun `a missing home app waits and installation applies only the launcher`() {
+        val packages = PackageHarness()
+        val policy = scalarPackagePayload().apply { getJSONObject("settings").put("startupApp", HOME_APP) }
+        packages.receiveAndRunWorkers(policy)
+
+        val waiting = checkNotNull(packages.attempt())
+        assertEquals("waiting", waiting.results.getJSONObject("startupApp").getString("status"))
+        assertFalse(waiting.needsRetry)
+        assertEquals(ConfigurationApplyStatus.WAITING_FOR_HOME_APP, packages.controller.screenSnapshot()?.applyStatus)
+        assertEquals(HOME_APP, packages.controller.screenSnapshot()?.waitingHomeAppPackage)
+        assertTrue(packages.appliedNotices.isEmpty())
+        assertFalse("startupApp" in packages.scalarWrites.currentValues)
+
+        packages.receiveAndRunWorkers(JSONObject(policy.toString()).put("retry_id", RETRY_ID))
+        val callsWhileWaiting = packages.scalarWrites.count
+        packages.controller.onAppInstalled("com.example.unrelated")
+        packages.worker.runAll()
+        assertEquals(emptySet<String>(), packages.attempt()?.retryIds)
+        assertEquals(callsWhileWaiting, packages.scalarWrites.count)
+
+        packages.installedHomeApps += HOME_APP
+        packages.controller.onAppInstalled(HOME_APP)
+        packages.controller.onAppInstalled(HOME_APP)
+        packages.worker.runAll()
+
+        val accepted = checkNotNull(packages.attempt())
+        assertEquals("applied", accepted.results.getJSONObject("startupApp").getString("status"))
+        assertEquals(60, accepted.results.getJSONObject("brightness").getInt("value"))
+        assertEquals(HOME_APP, packages.scalarWrites.currentValues["startupApp"])
+        assertEquals(callsWhileWaiting + 1, packages.scalarWrites.count)
+        assertEquals(setOf("startupApp"), packages.scalarWrites.calls.last())
+        assertEquals(ConfigurationApplyStatus.APPLIED, packages.controller.screenSnapshot()?.applyStatus)
+        assertNull(packages.controller.screenSnapshot()?.waitingHomeAppPackage)
+        assertTrue(packages.appliedNotices.single().isCurrent())
+    }
+
+    @Test
+    fun `a waiting home app survives reboot and is checked after a same boot process restart`() {
+        val previous = PackageHarness()
+        val policy = scalarPackagePayload().apply { getJSONObject("settings").put("startupApp", HOME_APP) }
+        previous.receiveAndRunWorkers(policy)
+
+        val rebooted = previous.restart(bootCount = 134)
+        rebooted.wifi.worker.runAll()
+        rebooted.worker.runAll()
+        assertEquals("waiting", rebooted.attempt()?.results?.getJSONObject("startupApp")?.getString("status"))
+        assertEquals(134, rebooted.attempt()?.bootCount)
+        assertEquals(ConfigurationApplyStatus.WAITING_FOR_HOME_APP, rebooted.controller.screenSnapshot()?.applyStatus)
+        assertEquals(HOME_APP, rebooted.controller.screenSnapshot()?.waitingHomeAppPackage)
+        assertTrue(rebooted.scalarWrites.overwriteModes.first())
+        assertTrue(rebooted.appliedNotices.isEmpty())
+
+        // Installation while the client process was stopped produced no callback for the client.
+        rebooted.installedHomeApps += HOME_APP
+        val restarted = rebooted.restart(bootCount = 134)
+        restarted.wifi.worker.runAll()
+        restarted.worker.runAll()
+        assertEquals(listOf(setOf("startupApp")), restarted.scalarWrites.calls)
+        assertEquals("applied", restarted.attempt()?.results?.getJSONObject("startupApp")?.getString("status"))
+        assertEquals(60, restarted.attempt()?.results?.getJSONObject("brightness")?.getInt("value"))
+    }
+
+    @Test
+    fun `headset Settings keeps the missing home app detail alongside another failure`() {
+        val packages = PackageHarness(failedScalars = setOf("brightness"))
+        val policy = scalarPackagePayload().apply { getJSONObject("settings").put("startupApp", HOME_APP) }
+        packages.receiveAndRunWorkers(policy)
+
+        val state = checkNotNull(packages.controller.screenSnapshot())
+        assertEquals(ConfigurationApplyStatus.INCOMPLETE, state.applyStatus)
+        assertEquals(HOME_APP, state.waitingHomeAppPackage)
+    }
+
+    @Test
+    fun `installation during Wi-Fi application retains its result and does not mask other failures`() {
+        val packages = PackageHarness(failedScalars = setOf("brightness"))
+        val policy = packagePayload(listOf(network("office-a")), prioritizeNetworks = false)
+            .apply { getJSONObject("settings").put("startupApp", HOME_APP) }
+        packages.receive(policy)
+
+        assertEquals("applying", packages.controller.resultSnapshot()?.getString("status"))
+        assertEquals("waiting", packages.attempt()?.results?.getJSONObject("startupApp")?.getString("status"))
+        packages.installedHomeApps += HOME_APP
+        packages.controller.onAppInstalled(HOME_APP)
+        packages.worker.runAll()
+        packages.wifi.worker.runAll()
+        packages.worker.runAll()
+
+        val attempt = checkNotNull(packages.attempt())
+        assertEquals("applied", attempt.results.getJSONObject("startupApp").getString("status"))
+        assertEquals("applied", attempt.results.getJSONObject("wifi").getString("status"))
+        assertEquals("failed", attempt.results.getJSONObject("brightness").getString("status"))
+        assertTrue(attempt.needsRetry)
+        assertEquals(1, packages.wifi.adapter.applyCalls.size)
+        assertTrue(packages.appliedNotices.isEmpty())
+    }
+
+    @Test
+    fun `installation cannot revive a released or replaced home app setting`() {
+        val policy = scalarPackagePayload().apply { getJSONObject("settings").put("startupApp", HOME_APP) }
+        for (replacement in listOf(noPackagePayload(), scalarPackagePayload().put("revision", REVISION_2))) {
+            val packages = PackageHarness()
+            packages.receiveAndRunWorkers(policy)
+            packages.receiveAndRunWorkers(replacement)
+
+            val callsAfterReplacement = packages.scalarWrites.count
+            packages.installedHomeApps += HOME_APP
+            packages.controller.onAppInstalled(HOME_APP)
+            packages.worker.runAll()
+
+            assertEquals(callsAfterReplacement, packages.scalarWrites.count)
+            assertFalse("startupApp" in packages.scalarWrites.currentValues)
+            assertNull(packages.controller.screenSnapshot()?.waitingHomeAppPackage)
+        }
+    }
+
+    @Test
     fun `a scalar writer exception ends the claim and permits Retry on the same boot`() {
         val packages = PackageHarness()
         val policy = packagePayload(listOf(network("office-a")), prioritizeNetworks = false)
@@ -1344,9 +1461,10 @@ class ConfigurationPackageControllerTest {
         failedScalars: Set<String> = emptySet(),
         var journalReadFailuresRemaining: Int = 0,
         private val packageStore: ConfigurationPackageStore? = null,
+        val installedHomeApps: MutableSet<String> = mutableSetOf(),
     ) {
         val worker = QueueExecutor()
-        val scalarWrites = ScalarWrites(failedScalars)
+        val scalarWrites = ScalarWrites(failedScalars, installedHomeApps)
         val appliedNotices = mutableListOf<AppliedNotice>()
         var persistedPolicy: String? = initialPolicy
             private set
@@ -1436,6 +1554,7 @@ class ConfigurationPackageControllerTest {
                 deferSdk = deferSdk,
                 failedScalars = scalarWrites.failedKeys,
                 packageStore = packageStore,
+                installedHomeApps = installedHomeApps,
             )
         }
 
@@ -1445,7 +1564,7 @@ class ConfigurationPackageControllerTest {
             ?: ConfigurationJournal()
     }
 
-    private class ScalarWrites(val failedKeys: Set<String> = emptySet()) {
+    private class ScalarWrites(val failedKeys: Set<String>, private val installedHomeApps: Set<String>) {
         var count = 0
             private set
         var failNext = false
@@ -1468,6 +1587,13 @@ class ConfigurationPackageControllerTest {
             return JSONObject().apply {
                 for (key in keys) {
                     val outcome = if (key in failedKeys) settingOutcome("failed", reason = "UPDATE_FAILED")
+                    else if (key == "startupApp") applyPicoLauncher(values.opt(key) as? String, { packageName ->
+                        if (packageName in installedHomeApps) true else null
+                    }) { packageName ->
+                        currentValues[key] = packageName.orEmpty()
+                        changed.add(key)
+                        0
+                    }
                     else {
                         val requested = values.get(key)
                         if (overwrite || currentValues[key] != requested) {
@@ -1487,6 +1613,7 @@ class ConfigurationPackageControllerTest {
         private const val REVISION_2 = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
         private const val PACKAGE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
         private const val PACKAGE_ID_2 = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        private const val HOME_APP = "com.example.home"
 
         private fun bootWithCachedPackage(
             policy: JSONObject,

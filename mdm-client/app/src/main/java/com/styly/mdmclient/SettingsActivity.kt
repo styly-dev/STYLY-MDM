@@ -217,18 +217,23 @@ class SettingsActivity : AppCompatActivity() {
             } ?: getString(R.string.configuration_deployment_unknown)
         }
         val status = state?.applyStatus
-        val statusText = when {
+        val statusTextRes = when {
             status == ConfigurationApplyStatus.RELEASE_UNSAVED -> R.string.configuration_release_unsaved
             version == null && state?.groupKnown == true -> R.string.configuration_not_deployed
-            version == null -> 0
+            version == null -> null
             status == null -> R.string.configuration_unsupported
             status == ConfigurationApplyStatus.APPLYING -> R.string.configuration_applying
             status == ConfigurationApplyStatus.WAITING -> R.string.configuration_waiting
+            status == ConfigurationApplyStatus.WAITING_FOR_HOME_APP -> null
             status == ConfigurationApplyStatus.APPLIED -> R.string.configuration_applied
             else -> R.string.configuration_incomplete
         }
-        configurationApplyStatus.visibility = if (statusText != 0) View.VISIBLE else View.GONE
-        if (statusText != 0) configurationApplyStatus.setText(statusText)
+        val waitingHomeAppText = state?.waitingHomeAppPackage?.let {
+            getString(R.string.configuration_waiting_for_home_app, it)
+        }
+        val statusText = listOfNotNull(statusTextRes?.let { getString(it) }, waitingHomeAppText).joinToString("\n")
+        configurationApplyStatus.visibility = if (statusText.isNotEmpty()) View.VISIBLE else View.GONE
+        configurationApplyStatus.text = statusText
         reapplyButton.visibility = if (version != null && status != null) View.VISIBLE else View.GONE
         reapplyButton.isEnabled = state?.canReapply == true && !reapplyPending
         reapplyButton.setOnClickListener {

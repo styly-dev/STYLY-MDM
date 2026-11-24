@@ -456,12 +456,58 @@ test('device status uses deployment keys and requires both IDs for current resul
   assert.equal(retryEligible(device({ ...failed, status: 'applying' }), d1), false);
 });
 
+test('a missing PICO home app shows Waiting without Retry and later shows Accepted', async () => {
+  const deployment = { ...d1, keys: ['startupApp'] };
+  const app = 'com.example.viewer';
+  const startupApp = { status: 'waiting', value: app, reason: 'APP_NOT_INSTALLED' };
+  const report = { ...deployment, status: 'complete', results: { startupApp } };
+  const devices = [{ ...online, configuration_state: report }];
+  const fixture = createHarness(() => response(profile()), { devices });
+  fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
+  fixture.controller.renderGroup('The Lab');
+  await new Promise(resolve => setImmediate(resolve));
+
+  const results = fixture.groupControls['[data-settings-results]'];
+  assert.match(results.innerHTML, /settings-device-result pending/);
+  assert.match(results.innerHTML, /class="waiting"[\s\S]*Waiting · App not found on the headset \(com\.example\.viewer\)/);
+  assert.doesNotMatch(results.innerHTML, /data-group-action="retry"|unverified/);
+  assert.equal(fixture.groupControls['[data-deployment-count]'].textContent, 'Applied 0/1');
+
+  devices[0].configuration_state = { ...report, results: { startupApp: { status: 'applied', value: app } } };
+  fixture.controller.renderGroup('The Lab');
+  assert.match(results.innerHTML, /settings-device-result success/);
+  assert.match(results.innerHTML, /aria-label="Accepted"[\s\S]*Takes effect after reboot/);
+  assert.doesNotMatch(results.innerHTML, /App not found|data-group-action="retry"/);
+  assert.equal(fixture.groupControls['[data-deployment-count]'].textContent, 'Applied 1/1');
+
+  const mixed = { ...online, configuration_state: { ...report, results: { ...failed.results, startupApp } } };
+  const mixedDeployment = { ...deployment, keys: ['brightness', 'startupApp'] };
+  assert.equal(deviceOutcome(mixed, pkg.package_id, mixedDeployment)[0], 'failed');
+  assert.equal(retryEligible(mixed, mixedDeployment), true);
+});
+
 test('release stays pending for a device that still reports a previous deployment', () => {
   const device = { ...online, configuration_state: applied };
   assert.equal(deviceOutcome(device, null, null)[1], 'Release pending');
   assert.equal(deviceOutcome({ ...device, status: 'offline' }, null, null)[1], 'Release pending · Offline');
   assert.equal(deviceOutcome({ ...device, configuration_supported: false }, null, null)[1], 'Client update needed');
   assert.equal(deviceOutcome({ ...device, configuration_state: null }, null, null)[1], 'No managed settings');
+});
+
+test('a disabled PICO home app shows the package and offers Retry', () => {
+  const deployment = { ...d1, keys: ['startupApp'] };
+  const startupApp = { status: 'failed', value: 'com.example.viewer', reason: 'APP_DISABLED' };
+  const report = { ...deployment, status: 'complete', results: { startupApp } };
+  const device = { ...online, configuration_state: report };
+  const fixture = createHarness(() => response(profile()), { devices: [device] });
+  fixture.broadcast({ assignments: { 'The Lab': 'pkg' }, deployments: { 'The Lab': deployment } });
+  fixture.controller.renderGroup('The Lab');
+
+  const results = fixture.groupControls['[data-settings-results]'].innerHTML;
+  assert.match(results, /aria-label="Failed"/);
+  assert.match(results, /App disabled on the headset \(com\.example\.viewer\)/);
+  assert.match(results, /data-group-action="retry"/);
+  assert.doesNotMatch(results, /Invalid value|App not found/);
 });
 
 test('Wi-Fi deployment does not use the removed Wi-Fi priority client gate', () => {

@@ -14,6 +14,7 @@
     <string name="configuration_deployment_unknown">Time unknown</string>
     <string name="configuration_not_deployed">No configuration package deployed</string>
     <string name="configuration_waiting">Waiting to apply settings…</string>
+    <string name="configuration_waiting_for_home_app">Home app not installed: %1$s. It will be applied after installation.</string>
     <string name="configuration_applying">Applying settings…</string>
     <string name="configuration_applied">Settings applied</string>
     <string name="configuration_applied_notice">STYLY-MDM Package Applied!</string>

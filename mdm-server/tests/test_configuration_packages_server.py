@@ -1586,6 +1586,47 @@ def test_configuration_state_is_sanitized_and_has_no_effect_on_delivery(tmp_path
     asyncio.run(body())
 
 
+def test_home_app_waiting_report_reaches_device_list_and_can_be_replaced_by_acceptance(tmp_path):
+    async def body():
+        async with _running_server(tmp_path, {"Studio": [DEVICE_ID]}) as (session, base):
+            empty = await _create(session, base, "Office")
+            app = "com.example.viewer"
+            await _deploy_to(session, base, empty, {
+                "startupApp": {"managed": True, "value": app},
+            }, "Studio")
+            async with session.ws_connect(base + "/ws/device", autoping=False) as ws:
+                await _register(ws)
+                policy = await _receive_type(ws, "CONFIGURATION_POLICY")
+                waiting = {"status": "waiting", "value": app, "reason": "APP_NOT_INSTALLED"}
+                state = {"package_id": policy["package_id"], "revision": policy["revision"], "status": "complete"}
+                await ws.send_json({"type": "CONFIGURATION_STATE", "configuration_state": {
+                    **state, "results": {
+                        "startupApp": {**waiting, "password": "secret"},
+                        "wifi": waiting,
+                    },
+                }})
+                await _assert_no_policy(ws)
+                row = next(row for row in json.loads(server.build_device_list_msg())["devices"]
+                           if row["device_id"] == DEVICE_ID)
+                assert row["configuration_state"] == {**state, "results": {"startupApp": waiting}}
+
+                disabled = {"status": "failed", "value": app, "reason": "APP_DISABLED"}
+                await ws.send_json({"type": "CONFIGURATION_STATE", "configuration_state": {
+                    **state, "results": {"startupApp": disabled, "wifi": disabled},
+                }})
+                await _assert_no_policy(ws)
+                assert server.device_registry[DEVICE_ID]["configuration_state"] == {
+                    **state, "results": {"startupApp": disabled, "wifi": {"status": "failed"}},
+                }
+
+                accepted = {**state, "results": {"startupApp": {"status": "applied", "value": app}}}
+                await ws.send_json({"type": "CONFIGURATION_STATE", "configuration_state": accepted})
+                await _assert_no_policy(ws)
+                assert server.device_registry[DEVICE_ID]["configuration_state"] == accepted
+
+    asyncio.run(body())
+
+
 def test_device_reports_refresh_on_reregistration_and_can_be_cleared(tmp_path):
     async def body():
         result = {"package_id": OTHER_ID, "revision": OFFLINE_ID, "status": "complete", "results": {}}

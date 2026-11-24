@@ -53,10 +53,10 @@ class PicoDeviceSettingsTest {
     }
 
     @Test
-    fun `missing or malformed startup app does not change the launcher`() {
+    fun `missing startup app waits but disabled or malformed apps fail without changing the launcher`() {
         var launcherCalls = 0
 
-        val missing = applyPicoLauncher("com.example.missing", { false }) {
+        val missing = applyPicoLauncher("com.example.missing", { null }) {
             launcherCalls += 1
             0
         }
@@ -70,10 +70,12 @@ class PicoDeviceSettingsTest {
             0
         }
 
-        assertEquals("failed", missing.getString("status"))
-        assertEquals("INVALID_VALUE", missing.getString("reason"))
+        assertEquals("waiting", missing.getString("status"))
+        assertEquals("APP_NOT_INSTALLED", missing.getString("reason"))
+        assertEquals("com.example.missing", missing.getString("value"))
         assertEquals("failed", disabled.getString("status"))
-        assertEquals("INVALID_VALUE", disabled.getString("reason"))
+        assertEquals("APP_DISABLED", disabled.getString("reason"))
+        assertEquals("com.example.disabled", disabled.getString("value"))
         assertEquals("failed", malformed.getString("status"))
         assertEquals("INVALID_VALUE", malformed.getString("reason"))
         assertEquals(0, launcherCalls)

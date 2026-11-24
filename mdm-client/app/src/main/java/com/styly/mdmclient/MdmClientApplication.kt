@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Environment
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.pvr.tobservice.ToBServiceHelper
 import java.io.File
 import java.util.concurrent.atomic.AtomicLong
@@ -62,6 +63,17 @@ class MdmClientApplication : Application() {
         }, IntentFilter(Intent.ACTION_SHUTDOWN))
         wifiController = WifiSettingsController(this)
         configurationPackages = ConfigurationPackageController(this, wifiSettingsController())
+        if (supportsPico4UltraEnterpriseSettings()) {
+            // The package controller and its installation listener share the process lifetime.
+            ContextCompat.registerReceiver(this, object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    if (intent.action == Intent.ACTION_PACKAGE_ADDED) {
+                        intent.data?.schemeSpecificPart?.let(configurationPackages::onAppInstalled)
+                    }
+                }
+            }, IntentFilter(Intent.ACTION_PACKAGE_ADDED).apply { addDataScheme("package") },
+                ContextCompat.RECEIVER_EXPORTED)
+        }
         identityResolver = DeviceIdentityResolver.create(this).also {
             it.startInitialLookup()
         }
