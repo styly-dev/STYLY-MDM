@@ -65,8 +65,8 @@ def _delays(*seconds):
 SECTIONS = [
     {"id": "basic", "title": "Basic settings", "description": "Display, lenses, sleep, power and home app", "items": [
         _item("brightness", "Screen brightness", "Screen brightness level.", "range", 70, min=1, max=100),
-        _item("ipd", "IPD", "Set the distance between the headset lenses for the wearer.", "decimal",
-              63, min=58, max=72, step=0.1, unit="mm"),
+        _item("ipd", "IPD", "Set lens spacing from 62 to 72 mm in 0.5 mm steps.", "range",
+              63, min=62, max=72, step=0.5, unit="mm"),
         _item("autoSleep", "Auto sleep", "Enable automatic sleep.", "bool", False),
         _item("sleepDelay", "Sleep delay", "Time before the headset sleeps.", "delay", -1,
               options=_delays(-1, 300, 600, 1800)),
@@ -136,10 +136,10 @@ def _valid_value(item, value, *, require_repeat=True):
     if kind == "bool":
         return type(value) is bool
     if kind == "range":
-        return _bounded_int(value, item["min"], item["max"])
-    if kind == "decimal":
+        if "step" not in item:
+            return _bounded_int(value, item["min"], item["max"])
         return (type(value) in (int, float) and item["min"] <= value <= item["max"]
-                and round(value, 1) == value)
+                and (value - item["min"]) % item["step"] == 0)
     if kind == "lbe-map":
         return value is None or valid_map_reference(value)
     if kind == "delay":

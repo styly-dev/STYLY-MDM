@@ -30,7 +30,7 @@ const sections = [
 ];
 const lbeSections = [
   { ...sections[0], items: [...sections[0].items,
-    { id: 'ipd', label: 'IPD', kind: 'decimal', min: 58, max: 72, step: 0.1, unit: 'mm', default: 64 }],
+    { id: 'ipd', label: 'IPD', kind: 'range', min: 62, max: 72, step: 0.5, unit: 'mm', default: 63 }],
   },
   { id: 'lbe', title: 'LBE', description: 'Location-based experience', items: [
     { id: 'lbeMode', label: 'LBE mode', kind: 'bool', default: false },
@@ -101,17 +101,16 @@ test('managed writes reject values outside the catalog', () => {
     { managed: false, value: 'com.legacy.home' }, 'saved unmanaged package IDs remain available');
 });
 
-test('unmanaged IPD and Home app keep valid saved values or restore defaults', () => {
+test('unmanaged IPD keeps its saved value and Home app handles a cleared input', () => {
   const saved = loadDraft(lbeSections, {
     ipd: { managed: true, value: 63.5 },
     startupApp: { managed: true, value: 'com.example.viewer' },
   });
   const draft = structuredClone(saved);
-  draft.ipd = { managed: false, value: 0 };
+  draft.ipd.managed = false;
   draft.startupApp = { managed: false, value: '' };
   const payload = buildPayload(lbeSections, draft, saved);
-  assert.deepEqual(payload.ipd, { managed: false, value: 63.5 },
-    'a cleared number input must not become an invalid zero');
+  assert.deepEqual(payload.ipd, { managed: false, value: 63.5 });
   assert.deepEqual(payload.startupApp, { managed: false, value: '' },
     'clearing a managed Home app explicitly restores the PICO launcher');
 
@@ -120,15 +119,40 @@ test('unmanaged IPD and Home app keep valid saved values or restore defaults', (
     { managed: false, value: 'com.example.viewer' }, 'invalid unmanaged input falls back to the saved value');
 });
 
-test('IPD enforces the decimal range and one tenth millimeter step', () => {
+test('IPD enforces the 62–72 mm range and half-millimeter step', () => {
   const saved = loadDraft(lbeSections, {});
   const draft = structuredClone(saved);
-  draft.ipd = { managed: true, value: 64.7 };
-  assert.equal(buildPayload(lbeSections, draft, saved).ipd.value, 64.7);
-  for (const value of [57.9, 72.1, 64.05, NaN]) {
+  draft.ipd.managed = true;
+  for (const value of [62, 62.5, 72]) {
+    draft.ipd.value = value;
+    assert.equal(buildPayload(lbeSections, draft, saved).ipd.value, value);
+  }
+  for (const value of [61.9, 72.5, 64.1, NaN]) {
     draft.ipd.value = value;
     assert.throws(() => buildPayload(lbeSections, draft, saved), /Select a supported value for IPD/);
   }
+});
+
+test('IPD renders as a slider and updates the displayed millimeters before saving', async () => {
+  const latest = profile({ itemSections: lbeSections, settings: { ipd: { managed: true, value: 63 } } });
+  const fixture = createHarness(({ method, url, body }) => {
+    if (method === 'GET') return response(latest);
+    assert.equal(url, '/api/packages/pkg/save-and-deploy');
+    assert.deepEqual(body.settings.ipd, { managed: true, value: 62.5 });
+    return response({ ...latest, settings: body.settings, edit_revision: 'edit2', published_revision: 'r1' });
+  });
+  await fixture.controller.showPackages('pkg');
+  assert.match(fixture.packagePanel.innerHTML,
+    /type="range" min="62" max="72" step="0.5" data-setting="ipd" value="63"><output>63.0 mm<\/output>/);
+  const target = {
+    dataset: { setting: 'ipd' }, type: 'range', value: '62.5', nextElementSibling: {},
+    matches: () => false,
+    setAttribute: (name, value) => assert.deepEqual([name, value], ['aria-valuetext', '62.5 mm']),
+  };
+  fixture.packagePanel.handlers.get('input')({ target });
+  assert.equal(target.nextElementSibling.value, '62.5 mm');
+  await fixture.editClick('deploy');
+  assert.equal(fixture.requests.at(-1).url, '/api/packages/pkg/save-and-deploy');
 });
 
 test('LBE mode alone manages its map and retains the selected ZIP while Off or unmanaged', () => {
@@ -1200,7 +1224,7 @@ function createHarness(respond, { devices = [], groups = { 'The Lab': ['headset'
   };
   // A Manage checkbox sits beside the value fieldset, not inside it.
   const edit = ({ dataset, value, checked, type }) => packagePanel.handlers.get('input')({ target: {
-    dataset, value, checked, type, matches: () => false, nextElementSibling: {},
+    dataset, value, checked, type, matches: () => false, setAttribute: () => {}, nextElementSibling: {},
     closest: selector => selector === '.settings-row' ? { querySelector: () => valueField } :
       selector === '.settings-value' ? (dataset.manage ? null : valueField) :
         selector === '.wifi-network' ? wifiArticle(dataset) :

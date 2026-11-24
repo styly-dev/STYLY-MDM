@@ -173,7 +173,7 @@ def test_lbe_map_download_survives_disconnect_and_requires_current_revision(tmp_
             assert await _request(session, "GET", base, "/api/lbe-maps") == {"maps": [reference]}
 
             settings = {
-                "ipd": {"managed": True, "value": 63.1},
+                "ipd": {"managed": True, "value": 63.5},
                 "lbeMode": {"managed": True, "value": True},
                 "lbeMap": {"managed": True, "value": reference},
             }
@@ -223,7 +223,7 @@ def test_lbe_map_download_survives_disconnect_and_requires_current_revision(tmp_
                 policy = await _receive_type(ws, "CONFIGURATION_POLICY")
                 old_policy = await _receive_type(legacy_ws, "CONFIGURATION_POLICY")
                 assert policy["settings"] == old_policy["settings"] == {
-                    "ipd": 63.1, "lbeMode": True, "lbeMap": reference,
+                    "ipd": 63.5, "lbeMode": True, "lbeMap": reference,
                 }
                 assert "lbe_map_download" not in old_policy and "lbe_map_token" not in old_policy
                 await download(policy, expected=403)
@@ -293,7 +293,7 @@ def test_lbe_map_download_survives_disconnect_and_requires_current_revision(tmp_
                 saved_off = await _deploy(session, base, deployed, settings=off)
                 assert saved_off["settings"]["lbeMap"] == invalid["lbeMap"]
                 disabled = await _receive_type(reconnected, "CONFIGURATION_POLICY")
-                assert disabled["settings"] == {"ipd": 63.1, "lbeMode": False}
+                assert disabled["settings"] == {"ipd": 63.5, "lbeMode": False}
                 assert "lbe_map_token" not in disabled
                 assert "lbe_map_token_expires_at" not in server.devices[DEVICE_ID]
                 await download(current, token=current["lbe_map_token"], expected=403)
@@ -375,14 +375,14 @@ def test_public_configuration_state_preserves_lbe_and_ipd_evidence():
     report = {
         "package_id": str(uuid.uuid4()), "revision": str(uuid.uuid4()), "status": "complete",
         "results": {
-            "ipd": {"status": "applied", "value": 63.1, "reason": "ACCEPTED_UNVERIFIED", "token": "private"},
+            "ipd": {"status": "applied", "value": 63.5, "reason": "ACCEPTED_UNVERIFIED", "token": "private"},
             "lbeMap": {"status": "applied", "value": reference, "reason": "MAP_ACTIVE_UNVERIFIED"},
             "lbeMode": {"status": "failed", "value": False, "reason": "MAP_REQUIRED"},
             "brightness": {"status": "applied", "value": 40, "reason": "ACCEPTED_UNVERIFIED"},
         },
     }
     assert configuration_packages.public_configuration_state(report)["results"] == {
-        "ipd": {"status": "applied", "value": 63.1, "reason": "ACCEPTED_UNVERIFIED"},
+        "ipd": {"status": "applied", "value": 63.5, "reason": "ACCEPTED_UNVERIFIED"},
         "lbeMap": {"status": "applied", "value": reference, "reason": "MAP_ACTIVE_UNVERIFIED"},
         "lbeMode": {"status": "failed", "value": False, "reason": "MAP_REQUIRED"},
         "brightness": {"status": "applied", "value": 40},
@@ -607,7 +607,7 @@ def test_mutations_enforce_origin_draft_cas_impact_and_validation(tmp_path):
             assert [section["id"] for section in initial["sections"]] == ["basic", "network", "input", "safety", "lbe", "advanced"]
             ipd = next(item for item in initial["sections"][0]["items"] if item["id"] == "ipd")
             assert (ipd["kind"], ipd["min"], ipd["max"], ipd["step"], ipd["unit"]) == (
-                "decimal", 58, 72, 0.1, "mm",
+                "range", 62, 72, 0.5, "mm",
             )
             advanced = next(section for section in initial["sections"] if section["id"] == "advanced")
             usb_boot = next(item for item in advanced["items"] if item["id"] == "usbBoot")
@@ -647,8 +647,9 @@ def test_mutations_enforce_origin_draft_cas_impact_and_validation(tmp_path):
 
             for invalid in (
                 _brightness(False),
-                {"ipd": {"managed": True, "value": 57.9}},
-                {"ipd": {"managed": True, "value": 64.05}},
+                {"ipd": {"managed": True, "value": 61.9}},
+                {"ipd": {"managed": True, "value": 72.5}},
+                {"ipd": {"managed": True, "value": 64.1}},
                 {"ipd": {"managed": True, "value": True}},
                 {"lbeMap": {"managed": True, "value": None}},
                 {"usbCopy": {"managed": True, "value": "on"}},

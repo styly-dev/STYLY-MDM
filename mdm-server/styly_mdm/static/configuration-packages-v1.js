@@ -62,19 +62,11 @@
 
   function supportedValue(item, value) {
     if (item.kind === 'range') {
-      if (typeof value !== 'number' || !Number.isInteger(value)) return false;
-      const min = Number(item.min ?? 0);
-      const max = Number(item.max ?? 100);
-      return value >= min && value <= max;
-    }
-    if (item.kind === 'decimal') {
       if (typeof value !== 'number' || !Number.isFinite(value)) return false;
       const min = Number(item.min ?? 0);
-      const max = Number(item.max ?? Number.MAX_SAFE_INTEGER);
+      const max = Number(item.max ?? 100);
       const step = Number(item.step ?? 1);
-      const steps = (value - min) / step;
-      const aligned = Math.abs(steps - Math.round(steps)) < 1e-7;
-      return value >= min && value <= max && aligned;
+      return value >= min && value <= max && (value - min) % step === 0;
     }
     if (item.kind === 'delay') return item.options?.some(option => option.value === value) === true;
     if (item.kind === 'bool') return typeof value === 'boolean';
@@ -249,9 +241,6 @@
         payloadValue = schedulePayload(item, value, saved[item.id]?.value, managed && value.enabled === true);
       } else if (managed && !supportedValue(item, value)) {
         throw new Error('Select a supported value for ' + item.label + '.');
-      } else if (!managed && item.kind === 'decimal' && !supportedValue(item, value)) {
-        const savedValue = saved[item.id]?.value;
-        payloadValue = supportedValue(item, savedValue) ? savedValue : item.default;
       }
       if (item.id === 'lbeMap' && managed && !validLbeMap(value)) {
         throw new Error('Select a map ZIP before enabling LBE mode.');
@@ -466,10 +455,10 @@
       case 'bool':
         return `<div class="settings-radios">${[true, false].map(on =>
           `<label><input type="radio" name="setting-${esc(item.id)}" ${field} value="${on}" ${value === on ? 'checked' : ''}> ${on ? 'On' : 'Off'}</label>`).join('')}</div>`;
-      case 'range':
-        return `<div class="settings-range"><input aria-label="${label}" type="range" min="${esc(item.min ?? 0)}" max="${esc(item.max ?? 100)}" ${field} value="${esc(value)}"><output>${esc(value)}%</output></div>`;
-      case 'decimal':
-        return `<label class="settings-unit"><input class="field" aria-label="${label}" type="number" min="${esc(item.min)}" max="${esc(item.max)}" step="${esc(item.step)}" ${field} value="${esc(value)}"><span>${esc(item.unit || '')}</span></label>`;
+      case 'range': {
+        const formatted = esc(actualValue(item, value));
+        return `<div class="settings-range"><input aria-label="${label}" aria-valuetext="${formatted}" type="range" min="${esc(item.min ?? 0)}" max="${esc(item.max ?? 100)}" step="${esc(item.step ?? 1)}" ${field} value="${esc(value)}"><output>${formatted}</output></div>`;
+      }
       case 'delay':
         return `<select class="field" aria-label="${label}" ${field}>${item.options.map(option =>
           `<option value="${esc(option.value)}" ${option.value === value ? 'selected' : ''}>${esc(option.label)}</option>`).join('')}</select>`;
@@ -571,8 +560,10 @@
 
   function actualValue(item, value) {
     if (!item) return '';
-    if (item.kind === 'range') return typeof value === 'number' ? value + '%' : '';
-    if (item.kind === 'decimal') return typeof value === 'number' ? value.toFixed(1) + ' mm' : '';
+    if (item.kind === 'range') {
+      if (typeof value !== 'number') return '';
+      return item.unit ? value.toFixed(1) + ' ' + item.unit : value + '%';
+    }
     if (item.kind === 'lbe-map') return validLbeMap(value) ? value.name : '';
     if (item.kind === 'bool') return typeof value === 'boolean' ? value ? 'On' : 'Off' : '';
     if (item.kind === 'delay') return item.options.find(option => option.value === value)?.label || '';
@@ -1728,7 +1719,12 @@
           entry.value = target.value === 'true';
         } else {
           entry.value = Number(target.value);
-          if (target.type === 'range') target.nextElementSibling.value = target.value + '%';
+          if (target.type === 'range') {
+            const item = model.sections.flatMap(section => section.items).find(item => item.id === setting);
+            const formatted = actualValue(item, entry.value);
+            target.nextElementSibling.value = formatted;
+            target.setAttribute('aria-valuetext', formatted);
+          }
         }
       } else return;
       model.error = false;

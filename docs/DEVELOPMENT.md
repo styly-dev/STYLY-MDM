@@ -288,10 +288,11 @@ three seconds after the MDM service starts. Clear that per-device setting if the
 PICO home app should stay in the foreground after boot. The Home button still
 opens the configured PICO home app.
 
-**IPD** under **Basic settings** sets lens spacing from 58 to 72 mm in 0.1 mm
-increments on PICO 4 Ultra Enterprise. Managing IPD can move the headset's
-lenses. A successful `pbsSetIPD` callback is reported as **Accepted** because
-TobService exposes no supported physical position readback. The client reapplies
+**IPD** under **Basic settings** has a slider from 62 to 72 mm in 0.5 mm
+increments on PICO 4 Ultra Enterprise. The server and client enforce these
+limits. Managing IPD can move the headset's lenses. A successful `pbsSetIPD`
+callback is reported as **Accepted** because TobService exposes no supported
+physical position readback. The client reapplies
 managed IPD on each OS boot and on headset **Reapply settings**. Within one boot,
 ordinary delivery and console **Retry** reuse the accepted value only when the
 immediately preceding active assignment requested that same IPD and its latest

@@ -62,15 +62,15 @@ class PicoDeviceSettingsTest {
     }
 
     @Test
-    fun `IPD accepts only tenths inside the SDK range`() {
-        assertEquals(58.0, normalizeIpd(58), 0.0)
-        assertEquals(63.1, normalizeIpd(63.1), 0.0)
+    fun `IPD accepts half-millimeter steps from 62 to 72`() {
+        assertEquals(62.0, normalizeIpd(62), 0.0)
+        assertEquals(62.5, normalizeIpd(62.5), 0.0)
         assertEquals(72.0, normalizeIpd(72L), 0.0)
     }
 
     @Test
     fun `IPD rejects off-grid and out-of-range values`() {
-        for (value in listOf(57.9, 72.1, 58.00001, Double.NaN, Double.POSITIVE_INFINITY, "63.1")) {
+        for (value in listOf(61.9, 72.5, 63.1, Double.NaN, Double.POSITIVE_INFINITY, "62.5")) {
             try {
                 normalizeIpd(value)
                 throw AssertionError("Expected IPD $value to be rejected")

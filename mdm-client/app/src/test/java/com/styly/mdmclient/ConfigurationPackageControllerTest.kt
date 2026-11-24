@@ -1652,7 +1652,7 @@ class ConfigurationPackageControllerTest {
     @Test
     fun `Retry retains accepted IPD while headset Reapply sends it again`() {
         val packages = PackageHarness(failedScalars = setOf("brightness"))
-        val policy = scalarPackagePayload().apply { getJSONObject("settings").put("ipd", 63.1) }
+        val policy = scalarPackagePayload().apply { getJSONObject("settings").put("ipd", 63.5) }
         packages.receiveAndRunWorkers(policy)
         assertTrue(packages.scalarWrites.calls.last().contains("ipd"))
 
@@ -1667,9 +1667,9 @@ class ConfigurationPackageControllerTest {
     @Test
     fun `a failed assignment save cannot retain IPD from a superseded package`() {
         val packages = PackageHarness()
-        val policyA = scalarPackagePayload().apply { getJSONObject("settings").put("ipd", 60.0) }
+        val policyA = scalarPackagePayload().apply { getJSONObject("settings").put("ipd", 62.0) }
         packages.receiveAndRunWorkers(policyA)
-        assertEquals(60.0, packages.scalarWrites.currentValues["ipd"])
+        assertEquals(62.0, packages.scalarWrites.currentValues["ipd"])
 
         val policyB = scalarPackagePayload()
             .put("package_id", PACKAGE_ID_2)
@@ -1688,10 +1688,10 @@ class ConfigurationPackageControllerTest {
 
         packages.receiveAndRunWorkers(reassignedA)
 
-        assertEquals(60.0, (packages.scalarWrites.currentValues["ipd"] as Number).toDouble(), 0.0)
+        assertEquals(62.0, (packages.scalarWrites.currentValues["ipd"] as Number).toDouble(), 0.0)
         val ipd = packages.attempt()?.results?.getJSONObject("ipd")
         assertEquals("applied", ipd?.getString("status"))
-        assertEquals(60.0, ipd?.getDouble("value") ?: Double.NaN, 0.0)
+        assertEquals(62.0, ipd?.getDouble("value") ?: Double.NaN, 0.0)
     }
 
     @Test
@@ -1777,7 +1777,7 @@ class ConfigurationPackageControllerTest {
     @Test
     fun `IPD acceptance carries across adjacent revisions and packages but resets on reboot`() {
         val packages = PackageHarness()
-        val policy = scalarPackagePayload().apply { getJSONObject("settings").put("ipd", 63.1) }
+        val policy = scalarPackagePayload().apply { getJSONObject("settings").put("ipd", 63.5) }
         packages.receiveAndRunWorkers(policy)
         packages.receiveAndRunWorkers(JSONObject(policy.toString()).put("revision", REVISION_2))
         packages.receiveAndRunWorkers(JSONObject(policy.toString()).put("package_id", PACKAGE_ID_2))

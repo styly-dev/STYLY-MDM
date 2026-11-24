@@ -22,7 +22,6 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.function.Consumer
-import java.math.BigDecimal
 
 internal data class PicoShutdownSchedule(
     val enabled: Boolean,
@@ -63,16 +62,11 @@ internal fun settingOutcome(
 }
 
 internal fun normalizeIpd(value: Any?): Double {
-    val number = value as? Number ?: throw IllegalArgumentException("IPD must be numeric")
-    val decimal = try {
-        BigDecimal(number.toString())
-    } catch (_: NumberFormatException) {
-        throw IllegalArgumentException("IPD must be finite")
+    val millimeters = (value as? Number)?.toDouble() ?: throw IllegalArgumentException("IPD must be numeric")
+    require(millimeters in 62.0..72.0 && millimeters % 0.5 == 0.0) {
+        "IPD must be 62.0–72.0 mm in 0.5 mm steps"
     }
-    if (decimal < BigDecimal("58") || decimal > BigDecimal("72") ||
-        decimal.movePointRight(1).stripTrailingZeros().scale() > 0
-    ) throw IllegalArgumentException("IPD must be 58.0–72.0 in 0.1 steps")
-    return decimal.toDouble()
+    return millimeters
 }
 
 internal enum class LbeMapImportResult {
