@@ -65,5 +65,5 @@ def test_oversized_upload_is_rejected_with_413_while_file_is_locked(monkeypatch)
     status, body = asyncio.run(_upload(b"x" * 4096))
 
     assert status == 413
-    assert body["error"] == "APK exceeds 2 GiB limit"
+    assert body["error"] == "APK exceeds 4 GiB limit"
     assert list(server.APK_DIR.glob("*.apk")) == []

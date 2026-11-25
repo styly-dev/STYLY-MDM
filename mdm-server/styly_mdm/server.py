@@ -62,7 +62,10 @@ logging.getLogger("aiohttp.access").addFilter(_RedactPushLeaseFilter())
 DATA_DIR = Path(os.environ.get("MDM_DATA_DIR", ".")).resolve()
 
 APK_DIR = DATA_DIR / "apks"
-MAX_APK_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB
+# 4 GiB is the ceiling of the plain (non-zip64) ZIP format. zip64 APKs are not
+# supported by APK signing or by the CD-digest verification (integrity.py).
+MAX_APK_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
+MAX_APK_SIZE_LABEL = "4 GiB"
 
 # The signed styly-mdm-client APK matching this server is bundled inside the wheel
 # (read-only package data) and seeded into APK_DIR on startup, so the console can
@@ -77,7 +80,7 @@ CLIENT_APK_RE = re.compile(r"^styly-mdm-client_v?(\d+(?:\.\d+)+)(?:-.*)?\.apk$")
 
 # Maximum number of device downloads allowed in flight across the whole server.
 # Fanning a file out to a large group otherwise makes every device pull it from the
-# server at the same instant (an APK can be up to 2 GiB, a push bundle likewise),
+# server at the same instant (an APK can be up to 4 GiB, a push bundle up to 2 GiB),
 # spiking LAN/server bandwidth and stalling transfers. Every byte-moving fan-out —
 # install, push, sync — gates its dispatch on the same pool of this many slots; a
 # slot frees as soon as its device reports the download finished. Read when the pool
@@ -2865,8 +2868,8 @@ async def upload_apk_handler(request: web.Request) -> web.Response:
     # to delete a file that is still open (WinError 32).
     if too_large:
         destination.unlink(missing_ok=True)
-        log.warning("Rejected APK upload %s: exceeds 2 GiB limit", destination.name)
-        return web.json_response({"error": "APK exceeds 2 GiB limit"}, status=413)
+        log.warning("Rejected APK upload %s: exceeds %s limit", destination.name, MAX_APK_SIZE_LABEL)
+        return web.json_response({"error": f"APK exceeds {MAX_APK_SIZE_LABEL} limit"}, status=413)
 
     if size == 0:
         destination.unlink(missing_ok=True)

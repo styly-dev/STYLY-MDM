@@ -674,7 +674,7 @@ documented in PR #82. `/ws/device` keeps compression enabled for device traffic.
 
 > **Transfer throttling.** An `INSTALL_APK` or a `PUSH_FILES` targeting a large group
 > would otherwise make every device pull the file from the server at the same instant
-> (an APK can be up to 2 GiB, a push bundle likewise), spiking LAN/server bandwidth.
+> (an APK can be up to 4 GiB, a push bundle up to 2 GiB), spiking LAN/server bandwidth.
 > Instead the server owns a pool of **N** transfer slots
 > (`MDM_MAX_CONCURRENT_TRANSFERS` env var / `--max-concurrent-transfers` flag,
 > default **5**) and every byte-moving fan-out — install, push, sync — must take one
