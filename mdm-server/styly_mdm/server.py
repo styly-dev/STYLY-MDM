@@ -2843,6 +2843,7 @@ async def upload_apk_handler(request: web.Request) -> web.Response:
     APK_DIR.mkdir(parents=True, exist_ok=True)
     destination = unique_apk_path(safe_name)
     size = 0
+    too_large = False
 
     try:
         with destination.open("wb") as f:
@@ -2852,13 +2853,20 @@ async def upload_apk_handler(request: web.Request) -> web.Response:
                     break
                 size += len(chunk)
                 if size > MAX_APK_SIZE:
-                    destination.unlink(missing_ok=True)
-                    return web.json_response({"error": "APK exceeds 2 GiB limit"}, status=413)
+                    too_large = True
+                    break
                 f.write(chunk)
     except Exception as e:
         destination.unlink(missing_ok=True)
         log.exception("Failed to store uploaded APK")
         return web.json_response({"error": f"Failed to store APK: {e}"}, status=500)
+
+    # Remove the partial file only after the handle is closed: Windows refuses
+    # to delete a file that is still open (WinError 32).
+    if too_large:
+        destination.unlink(missing_ok=True)
+        log.warning("Rejected APK upload %s: exceeds 2 GiB limit", destination.name)
+        return web.json_response({"error": "APK exceeds 2 GiB limit"}, status=413)
 
     if size == 0:
         destination.unlink(missing_ok=True)
