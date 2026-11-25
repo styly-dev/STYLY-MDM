@@ -17,6 +17,7 @@ import sys
 import time
 import uuid
 import zipfile
+from itertools import count
 from pathlib import Path
 from aiohttp import WSCloseCode, web
 
@@ -193,8 +194,9 @@ MAX_DEVICE_IP_LEN = 64
 MAX_VERSION_NAME_LEN = 64
 MAX_IDENTITY_DIAGNOSTIC_LEN = 256
 
-# Connected devices: device_id -> {ws, device_id, model, ip, status, startup_app, battery}
+# Connected devices: device_id -> live connection and device state.
 devices: dict[str, dict] = {}
+_device_connection_order = count()
 
 # One entry per live, not-yet-identified socket. This collection is intentionally
 # absent from every persistence path; its connection_id is live-connection scoped
@@ -1212,8 +1214,8 @@ def _owns_device(device_id: str | None, ws: web.WebSocketResponse) -> bool:
     A reboot does not always close the client's socket cleanly, so the server can
     still hold the pre-reboot connection open (it only notices at the next
     heartbeat) when the rebooted client has already reconnected and re-registered.
-    Both sockets then carry the same device_id, and the newest REGISTER is the
-    owner: ``devices[device_id]["ws"]`` is where commands are sent, so it is also
+    The newer socket takes ownership when it registers.
+    ``devices[device_id]["ws"]`` is where commands are sent, so it is also
     the only connection allowed to mutate that device's state or tear it down
     (#70).
     """
@@ -1306,6 +1308,8 @@ async def _complete_device_registration(
 
 async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
     ws = _websocket_response_factory(heartbeat=30)
+    # Order sockets before the handshake can yield. REGISTER can arrive much later.
+    connection_order = next(_device_connection_order)
     await ws.prepare(request)
     log.info("Device WebSocket connected from %s", request.remote)
 
@@ -1326,12 +1330,12 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
                 msg_type = data.get("type")
 
-                # A newer REGISTER has taken ownership of this device_id, so this
+                # A newer connection has taken ownership of this device_id, so this
                 # socket is a leftover from a reboot the server has not noticed yet.
                 # It must not advance or settle any per-device state — releasing a
                 # transfer slot or forwarding a terminal result from here would
                 # finish the *live* connection's job behind its back (#70). REGISTER
-                # is the one exception: that is how a connection claims ownership.
+                # is handled separately to check connection order at first claim.
                 if msg_type != "REGISTER" and device_id and not _owns_device(device_id, ws):
                     log.info("Ignoring %s from superseded connection: %s",
                              msg_type, device_id)
@@ -1409,20 +1413,29 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         break
 
                     new_device_id = registration["device_id"]
+                    owner = devices.get(new_device_id)
+                    if owner is not None and connection_order < owner["connection_order"]:
+                        log.info("Rejecting registration from superseded connection: %s", new_device_id)
+                        await ws.close(
+                            code=WSCloseCode.GOING_AWAY,
+                            message=b"Superseded by a newer connection",
+                        )
+                        break
                     model = registration["model"]
                     ip = registration["ip"]
                     startup_app = registration["startup_app"]
                     version_code = registration["version_code"]
                     version_name = registration["version_name"]
                     prev = device_registry.get(new_device_id, {})
-                    # Promotion is one synchronous mutation: no task can observe this
-                    # socket in both the provisional and canonical collections.
+                    # Keep the ownership check and replacement synchronous, including
+                    # removal from the provisional collection during promotion.
                     provisional_connections.pop(ws, None)
                     device_id = new_device_id
                     socket_identity_kind = kind
                     push_state_status = parse_push_state_status(data.get("push_state"))
                     devices[device_id] = {
                         "ws": ws,
+                        "connection_order": connection_order,
                         "device_id": device_id,
                         "identity_kind": kind,
                         "registration_ready": False,
@@ -1774,7 +1787,8 @@ async def device_ws_handler(request: web.Request) -> web.WebSocketResponse:
                     "status": "error",
                     "detail": "device disconnected before verification completed",
                 })
-        if device_id and is_current:
+        # The notification above can yield while a newer socket registers.
+        if device_id and _owns_device(device_id, ws):
             del devices[device_id]
             # Keep the registry entry; just stop reporting the device as online and
             # stamp when it was last seen so it shows as offline in the list.

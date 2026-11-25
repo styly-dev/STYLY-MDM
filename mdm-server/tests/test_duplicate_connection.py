@@ -198,6 +198,181 @@ def test_e2e_stale_connection_teardown_keeps_the_live_device_online(tmp_path):
     asyncio.run(body())
 
 
+@pytest.mark.parametrize("registration_kind", ["canonical", "provisional", "legacy"])
+def test_e2e_delayed_registration_cannot_replace_a_newer_connection(
+    tmp_path, registration_kind
+):
+    """An older accepted socket cannot claim a device after its newer socket."""
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        ts = TestServer(server.create_app())
+        await ts.start_server()
+        base = f"http://{ts.host}:{ts.port}"
+        device_id = "64b19041-0b8c-4ef4-82fd-000000000000"
+        stale = None
+        newer = None
+        newest = None
+        admin = None
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Accept the older socket before it claims a canonical identity.
+                stale = await session.ws_connect(base + "/ws/device")
+                if registration_kind == "provisional":
+                    await stale.send_json({
+                        "type": "REGISTER",
+                        "identity_scheme": server.IDENTITY_SCHEME,
+                        "device_id": None,
+                        "identity": {
+                            "state": "provisional",
+                            "status": "resolving",
+                            "diagnostic": "",
+                            "mint_attempted": False,
+                        },
+                    })
+                    assert await _recv_type(stale, "REGISTERED_PROVISIONAL") is not None
+
+                newer = await _register(session, base, device_id, version_code=8)
+                runtime = ts.app["push_runtime"]
+                newer_session = runtime.sessions[device_id]
+                newer_owner = server.devices[device_id]["ws"]
+                assert newer_session.ws is newer_owner
+
+                # The delayed first canonical REGISTER, including promotion from
+                # provisional identity, and a legacy REGISTER, must be rejected.
+                received = []
+                delayed_registration = {
+                    "type": "REGISTER",
+                    "identity_scheme": server.IDENTITY_SCHEME,
+                    "device_id": device_id,
+                    "model": "M",
+                    "ip": "1.1.1.2",
+                    "version_code": 7,
+                    "version_name": "t",
+                }
+                if registration_kind == "legacy":
+                    delayed_registration.pop("identity_scheme")
+                await stale.send_json(delayed_registration)
+                assert await _recv_type(
+                    stale, "REGISTERED", timeout=2, seen=received,
+                ) is None
+                assert received == []
+                assert stale.close_code == server.WSCloseCode.GOING_AWAY
+
+                assert server.devices[device_id]["ws"] is newer_owner
+                assert runtime.sessions[device_id] is newer_session
+
+                admin = await session.ws_connect(base + "/ws/admin")
+                await admin.send_json({
+                    "type": "REBOOT_DEVICE", "target_devices": [device_id],
+                })
+                assert await _recv_type(newer, "EXECUTE_REBOOT") is not None
+
+                # A later legitimate connection can still become the owner.
+                newest = await _register(session, base, device_id, version_code=9)
+                newest_owner = server.devices[device_id]["ws"]
+                assert newest_owner is not newer_owner
+                assert runtime.sessions[device_id].ws is newest_owner
+                assert not newer.closed
+
+                await newer.close()
+                await newest.close()
+                await admin.close()
+        finally:
+            if stale is not None and not stale.closed:
+                await stale.close()
+            if newer is not None and not newer.closed:
+                await newer.close()
+            if newest is not None and not newest.closed:
+                await newest.close()
+            if admin is not None and not admin.closed:
+                await admin.close()
+            await ts.close()
+
+    asyncio.run(body())
+
+
+def test_e2e_connection_registered_during_disconnect_notification_stays_online(
+    tmp_path, monkeypatch,
+):
+    """Disconnect cleanup rechecks ownership after awaiting admin notification."""
+    async def body():
+        server._apply_data_dir(str(tmp_path))
+        device_id = "64b19041-0b8c-4ef4-82fd-000000000000"
+        notification_started = asyncio.Event()
+        finish_notification = asyncio.Event()
+        old = None
+        newer = None
+        close_task = None
+        original_forward = server.forward_to_admins
+        original_device_handler = server.device_ws_handler
+        device_handler_count = 0
+        old_handler_finished = asyncio.Event()
+
+        async def observe_device_handler_completion(request):
+            nonlocal device_handler_count
+            device_handler_count += 1
+            is_old_handler = device_handler_count == 1
+            result = await original_device_handler(request)
+            if is_old_handler:
+                old_handler_finished.set()
+            return result
+
+        async def pause_disconnect_notification(payload):
+            if (
+                payload.get("type") == "SELF_UPDATE_VERIFIED"
+                and payload.get("status") == "error"
+            ):
+                notification_started.set()
+                await finish_notification.wait()
+            await original_forward(payload)
+
+        monkeypatch.setattr(server, "forward_to_admins", pause_disconnect_notification)
+        monkeypatch.setattr(server, "device_ws_handler", observe_device_handler_completion)
+
+        class PersistentHandlerTestServer(TestServer):
+            async def _make_runner(self, **kwargs):
+                kwargs["handler_cancellation"] = False
+                return await super()._make_runner(**kwargs)
+
+        ts = PersistentHandlerTestServer(server.create_app())
+        await ts.start_server()
+        base = f"http://{ts.host}:{ts.port}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                old = await _register(session, base, device_id, version_code=7)
+                server.pending_self_updates[device_id] = {
+                    "phase": "verifying",
+                    "correlation_id": "disconnect-race",
+                    "timeout_task": None,
+                }
+
+                # Let the old connection pass its ownership check, then pause at
+                # the awaited notification before it deletes the device entry.
+                close_task = asyncio.create_task(old.close())
+                await asyncio.wait_for(notification_started.wait(), timeout=2)
+
+                newer = await _register(session, base, device_id, version_code=8)
+                newer_owner = server.devices[device_id]["ws"]
+                finish_notification.set()
+                await asyncio.wait_for(close_task, timeout=2)
+                await asyncio.wait_for(old_handler_finished.wait(), timeout=2)
+
+                assert server.devices[device_id]["ws"] is newer_owner
+                assert server.devices[device_id]["registration_ready"] is True
+                assert ts.app["push_runtime"].sessions[device_id].ws is newer_owner
+        finally:
+            finish_notification.set()
+            if close_task is not None and not close_task.done():
+                await asyncio.gather(close_task, return_exceptions=True)
+            if old is not None and not old.closed:
+                await old.close()
+            if newer is not None and not newer.closed:
+                await newer.close()
+            await ts.close()
+
+    asyncio.run(body())
+
+
 def test_e2e_battery_update_on_a_superseded_socket_is_ignored(tmp_path):
     """Late telemetry must not raise KeyError and kill the surviving handler."""
     async def body():

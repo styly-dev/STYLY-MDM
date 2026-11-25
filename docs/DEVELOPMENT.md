@@ -1359,27 +1359,30 @@ time a window opens, so a pushed config takes effect on the next network transit
 disconnect — no reinstall or reboot. A device that has never reached a server can only
 run on the defaults (the push channel needs a live socket).
 
-### Duplicate connections: the newest registration owns the device
+### Duplicate connections: the newer WebSocket owns the device
 
 A reboot does not always close the client's socket cleanly — the server can still hold
 the pre-reboot WebSocket open (it only notices at the next 30 s heartbeat) when the
 rebooted client has already reconnected and re-registered. Two live connections then
-carry the same `device_id`, and the invariant is that **the newest `REGISTER` owns the
-entry in `devices`**: `devices[device_id]["ws"]` is the connection every command is sent
-to, and only that connection may tear the entry down.
+carry the same `device_id`. The server orders those sockets when their WebSocket
+handlers start. If an older socket attempts its first registration or a provisional
+promotion while a newer socket owns the device, the server closes the older socket
+with code 1001 (issue #120). The check and replacement run without yielding.
+Registration refreshes on the owning socket keep their existing session.
 
-`device_ws_handler` enforces that in two places, both via `_owns_device()`:
+`devices[device_id]["ws"]` is the connection that receives commands. Once a socket
+has registered, `device_ws_handler` uses `_owns_device()` to guard:
 
 - **Inbound frames.** One guard above the message dispatch chain drops every
   device-originated message except `REGISTER` when the socket no longer owns the
   device_id. Without it a leftover socket could release the live connection's transfer
   slot (`DOWNLOAD_COMPLETE`), forward a terminal result (`INSTALL_RESULT`,
   `PUSH_FILES_RESULT`), or consume a self-update verification — finishing the live
-  client's job behind its back. `REGISTER` is the one exception: that is how a
-  connection claims ownership in the first place.
-- **Teardown.** The `finally` block runs only for the owning connection: deleting the
-  registration, freeing transfer slots, dropping the install-dispatch record, and
-  failing a pending self-update verification.
+  client's job behind its back. A first `REGISTER` uses the connection order check above.
+- **Teardown.** Only the owner can free transfer slots, drop the install-dispatch
+  record, or fail a pending self-update verification. It checks ownership again
+  before deleting the entry because another socket may have registered during the
+  self-update failure notification.
 
 Without that guard the stale socket's teardown deleted the *live* registration, so a
 reconnected device showed as `offline` in the console until its next `BATTERY_UPDATE`
